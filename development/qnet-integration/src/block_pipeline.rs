@@ -34,6 +34,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
@@ -42,6 +43,90 @@ use crate::consensus_state::{CoordinatorHandle, ConsensusEvent};
 use crate::node::{is_info, is_warn, is_debug, BlockchainNode};
 use crate::unified_p2p::SimplifiedP2P;
 use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
+
+// ============================================================================
+// v13.0: FORK RECOVERY SIGNAL
+// ============================================================================
+// Tracks hash_chain_break events per height from distinct peers.
+// When N distinct peers report hash_chain_break at the same height,
+// it's a confirmed fork — signal rollback+resync to the main consensus loop.
+//
+// ARCHITECTURE: This is the "circuit breaker" that prevents permanent stall.
+// Without this, a forked node discards all incoming blocks forever.
+// ============================================================================
+
+/// Default fork break threshold (used at genesis with 5 nodes).
+/// Overridden dynamically by update_fork_threshold() from main consensus loop.
+const FORK_BREAK_PEER_THRESHOLD_DEFAULT: usize = 3;
+
+/// Floor: never go below 3 peers (even with few connections)
+const FORK_BREAK_PEER_THRESHOLD_MIN: usize = 3;
+
+/// Cap: pipeline realistically sees blocks from ~20-30 relay peers.
+/// Higher threshold = detection never fires. Safety ensured by
+/// check_finality_allows_rollback() + try_fork_recovery() cooldown + Dilithium sigs.
+const FORK_BREAK_PEER_THRESHOLD_MAX: usize = 20;
+
+/// Dynamic fork break threshold: f+1 of connected peers, bounded by [MIN, MAX].
+/// Updated every 30s from main consensus loop via update_fork_threshold().
+/// verify_stage reads this atomically — no P2P dependency needed.
+static DYNAMIC_FORK_THRESHOLD: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(FORK_BREAK_PEER_THRESHOLD_DEFAULT);
+
+/// Update fork break threshold based on current connected peer count.
+/// Called from main consensus loop where P2P context is available.
+/// Formula: f+1 = ceil(connected/3), clamped to [3, 20].
+///
+/// Examples:
+///   5 connected → max(3, min(ceil(5/3)=2, 20)) = 3  (60%)
+///   10 connected → max(3, min(4, 20)) = 4  (40%)
+///   50 connected → max(3, min(17, 20)) = 17  (34%)
+///   100 connected → max(3, min(34, 20)) = 20  (20%)
+///   1000 connected → max(3, min(334, 20)) = 20  (2%, safety via finality+cooldown)
+pub fn update_fork_threshold(connected_peers: usize) {
+    let f_plus_1 = (connected_peers + 2) / 3; // ceil(n/3)
+    let threshold = std::cmp::max(
+        FORK_BREAK_PEER_THRESHOLD_MIN,
+        std::cmp::min(f_plus_1, FORK_BREAK_PEER_THRESHOLD_MAX),
+    );
+    DYNAMIC_FORK_THRESHOLD.store(threshold, std::sync::atomic::Ordering::Relaxed);
+    if is_debug() {
+        println!("[DBG][PIPELINE] fork_threshold_updated peers={} threshold={}", connected_peers, threshold);
+    }
+}
+
+/// Get current dynamic fork threshold (called from verify_stage)
+fn get_fork_threshold() -> usize {
+    DYNAMIC_FORK_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Cooldown between fork recovery signals (prevents rollback ping-pong)
+const FORK_RECOVERY_COOLDOWN_SECS: u64 = 60;
+
+/// Global fork recovery signal: fork_height (0 = no signal)
+/// Main consensus loop checks this and triggers rollback+resync
+static FORK_RECOVERY_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Timestamp of last fork recovery signal (prevents re-triggering too fast)
+static FORK_RECOVERY_LAST_SIGNAL: AtomicU64 = AtomicU64::new(0);
+
+/// Track distinct peers per height that reported hash_chain_break
+static HASH_CHAIN_BREAK_TRACKER: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, std::collections::HashSet<String>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Check and consume fork recovery signal
+/// Returns Some(fork_height) if recovery is needed
+pub fn take_fork_recovery_signal() -> Option<u64> {
+    let h = FORK_RECOVERY_HEIGHT.swap(0, Ordering::SeqCst);
+    if h > 0 { Some(h) } else { None }
+}
+
+/// Clear stale entries from break tracker (called periodically)
+pub fn cleanup_break_tracker(min_height: u64) {
+    if let Ok(mut tracker) = HASH_CHAIN_BREAK_TRACKER.lock() {
+        tracker.retain(|h, _| *h >= min_height);
+    }
+}
 
 // ============================================================================
 // PIPELINE TYPES
@@ -458,6 +543,65 @@ impl BlockPipeline {
                         println!("[WARN][PIPELINE] hash_chain_break h={} from={}", mb.height, decoded.from_peer);
                     }
                     metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+
+                    // v13.0: Track hash_chain_break per height from distinct peers.
+                    // When FORK_BREAK_PEER_THRESHOLD distinct peers report break at same height,
+                    // it confirms WE are on the wrong fork — signal rollback+resync.
+                    {
+                        let peer_id = decoded.from_peer.clone();
+                        let current_threshold = get_fork_threshold();
+                        let should_signal = if let Ok(mut tracker) = HASH_CHAIN_BREAK_TRACKER.lock() {
+                            let peers = tracker.entry(mb.height).or_insert_with(std::collections::HashSet::new);
+                            peers.insert(peer_id);
+                            let count = peers.len();
+                            if count >= current_threshold {
+                                if is_warn() {
+                                    println!("[WARN][PIPELINE] fork_confirmed h={} distinct_peers={} threshold={}",
+                                             mb.height, count, current_threshold);
+                                }
+                                true
+                            } else {
+                                if is_debug() {
+                                    println!("[DBG][PIPELINE] break_tracked h={} peers={}/{}",
+                                             mb.height, count, current_threshold);
+                                }
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if should_signal {
+                            // Cooldown: prevent rollback ping-pong between node groups
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let last_signal = FORK_RECOVERY_LAST_SIGNAL.load(Ordering::SeqCst);
+                            let cooldown_ok = now_secs.saturating_sub(last_signal) >= FORK_RECOVERY_COOLDOWN_SECS;
+
+                            if cooldown_ok {
+                                // Atomic CAS: only set if no pending signal (0 → fork_height)
+                                // Prevents overwriting a signal the main loop hasn't consumed yet
+                                if FORK_RECOVERY_HEIGHT.compare_exchange(
+                                    0, mb.height, Ordering::SeqCst, Ordering::SeqCst
+                                ).is_ok() {
+                                    FORK_RECOVERY_LAST_SIGNAL.store(now_secs, Ordering::SeqCst);
+                                    println!("[WARN][PIPELINE] fork_recovery_signal h={} threshold={} (rollback+resync required)",
+                                             mb.height, current_threshold);
+                                }
+                            } else if is_info() {
+                                println!("[INFO][PIPELINE] fork_signal_cooldown h={} remaining={}s",
+                                         mb.height, FORK_RECOVERY_COOLDOWN_SECS - now_secs.saturating_sub(last_signal));
+                            }
+
+                            // Clear tracker for this height (one-shot)
+                            if let Ok(mut tracker) = HASH_CHAIN_BREAK_TRACKER.lock() {
+                                tracker.remove(&mb.height);
+                            }
+                        }
+                    }
+
                     continue;
                 }
             }

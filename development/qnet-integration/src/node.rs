@@ -12,6 +12,11 @@ pub const PROTOCOL_VERSION: u32 = 1;  // Increment when breaking changes are mad
 pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 
 // PRODUCTION CONSTANTS - No hardcoded magic numbers!
+/// Maximum eligible producers/validators per epoch AND per consensus round.
+/// Single source of truth — used in snapshot creation, candidate selection,
+/// emergency fallback, and CommitReveal consensus config.
+/// Scales BFT to millions of nodes: only 1000 participate in voting/production.
+pub const MAX_VALIDATORS: usize = 1000;
 const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
 const FORK_CHECK_INTERVAL: u64 = 5; // v10.0: Lightweight fork detection every 5 blocks (6× faster than rotation-only)
 #[allow(dead_code)]
@@ -2307,7 +2312,7 @@ impl BlockchainNode {
     /// This snapshot is stored in macroblock and used for deterministic producer selection
     /// All nodes will read the SAME snapshot from blockchain - NO gossip race conditions!
     /// 
-    /// PRODUCTION: Scales to millions of nodes with MAX_VALIDATORS_PER_EPOCH limit
+    /// PRODUCTION: Scales to millions of nodes with MAX_VALIDATORS limit
     /// PRODUCTION v2.34: Create DETERMINISTIC eligible producers snapshot
     /// 
     /// ARCHITECTURE v9.3: Base set = actual BFT committers (who proved sync by signing commit).
@@ -2324,7 +2329,6 @@ impl BlockchainNode {
         storage: &Storage,
     ) -> Vec<qnet_state::EligibleProducer> {
         const MIN_REPUTATION: f64 = 0.70;
-        const MAX_VALIDATORS_PER_EPOCH: usize = 1000;
         
         let current_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2522,12 +2526,12 @@ impl BlockchainNode {
 
         eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         
-        // v3.37: VRF-based fair selection when exceeding MAX_VALIDATORS_PER_EPOCH
+        // v3.37: VRF-based fair selection when exceeding MAX_VALIDATORS
         // Reputation-first ordering preserved; equal-reputation tiebreaker uses
         // deterministic VRF hash instead of alphabetical node_id — ensures every
         // node with the same reputation has an equal chance each epoch.
         // Precompute hashes O(n) — same pattern as select_consensus_committee.
-        if eligible.len() > MAX_VALIDATORS_PER_EPOCH {
+        if eligible.len() > MAX_VALIDATORS {
 
             let vrf_seed: [u8; 32] = if macroblock_index >= 2 {
                 let n_minus_2 = macroblock_index - 2;
@@ -2582,7 +2586,7 @@ impl BlockchainNode {
                         ha.cmp(hb)
                     })
             });
-            eligible.truncate(MAX_VALIDATORS_PER_EPOCH);
+            eligible.truncate(MAX_VALIDATORS);
             eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
 
             println!("[INFO][SNAP] vrf_selection mb={} total={} selected={} seed={}",
@@ -6203,8 +6207,8 @@ impl BlockchainNode {
             commit_phase_duration: Duration::from_secs(12),    // OPTIMIZED: 12s commit phase (blocks 61-72)
             reveal_phase_duration: Duration::from_secs(12),    // OPTIMIZED: 12s reveal phase (blocks 73-84)
             min_participants: 4,           // PRODUCTION: 4 nodes minimum for Byzantine safety (3f+1, f=1)
-            max_participants: 1000,        // Maximum participants per round
-            max_validators_per_round: 1000, // PRODUCTION: 1000 validators per round (per NETWORK_LOAD_ANALYSIS.md)
+            max_participants: MAX_VALIDATORS,
+            max_validators_per_round: MAX_VALIDATORS,
             enable_validator_sampling: true, // Enable sampling for scalability
             reputation_threshold: 0.70,    // 70% minimum reputation for participation
         };
@@ -9938,6 +9942,12 @@ impl BlockchainNode {
                             *height.write().await = received_block.height;
                             if is_debug() { println!("[DBG][BLOCK] height_updated h={}", received_block.height); }
                             
+                            // v13.0: Capture previous tip BEFORE updating atomics.
+                            // CRITICAL ORDERING: prev_tip must be read BEFORE LAST_BLOCK_PRODUCED_HEIGHT
+                            // is overwritten, otherwise the tip-advance check always compares
+                            // received_block.height against itself (== prev_tip + 1 is impossible).
+                            let prev_tip = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
+
                             // v5.4: Use block's ON-CHAIN timestamp for LBPT (not wall-clock).
                             // Block timestamp is identical on all nodes → identical local_delay →
                             // identical timeout_round. Using get_timestamp_safe() caused divergence
@@ -9953,9 +9963,31 @@ impl BlockchainNode {
                             // v9.0: Track sync progress for deadlock detection
                             LAST_SYNC_PROGRESS_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
 
-                            // v3.9: Reset timeout_round when new block received
-                            // This clears failover state since network is progressing
-                            reset_timeout_round();
+                            // v13.0: Reset timeout_round ONLY when advancing to next expected height.
+                            // OLD BUG: reset_timeout_round() was called on ANY height advance,
+                            // including sync blocks (e.g., receiving h=500 while catching up).
+                            // This reset CURRENT_TIMEOUT_ROUND to 0 mid-consensus, causing:
+                            //   - Node A at round=3, Node B receives sync block → round=0
+                            //   - Different timeout_round → different producer selection → FORK
+                            // FIX: Only reset when we receive the block we're WAITING for (next tip).
+                            // During sync (receiving blocks far behind tip), timeout_round stays intact.
+                            // NOTE: prev_tip was captured ABOVE, before LAST_BLOCK_PRODUCED_HEIGHT update.
+                            {
+                                let is_tip_advance = received_block.height == prev_tip + 1;
+                                if is_tip_advance {
+                                    reset_timeout_round();
+                                    if is_debug() {
+                                        println!("[DBG][TIMEOUT] round_reset h={} prev_tip={} reason=tip_advance",
+                                                 received_block.height, prev_tip);
+                                    }
+                                } else if is_debug() {
+                                    let current_round = get_current_timeout_round();
+                                    if current_round > 0 {
+                                        println!("[DBG][TIMEOUT] round_preserved={} h={} prev_tip={} reason=sync_or_skip",
+                                                 current_round, received_block.height, prev_tip);
+                                    }
+                                }
+                            }
 
                             // v5.5: Unlock production — we confirmed sync with network
                             // by receiving a new block at our tip height
@@ -10454,11 +10486,17 @@ impl BlockchainNode {
                 // MONITORING ONLY: Log if significantly behind network (not a fork, just sync needed)
                 if should_check_fork() {
                     if let Some(p2p) = &unified_p2p {
+                        // v13.0: Update dynamic fork recovery threshold based on connected peers.
+                        // Pipeline verify_stage has no P2P access — reads AtomicUsize instead.
+                        // Formula: f+1 = ceil(connected/3), clamped to [3, 20].
+                        let connected = p2p.get_connected_peer_count();
+                        crate::block_pipeline::update_fork_threshold(connected);
+
                         if let Ok(network_height) = p2p.sync_blockchain_height().await {
                             let local_height = *height.read().await;
-                            
+
                             if network_height > local_height.saturating_add(50) {
-                                println!("[WARN][SYNC] behind_network local={} network={} gap={}", 
+                                println!("[WARN][SYNC] behind_network local={} network={} gap={}",
                                          local_height, network_height, network_height.saturating_sub(local_height));
                             }
                         }
@@ -14710,9 +14748,26 @@ impl BlockchainNode {
                                     let last_block_hash = storage.get_latest_macroblock_hash()
                                         .unwrap_or([0u8; 32]);
 
+                                    // v13.0: JUMP-TO-HIGHEST — check if peer voted for higher round
+                                    // If so, adopt that round and vote at it for fast convergence.
+                                    // This replaces slow independent round computation with O(1) cascade.
+                                    let effective_vote_round = if let Some(jump_target) = p2p.take_timeout_jump_target(timeout_mb_index) {
+                                        if jump_target > proposed_timeout_round && jump_target > certified_timeout_round {
+                                            if is_info() {
+                                                println!("[INFO][TIMEOUT] jump_adopt h={} proposed={} jump_to={}",
+                                                         next_height, proposed_timeout_round, jump_target);
+                                            }
+                                            jump_target
+                                        } else {
+                                            proposed_timeout_round
+                                        }
+                                    } else {
+                                        proposed_timeout_round
+                                    };
+
                                     // v4.2: vote_msg uses macroblock index for consistency
                                     let vote_msg = format!("TIMEOUT:{}:{}:{}",
-                                        timeout_mb_index, proposed_timeout_round, hex::encode(&last_block_hash));
+                                        timeout_mb_index, effective_vote_round, hex::encode(&last_block_hash));
 
                                     // Sign with quantum crypto (Dilithium)
                                     if let Some(crypto) = try_get_quantum_crypto() {
@@ -14720,7 +14775,7 @@ impl BlockchainNode {
                                             Ok(sig) => {
                                                 p2p.broadcast_timeout_vote(
                                                     timeout_mb_index,
-                                                    proposed_timeout_round,
+                                                    effective_vote_round,
                                                     last_block_hash,
                                                     sig.signature.as_bytes().to_vec()
                                                 );
@@ -14751,6 +14806,72 @@ impl BlockchainNode {
                                 }
                             }
                             
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v13.0: PIPELINE FORK RECOVERY
+                            // ═══════════════════════════════════════════════════════════════════
+                            // When block_pipeline detects hash_chain_break from multiple distinct
+                            // peers at the same height, it signals that WE are on the wrong fork.
+                            // Action: rollback to fork_height-1, clear caches, resync from peers.
+                            // This is the ONLY way to recover from a persistent fork without restart.
+                            // ═══════════════════════════════════════════════════════════════════
+                            if let Some(fork_h) = crate::block_pipeline::take_fork_recovery_signal() {
+                                let local_h = *height.read().await;
+                                let rollback_to = fork_h.saturating_sub(1);
+                                println!("[WARN][FORK] pipeline_detected fork_h={} local_h={} rollback_to={}",
+                                         fork_h, local_h, rollback_to);
+
+                                if let Some(p2p) = &unified_p2p {
+                                    // 1. Rollback local chain to before fork point
+                                    if rollback_to > 0 && rollback_to < local_h {
+                                        if !crate::storage::start_rollback_protection(rollback_to) {
+                                            println!("[WARN][FORK] rollback_protection_busy");
+                                        } else {
+                                            // Delete forked blocks from storage
+                                            for h in fork_h..=local_h {
+                                                if let Err(e) = storage.delete_microblock(h) {
+                                                    if is_warn() {
+                                                        println!("[WARN][FORK] delete_fail h={} err={}", h, e);
+                                                    }
+                                                }
+                                            }
+
+                                            // v10.2: DISK FIRST, RAM SECOND (crash-safe order)
+                                            if let Err(e) = storage.set_chain_height(rollback_to) {
+                                                eprintln!("[ERR][FORK] set_chain_height_fail h={} err={}", rollback_to, e);
+                                            }
+                                            *height.write().await = rollback_to;
+                                            LAST_BLOCK_PRODUCED_HEIGHT.store(rollback_to, Ordering::Relaxed);
+                                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                                rollback_to, std::sync::atomic::Ordering::Release
+                                            );
+
+                                            crate::storage::end_rollback_protection();
+
+                                            // Clear stale caches
+                                            clear_expected_producer_cache_above(rollback_to);
+                                            complete_rollback_cleanup(rollback_to);
+
+                                            println!("[INFO][FORK] rollback_ok to={} deleted={} blocks",
+                                                     rollback_to, local_h - rollback_to);
+                                        }
+                                    }
+
+                                    // 2. Resync from peers (fork_height to current network tip)
+                                    let sync_to = std::cmp::min(
+                                        p2p.get_best_peer_height(),
+                                        fork_h.saturating_add(200) // bounded resync
+                                    );
+                                    if sync_to > rollback_to {
+                                        println!("[INFO][FORK] resync range={}-{}", rollback_to + 1, sync_to);
+                                        if let Err(e) = p2p.sync_blocks(rollback_to + 1, sync_to).await {
+                                            eprintln!("[ERR][FORK] resync_fail err={}", e);
+                                        } else {
+                                            println!("[INFO][FORK] resync_ok range={}-{}", rollback_to + 1, sync_to);
+                                        }
+                                    }
+                                }
+                            }
+
                             // ═══════════════════════════════════════════════════════════════════
                             // FIX v2.48: CHRONIC STALL RECOVERY
                             // ═══════════════════════════════════════════════════════════════════
@@ -20601,17 +20722,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let candidates = stable_candidates;
             
             // CRITICAL: Apply MAX_VALIDATORS limit BEFORE sorting (for scalability)
-            // Same limit as normal consensus to prevent O(n log n) on millions of nodes
-            const MAX_EMERGENCY_VALIDATORS: usize = 1000; // Same as MAX_VALIDATORS_PER_ROUND
-            
-            let limited_candidates = if candidates.len() <= MAX_EMERGENCY_VALIDATORS {
+            let limited_candidates = if candidates.len() <= MAX_VALIDATORS {
                 candidates.clone()
             } else {
-                // PRODUCTION: Deterministic sampling for large networks
                 println!("[INFO][MB] emergency_candidates_limited from={} to={}",
-                        candidates.len(), MAX_EMERGENCY_VALIDATORS);
+                        candidates.len(), MAX_VALIDATORS);
                 candidates.iter()
-                    .take(MAX_EMERGENCY_VALIDATORS)
+                    .take(MAX_VALIDATORS)
                     .cloned()
                     .collect()
             };
@@ -21263,15 +21380,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // This allows each caller to sort candidates at the exact point where deterministic ordering is needed
         
         // CRITICAL: Apply validator sampling for scalability (prevent millions of validators)
-        // QNet configuration: 1000 validators per round for optimal Byzantine safety + performance
-        const MAX_VALIDATORS_PER_ROUND: usize = 1000; // Per NETWORK_LOAD_ANALYSIS.md specification
-        
-        let sampled_candidates = if all_qualified.len() <= MAX_VALIDATORS_PER_ROUND {
-            // Small network: Use all qualified candidates (sorting done by caller)
+        let sampled_candidates = if all_qualified.len() <= MAX_VALIDATORS {
             all_qualified
         } else {
-            // Large network: Apply deterministic sampling for Byzantine consensus
-            Self::deterministic_validator_sampling(&all_qualified, MAX_VALIDATORS_PER_ROUND).await
+            Self::deterministic_validator_sampling(&all_qualified, MAX_VALIDATORS).await
         };
         
         sampled_candidates
@@ -21358,15 +21470,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         all_qualified.dedup_by(|a, b| a.0 == b.0);
         
         // Apply validator sampling (same logic as Genesis phase)
-        const MAX_VALIDATORS_PER_ROUND: usize = 1000; // Per NETWORK_LOAD_ANALYSIS.md
-        
-        let sampled_candidates = if all_qualified.len() <= MAX_VALIDATORS_PER_ROUND {
+        let sampled_candidates = if all_qualified.len() <= MAX_VALIDATORS {
             println!("  ├── Registry network: using all {} qualified validators", all_qualified.len());
             all_qualified
         } else {
-            println!("  ├── Large registry network: sampling {} from {} qualified validators", 
-                     MAX_VALIDATORS_PER_ROUND, all_qualified.len());
-            Self::deterministic_validator_sampling(&all_qualified, MAX_VALIDATORS_PER_ROUND).await
+            println!("  ├── Large registry network: sampling {} from {} qualified validators",
+                     MAX_VALIDATORS, all_qualified.len());
+            Self::deterministic_validator_sampling(&all_qualified, MAX_VALIDATORS).await
         };
         
         println!("  └── Final registry candidates: {} (ready for millions scale)", sampled_candidates.len());
@@ -27560,6 +27670,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Sync blocks from network
     pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), QNetError> {
+        // v13.0: Guard against inverted ranges (from > to)
+        // This can happen when height calculations underflow or peers report stale data.
+        // Without this guard, `from..=to` with from > to creates an empty range but
+        // save_sync_progress records a broken state → infinite empty sync loop on restart.
+        if from_height > to_height {
+            if is_warn() {
+                println!("[WARN][SYNC] inverted_range from={} to={} skipped", from_height, to_height);
+            }
+            return Ok(());
+        }
+
         if let Some(ref p2p) = self.unified_p2p {
             // Start sync process
             if is_info() { println!("[INFO][SYNC] block_sync {}-{}", from_height, to_height); }
@@ -27586,10 +27707,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// CRITICAL FIX v2.61: Size-based batched sync to prevent QUIC message loss
     /// v5.6: Added from_peer_addr for routing responses to unregistered new nodes
     pub async fn handle_sync_request(&self, from_height: u64, to_height: u64, requester_id: String, from_peer_addr: String) -> Result<(), QNetError> {
+        // v13.0: Guard against inverted sync requests from peers
+        if from_height > to_height {
+            if is_warn() {
+                println!("[WARN][SYNC] inverted_request from={} addr={} heights={}-{} rejected",
+                         requester_id, from_peer_addr, from_height, to_height);
+            }
+            return Ok(());
+        }
+
         if is_info() {
             println!("[INFO][SYNC] request from={} addr={} heights={}-{}", requester_id, from_peer_addr, from_height, to_height);
         }
-        
+
         // Get microblocks from storage (already in network format)
         let blocks_data = self.storage.get_microblocks_range(from_height, to_height).await?;
         
@@ -28200,6 +28330,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// Sync macroblocks from network
     /// PRODUCTION: Requests macroblocks from peers and waits for response
     pub async fn sync_macroblocks(&self, from_index: u64, to_index: u64) -> Result<(), QNetError> {
+        // v13.0: Guard against inverted macroblock ranges
+        if from_index > to_index {
+            if is_warn() {
+                println!("[WARN][SYNC] inverted_macroblock_range from={} to={} skipped", from_index, to_index);
+            }
+            return Ok(());
+        }
+
         if let Some(ref p2p) = self.unified_p2p {
             println!("[INFO][SYNC] macroblock_sync_start from={} to={}", from_index, to_index);
             

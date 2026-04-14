@@ -1012,6 +1012,12 @@ static VOTER_MAX_ROUND: Lazy<Arc<DashMap<(u64, String), u64>>> =
 static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<u64, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
+/// v13.0: Jump-to-highest target — set when peer's verified vote has higher round than ours.
+/// Key: macroblock_index, Value: target round to jump to.
+/// Consumed by main consensus loop: read + clear atomically → broadcast vote at target round.
+static TIMEOUT_JUMP_TARGET: Lazy<Arc<DashMap<u64, u64>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
 // ═══════════════════════════════════════════════════════════════════
 // v4.0: VRF LEADER CLAIMS — secret leader election via VRF
 // Key: leadership_round → Vec<VerifiedLeaderClaim>
@@ -4470,13 +4476,17 @@ impl SimplifiedP2P {
                 HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_height);
                 HIGHEST_ADOPTED_ROUND.retain(|h, _| *h >= min_height);
                 VOTER_MAX_ROUND.retain(|(h, _), _| *h >= min_height);
+                TIMEOUT_JUMP_TARGET.retain(|h, _| *h >= min_height);
 
                 let timeout_voted_before = TIMEOUT_VOTED_HEIGHTS.len();
                 TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_height);
                 let timeout_voted_removed = timeout_voted_before.saturating_sub(TIMEOUT_VOTED_HEIGHTS.len());
 
+                // v13.0: Clean pipeline fork recovery tracker
+                crate::block_pipeline::cleanup_break_tracker(min_height);
+
                 let timeout_total_removed = timeout_votes_removed + timeout_certs_removed + timeout_voted_removed;
-                
+
                 // Log if anything was cleaned
                 let total_removed = retry_removed + fallback_removed + pending_sync_removed + pending_macro_removed + empty_response_removed + invalid_cert_removed + timeout_total_removed;
                 if total_removed > 0 {
@@ -18317,13 +18327,21 @@ impl SimplifiedP2P {
     
     /// Batch sync for catch-up - request blocks in batches
     pub async fn batch_sync(&self, from_height: u64, to_height: u64, batch_size: u64) -> Result<(), String> {
+        // v13.0: Guard against inverted ranges
+        if from_height > to_height {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] batch_inverted_range from={} to={} skipped", from_height, to_height);
+            }
+            return Ok(());
+        }
+
         if crate::node::is_info() {
             println!("[INFO][SYNC] Starting batch sync from {} to {} (batch size: {})",
                      from_height, to_height, batch_size);
         }
-        
+
         let mut current = from_height;
-        
+
         while current <= to_height {
             let batch_to = std::cmp::min(current + batch_size - 1, to_height);
             
@@ -20951,6 +20969,40 @@ impl SimplifiedP2P {
                      height, timeout_round, voter_id, votes_count, byzantine_threshold);
         }
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // v13.0: JUMP-TO-HIGHEST — O(1) timeout round convergence
+        //
+        // PROBLEM: Without this, each node independently computes proposed_timeout_round
+        // from local delay. NTP drift (±2s) → different rounds → different producers → fork.
+        // Adopted round requires f+1 votes at the SAME round. If 5 nodes compute
+        // rounds [3,4,4,5,5], no single round gets f+1=2 → adopted stays 0 → stall.
+        //
+        // SOLUTION: When we see a verified vote for round R > our current voted round,
+        // immediately adopt R and broadcast our own vote at R. This cascades:
+        //   t=0: Node A votes round=5 (highest delay)
+        //   t=1: Nodes B,C,D,E receive vote, jump to round=5, broadcast
+        //   t=2: All nodes have f+1 votes for round=5 → adopted=5 → same producer
+        //
+        // SECURITY: Only jumps to rounds from VERIFIED votes (Dilithium sig checked above).
+        // Cannot be exploited: attacker needs valid Dilithium key (quantum-resistant).
+        // Maximum jump is bounded by honest nodes' actual delay (no amplification).
+        // ═══════════════════════════════════════════════════════════════════════
+        {
+            let our_voted = TIMEOUT_VOTED_HEIGHTS.get(&height).map(|v| *v).unwrap_or(0);
+            if timeout_round > our_voted && voter_id != self.node_id {
+                if crate::node::is_info() {
+                    println!("[INFO][TIMEOUT] jump_to_highest h={} our={} peer_round={} voter={}",
+                             height, our_voted, timeout_round, voter_id);
+                }
+                // Signal to main consensus loop: a higher round exists, re-vote
+                // We set the JUMP_TARGET so the next consensus iteration picks it up
+                // and broadcasts a vote at this round (with proper Dilithium signature)
+                TIMEOUT_JUMP_TARGET.entry(height)
+                    .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
+                    .or_insert(timeout_round);
+            }
+        }
+
         // Check if we have enough votes for proof
         if votes_count >= byzantine_threshold {
             self.generate_and_broadcast_timeout_proof(height, timeout_round, hash_arr);
@@ -21515,6 +21567,13 @@ impl SimplifiedP2P {
         });
     }
     
+    /// v13.0: Take jump-to-highest target for a given macroblock index.
+    /// Returns Some(target_round) if a peer voted for a higher round than us.
+    /// Atomically removes the entry (consume-once pattern).
+    pub fn take_timeout_jump_target(&self, mb_index: u64) -> Option<u64> {
+        TIMEOUT_JUMP_TARGET.remove(&mb_index).map(|(_, v)| v)
+    }
+
     /// Get current timeout proof if available
     pub fn get_timeout_certificate(&self, height: u64, timeout_round: u64) -> Option<TimeoutProof> {
         TIMEOUT_CERTIFICATES.get(&(height, timeout_round)).map(|v| v.clone())
