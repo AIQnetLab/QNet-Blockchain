@@ -16463,6 +16463,14 @@ impl BlockchainNode {
                                     // This prevents finalizing diverged chains → permanent deadlock
                                     ENTROPY_MISMATCH_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
                                     ENTROPY_MISMATCH_HEIGHT.store(next_block_height, std::sync::atomic::Ordering::SeqCst);
+                                    // v13.2: Record wall-clock time for auto-clear timeout
+                                    ENTROPY_MISMATCH_SET_TIME.store(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
 
                                     if is_my_turn_to_produce {
                                         // v3.33: Producer yields this rotation only — BFT Timeout handles failover.
@@ -16528,6 +16536,14 @@ impl BlockchainNode {
                                     // v10.0: Block finality advancement while entropy diverges
                                     ENTROPY_MISMATCH_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
                                     ENTROPY_MISMATCH_HEIGHT.store(next_block_height, std::sync::atomic::Ordering::SeqCst);
+                                    // v13.2: Record wall-clock time for auto-clear timeout
+                                    ENTROPY_MISMATCH_SET_TIME.store(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
 
                                     if is_my_turn_to_produce {
                                         // v3.33: Producer yields — majority disagrees with our entropy,
