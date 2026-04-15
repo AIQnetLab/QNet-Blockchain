@@ -685,6 +685,25 @@ impl BlockPipeline {
                 }
             }
 
+            // 4. Producer validation (LIVE mode only — sync mode skips)
+            // v13.2: CRITICAL — prevents double-production forks.
+            // During live operation, only accept blocks from the expected leader.
+            // During sync, skip (no cached expectation for historical blocks;
+            // hash chain continuity guarantees chain integrity).
+            if !snap.is_syncing() && mb.height > 0 {
+                if let Some((expected, expected_round)) = crate::node::get_expected_producer(mb.height) {
+                    if mb.producer != expected {
+                        if is_warn() {
+                            println!("[WARN][PIPELINE] wrong_producer h={} expected={} got={} round={}",
+                                     mb.height, expected, mb.producer, expected_round);
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                // No cache entry = first block at this height, accept (leader will cache next)
+            }
+
             // All checks passed — forward to apply stage
             let block_height = decoded.height; // Copy before move
             let verified = VerifiedBlock {
