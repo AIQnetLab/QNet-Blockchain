@@ -17992,7 +17992,19 @@ impl SimplifiedP2P {
     ///         Previous bug: sent to one peer, returned Ok(), peer didn't respond,
     ///         next call picked same peer again → deadlock
     pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), String> {
-        
+
+        // v13.1: Guard against inverted ranges at the source.
+        // Callers (sync_manager, fast_sync) may compute from > to when remaining = 0
+        // or target height is stale. Without this, the request goes on the wire and
+        // every peer logs inverted_request rejection in a tight loop.
+        if from_height > to_height {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] inverted_range from={} to={} skipped_at_source",
+                         from_height, to_height);
+            }
+            return Ok(());
+        }
+
         // v4.0: Also request timeout proofs for this range (BFT Timeout Protocol)
         // This ensures syncing nodes get all necessary data for producer validation
         self.request_timeout_proofs(from_height, to_height);

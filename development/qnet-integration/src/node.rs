@@ -410,7 +410,7 @@ static SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
 static FAST_SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
 /// v9.0: Progress-based sync timeout. Updated on each synced block.
 /// Deadlock = no progress for 120s (instead of fixed 300s cap).
-static LAST_SYNC_PROGRESS_TIME: AtomicU64 = AtomicU64::new(0);
+pub static LAST_SYNC_PROGRESS_TIME: AtomicU64 = AtomicU64::new(0);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.8: DETERMINISTIC TIMEOUT-BASED FAILOVER
@@ -15337,7 +15337,7 @@ impl BlockchainNode {
                                             Duration::from_secs(timeout_secs),
                                             p2p_clone.parallel_download_microblocks(
                                                 &storage_clone,
-                                                current_from.saturating_sub(1),
+                                                current_from,
                                                 target
                                             )
                                         ).await;

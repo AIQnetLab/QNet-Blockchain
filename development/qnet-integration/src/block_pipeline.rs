@@ -114,11 +114,22 @@ static FORK_RECOVERY_LAST_SIGNAL: AtomicU64 = AtomicU64::new(0);
 static HASH_CHAIN_BREAK_TRACKER: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, std::collections::HashSet<String>>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-/// Check and consume fork recovery signal
-/// Returns Some(fork_height) if recovery is needed
+/// Check and consume fork recovery signal.
+/// Returns Some(fork_height) if recovery is needed.
+/// v13.1: Also clears break_tracker to prevent re-triggering while recovery runs.
+/// Without this, new blocks at the same height re-fill the tracker and re-trigger
+/// fork_confirmed every cooldown window, spamming logs and wasting cycles.
 pub fn take_fork_recovery_signal() -> Option<u64> {
     let h = FORK_RECOVERY_HEIGHT.swap(0, Ordering::SeqCst);
-    if h > 0 { Some(h) } else { None }
+    if h > 0 {
+        // Clear ALL tracker entries — recovery will resync and entries are stale
+        if let Ok(mut tracker) = HASH_CHAIN_BREAK_TRACKER.lock() {
+            tracker.clear();
+        }
+        Some(h)
+    } else {
+        None
+    }
 }
 
 /// Clear stale entries from break tracker (called periodically)
@@ -508,7 +519,19 @@ impl BlockPipeline {
         metrics: Arc<PipelineMetrics>,
         _node_id: String,
     ) {
-        while let Some(decoded) = rx.recv().await {
+        // v13.1: Bounded deferred buffer for out-of-order blocks.
+        // When blocks arrive before their parent (normal during sync),
+        // they're stored here instead of being dropped. After each new block
+        // is verified, we drain deferred blocks whose parent has now arrived.
+        // Bounded to prevent OOM under load (thousands of Super nodes).
+        const DEFERRED_MAX: usize = 2000;
+        let mut deferred: HashMap<u64, DecodedBlock> = HashMap::new();
+
+        'outer: while let Some(decoded) = rx.recv().await {
+            // Process this block, then try to drain deferred chain
+            let mut to_process = vec![decoded];
+
+            while let Some(decoded) = to_process.pop() {
             let mb = &decoded.microblock;
 
             // 1. Hash chain continuity (except genesis)
@@ -520,13 +543,22 @@ impl BlockPipeline {
                         mb.previous_hash == prev_hash
                     }
                     Ok(None) => {
-                        // Previous block not yet available — defer, don't reject.
-                        // This is normal during sync when blocks arrive out of order.
-                        if is_info() {
-                            println!("[INFO][PIPELINE] block_deferred h={} reason=parent_missing need_h={}", mb.height, mb.height - 1);
+                        // Previous block not yet available — defer for retry.
+                        // When parent arrives, this block will be re-checked.
+                        if deferred.len() < DEFERRED_MAX {
+                            if is_debug() {
+                                println!("[DBG][PIPELINE] block_deferred h={} need_h={} buf={}",
+                                         mb.height, mb.height - 1, deferred.len());
+                            }
+                            deferred.insert(mb.height, decoded);
+                        } else {
+                            // Buffer full — drop oldest to make room
+                            if is_info() {
+                                println!("[INFO][PIPELINE] deferred_full h={} dropped (buf={})",
+                                         mb.height, DEFERRED_MAX);
+                            }
+                            metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                         }
-                        // Skip — sync manager will ensure ordering
-                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     Err(e) => {
@@ -654,8 +686,9 @@ impl BlockPipeline {
             }
 
             // All checks passed — forward to apply stage
+            let block_height = decoded.height; // Copy before move
             let verified = VerifiedBlock {
-                height: decoded.height,
+                height: block_height,
                 decompressed: decoded.decompressed,
                 microblock: decoded.microblock,
                 from_peer: decoded.from_peer,
@@ -663,7 +696,7 @@ impl BlockPipeline {
 
             metrics.verified.fetch_add(1, Ordering::Relaxed);
 
-            if decoded.height <= 5 || decoded.height % 100 == 0 {
+            if block_height <= 5 || block_height % 100 == 0 {
                 if is_info() {
                     println!("[INFO][PIPELINE] verified h={} prod={} txs={}",
                              verified.height, verified.microblock.producer,
@@ -672,7 +705,33 @@ impl BlockPipeline {
             }
 
             if let Err(_) = tx.send(verified).await {
-                break;
+                break 'outer;
+            }
+
+            // v13.1: Drain deferred chain — the block we just verified may unblock
+            // a sequence of deferred blocks: h+1 → h+2 → h+3 ...
+            // This turns O(N*M) retry into O(N) sequential drain.
+            let mut next = block_height + 1;
+            while let Some(def) = deferred.remove(&next) {
+                to_process.push(def);
+                next += 1;
+            }
+
+            } // end while let Some(decoded) = to_process.pop()
+
+            // Periodic deferred cleanup: evict entries older than 500 blocks behind tip
+            if deferred.len() > 100 {
+                let chain_h = storage.get_chain_height().unwrap_or(0);
+                if chain_h > 500 {
+                    let cutoff = chain_h - 500;
+                    let before = deferred.len();
+                    deferred.retain(|h, _| *h > cutoff);
+                    let evicted = before - deferred.len();
+                    if evicted > 0 && is_info() {
+                        println!("[INFO][PIPELINE] deferred_evict count={} cutoff={} remaining={}",
+                                 evicted, cutoff, deferred.len());
+                    }
+                }
             }
         }
     }
@@ -853,6 +912,38 @@ impl BlockPipeline {
 
             // ── Post-save updates (no state lock held) ──
             metrics.applied.fetch_add(1, Ordering::Relaxed);
+
+            // ── v13.1: Timeout tracking (was missing — root cause of fork divergence) ──
+            // Pipeline is the ONLY block processing path since v13.0.
+            // Without these updates, LAST_BLOCK_PRODUCED_TIME stays at genesis_ts,
+            // causing timeout_round to escalate forever → different rounds on each
+            // node → different leader selection → fork from block 5 onward.
+            {
+                let prev_tip = crate::node::LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
+                crate::node::LAST_BLOCK_PRODUCED_TIME.store(
+                    block.microblock.timestamp, Ordering::Relaxed,
+                );
+                crate::node::LAST_BLOCK_PRODUCED_HEIGHT.store(height, Ordering::Relaxed);
+
+                // Reset timeout_round ONLY on tip advance (next expected block).
+                // During sync (receiving blocks far behind tip), round stays intact
+                // so syncing nodes don't disrupt consensus of nodes at the tip.
+                let is_tip_advance = height == prev_tip + 1;
+                if is_tip_advance {
+                    crate::node::reset_timeout_round();
+                    if crate::node::is_debug() {
+                        println!("[DBG][PIPELINE] round_reset h={} prev_tip={}", height, prev_tip);
+                    }
+                } else if height > prev_tip + 1 && crate::node::is_debug() {
+                    println!("[DBG][PIPELINE] round_preserved h={} prev_tip={} reason=sync_or_skip",
+                             height, prev_tip);
+                }
+            }
+
+            // Update sync progress timestamp (deadlock detection)
+            crate::node::LAST_SYNC_PROGRESS_TIME.store(
+                crate::node::get_timestamp_safe(), Ordering::Relaxed,
+            );
 
             // Update RAM height
             {

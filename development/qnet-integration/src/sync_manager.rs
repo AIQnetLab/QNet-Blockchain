@@ -341,8 +341,11 @@ impl SyncManager {
         let mut consecutive_failures = 0u32;
 
         while current <= target && self.active.load(Ordering::Relaxed) {
-            // Adaptive wave size based on progress and failures
-            let wave_size = self.adaptive_wave_size(consecutive_failures, target - current);
+            // v13.1: remaining is inclusive (current..=target), so +1.
+            // Old bug: target - current = 0 when current == target → wave_size = 0
+            // → wave_end = current - 1 → inverted range → infinite retry loop.
+            let remaining = target - current + 1;
+            let wave_size = self.adaptive_wave_size(consecutive_failures, remaining);
             let wave_end = std::cmp::min(current + wave_size - 1, target);
 
             if is_debug() {
@@ -469,6 +472,7 @@ impl SyncManager {
     }
 
     /// Adaptive wave size: smaller on failures, larger on success.
+    /// v13.1: Always returns >= 1 to prevent inverted ranges.
     fn adaptive_wave_size(&self, failures: u32, remaining: u64) -> u64 {
         let base = if failures == 0 {
             self.config.max_wave_size
@@ -478,8 +482,8 @@ impl SyncManager {
             self.config.min_wave_size
         };
 
-        // Don't request more than remaining
-        std::cmp::min(base, remaining)
+        // Floor = 1: zero wave_size causes wave_end = current - 1 (inverted range)
+        std::cmp::max(1, std::cmp::min(base, remaining))
     }
 }
 
