@@ -83,6 +83,25 @@ pub struct MicroBlock {
     /// Validators MUST verify: computed_root == block.state_root
     #[serde(default)]
     pub state_root: [u8; 32],
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v14.0: TIMEOUT ROUND — Producer Authority Proof
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Records which timeout_round was used for leader selection when this block
+    // was produced. Enables any node to independently verify producer authority:
+    //   expected = candidates[ hash(seed, height, round, timeout_round) % N ]
+    //   assert(expected == block.producer)
+    //
+    // Without this field, nodes must rely on local timeout_round cache which
+    // diverges during network stalls — causing false-positive block rejections.
+    // With this field, verification is fully deterministic from on-chain state.
+    //
+    // Backward compatible: old blocks deserialize as timeout_round=0 (primary leader).
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Timeout round used for leader selection (0 = primary leader, >0 = failover)
+    #[serde(default)]
+    pub timeout_round: u64,
 }
 
 /// Macroblock structure - consensus blocks that finalize microblocks
@@ -407,10 +426,18 @@ pub struct EfficientMicroBlock {
     // ═══════════════════════════════════════════════════════════════════════════
     // v3.27: STATE ROOT
     // ═══════════════════════════════════════════════════════════════════════════
-    
+
     /// State Merkle root after applying all transactions and fees
     #[serde(default)]
     pub state_root: [u8; 32],
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v14.0: TIMEOUT ROUND — Producer Authority Proof
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Timeout round used for leader selection (0 = primary, >0 = failover)
+    #[serde(default)]
+    pub timeout_round: u64,
 }
 
 /// Light microblock header for mobile nodes
@@ -822,9 +849,11 @@ impl MicroBlock {
             fees_collected: 0,
             // v3.27: State root (computed after applying TX + fees)
             state_root: [0u8; 32],
+            // v14.0: Timeout round (default 0 = primary leader)
+            timeout_round: 0,
         }
     }
-    
+
     /// Calculate microblock hash
     pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha3_256::new();
@@ -915,9 +944,11 @@ impl EfficientMicroBlock {
             fees_collected: 0,
             // v3.27: state_root (computed after applying TX + fees)
             state_root: [0u8; 32],
+            // v14.0: Timeout round (default 0 = primary leader)
+            timeout_round: 0,
         }
     }
-    
+
     /// Create efficient microblock from full microblock (conversion for migration)
     pub fn from_microblock(microblock: &MicroBlock) -> Self {
         let transaction_hashes: Vec<[u8; 32]> = microblock.transactions
@@ -967,9 +998,11 @@ impl EfficientMicroBlock {
             fees_collected: microblock.fees_collected,
             // v3.27: Copy state_root from source microblock
             state_root: microblock.state_root,
+            // v14.0: Copy timeout_round from source microblock
+            timeout_round: microblock.timeout_round,
         }
     }
-    
+
     /// Calculate merkle root from transaction hashes
     fn calculate_merkle_root_from_hashes(transaction_hashes: &[[u8; 32]]) -> [u8; 32] {
         if transaction_hashes.is_empty() {

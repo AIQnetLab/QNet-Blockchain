@@ -66,10 +66,17 @@ fn create_test_microblock(height: u64, tx_count: usize) -> MicroBlock {
         height,
         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         transactions,
-        producer: format!("genesis_node_{:03}", (height % 5) + 1), // Real QNet producer format
-        signature: vec![0u8; 64],  // Dilithium signature size
-        previous_hash: [0u8; 32],  // SHA3-256 hash
-        merkle_root: [0u8; 32],    // Merkle root of transactions
+        producer: format!("genesis_node_{:03}", (height % 5) + 1),
+        signature: vec![0u8; 64],
+        previous_hash: [0u8; 32],
+        merkle_root: [0u8; 32],
+        poh_hash: vec![0u8; 64],
+        poh_count: 0,
+        vrf_output: None,
+        vrf_proof: None,
+        fees_collected: 0,
+        state_root: [0u8; 32],
+        timeout_round: 0,
     }
 }
 

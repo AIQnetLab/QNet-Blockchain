@@ -685,23 +685,39 @@ impl BlockPipeline {
                 }
             }
 
-            // 4. Producer validation (LIVE mode only — sync mode skips)
-            // v13.2: CRITICAL — prevents double-production forks.
-            // During live operation, only accept blocks from the expected leader.
-            // During sync, skip (no cached expectation for historical blocks;
-            // hash chain continuity guarantees chain integrity).
+            // 4. Producer authority monitoring — SOFT CHECK (never reject)
+            //
+            // v14.0: Enhanced with block's own timeout_round for precise diagnostics.
+            // Two categories of producer mismatch:
+            //   A. timeout_divergence: block.timeout_round != our cached timeout_round
+            //      → Normal during failover. Different timeout → different leader. INFO level.
+            //   B. same_round_mismatch: same timeout_round but different producer
+            //      → Suspicious (possible equivocation or cache corruption). WARN level.
+            //
+            // NEVER reject: hash chain + Dilithium signature + BFT finality guarantee validity.
+            // Rejecting based on local cache CAUSED the forks we're fixing (v13.3 evidence).
             if !snap.is_syncing() && mb.height > 0 {
                 if let Some((expected, expected_round)) = crate::node::get_expected_producer(mb.height) {
                     if mb.producer != expected {
-                        if is_warn() {
-                            println!("[WARN][PIPELINE] wrong_producer h={} expected={} got={} round={}",
-                                     mb.height, expected, mb.producer, expected_round);
+                        if mb.timeout_round != expected_round {
+                            // Category A: Timeout divergence — block produced at different timeout_round.
+                            // This is EXPECTED during network stalls/failover. Not suspicious.
+                            // Previously this caused forks via hard-reject (v13.2 evidence).
+                            if is_info() {
+                                println!("[INFO][PIPELINE] timeout_divergence h={} our_round={} block_round={} our_prod={} block_prod={}",
+                                         mb.height, expected_round, mb.timeout_round, expected, mb.producer);
+                            }
+                        } else {
+                            // Category B: Same round, different producer — genuinely suspicious.
+                            // Could indicate: equivocation, stale VRF snapshot, or candidate list divergence.
+                            // Log at WARN for investigation, but do NOT reject — BFT handles it.
+                            if is_warn() {
+                                println!("[WARN][PIPELINE] producer_mismatch h={} round={} expected={} got={} (same_round)",
+                                         mb.height, expected_round, expected, mb.producer);
+                            }
                         }
-                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                        continue;
                     }
                 }
-                // No cache entry = first block at this height, accept (leader will cache next)
             }
 
             // All checks passed — forward to apply stage

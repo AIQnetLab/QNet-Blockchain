@@ -13236,6 +13236,7 @@ impl BlockchainNode {
                                 vrf_proof: None,
                                 fees_collected: 0, // v3.18: Genesis block has no fees
                                 state_root: [0u8; 32], // v3.27: Will be set after TX application
+                                timeout_round: 0, // v14.0: Genesis has no timeout
                             };
                             
                             // ═══════════════════════════════════════════════════════════════════
@@ -14934,7 +14935,13 @@ impl BlockchainNode {
                         // ═══════════════════════════════════════════════════════════════════
                         if let Some(fork_h) = crate::block_pipeline::take_fork_recovery_signal() {
                             let local_h = *height.read().await;
-                            let rollback_to = fork_h.saturating_sub(1);
+                            // v13.2 FIX: When fork_h = local_h + 1 (most common case — fork at NEXT
+                            // block after our tip), our tip block IS the forked block. Must rollback
+                            // below BOTH fork_h and local_h. min() handles all cases:
+                            //   fork_h=2759, local_h=2758 → min=2758, rollback=2757 (delete tip)
+                            //   fork_h=100,  local_h=200  → min=100,  rollback=99   (delete 100-200)
+                            //   fork_h=2856, local_h=2855 → min=2855, rollback=2854 (delete tip)
+                            let rollback_to = std::cmp::min(fork_h, local_h).saturating_sub(1);
                             println!("[WARN][FORK] pipeline_detected fork_h={} local_h={} rollback_to={}",
                                      fork_h, local_h, rollback_to);
 
@@ -14944,8 +14951,10 @@ impl BlockchainNode {
                                     if !crate::storage::start_rollback_protection(rollback_to) {
                                         println!("[WARN][FORK] rollback_protection_busy");
                                     } else {
-                                        // Delete forked blocks from storage
-                                        for h in fork_h..=local_h {
+                                        // Delete ALL blocks from rollback_to+1 to local_h
+                                        // (includes our forked tip block)
+                                        let delete_from = rollback_to + 1;
+                                        for h in delete_from..=local_h {
                                             if let Err(e) = storage.delete_microblock(h) {
                                                 if is_warn() {
                                                     println!("[WARN][FORK] delete_fail h={} err={}", h, e);
@@ -18135,6 +18144,7 @@ impl BlockchainNode {
                         vrf_proof: qrb_proof,
                         fees_collected: block_fees_collected, // v3.18: Direct to producer
                         state_root: [0u8; 32], // v3.27: Will be set below after TX+fees application
+                        timeout_round: get_current_timeout_round(), // v14.0: Record for producer authority verification
                     };
                     
                     // ═══════════════════════════════════════════════════════════════════════════
