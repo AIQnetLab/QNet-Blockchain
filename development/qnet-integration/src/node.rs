@@ -2514,17 +2514,49 @@ impl BlockchainNode {
 
             // ── LEVEL 2: Carry-over from recent macroblock eligible sets ──
             // Nodes that were in eligible_producers within the last 3 macroblocks
-            // are carried over. This allows returning nodes to re-enter WITHOUT
-            // a new on-chain registration TX — they just need to have been active
-            // recently (within ~3 epochs ≈ 4.5 minutes).
+            // are carried over ONLY IF they also participated in at least one of
+            // those macroblocks' BFT rounds (signed commits on-chain).
             //
-            // This is deterministic: all nodes read the same macroblocks from storage.
+            // ═══════════════════════════════════════════════════════════════════
+            // v14.2: LIVENESS-GATED CARRYOVER
+            // ═══════════════════════════════════════════════════════════════════
+            // Previous behaviour: any node that appeared in any of the last 3 macroblock
+            // eligible_producers lists was re-added WITHOUT any activity check. A dead
+            // node would stay in carryover for 3 epochs, then get re-added if its last
+            // macroblock still listed it, and so on indefinitely — phantom accumulation.
+            //
+            // New rule: a node is carried over ONLY IF it has an on-chain commit in at
+            // least one of the last CARRYOVER_LOOKBACK macroblocks (consensus_data.commits
+            // HashMap). Commits are cryptographically signed → cannot be forged →
+            // a dead node cannot produce them → it auto-expires after the lookback window.
+            //
+            // Determinism: commits HashMaps are stored in the macroblocks on disk. All
+            // nodes read identical data → identical liveness filter output. No divergence.
+            //
+            // Scalability: O(peers × lookback) = O(1000 × 3) = 3000 HashMap reads per
+            // snapshot build. Negligible at snapshot creation (once per 90 blocks).
+            // ═══════════════════════════════════════════════════════════════════
             const CARRYOVER_LOOKBACK: u64 = 3;
             let carryover_start = macroblock_index.saturating_sub(CARRYOVER_LOOKBACK);
             let updated_existing_ids: std::collections::HashSet<String> = eligible.iter()
                 .map(|p| p.node_id.clone())
                 .collect();
+
+            // Build liveness set: union of committers across lookback macroblocks.
+            let mut live_committers: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for mb_idx in carryover_start..macroblock_index {
+                if mb_idx == 0 { continue; }
+                if let Ok(Some(mb_data)) = storage.get_macroblock_by_height(mb_idx) {
+                    if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
+                        for committer in mb.consensus_data.commits.keys() {
+                            live_committers.insert(committer.clone());
+                        }
+                    }
+                }
+            }
+
             let mut carryover_count = 0usize;
+            let mut carryover_excluded_dead = 0usize;
 
             for mb_idx in carryover_start..macroblock_index {
                 if mb_idx == 0 { continue; }
@@ -2533,16 +2565,23 @@ impl BlockchainNode {
                         if let Some(ref snapshot_data) = mb.consensus_data.eligible_producers {
                             if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
                                 for p in &producers {
-                                    if !updated_existing_ids.contains(&p.node_id) {
-                                        let reputation = reputation_map.get(&p.node_id).copied()
-                                            .unwrap_or(p.reputation);
-                                        if reputation >= MIN_REPUTATION {
-                                            eligible.push(qnet_state::EligibleProducer {
-                                                node_id: p.node_id.clone(),
-                                                reputation,
-                                            });
-                                            carryover_count += 1;
-                                        }
+                                    if updated_existing_ids.contains(&p.node_id) { continue; }
+                                    if eligible.iter().any(|e| e.node_id == p.node_id) { continue; }
+
+                                    // v14.2: LIVENESS GATE — must have committed in lookback window
+                                    if !live_committers.contains(&p.node_id) {
+                                        carryover_excluded_dead += 1;
+                                        continue;
+                                    }
+
+                                    let reputation = reputation_map.get(&p.node_id).copied()
+                                        .unwrap_or(p.reputation);
+                                    if reputation >= MIN_REPUTATION {
+                                        eligible.push(qnet_state::EligibleProducer {
+                                            node_id: p.node_id.clone(),
+                                            reputation,
+                                        });
+                                        carryover_count += 1;
                                     }
                                 }
                             }
@@ -2551,14 +2590,39 @@ impl BlockchainNode {
                 }
             }
 
-            if carryover_count > 0 {
-                println!("[INFO][SNAP] v9.3 L2_CARRYOVER: added {} from recent macroblocks ({}-{}) total={}",
-                         carryover_count, carryover_start, macroblock_index.saturating_sub(1), eligible.len());
+            if carryover_count > 0 || carryover_excluded_dead > 0 {
+                println!("[INFO][SNAP] v14.2 L2_CARRYOVER added={} excluded_dead={} live_committers={} mb_range={}-{} total={}",
+                         carryover_count, carryover_excluded_dead, live_committers.len(),
+                         carryover_start, macroblock_index.saturating_sub(1), eligible.len());
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v14.1: DEFENSIVE DEDUP — prevent duplicate node_ids in eligible set
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Upstream checks in Level 1 (line 2471) and Level 2 (line 2536) should
+        // already prevent duplicates, but defence-in-depth is cheap and critical:
+        // a single duplicate silently inflates BFT quorum and breaks liveness.
+        //
+        // We dedupe by node_id AFTER sort, keeping the FIRST occurrence (highest
+        // reputation after initial sort or L1/L2 addition order). Same complexity
+        // as the subsequent VRF sort — O(n log n) total.
+        //
+        // Determinism preserved: same input → same deduped output on every node.
+        // ═══════════════════════════════════════════════════════════════════════════
+        {
+            let pre_dedup = eligible.len();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(pre_dedup);
+            eligible.retain(|p| !p.node_id.is_empty() && seen.insert(p.node_id.clone()));
+            let removed = pre_dedup - eligible.len();
+            if removed > 0 {
+                println!("[WARN][SNAP] dedup mb={} removed={} pre={} post={} — duplicates detected (should never happen)",
+                         macroblock_index, removed, pre_dedup, eligible.len());
             }
         }
 
         eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-        
+
         // v3.37: VRF-based fair selection when exceeding MAX_VALIDATORS
         // Reputation-first ordering preserved; equal-reputation tiebreaker uses
         // deterministic VRF hash instead of alphabetical node_id — ensures every
@@ -15029,16 +15093,29 @@ impl BlockchainNode {
                                     };
                                     let height_gap = network_height.saturating_sub(microblock_height);
                                     
-                                    // v2.83: MUCH HIGHER threshold to prevent destructive rollbacks
-                                    // v9.0: Trigger rollback based on network size.
-                                    // Small networks need FAST detection (10 blocks) — a 50-block
-                                    // gap on a 5-node genesis net means the network is dead.
-                                    // Larger networks tolerate more because propagation is slower.
+                                    // ═══════════════════════════════════════════════════════════════════
+                                    // v14.2: DESTRUCTIVE ROLLBACK NOW REQUIRES STRONG FORK EVIDENCE
+                                    // ═══════════════════════════════════════════════════════════════════
+                                    // Previous thresholds (10/50/100 blocks) were too tight — a node that
+                                    // was 29 blocks behind got rolled back 91 blocks and then had to re-
+                                    // download 120 blocks. That's the OPPOSITE of recovery.
+                                    //
+                                    // New thresholds are wider. Combined with the sync-progress guard at
+                                    // line 15093 (`!sync_active`), a node that is actively catching up
+                                    // will NOT trigger force_resync even when gap is large — catch-up is
+                                    // the correct response when you just lag, not rollback.
+                                    //
+                                    // Force_resync remains for TRUE fork scenarios: node is healthy,
+                                    // not syncing, but its chain is provably different (hash mismatch).
+                                    // That path is covered by block_pipeline detecting fork_confirmed
+                                    // (signals via take_fork_recovery_signal), which goes through a
+                                    // different handler with hash evidence.
+                                    // ═══════════════════════════════════════════════════════════════════
                                     let network_size = p2p.get_active_full_super_nodes().len();
                                     let dynamic_threshold = match network_size {
-                                        0..=10 => 10,     // Genesis/small: fast detection
-                                        11..=100 => 50,   // Medium: moderate tolerance
-                                        _ => 100,         // Large: high latency tolerance
+                                        0..=10 => 120,    // Small net: tolerate ~2 minutes of catch-up
+                                        11..=100 => 200,  // Medium
+                                        _ => 400,         // Large: tolerate more for propagation
                                     };
 
                                     // v9.0: ADAPTIVE cooldown — escalates on repeated rollbacks.
@@ -15075,16 +15152,26 @@ impl BlockchainNode {
                                         println!("[INFO][FORK] force_resync local={} network={} nodes={}",
                                                  microblock_height, network_height, network_size);
                                         
-                                        // v3.30: Smart rollback — go to START of current macroblock cycle
-                                        // (position 0, before consensus window at blocks 61-90).
-                                        // Fixed 10-block rollback could land back inside the consensus
-                                        // window causing the same deadlock repeatedly.
+                                        // ═══════════════════════════════════════════════════════════════
+                                        // v14.2: BOUNDED ROLLBACK — do not remove more than we need to
+                                        // ═══════════════════════════════════════════════════════════════
+                                        // Previous formula always went back to (prev_macroblock_boundary)
+                                        // which was typically 90 blocks — regardless of actual gap. If we
+                                        // were only 29 blocks behind, that's 3× over-deletion and 120
+                                        // blocks to re-download instead of 29.
+                                        //
+                                        // New formula: rollback to just BELOW the fork boundary — the
+                                        // last macroblock boundary that's BEFORE the gap. This is still
+                                        // deterministic (anchored on macroblock boundaries) but minimally
+                                        // destructive. For small gaps on recently-synced chains it
+                                        // typically removes ≤ 90 blocks.
+                                        //
+                                        // Determinism: macroblock boundaries are at height multiples of 90.
+                                        // Every node reading the same microblock_height computes the same
+                                        // rollback_to — no divergence.
+                                        // ═══════════════════════════════════════════════════════════════
                                         let cycle_start = (microblock_height / 90) * 90;
-                                        let rollback_to = if cycle_start >= 90 {
-                                            cycle_start.saturating_sub(90)
-                                        } else {
-                                            0
-                                        };
+                                        let rollback_to = cycle_start; // Go to START of current epoch, not previous
                                         
                                         // v9.3: FINALITY CHECK — cannot rollback below finalized macroblock.
                                         // EXCEPTION: During fast sync, finality may be ahead of actual chain
@@ -16621,24 +16708,42 @@ impl BlockchainNode {
                             // If they don't, they cannot create valid blocks with correct PoH
                             // v2.96: Lock-free access with DashMap
                             let producer_is_synchronized = {
-                                // Check if current_producer returned entropy = 0 (not synchronized)
+                                // ═══════════════════════════════════════════════════════════════════
+                                // v14.2: SILENT PRODUCER = NOT SYNCED (safety over liveness)
+                                // ═══════════════════════════════════════════════════════════════════
+                                // OLD behaviour: None response → assume_synced=true.
+                                //   Consequence: a DEAD producer kept its leader slot forever because
+                                //   non-response was interpreted as "maybe OK, other nodes will reject
+                                //   invalid blocks". But if no block comes at all, nothing gets rejected,
+                                //   and failover never fires. Network deadlocks.
+                                //
+                                // NEW behaviour: None response → NOT synced → fallback_select picks next.
+                                //   Safety: hash chain + Dilithium signatures still guarantee no invalid
+                                //   block is accepted. Worst case of incorrect skip = we produce with a
+                                //   different valid leader one rotation early — BFT tolerates.
+                                //
+                                // This mirrors top-tier L1 liveness design: view-change must NOT depend
+                                // on the silent leader answering questions about itself.
+                                // ═══════════════════════════════════════════════════════════════════
                                 let producer_entropy = ENTROPY_RESPONSES.get(&(entropy_height, current_producer.clone()));
                                 match producer_entropy {
                                     Some(ref entry) if *entry.value() == [0u8; 32] => {
-                                        // Producer returned 0 = NOT synchronized (doesn't have entropy block)
-                                        eprintln!("[ERR][PROD] not_synced producer={} entropy_h={}", current_producer, entropy_height);
+                                        // Producer explicitly returned 0 = NOT synchronized
+                                        eprintln!("[ERR][PROD] not_synced producer={} entropy_h={} reason=zero_entropy",
+                                                  current_producer, entropy_height);
                                         false
                                     }
                                     Some(_) => {
-                                        // Producer returned valid entropy = synchronized
+                                        // Producer returned valid entropy hash = synchronized
                                         true
                                     }
                                     None => {
-                                        // No response from producer - could be network issue or lagging
-                                        // Be conservative: assume synchronized if no response (Byzantine resilience)
-                                        // Other nodes will reject invalid blocks anyway
-                                        if is_info() { println!("[INFO][PROD] no_entropy_response producer={} assuming_synced", current_producer); }
-                                        true
+                                        // v14.2: Silence is treated as unsynced (safe default for liveness).
+                                        if is_warn() {
+                                            println!("[WARN][PROD] no_entropy_response producer={} entropy_h={} treating_as=not_synced",
+                                                     current_producer, entropy_height);
+                                        }
+                                        false
                                     }
                                 }
                             };
@@ -22013,27 +22118,72 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             // CRITICAL FIX v2.31: Even unsynchronized nodes MUST receive macroblocks!
                             // Without macroblocks, node cannot do producer selection when it catches up
                             // This prevents the "cascade desync" problem where missing one MB leads to missing all
+                            // ═══════════════════════════════════════════════════════════════════
+                            // v14.2: MB-SYNC LOOP PREVENTION
+                            // ═══════════════════════════════════════════════════════════════════
+                            // Previous code spawned a fresh 45s-delayed task on EVERY iteration of
+                            // the consensus window (runs every ~1s per block). After 45s, dozens of
+                            // tasks fired simultaneously, each hitting peers for the SAME mb_idx.
+                            // When the MB was already saved (common case), they all returned
+                            // `already_saved skip_save` — wasted CPU + network.
+                            //
+                            // Fix applies 3 guards:
+                            //   1. Storage pre-check: if MB is already saved, don't spawn at all.
+                            //   2. Pending-sync deduplication: if a sync is already in-flight, skip.
+                            //   3. Inside spawn, re-check storage after the 45s delay (another task
+                            //      may have saved it in the meantime).
+                            // ═══════════════════════════════════════════════════════════════════
                             if let Some(ref p2p_sync) = p2p {
-                                let p2p_for_sync = p2p_sync.clone();
-                                let mb_idx = macroblock_index;
-                                
-                                tokio::spawn(async move {
-                                    // Wait for consensus to complete on other nodes
-                                    tokio::time::sleep(Duration::from_secs(45)).await;
-                                    
-                                    println!("[INFO][SYNC] mb_request_unsynced mb={}", mb_idx);
-                                    
-                                    // Request with retries
-                                    for attempt in 1..=3 {
-                                        if let Err(e) = p2p_for_sync.sync_macroblocks(mb_idx, mb_idx).await {
-                                            println!("[WARN][SYNC] mb_request_failed attempt={}/3 mb={} err={}", attempt, mb_idx, e);
-                                            tokio::time::sleep(Duration::from_secs(5)).await;
-                                        } else {
-                                            println!("[INFO][SYNC] mb_request_sent mb={}", mb_idx);
-                                            break;
+                                // Guard 1: storage pre-check (O(1) hash index lookup).
+                                let already_saved = storage.get_macroblock_by_height(macroblock_index)
+                                    .map(|mb| mb.is_some())
+                                    .unwrap_or(false);
+
+                                // Guard 2: pending-sync deduplication.
+                                // insert_pending returns false if already present → skip spawn.
+                                let insert_pending = crate::unified_p2p::mark_macroblock_pending_sync(macroblock_index);
+
+                                if !already_saved && insert_pending {
+                                    let p2p_for_sync = p2p_sync.clone();
+                                    let storage_for_sync = storage.clone();
+                                    let mb_idx = macroblock_index;
+
+                                    tokio::spawn(async move {
+                                        // Wait for consensus to complete on other nodes
+                                        tokio::time::sleep(Duration::from_secs(45)).await;
+
+                                        // Guard 3: re-check storage after delay — another task may
+                                        // have saved the MB during the wait.
+                                        if let Ok(Some(_)) = storage_for_sync.get_macroblock_by_height(mb_idx) {
+                                            crate::unified_p2p::clear_macroblock_pending_sync(mb_idx);
+                                            if crate::node::is_debug() {
+                                                println!("[DBG][SYNC] mb_request_skipped_already_saved mb={}", mb_idx);
+                                            }
+                                            return;
                                         }
-                                    }
-                                });
+
+                                        println!("[INFO][SYNC] mb_request_unsynced mb={}", mb_idx);
+
+                                        // Request with retries
+                                        for attempt in 1..=3 {
+                                            // Re-check before each retry (we may have received via broadcast)
+                                            if let Ok(Some(_)) = storage_for_sync.get_macroblock_by_height(mb_idx) {
+                                                break;
+                                            }
+                                            if let Err(e) = p2p_for_sync.sync_macroblocks(mb_idx, mb_idx).await {
+                                                println!("[WARN][SYNC] mb_request_failed attempt={}/3 mb={} err={}", attempt, mb_idx, e);
+                                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                            } else {
+                                                println!("[INFO][SYNC] mb_request_sent mb={}", mb_idx);
+                                                break;
+                                            }
+                                        }
+                                        crate::unified_p2p::clear_macroblock_pending_sync(mb_idx);
+                                    });
+                                } else if crate::node::is_debug() {
+                                    println!("[DBG][SYNC] mb_request_dedup mb={} already_saved={} pending_existing={}",
+                                             macroblock_index, already_saved, !insert_pending);
+                                }
                             }
                             
                             // v2.48 FIX: Do NOT update last_consensus_round here!

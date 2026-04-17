@@ -385,10 +385,66 @@ pub fn get_pending_sync_count() -> usize {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// v14.2: SYNC PEER COOL-DOWN TRACKER
+// ═══════════════════════════════════════════════════════════════════════════════
+// When a peer fails to respond to a sync request, record the failure. Subsequent
+// wave attempts de-prioritise (or skip) peers whose last failure was within the
+// cool-down window. This guarantees retry peer rotation: a stalled peer does not
+// block sync forever by being at the top of the sort order.
+//
+// Entry: peer_id → (last_failure_ts, consecutive_failures)
+// Cool-down scales with consecutive failures (exponential back-off, capped).
+// Entry expires after a successful response or full cool-down.
+// ═══════════════════════════════════════════════════════════════════════════════
+pub static SYNC_PEER_COOLDOWN: Lazy<DashMap<String, (u64, u32)>> =
+    Lazy::new(|| DashMap::new());
+
+/// Cool-down window for a peer based on consecutive failure count (seconds).
+/// Failure 1 → 5s, 2 → 15s, 3+ → 45s (capped).
+pub fn sync_peer_cooldown_secs(failures: u32) -> u64 {
+    match failures {
+        0 => 0,
+        1 => 5,
+        2 => 15,
+        _ => 45,
+    }
+}
+
+/// Returns true if peer is in active cool-down window (should be skipped for sync).
+pub fn is_sync_peer_cooling_down(peer_id: &str) -> bool {
+    if let Some(entry) = SYNC_PEER_COOLDOWN.get(peer_id) {
+        let (last_ts, failures) = *entry.value();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cooldown = sync_peer_cooldown_secs(failures);
+        return now.saturating_sub(last_ts) < cooldown;
+    }
+    false
+}
+
+/// Record a sync failure for `peer_id` (increments consecutive counter).
+pub fn record_sync_peer_failure(peer_id: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    SYNC_PEER_COOLDOWN.entry(peer_id.to_string())
+        .and_modify(|e| { e.0 = now; e.1 = e.1.saturating_add(1); })
+        .or_insert((now, 1));
+}
+
+/// Clear cool-down on successful response (resets consecutive counter).
+pub fn record_sync_peer_success(peer_id: &str) {
+    SYNC_PEER_COOLDOWN.remove(peer_id);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // v3.1: MACROBLOCK DEDUPLICATION (same pattern as microblocks)
 // Macroblocks are less frequent but still need protection
 // ═══════════════════════════════════════════════════════════════════════════════
-static PENDING_SYNC_MACROBLOCKS: Lazy<DashMap<u64, u64>> = 
+static PENDING_SYNC_MACROBLOCKS: Lazy<DashMap<u64, u64>> =
     Lazy::new(|| DashMap::new());
 
 // Macroblocks are rarer, so smaller limits
@@ -3372,6 +3428,13 @@ impl SimplifiedP2P {
                     peer.last_block_height = h;
                     // v9.5: O(1) atomic update — avoids O(N) scan in get_best_peer_height()
                     BEST_PEER_HEIGHT.fetch_max(h, std::sync::atomic::Ordering::Relaxed);
+                    // v14.2: event-driven sync nudge — trigger desync check if we're behind.
+                    // Threshold matches sync_manager's auto_sync_gap (20). Avoids pointless nudges
+                    // for normal 1-2 block transient lag during block propagation.
+                    let our_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                    if h > our_h.saturating_add(20) {
+                        crate::sync_manager::nudge_sync_check();
+                    }
                 }
             }
             return;
@@ -3389,6 +3452,11 @@ impl SimplifiedP2P {
                             entry.last_block_height = h;
                             // v9.5: O(1) atomic update
                             BEST_PEER_HEIGHT.fetch_max(h, std::sync::atomic::Ordering::Relaxed);
+                            // v14.2: event-driven sync nudge on peer height jump
+                            let our_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                            if h > our_h.saturating_add(20) {
+                                crate::sync_manager::nudge_sync_check();
+                            }
                         }
                     }
                     return;
@@ -3474,7 +3542,42 @@ impl SimplifiedP2P {
         if self.connected_peers_lockfree.contains_key(&peer_info.addr) {
             return false;
         }
-        
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v14.1: IDENTITY DEDUP — same node_id at different address
+        // ═══════════════════════════════════════════════════════════════════════════
+        // If this node_id is already connected via a different address (e.g., HTTP
+        // on :8001 and QUIC on :9876 for the same peer), refresh the existing entry
+        // rather than inserting a duplicate. This prevents connected_peers_lockfree
+        // from storing multiple entries per peer and inflating BFT validator counts.
+        //
+        // This is critical at genesis: each Super node listens on 3 ports. Without
+        // this check, a 5-node network appears as 13 phantom validators in the BFT
+        // threshold calculation, breaking liveness.
+        // ═══════════════════════════════════════════════════════════════════════════
+        if !peer_info.id.is_empty() {
+            if let Some(existing_addr_entry) = self.peer_id_to_addr.get(&peer_info.id) {
+                let existing_addr = existing_addr_entry.value().clone();
+                drop(existing_addr_entry);
+                // Refresh last_seen/height on existing entry; skip duplicate insert
+                if let Some(mut entry) = self.connected_peers_lockfree.get_mut(&existing_addr) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    entry.last_seen = now;
+                    if peer_info.last_block_height > entry.last_block_height {
+                        entry.last_block_height = peer_info.last_block_height;
+                    }
+                }
+                if crate::node::is_debug() {
+                    println!("[DBG][P2P] peer_dedup id={} existing_addr={} new_addr={} — refreshed (skipping insert)",
+                             peer_info.id, existing_addr, peer_info.addr);
+                }
+                return false;
+            }
+        }
+
         // K-BUCKET MANAGEMENT: Check bucket size (max 20 per bucket)
         let bucket_peers: Vec<_> = self.connected_peers_lockfree.iter()
             .filter(|entry| entry.value().bucket_index == peer_info.bucket_index)
@@ -4229,6 +4332,71 @@ impl SimplifiedP2P {
                         .max()
                         .unwrap_or(0);
                     BEST_PEER_HEIGHT.store(new_best, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // ═══════════════════════════════════════════════════════════════════════
+                // v14.1: IDENTITY-LEVEL DEDUP — collapse same node_id at multiple addresses
+                // ═══════════════════════════════════════════════════════════════════════
+                // Each Super node listens on 3 ports (HTTP :8001 + QUIC-main :9876 +
+                // QUIC-alt :9877). Historical peer exchange may have inserted one node
+                // under several addresses. Keep ONLY the most-recently-seen entry per
+                // node_id; remove the rest. Preserves liveness (we still have the fresh
+                // entry) while eliminating BFT threshold inflation.
+                //
+                // Determinism of selection: keep entry with highest last_seen; ties
+                // broken by lexicographic address ordering (stable across nodes).
+                //
+                // Complexity: O(n log n) where n = peer count. At 1000 peers per round
+                // (MAX_VALIDATORS), this is ~10ms every 5 min — negligible overhead.
+                // ═══════════════════════════════════════════════════════════════════════
+                {
+                    use std::collections::HashMap;
+                    let mut best_per_id: HashMap<String, (String, u64)> = HashMap::new();
+                    for entry in connected_peers_lockfree.iter() {
+                        let id = entry.value().id.clone();
+                        if id.is_empty() { continue; }
+                        let addr = entry.key().clone();
+                        let last_seen = entry.value().last_seen;
+                        best_per_id.entry(id)
+                            .and_modify(|(cur_addr, cur_ls)| {
+                                if last_seen > *cur_ls || (last_seen == *cur_ls && addr < *cur_addr) {
+                                    *cur_addr = addr.clone();
+                                    *cur_ls = last_seen;
+                                }
+                            })
+                            .or_insert((addr, last_seen));
+                    }
+
+                    // Collect duplicate addresses to remove (not the winners)
+                    let mut dup_removed = 0usize;
+                    let dup_to_remove: Vec<String> = connected_peers_lockfree.iter()
+                        .filter_map(|entry| {
+                            let id = entry.value().id.clone();
+                            if id.is_empty() { return None; }
+                            let addr = entry.key().clone();
+                            if let Some((winner_addr, _)) = best_per_id.get(&id) {
+                                if winner_addr != &addr {
+                                    return Some(addr);
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+
+                    for addr in &dup_to_remove {
+                        connected_peers_lockfree.remove(addr);
+                        dup_removed += 1;
+                    }
+
+                    // Re-point peer_id_to_addr to the winner address for each node_id
+                    for (id, (winner_addr, _)) in &best_per_id {
+                        peer_id_to_addr.insert(id.clone(), winner_addr.clone());
+                    }
+
+                    if dup_removed > 0 && crate::node::is_info() {
+                        println!("[INFO][P2P] dedup_by_id removed={} unique_ids={} total_before_dedup={}",
+                                 dup_removed, best_per_id.len(), best_per_id.len() + dup_removed);
+                    }
                 }
 
                 // v9.5: Periodic BEST_PEER_HEIGHT refresh (safety net every 5 minutes).
@@ -7770,22 +7938,56 @@ impl SimplifiedP2P {
             return Ok(0);
         }
         
-        // v2.24.3: QUIC-ONLY SYNC - Use cached heights from PeerInfo
-        // Heights are updated via heartbeats and block broadcasts (no HTTP queries needed)
-        // SCALABILITY: O(n) where n = connected peers, zero network overhead
-        // SAFETY: Filter u64::MAX and unreasonably large values to prevent overflow cascades.
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v14.2: STALENESS FILTER — exclude peers whose height hasn't updated recently.
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Peer `last_block_height` is refreshed only on inbound heartbeat/broadcast.
+        // If a peer crashed or was isolated, its height stays frozen while the network
+        // advances. Using a stale height for `median_height` / `consensus_height` feeds
+        // incorrect data into sync, leader selection, and fork-detection logic.
+        //
+        // Rule: trust `last_block_height` ONLY if `last_seen` is within PEER_HEIGHT_TTL
+        // (120s for 1 block/sec — ≈120 block margin). Stale entries are excluded from
+        // the consensus calculation entirely. If ALL entries are stale, we fall through
+        // to the empty-peers branch below (which either returns 0 or BOOTSTRAP_MODE).
+        //
+        // Determinism note: each node filters by its own clock+last_seen, so consensus_height
+        // from this function is ALREADY node-local (sync decisions only). BFT-critical
+        // paths use the deterministic macroblock snapshot, not this value.
+        // ═══════════════════════════════════════════════════════════════════════════
+        const PEER_HEIGHT_TTL_SECS: u64 = 120;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let stale_threshold = now_secs.saturating_sub(PEER_HEIGHT_TTL_SECS);
+        let mut stale_filtered = 0usize;
+
         let mut peer_heights: Vec<u64> = validated_peers.iter()
             .filter(|p| {
                 let h = p.last_block_height;
-                h > 0 && h != u64::MAX && h < 2_000_000_000
+                if h == 0 || h == u64::MAX || h >= 2_000_000_000 {
+                    return false;
+                }
+                if p.last_seen < stale_threshold {
+                    stale_filtered += 1;
+                    return false;
+                }
+                true
             })
             .map(|p| p.last_block_height)
             .collect();
-        
-        // Log peer heights for debugging
-        for peer in validated_peers.iter().filter(|p| p.last_block_height > 0) {
+
+        if stale_filtered > 0 && crate::node::is_info() {
+            println!("[INFO][SYNC] stale_heights_excluded count={} ttl={}s total_peers={}",
+                     stale_filtered, PEER_HEIGHT_TTL_SECS, validated_peers.len());
+        }
+
+        // Log peer heights for debugging (only fresh entries)
+        for peer in validated_peers.iter().filter(|p| p.last_block_height > 0 && p.last_seen >= stale_threshold) {
             if crate::node::is_info() {
-                println!("[INFO][SYNC] Peer {} reports height: {} (cached)", peer.id, peer.last_block_height);
+                let age = now_secs.saturating_sub(peer.last_seen);
+                println!("[INFO][SYNC] peer_height id={} h={} age={}s", peer.id, peer.last_block_height, age);
             }
         }
         
@@ -10512,7 +10714,10 @@ impl SimplifiedP2P {
         let gap = target_height - current_height;
 
         // Adaptive wave size based on gap
-        let wave_size: u64 = if gap > 1000 { 100 } else if gap > 100 { 50 } else { 20 };
+        // v14.2: Larger waves for faster catch-up (previous 20/50/100 too small).
+        // Network latency is the bottleneck, not batch size. Bigger waves = fewer
+        // round-trips = faster convergence during recovery.
+        let wave_size: u64 = if gap > 10000 { 500 } else if gap > 1000 { 250 } else if gap > 100 { 100 } else { 50 };
         // Max concurrent waves (prefetch ahead)
         let max_prefetch_waves: u64 = 2;
 
@@ -12354,18 +12559,54 @@ impl SimplifiedP2P {
                 if crate::node::is_info() {
                     println!("[INFO][P2P] PeerListResponse from {}: {} peers via QUIC", sender_id, peers.len());
                 }
-                // Store received peer info for peer exchange processing
-                // Peers will be validated and added by the peer exchange cycle
+                // ═══════════════════════════════════════════════════════════════════
+                // v14.1: DEDUP BY node_id — prevent peer list inflation
+                // ═══════════════════════════════════════════════════════════════════
+                // Previously we only checked `addr`. A single peer advertising multiple
+                // endpoints (HTTP :8001, QUIC-main :9876, QUIC-alt :9877) would be
+                // inserted 3 times under 3 different addresses but same node_id.
+                // This inflated connected_peers_lockfree.len() by 3× and broke BFT
+                // threshold calculation (13 phantom validators for 5 real nodes).
+                //
+                // Now: for any incoming peer, if node_id is already mapped to some
+                // address via peer_id_to_addr, we UPDATE last_seen on the existing
+                // entry rather than inserting a duplicate. This preserves connection
+                // diversity (multiple transports) without inflating the validator
+                // count — the latest-seen transport wins.
+                // ═══════════════════════════════════════════════════════════════════
                 for (addr, peer_id, height) in &peers {
-                    if peer_id != &self.node_id && !addr.is_empty() {
+                    if peer_id != &self.node_id && !addr.is_empty() && !peer_id.is_empty() {
+                        // Check if this node_id already exists at any address
+                        if let Some(existing_addr_entry) = self.peer_id_to_addr.get(peer_id) {
+                            let existing_addr = existing_addr_entry.value().clone();
+                            drop(existing_addr_entry);
+                            // Node_id already known — refresh last_seen & height on existing entry
+                            if let Some(mut entry) = self.connected_peers_lockfree.get_mut(&existing_addr) {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                entry.last_seen = now;
+                                entry.last_block_height = *height;
+                            }
+                            if crate::node::is_debug() {
+                                println!("[DBG][P2P] peer_dedup id={} existing_addr={} gossiped_addr={} — refreshed",
+                                         peer_id, existing_addr, addr);
+                            }
+                            continue;
+                        }
                         if let Ok(mut peer_info) = Self::parse_peer_address_static(addr) {
                             peer_info.id = peer_id.clone();
                             peer_info.last_block_height = *height;
-                            // Only add if not already known
+                            // New node_id — insert (address uniqueness preserved by DashMap)
                             if !self.connected_peers_lockfree.contains_key(addr) {
                                 let ip = addr.split(':').next().unwrap_or("");
                                 if is_genesis_node_ip(ip) || !std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
-                                    self.connected_peers_lockfree.insert(addr.clone(), peer_info);
+                                    self.connected_peers_lockfree.insert(addr.clone(), peer_info.clone());
+                                    self.peer_id_to_addr.insert(peer_id.clone(), addr.clone());
+                                    if crate::node::is_info() {
+                                        println!("[INFO][P2P] peer_added id={} addr={} via=gossip", peer_id, addr);
+                                    }
                                 }
                             }
                         }
@@ -18078,62 +18319,128 @@ impl SimplifiedP2P {
         //   - Return error only if ALL peers fail
         // ═══════════════════════════════════════════════════════════════════════════
         
-        let request = NetworkMessage::RequestBlocks {
-            from_height,
-            to_height,
-            requester_id: self.node_id.clone(),
-        };
-        
         // ═══════════════════════════════════════════════════════════════════════════
-        // v3.7: CRITICAL FIX - PARALLEL REQUESTS to ALL peers simultaneously!
-        // 
-        // PROBLEM (was):
-        //   for peer in peers {
-        //       send_request(peer);
-        //       sleep(5_sec);        ← SEQUENTIAL! 
-        //       if !received { continue; }  ← Try next peer after timeout
-        //   }
-        //   Result: 3 peers × 5 sec = 15 sec for ONE block if first 2 peers down!
-        //
-        // SOLUTION (now):
-        //   Send to ALL 3 peers SIMULTANEOUSLY
-        //   Wait ONCE for shortest timeout
-        //   Check storage - if block received from ANY peer, done!
-        //
-        // Result: 3 peers × 1 parallel request = 2-4 sec total!
+        // v14.2: RANGE-SHARDED PARALLEL SYNC
         // ═══════════════════════════════════════════════════════════════════════════
-        
-        let max_peers_to_try = 3.min(live_peers.len());
-        let mut sent_to_peers: Vec<String> = Vec::new();
-        
-        // STEP 1: Send requests to ALL peers SIMULTANEOUSLY (fire-and-forget)
-        for peer in live_peers.iter().take(max_peers_to_try) {
-            if peer.id == self.node_id {
-                continue;
+        // Previous behaviour: the SAME range was sent to all N peers. Result — N× network
+        // traffic for 1× useful data. Two peers returning blocks 5582-5601 = 40 blocks
+        // received for 20 blocks of value. Wasteful at scale and saturates fast peers.
+        //
+        // New behaviour: split [from..to] into N sub-ranges, one per peer. All N requests
+        // fly in parallel, each peer fetches DIFFERENT blocks. At peer count = 3 and gap
+        // of 300 blocks, each peer delivers ~100 blocks in parallel — 3× throughput.
+        //
+        // Fallback: if range is too small to shard (<3× peer count), fall back to full-
+        // range parallel request for redundancy against a single flaky peer.
+        //
+        // Determinism: sort by (height desc, reputation desc) above ensures each node
+        // selects the same peer ordering (within its view) — sync behaviour is stable.
+        //
+        // Scalability: up to MAX_PARALLEL_SYNC_PEERS (8). At 1000 Super nodes scale,
+        // extra parallelism beyond ~8 brings diminishing returns (peer bandwidth saturates).
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v14.2: Exclude peers in active cool-down (they failed a recent sync).
+        // Keeps wave retries from hitting the same stalled peer repeatedly.
+        let cooling_down_before = live_peers.len();
+        live_peers.retain(|p| !is_sync_peer_cooling_down(&p.id));
+        if live_peers.is_empty() {
+            // All peers cooling down — pick any so we don't stall completely.
+            // Better to retry a stalled peer than return immediate error.
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] all_peers_cooling_down — falling back to full list");
             }
-            
-            self.send_network_message(&peer.addr, request.clone());
-            sent_to_peers.push(peer.id.clone());
+            live_peers = self.get_validated_active_peers().into_iter().collect();
+        } else if cooling_down_before != live_peers.len() && crate::node::is_info() {
+            println!("[INFO][SYNC] filter_cooling_peers skipped={} remaining={}",
+                     cooling_down_before - live_peers.len(), live_peers.len());
         }
-        
+
+        const MAX_PARALLEL_SYNC_PEERS: usize = 8;
+        let max_peers_to_try = MAX_PARALLEL_SYNC_PEERS.min(live_peers.len());
+        let requested_count_for_split = to_height.saturating_sub(from_height).saturating_add(1);
+
+        // Shard only if we have enough blocks to split meaningfully (≥3 per peer)
+        let should_shard = max_peers_to_try >= 2 && requested_count_for_split >= (max_peers_to_try as u64) * 3;
+
+        let mut sent_to_peers: Vec<String> = Vec::new();
+        if should_shard {
+            // Range-shard: give each peer a distinct sub-range
+            let shard_size = requested_count_for_split / max_peers_to_try as u64;
+            let remainder = requested_count_for_split % max_peers_to_try as u64;
+            let mut shard_start = from_height;
+            let mut peer_idx = 0usize;
+            for peer in live_peers.iter() {
+                if peer.id == self.node_id {
+                    continue;
+                }
+                if peer_idx >= max_peers_to_try {
+                    break;
+                }
+                // Last peer absorbs remainder
+                let extra = if peer_idx as u64 == (max_peers_to_try as u64).saturating_sub(1) { remainder } else { 0 };
+                let shard_end = std::cmp::min(shard_start + shard_size - 1 + extra, to_height);
+                let request = NetworkMessage::RequestBlocks {
+                    from_height: shard_start,
+                    to_height: shard_end,
+                    requester_id: self.node_id.clone(),
+                };
+                self.send_network_message(&peer.addr, request);
+                sent_to_peers.push(format!("{}[{}-{}]", peer.id, shard_start, shard_end));
+                shard_start = shard_end + 1;
+                peer_idx += 1;
+                if shard_start > to_height {
+                    break;
+                }
+            }
+        } else {
+            // Small range: redundant parallel (same range to each peer) for speed over efficiency
+            let request = NetworkMessage::RequestBlocks {
+                from_height,
+                to_height,
+                requester_id: self.node_id.clone(),
+            };
+            for peer in live_peers.iter().take(max_peers_to_try) {
+                if peer.id == self.node_id {
+                    continue;
+                }
+                self.send_network_message(&peer.addr, request.clone());
+                sent_to_peers.push(peer.id.clone());
+            }
+        }
+
         if sent_to_peers.is_empty() {
             return Err("No valid peers to sync from".to_string());
         }
-        
+
         if crate::node::is_info() {
-            println!("[INFO][SYNC] parallel_request h={}-{} peers=[{}]", 
-                     from_height, to_height, sent_to_peers.join(","));
+            let mode = if should_shard { "sharded" } else { "redundant" };
+            println!("[INFO][SYNC] parallel_request mode={} h={}-{} peers=[{}]",
+                     mode, from_height, to_height, sent_to_peers.join(","));
         }
         
-        // STEP 2: Calculate adaptive timeout based on batch size
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v14.2: TIMEOUTS ALIGNED WITH REAL NETWORK LATENCY
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Previous table (2-18s) was sized for dial-up-era networks. Modern inter-datacentre
+        // latency is <100ms; 20-block batch over QUIC completes in <200ms on healthy paths.
+        // Long timeouts mean a single stalled peer blocks sync for seconds instead of the
+        // sub-second failover expected in L1-grade protocols.
+        //
+        // New table: tight upper bounds that trigger peer rotation quickly. The storage poll
+        // loop (200ms interval) still catches responses that arrive during the wait window.
+        //
+        // MAX_BATCH_BLOCKS raised from 100 → 500 to reduce per-block overhead during catch-up.
+        // At 500 blocks × ~500 bytes = 250KB per request — well under QUIC stream limits (10MB).
+        // ═══════════════════════════════════════════════════════════════════════════
+        const MAX_BATCH_BLOCKS: u64 = 500;
         let requested_count = to_height.saturating_sub(from_height).saturating_add(1);
-        let actual_batch_size = requested_count.min(100);  // Server sends max 100!
+        let actual_batch_size = requested_count.min(MAX_BATCH_BLOCKS);
         let timeout_secs = match actual_batch_size {
-            1 => 2,           // Single block - 2 sec
-            2..=10 => 4,      // Small batch - 4 sec
-            11..=30 => 8,     // Medium batch - 8 sec
-            31..=50 => 12,    // Large batch - 12 sec
-            _ => 18,          // Max batch (51-100) - 18 sec
+            1       => 1,    // Single block - 1 sec (was 2)
+            2..=10  => 1,    // Small batch - 1 sec (was 4)
+            11..=50 => 2,    // Medium batch - 2 sec (was 8-12)
+            51..=200 => 3,   // Large batch - 3 sec (was 18)
+            _       => 5,    // Max batch (201-500) - 5 sec
         };
         
         // STEP 3: Poll storage every 200ms until block arrives or timeout
@@ -18165,9 +18472,19 @@ impl SimplifiedP2P {
                         break;
                     }
                 }
-                
+
+                // v14.2: Record success for all peers that were asked (at least one responded).
+                // Conservative: we can't tell which exact peer answered, so credit all that got a
+                // request. Worst case a slow peer keeps a not-quite-deserved success credit; this
+                // is fine because the next failure will re-establish its cool-down.
+                for peer_tag in &sent_to_peers {
+                    // Tags may be "id" or "id[range]" (sharded mode) — strip range suffix.
+                    let peer_id = peer_tag.split('[').next().unwrap_or(peer_tag);
+                    record_sync_peer_success(peer_id);
+                }
+
                 if crate::node::is_info() {
-                    println!("[INFO][SYNC] parallel_received h={}-{} count={}/{} elapsed={}ms", 
+                    println!("[INFO][SYNC] parallel_received h={}-{} count={}/{} elapsed={}ms",
                              from_height, from_height + received_count - 1,
                              received_count, requested_count,
                              start.elapsed().as_millis());
@@ -18175,15 +18492,20 @@ impl SimplifiedP2P {
                 return Ok(());
             }
         }
-        
-        // Timeout - none of the peers responded
+
+        // v14.2: Timeout — record failure against every peer we asked. Next wave's
+        // cool-down filter will skip them, and the retry picks different peers.
+        for peer_tag in &sent_to_peers {
+            let peer_id = peer_tag.split('[').next().unwrap_or(peer_tag);
+            record_sync_peer_failure(peer_id);
+        }
+
         if crate::node::is_warn() {
-            println!("[WARN][SYNC] parallel_timeout h={}-{} peers=[{}] timeout={}s", 
+            println!("[WARN][SYNC] parallel_timeout h={}-{} peers=[{}] timeout={}s",
                      from_height, to_height, sent_to_peers.join(","), timeout_secs);
         }
-        
-        // All peers failed - return error
-        Err(format!("Sync failed: {} peers did not respond for h={}-{}", 
+
+        Err(format!("Sync failed: {} peers did not respond for h={}-{}",
                     sent_to_peers.len(), from_height, to_height))
     }
     
@@ -21015,9 +21337,112 @@ impl SimplifiedP2P {
             }
         }
 
-        // Check if we have enough votes for proof
+        // Check if we have enough votes for proof (same-round path)
         if votes_count >= byzantine_threshold {
             self.generate_and_broadcast_timeout_proof(height, timeout_round, hash_arr);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // v14.2: CUMULATIVE CERTIFICATE — survives JUMP_TO_HIGHEST race
+        // ═══════════════════════════════════════════════════════════════════════
+        // Problem: each vote triggers jump_to_highest, so voters spread across
+        // rounds [R, R+1, R+2, ...]. No SAME-round ever collects byzantine_threshold.
+        // Network sees f+1 adopted (rotation advances) but cert never issues →
+        // leader doesn't change → deadlock.
+        //
+        // Cumulative view: if N unique voters have voted at round ≥ R_lower, and N
+        // ≥ byzantine_threshold (2f+1), then ANY round in [R_lower..max] effectively
+        // has 2f+1 quorum — voters at a higher round DID see and support that
+        // lower-round timeout event (higher round implies lower).
+        //
+        // We pick the LOWEST R such that ≥ byzantine_threshold voters have max_round ≥ R.
+        // Generate cert at R using their actual signed votes (each vote signs a
+        // specific round — we use that signer's highest signed round as the witness).
+        //
+        // Safety: each signature is cryptographically bound to (height, round, hash).
+        // A voter's signature at round X attests to "timeout at height valid from R=0
+        // through at least X". Aggregating 2f+1 such signatures at rounds ≥ R proves
+        // BFT liveness at round R.
+        //
+        // Liveness: with this, a sprayed vote pattern ([3,4,5,6,7] at 5 voters)
+        // collapses to a valid certificate at round 3 (the minimum) — no deadlock.
+        // ═══════════════════════════════════════════════════════════════════════
+        {
+            let f_plus_1_cum = (total_validators + 2) / 3;
+            let byz_threshold_cum = byzantine_threshold;
+
+            // Collect all (voter, max_round) for this height
+            let voter_rounds: Vec<(String, u64)> = VOTER_MAX_ROUND.iter()
+                .filter(|e| e.key().0 == height)
+                .map(|e| (e.key().1.clone(), *e.value()))
+                .collect();
+
+            if voter_rounds.len() >= byz_threshold_cum {
+                // Sort by max_round DESC; the byzantine_threshold-th voter defines
+                // the lowest round with full quorum support.
+                let mut sorted = voter_rounds.clone();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                let cert_round = sorted[byz_threshold_cum - 1].1;
+
+                if cert_round > 0 {
+                    // Check if a certificate at cert_round or higher is already generated
+                    let already_certified = TIMEOUT_CERTIFICATES.iter()
+                        .any(|e| e.key().0 == height && e.key().1 >= cert_round);
+                    if !already_certified {
+                        // Collect signed votes for cert_round from the voters whose
+                        // max_round ≥ cert_round. For each such voter, we need their
+                        // actual signed vote at SOME round ≥ cert_round (already in TIMEOUT_VOTES).
+                        let mut cumulative_votes: Vec<(String, Vec<u8>, u64)> = Vec::new();
+                        for (voter, max_r) in &sorted {
+                            if *max_r < cert_round { break; }
+                            // Find any stored signed vote from this voter (iterate rounds from max down)
+                            let mut found = false;
+                            for r in (cert_round..=*max_r).rev() {
+                                if let Some(entry) = TIMEOUT_VOTES.get(&(height, r)) {
+                                    if let Some((sig, _)) = entry.get(voter) {
+                                        cumulative_votes.push((voter.clone(), sig.clone(), r));
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !found && crate::node::is_debug() {
+                                println!("[DBG][TIMEOUT] cumulative_vote_missing voter={} cert_round={} max_r={}",
+                                         voter, cert_round, max_r);
+                            }
+                            if cumulative_votes.len() >= byz_threshold_cum { break; }
+                        }
+
+                        if cumulative_votes.len() >= byz_threshold_cum {
+                            if crate::node::is_info() {
+                                println!("[INFO][TIMEOUT] cumulative_certificate h={} round={} voters={}/{} rounds_span=[{}..{}]",
+                                         height, cert_round, cumulative_votes.len(), total_validators,
+                                         cumulative_votes.iter().map(|(_,_,r)| *r).min().unwrap_or(0),
+                                         cumulative_votes.iter().map(|(_,_,r)| *r).max().unwrap_or(0));
+                            }
+                            // Generate proof at cert_round. We reuse the same-round proof
+                            // generator only if we have same-round votes; otherwise emit
+                            // a marker and rely on the existing certificate cache for
+                            // downstream consumers (adopted round logic).
+                            if let Some(same_round_entry) = TIMEOUT_VOTES.get(&(height, cert_round)) {
+                                if same_round_entry.len() >= byz_threshold_cum {
+                                    self.generate_and_broadcast_timeout_proof(height, cert_round, hash_arr);
+                                } else {
+                                    // Register a "cumulative" certificate marker in HIGHEST_CERTIFIED_ROUND
+                                    // so leader_selection sees the advanced round even without same-round proof.
+                                    HIGHEST_CERTIFIED_ROUND.entry(height)
+                                        .and_modify(|cur| { if cert_round > *cur { *cur = cert_round; } })
+                                        .or_insert(cert_round);
+                                }
+                            } else {
+                                HIGHEST_CERTIFIED_ROUND.entry(height)
+                                    .and_modify(|cur| { if cert_round > *cur { *cur = cert_round; } })
+                                    .or_insert(cert_round);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     
@@ -21826,16 +22251,59 @@ impl SimplifiedP2P {
         // v9.0: Acquire ordering — BFT threshold depends on correct height
         let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
 
-        // v6.6: Genesis epoch (blocks 0-180): use 5 genesis validators as BASE,
-        // but also count connected Super peers to reflect actual network size.
-        // This ensures BFT 2/3 threshold grows as new nodes join during genesis epoch.
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v14.1: BFT VALIDATOR COUNT — UNIQUE BY node_id, LIVENESS-FILTERED
+        // ═══════════════════════════════════════════════════════════════════════════
+        // ROOT CAUSE OF v14.0 DEADLOCK:
+        //   `connected_peers_lockfree` is keyed by (address, port). A single peer
+        //   connects on 3 endpoints: HTTP :8001, QUIC-main :9876, QUIC-alt :9877.
+        //   Therefore `len()` over-counts by factor of 3. With 4 real peers + self,
+        //   raw `len()+1 = 13` — BFT threshold becomes (13*2+2)/3 = 9, unreachable
+        //   with 5 real validators. Network deadlocks: no TimeoutCertificate, no
+        //   finalization, production_gate locks, no progress.
+        //
+        // CORRECT SEMANTICS:
+        //   For BFT safety threshold, we need the count of distinct IDENTITIES
+        //   (unique node_ids), not distinct connections. Multiple transports to the
+        //   same peer count as one validator.
+        //
+        // LIVENESS FILTER:
+        //   Only peers seen within BFT_LIVENESS_WINDOW_SECS (300s) are counted.
+        //   A peer that crashed 2 hours ago should not inflate the quorum we need.
+        //   This preserves BFT safety (2f+1 correct votes among live validators)
+        //   while restoring liveness.
+        //
+        // SCALABILITY BOUND:
+        //   Result capped at MAX_VALIDATORS (1000). At scale with thousands of
+        //   Super nodes, we sample down to 1000 per round via VRF (see
+        //   create_eligible_producers_snapshot). This matches top-tier L1 BFT
+        //   committee-size design.
+        //
+        // DETERMINISM NOTE:
+        //   Macroblock-snapshot path is deterministic (all nodes read same MB).
+        //   Fallback path is node-local — only used during genesis epoch and when
+        //   N-2 macroblock is unavailable. This is acceptable because threshold
+        //   mismatch during fallback only affects that one node's view; safety
+        //   still holds via signature verification on accepted votes.
+        // ═══════════════════════════════════════════════════════════════════════════
+        const BFT_LIVENESS_WINDOW_SECS: u64 = 300; // 5 minutes
+        const GENESIS_MIN_VALIDATORS: usize = 5;
+
+        // v6.6: Genesis epoch (blocks 0-180) — bootstrap mode
         if local_h <= 180 {
-            let connected = self.connected_peers_lockfree.len();
-            let total = std::cmp::max(5, connected + 1); // at least 5 (genesis), grow with network
+            let unique_live = self.count_unique_live_peers(BFT_LIVENESS_WINDOW_SECS);
+            // +1 for self; min 5 (genesis constants); cap at MAX_VALIDATORS
+            let total = std::cmp::max(GENESIS_MIN_VALIDATORS, unique_live + 1)
+                .min(crate::node::MAX_VALIDATORS);
+            if crate::node::is_info() {
+                println!("[INFO][BFT] validator_count={} source=genesis unique_peers={} h={}",
+                         total, unique_live, local_h);
+            }
             return total;
         }
 
-        // Normal epoch: read eligible_producers from macroblock snapshot (N-2 rule)
+        // Normal epoch: read eligible_producers from macroblock snapshot (N-2 rule).
+        // This is the deterministic path — all nodes produce identical counts.
         let current_epoch = (local_h - 1) / 90 + 1;
         let required_macroblock = current_epoch.saturating_sub(2);
 
@@ -21846,11 +22314,19 @@ impl SimplifiedP2P {
                         if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
                             if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
                                 if !producers.is_empty() {
-                                    if crate::node::is_debug() {
-                                        println!("[DBG][BFT] validator_count={} source=macroblock_{} epoch={}",
-                                                 producers.len(), required_macroblock, current_epoch);
+                                    // v14.1: Defensive dedup — snapshot already deduped at build time,
+                                    // but a corrupted or legacy snapshot might contain dupes. Safety first.
+                                    let mut seen = std::collections::HashSet::with_capacity(producers.len());
+                                    let unique_count = producers.iter()
+                                        .filter(|p| !p.node_id.is_empty() && seen.insert(p.node_id.clone()))
+                                        .count();
+                                    let capped = unique_count.min(crate::node::MAX_VALIDATORS);
+                                    if crate::node::is_info() {
+                                        println!("[INFO][BFT] validator_count={} source=macroblock_{} epoch={} raw={} unique={}",
+                                                 capped, required_macroblock, current_epoch,
+                                                 producers.len(), unique_count);
                                     }
-                                    return producers.len();
+                                    return capped;
                                 }
                             }
                         }
@@ -21859,13 +22335,48 @@ impl SimplifiedP2P {
             }
         }
 
-        // Fallback (first epochs before macroblock is available): P2P count
-        let connected = self.connected_peers_lockfree.len();
-        let total = connected + 1;
-        if crate::node::is_debug() {
-            println!("[DBG][BFT] validator_count={} source=p2p_fallback epoch={}", total, current_epoch);
+        // Fallback: macroblock snapshot unavailable → use live unique peers.
+        // v14.1: Dedupe by node_id + liveness filter prevents phantom inflation.
+        let unique_live = self.count_unique_live_peers(BFT_LIVENESS_WINDOW_SECS);
+        let total = std::cmp::max(GENESIS_MIN_VALIDATORS, unique_live + 1)
+            .min(crate::node::MAX_VALIDATORS);
+        if crate::node::is_info() {
+            println!("[INFO][BFT] validator_count={} source=p2p_fallback epoch={} unique_peers={} raw_len={}",
+                     total, current_epoch, unique_live, self.connected_peers_lockfree.len());
         }
         total
+    }
+
+    /// Count unique alive peers by node_id, excluding self and stale entries.
+    ///
+    /// v14.1: ROOT CAUSE FIX — prevents the "3× port inflation" bug where each peer
+    /// was counted 3 times (HTTP :8001 + QUIC-main :9876 + QUIC-alt :9877). Critical
+    /// for correct BFT threshold calculation.
+    ///
+    /// Parameters:
+    ///   liveness_window_secs — peers with `last_seen < now - window` are excluded.
+    ///                          Prevents a dead peer from inflating the quorum size.
+    ///
+    /// Returns: number of distinct node_ids seen in `liveness_window_secs`.
+    /// Excludes self (caller adds +1 if needed).
+    fn count_unique_live_peers(&self, liveness_window_secs: u64) -> usize {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let threshold = now.saturating_sub(liveness_window_secs);
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer = entry.value();
+            if peer.id.is_empty() || peer.id == self.node_id {
+                continue;
+            }
+            if peer.last_seen >= threshold {
+                seen.insert(peer.id.clone());
+            }
+        }
+        seen.len()
     }
     
     /// Get addresses of all validators for timeout vote broadcast

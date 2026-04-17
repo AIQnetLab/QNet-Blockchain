@@ -38,6 +38,33 @@ use crate::consensus_state::{CoordinatorHandle, ConsensusEvent};
 use crate::block_pipeline::PipelineIngest;
 use crate::node::{is_info, is_warn, is_debug};
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// v14.2: EVENT-DRIVEN SYNC NUDGE
+// ═══════════════════════════════════════════════════════════════════════════════
+// Global flag set by P2P layer when it observes a peer reporting a height
+// significantly above the local chain tip. Sync manager reads this flag at a fast
+// sub-second interval and triggers desync check immediately (instead of waiting
+// up to 30s for the periodic tick).
+//
+// Used in addition to the periodic tick for two reasons:
+// 1. Liveness: new block arrival triggers sync check within ~1s instead of 30s.
+// 2. Stability: periodic tick remains as a safety net if nudge is missed.
+//
+// Contention: single u64 atomic flag — zero lock overhead at millions of events/s.
+// ═══════════════════════════════════════════════════════════════════════════════
+pub static SYNC_EVENT_NUDGE: AtomicBool = AtomicBool::new(false);
+
+/// Called by P2P layer when a peer announces height > local_height + threshold.
+/// Triggers sync_manager to run desync check at next fast-tick (<1s).
+pub fn nudge_sync_check() {
+    SYNC_EVENT_NUDGE.store(true, Ordering::Relaxed);
+}
+
+/// Consume the nudge flag (returns true if set, then clears it).
+fn take_sync_nudge() -> bool {
+    SYNC_EVENT_NUDGE.swap(false, Ordering::Relaxed)
+}
+
 // ============================================================================
 // SYNC CONFIG
 // ============================================================================
@@ -63,10 +90,13 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            min_wave_size: 20,
-            max_wave_size: 100,
-            request_timeout: Duration::from_secs(10),
-            wave_delay: Duration::from_millis(100),
+            // v14.2: Scaled for L1-grade catch-up. Previous 20/100 blocks was sized for
+            // low-bandwidth era; modern QUIC links carry 250 blocks in <1s. 10s request
+            // timeout reduced to 3s — stalled peers should rotate quickly, not block sync.
+            min_wave_size: 50,
+            max_wave_size: 500,
+            request_timeout: Duration::from_secs(3),
+            wave_delay: Duration::from_millis(50),
             max_retries: 5,
             auto_sync_gap: 20,
             min_peers_for_sync: 2,
@@ -185,8 +215,18 @@ impl SyncManager {
             println!("[INFO][SYNC] manager_started");
         }
 
-        // Periodic check for desync
-        let mut check_interval = tokio::time::interval(Duration::from_secs(30));
+        // ═══════════════════════════════════════════════════════════════════════
+        // v14.2: EVENT-DRIVEN + PERIODIC CHECK
+        // ═══════════════════════════════════════════════════════════════════════
+        // fast_tick (500ms) → reacts to SYNC_EVENT_NUDGE from P2P almost immediately.
+        // slow_tick (15s)   → safety-net periodic check in case nudges are lost.
+        //
+        // Previous single 30s interval meant up to 30s delay between a peer announcing
+        // a higher block and sync starting to pull it — unacceptable for top-tier L1
+        // latency expectations.
+        // ═══════════════════════════════════════════════════════════════════════
+        let mut fast_tick = tokio::time::interval(Duration::from_millis(500));
+        let mut slow_tick = tokio::time::interval(Duration::from_secs(15));
 
         loop {
             tokio::select! {
@@ -209,8 +249,17 @@ impl SyncManager {
                         }
                     }
                 }
-                _ = check_interval.tick() => {
-                    // Periodic desync check
+                _ = fast_tick.tick() => {
+                    // v14.2: event-driven reaction to peer-height nudges from P2P
+                    if take_sync_nudge() && !self.active.load(Ordering::Relaxed) {
+                        if is_info() {
+                            println!("[INFO][SYNC] nudge_triggered — fast-path desync check");
+                        }
+                        self.check_desync().await;
+                    }
+                }
+                _ = slow_tick.tick() => {
+                    // Safety-net periodic check (in case a nudge was missed)
                     if !self.active.load(Ordering::Relaxed) {
                         self.check_desync().await;
                     }
