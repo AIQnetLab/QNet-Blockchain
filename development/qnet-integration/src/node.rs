@@ -16707,38 +16707,47 @@ impl BlockchainNode {
                             // ARCHITECTURE: A producer MUST have blocks up to (current_height - FINALITY_WINDOW)
                             // If they don't, they cannot create valid blocks with correct PoH
                             // v2.96: Lock-free access with DashMap
-                            let producer_is_synchronized = {
+                            let producer_is_synchronized = if current_producer == node_id {
                                 // ═══════════════════════════════════════════════════════════════════
-                                // v14.2: SILENT PRODUCER = NOT SYNCED (safety over liveness)
+                                // v14.3: SELF-TRUST FOR OWN LOCAL STATE
                                 // ═══════════════════════════════════════════════════════════════════
-                                // OLD behaviour: None response → assume_synced=true.
-                                //   Consequence: a DEAD producer kept its leader slot forever because
-                                //   non-response was interpreted as "maybe OK, other nodes will reject
-                                //   invalid blocks". But if no block comes at all, nothing gets rejected,
-                                //   and failover never fires. Network deadlocks.
+                                // ENTROPY_RESPONSES is populated ONLY from peer replies — a node never
+                                // queries itself. When we are the current_producer, our `our_entropy`
+                                // was already computed from local RocksDB at line 16210, so an ENTRY
+                                // for (entropy_height, self.node_id) is ALWAYS None by construction.
                                 //
-                                // NEW behaviour: None response → NOT synced → fallback_select picks next.
-                                //   Safety: hash chain + Dilithium signatures still guarantee no invalid
-                                //   block is accepted. Worst case of incorrect skip = we produce with a
-                                //   different valid leader one rotation early — BFT tolerates.
+                                // v14.2 Fix C applied "None => false" uniformly, which caused self to
+                                // exclude itself at every rotation boundary (h=31, 61, 91, …) — a
+                                // regression that deadlocked fresh networks at h=30.
                                 //
-                                // This mirrors top-tier L1 liveness design: view-change must NOT depend
-                                // on the silent leader answering questions about itself.
+                                // Self-production safety is enforced by SECONDARY checks elsewhere:
+                                //   1. has_prev_block (line ~15988) — no prev block => skip produce
+                                //   2. coordinator_is_synchronized (line ~15935) — sync in progress
+                                //      => skip produce
+                                //   3. Peers validate produced block via hash chain + Dilithium sig +
+                                //      state_root — invalid block is rejected by BFT majority.
+                                //
+                                // Pattern matches top-tier BFT: "trust local data for own actions,
+                                // verify remote via cryptographic proof."
+                                // ═══════════════════════════════════════════════════════════════════
+                                true
+                            } else {
+                                // ═══════════════════════════════════════════════════════════════════
+                                // v14.2: SILENT REMOTE PRODUCER = NOT SYNCED (safety over liveness)
+                                // ═══════════════════════════════════════════════════════════════════
+                                // For REMOTE producer: None response → unsynced → fallback_select.
+                                // Prevents deadlock where a dead remote producer keeps its leader slot
+                                // forever because non-response used to mean "assume synced".
                                 // ═══════════════════════════════════════════════════════════════════
                                 let producer_entropy = ENTROPY_RESPONSES.get(&(entropy_height, current_producer.clone()));
                                 match producer_entropy {
                                     Some(ref entry) if *entry.value() == [0u8; 32] => {
-                                        // Producer explicitly returned 0 = NOT synchronized
                                         eprintln!("[ERR][PROD] not_synced producer={} entropy_h={} reason=zero_entropy",
                                                   current_producer, entropy_height);
                                         false
                                     }
-                                    Some(_) => {
-                                        // Producer returned valid entropy hash = synchronized
-                                        true
-                                    }
+                                    Some(_) => true,
                                     None => {
-                                        // v14.2: Silence is treated as unsynced (safe default for liveness).
                                         if is_warn() {
                                             println!("[WARN][PROD] no_entropy_response producer={} entropy_h={} treating_as=not_synced",
                                                      current_producer, entropy_height);
