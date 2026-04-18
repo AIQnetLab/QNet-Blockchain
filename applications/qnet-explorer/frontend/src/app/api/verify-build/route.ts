@@ -11,10 +11,9 @@ import { createHash, randomBytes } from 'crypto';
 // (VERIFY_BUILD_ALLOWED_ORIGINS, comma-separated).
 // ---------------------------------------------------------------------------
 const DEFAULT_ALLOWED_ORIGINS = [
-  'https://qnet.network',
-  'https://www.qnet.network',
-  'https://explorer.qnet.network',
-  'https://testnet.qnet.network',
+  'https://aiqnet.io',
+  'https://www.aiqnet.io',
+  'https://explorer.aiqnet.io',
 ];
 
 function resolveAllowedOrigin(request: NextRequest): string | null {
