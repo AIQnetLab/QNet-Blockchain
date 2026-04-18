@@ -3,13 +3,13 @@ seeds = false
 skip-lint = false
 
 [programs.localnet]
-onedev_burn_contract = "D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7"
+onedev_burn_contract = "CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw"
 
 [programs.devnet]
-onedev_burn_contract = "D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7"
+onedev_burn_contract = "CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw"
 
 [programs.mainnet]
-onedev_burn_contract = "D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7"
+onedev_burn_contract = "CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw"
 
 [registry]
 url = "https://api.apr.dev"
