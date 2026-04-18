@@ -16701,196 +16701,68 @@ impl BlockchainNode {
                                 println!("[WARN][CONS] no_responses h={} phase=genesis", next_block_height);
                             }
                             
-                            // CRITICAL FIX: Check if selected producer is synchronized
-                            // If producer returned entropy=0, they don't have the entropy block → NOT synchronized
-                            // This prevents selecting a lagging node as producer (e.g., node stuck at height 1)
-                            // ARCHITECTURE: A producer MUST have blocks up to (current_height - FINALITY_WINDOW)
-                            // If they don't, they cannot create valid blocks with correct PoH
-                            // v2.96: Lock-free access with DashMap
-                            let producer_is_synchronized = if current_producer == node_id {
-                                // ═══════════════════════════════════════════════════════════════════
-                                // v14.3: SELF-TRUST FOR OWN LOCAL STATE
-                                // ═══════════════════════════════════════════════════════════════════
-                                // ENTROPY_RESPONSES is populated ONLY from peer replies — a node never
-                                // queries itself. When we are the current_producer, our `our_entropy`
-                                // was already computed from local RocksDB at line 16210, so an ENTRY
-                                // for (entropy_height, self.node_id) is ALWAYS None by construction.
-                                //
-                                // v14.2 Fix C applied "None => false" uniformly, which caused self to
-                                // exclude itself at every rotation boundary (h=31, 61, 91, …) — a
-                                // regression that deadlocked fresh networks at h=30.
-                                //
-                                // Self-production safety is enforced by SECONDARY checks elsewhere:
-                                //   1. has_prev_block (line ~15988) — no prev block => skip produce
-                                //   2. coordinator_is_synchronized (line ~15935) — sync in progress
-                                //      => skip produce
-                                //   3. Peers validate produced block via hash chain + Dilithium sig +
-                                //      state_root — invalid block is rejected by BFT majority.
-                                //
-                                // Pattern matches top-tier BFT: "trust local data for own actions,
-                                // verify remote via cryptographic proof."
-                                // ═══════════════════════════════════════════════════════════════════
-                                true
-                            } else {
-                                // ═══════════════════════════════════════════════════════════════════
-                                // v14.2: SILENT REMOTE PRODUCER = NOT SYNCED (safety over liveness)
-                                // ═══════════════════════════════════════════════════════════════════
-                                // For REMOTE producer: None response → unsynced → fallback_select.
-                                // Prevents deadlock where a dead remote producer keeps its leader slot
-                                // forever because non-response used to mean "assume synced".
-                                // ═══════════════════════════════════════════════════════════════════
+                            // ═══════════════════════════════════════════════════════════════════════════
+                            // v14.4: REMOVED LOCAL FALLBACK — TRUST BFT TIMEOUT PROTOCOL v4.0
+                            // ═══════════════════════════════════════════════════════════════════════════
+                            // Prior versions contained a local "producer sync check" followed by an
+                            // unconditional `fallback_select → fallback_selected_self` path that produced
+                            // blocks WITHOUT any 2f+1 BFT vote. Root cause of the h=301 / h=302 split-brain:
+                            //
+                            //   1. Validator sends entropy request to peers (including designated leader).
+                            //   2. Validator's bft_wait succeeds at 60% of non-leader peers (~200ms).
+                            //   3. Designated leader is STILL inside its own bft_wait + production (~220ms).
+                            //   4. Leader hasn't answered the validator's entropy query yet.
+                            //   5. Fix C (v14.2) interpreted that silence as "not synced".
+                            //   6. Fallback_select re-hashed locally → picked another candidate → self.
+                            //   7. Two producers emit h=N in parallel → different prev_hash chains.
+                            //
+                            // This duplicate-check + local fallback has THREE architectural problems:
+                            //   A. No 2f+1 vote — one node unilaterally promotes itself.
+                            //   B. Triggered by timing, not by proof of liveness failure.
+                            //   C. Bypasses the properly implemented BFT Timeout Vote path at line ~14778
+                            //      (`certified_timeout_round = p2p.get_highest_certified_timeout_round()`),
+                            //      which already provides deterministic failover backed by Dilithium-signed
+                            //      votes from ≥ 2f+1 validators and an explicit TimeoutCertificate.
+                            //
+                            // The existing L1-grade path is sufficient:
+                            //   • bft_wait (≥ 60%) proves entropy consensus among peers.
+                            //   • A genuinely silent / dead leader fails to produce a block for the slot.
+                            //   • Validators broadcast signed TimeoutVote (unified_p2p.rs:11227).
+                            //   • 2f+1 votes → TimeoutCertificate (unified_p2p.rs:21341).
+                            //   • HIGHEST_CERTIFIED_ROUND advances → next select_microblock_producer_with_round
+                            //     call deterministically picks a new producer across ALL nodes.
+                            //   • Equivocation attempts are logged and slashed (node.rs:2228,
+                            //     unified_p2p.rs:21257).
+                            //
+                            // SAFETY / LIVENESS TRADE-OFF:
+                            //   • SAFETY — no node produces unless it is the deterministically selected
+                            //     leader (primary at round 0 OR certified-failover leader at round > 0).
+                            //   • LIVENESS — bounded: a stuck leader is replaced within one timeout
+                            //     interval once 2f+1 timeout votes gather, exactly as in top-tier BFT
+                            //     protocol designs.
+                            //   • SCALABILITY — unchanged; BFT Timeout Protocol already supports up to
+                            //     MAX_VALIDATORS (1000) producers per round.
+                            //   • DETERMINISM — every node consumes the same certified round and the same
+                            //     candidate list from the N-2 macroblock snapshot; no divergence possible.
+                            //
+                            // The only action taken here now is observational: when `bft_wait` returned
+                            // a zero-entropy response from the designated producer, we log it (so that
+                            // operators can correlate with timeout votes). Production of blocks is NOT
+                            // altered on that signal alone. The timeout vote handler in unified_p2p.rs
+                            // is the single source of truth for producer change.
+                            // ═══════════════════════════════════════════════════════════════════════════
+                            if current_producer != node_id {
                                 let producer_entropy = ENTROPY_RESPONSES.get(&(entropy_height, current_producer.clone()));
-                                match producer_entropy {
-                                    Some(ref entry) if *entry.value() == [0u8; 32] => {
-                                        eprintln!("[ERR][PROD] not_synced producer={} entropy_h={} reason=zero_entropy",
-                                                  current_producer, entropy_height);
-                                        false
-                                    }
-                                    Some(_) => true,
-                                    None => {
-                                        if is_warn() {
-                                            println!("[WARN][PROD] no_entropy_response producer={} entropy_h={} treating_as=not_synced",
-                                                     current_producer, entropy_height);
-                                        }
-                                        false
+                                if let Some(ref entry) = producer_entropy {
+                                    if *entry.value() == [0u8; 32] && is_warn() {
+                                        // Zero-entropy is an explicit "I don't have that block" reply.
+                                        // Log only; BFT Timeout Vote path will handle the view change.
+                                        println!("[WARN][PROD] observed_zero_entropy producer={} entropy_h={} action=awaiting_bft_timeout_cert",
+                                                 current_producer, entropy_height);
                                     }
                                 }
-                            };
-                            
-                            // If producer is NOT synchronized, select next candidate
-                            if !producer_is_synchronized {
-                                if is_info() { println!("[INFO][PROD] fallback_select reason=not_synced producer={}", current_producer); }
-                                
-                                // ═══════════════════════════════════════════════════════════════════
-                                // SCALABLE FIX: Use DETERMINISTIC candidates from macroblock snapshot
-                                // ═══════════════════════════════════════════════════════════════════
-                                // OLD (BROKEN for >5 nodes): Used ENTROPY_RESPONSES (non-deterministic sampling)
-                                //   Each node samples different 100/1000 peers → different ENTROPY_RESPONSES
-                                //   → different synchronized_candidates → different SHA3-512 → NO CONSENSUS
-                                //
-                                // NEW (SCALABLE): Use calculate_qualified_candidates() — same deterministic
-                                //   source as select_microblock_producer_with_round (macroblock snapshot).
-                                //   All nodes have IDENTICAL candidate list. Exclude only the not_synced
-                                //   producer. Works for 5 nodes AND 1000+ nodes identically.
-                                // ═══════════════════════════════════════════════════════════════════
-                                let fallback_candidates: Vec<(String, f64)> = if let Some(ref p2p) = unified_p2p {
-                                    let all_candidates = Self::calculate_qualified_candidates(
-                                        p2p, &node_id, node_type, next_block_height
-                                    ).await;
-                                    // Exclude only the not_synced producer — deterministic exclusion
-                                    all_candidates.into_iter()
-                                        .filter(|(id, _)| id != &current_producer)
-                                        .collect()
-                                } else {
-                                    Vec::new()
-                                };
-                                
-                                if fallback_candidates.is_empty() {
-                                    // ═══════════════════════════════════════════════════════════════════════════
-                                    // PRODUCTION v2.54: AGGRESSIVE SYNC on desync detection
-                                    // ═══════════════════════════════════════════════════════════════════════════
-                                    println!("[WARN][PROD] no_fallback_candidates - triggering aggressive sync");
-                                    
-                                    if let Some(ref p2p) = unified_p2p {
-                                        let local_height = *height.read().await;
-                                        let network_height = p2p.get_cached_network_height().unwrap_or(local_height);
-                                        
-                                        if network_height > local_height + 5 {
-                                            let gap = network_height.saturating_sub(local_height);
-                                            println!("[INFO][SYNC] aggressive_sync local={} network={} gap={}", 
-                                                    local_height, network_height, gap);
-                                            
-                                            // STATE MACHINE: Switch to Syncing
-                                            let progress = ((local_height as f64 / network_height as f64) * 100.0) as u8;
-                                            set_node_state(NodeState::Syncing {
-                                                local_height,
-                                                target_height: network_height,
-                                                progress_percent: progress,
-                                            });
-                                            
-                                            // Trigger macroblock sync for fastest recovery
-                                            let current_epoch = (local_height / 90) + 1;
-                                            let safe_macroblock = current_epoch.saturating_sub(1);
-                                            if safe_macroblock > 0 {
-                                                let p2p_clone = p2p.clone();
-                                                tokio::spawn(async move {
-                                                    println!("[INFO][SYNC] aggressive_mb_sync target={}", safe_macroblock);
-                                                    if let Err(e) = p2p_clone.sync_macroblocks(1, safe_macroblock).await {
-                                                        println!("[WARN][SYNC] mb_sync_err: {}", e);
-                                                    }
-                                                });
-                                            }
-                                        } else {
-                                            println!("[INFO][PROD] local_height={} network={} - awaiting peer sync", 
-                                                    local_height, network_height);
-                                        }
-                                    }
-                                    
-                                    // Short wait then retry (sync happens in background)
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    continue;
-                                }
-                                
-                                // DETERMINISTIC fallback selection using SHA3-512
-                                // BFT timeout fallback — used when VRF claims unavailable
-                                // Candidate list is from macroblock snapshot → IDENTICAL on all nodes
-                                let mut selector = Sha3_512::new();
-                                
-                                // Domain separator (different from primary to avoid collision)
-                                selector.update(b"QNet_Quantum_Fallback_Producer_Selection_v2");
-                                
-                                // Entropy source: from Dilithium-signed blocks (quantum-resistant)
-                                selector.update(&our_entropy);
-                                
-                                // Add block height and round for uniqueness
-                                let leadership_round = (next_block_height - 1) / ROTATION_INTERVAL_BLOCKS;
-                                selector.update(&leadership_round.to_le_bytes());
-                                selector.update(&next_block_height.to_le_bytes());
-                                selector.update(&entropy_height.to_le_bytes());
-                                
-                                // Deterministic exclusion marker — hash includes who was excluded
-                                selector.update(current_producer.as_bytes());
-                                
-                                // Sort candidates by node_id for determinism (CRITICAL for Byzantine consensus)
-                                let mut sorted_candidates: Vec<String> = fallback_candidates.iter()
-                                    .map(|(id, _)| id.clone())
-                                    .collect();
-                                sorted_candidates.sort();
-                                
-                                // Include full candidate list in hash
-                                for candidate in &sorted_candidates {
-                                    selector.update(candidate.as_bytes());
-                                }
-                                
-                                // Generate quantum-resistant selection hash
-                                let selection_hash = selector.finalize();
-                                
-                                // Convert to selection index (uniform distribution)
-                                let selection_value = u64::from_le_bytes([
-                                    selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
-                                    selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
-                                ]);
-                                // v9.1: Guard against empty candidates (would panic on % 0)
-                                if sorted_candidates.is_empty() {
-                                    if crate::node::is_warn() {
-                                        println!("[WARN][PROD] fallback_no_candidates h={}", next_block_height);
-                                    }
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    continue;
-                                }
-                                let selection_index = (selection_value % sorted_candidates.len() as u64) as usize;
-
-                                let new_producer = sorted_candidates[selection_index].clone();
-                                println!("[INFO][PROD] fallback={} excluded={} cand={}",
-                                         new_producer, current_producer, sorted_candidates.len());
-                                
-                                // Update producer for this round
-                                current_producer = new_producer.clone();
-                                is_my_turn_to_produce = current_producer == node_id;
-                                
-                                if is_my_turn_to_produce {
-                                    println!("[INFO][PROD] fallback_selected_self h={}", next_block_height);
-                                }
+                                // Silence (None) is NOT treated as not-synced. A busy leader is still
+                                // a valid leader until a signed 2f+1 timeout certificate says otherwise.
                             }
                         }
                     }
