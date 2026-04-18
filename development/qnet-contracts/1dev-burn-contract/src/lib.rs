@@ -1,6 +1,9 @@
 use anchor_lang::prelude::*;
 
-declare_id!("D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7");
+// v14.5: Redeployed after security hardening (authority-attested burns,
+// phase transition gated by verification_authority). New program keypair
+// target/deploy/onedev_burn_contract-keypair.json.
+declare_id!("CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw");
 
 pub mod state;
 pub mod errors;
@@ -21,8 +24,17 @@ pub mod onedev_burn_contract {
         burn_address: Pubkey,
         one_dev_mint: Pubkey,
         network_genesis_timestamp: i64,
+        verification_authority: Pubkey, // v14.5
     ) -> Result<()> {
-        initialize::handler(ctx, authority, admin, burn_address, one_dev_mint, network_genesis_timestamp)
+        initialize::handler(
+            ctx,
+            authority,
+            admin,
+            burn_address,
+            one_dev_mint,
+            network_genesis_timestamp,
+            verification_authority,
+        )
     }
 
     /// Record a 1DEV burn transaction for node activation
