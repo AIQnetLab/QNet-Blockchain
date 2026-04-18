@@ -833,7 +833,7 @@ async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
     let program_id = std::env::var("BURN_TRACKER_PROGRAM_ID").unwrap_or_else(|_| {
         // Production program ID for 1DEV burn tracker on Solana
         // Deployed and verified - tracks 1DEV token burns for QNet activation
-        "D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7".to_string()
+        "CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw".to_string()
     });
     
     println!("📋 Burn Tracker Program ID: {}", program_id);

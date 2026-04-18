@@ -96,7 +96,7 @@ impl QNetNetworkConfig {
             solana: SolanaConfig {
                 rpc_url: "https://api.devnet.solana.com".to_string(),
                 onedev_mint: "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ".to_string(),
-                burn_contract: "D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7".to_string(),
+                burn_contract: "CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw".to_string(),
                 burn_address: "1nc1nerator11111111111111111111111111111111".to_string(),
                 commitment: "confirmed".to_string(),
             },
@@ -161,7 +161,7 @@ impl QNetNetworkConfig {
             solana: SolanaConfig {
                 rpc_url: "https://api.devnet.solana.com".to_string(),
                 onedev_mint: "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ".to_string(),
-                burn_contract: "D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7".to_string(),
+                burn_contract: "CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw".to_string(),
                 burn_address: "1nc1nerator11111111111111111111111111111111".to_string(),
                 commitment: "processed".to_string(),
             },

@@ -14,7 +14,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 entrypoint!(process_instruction);
 
 // Program ID - this will be updated after deployment
-solana_program::declare_id!("D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7");
+solana_program::declare_id!("CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw");
 
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub struct BurnData {

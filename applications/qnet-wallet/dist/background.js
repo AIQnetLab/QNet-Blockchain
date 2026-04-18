@@ -3779,7 +3779,7 @@ const ONE_DEV_TOKEN_MINT = {
 };
 
 // 1DEV Burn Tracker Contract
-const BURN_CONTRACT_PROGRAM_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
+const BURN_CONTRACT_PROGRAM_ID = 'CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw';
 
 // Global state management with optimizations
 let walletState = {

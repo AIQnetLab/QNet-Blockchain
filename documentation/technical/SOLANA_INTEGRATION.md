@@ -201,7 +201,7 @@ After 90% burn or 5 years, the system transitions to Phase 2:
 
 ```
 [Solana Devnet]
-burn_contract = "D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7"
+burn_contract = "CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw"
 1dev_mint     = "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"
 burn_address  = "1nc1nerator11111111111111111111111111111111"
 

@@ -4813,7 +4813,7 @@ export class WalletManager {
       const isTestnet = testnetSetting === null ? true : testnetSetting === 'true';
       
       // Burn contract for checking
-      const BURN_CONTRACT_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
+      const BURN_CONTRACT_ID = 'CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw';
       
       try {
         // Import Solana web3

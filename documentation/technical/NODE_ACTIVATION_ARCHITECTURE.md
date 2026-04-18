@@ -227,7 +227,7 @@ pub async fn register_activation_on_blockchain(
 ### Phase 1: 1DEV Token Burn on Solana (Years 0-5)
 
 **Solana Contract Address (Devnet):**
-- Contract: `D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7` (Anchor program)
+- Contract: `CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw` (Anchor program)
 - 1DEV Mint: `62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ`
 
 **How Phase 1 Works:**

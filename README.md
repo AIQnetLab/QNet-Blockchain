@@ -481,7 +481,7 @@ Explorer → Node RPC (RocksDB)
 - ✅ **Mobile Applications**: iOS/Android apps for Light nodes only
 - ✅ **Docker Env Activation**: Server nodes activated via environment variables (same as Genesis)
 - ✅ **IPFS Integration**: Optional P2P snapshot distribution
-- ✅ **1DEV Burn Contract**: [D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7](https://explorer.solana.com/address/D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7?cluster=devnet) on Solana Devnet
+- ✅ **1DEV Burn Contract**: [CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw](https://explorer.solana.com/address/CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw?cluster=devnet) on Solana Devnet
 
 ### 📋 **Testnet Deployment**
 
@@ -1043,7 +1043,7 @@ sudo iptables -A INPUT -p udp --dport 10876 -j ACCEPT
 
 **1DEV Burn Contract is successfully deployed on Solana Devnet:**
 
-- **🔴 Program Address**: [D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7](https://explorer.solana.com/address/D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7?cluster=devnet)
+- **🔴 Program Address**: [CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw](https://explorer.solana.com/address/CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw?cluster=devnet)
 - **📦 Program Data**: [HMbSTfp7fqsMopRqEy5u4fxQgLnYmM7ThPZzoo2VF4Gm](https://explorer.solana.com/address/HMbSTfp7fqsMopRqEy5u4fxQgLnYmM7ThPZzoo2VF4Gm?cluster=devnet)
 - **💰 Deployer Wallet**: [6gesV5Dojg9tfH9TRytvXabnQT8U7oMbz5VKpTFi8rG4](https://explorer.solana.com/address/6gesV5Dojg9tfH9TRytvXabnQT8U7oMbz5VKpTFi8rG4?cluster=devnet)
 - **🚀 Deploy Transaction**: [4z2A93vJ527LayPu8baer4MxYT8hVkoGCumCeJPpn6mmKZUpPtFmzFatFg7sTA5wzCUubuLupmKRTcA26EwpcwRR](https://explorer.solana.com/tx/4z2A93vJ527LayPu8baer4MxYT8hVkoGCumCeJPpn6mmKZUpPtFmzFatFg7sTA5wzCUubuLupmKRTcA26EwpcwRR?cluster=devnet)

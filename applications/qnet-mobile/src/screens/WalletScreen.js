@@ -34,7 +34,7 @@ import {
 import { getRandomGenesisNode } from '../config/nodes';
 
 // 1DEV Burn Tracker Contract (same as browser extension)
-const BURN_CONTRACT_PROGRAM_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
+const BURN_CONTRACT_PROGRAM_ID = 'CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw';
 
 // Translations - All supported languages
 const translations = {

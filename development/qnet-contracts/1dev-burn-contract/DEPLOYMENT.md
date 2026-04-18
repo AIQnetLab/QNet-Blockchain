@@ -81,7 +81,7 @@ PowerShell -ExecutionPolicy Bypass -File deploy.ps1
 
 1. **Update environment variable:**
    ```bash
-   # Program ID: D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7 (embedded in node)
+   # Program ID: CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw (embedded in node)
    ```
 
 2. **Update config files:**
@@ -210,7 +210,7 @@ For deployment issues:
 ## Contract Addresses
 
 ### Current Deployment
-- **Program ID:** `D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7` (production)
+- **Program ID:** `CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw` (production)
 - **1DEV Mint:** `62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ`
 - **Burn Address:** `1nc1nerator11111111111111111111111111111111`
 

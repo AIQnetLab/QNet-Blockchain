@@ -694,7 +694,7 @@ async def record_activation_in_solana_contract(wallet_address: str, node_type: s
     
     # PRODUCTION: This would call the actual Solana contract
     # For now, return the PDA address that would be created
-    contract_address = "D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7"
+    contract_address = "CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw"
     
     # Calculate PDA address for this activation (SHA3-256 for consistency)
     import base58

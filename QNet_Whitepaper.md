@@ -1281,7 +1281,7 @@ pub struct SimpleMempool {
 - **Blockchain**: Solana (SPL Token)
 - **Decimals**: 6
 - **Testnet address**: `62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ` (devnet)
-- **Burn contract**: `D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7` (devnet)
+- **Burn contract**: `CCZSessk1TbWie6Ye2JX2cNEWHTEWxCwe5sLz8JaFriw` (devnet)
 - **Burn address**: `1nc1nerator11111111111111111111111111111111`
 - **Mainnet address**: `4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump` (Mainnet)
 - **Burn contract**: `` (Mainnet)
