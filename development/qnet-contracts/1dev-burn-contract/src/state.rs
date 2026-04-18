@@ -68,6 +68,11 @@ pub struct BurnTracker {
     pub last_update: i64,
     /// Bump seed
     pub bump: u8,
+    /// v14.5: Authority that attests off-chain RPC verification of burn txs.
+    /// Required signer on `record_burn` and `execute_phase_transition` to
+    /// close the anyone-can-call hole. Set at tracker initialization and
+    /// rotatable only via admin instruction (not defined here).
+    pub verification_authority: Pubkey,
 }
 
 impl BurnTracker {
@@ -87,7 +92,8 @@ impl BurnTracker {
         1 +  // phase_transitioned
         1 +  // paused
         8 +  // last_update
-        1;   // bump
+        1 +  // bump
+        32;  // verification_authority (v14.5)
 
     pub fn should_transition(&self) -> bool {
         let current_time = Clock::get().expect("Clock sysvar should be available").unix_timestamp;

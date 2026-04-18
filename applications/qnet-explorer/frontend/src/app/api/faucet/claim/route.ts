@@ -66,17 +66,59 @@ function checkAddressCooldown(
   return { allowed: false, nextClaimTime: lastClaim + cooldownMs };
 }
 
+// ---------------------------------------------------------------------------
+// v14.5: SECURE CLIENT IP DETECTION
+// ---------------------------------------------------------------------------
+// Previous implementation trusted x-forwarded-for / x-real-ip / cf-connecting-ip
+// headers blindly. An attacker could send any value and defeat per-IP rate
+// limits by rotating the header on every request.
+//
+// New rule: proxy-supplied headers are ONLY trusted when the deployment
+// explicitly opts in via FAUCET_TRUSTED_PROXY=1 (set by the reverse-proxy
+// operator who controls the edge). Without that flag we always rely on the
+// direct socket address (NextRequest.ip, populated by the runtime) and never
+// on attacker-controlled headers.
+// ---------------------------------------------------------------------------
 function getClientIP(request: NextRequest): string {
-  const forwarded = request.headers.get('x-forwarded-for');
-  const realIP = request.headers.get('x-real-ip');
-  const cfIP = request.headers.get('cf-connecting-ip');
-  if (forwarded) return forwarded.split(',')[0].trim();
-  return realIP || cfIP || 'unknown';
+  const trustProxy = process.env.FAUCET_TRUSTED_PROXY === '1';
+  if (trustProxy) {
+    // Operator asserts the edge strips/normalises the header chain.
+    const forwarded = request.headers.get('x-forwarded-for');
+    if (forwarded) return forwarded.split(',')[0].trim();
+    const realIP = request.headers.get('x-real-ip');
+    if (realIP) return realIP;
+    const cfIP = request.headers.get('cf-connecting-ip');
+    if (cfIP) return cfIP;
+  }
+  // Default path: direct socket address (not forgeable over the network).
+  // Next.js populates `ip` from the underlying connection when no trusted
+  // proxy chain is configured.
+  return (request as unknown as { ip?: string }).ip || 'unknown';
 }
 
-function detectEnvironment(request: NextRequest): 'testnet' | 'mainnet' {
-  const hostname = request.headers.get('host') || '';
-  return hostname.includes('testnet') || hostname.includes('localhost') ? 'testnet' : 'mainnet';
+// ---------------------------------------------------------------------------
+// v14.5: SECURE ENVIRONMENT DETECTION
+// ---------------------------------------------------------------------------
+// Previous implementation inferred the environment from the Host header,
+// which is supplied by the client and can be forged:
+//   curl -H "Host: testnet.example" https://mainnet.example/api/faucet/claim
+// That caused the rate-limit bypass branch (environment === 'testnet' skips
+// the limit) to fire on mainnet, enabling unlimited SPL 1DEV transfers.
+//
+// New rule: environment comes ONLY from a server-side build-time or runtime
+// env var that the client cannot influence. FAUCET_ENV must be 'testnet' or
+// 'mainnet' — anything else (or missing) defaults to the safer 'mainnet'.
+// NEXT_PUBLIC_NETWORK is accepted as a secondary fallback because it is
+// already used across the frontend for network switching; note it is fixed
+// at build time so still not attacker-influenceable per request.
+// ---------------------------------------------------------------------------
+function detectEnvironment(_request: NextRequest): 'testnet' | 'mainnet' {
+  const explicit = (process.env.FAUCET_ENV || process.env.NEXT_PUBLIC_NETWORK || '').toLowerCase();
+  if (explicit === 'testnet' || explicit === 'dev' || explicit === 'development') {
+    return 'testnet';
+  }
+  // Default: safer branch — mainnet rules (full rate limiting).
+  return 'mainnet';
 }
 
 // ---------------------------------------------------------------------------

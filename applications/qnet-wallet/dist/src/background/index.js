@@ -31,31 +31,65 @@ chrome.runtime.onStartup.addListener(() => {
     initializeBackgroundServices();
 });
 
-// Handle messages from popup and content scripts
+// ---------------------------------------------------------------------------
+// v14.5: SENDER IDENTITY VALIDATION (defense-in-depth)
+// ---------------------------------------------------------------------------
+// chrome.runtime.onMessage fires for messages from our own extension pages
+// (popup, content scripts). The manifest does NOT declare
+// `externally_connectable`, so web pages cannot reach this listener
+// directly — but we enforce `sender.id === chrome.runtime.id` to make that
+// guarantee explicit and defensive against future manifest misconfiguration.
+//
+// Sensitive mutation messages (WALLET_UNLOCKED, WALLET_LOCKED, NODE_ACTIVATED,
+// TRANSACTION_CONFIRMED) can ONLY originate from privileged extension UIs
+// (popup / setup). If they ever arrive from a content script embedded on an
+// arbitrary web page (`sender.tab` is set), we reject them — a random
+// website must not be able to flip the wallet into "unlocked" state.
+// ---------------------------------------------------------------------------
+const SENSITIVE_MESSAGE_TYPES = new Set([
+    'WALLET_UNLOCKED',
+    'WALLET_LOCKED',
+    'NODE_ACTIVATED',
+    'TRANSACTION_CONFIRMED',
+]);
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     console.log('Background received message:', message);
-    
+
+    // v14.5: Only our own extension may send messages here.
+    if (!sender || sender.id !== chrome.runtime.id) {
+        console.warn('[QNET][WARN] rejected_message reason=foreign_sender id=' + (sender && sender.id));
+        return;
+    }
+
+    // v14.5: Sensitive state mutations must not come from a content-script
+    // context (i.e. a web page). Only popup/setup/background UIs qualify.
+    if (SENSITIVE_MESSAGE_TYPES.has(message && message.type) && sender.tab) {
+        console.warn('[QNET][WARN] rejected_sensitive_msg type=' + message.type + ' reason=tab_origin url=' + (sender.url || ''));
+        return;
+    }
+
     switch (message.type) {
         case 'GET_WALLET_STATE':
             handleGetWalletState(sendResponse);
             return true; // Keep channel open for async response
-            
+
         case 'WALLET_UNLOCKED':
             handleWalletUnlocked(message.data);
             break;
-            
+
         case 'WALLET_LOCKED':
             handleWalletLocked();
             break;
-            
+
         case 'NODE_ACTIVATED':
             handleNodeActivated(message.data);
             break;
-            
+
         case 'TRANSACTION_CONFIRMED':
             handleTransactionConfirmed(message.data);
             break;
-            
+
         default:
             console.warn('Unknown message type:', message.type);
     }

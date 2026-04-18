@@ -7,15 +7,61 @@
  * Import from this file: import { GENESIS_NODES, getSolanaRpcUrl } from '../config/nodes';
  */
 
-// Genesis node public API endpoints (infrastructure backbone)
-// These nodes are always available for initial bootstrap
-export const GENESIS_NODES = [
-  'http://154.38.160.39:8001',   // Genesis 001 - North America
-  'http://62.171.157.44:8001',   // Genesis 002 - Europe
-  'http://161.97.86.81:8001',    // Genesis 003 - Europe
-  'http://5.189.130.160:8001',   // Genesis 004 - Europe
-  'http://162.244.25.114:8001',  // Genesis 005 - Europe
+// ---------------------------------------------------------------------------
+// v14.5: HTTPS-FIRST BOOTSTRAP (MITM mitigation)
+// ---------------------------------------------------------------------------
+// Previous configuration used plaintext HTTP for all 5 genesis nodes. Any
+// on-path attacker (public Wi-Fi, hostile ISP, compromised router) could:
+//   • read wallet addresses + FCM push tokens as they were registered,
+//   • substitute responses (fake balance, fake peer list),
+//   • replay / manipulate activation flows.
+//
+// v14.5 defaults to HTTPS endpoints (the genesis servers terminate TLS on
+// port 443 behind nginx). The legacy HTTP fallback remains available only
+// when the runtime explicitly opts in via `process.env.QNET_ALLOW_HTTP=1`
+// (e.g. for local development against an unprovisioned host), and even then
+// a console warning is emitted to remind operators of the MITM risk.
+//
+// For mainnet mobile builds `QNET_ALLOW_HTTP` is unset → HTTPS is enforced.
+// ---------------------------------------------------------------------------
+export const GENESIS_NODES_HTTPS = [
+  'https://154.38.160.39:8001',   // Genesis 001 - North America
+  'https://62.171.157.44:8001',   // Genesis 002 - Europe
+  'https://161.97.86.81:8001',    // Genesis 003 - Europe
+  'https://5.189.130.160:8001',   // Genesis 004 - Europe
+  'https://162.244.25.114:8001',  // Genesis 005 - Europe
 ];
+
+export const GENESIS_NODES_HTTP_LEGACY = [
+  'http://154.38.160.39:8001',
+  'http://62.171.157.44:8001',
+  'http://161.97.86.81:8001',
+  'http://5.189.130.160:8001',
+  'http://162.244.25.114:8001',
+];
+
+const _allowInsecure = (() => {
+  try {
+    // React Native / Node contexts
+    // eslint-disable-next-line no-undef
+    return typeof process !== 'undefined' && process?.env?.QNET_ALLOW_HTTP === '1';
+  } catch (_) {
+    return false;
+  }
+})();
+
+if (_allowInsecure && typeof console !== 'undefined') {
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[QNET][WARN] QNET_ALLOW_HTTP=1 — using plaintext bootstrap URLs. ' +
+      'Traffic (wallet addresses, push tokens) is susceptible to MITM. ' +
+      'For mainnet do NOT set this flag.'
+  );
+}
+
+export const GENESIS_NODES = _allowInsecure
+  ? GENESIS_NODES_HTTP_LEGACY
+  : GENESIS_NODES_HTTPS;
 
 // Node discovery settings
 export const NODE_DISCOVERY = {

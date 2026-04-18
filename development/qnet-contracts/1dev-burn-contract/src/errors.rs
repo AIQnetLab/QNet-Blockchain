@@ -32,4 +32,7 @@ pub enum BurnError {
     InvalidBurner,
     #[msg("Phase transition conditions not met")]
     TransitionNotReady,
-} 
+    /// v14.5: Signer is not the pinned verification authority.
+    #[msg("Unauthorized caller — verification authority required")]
+    UnauthorizedCaller,
+}

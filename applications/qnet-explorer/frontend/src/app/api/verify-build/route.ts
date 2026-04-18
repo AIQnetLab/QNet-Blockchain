@@ -1,6 +1,33 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createHash, randomBytes } from 'crypto';
 
+// ---------------------------------------------------------------------------
+// v14.5: CORS ALLOWLIST (was: Access-Control-Allow-Origin: *)
+// ---------------------------------------------------------------------------
+// Wildcard CORS lets any origin read the build-verification payload and, if
+// paired with credentials, exfiltrate response data from authenticated users.
+// The endpoint is still publicly readable — we just stop advertising cross-
+// origin permission. Explicitly known front-ends can be added via env
+// (VERIFY_BUILD_ALLOWED_ORIGINS, comma-separated).
+// ---------------------------------------------------------------------------
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://qnet.network',
+  'https://www.qnet.network',
+  'https://explorer.qnet.network',
+  'https://testnet.qnet.network',
+];
+
+function resolveAllowedOrigin(request: NextRequest): string | null {
+  const extra = (process.env.VERIFY_BUILD_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+  const allowed = [...DEFAULT_ALLOWED_ORIGINS, ...extra];
+  const origin = request.headers.get('origin');
+  if (origin && allowed.includes(origin)) return origin;
+  return null;
+}
+
 export async function GET(request: NextRequest) {
   const buildInfo = {
     // Build information
@@ -43,13 +70,16 @@ export async function GET(request: NextRequest) {
     }
   };
 
-  return NextResponse.json(buildInfo, {
-    headers: {
-      'Content-Type': 'application/json',
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-      'Access-Control-Allow-Origin': '*',
-    },
-  });
+  const allowedOrigin = resolveAllowedOrigin(request);
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-cache, no-store, must-revalidate',
+  };
+  if (allowedOrigin) {
+    headers['Access-Control-Allow-Origin'] = allowedOrigin;
+    headers['Vary'] = 'Origin';
+  }
+  return NextResponse.json(buildInfo, { headers });
 }
 
 async function getFileHash(filename: string): Promise<string> {
