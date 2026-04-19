@@ -11913,31 +11913,90 @@ impl QuorumCertificate {
         }
         // De-dup voter_ids to guard against signature replay inside a QC.
         let mut seen = std::collections::HashSet::new();
-        let msg = format!(
+        let expected_msg = format!(
             "COMMIT:{}:{}",
             self.height,
             hex::encode(self.block_hash)
         );
-        let msg_bytes = msg.as_bytes();
+        let expected_bytes = expected_msg.as_bytes();
+
         for (voter, sig_bytes) in &self.votes {
             if !seen.insert(voter.clone()) {
                 return Err(format!("QC_DUPLICATE_VOTER voter={}", voter));
             }
-            let pk = crate::genesis_constants::get_vrf_public_key(voter)
-                .ok_or_else(|| format!("QC_UNKNOWN_VOTER voter={}", voter))?;
-            if pk.len() != 1952 {
-                return Err(format!("QC_BAD_PK_LEN voter={} len={}", voter, pk.len()));
+
+            // ═══════════════════════════════════════════════════════════════
+            // v14.7.1: consensus-signature envelope verify (shared format
+            // with TimeoutVote, HeartbeatCommitment, tx Dilithium validation).
+            // ═══════════════════════════════════════════════════════════════
+            // Wire format of each committer's `sig_bytes`:
+            //   UTF-8 bytes of the string
+            //   "dilithium_sig_{voter}_{base64(envelope)}"
+            // where envelope =
+            //   [sig_len: u32 LE][SignedMessage][pk_len: u32 LE][PublicKey(1952)]
+            //
+            // Verification:
+            //   1. Parse the string, strip the per-voter prefix, base64-decode.
+            //   2. Extract the SignedMessage slice via sig_len header.
+            //   3. Load the voter's registered Dilithium3 public key from
+            //      VRF_PK_REGISTRY (committee-bound identity binding).
+            //   4. `dilithium3::open(signed_msg, pk)` — checks the signature
+            //      AND returns the original message bytes.
+            //   5. Assert opened == "COMMIT:{height}:{hash_hex}".
+            //
+            // Any step failing -> return QC_*_FAIL — the whole QC is
+            // rejected so no partially-verified QC can advance finality.
+            // ═══════════════════════════════════════════════════════════════
+
+            let sig_str = std::str::from_utf8(sig_bytes)
+                .map_err(|_| format!("QC_SIG_NOT_UTF8 voter={} len={}", voter, sig_bytes.len()))?;
+
+            let prefix = format!("dilithium_sig_{}_", voter);
+            let b64_part = sig_str
+                .strip_prefix(&prefix)
+                .ok_or_else(|| format!("QC_SIG_NO_PREFIX voter={}", voter))?;
+
+            use base64::engine::general_purpose;
+            use base64::Engine;
+            let combined = general_purpose::STANDARD
+                .decode(b64_part)
+                .map_err(|e| format!("QC_SIG_BAD_B64 voter={} err={:?}", voter, e))?;
+            if combined.len() < 8 {
+                return Err(format!("QC_SIG_TRUNC voter={} len={}", voter, combined.len()));
             }
+            let sig_len = u32::from_le_bytes(
+                combined[0..4].try_into()
+                    .map_err(|_| format!("QC_SIG_BAD_LEN_HDR voter={}", voter))?,
+            ) as usize;
+            if combined.len() < 4 + sig_len + 4 {
+                return Err(format!("QC_SIG_TRUNC_BODY voter={} got={} need>={}",
+                                   voter, combined.len(), 4 + sig_len + 4));
+            }
+            let sm_bytes = &combined[4..4 + sig_len];
+
+            let registered_pk = crate::genesis_constants::get_vrf_public_key(voter)
+                .ok_or_else(|| format!("QC_UNKNOWN_VOTER voter={}", voter))?;
+            if registered_pk.len() != 1952 {
+                return Err(format!("QC_BAD_PK_LEN voter={} len={}", voter, registered_pk.len()));
+            }
+
             use pqcrypto_mldsa::mldsa65 as dilithium3;
-            use pqcrypto_traits::sign::{
-                DetachedSignature as DsTrait, PublicKey as PkTrait,
-            };
-            let sig = dilithium3::DetachedSignature::from_bytes(sig_bytes)
-                .map_err(|e| format!("QC_BAD_SIG voter={} err={:?}", voter, e))?;
-            let pubkey = dilithium3::PublicKey::from_bytes(&pk)
+            use pqcrypto_traits::sign::{SignedMessage as SmTrait, PublicKey as PkTrait};
+
+            let signed_msg = dilithium3::SignedMessage::from_bytes(sm_bytes)
+                .map_err(|e| format!("QC_BAD_SM voter={} err={:?}", voter, e))?;
+            let pubkey = dilithium3::PublicKey::from_bytes(&registered_pk)
                 .map_err(|e| format!("QC_BAD_PK voter={} err={:?}", voter, e))?;
-            dilithium3::verify_detached_signature(&sig, msg_bytes, &pubkey)
+
+            let opened = dilithium3::open(&signed_msg, &pubkey)
                 .map_err(|e| format!("QC_VERIFY_FAIL voter={} err={:?}", voter, e))?;
+
+            if opened != expected_bytes {
+                return Err(format!(
+                    "QC_MSG_MISMATCH voter={} opened_len={} expected={}",
+                    voter, opened.len(), expected_msg
+                ));
+            }
         }
         Ok(())
     }
@@ -12565,39 +12624,45 @@ impl SimplifiedP2P {
                 }
                 // Rate-limit by voter to guard against DoS (30 / 60s per voter).
                 if self.is_consensus_rate_limited(&voter_id, "commit", 30) { return; }
-                let pk = match crate::genesis_constants::get_vrf_public_key(&voter_id) {
-                    Some(k) => k,
-                    None => {
-                        if crate::node::is_debug() {
-                            println!("[DBG][QC] commit_vote_unknown_voter voter={}", voter_id);
+
+                // ═══════════════════════════════════════════════════════════════
+                // v14.7.1: WIRE FORMAT FIX — match TimeoutVote envelope pattern.
+                // ═══════════════════════════════════════════════════════════════
+                // The emitter uses `create_consensus_signature`, which returns
+                // a formatted envelope string
+                //   "dilithium_sig_{node_id}_{base64(SignedMessage || PublicKey)}"
+                // and ships it as UTF-8 bytes over the wire. The canonical way
+                // to verify this (shared with TimeoutVote, HeartbeatCommitment
+                // and every other consensus-signed payload in the codebase) is
+                // `String::from_utf8` → `verify_consensus_signature`, which
+                // unpacks the envelope, selects the correct Dilithium3 public
+                // key from VRF_PK_REGISTRY, and invokes `dilithium3::open()`.
+                //
+                // The previous hand-rolled `DetachedSignature::from_bytes` path
+                // assumed raw detached bytes and therefore failed for EVERY
+                // vote — observed as `commit_vote_bad_sig=120` per node and no
+                // QC ever sealed.
+                // ═══════════════════════════════════════════════════════════════
+                let sig_str = match String::from_utf8(signature.to_vec()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        if crate::node::is_warn() {
+                            println!("[WARN][QC] commit_vote_sig_not_utf8 h={} voter={} len={}",
+                                     height, voter_id, signature.len());
                         }
                         return;
                     }
                 };
-                if pk.len() != 1952 {
-                    if crate::node::is_warn() {
-                        println!("[WARN][QC] commit_vote_bad_pk_len voter={} len={}", voter_id, pk.len());
-                    }
-                    return;
-                }
                 let msg = commit_vote_msg(height, &block_hash);
-                use pqcrypto_mldsa::mldsa65 as dilithium3;
-                use pqcrypto_traits::sign::{
-                    DetachedSignature as DsTrait, PublicKey as PkTrait,
-                };
-                let sig_ok = (|| -> Option<()> {
-                    let sig = dilithium3::DetachedSignature::from_bytes(&signature).ok()?;
-                    let pubkey = dilithium3::PublicKey::from_bytes(&pk).ok()?;
-                    dilithium3::verify_detached_signature(&sig, msg.as_bytes(), &pubkey).ok()?;
-                    Some(())
-                })().is_some();
-                if !sig_ok {
+                if !self.verify_consensus_signature(&voter_id, &msg, &sig_str) {
                     if crate::node::is_warn() {
                         println!("[WARN][QC] commit_vote_bad_sig h={} voter={}", height, voter_id);
                     }
                     return;
                 }
-                // Compute 2f+1 threshold from current active validator count.
+
+                // Compute 2f+1 threshold from current active validator count
+                // (committee-capped at MAX_VALIDATORS, not raw peer count).
                 let total = self.get_active_validator_count();
                 let threshold = ((2 * total) / 3) + 1;
                 if let Some(qc) = insert_verified_commit_vote(

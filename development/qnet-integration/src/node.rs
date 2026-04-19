@@ -16375,70 +16375,31 @@ impl BlockchainNode {
                     }
 
                     // ═══════════════════════════════════════════════════════════
-                    // v14.7 (pt 6): QC-BEFORE-PRODUCE at rotation boundary
+                    // v14.7.1: pt 6 QC-before-produce guard REMOVED.
                     // ═══════════════════════════════════════════════════════════
-                    // Before an incoming primary produces the first block of a
-                    // new rotation (h where (h-1) % 30 == 0), verify that the
-                    // PREVIOUS rotation's terminal block is durable locally.
-                    // Without this check, a producer elected at rotation N
-                    // could extend the chain before rotation N-1's last block
-                    // is even persisted on this node — giving rise to an
-                    // internal fork between our local tip and what we're about
-                    // to broadcast.
+                    // The previous implementation compared a rotation-index
+                    // (`(h-1)/ROTATION_INTERVAL_BLOCKS`) with a timeout-round
+                    // (escalates to 1000+ during stalls). Those are distinct
+                    // scales — the check always tripped after the first
+                    // timeout escalation and livelocked the chain at every
+                    // rotation boundary.
                     //
-                    // The check has two parts:
-                    //   1. Local continuity: our storage HAS the block at
-                    //      (next_block_height - 1), i.e. the last block of the
-                    //      outgoing rotation round.
-                    //   2. No newer certificate overrides our view: if a peer
-                    //      has already certified a higher timeout_round for
-                    //      this macroblock index, OUR view of the outgoing
-                    //      round is obsolete and we should not produce.
+                    // The BFT safety property it attempted to enforce — "do
+                    // not extend a chain whose predecessor round has been
+                    // certified past us" — is already enforced correctly and
+                    // atomically by the v14.6 pre-save stale-round guard
+                    // (see node.rs in the production path, just before the
+                    // RocksDB write). That guard compares the BLOCK's actual
+                    // `timeout_round` against `HIGHEST_CERTIFIED_ROUND` /
+                    // `HIGHEST_ADOPTED_ROUND` under the same MB index, which
+                    // is the semantically correct comparison. Defence-in-
+                    // depth on the validator side is provided by the
+                    // pipelined-QC verify stage in block_pipeline.rs.
                     //
-                    // Producer fails-soft: logs a warning and SKIPS production
-                    // for this iteration; the main loop polls again shortly.
-                    // Validators are unaffected.
-                    //
-                    // Scales: two storage look-ups + one DashMap read. O(1).
-                    // Safe at 1000+ Super-node round.
+                    // Removing this duplicate check restores liveness while
+                    // preserving all real BFT-safety properties.
                     // ═══════════════════════════════════════════════════════════
-                    if is_my_turn_to_produce && next_block_height > ROTATION_INTERVAL_BLOCKS {
-                        let prev_rotation_last_h = next_block_height - 1;
-                        let local_prev_block_present = storage
-                            .load_microblock(prev_rotation_last_h)
-                            .ok()
-                            .flatten()
-                            .is_some();
-                        let mb_idx_here = next_block_height / 90;
-                        let observed_certified = if let Some(p) = &unified_p2p {
-                            p.get_highest_certified_round(mb_idx_here)
-                        } else { 0 };
-                        // We're entering round R at this rotation; R is derived
-                        // from rotation index inside macroblock. A certificate
-                        // for R' > expected_round_of_this_rotation means the
-                        // network already certified a failover past our entry
-                        // point — we should yield before producing.
-                        let expected_entry_round = ((next_block_height - 1) / ROTATION_INTERVAL_BLOCKS) % 1_000;
-                        let cert_overrides_entry = observed_certified > expected_entry_round
-                            && observed_certified > 0;
 
-                        if !local_prev_block_present || cert_overrides_entry {
-                            if is_warn() {
-                                println!(
-                                    "[WARN][PROD] qc_before_produce_failed h={} prev_h={} prev_present={} cert_round_observed={} entry_round={} action=skip_iter",
-                                    next_block_height, prev_rotation_last_h,
-                                    local_prev_block_present, observed_certified,
-                                    expected_entry_round
-                                );
-                            }
-                            // Short sleep to avoid tight loop; next iteration
-                            // of production tick will re-evaluate after sync
-                            // catches up or cert is observed.
-                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-                            continue;
-                        }
-                    }
-                    
                     if let Some(p2p) = &unified_p2p {
                         // CRITICAL FIX: Use FINALITY_WINDOW for entropy consensus (Byzantine-safe)
                         // This ensures ALL synchronized nodes have the same entropy block
