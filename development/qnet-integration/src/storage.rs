@@ -2282,30 +2282,30 @@ impl PersistentStorage {
     pub fn save_consensus_state(&self, round: u64, state: &[u8]) -> IntegrationResult<()> {
         let consensus_cf = self.db.cf_handle("consensus")
             .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
-        
+
         let key = format!("round_{}", round);
         self.db.put_cf(&consensus_cf, key.as_bytes(), state)?;
-        
+
         // Update latest round for quick lookup
         self.db.put_cf(&consensus_cf, b"latest_round", &round.to_be_bytes())?;
-        
+
         Ok(())
     }
-    
+
     /// Load consensus round state for recovery
     pub fn load_consensus_state(&self, round: u64) -> IntegrationResult<Option<Vec<u8>>> {
         let consensus_cf = self.db.cf_handle("consensus")
             .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
-        
+
         let key = format!("round_{}", round);
         Ok(self.db.get_cf(&consensus_cf, key.as_bytes())?)
     }
-    
+
     /// Get latest consensus round from storage
     pub fn get_latest_consensus_round(&self) -> IntegrationResult<u64> {
         let consensus_cf = self.db.cf_handle("consensus")
             .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
-        
+
         match self.db.get_cf(&consensus_cf, b"latest_round")? {
             Some(bytes) => {
                 let round = u64::from_be_bytes(bytes.try_into()
@@ -2314,6 +2314,70 @@ impl PersistentStorage {
             },
             None => Ok(0), // No consensus state saved yet
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v14.7 (pt 9): TIMEOUT-CERTIFICATE PERSISTENCE
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BFT TimeoutCertificates (2f+1 signed votes for a timeout_round at a given
+    // macroblock index) and the HIGHEST_CERTIFIED_ROUND / HIGHEST_ADOPTED_ROUND
+    // trackers live in DashMaps. Prior to v14.7 they were RAM-only — any node
+    // restart blanked them, so the v14.6 pre-save guard (which reads these maps
+    // to decide whether to yield as stale primary) was guaranteed to malfunction
+    // in the crucial seconds after reboot.
+    //
+    // We now persist the full certificate set plus the two derived high-water
+    // trackers under dedicated keys inside the existing "consensus" CF (hot
+    // write buffer). Calls write-through on every certificate insert/adopt.
+    // Startup code rehydrates the DashMaps before the production loop starts
+    // so the guard sees the correct view from the first tick.
+    //
+    // Keys:
+    //   "tcerts_v1"     → bincode<Vec<((u64,u64), TimeoutCertificate)>>
+    //   "hi_cert_v1"    → bincode<Vec<(u64, u64)>>  (mb_index → round)
+    //   "hi_adopt_v1"   → bincode<Vec<(u64, u64)>>  (mb_index → round)
+    //
+    // Scalability: O(k) serialise where k = active macroblock window. Cleanup
+    // retain() in unified_p2p prunes old entries every block, so k is bounded
+    // by the cert-retention window (a handful of macroblocks).
+    // ═══════════════════════════════════════════════════════════════════════════
+    pub fn save_timeout_certificates(&self, payload: &[u8]) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        self.db.put_cf(&cf, b"tcerts_v1", payload)?;
+        Ok(())
+    }
+
+    pub fn load_timeout_certificates(&self) -> IntegrationResult<Option<Vec<u8>>> {
+        let cf = self.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        Ok(self.db.get_cf(&cf, b"tcerts_v1")?)
+    }
+
+    pub fn save_highest_certified_rounds(&self, payload: &[u8]) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        self.db.put_cf(&cf, b"hi_cert_v1", payload)?;
+        Ok(())
+    }
+
+    pub fn load_highest_certified_rounds(&self) -> IntegrationResult<Option<Vec<u8>>> {
+        let cf = self.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        Ok(self.db.get_cf(&cf, b"hi_cert_v1")?)
+    }
+
+    pub fn save_highest_adopted_rounds(&self, payload: &[u8]) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        self.db.put_cf(&cf, b"hi_adopt_v1", payload)?;
+        Ok(())
+    }
+
+    pub fn load_highest_adopted_rounds(&self) -> IntegrationResult<Option<Vec<u8>>> {
+        let cf = self.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        Ok(self.db.get_cf(&cf, b"hi_adopt_v1")?)
     }
     
     /// Save sync progress for resuming after restart
@@ -3970,7 +4034,27 @@ impl Storage {
     pub fn get_latest_consensus_round(&self) -> IntegrationResult<u64> {
         self.persistent.get_latest_consensus_round()
     }
-    
+
+    // v14.7 (pt 9): timeout-certificate persistence wrappers
+    pub fn save_timeout_certificates(&self, payload: &[u8]) -> IntegrationResult<()> {
+        self.persistent.save_timeout_certificates(payload)
+    }
+    pub fn load_timeout_certificates(&self) -> IntegrationResult<Option<Vec<u8>>> {
+        self.persistent.load_timeout_certificates()
+    }
+    pub fn save_highest_certified_rounds(&self, payload: &[u8]) -> IntegrationResult<()> {
+        self.persistent.save_highest_certified_rounds(payload)
+    }
+    pub fn load_highest_certified_rounds(&self) -> IntegrationResult<Option<Vec<u8>>> {
+        self.persistent.load_highest_certified_rounds()
+    }
+    pub fn save_highest_adopted_rounds(&self, payload: &[u8]) -> IntegrationResult<()> {
+        self.persistent.save_highest_adopted_rounds(payload)
+    }
+    pub fn load_highest_adopted_rounds(&self) -> IntegrationResult<Option<Vec<u8>>> {
+        self.persistent.load_highest_adopted_rounds()
+    }
+
     /// Save sync progress
     pub fn save_sync_progress(&self, from_height: u64, to_height: u64, current: u64) -> IntegrationResult<()> {
         self.persistent.save_sync_progress(from_height, to_height, current)
@@ -4051,6 +4135,11 @@ impl Storage {
                         state_root: efficient_block.state_root,
                         // v14.0: Timeout round for producer authority
                         timeout_round: efficient_block.timeout_round,
+                        // v14.7: QC is reconstructable from BLOCK_COMMIT_QC
+                        // DashMap or on-chain from next block; storage-path
+                        // rehydration leaves it None to keep EfficientMicroBlock
+                        // schema unchanged.
+                        prev_block_qc: None,
                     };
                     
                     // Serialize as full MicroBlock for network transmission
@@ -4309,6 +4398,9 @@ impl Storage {
             state_root: efficient_block.state_root,
             // v14.0: Timeout round for producer authority
             timeout_round: efficient_block.timeout_round,
+            // v14.7: QC not persisted in EfficientMicroBlock layout; rehydrated
+            // on demand from BLOCK_COMMIT_QC or the next block's header.
+            prev_block_qc: None,
         };
 
         Ok(Some(microblock))

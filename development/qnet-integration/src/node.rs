@@ -37,7 +37,7 @@ const API_HEALTH_CHECK_DELAY_SECS: u64 = 2; // Delay between health checks
 // - P2P block propagation (~500ms-1s)
 // - Node synchronization during failover
 // - Byzantine consensus coordination
-const FINALITY_WINDOW: u64 = 10; // 10 blocks = 10 seconds (safe for production)
+pub const FINALITY_WINDOW: u64 = 10; // 10 blocks = 10 seconds (safe for production)
 
 // EMISSION INTERVAL: Reward emission every 4 hours
 // CRITICAL: Deterministic emission block calculation
@@ -1562,9 +1562,9 @@ pub struct BlockchainNode {
     bitmap_commitment_tracker: Arc<DashMap<u64, HeartbeatCommitmentStatus>>,
     
     // Verifiable Time Sequence (VTS) for time synchronization
-    quantum_poh: Option<Arc<crate::quantum_poh::QuantumPoH>>,
+    poh: Option<Arc<crate::poh::PoH>>,
     #[allow(dead_code)]
-    quantum_poh_receiver: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::quantum_poh::PoHEntry>>>>,
+    poh_receiver: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::poh::PoHEntry>>>>,
     
     // Parallel Executor for parallel transaction execution
     parallel_executor: Option<Arc<crate::parallel_executor::ParallelExecutor>>,
@@ -2774,8 +2774,8 @@ impl BlockchainNode {
     // and properly handles Genesis fallback + background sync for missing MacroBlocks
     
     /// Get Quantum VTS reference
-    pub fn get_quantum_poh(&self) -> &Option<Arc<crate::quantum_poh::QuantumPoH>> {
-        &self.quantum_poh
+    pub fn get_poh(&self) -> &Option<Arc<crate::poh::PoH>> {
+        &self.poh
     }
     
     /// Get Parallel Executor reference
@@ -6844,7 +6844,7 @@ impl BlockchainNode {
         // Light nodes do NOT run PoH - they are mobile devices with limited resources
         // =========================================================================
         // v3.18: Full node type removed
-        let (quantum_poh, poh_receiver): (Option<Arc<crate::quantum_poh::QuantumPoH>>, Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::quantum_poh::PoHEntry>>>>) =
+        let (poh, poh_receiver): (Option<Arc<crate::poh::PoH>>, Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::poh::PoHEntry>>>>) =
             if matches!(node_type, NodeType::Super) {
                 if is_info() { println!("[INFO][POH] init type={:?}", node_type); }
                 
@@ -6882,10 +6882,10 @@ impl BlockchainNode {
                 
                 let (poh, receiver) = if let Some((hash, count)) = initial_poh_state {
                     if is_info() { println!("[INFO][POH] checkpoint_restore count={}", count); }
-                    crate::quantum_poh::QuantumPoH::new_from_checkpoint(hash, count)
+                    crate::poh::PoH::new_from_checkpoint(hash, count)
                 } else {
                     if is_info() { println!("[INFO][POH] fresh_start"); }
-                    crate::quantum_poh::QuantumPoH::new(genesis_hash)
+                    crate::poh::PoH::new(genesis_hash)
                 };
                 
                 let poh_arc = Arc::new(poh);
@@ -6914,7 +6914,7 @@ impl BlockchainNode {
                         if current_million >= last_million + 10 {
                             let rounded_count = current_million * 1_000_000;
                             
-                            let checkpoint_entry = crate::quantum_poh::PoHEntry {
+                            let checkpoint_entry = crate::poh::PoHEntry {
                                 num_hashes: rounded_count,
                                 hash: entry.hash.clone(),
                                 data: entry.data.clone(),
@@ -7087,8 +7087,8 @@ impl BlockchainNode {
             // v2.96: DashMap for confirmation tracking + retry
             heartbeat_commitment_tracker: Arc::new(DashMap::new()),
             bitmap_commitment_tracker: Arc::new(DashMap::new()),
-            quantum_poh,  // Already Option - None for Light nodes, Some for Full/Super
-            quantum_poh_receiver: poh_receiver,  // Already Option
+            poh,  // Already Option - None for Light nodes, Some for Full/Super
+            poh_receiver: poh_receiver,  // Already Option
             parallel_executor,
             adaptive_bft,
             pre_execution,
@@ -8341,7 +8341,7 @@ impl BlockchainNode {
         state: Arc<RwLock<StateManager>>,
         height: Arc<RwLock<u64>>,
         unified_p2p: Option<Arc<SimplifiedP2P>>,
-        quantum_poh: Option<Arc<crate::quantum_poh::QuantumPoH>>,
+        poh: Option<Arc<crate::poh::PoH>>,
         node_id: String,
         node_type: NodeType,
         block_event_tx: tokio::sync::broadcast::Sender<u64>,
@@ -10000,7 +10000,7 @@ impl BlockchainNode {
                             &node_id,
                             node_type,
                             Some(&storage),
-                            &quantum_poh
+                            &poh
                         ).await;
                         
                         if next_producer == node_id {
@@ -10015,7 +10015,7 @@ impl BlockchainNode {
                     
                     // CRITICAL FIX: Asynchronous PoH synchronization to prevent blocking
                     // This ensures all nodes maintain consistent PoH state without blocking block processing
-                    if let Some(ref poh) = quantum_poh {
+                    if let Some(ref poh) = poh {
                         if received_block.height > 0 {
                             // CRITICAL FIX: Synchronous PoH sync to prevent race conditions
                             // Producer must wait for PoH sync before creating next block
@@ -12368,7 +12368,7 @@ impl BlockchainNode {
         let mempool = self.mempool.clone();
         let node_id = self.node_id.clone();
         let node_type = self.node_type.clone();
-        let quantum_poh = self.quantum_poh.clone();
+        let poh = self.poh.clone();
         let heartbeat_tracker = self.heartbeat_commitment_tracker.clone();
         let is_running = self.is_running.clone();
         
@@ -12509,7 +12509,7 @@ impl BlockchainNode {
                                                     &node_id,
                                                     node_type.clone(),
                                                     Some(&storage),
-                                                    &quantum_poh,
+                                                    &poh,
                                                 ).await;
                                                 
                                                 // Step 2: Check if we're near rotation boundary (next 2 blocks may have different producers)
@@ -12519,7 +12519,7 @@ impl BlockchainNode {
                                                     &node_id,
                                                     node_type.clone(),
                                                     Some(&storage),
-                                                    &quantum_poh,
+                                                    &poh,
                                                 ).await;
                                                 
                                                 if is_info() {
@@ -12693,7 +12693,7 @@ impl BlockchainNode {
         let mempool = self.mempool.clone();
         let node_id = self.node_id.clone();
         let node_type = self.node_type.clone();
-        let quantum_poh = self.quantum_poh.clone();
+        let poh = self.poh.clone();
         let bitmap_tracker = self.bitmap_commitment_tracker.clone();
         let is_running = self.is_running.clone();
         
@@ -12961,7 +12961,7 @@ impl BlockchainNode {
                                                             &node_id,
                                                             node_type.clone(),
                                                             Some(&storage),
-                                                            &quantum_poh,
+                                                            &poh,
                                                         ).await;
 
                                                         if producer.is_empty() || producer == node_id || sent_to.contains(&producer) {
@@ -13084,7 +13084,62 @@ impl BlockchainNode {
     async fn start_microblock_production(&mut self) {
         // PRODUCTION: Start health monitor for sync flags (deadlock prevention)
         Self::start_sync_health_monitor();
-        
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // v14.7 (pt 9): REHYDRATE TIMEOUT-CERTIFICATE STATE FROM DISK
+        // ═══════════════════════════════════════════════════════════════════════
+        // Loads the persisted TIMEOUT_CERTIFICATES + HIGHEST_CERTIFIED_ROUND +
+        // HIGHEST_ADOPTED_ROUND DashMaps so the v14.6 pre-save guard sees the
+        // correct view immediately after restart, not zero. Without this, a
+        // rebooted node could sign a stale-round block in the first seconds
+        // post-boot (before its P2P layer re-fetches certificates from peers).
+        //
+        // Safe at 1000+ validator scale: payload is per-macroblock-index, not
+        // per-validator. Cleanup retain() keeps it bounded to the active window.
+        // ═══════════════════════════════════════════════════════════════════════
+        {
+            let tc_bytes = self.storage.load_timeout_certificates().unwrap_or(None).unwrap_or_default();
+            let hc_bytes = self.storage.load_highest_certified_rounds().unwrap_or(None).unwrap_or_default();
+            let ha_bytes = self.storage.load_highest_adopted_rounds().unwrap_or(None).unwrap_or_default();
+            let tc_n = crate::unified_p2p::rehydrate_timeout_certificates(&tc_bytes);
+            let hc_n = crate::unified_p2p::rehydrate_highest_certified_rounds(&hc_bytes);
+            let ha_n = crate::unified_p2p::rehydrate_highest_adopted_rounds(&ha_bytes);
+            if is_info() {
+                println!("[INFO][CONS] timeout_state_rehydrated certs={} hi_cert={} hi_adopt={}",
+                         tc_n, hc_n, ha_n);
+            }
+        }
+
+        // v14.7 (pt 9): Spawn periodic FLUSHER for timeout-certificate state.
+        // 2s tick is a deliberate trade-off — long enough to coalesce bursts of
+        // vote-driven cert updates into a single RocksDB write, short enough
+        // that a crash loses at most ~2 rotation rounds of cert state. Worst
+        // case the rehydration at next start is 2s stale; timeout protocol
+        // converges within one rotation anyway. No locks taken; snapshot
+        // helpers iterate DashMaps atomically.
+        {
+            let storage_flush = self.storage.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(2));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    let tc = crate::unified_p2p::snapshot_timeout_certificates();
+                    let hc = crate::unified_p2p::snapshot_highest_certified_rounds();
+                    let ha = crate::unified_p2p::snapshot_highest_adopted_rounds();
+                    if let Err(e) = storage_flush.save_timeout_certificates(&tc) {
+                        if is_warn() { println!("[WARN][CONS] tcerts_flush_fail err={}", e); }
+                    }
+                    if let Err(e) = storage_flush.save_highest_certified_rounds(&hc) {
+                        if is_warn() { println!("[WARN][CONS] hi_cert_flush_fail err={}", e); }
+                    }
+                    if let Err(e) = storage_flush.save_highest_adopted_rounds(&ha) {
+                        if is_warn() { println!("[WARN][CONS] hi_adopt_flush_fail err={}", e); }
+                    }
+                }
+            });
+        }
+
         // PRODUCTION v2.78: Start commitment TX submission loop (parallel with block production)
         self.start_commitment_tx_loop().await;
         
@@ -13105,7 +13160,7 @@ impl BlockchainNode {
         let _last_block_attempt = self.last_block_attempt.clone();
         let perf_config = self.perf_config.clone();
         let rotation_tracker = self.rotation_tracker.clone();
-        let quantum_poh_for_spawn = self.quantum_poh.clone();
+        let poh_for_spawn = self.poh.clone();
         let parallel_executor_for_spawn = self.parallel_executor.clone();
         let adaptive_bft_for_spawn = self.adaptive_bft.clone();
         let pre_execution_for_spawn = self.pre_execution.clone();
@@ -13301,6 +13356,7 @@ impl BlockchainNode {
                                 fees_collected: 0, // v3.18: Genesis block has no fees
                                 state_root: [0u8; 32], // v3.27: Will be set after TX application
                                 timeout_round: 0, // v14.0: Genesis has no timeout
+                                prev_block_qc: None, // v14.7: Genesis has no predecessor
                             };
                             
                             // ═══════════════════════════════════════════════════════════════════
@@ -13971,7 +14027,7 @@ impl BlockchainNode {
             let mut last_production_height = 0u64;
             
             // QUANTUM VTS: Get reference for microblock production
-            let quantum_poh = quantum_poh_for_spawn.clone();
+            let poh = poh_for_spawn.clone();
             
             // PARALLEL EXECUTOR: Get reference for parallel processing
             let parallel_executor = parallel_executor_for_spawn.clone();
@@ -14757,15 +14813,65 @@ impl BlockchainNode {
                             local_delay
                         };
 
-                        // Timeout constants: fast recovery when producer is unavailable.
-                        const TIMEOUT_GRACE_PERIOD: u64 = 3;   // 3s grace before stall detection
-                        const TIMEOUT_VOTE_INTERVAL: u64 = 1;  // 1s per rotation round
+                        // v14.7 (pt 8): ADAPTIVE TIMEOUT GRACE PERIOD
+                        // ═══════════════════════════════════════════════════════════════
+                        // Problem: hardcoded 3s grace assumed block production ≤ 1s, but
+                        // rotation-boundary blocks legitimately take 4-12s because a
+                        // designated primary must run entropy bft_wait (≥ 3s) + PoH mix +
+                        // state_root + Dilithium sign + shred broadcast. Fixed grace
+                        // caused every rotation boundary to fire spurious timeout votes
+                        // while the honest primary was still producing, triggering
+                        // unnecessary failovers.
+                        //
+                        // Formula:
+                        //   base_grace   = 3s + 2 × avg_peer_rtt  (steady-state WAN headroom)
+                        //   rotation_add = budget for entropy bft_wait + propagation at
+                        //                  current validator count
+                        //   grace        = base_grace + rotation_add  (only at boundary)
+                        //
+                        // Rotation boundary detection uses the same predicate as the
+                        // entropy check (microblock_height produced via
+                        // `select_microblock_producer_with_round` on a rotation block).
+                        //
+                        // Scales: O(1). Safe at 1000+ Super-node rounds.
+                        // ═══════════════════════════════════════════════════════════════
+                        let avg_peer_latency_ms: u64 = if let Some(p) = &unified_p2p {
+                            p.get_average_peer_latency()
+                        } else { 50 };
+                        let active_validator_count: usize = if let Some(p) = &unified_p2p {
+                            p.get_active_validator_count()
+                        } else { 5 };
+                        let is_rotation_boundary_now = microblock_height > 0
+                            && microblock_height % ROTATION_INTERVAL_BLOCKS == 0;
+
+                        // Steady-state grace: 3s floor + 2 × RTT for propagation headroom.
+                        let base_grace_secs: u64 = 3u64.max(3 + (2 * avg_peer_latency_ms) / 1000);
+
+                        // Rotation boundary budget: entropy bft_wait + broadcast fanout.
+                        // Matches max_consensus_wait ceiling used in the production loop
+                        // (see max_consensus_wait at the bft_wait site) so the grace
+                        // always covers the longest legitimate production path.
+                        let rotation_extra_secs: u64 = match active_validator_count {
+                            0..=50    => 12, // genesis: 3s bft_wait + 4s poh/sign + 5s margin
+                            51..=200  => 9,
+                            201..=1000 => 7,
+                            _         => 8,  // 1000+ cap (MAX_VALIDATORS)
+                        };
+
+                        let timeout_grace_period: u64 = if is_rotation_boundary_now {
+                            base_grace_secs + rotation_extra_secs
+                        } else {
+                            base_grace_secs
+                        };
+                        // Keep vote interval as 1s so escalation cadence stays dense
+                        // once a real stall IS detected beyond the grace window.
+                        let timeout_vote_interval: u64 = 1;
 
                         // Calculate proposed timeout round from delay (uncapped)
-                        let proposed_timeout_round = if local_delay <= TIMEOUT_GRACE_PERIOD {
+                        let proposed_timeout_round = if local_delay <= timeout_grace_period {
                             0
                         } else {
-                            ((local_delay - TIMEOUT_GRACE_PERIOD) / TIMEOUT_VOTE_INTERVAL + 1) as u64
+                            ((local_delay - timeout_grace_period) / timeout_vote_interval + 1) as u64
                         };
 
                         // v4.2: Timeout votes/certificates keyed by MACROBLOCK INDEX,
@@ -14894,7 +15000,7 @@ impl BlockchainNode {
                                 if let Some(_p2p) = &unified_p2p {
                                     let current_producer = Self::select_microblock_producer_with_round(
                                         next_height, &unified_p2p, &node_id, node_type,
-                                        Some(&storage), &quantum_poh, timeout_round_for_rotation
+                                        Some(&storage), &poh, timeout_round_for_rotation
                                     ).await;
 
                                     if is_info() {
@@ -15950,14 +16056,16 @@ impl BlockchainNode {
                 // Using LAST_BLOCK_PRODUCED_TIME ensures all synced nodes compute SAME delay!
                 let timeout_round = get_current_timeout_round();
                 
-                // v3.8: Use select_microblock_producer_with_round for deterministic failover
-                let mut current_producer = Self::select_microblock_producer_with_round(
+                // v3.8: Use select_microblock_producer_with_round for deterministic failover.
+                // Value is read-only after this point (validated via is_my_turn_to_produce,
+                // cloned into NodeState/logs); mutability was spurious.
+                let current_producer = Self::select_microblock_producer_with_round(
                     next_block_height,
-                    &unified_p2p, 
-                    &node_id, 
+                    &unified_p2p,
+                    &node_id,
                     node_type,
                     Some(&storage),
-                    &quantum_poh,
+                    &poh,
                     timeout_round  // CRITICAL: Pass timeout_round for deterministic failover!
                 ).await;
                 
@@ -16098,6 +16206,81 @@ impl BlockchainNode {
                     && next_block_height % FORK_CHECK_INTERVAL == 0
                     && !is_rotation_boundary_check; // Skip when rotation does full entropy check
 
+                // ═══════════════════════════════════════════════════════════════
+                // v14.7 (pt 1): ENTROPY LOOKAHEAD — pre-request for next rotation
+                // ═══════════════════════════════════════════════════════════════
+                // Problem: the rotation-boundary block (every 30 microblocks) is
+                // the slow block — its producer must complete an entropy
+                // bft_wait loop (up to 3 s) before signing. That wait is
+                // synchronous inside the production path, which blows the
+                // 1 s/block budget and opens a 10 s fork window at every
+                // rotation.
+                //
+                // Fix: start collecting entropy responses for the UPCOMING
+                // rotation height N+2 blocks in advance. Requests are
+                // fire-and-forget (no await on response), so they add no
+                // latency to the current block. By the time we actually
+                // reach the rotation boundary, ENTROPY_RESPONSES already
+                // contains >= 60% peer replies and the bft_wait loop exits
+                // on its first poll iteration (< 200 ms).
+                //
+                // Lookahead distance: 2 blocks. Gives ~2 s for WAN propagation
+                // + response processing even on continental links. Larger
+                // windows risk stale entropy; smaller windows leave no
+                // headroom. 2 is the sweet spot for 1 s block time.
+                //
+                // Scales: fire-and-forget, O(sample_size) per lookahead call.
+                // With MAX_VALIDATORS=1000 and sample=100 the added load is
+                // ~100 outbound requests per 30 blocks = 3.3 req/s per node.
+                // Bandwidth-neutral vs. the unsolicited stream the entropy
+                // system would generate during bft_wait anyway.
+                // ═══════════════════════════════════════════════════════════════
+                const ENTROPY_LOOKAHEAD_BLOCKS: u64 = 2;
+                let is_entropy_lookahead = next_block_height > 1
+                    && !is_rotation_boundary_check
+                    && (next_block_height + ENTROPY_LOOKAHEAD_BLOCKS > 1)
+                    && ((next_block_height + ENTROPY_LOOKAHEAD_BLOCKS - 1) % ROTATION_INTERVAL_BLOCKS == 0);
+                if is_entropy_lookahead {
+                    if let Some(p2p) = &unified_p2p {
+                        let future_height = next_block_height + ENTROPY_LOOKAHEAD_BLOCKS;
+                        let entropy_target_height = if future_height > FINALITY_WINDOW {
+                            future_height - FINALITY_WINDOW
+                        } else {
+                            future_height.saturating_sub(1)
+                        };
+                        let peers = p2p.get_validated_active_peers();
+                        // Match sample_size logic from main entropy path — cap by
+                        // producer count tier so 1000+ networks don't broadcast
+                        // storm. Bounds stay equal to the reactive path.
+                        let qualified = p2p.get_qualified_producers_count();
+                        let sample_size = match qualified {
+                            0..=50    => std::cmp::min(peers.len(), 50),
+                            51..=200  => std::cmp::min(peers.len(), 20),
+                            201..=1000 => std::cmp::min(peers.len(), 50),
+                            _         => std::cmp::min(peers.len(), 100),
+                        };
+                        let request = crate::unified_p2p::NetworkMessage::EntropyRequest {
+                            block_height: entropy_target_height,
+                            requester_id: node_id.clone(),
+                        };
+                        let mut sent = 0usize;
+                        for peer in peers.iter().take(sample_size) {
+                            if peer.id == node_id {
+                                continue;
+                            }
+                            if ENTROPY_RESPONSES.contains_key(&(entropy_target_height, peer.id.clone())) {
+                                continue;
+                            }
+                            p2p.send_network_message(&peer.addr, request.clone());
+                            sent += 1;
+                        }
+                        if sent > 0 && is_info() {
+                            println!("[INFO][CONS] entropy_lookahead future_rot_h={} entropy_h={} peers_queried={}",
+                                     future_height, entropy_target_height, sent);
+                        }
+                    }
+                }
+
                 if is_fork_check {
                     if let Some(p2p) = &unified_p2p {
                         // Check a finalized block (FINALITY_WINDOW deep) — all synced nodes have it
@@ -16189,6 +16372,71 @@ impl BlockchainNode {
                     let entropy_role = if is_my_turn_to_produce { "producer" } else { "validator" };
                     if is_info() {
                         println!("[INFO][CONS] rotation_boundary h={} role={} entropy_check", next_block_height, entropy_role);
+                    }
+
+                    // ═══════════════════════════════════════════════════════════
+                    // v14.7 (pt 6): QC-BEFORE-PRODUCE at rotation boundary
+                    // ═══════════════════════════════════════════════════════════
+                    // Before an incoming primary produces the first block of a
+                    // new rotation (h where (h-1) % 30 == 0), verify that the
+                    // PREVIOUS rotation's terminal block is durable locally.
+                    // Without this check, a producer elected at rotation N
+                    // could extend the chain before rotation N-1's last block
+                    // is even persisted on this node — giving rise to an
+                    // internal fork between our local tip and what we're about
+                    // to broadcast.
+                    //
+                    // The check has two parts:
+                    //   1. Local continuity: our storage HAS the block at
+                    //      (next_block_height - 1), i.e. the last block of the
+                    //      outgoing rotation round.
+                    //   2. No newer certificate overrides our view: if a peer
+                    //      has already certified a higher timeout_round for
+                    //      this macroblock index, OUR view of the outgoing
+                    //      round is obsolete and we should not produce.
+                    //
+                    // Producer fails-soft: logs a warning and SKIPS production
+                    // for this iteration; the main loop polls again shortly.
+                    // Validators are unaffected.
+                    //
+                    // Scales: two storage look-ups + one DashMap read. O(1).
+                    // Safe at 1000+ Super-node round.
+                    // ═══════════════════════════════════════════════════════════
+                    if is_my_turn_to_produce && next_block_height > ROTATION_INTERVAL_BLOCKS {
+                        let prev_rotation_last_h = next_block_height - 1;
+                        let local_prev_block_present = storage
+                            .load_microblock(prev_rotation_last_h)
+                            .ok()
+                            .flatten()
+                            .is_some();
+                        let mb_idx_here = next_block_height / 90;
+                        let observed_certified = if let Some(p) = &unified_p2p {
+                            p.get_highest_certified_round(mb_idx_here)
+                        } else { 0 };
+                        // We're entering round R at this rotation; R is derived
+                        // from rotation index inside macroblock. A certificate
+                        // for R' > expected_round_of_this_rotation means the
+                        // network already certified a failover past our entry
+                        // point — we should yield before producing.
+                        let expected_entry_round = ((next_block_height - 1) / ROTATION_INTERVAL_BLOCKS) % 1_000;
+                        let cert_overrides_entry = observed_certified > expected_entry_round
+                            && observed_certified > 0;
+
+                        if !local_prev_block_present || cert_overrides_entry {
+                            if is_warn() {
+                                println!(
+                                    "[WARN][PROD] qc_before_produce_failed h={} prev_h={} prev_present={} cert_round_observed={} entry_round={} action=skip_iter",
+                                    next_block_height, prev_rotation_last_h,
+                                    local_prev_block_present, observed_certified,
+                                    expected_entry_round
+                                );
+                            }
+                            // Short sleep to avoid tight loop; next iteration
+                            // of production tick will re-evaluate after sync
+                            // catches up or cert is observed.
+                            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                            continue;
+                        }
                     }
                     
                     if let Some(p2p) = &unified_p2p {
@@ -17973,7 +18221,7 @@ impl BlockchainNode {
                                     // FALLBACK: Use local PoH to prevent node from getting stuck
                                     POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
                                     println!("[WARN][MB] poh_fallback retries={} source=local", retry);
-                                    if let Some(ref poh) = quantum_poh {
+                                    if let Some(ref poh) = poh {
                                         let (hash, count, _slot) = poh.get_state().await;
                                         (hash, count)
                                     } else {
@@ -17994,7 +18242,7 @@ impl BlockchainNode {
                                     // FALLBACK: Use local PoH to prevent node from getting stuck
                                     POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
                                     println!("[WARN][MB] poh_fallback_on_error retries={}", retry);
-                                    if let Some(ref poh) = quantum_poh {
+                                    if let Some(ref poh) = poh {
                                         let (hash, count, _slot) = poh.get_state().await;
                                         (hash, count)
                                     } else {
@@ -18010,7 +18258,7 @@ impl BlockchainNode {
                         }
                     } else {
                         // Block #1: use local PoH or zero
-                        if let Some(ref poh) = quantum_poh {
+                        if let Some(ref poh) = poh {
                             let (hash, count, _slot) = poh.get_state().await;
                             (hash, count)
                         } else {
@@ -18114,6 +18362,18 @@ impl BlockchainNode {
                         txs.truncate(limit_idx);
                     }
                     
+                    // v14.7 (pipelined QC): attach QuorumCertificate for
+                    // height-1 if 2f+1 commit votes are already aggregated.
+                    // Producers strictly prefer attaching a QC — blocks with
+                    // None are accepted only during the genesis/boot window
+                    // to bootstrap the chain without a predecessor.
+                    let prev_block_qc_bytes: Option<Vec<u8>> = if next_block_height > 1 {
+                        crate::unified_p2p::quorum_cert_for_block(next_block_height - 1)
+                            .and_then(|qc| bincode::serialize(&qc).ok())
+                    } else {
+                        None
+                    };
+
                     let mut microblock = qnet_state::MicroBlock {
                         height: next_block_height,  // Use next_block_height instead of microblock_height
                         timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
@@ -18131,6 +18391,7 @@ impl BlockchainNode {
                         fees_collected: block_fees_collected, // v3.18: Direct to producer
                         state_root: [0u8; 32], // v3.27: Will be set below after TX+fees application
                         timeout_round: get_current_timeout_round(), // v14.0: Record for producer authority verification
+                        prev_block_qc: prev_block_qc_bytes, // v14.7: Embedded 2f+1 QC for h-1
                     };
                     
                     // ═══════════════════════════════════════════════════════════════════════════
@@ -18256,7 +18517,7 @@ impl BlockchainNode {
                     }
                     
                     // QUANTUM VTS: Mix microblock into VTS chain for cryptographic time proof
-                    if let Some(ref poh) = quantum_poh {
+                    if let Some(ref poh) = poh {
                         let block_data = bincode::serialize(&microblock).unwrap_or_default();
                         match poh.create_microblock_proof(&block_data).await {
                             Ok(poh_entry) => {
@@ -18621,7 +18882,80 @@ impl BlockchainNode {
                     let height_for_storage = microblock.height;
                     let p2p_for_reward = unified_p2p.clone();
                     let rotation_tracker_clone = rotation_tracker.clone();
-                    
+
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // v14.6: STALE-ROUND GUARD (pre-save re-check of consensus view)
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // Problem root-caused from testnet h=4711 split-brain:
+                    //
+                    //   * Block production takes 8-15 s (entropy bft_wait → PoH mixing →
+                    //     state_root → Dilithium sign → serialize). The producer is busy
+                    //     for that entire window.
+                    //   * During the window, validators may cast signed timeout votes.
+                    //     Enough of them reach f+1 / 2f+1 → adopted / certified round
+                    //     advances past 0. Other nodes switch to the failover producer.
+                    //   * The slow primary returns from its pipeline with a block signed
+                    //     for the OLD round (e.g. timeout_round=0). The failover producer
+                    //     meanwhile has already produced its own block for the NEW round
+                    //     (e.g. timeout_round=16). Both blocks are valid-looking at height
+                    //     h; different peers accept different ones first → split-brain.
+                    //
+                    // v14.4 removed the local `fallback_selected_self` short-cut that
+                    // allowed a node to self-promote without 2f+1 votes, but this path is
+                    // different — it's the legitimate primary producer failing to notice
+                    // that consensus has already rotated away from it.
+                    //
+                    // Top-tier BFT design:
+                    //   Leader commitment is valid only if "I am still leader at commit
+                    //   time". Before broadcasting the final block, re-read the certified
+                    //   / adopted round from shared state. If it advanced past the round
+                    //   we locked in at production start, our block is stale — yield
+                    //   silently. The failover producer's block (at the new round) wins.
+                    //
+                    // Safety:
+                    //   * Hash chain + Dilithium sig + state_root still validate both
+                    //     candidate blocks — we never accept garbage. This guard only
+                    //     PREVENTS us from emitting a second valid candidate.
+                    //   * Validators additionally reject stale-round blocks in the pipeline
+                    //     verify stage (defence-in-depth added in block_pipeline.rs).
+                    //
+                    // Scalability:
+                    //   * Two atomic reads (HIGHEST_CERTIFIED_ROUND, HIGHEST_ADOPTED_ROUND
+                    //     DashMap lookup). Microseconds. Unaffected by validator count.
+                    //
+                    // Liveness:
+                    //   * If the primary yields, the failover leader's block stands.
+                    //   * If nobody else has a block ready, the next iteration of the
+                    //     production loop picks up the new round deterministically and
+                    //     produces cleanly.
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    if let Some(p2p_guard) = &unified_p2p {
+                        let guard_mb = height_for_storage / 90;
+                        let cert_now = p2p_guard.get_highest_certified_round(guard_mb);
+                        let total_now = p2p_guard.get_active_validator_count();
+                        let f1_now = (total_now + 2) / 3;
+                        let adopt_now = p2p_guard.get_highest_adopted_round(guard_mb, f1_now);
+                        let latest_round_now = cert_now.max(adopt_now);
+                        if latest_round_now > microblock.timeout_round {
+                            println!(
+                                "[WARN][PROD] yield_stale_round h={} produced_for_round={} latest_certified={} latest_adopted={} action=skip_save",
+                                height_for_storage, microblock.timeout_round,
+                                cert_now, adopt_now
+                            );
+                            // Clear broadcast lock so the next iteration can proceed
+                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            // Return TX to mempool so the failover producer can include them
+                            if !included_tx_hashes.is_empty() && is_debug() {
+                                println!(
+                                    "[DBG][MEMPOOL] yield_stale_round tx_count={} left_in_mempool",
+                                    included_tx_hashes.len()
+                                );
+                            }
+                            continue;
+                        }
+                    }
+
                     // Save synchronously to ensure block exists before height increment
                     // This is FAST (just RocksDB write, ~10-50ms) and prevents race conditions
                     let save_result = storage_clone.save_block_with_delta(height_for_storage, &microblock_data);
@@ -19877,11 +20211,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         own_node_id: &str,
         own_node_type: NodeType,
         storage: Option<&Arc<Storage>>,
-        quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>,
+        poh: &Option<Arc<crate::poh::PoH>>,
     ) -> String {
         // v3.8: Wrapper that calls internal function with timeout_round=0 (normal selection)
         Self::select_microblock_producer_with_round(
-            current_height, unified_p2p, own_node_id, own_node_type, storage, quantum_poh, 0
+            current_height, unified_p2p, own_node_id, own_node_type, storage, poh, 0
         ).await
     }
     
@@ -19894,7 +20228,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         own_node_id: &str,
         own_node_type: NodeType,
         storage: Option<&Arc<Storage>>,
-        _quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>,
+        _poh: &Option<Arc<crate::poh::PoH>>,
         timeout_round: u64,
     ) -> String {
         // PRODUCTION v4.0: Dilithium3-VRF Secret Leader Election
@@ -26286,7 +26620,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             &self.node_id,
             self.node_type,
             Some(&self.storage),
-            &self.quantum_poh  // Pass PoH for quantum entropy
+            &self.poh  // Pass PoH for quantum entropy
         ).await;
         
         // Additional check: only return true if we're synchronized
@@ -30455,7 +30789,7 @@ impl BlockchainNode {
                 let key = format!("poh_checkpoint_{}", latest_count);
                 if let Ok(Some(compressed_data)) = storage.load_raw(&key) {
                     if let Ok(decompressed) = zstd::decode_all(&compressed_data[..]) {
-                        if let Ok(entry) = bincode::deserialize::<crate::quantum_poh::PoHEntry>(&decompressed) {
+                        if let Ok(entry) = bincode::deserialize::<crate::poh::PoHEntry>(&decompressed) {
                             println!("[INFO][NODE] poh_checkpoint_loaded source=index count={}", entry.num_hashes);
                             return Some((entry.hash, entry.num_hashes));
                         }
@@ -30479,7 +30813,7 @@ impl BlockchainNode {
             
             if let Ok(Some(compressed_data)) = storage.load_raw(&key) {
                 if let Ok(decompressed) = zstd::decode_all(&compressed_data[..]) {
-                    if let Ok(entry) = bincode::deserialize::<crate::quantum_poh::PoHEntry>(&decompressed) {
+                    if let Ok(entry) = bincode::deserialize::<crate::poh::PoHEntry>(&decompressed) {
                         latest_checkpoint = Some((entry.hash.clone(), entry.num_hashes));
                         println!("[INFO][NODE] poh_checkpoint_found count={}", entry.num_hashes);
                         
@@ -30542,8 +30876,8 @@ impl Clone for BlockchainNode {
             parallel_validator: self.parallel_validator.clone(),
             archive_manager: self.archive_manager.clone(),
             reward_manager: self.reward_manager.clone(),
-            quantum_poh: self.quantum_poh.clone(),
-            quantum_poh_receiver: None, // Cannot clone receiver - use None for cloned instances
+            poh: self.poh.clone(),
+            poh_receiver: None, // Cannot clone receiver - use None for cloned instances
             parallel_executor: self.parallel_executor.clone(),
             adaptive_bft: self.adaptive_bft.clone(),
             pre_execution: self.pre_execution.clone(),

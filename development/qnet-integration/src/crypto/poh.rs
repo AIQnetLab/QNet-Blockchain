@@ -89,7 +89,7 @@ pub struct PoHEntry {
 ///
 /// INVARIANT: hash_count MUST always increase monotonically
 #[derive(Debug)]
-pub struct QuantumPoH {
+pub struct PoH {
     /// Current hash in the chain (64 bytes)
     current_hash: Arc<RwLock<[u8; 64]>>,
     /// Number of hashes computed (atomic for fast reads)
@@ -110,7 +110,7 @@ pub struct QuantumPoH {
     backward_sync_count: Arc<AtomicU64>,
 }
 
-impl QuantumPoH {
+impl PoH {
     /// Create new Quantum VTS instance from genesis hash
     pub fn new(genesis_hash: Vec<u8>) -> (Self, mpsc::Receiver<PoHEntry>) {
         let (entry_sender, entry_receiver) = mpsc::channel(10_000); // Bounded: 10K PoH entries max
@@ -237,11 +237,11 @@ impl QuantumPoH {
     pub async fn start(&self) {
         // Check if already running (atomic, no lock needed)
         if self.is_running.swap(true, Ordering::SeqCst) {
-            println!("[QuantumPoH] ⚠️ Already running");
+            println!("[PoH] ⚠️ Already running");
             return;
         }
         
-        println!("[QuantumPoH] 🚀 Starting Quantum VTS generator (500K hashes/sec)");
+        println!("[PoH] 🚀 Starting Quantum VTS generator (500K hashes/sec)");
         
         // Clone Arc references for the spawned task
         let current_hash = self.current_hash.clone();
@@ -336,13 +336,13 @@ impl QuantumPoH {
                     if elapsed > expected {
                         let drift = (elapsed - expected).as_secs_f64() / expected.as_secs_f64();
                         if drift > MAX_DRIFT_PERCENT {
-                            println!("[QuantumPoH] ⚠️ Clock drift: {:.2}% slow (slot {})", 
+                            println!("[PoH] ⚠️ Clock drift: {:.2}% slow (slot {})", 
                                     drift * 100.0, new_slot);
                         }
                     } else {
                         let drift = (expected - elapsed).as_secs_f64() / expected.as_secs_f64();
                         if drift > MAX_DRIFT_PERCENT {
-                            println!("[QuantumPoH] ⚠️ Clock drift: {:.2}% fast (slot {})", 
+                            println!("[PoH] ⚠️ Clock drift: {:.2}% fast (slot {})", 
                                     drift * 100.0, new_slot);
                         }
                     }
@@ -359,7 +359,7 @@ impl QuantumPoH {
                     
                     // Log every 10 slots
                     if new_slot % 10 == 0 && new_slot > 0 {
-                        println!("[QuantumPoH] ⚡ {:.2}M hashes/sec, Slot: {}, Count: {}", 
+                        println!("[PoH] ⚡ {:.2}M hashes/sec, Slot: {}, Count: {}", 
                                 hps as f64 / 1_000_000.0, new_slot, new_count);
                     }
                     
@@ -368,21 +368,27 @@ impl QuantumPoH {
                 }
             }
             
-            println!("[QuantumPoH] 🛑 Generator stopped");
+            println!("[PoH] 🛑 Generator stopped");
         });
     }
     
     /// Stop the PoH generator
     pub async fn stop(&self) {
-        println!("[QuantumPoH] 🛑 Stopping PoH generator");
+        println!("[PoH] 🛑 Stopping PoH generator");
         self.is_running.store(false, Ordering::SeqCst);
     }
     
     /// Mix data (transaction/block) into the PoH chain
-    /// 
+    ///
     /// This creates a verifiable proof that the data existed at this point
-    /// in the PoH sequence. Uses pure SHA3-512 for deterministic verification.
-    /// 
+    /// in the PoH sequence. Uses Blake3 for deterministic verification —
+    /// chosen over SHA3-512 for per-tick hashing performance (≈5× faster
+    /// while retaining 128-bit post-quantum security via Grover's bound).
+    /// PoH is an internal time-sequence primitive and is NOT exposed as a
+    /// consumer-facing crypto contract; consumer-facing commitments (block
+    /// signatures, state Merkle) use NIST-standardised Dilithium3 and
+    /// SHA3-256 respectively.
+    ///
     /// THREAD SAFETY: Acquires update_mutex to serialize with generator
     pub async fn mix_transaction(&self, tx_data: Vec<u8>) -> Result<PoHEntry, String> {
         if !self.is_running.load(Ordering::SeqCst) {
@@ -472,7 +478,7 @@ impl QuantumPoH {
         for (entry_idx, entry) in entries.iter().enumerate() {
             // CRITICAL: Counter must be strictly increasing
             if entry.num_hashes <= last_count {
-                println!("[QuantumPoH] ❌ Entry {}: count {} <= previous {}", 
+                println!("[PoH] ❌ Entry {}: count {} <= previous {}", 
                         entry_idx, entry.num_hashes, last_count);
                 return false;
             }
@@ -507,7 +513,7 @@ impl QuantumPoH {
             
             // Verify hash matches
             if hash_bytes.to_vec() != entry.hash {
-                println!("[QuantumPoH] ❌ Entry {}: hash mismatch at count {}", 
+                println!("[PoH] ❌ Entry {}: hash mismatch at count {}", 
                         entry_idx, entry.num_hashes);
                 return false;
             }
@@ -515,7 +521,7 @@ impl QuantumPoH {
             last_count = entry.num_hashes;
         }
         
-        println!("[QuantumPoH] ✅ Verified {} entries", entries.len());
+        println!("[PoH] ✅ Verified {} entries", entries.len());
         true
     }
 }
@@ -524,7 +530,7 @@ impl QuantumPoH {
 // QNet Block Integration
 // ============================================================================
 
-impl QuantumPoH {
+impl PoH {
     /// Create PoH proof for a microblock
     /// 
     /// This mixes the block data into the PoH chain, creating a verifiable
@@ -554,6 +560,6 @@ impl QuantumPoH {
 
 // Type aliases for public API (VTS = Verifiable Time Sequence)
 /// Verifiable Time Sequence - cryptographic time ordering
-pub type VerifiableTimeSequence = QuantumPoH;
+pub type VerifiableTimeSequence = PoH;
 /// VTS Entry - checkpoint in the verifiable time chain  
 pub type VTSEntry = PoHEntry;

@@ -16,7 +16,7 @@
 //! ├── mod.rs              - This file (public exports)
 //! ├── hybrid_crypto.rs    - Dilithium + Ed25519 hybrid signatures
 //! ├── quantum_crypto.rs   - Quantum-resistant cryptography core
-//! ├── quantum_poh.rs      - Verifiable Time Sequence (VTS)
+//! ├── poh.rs              - Verifiable Time Sequence (VTS)
 //! ├── vrf.rs              - Legacy VRF (deprecated)
 //! ├── vrf_hybrid.rs       - Hybrid VRF for QRB (NOT producer selection)
 //! ├── key_manager.rs      - Key generation and management
@@ -49,7 +49,7 @@ pub mod quantum_crypto;
 
 /// Verifiable Time Sequence (VTS)
 /// Time-based consensus with quantum-resistant hashing
-pub mod quantum_poh;
+pub mod poh;
 
 /// Dilithium3-VRF: Post-quantum VRF for secret leader election
 /// Uses NIST FIPS 204 (ML-DSA-65) + SHA3-256
@@ -97,8 +97,8 @@ pub use quantum_crypto::{
 };
 
 // Quantum VTS types
-pub use quantum_poh::{
-    QuantumPoH,
+pub use poh::{
+    PoH,
     PoHEntry,
 };
 

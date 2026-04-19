@@ -53,6 +53,13 @@ pub fn is_legacy_genesis_node(node_id: &str) -> bool {
     LEGACY_GENESIS_NODES.contains(&node_id)
 }
 
+/// v14.7: Count of genesis validators — hard floor for quorum computation
+/// when the live validator set cache is empty (cold-start / pre-handshake).
+/// Every genesis node appears in `LEGACY_GENESIS_NODES`.
+pub fn genesis_node_count() -> usize {
+    LEGACY_GENESIS_NODES.len()
+}
+
 /// Get Genesis node IP by bootstrap ID (001-005)
 pub fn get_genesis_ip_by_id(bootstrap_id: &str) -> Option<&'static str> {
     for (ip, id) in GENESIS_NODE_IPS {

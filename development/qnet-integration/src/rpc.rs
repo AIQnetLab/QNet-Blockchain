@@ -7492,7 +7492,7 @@ async fn handle_poh_status(remote_addr: Option<std::net::SocketAddr>, blockchain
         return Ok(resp);
     }
     // CRITICAL FIX: Get real hash rate from PoH instance
-    let (enabled, hash_rate_str, status) = if let Some(poh) = blockchain.get_quantum_poh() {
+    let (enabled, hash_rate_str, status) = if let Some(poh) = blockchain.get_poh() {
         let hash_rate = poh.get_performance().await;
         let hash_rate_formatted = if hash_rate >= 1_000_000.0 {
             format!("{:.2}M hashes/sec", hash_rate / 1_000_000.0)
@@ -13359,7 +13359,7 @@ async fn handle_producer_status(
             &node_id,
             blockchain.get_node_type(),
             Some(&blockchain.get_storage()),
-            &blockchain.get_quantum_poh()
+            &blockchain.get_poh()
         ).await
     } else {
         node_id.to_string()  // Solo mode

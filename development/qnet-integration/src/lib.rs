@@ -45,7 +45,7 @@ pub mod crypto;
 // Backwards compatibility re-exports (so existing imports still work)
 pub use crypto::hybrid_crypto;
 pub use crypto::quantum_crypto;
-pub use crypto::quantum_poh;
+pub use crypto::poh;
 pub use crypto::vrf;
 pub use crypto::vrf_hybrid;
 pub use crypto::key_manager;

@@ -3,7 +3,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use qnet_integration::{
-    quantum_poh::QuantumPoH,
+    poh::PoH,
     vrf::{QNetVrf, select_producer_with_vrf},
     storage::PersistentStorage,
     node::NodeType,
