@@ -577,9 +577,13 @@ pub fn check_weak_subjectivity(chain_tip: u64) -> Result<(), String> {
 }
 
 /// v9.0 BUG-30: Check if rollback to target_height is allowed by finality rules.
-/// LAST_FINALIZED_HEIGHT stores mb_index * 90 = the highest finalized microblock height.
-/// All 8 code paths that set this value use the same mb_index*90 format.
-/// Returns Err with reason if rollback would violate finality.
+/// LEGACY v14.8: Non-atomic finality check. Exists only for diagnostic paths
+/// that need to inspect the current finality boundary WITHOUT claiming the
+/// rollback slot. All write-side rollback paths MUST instead use
+/// `crate::storage::begin_finality_guarded_rollback(target, finalized_h)`,
+/// which atomically combines the check with claiming the slot so that no
+/// thread can advance finality between the check and the delete loop.
+#[allow(dead_code)]
 pub fn check_finality_allows_rollback(target_height: u64) -> Result<(), String> {
     let finalized_height = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
     if finalized_height > 0 && target_height < finalized_height {
@@ -615,6 +619,24 @@ pub fn complete_rollback_cleanup(target_height: u64) {
 /// Auto-clear breaks the cycle: after 120s the mismatch is considered stale,
 /// finality resumes, production_gate opens, network recovers.
 pub fn try_advance_finality(round: u64, context: &str) -> bool {
+    // v14.8.1: ATOMIC ROLLBACK INVARIANT — serialised via FINALITY_MUTEX.
+    //
+    // Holding the finality-state mutex across the full read-check-store
+    // sequence eliminates the TOCTOU that atomic-only protection could not
+    // close: a rollback claim cannot land between our read of
+    // is_rollback_in_progress and our store to LAST_FINALIZED_HEIGHT while
+    // we hold this lock. The mutex is held for microseconds; it never
+    // covers `.await` points or storage I/O. Contention is negligible at
+    // scale because macroblock finality ticks at epoch boundaries (~every
+    // 90 s per mb), not per-microblock.
+    let _finality_guard = crate::storage::lock_finality_state();
+
+    if crate::storage::is_rollback_in_progress() {
+        if is_warn() {
+            println!("[WARN][{}] skip_finality_rollback_in_progress round={}", context, round);
+        }
+        return false;
+    }
     if ENTROPY_MISMATCH_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
         // v13.2: Auto-clear after timeout — prevents permanent deadlock
         let mismatch_age = {
@@ -1675,6 +1697,14 @@ impl BlockchainNode {
         if is_info() {
             println!("[INFO][VRF] self_pk_registered node={} pk_hash={}",
                      self.node_id, &pk_hex[..16]);
+        }
+
+        // v14.8: Register OWN PK with the consensus-layer registry. We hold the
+        // private key locally, so self-registration is implicitly proven. This
+        // closes the "pk_not_registered" rejection path for our own signatures
+        // as soon as the node has a keypair in hand.
+        if !qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(&self.node_id, &pk_bytes) {
+            println!("[WARN][CONSENSUS] self_consensus_pk_register_failed node={}", self.node_id);
         }
 
         // Create VRF instance from this identity
@@ -3279,6 +3309,10 @@ impl BlockchainNode {
                             if !crate::genesis_constants::has_vrf_key(node_id) {
                                 if let Ok(pk_bytes) = hex::decode(pk_hex) {
                                     crate::genesis_constants::register_vrf_public_key(node_id, &pk_bytes);
+                                    // v14.8: Mirror to consensus-layer registry. The TX was
+                                    // signature-validated by the chain before reaching this
+                                    // code path, so the (node_id, pk) binding is authenticated.
+                                    let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, &pk_bytes);
                                     if let Err(e) = storage.save_vrf_public_key(node_id, pk_hex) {
                                         if crate::node::is_warn() {
                                             println!("[WARN][STORAGE] vrf_pk_save_failed node={} err={}", node_id, e);
@@ -3300,6 +3334,8 @@ impl BlockchainNode {
                             if !crate::genesis_constants::has_vrf_key(node_id) {
                                 if let Ok(pk_bytes) = hex::decode(pk_hex) {
                                     crate::genesis_constants::register_vrf_public_key(node_id, &pk_bytes);
+                                    // v14.8: Mirror to consensus-layer registry (chain-authenticated).
+                                    let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, &pk_bytes);
                                     if let Err(e) = storage.save_vrf_public_key(node_id, pk_hex) {
                                         if crate::node::is_warn() {
                                             println!("[WARN][STORAGE] vrf_pk_save_failed node={} err={}", node_id, e);
@@ -7146,12 +7182,16 @@ impl BlockchainNode {
         if is_debug() { println!("[DBG][NODE] created node_id={}", node_id); }
         
         // v4.0: Restore VRF public keys from persistent storage
+        // v14.8: Also mirror each key into the consensus-layer registry.
+        // Keys in persistent storage were all installed from chain-validated
+        // NodeRegistration / NodeReactivation TXs, so they are authenticated.
         {
             match blockchain.storage.load_all_vrf_public_keys() {
                 Ok(keys) => {
                     let count = keys.len();
                     for (nid, pk_bytes) in keys {
                         crate::genesis_constants::register_vrf_public_key(&nid, &pk_bytes);
+                        let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(&nid, &pk_bytes);
                     }
                     if count > 0 {
                         println!("[INFO][NODE] vrf_pk_restored count={}", count);
@@ -7600,14 +7640,70 @@ impl BlockchainNode {
         
         // PRODUCTION v2.19.12: Start macroblock receiver handler
         // v3.2: CRITICAL FIX - Clear pending sync on errors to prevent stuck entries
+        // v14.8.2: Peer rotation when our node lacks the N-2 snapshot required
+        // for strict canonical validation — see process_received_macroblock.
         let blockchain_for_macroblocks = blockchain.clone();
         tokio::spawn(async move {
             while let Some(received_macroblock) = macroblock_rx.recv().await {
                 let index = received_macroblock.height;
+                // v14.8.2: Capture peer identity BEFORE consuming the message so we
+                // can cooldown the right sender if the sync gap is on our side.
+                let from_peer_hint = received_macroblock.from_peer.clone();
                 // Process received macroblock
                 if let Err(e) = blockchain_for_macroblocks.process_received_macroblock(received_macroblock).await {
                     // v3.2: CRITICAL - Clear pending sync on error to allow re-request
                     crate::unified_p2p::clear_macroblock_pending_sync(index);
+
+                    // v14.8.2: Detect the canonical "need_mb_prev:{X}" error emitted
+                    // by process_received_macroblock when our disk is missing the
+                    // N-2 snapshot required to validate the incoming macroblock.
+                    //
+                    // Two responses:
+                    //   1. Cool down the PEER we just received from. Not because
+                    //      they are malicious — they aren't; it's OUR sync gap —
+                    //      but SYNC_PEER_COOLDOWN's selector will pick a different
+                    //      peer for our follow-up sync request. That gives us
+                    //      deterministic peer rotation without explicitly wiring
+                    //      a ranked peer list through the call chain.
+                    //   2. Request the missing macroblock N-2. sync_macroblocks_inner
+                    //      honours SYNC_PEER_COOLDOWN, so step 1 is what routes us
+                    //      to a different peer.
+                    //
+                    // When N-2 arrives, its own processing will populate the eligible
+                    // snapshot; a future retry of the original macroblock (from any
+                    // peer) will then pass the strict committee-size check.
+                    let err_str = e.to_string();
+                    if let Some(need) = err_str.strip_prefix("Sync error: need_mb_prev:")
+                                           .or_else(|| err_str.strip_prefix("need_mb_prev:"))
+                    {
+                        // Extract missing mb index from the `{X} for validating mb#{N}`
+                        // payload. Take everything before the first whitespace.
+                        let missing_idx_str = need.split_whitespace().next().unwrap_or("");
+                        if let Ok(missing_idx) = missing_idx_str.parse::<u64>() {
+                            if crate::node::is_warn() {
+                                println!("[WARN][MB-SYNC] need_n_minus_2 mb={} missing_n2={} peer={} — cooling peer + requesting N-2 from rotation",
+                                         index, missing_idx, from_peer_hint);
+                            }
+                            // Cool down the source peer so the next call picks
+                            // a different one. record_sync_peer_failure respects
+                            // SYNC_PEER_COOLDOWN cadence internally.
+                            crate::unified_p2p::record_sync_peer_failure(&from_peer_hint);
+
+                            // Kick off async sync of the missing N-2. When it
+                            // lands, re-broadcast of the original macroblock
+                            // (or a fresh sync_macroblocks(index,index) call)
+                            // will find N-2 on disk and validate cleanly.
+                            let p2p_for_rotation = blockchain_for_macroblocks.unified_p2p.clone();
+                            tokio::spawn(async move {
+                                if let Some(p2p) = p2p_for_rotation {
+                                    let _ = p2p.sync_macroblocks(missing_idx, missing_idx).await;
+                                }
+                            });
+                            // Not an error for logging purposes — this is the
+                            // expected rotation flow, not a failure.
+                            continue;
+                        }
+                    }
                     eprintln!("[ERR][MB-SYNC] process_failed idx={} err={}", index, e);
                 }
             }
@@ -7886,23 +7982,20 @@ impl BlockchainNode {
                                 our_hash: format!("ahead_by_{}", local_height - network_height),
                             });
                             
-                            // v3.23: Start rollback protection before deleting blocks
-                            if !crate::storage::start_rollback_protection(network_height) {
-                                println!("[WARN][ROLLBACK] protection_failed skipping");
+                            // v14.8: Atomic `claim slot + finality-check` in one step.
+                            // With the slot claimed, `try_advance_finality` is blocked,
+                            // so no thread can shift LAST_FINALIZED_HEIGHT into our
+                            // rollback range while we're deleting.
+                            let finalized_h = crate::node::LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                            if let Err(reason) = crate::storage::begin_finality_guarded_rollback(network_height, finalized_h) {
+                                println!("[WARN][ROLLBACK] {} — skipping rollback", reason);
                                 set_node_state(NodeState::Idle { last_height: local_height });
-                                return; // Exit async task
-                            }
-                            
-                            // ROLLBACK: Delete blocks from network_height+1 to local_height
-                            // This ensures we're on the same chain as the network
-                            let rollback_from = network_height + 1;
-                            let rollback_to = local_height;
-                            
-                            // v3.33: FINALITY CHECK — cannot rollback below finalized macroblock
-                            if let Err(reason) = crate::node::check_finality_allows_rollback(network_height) {
-                                println!("[ERR][ROLLBACK] {} — skipping rollback", reason);
                                 return;
                             }
+
+                            // ROLLBACK: Delete blocks from network_height+1 to local_height
+                            let rollback_from = network_height + 1;
+                            let rollback_to = local_height;
                             
                             if is_info() { println!("[INFO][ROLLBACK] deleting from={} to={}", rollback_from, rollback_to); }
                             
@@ -9018,19 +9111,14 @@ impl BlockchainNode {
                                                         // Rollback to fork point and resync
                                                         if fork_height <= local_height {
                                                             let rollback_to = fork_height.saturating_sub(1);
-                                                            
-                                                            // v3.33: FINALITY CHECK
-                                                            if let Err(reason) = crate::node::check_finality_allows_rollback(rollback_to) {
-                                                                println!("[ERR][REORG] {} — skipping reorg", reason);
+
+                                                            // v14.8: Atomic claim + finality check.
+                                                            let finalized_h = crate::node::LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                                                            if let Err(reason) = crate::storage::begin_finality_guarded_rollback(rollback_to, finalized_h) {
+                                                                println!("[WARN][REORG] {} — skipping reorg", reason);
                                                                 return;
                                                             }
-                                                            
-                                                            // v3.23: Start rollback protection
-                                                            if !crate::storage::start_rollback_protection(rollback_to) {
-                                                                println!("[WARN][REORG] rollback_protection_busy");
-                                                                return; // Exit async task
-                                                            }
-                                                            
+
                                                             if is_info() { println!("[INFO][REORG] rollback from={} to={}", local_height, rollback_to); }
                                                             
                                                             for h in fork_height..=local_height {
@@ -9125,17 +9213,12 @@ impl BlockchainNode {
                                                         if high_rep_count >= MIN_PEERS_FOR_RESYNC {
                                                             if is_info() { println!("[INFO][REORG] resync validators={}", high_rep_count); }
                                                             let rollback_to = fork_height.saturating_sub(1);
-                                                            
-                                                            // v3.33: FINALITY CHECK
-                                                            if let Err(reason) = crate::node::check_finality_allows_rollback(rollback_to) {
-                                                                println!("[ERR][REORG] {} — skipping resync", reason);
+
+                                                            // v14.8: Atomic claim + finality check.
+                                                            let finalized_h = crate::node::LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                                                            if let Err(reason) = crate::storage::begin_finality_guarded_rollback(rollback_to, finalized_h) {
+                                                                println!("[WARN][REORG] {} — skipping resync", reason);
                                                                 return;
-                                                            }
-                                                            
-                                                            // v3.23: Start rollback protection
-                                                            if !crate::storage::start_rollback_protection(rollback_to) {
-                                                                println!("[WARN][REORG] rollback_protection_busy case2");
-                                                                return; // Exit async task
                                                             }
                                                             
                                                             // Rollback to fork point
@@ -10427,9 +10510,11 @@ impl BlockchainNode {
                                             RECOVERY_FAIL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
                                             let cycle_start = (received_block.height / 90) * 90;
                                             let rb_target = if cycle_start >= 90 { cycle_start.saturating_sub(90) } else { 0 };
-                                            if let Err(reason) = check_finality_allows_rollback(rb_target) {
-                                                println!("[ERR][STATE] finality_blocks_rollback: {}", reason);
-                                            } else if crate::storage::start_rollback_protection(rb_target) {
+                                            // v14.8: Atomic claim + finality check in one step.
+                                            let finalized_h = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                                            if let Err(reason) = crate::storage::begin_finality_guarded_rollback(rb_target, finalized_h) {
+                                                println!("[WARN][STATE] rollback_skipped reason={}", reason);
+                                            } else {
                                                 for h in (rb_target + 1)..=received_block.height {
                                                     if let Err(e) = storage.delete_microblock(h) {
                                                         eprintln!("[ERR][STORAGE] rollback_delete_failed h={} err={}", h, e);
@@ -10583,12 +10668,6 @@ impl BlockchainNode {
                 // MONITORING ONLY: Log if significantly behind network (not a fork, just sync needed)
                 if should_check_fork() {
                     if let Some(p2p) = &unified_p2p {
-                        // v13.0: Update dynamic fork recovery threshold based on connected peers.
-                        // Pipeline verify_stage has no P2P access — reads AtomicUsize instead.
-                        // Formula: f+1 = ceil(connected/3), clamped to [3, 20].
-                        let connected = p2p.get_connected_peer_count();
-                        crate::block_pipeline::update_fork_threshold(connected);
-
                         if let Ok(network_height) = p2p.sync_blockchain_height().await {
                             let local_height = *height.read().await;
 
@@ -13356,7 +13435,6 @@ impl BlockchainNode {
                                 fees_collected: 0, // v3.18: Genesis block has no fees
                                 state_root: [0u8; 32], // v3.27: Will be set after TX application
                                 timeout_round: 0, // v14.0: Genesis has no timeout
-                                prev_block_qc: None, // v14.7: Genesis has no predecessor
                             };
                             
                             // ═══════════════════════════════════════════════════════════════════
@@ -14588,72 +14666,30 @@ impl BlockchainNode {
                                 last_macroblock_trigger = new_trigger;
                             }
                             
-                            // ═══════════════════════════════════════════════════════════════
-                            // FIX v2.48: PFP ACTIVATION IN SYNC MODE
-                            // ═══════════════════════════════════════════════════════════════
-                            // Root cause of incident: node 002 was elected mb=509 INITIATOR
-                            // but was in catch-up sync mode at h=45810. The PFP trigger only
-                            // fires inside the production loop (check_height % 90 == 0).
-                            // A syncing node never runs the production loop → PFP never fires
-                            // → mb=509 was never initiated → network stall → fork.
-                            //
-                            // FIX: After sync advances past an epoch boundary, check if the
-                            // macroblock for that epoch is MISSING. If so, activate PFP from
-                            // this sync-path, independent of the production loop.
-                            // ═══════════════════════════════════════════════════════════════
+                            // v14.7.2: After sync advances past an epoch boundary, request missing
+                            // macroblocks directly from peers. Canonical BFT finality is produced by
+                            // the regular 2f+1 macroblock consensus at the 90-block boundary —
+                            // no degraded thresholds, no Byzantine-unsafe fallbacks.
                             if canonical_height > 180 && canonical_height > old_height {
-                                // Check every epoch boundary we just crossed during this sync
                                 let first_epoch_boundary = ((old_height / 90) + 1) * 90;
                                 let mut check_boundary = first_epoch_boundary;
                                 while check_boundary <= canonical_height {
                                     let expected_mb = check_boundary / 90;
-                                    // Only check if macroblock is actually missing
                                     let mb_missing = storage
                                         .get_macroblock_by_height(expected_mb)
                                         .map(|r| r.is_none())
                                         .unwrap_or(true);
-                                    
+
                                     if mb_missing && expected_mb > 0 {
                                         let blocks_since = canonical_height.saturating_sub(check_boundary);
-                                        println!("[WARN][SYNC] epoch_boundary_crossed h={} mb={} MISSING blocks_without={} → activating PFP from sync path",
+                                        println!("[WARN][SYNC] epoch_boundary_crossed h={} mb={} MISSING blocks_without={} → direct macroblock sync",
                                                  canonical_height, expected_mb, blocks_since);
-                                        
-                                        // FIX v2.49: Fast direct macroblock request BEFORE full PFP
-                                        // The macroblock leader already produced and broadcast it.
-                                        // First try a quick direct sync (no wait) - if the MB is already
-                                        // on the network, this is immediate. Only fall back to full PFP if
-                                        // the quick request fails, eliminating the unnecessary 2-sec delay.
-                                        let storage_pfp = storage.clone();
-                                        let consensus_pfp = consensus.clone();
+
                                         let p2p_pfp = unified_p2p.clone();
-                                        let pfp_height = canonical_height;
-                                        let pfp_blocks = blocks_since.max(1);
                                         tokio::spawn(async move {
-                                            // v2.49: Quick direct fetch (no initial delay)
-                                            // Leader broadcast the MB when it was created - it should be available now
                                             if let Some(ref p2p) = p2p_pfp {
                                                 let _ = p2p.sync_macroblocks(expected_mb, expected_mb).await;
-                                                // Give it 500ms to propagate
-                                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                             }
-                                            // Check if quick fetch was enough
-                                            let already_synced = storage_pfp
-                                                .get_macroblock_by_height(expected_mb)
-                                                .map(|r| r.is_some())
-                                                .unwrap_or(false);
-                                            if already_synced {
-                                                if is_info() { println!("[INFO][SYNC-PFP] mb={} fast_fetched skipping_pfp", expected_mb); }
-                                                return;
-                                            }
-                                            // Quick fetch failed - activate full PFP
-                                            println!("[INFO][SYNC-PFP] activating PFP for missing mb={} h={}", expected_mb, pfp_height);
-                                            Self::activate_progressive_finalization_with_level(
-                                                storage_pfp,
-                                                consensus_pfp,
-                                                pfp_height,
-                                                p2p_pfp,
-                                                pfp_blocks,
-                                            ).await;
                                         });
                                     }
                                     check_boundary += 90;
@@ -15010,32 +15046,24 @@ impl BlockchainNode {
                                 }
                             }
                             
-                            // ═══════════════════════════════════════════════════════════════════
-                            // FIX v2.48: CHRONIC STALL RECOVERY
-                            // ═══════════════════════════════════════════════════════════════════
-                            // Root cause of incident: All 4 non-forked nodes stuck at h=45900.
-                            // Byzantine median height == local height → gap=0 → rollback never fires.
-                            // certified_round stays 0 because nobody can get 2/3 consensus.
-                            //
-                            // NEW: If stall > CHRONIC_STALL_THRESHOLD (120s) AND certified_round=0:
-                            //   1. The macroblock for current epoch is MISSING
-                            //   2. Force PFP activation — this node may be the unaware initiator
-                            //   3. Trigger full resync from all peers to get any missed blocks
-                            // ═══════════════════════════════════════════════════════════════════
-                            static CHRONIC_STALL_LAST_PFP: std::sync::atomic::AtomicU64 =
+                            // v14.7.2: CHRONIC STALL RECOVERY — canonical peer-driven resync.
+                            // If stall > CHRONIC_STALL_THRESHOLD (120s) AND no certified round,
+                            // force macroblock + block sync from peers. Canonical 2f+1 BFT
+                            // consensus at the next 90-block boundary is the only finality path.
+                            static CHRONIC_STALL_LAST_RESYNC: std::sync::atomic::AtomicU64 =
                                 std::sync::atomic::AtomicU64::new(0);
-                            let chronic_stall_threshold = 120u64; // 2 minutes
-                            let pfp_cooldown = 120u64;            // re-trigger PFP at most every 2 min
-                            
+                            let chronic_stall_threshold = 120u64;
+                            let resync_cooldown = 120u64;
+
                             if local_delay > chronic_stall_threshold && certified_timeout_round == 0 {
                                 let now_u64 = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs();
-                                let last_pfp = CHRONIC_STALL_LAST_PFP.load(std::sync::atomic::Ordering::Relaxed);
-                                
-                                if now_u64.saturating_sub(last_pfp) > pfp_cooldown {
-                                    CHRONIC_STALL_LAST_PFP.store(now_u64, std::sync::atomic::Ordering::Relaxed);
+                                let last_resync = CHRONIC_STALL_LAST_RESYNC.load(std::sync::atomic::Ordering::Relaxed);
+
+                                if now_u64.saturating_sub(last_resync) > resync_cooldown {
+                                    CHRONIC_STALL_LAST_RESYNC.store(now_u64, std::sync::atomic::Ordering::Relaxed);
                                     
                                     let latest_mb = next_height / 90;
                                     // v3.30: Scan for first missing macroblock to sync the right one
@@ -15056,11 +15084,10 @@ impl BlockchainNode {
                                     println!("[WARN][STALL] chronic_stall h={} delay={}s mb={} first_missing={} certified_round=0 → forcing PFP + resync",
                                              next_height, local_delay, latest_mb, missing_mb);
                                     
-                                    // 1. Force macroblock sync from all peers (target first missing)
+                                    // v14.7.2: Force macroblock sync + block resync from peers.
+                                    // No degraded PFP — canonical 2f+1 macroblock consensus at
+                                    // the next 90-block boundary is the only finality path.
                                     if let Some(p2p) = &unified_p2p {
-                                        // v3.36: Clear stale macroblock pending entries before requesting
-                                        // Without this, mark_macroblock_pending_sync returns false for stale
-                                        // entries, silently discarding the response → sync never completes
                                         for idx in missing_mb.saturating_sub(1)..=latest_mb {
                                             crate::unified_p2p::clear_macroblock_pending_sync(idx);
                                         }
@@ -15069,28 +15096,9 @@ impl BlockchainNode {
                                         let _ = p2p.sync_macroblocks(
                                             missing_mb.saturating_sub(1), latest_mb
                                         ).await;
-                                        
-                                        // 2. Force block resync for last 90 blocks to recover gap
+
                                         let resync_from = next_height.saturating_sub(90);
                                         let _ = p2p.sync_blocks(resync_from, next_height).await;
-                                        
-                                        // 3. Activate PFP — will elect correct leader deterministically
-                                        //    Same logic as the production loop but triggered from stall path
-                                        let blocks_without = local_delay.min(270) as u64;
-                                        let storage_clone = storage.clone();
-                                        let consensus_clone = consensus.clone();
-                                        let p2p_clone = p2p.clone();
-                                        let p2p_opt = Some(p2p_clone);
-                                        tokio::spawn(async move {
-                                            println!("[INFO][STALL] spawning PFP h={} blocks_without={}", next_height, blocks_without);
-                                            Self::activate_progressive_finalization_with_level(
-                                                storage_clone,
-                                                consensus_clone,
-                                                next_height,
-                                                p2p_opt,
-                                                blocks_without,
-                                            ).await;
-                                        });
                                     }
                                 }
                             }
@@ -15118,8 +15126,10 @@ impl BlockchainNode {
                             if let Some(p2p) = &unified_p2p {
                                 // 1. Rollback local chain to before fork point
                                 if rollback_to > 0 && rollback_to < local_h {
-                                    if !crate::storage::start_rollback_protection(rollback_to) {
-                                        println!("[WARN][FORK] rollback_protection_busy");
+                                    // v14.8: Atomic claim + finality check.
+                                    let finalized_h = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                                    if let Err(reason) = crate::storage::begin_finality_guarded_rollback(rollback_to, finalized_h) {
+                                        println!("[WARN][FORK] rollback_skipped reason={}", reason);
                                     } else {
                                         // Delete ALL blocks from rollback_to+1 to local_h
                                         // (includes our forked tip block)
@@ -15279,32 +15289,23 @@ impl BlockchainNode {
                                         let cycle_start = (microblock_height / 90) * 90;
                                         let rollback_to = cycle_start; // Go to START of current epoch, not previous
                                         
-                                        // v9.3: FINALITY CHECK — cannot rollback below finalized macroblock.
-                                        // EXCEPTION: During fast sync, finality may be ahead of actual chain
-                                        // (macroblocks synced but microblocks incomplete). In that case,
-                                        // reset finality to actual chain height so recovery can proceed.
-                                        if let Err(reason) = check_finality_allows_rollback(rollback_to) {
-                                            let finalized = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-                                            if finalized > microblock_height {
-                                                // Finality is AHEAD of chain — impossible state, fix it
+                                        // v14.8: Atomic claim + finality check.
+                                        // EXCEPTION preserved from legacy path: if finality is
+                                        // impossibly AHEAD of the actual chain (fast-sync window),
+                                        // reset it to chain tip so recovery can proceed.
+                                        {
+                                            let finalized_now = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                                            if finalized_now > microblock_height {
                                                 let safe = (microblock_height / 90) * 90;
                                                 LAST_FINALIZED_HEIGHT.store(safe, std::sync::atomic::Ordering::SeqCst);
                                                 LAST_FINALIZED_CONSENSUS_ROUND.store(safe, std::sync::atomic::Ordering::SeqCst);
-                                                println!("[WARN][FORK] finality_ahead_of_chain finalized={} chain={} reset_to={}", finalized, microblock_height, safe);
-                                                // Re-check after reset
-                                                if let Err(reason2) = check_finality_allows_rollback(rollback_to) {
-                                                    println!("[ERR][FORK] {} — skipping stall recovery rollback (post-reset)", reason2);
-                                                    continue;
-                                                }
-                                            } else {
-                                                println!("[ERR][FORK] {} — skipping stall recovery rollback", reason);
-                                                continue;
+                                                println!("[WARN][FORK] finality_ahead_of_chain finalized={} chain={} reset_to={}",
+                                                         finalized_now, microblock_height, safe);
                                             }
                                         }
-                                        
-                                        // v3.23: Start rollback protection
-                                        if !crate::storage::start_rollback_protection(rollback_to) {
-                                            println!("[WARN][FORK] rollback_protection_busy stall_recovery");
+                                        let finalized_h = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                                        if let Err(reason) = crate::storage::begin_finality_guarded_rollback(rollback_to, finalized_h) {
+                                            println!("[WARN][FORK] stall_recovery_skipped reason={}", reason);
                                             continue;
                                         }
                                         
@@ -16586,9 +16587,16 @@ impl BlockchainNode {
                                 (1001.., _) => tokio::time::Duration::from_millis(4000),        // Global WAN (MAX SAFE)
                             };
                             
-                            let byzantine_threshold = ((sample_size as f64 * 0.6).ceil() as usize).max(1); // 60% of peers, minimum 1
-                            
-                            println!("[INFO][CONS] bft_wait responses={}/{} threshold=60%", 
+                            // v14.7.2: canonical BFT safety threshold — 2f+1 for any n.
+                            // Formula `(n*2+2)/3` is the canonical ceiling form of
+                            // the 2f+1 safety bound (the minimum supermajority that
+                            // rules out two conflicting values being accepted).
+                            // Works uniformly for n=5, n=1000, n=millions.
+                            // Replaces the previous fixed 60% which was Byzantine-
+                            // safe only for n≤5 and became exploitable above that.
+                            let byzantine_threshold = ((sample_size * 2 + 2) / 3).max(1);
+
+                            println!("[INFO][CONS] bft_wait responses={}/{} threshold=2f+1_canonical",
                                      byzantine_threshold, sample_size);
                             
                             // STATE MACHINE: Waiting for consensus
@@ -16687,7 +16695,7 @@ impl BlockchainNode {
                             //   → matches=0 triggered fork detection incorrectly!
                             //
                             // FIX: Only trigger fork if:
-                            //   1. We have at least MIN_FORK_DETECTION_RESPONSES (3)
+                            //   1. We have at least min_fork_detection_responses (3)
                             //   2. AND all of them disagree (matches == 0)
                             //   3. AND we're past Genesis phase (height > 10)
                             // ═══════════════════════════════════════════════════════════════════
@@ -16701,36 +16709,33 @@ impl BlockchainNode {
                             //   - Ensures at least basic network connectivity
                             //   - Value 2 = at least 2 peers must confirm our entropy
                             //
-                            // MIN_FORK_DETECTION_RESPONSES: Minimum for definite fork detection
+                            // min_fork_detection_responses: Minimum for definite fork detection
                             //   - Higher threshold for fork declaration (more certainty needed)
                             //
                             // EXCEPTION: Genesis phase (h <= 10) - allow bootstrap production
                             // ═══════════════════════════════════════════════════════════════════
-                            // v3.25: DYNAMIC MIN_PRODUCTION_RESPONSES based on network size
+                            // v14.7.2: CANONICAL LIVENESS GATE — f+1 dynamic threshold
                             // ═══════════════════════════════════════════════════════════════════
-                            // Problem: Static MIN=2 is unsafe for large networks!
-                            //   - Genesis (5 nodes): 2/5 = 40% → OK
-                            //   - Large (100 sample): 2/100 = 2% → DANGEROUS!
+                            // Purpose: detect that THIS node is isolated from at least one
+                            // honest peer before producing a block. This is a liveness /
+                            // partition detector, NOT a safety threshold.
                             //
-                            // Solution: MIN_PRODUCTION = 40% of sample_size (Byzantine safe)
-                            //   - Genesis: 40% of 5 = 2 (minimum)
-                            //   - Small: 40% of 20 = 8
-                            //   - Medium: 40% of 50 = 20
-                            //   - Large: 40% of 100 = 40
+                            // Threshold = f+1 where n = sample_size, f = floor((n-1)/3).
+                            // Formula `(n+2)/3` gives the canonical ceiling of (n/3) which
+                            // equals f+1 for any n that satisfies the BFT invariant
+                            // n ≥ 3f+1. Scales uniformly — no buckets, no magic numbers,
+                            // works for n=5 as well as n=1_000_000.
                             //
-                            // This ensures: even if 33% malicious nodes collude, they cannot
-                            // produce blocks without 40% honest consensus (requires 7%+ honest)
+                            // f+1 semantics: with at most f byzantine, any set of f+1
+                            // distinct responders contains at least one honest peer.
+                            // That is sufficient evidence we are not network-partitioned
+                            // from the honest supermajority.
+                            //
+                            // Fork-confirmation threshold (below) remains at f+1 as well;
+                            // we do NOT use a different fork detection constant anymore.
                             // ═══════════════════════════════════════════════════════════════════
-                            const MIN_FORK_DETECTION_RESPONSES: usize = 3;
-                            
-                            // Dynamic MIN based on sample_size (defined at line 11648)
-                            // Use same sample_size variable for consistency
-                            let min_production_responses = match sample_size {
-                                0..=5 => 2,                                    // Genesis: 2/5 = 40%
-                                6..=20 => ((sample_size * 40) / 100).max(3),   // Small: 40%, min 3
-                                21..=50 => ((sample_size * 40) / 100).max(8),  // Medium: 40%, min 8
-                                _ => ((sample_size * 40) / 100).max(20),       // Large: 40%, min 20
-                            };
+                            let min_production_responses = ((sample_size + 2) / 3).max(1); // f+1 canonical
+                            let min_fork_detection_responses: usize = min_production_responses;
                             
                             let total_responses = matches + mismatches;
                             
@@ -16759,7 +16764,7 @@ impl BlockchainNode {
                             if mismatches > 0 {
                                 // v3.11 FIX: Only detect fork if we have enough responses
                                 // At startup, lagging nodes return empty entropy - NOT a real fork!
-                                if matches == 0 && total_responses >= MIN_FORK_DETECTION_RESPONSES && next_block_height > 10 {
+                                if matches == 0 && total_responses >= min_fork_detection_responses && next_block_height > 10 {
                                     // DEFINITE FORK: Multiple peers responded with DIFFERENT entropy
                                     println!("[ERR][CONS] fork_detected mismatches={} matches=0 total={}",
                                              mismatches, total_responses);
@@ -16829,10 +16834,10 @@ impl BlockchainNode {
                                         }
                                     }
                                     continue;
-                                } else if matches == 0 && (total_responses < MIN_FORK_DETECTION_RESPONSES || next_block_height <= 10) {
+                                } else if matches == 0 && (total_responses < min_fork_detection_responses || next_block_height <= 10) {
                                     // v3.11: Not enough data to confirm fork - likely startup/sync phase
                                     println!("[WARN][CONS] potential_fork responses={} need={} h={} phase=startup", 
-                                             total_responses, MIN_FORK_DETECTION_RESPONSES, next_block_height);
+                                             total_responses, min_fork_detection_responses, next_block_height);
                                 } else if mismatches > matches {
                                     // MAJORITY FORK: More peers disagree than agree
                                     println!("[ERR][CONS] fork_detected mismatches={} matches={} majority=disagree",
@@ -18323,18 +18328,6 @@ impl BlockchainNode {
                         txs.truncate(limit_idx);
                     }
                     
-                    // v14.7 (pipelined QC): attach QuorumCertificate for
-                    // height-1 if 2f+1 commit votes are already aggregated.
-                    // Producers strictly prefer attaching a QC — blocks with
-                    // None are accepted only during the genesis/boot window
-                    // to bootstrap the chain without a predecessor.
-                    let prev_block_qc_bytes: Option<Vec<u8>> = if next_block_height > 1 {
-                        crate::unified_p2p::quorum_cert_for_block(next_block_height - 1)
-                            .and_then(|qc| bincode::serialize(&qc).ok())
-                    } else {
-                        None
-                    };
-
                     let mut microblock = qnet_state::MicroBlock {
                         height: next_block_height,  // Use next_block_height instead of microblock_height
                         timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
@@ -18352,7 +18345,6 @@ impl BlockchainNode {
                         fees_collected: block_fees_collected, // v3.18: Direct to producer
                         state_root: [0u8; 32], // v3.27: Will be set below after TX+fees application
                         timeout_round: get_current_timeout_round(), // v14.0: Record for producer authority verification
-                        prev_block_qc: prev_block_qc_bytes, // v14.7: Embedded 2f+1 QC for h-1
                     };
                     
                     // ═══════════════════════════════════════════════════════════════════════════
@@ -19952,32 +19944,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     tokio::spawn(async move {
                         // Give consensus 5 more seconds to complete (total 35s from block 61)
                         tokio::time::sleep(Duration::from_secs(5)).await;
-                        
-                        // Check if macroblock was created
-                        // CRITICAL FIX v2.26.8: Use get_macroblock_by_height, NOT load_microblock!
-                        // Macroblocks are stored with key "macroblock_{index}" where index = 1, 2, 3...
-                        // load_microblock loads microblocks, not macroblocks!
+
                         let macroblock_exists = storage_check.get_macroblock_by_height(expected_macroblock)
                             .map(|mb| mb.is_some())
                             .unwrap_or(false);
-                        
+
                         if macroblock_exists {
                             if is_info() { println!("[INFO][MB] created h={}", expected_macroblock); }
-                            // SUCCESS: Macroblock created - trigger was updated correctly
                         } else {
-                            // FAILURE: Calculate blocks without finalization using ORIGINAL trigger
                             let blocks_without_finalization = check_height.saturating_sub(current_trigger);
-                            println!("[WARN][MB] Macroblock #{} not ready after {} blocks since last success", 
+                            println!("[WARN][MB] Macroblock #{} not ready after {} blocks — waiting for canonical 2f+1 BFT consensus at next boundary",
                                      expected_macroblock, blocks_without_finalization);
-                            
-                            // CRITICAL: Progressive Finalization with degradation
-                            Self::activate_progressive_finalization_with_level(
-                                storage_check,
-                                consensus_check,
-                                check_height,
-                                p2p_check,
-                                blocks_without_finalization
-                                ).await;
+                            // v14.7.2: No PFP degradation. Missing macroblocks are recovered
+                            // by the regular 2f+1 commit/reveal consensus at the next 90-block
+                            // boundary, or by direct sync from peers.
+                            if let Some(ref p2p) = p2p_check {
+                                let _ = p2p.sync_macroblocks(expected_macroblock, expected_macroblock).await;
+                            }
+                            let _ = storage_check;
+                            let _ = consensus_check;
                         }
                     });
                     
@@ -19990,55 +19975,36 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     if is_debug() { println!("[DBG][MB] continue h={}", microblock_height + 1); }
                 }
                 
-                // CRITICAL: Progressive retry for failed macroblocks
-                // CRITICAL FIX: Only run PFP AFTER first expected macroblock (block 90)
-                // Before block 90, no macroblocks are expected, so don't run recovery
+                // v14.7.2: Periodic macroblock-gap sync. No PFP degradation —
+                // canonical 2f+1 BFT consensus runs at every 90-block boundary.
+                // Direct peer sync fills missing macroblocks created by the
+                // canonical consensus already performed by the quorum.
                 if microblock_height >= 90 {
-                    // Check every 30 blocks after macroblock boundary
                     let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
-                    // CRITICAL FIX: PFP triggers 30 blocks after expected macroblock
-                    // Block 120 (30 after 90), 150 (60 after 90), etc.
-                    // Block 210 (30 after 180), 240 (60 after 180), etc.
-                    // Don't trigger at macroblock boundaries (90, 180, 270...)
-                    if blocks_since_trigger >= ROTATION_INTERVAL_BLOCKS && blocks_since_trigger % ROTATION_INTERVAL_BLOCKS == 0 && (microblock_height % 90) != 0 {
-                        // Check if macroblock still missing
-                        // CRITICAL FIX v2.26.8: Use consistent formula for expected_macroblock
-                        // Primary: use trigger-based calculation (always correct after fix #1)
-                        // Fallback: if trigger is 0, find the latest macroblock period we should have
+                    if blocks_since_trigger >= ROTATION_INTERVAL_BLOCKS
+                        && blocks_since_trigger % ROTATION_INTERVAL_BLOCKS == 0
+                        && (microblock_height % 90) != 0
+                    {
                         let expected_macroblock = if last_macroblock_trigger > 0 {
-                            // Normal case: trigger is properly updated
                             last_macroblock_trigger / 90
                         } else {
-                            // Fallback: trigger=0 means we synced but never hit a 90-block boundary
-                            // Search for the macroblock of the PREVIOUS period
-                            // height 91-179 → search #1, height 180-269 → search #2, etc.
                             let period = microblock_height / 90;
                             if period > 0 { period } else { 1 }
                         };
-                        // CRITICAL FIX: Check for the actual MACROBLOCK, not a microblock!
                         let macroblock_exists = storage.get_macroblock_by_height(expected_macroblock)
                             .map(|mb| mb.is_some())
                             .unwrap_or(false);
-                        
+
                         if !macroblock_exists {
-                            println!("[WARN][MB] pfp_recovery blocks_without_mb={}", blocks_since_trigger);
-                            
-                            let storage_recovery = storage.clone();
-                            let consensus_recovery = consensus.clone();
-                            let p2p_recovery = unified_p2p.clone();
-                            let recovery_height = microblock_height;
-                            
-                            tokio::spawn(async move {
-                                Self::activate_progressive_finalization_with_level(
-                                    storage_recovery,
-                                    consensus_recovery,
-                                    recovery_height,
-                                    p2p_recovery,
-                                    blocks_since_trigger
-                                ).await;
-                            });
+                            println!("[WARN][MB] mb_gap_sync blocks_without_mb={}", blocks_since_trigger);
+                            if let Some(ref p2p) = unified_p2p {
+                                let p2p_clone = p2p.clone();
+                                tokio::spawn(async move {
+                                    let _ = p2p_clone.sync_macroblocks(expected_macroblock, expected_macroblock).await;
+                                });
+                            }
                         } else {
-                            println!("[INFO][MB] pfp_ok mb={}", expected_macroblock);
+                            if is_debug() { println!("[DBG][MB] mb_ok mb={}", expected_macroblock); }
                         }
                     }
                 }
@@ -21442,135 +21408,27 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 }
                 Ok(None) => {
-                    // ═══════════════════════════════════════════════════════════════════════════
-                    // v5.0: LOCAL MACROBLOCK SELF-ASSEMBLY
-                    // Before giving up, check if ALL microblocks for this macroblock exist
-                    // in local storage. If yes — assemble it locally (deterministic, same on
-                    // all nodes that have the same blocks). This prevents permanent desync when
-                    // ALL nodes lost the macroblock (e.g. after simultaneous restarts) but
-                    // still have the constituent blocks in RocksDB.
-                    // ═══════════════════════════════════════════════════════════════════════════
-                    let mb_start = if required_macroblock > 0 { (required_macroblock - 1) * 90 + 1 } else { 1 };
-                    let mb_end = required_macroblock * 90;
-                    
-                    let mut all_microblocks_present = true;
-                    for h in mb_start..=mb_end {
-                        match storage.load_microblock(h) {
-                            Ok(Some(_)) => {}
-                            _ => { all_microblocks_present = false; break; }
-                        }
-                    }
-                    
-                    if all_microblocks_present && mb_end > 0 {
-                        println!("[INFO][CAND] mb={} NOT_FOUND but all microblocks {}-{} present — assembling locally",
-                                 required_macroblock, mb_start, mb_end);
-                        
-                        let storage_clone = storage.clone();
-                        let mb_idx = required_macroblock;
-                        // v6.6: Dynamic participant list — scan blocks for all registered Super nodes
-                        // instead of hardcoding 5 genesis nodes. Genesis nodes are always included
-                        // as baseline, then any on-chain NodeRegistration Super nodes are added.
-                        let mut participant_ids: Vec<String> = (1..=5)
-                            .map(|i| format!("genesis_node_{:03}", i))
-                            .collect();
-                        // Scan blocks in this macroblock range for NodeRegistration + NodeReactivation TXs
-                        for h in mb_start..=mb_end {
-                            if let Ok(Some(block)) = storage.load_microblock_auto_format(h) {
-                                for tx in &block.transactions {
-                                    if let qnet_state::TransactionType::NodeRegistration {
-                                        ref node_id, ref node_type, ..
-                                    } = tx.tx_type {
-                                        if *node_type == qnet_state::NodeType::Super
-                                           && !participant_ids.contains(node_id) {
-                                            participant_ids.push(node_id.clone());
-                                        }
-                                    }
-                                    // v10.0: NodeReactivation TXs — only include if sync-proven
-                                    // Same check as create_eligible_producers_snapshot LEVEL 1:
-                                    // current_height must be within 90 blocks of macroblock boundary
-                                    if let qnet_state::TransactionType::NodeReactivation {
-                                        ref node_id, current_height, ..
-                                    } = tx.tx_type {
-                                        if !participant_ids.contains(node_id) {
-                                            let proximity_ok = current_height + 90 >= mb_end
-                                                && current_height <= mb_end + 90;
-                                            if proximity_ok {
-                                                participant_ids.push(node_id.clone());
-                                            } else if is_info() {
-                                                println!("[INFO][CAND] v10.0 SKIP reactivation node={} current_h={} mb_end={} reason=unsynced",
-                                                         node_id, current_height, mb_end);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        let genesis_ids = participant_ids;
-                        
-                        // Synchronous assembly — we need the result NOW for this round
-                        let dummy_consensus = std::sync::Arc::new(tokio::sync::RwLock::new(
-                            qnet_consensus::CommitRevealConsensus::new(
-                                "self_assembly".to_string(),
-                                qnet_consensus::ConsensusConfig::default(),
-                            )
-                        ));
-                        let assembly_result = Self::create_emergency_macroblock_internal(
-                            storage_clone,
-                            dummy_consensus,
-                            mb_end,
-                            genesis_ids,
-                            "local_self_assembly",
-                        ).await;
-                        
-                        match assembly_result {
-                            Ok(()) => {
-                                println!("[INFO][CAND] mb={} self-assembled — retrying candidate lookup", mb_idx);
-                                // Retry: macroblock should now exist in storage
-                                if let Ok(Some(macroblock_data)) = storage.get_macroblock_by_height(mb_idx) {
-                                    if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_data) {
-                                        if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
-                                            if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
-                                                if !producers.is_empty() {
-                                                    let mut all_qualified: Vec<(String, f64)> = producers.iter()
-                                                        .map(|p| (p.node_id.clone(), p.reputation))
-                                                        .collect();
-                                                    all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
-                                                    println!("[INFO][CAND] mb={} self-assembly success — {} candidates", mb_idx, all_qualified.len());
-                                                    return all_qualified;
-                                                }
-                                            }
-                                        }
-                                        // Fallback: use commits
-                                        if !macroblock.consensus_data.commits.is_empty() {
-                                            let mut all_qualified: Vec<(String, f64)> = macroblock.consensus_data.commits.keys()
-                                                .map(|id| {
-                                                    let rep = p2p.get_deterministic_reputation()
-                                                        .map(|rep_arc| {
-                                                            let state = rep_arc.read();
-                                                            state.get_reputation(id,
-                                                                std::time::SystemTime::now()
-                                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                                    .unwrap_or_default()
-                                                                    .as_secs())
-                                                        })
-                                                        .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
-                                                    (id.clone(), rep / 100.0)
-                                                })
-                                                .collect();
-                                            all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
-                                            return all_qualified;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                println!("[WARN][CAND] mb={} self-assembly failed: {}", mb_idx, e);
-                            }
-                        }
-                    }
-                    
-                    // Original desync path: macroblock missing AND can't self-assemble
-                    println!("[ERR][CAND] DESYNC: mb={} NOT_FOUND h={} - node EXCLUDED from consensus!", 
+                    // v14.8: Self-assembly removed. Previous behaviour locally reconstructed
+                    // the missing macroblock by stuffing `consensus_data.commits/reveals`
+                    // with synthetic placeholder strings (e.g. `local_self_assembly_commit_N`).
+                    // That produced macroblocks with different bytes on different nodes
+                    // (HashMap iteration ordering, synthetic-string formatting) — so any two
+                    // self-assembled macroblocks at the same height could hash differently
+                    // and seed different eligible_producers snapshots, forking the chain.
+                    //
+                    // Canonical behaviour now: if we lack macroblock #N we abstain from this
+                    // election round and request it from peers. The next round — driven by
+                    // the canonical 2f+1 macroblock consensus — provides the authoritative
+                    // snapshot. Temporary abstention is safe: 2f+1 other validators are
+                    // enough to keep consensus alive without us.
+                    let mb_idx = required_macroblock;
+                    println!("[WARN][CAND] mb={} NOT_FOUND h={} — abstaining this round, requesting from peers",
+                             mb_idx, current_height);
+                    let p2p_sync = p2p.clone();
+                    tokio::spawn(async move {
+                        let _ = p2p_sync.sync_macroblocks(mb_idx, mb_idx).await;
+                    });
+                    println!("[ERR][CAND] DESYNC: mb={} NOT_FOUND h={} - node EXCLUDED from consensus!",
                              required_macroblock, current_height);
                     
                     // Trigger async sync for missing MacroBlock
@@ -22105,11 +21963,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         selection_hasher.update(&entropy_source);
         selection_hasher.update(macroblock_round.to_le_bytes());
-        
+
+        // v14.8: CANONICAL MACROBLOCK VIEW CHANGE.
+        // Mix the 2f+1-certified timeout round for THIS macroblock boundary
+        // into the leader-selection hash. When a macroblock's commit/reveal
+        // phase fails to reach 2f+1, validators broadcast a Dilithium3-signed
+        // TimeoutVote at (mb_index, round+1). After 2f+1 such votes a
+        // TimeoutCertificate forms and bumps HIGHEST_CERTIFIED_ROUND[mb_index].
+        // Incorporating that round here deterministically rotates the leader
+        // to a DIFFERENT validator — without touching the epoch boundary, the
+        // entropy source, or the participant set. Every honest node sees the
+        // same certified round, so every honest node picks the same next
+        // leader, and consensus resumes in the same epoch.
+        let macro_view_round = p2p.get_highest_certified_round(macroblock_round);
+        selection_hasher.update(macro_view_round.to_le_bytes());
+
         // Add all candidate IDs to ensure consistent ordering
         let mut sorted_candidates = qualified_candidates.clone();
         sorted_candidates.sort_by(|a, b| a.0.cmp(&b.0)); // Sort by ID for consistency
-        
+
         for (candidate_id, _reputation) in &sorted_candidates {
             selection_hasher.update(candidate_id.as_bytes());
         }
@@ -22848,615 +22720,86 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         });
     }
     
-    /// CRITICAL: Progressive Finalization Protocol activation
-    #[allow(dead_code)]
-    async fn activate_progressive_finalization(
-        storage: Arc<Storage>,
-        consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
-        current_height: u64,
-        unified_p2p: Option<Arc<SimplifiedP2P>>,
-    ) {
-        // Default to 90 blocks without finalization for backward compatibility
-        Self::activate_progressive_finalization_with_level(
-            storage,
-            consensus,
-            current_height,
-            unified_p2p,
-            90
-        ).await;
-    }
-    
-    /// PRODUCTION v3.30: Progressive Finalization Protocol with gap-fill
-    /// Scans for the FIRST missing macroblock instead of jumping to current_height/90.
-    /// This prevents gaps that make calculate_qualified_candidates return empty.
-    async fn activate_progressive_finalization_with_level(
-        storage: Arc<Storage>,
-        consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
-        current_height: u64,
-        unified_p2p: Option<Arc<SimplifiedP2P>>,
-        blocks_without_finalization: u64,
-    ) {
-        let latest_macroblock = current_height / 90;
-        
-        // v3.30: Scan for FIRST missing macroblock to fill gaps sequentially.
-        // Without this, PFP could create mb#476 while #475 is missing,
-        // causing calculate_qualified_candidates to fail permanently.
-        let expected_macroblock = {
-            let mut first_missing = latest_macroblock;
-            let scan_start = if latest_macroblock > 10 { latest_macroblock - 10 } else { 1 };
-            for idx in scan_start..=latest_macroblock {
-                let has_mb = storage.get_macroblock_by_height(idx)
-                    .map(|mb| mb.is_some())
-                    .unwrap_or(false);
-                if !has_mb {
-                    first_missing = idx;
-                    break;
-                }
-            }
-            first_missing
-        };
-        
-        if is_info() { 
-            println!("[INFO][PFP] activated h={} mb={} blocks_without={} scan_target={}", 
-                     current_height, latest_macroblock, blocks_without_finalization, expected_macroblock); 
-        }
-        
-        if let Some(p2p) = unified_p2p {
-            let validated_peers = p2p.get_validated_active_peers();
-            let available_nodes = validated_peers.len() + 1; // Include self
-            
-            // Progressive degradation based on network size
-            let total_for_consensus = std::cmp::min(available_nodes, 1000);
-            
-            let (required_nodes, timeout, finalization_type) = {
-                match blocks_without_finalization {
-                    0..=90 => {
-                        let required = std::cmp::min((total_for_consensus * 80) / 100, 800);
-                        (std::cmp::max(required, 1), 30, "standard")
-                    }
-                    91..=180 => {
-                        let required = std::cmp::min((total_for_consensus * 60) / 100, 600);
-                        (std::cmp::max(required, 1), 10, "checkpoint")
-                    }
-                    181..=270 => {
-                        let required = std::cmp::min((total_for_consensus * 40) / 100, 400);
-                        (std::cmp::max(required, 1), 5, "emergency")
-                    }
-                    _ => {
-                        let required = std::cmp::min((total_for_consensus * 1) / 100, 10);
-                        (std::cmp::max(required, 1), 2, "critical")
-                    }
-                }
-            };
-            
-            if is_debug() { 
-                println!("[DBG][PFP] mode={} required={}/{} timeout={}s", 
-                         finalization_type, required_nodes, available_nodes, timeout); 
-            }
-            
-            // Execute progressive finalization
-            let storage_finalize = storage.clone();
-            let consensus_finalize = consensus.clone();
-            let p2p_finalize = p2p.clone();
-            
-            // Get own node_id for leader selection
-            let _own_node_id = p2p.get_node_id();
-            
-            let pfp_target_macroblock = expected_macroblock; // v3.30: capture gap-filled value
-            tokio::spawn(async move {
-                // ═══════════════════════════════════════════════════════════════════
-                // v3.30: Use gap-filled target from outer scan, not current_height/90
-                // ═══════════════════════════════════════════════════════════════════
-                let expected_macroblock = pfp_target_macroblock;
-                
-                // ═══════════════════════════════════════════════════════════════════
-                // CRITICAL v2.45: DESYNC CHECK - Node MUST be synchronized to participate!
-                // Desynchronized nodes selecting different leaders → FORK!
-                // ═══════════════════════════════════════════════════════════════════
-                let network_height = p2p_finalize.get_cached_network_height().unwrap_or(0);
-                let local_height = storage_finalize.get_chain_height().unwrap_or(0);
-                
-                if network_height > 0 && local_height + 50 < network_height {
-                    println!("[WARN][PFP] desync_skip local={} network={} gap={}", 
-                             local_height, network_height, network_height.saturating_sub(local_height));
-                    return; // Do NOT participate - we're too far behind!
-                }
-                
-                if is_info() { println!("[INFO][PFP] sync_attempt mb={} h={}", expected_macroblock, current_height); }
-                
-                // Step 1: Try to sync from network first
-                let mut synced_from_network = false;
-                for attempt in 1..=3 {
-                    if let Err(e) = p2p_finalize.sync_macroblocks(expected_macroblock, expected_macroblock).await {
-                        if is_debug() { println!("[DBG][PFP] sync_failed mb={} attempt={} err={}", expected_macroblock, attempt, e); }
-                    }
-                    
-                    tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
-                    
-                    let has_macroblock = storage_finalize.get_macroblock_by_height(expected_macroblock)
-                        .map(|mb| mb.is_some())
-                        .unwrap_or(false);
-                    
-                    if has_macroblock {
-                        if is_info() { println!("[INFO][PFP] synced mb={} source=network", expected_macroblock); }
-                        synced_from_network = true;
-                        break;
-                    }
-                }
-                
-                if synced_from_network {
-                    return;
-                }
-                
-                // ═══════════════════════════════════════════════════════════════════
-                // UNIFIED v2.47: DETERMINISTIC PARTICIPANTS LIST
-                // Use SAME source as should_initiate_consensus() - blockchain-based!
-                // ═══════════════════════════════════════════════════════════════════
-                
-                // Get participants from calculate_qualified_candidates (same as should_initiate)
-                // This returns static Genesis list for height <= 180, or macroblock snapshot for height > 180
-                let own_node_id = p2p_finalize.get_node_id();
-                // v3.16: Use local_height for deterministic epoch calculation
-                let qualified = Self::calculate_qualified_candidates(
-                    &p2p_finalize, 
-                    &own_node_id, 
-                    NodeType::Super, // Genesis nodes are Super type
-                    local_height
-                ).await;
-                
-                let mut participants: Vec<String> = qualified.iter()
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                
-                // CRITICAL: Sort for deterministic ordering across ALL nodes
-                participants.sort();
-                
-                if participants.is_empty() {
-                    println!("[ERR][PFP] no_participants mb={}", expected_macroblock);
-                    return;
-                }
-                
-                // ═══════════════════════════════════════════════════════════════════
-                // CRITICAL v2.42: SELECT ONE LEADER DETERMINISTICALLY
-                // Same logic as should_initiate_consensus() - SHA3-512 entropy
-                // Only leader creates MacroBlock, others wait for sync
-                // ═══════════════════════════════════════════════════════════════════
-                
-                let pfp_leader = {
-                    let mut hasher = Sha3_512::new();
-                    
-                    // ═══════════════════════════════════════════════════════════════════
-                    // CRITICAL FIX v2.45: FULLY DETERMINISTIC PFP LEADER SELECTION
-                    // ═══════════════════════════════════════════════════════════════════
-                    // REMOVED: current_height, pfp_attempt (both can differ between nodes!)
-                    // 
-                    // WHY pfp_attempt was BROKEN:
-                    //   → DIFFERENT attempt → DIFFERENT leader → FORK!
-                    //
-                    // SOLUTION: Use ONLY data that is IDENTICAL on all synchronized nodes:
-                    //   1. expected_macroblock (deterministic from trigger)
-                    //   2. macroblock N-2 hash (Byzantine-finalized, same on all nodes)
-                    //   3. sorted participants list (from consensus)
-                    //
-                    // LEADER ROTATION: If leader doesn't produce macroblock within timeout,
-                    // PFP will be triggered again with SAME leader. After multiple failures,
-                    // fork recovery will kick in (120s stall → rollback → resync)
-                    // ═══════════════════════════════════════════════════════════════════
-                    
-                    hasher.update(b"QNet_PFP_Leader_Selection_v2.46_Deterministic");
-                    hasher.update(&expected_macroblock.to_le_bytes());
-                    
-                    // ═══════════════════════════════════════════════════════════════════
-                    // UNIFIED v2.47: ENTROPY SOURCE (same as should_initiate_consensus)
-                    // Epoch 1-2 (MB #1, #2): SHA3-512(Genesis block)[..32]
-                    // Epoch 3+  (MB #3+):    randomness_beacon from MB N-2
-                    // ═══════════════════════════════════════════════════════════════════
-                    if expected_macroblock <= 2 {
-                        // Epoch 1-2: Genesis block hash
-                        if let Ok(Some(genesis_data)) = storage_finalize.load_microblock(0) {
-                            let mut genesis_hasher = Sha3_512::new();
-                            genesis_hasher.update(&genesis_data);
-                            let result = genesis_hasher.finalize();
-                            hasher.update(&result[..32]);
-                        } else {
-                            println!("[WARN][PFP] genesis_not_found skip_pfp=true");
-                            return;
-                        }
-                    } else {
-                        // Epoch 3+: randomness_beacon from MB N-2
-                        let n_minus_2_index = expected_macroblock - 2;
-                        if let Ok(Some(macroblock_data)) = storage_finalize.get_macroblock_by_height(n_minus_2_index) {
-                            match bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_data) {
-                                Ok(macroblock) => {
-                                    if let Some(beacon) = macroblock.consensus_data.randomness_beacon {
-                                        hasher.update(&beacon);
-                                    } else {
-                                        // v12.0: Use consensus hash (struct fields), not raw bytes
-                                        println!("[WARN][PFP] mb#{} no_beacon using_consensus_hash", n_minus_2_index);
-                                        hasher.update(&macroblock.hash());
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("[ERR][PFP] deserialize_failed mb={} err={}", n_minus_2_index, e);
-                                    return;
-                                }
-                            }
-                        } else {
-                            println!("[WARN][PFP] mb_not_found idx={} skip_pfp=true", n_minus_2_index);
-                            return;
-                        }
-                    }
-                    
-                    // Add sorted participant list (already sorted above)
-                    for p in &participants {
-                        hasher.update(p.as_bytes());
-                    }
-                    
-                    let hash = hasher.finalize();
-                    let selection_value = u64::from_le_bytes([
-                        hash[0], hash[1], hash[2], hash[3],
-                        hash[4], hash[5], hash[6], hash[7],
-                    ]);
-                    
-                    let leader_index = (selection_value as usize) % participants.len();
-                    
-                    if is_info() { 
-                        let entropy_src = if expected_macroblock <= 2 { "genesis".to_string() } else { format!("mb#{}_beacon", expected_macroblock - 2) };
-                        println!("[INFO][PFP] leader_select mb={} entropy_src={} candidates={}", 
-                                 expected_macroblock, entropy_src, participants.len()); 
-                    }
-                    
-                    participants[leader_index].clone()
-                };
-                
-                let is_leader = own_node_id == pfp_leader;
-                
-                if is_info() { 
-                    println!("[INFO][PFP] leader_selected mb={} leader={} is_self={} participants={}", 
-                             expected_macroblock, pfp_leader, is_leader, participants.len()); 
-                }
-                
-                if is_leader {
-                    // ═══════════════════════════════════════════════════════════════
-                    // WE ARE THE LEADER - Create and broadcast MacroBlock
-                    // ═══════════════════════════════════════════════════════════════
-                    
-                    // Wait for timeout before creating (give normal consensus chance)
-                    tokio::time::sleep(Duration::from_secs(timeout)).await;
-                    
-                    // Double-check: maybe someone else created it during wait
-                    if storage_finalize.get_macroblock_by_height(expected_macroblock)
-                        .map(|mb| mb.is_some())
-                        .unwrap_or(false) 
-                    {
-                        if is_info() { println!("[INFO][PFP] already_exists mb={} skip=leader_create", expected_macroblock); }
-                        return;
-                    }
-                    
-                    if is_info() { println!("[INFO][PFP] creating mb={} type={} nodes={}", 
-                             expected_macroblock, finalization_type, participants.len()); }
-                    
-                    match Self::create_emergency_macroblock_internal(
-                        storage_finalize.clone(),
-                        consensus_finalize,
-                        current_height,
-                        participants.clone(),
-                        finalization_type
-                    ).await {
-                        Ok(_) => {
-                            if is_info() { println!("[INFO][PFP] created mb={} type={}", expected_macroblock, finalization_type); }
-                            
-                            // CRITICAL FIX v2.44: Broadcast MacroBlock data (not just notification!)
-                            // Previous code only sent notification, not actual data → nodes couldn't sync
-                            if let Ok(Some(mb_data)) = storage_finalize.get_macroblock_by_height(expected_macroblock) {
-                                // Compress for efficient transmission
-                                let compressed_data = zstd::encode_all(&mb_data[..], 3)
-                                    .unwrap_or_else(|_| mb_data.clone());
-                                
-                                if is_info() { 
-                                    println!("[INFO][PFP] broadcast mb={} bytes={}", 
-                                             expected_macroblock, compressed_data.len()); 
-                                }
-                                
-                                match p2p_finalize.broadcast_macroblock(
-                                    expected_macroblock, 
-                                    compressed_data, 
-                                    expected_macroblock // epoch = macroblock index
-                                ).await {
-                                    Ok(_) => {
-                                        if is_info() { 
-                                            println!("[INFO][PFP] broadcast_complete mb={}", expected_macroblock); 
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!("[WARN][PFP] broadcast_failed mb={} err={}", expected_macroblock, e);
-                                    }
-                                }
-                            } else {
-                                println!("[ERR][PFP] broadcast_failed mb={} reason=not_found_after_save", expected_macroblock);
-                            }
-                        }
-                        Err(e) => {
-                            println!("[ERR][PFP] create_failed mb={} err={}", expected_macroblock, e);
-                        }
-                    }
-                } else {
-                    // ═══════════════════════════════════════════════════════════════
-                    // WE ARE NOT THE LEADER - Wait for leader to create, then sync
-                    // ═══════════════════════════════════════════════════════════════
-                    
-                    if is_debug() { println!("[DBG][PFP] waiting_for_leader mb={} leader={}", expected_macroblock, pfp_leader); }
-                    
-                    // Wait longer than leader's timeout to give them time to create
-                    tokio::time::sleep(Duration::from_secs(timeout + 10)).await;
-                    
-                    // Try to sync the macroblock created by leader
-                    for attempt in 1..=5 {
-                        if let Err(e) = p2p_finalize.sync_macroblocks(expected_macroblock, expected_macroblock).await {
-                            if is_debug() { println!("[DBG][PFP] leader_sync_failed mb={} attempt={} err={}", expected_macroblock, attempt, e); }
-                        }
-                        
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                        
-                        if storage_finalize.get_macroblock_by_height(expected_macroblock)
-                            .map(|mb| mb.is_some())
-                            .unwrap_or(false) 
-                        {
-                            if is_info() { println!("[INFO][PFP] synced_from_leader mb={} leader={}", expected_macroblock, pfp_leader); }
-                            return;
-                        }
-                    }
-                    
-                    // v5.0: Leader failed — attempt LOCAL self-assembly from microblocks.
-                    // This is DETERMINISTIC: all nodes with the same blocks produce
-                    // the identical macroblock (same hashes, same state_accumulator).
-                    // Prevents permanent deadlock when PFP leader is unavailable.
-                    let mb_start_h = if expected_macroblock > 0 { (expected_macroblock - 1) * 90 + 1 } else { 1 };
-                    let mb_end_h = expected_macroblock * 90;
-                    let mut can_self_assemble = true;
-                    for h in mb_start_h..=mb_end_h {
-                        if storage_finalize.load_microblock(h).ok().flatten().is_none() {
-                            can_self_assemble = false;
-                            break;
-                        }
-                    }
-                    
-                    if can_self_assemble {
-                        println!("[INFO][PFP] leader_timeout mb={} leader={} — self-assembling from local microblocks {}-{}",
-                                 expected_macroblock, pfp_leader, mb_start_h, mb_end_h);
-                        match Self::create_emergency_macroblock_internal(
-                            storage_finalize.clone(),
-                            consensus_finalize.clone(),
-                            mb_end_h,
-                            participants.clone(),
-                            "pfp_self_assembly",
-                        ).await {
-                            Ok(()) => {
-                                println!("[INFO][PFP] self-assembled mb={} after leader timeout", expected_macroblock);
-                                // Broadcast to help other nodes
-                                if let Ok(Some(mb_data)) = storage_finalize.get_macroblock_by_height(expected_macroblock) {
-                                    let compressed = zstd::encode_all(&mb_data[..], 3).unwrap_or_else(|_| mb_data.clone());
-                                    let _ = p2p_finalize.broadcast_macroblock(expected_macroblock, compressed, expected_macroblock).await;
-                                }
-                            }
-                            Err(e) => println!("[WARN][PFP] self-assembly failed mb={}: {}", expected_macroblock, e),
-                        }
-                    } else {
-                        println!("[WARN][PFP] leader_timeout mb={} leader={} no_local_microblocks — waiting", expected_macroblock, pfp_leader);
-                    }
-                }
-            });
-        }
-    }
-    
-    /// PRODUCTION v2.42: Create emergency macroblock (called ONLY by PFP leader)
-    async fn create_emergency_macroblock_internal(
-        storage: Arc<Storage>,
-        _consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
-        height: u64,
-        participants: Vec<String>,
-        finalization_type: &str,
-    ) -> Result<(), String> {
-        // Validate height
-        if height == 0 {
-            if is_debug() { println!("[DBG][PFP] skip_genesis h=0"); }
-            return Ok(());
-        }
-        
-        let macroblock_index = height / 90;
-        
-        // Check if already exists (race condition protection)
-        if let Ok(Some(_)) = storage.get_macroblock_by_height(macroblock_index) {
-            if is_debug() { println!("[DBG][PFP] already_exists mb={}", macroblock_index); }
-            return Ok(());
-        }
-        
-        if is_info() { println!("[INFO][PFP] creating_macroblock mb={} type={} participants={}", 
-                 macroblock_index, finalization_type, participants.len()); }
-        
-        // Calculate state root from microblocks
-        // CRITICAL FIX: Correct calculation for macroblock boundaries
-        // For height 90: blocks 1-90, for height 180: blocks 91-180
-        // CRITICAL FIX: Adjust boundaries for new index formula
-        // For index 1 (blocks 1-90): start=1, end=90
-        // For index 2 (blocks 91-180): start=91, end=180
-        let start_height = if macroblock_index > 0 { (macroblock_index - 1) * 90 + 1 } else { 1 };
-        let end_height = macroblock_index * 90;
-        
-        let mut microblock_hashes = Vec::new();
-        let mut state_accumulator = [0u8; 32];
-        
-        for h in start_height..=end_height.min(height) {
-            // v12.0: Use consensus hash from struct fields, not raw storage bytes.
-            // Fast path: O(1) hash index lookup. Slow path: deserialize + block.hash().
-            let block_hash = if let Ok(Some(indexed_hash)) = storage.load_microblock_hash(h) {
-                indexed_hash
-            } else if let Ok(Some(block)) = tokio::task::block_in_place(|| storage.load_microblock_auto_format(h)) {
-                let h_val: [u8; 32] = block.hash();
-                let _ = storage.save_microblock_hash(h, &h_val);
-                h_val
-            } else {
-                continue;
-            };
-            microblock_hashes.push(block_hash);
-
-            // Accumulate state
-            for (i, &byte) in block_hash.iter().enumerate() {
-                state_accumulator[i] ^= byte;
-            }
-        }
-        
-        // Create simplified consensus data (emergency - no slashing in emergency mode)
-        let consensus_data = qnet_state::ConsensusData {
-            commits: participants.iter()
-                .map(|p| (p.clone(), format!("{}_commit_{}", finalization_type, height).into_bytes()))
-                .collect(),
-            reveals: participants.iter()
-                .map(|p| (p.clone(), format!("{}_reveal_{}", finalization_type, height).into_bytes()))
-                .collect(),
-            next_leader: participants.first().cloned().unwrap_or_default(),
-            // Emergency macroblocks don't include slashing (created during recovery)
-            slashing_events_data: None,
-            automatic_jails_data: None,
-            // v2.24: No reputation snapshot in emergency mode (preserve current state)
-            reputation_snapshot: None,
-            // v2.27.0: Emergency macroblocks use participants as eligible producers
-            // FIXED v2.32: Use REAL reputation from previous macroblock snapshot
-            eligible_producers: {
-                // Try to get reputation from previous macroblock's snapshot
-                let prev_mb_index = if macroblock_index > 1 { macroblock_index - 1 } else { 0 };
-                let reputation_map: std::collections::HashMap<String, f64> = if prev_mb_index > 0 {
-                    if let Ok(Some(prev_mb_data)) = storage.get_macroblock_by_height(prev_mb_index) {
-                        if let Ok(prev_mb) = bincode::deserialize::<qnet_state::MacroBlock>(&prev_mb_data) {
-                            if let Some(ref snapshot_bytes) = prev_mb.consensus_data.reputation_snapshot {
-                                bincode::deserialize(snapshot_bytes).unwrap_or_default()
-                            } else {
-                                std::collections::HashMap::new()
-                            }
-                        } else {
-                            std::collections::HashMap::new()
-                        }
-                    } else {
-                        std::collections::HashMap::new()
-                    }
-                } else {
-                    std::collections::HashMap::new()
-                };
-                
-                let producers: Vec<qnet_state::EligibleProducer> = participants.iter()
-                    .map(|id| {
-                        // Get reputation from snapshot (0-100 scale) or use INITIAL_REPUTATION
-                        let real_rep = reputation_map.get(id).copied()
-                            .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
-                        qnet_state::EligibleProducer {
-                            node_id: id.clone(),
-                            reputation: (real_rep / 100.0).clamp(0.70, 1.0),
-                        }
-                    })
-                    .collect();
-                bincode::serialize(&producers).ok()
-            },
-            // QRB v3.0: Emergency beacon uses state accumulator as fallback
-            randomness_beacon: Some(state_accumulator),
-            vrf_contributions_count: Some(0), // No VRF in emergency mode
-            // v2.41.0: No heartbeats in emergency mode (use previous data)
-            reward_heartbeats: None,
-            heartbeats_merkle_root: None,
-            // v2.78: No Light node attestations in emergency mode
-            reward_light_nodes: None,
-            // v2.50.0: Pool totals for deterministic reward calculation
-            // Emergency macroblocks don't include pool data (not emission blocks)
-            pool2_total_fees: None,
-            pool3_total_activations: None,
-            // v3.36: No committee in emergency mode
-            consensus_committee: None,
-            // v3.10: Emergency macroblocks don't modify exclusion list
-            excluded_producers_for_next_epoch: None,
-        };
-        
-        // Count microblocks before moving
-        let microblock_count = microblock_hashes.len();
-        
-        // Create emergency macroblock
-        // Defensive check: genesis must exist for any macroblock creation
-        {
-            let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
-            if genesis_ts == 0 {
-                if let Ok(Some(gb)) = storage.load_microblock_auto_format(0) {
-                    crate::GLOBAL_GENESIS_TIMESTAMP.store(gb.timestamp, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    println!("[ERR][MB] No Genesis block - skipping emergency macroblock");
-                    return Ok(());
-                }
-            }
-        }
-        // v3.38: WALL CLOCK TIMESTAMP for emergency macroblock
-        let deterministic_timestamp = get_timestamp_safe();
-        
-        let macroblock = qnet_state::MacroBlock {
-            height: macroblock_index,
-            timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
-            micro_blocks: microblock_hashes,
-            state_root: state_accumulator,
-            consensus_data,
-            previous_hash: storage.get_latest_macroblock_hash()
-                .unwrap_or([0u8; 32]),
-            // Emergency macroblock: PoH state not available in static context
-            poh_hash: vec![0u8; 64], // SHA3-512 produces 64 bytes
-            poh_count: 0, // Will be filled from last microblock's PoH
-        };
-        
-        // Save macroblock
-        storage.save_macroblock(macroblock.height, &macroblock).await
-            .map_err(|e| format!("Failed to save macroblock: {:?}", e))?;
-        
-        // v4.4: Update finality only if all constituent microblocks are present (defense-in-depth).
-        // PFP leader normally has all blocks, but edge cases during recovery may not.
-        let round = macroblock.height * 90;
-        let pfp_mb_start = if macroblock_index == 1 { 1 } else { (macroblock_index - 1) * 90 + 1 };
-        let pfp_mb_end = macroblock_index * 90;
-        let pfp_all_present = (pfp_mb_start..=pfp_mb_end)
-            .all(|h| storage.load_microblock(h).unwrap_or(None).is_some());
-        if pfp_all_present {
-            try_advance_finality(round, "PFP");
-        } else {
-            println!("[WARN][PFP] skip_finality_update mb={} round={} — microblocks incomplete", macroblock_index, round);
-        }
-        
-        if is_info() { 
-            println!("[INFO][PFP] saved mb={} type={} blocks={} participants={} round={}", 
-                     macroblock.height, finalization_type, microblock_count, participants.len(), round); 
-        }
-        
-        Ok(())
-    }
-    
-    /// DEPRECATED: Old emergency function - redirects to PFP
-    #[allow(dead_code)]
-    async fn trigger_emergency_macroblock_consensus(
-        storage: Arc<Storage>,
-        consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
-        failed_leader: String,
-        current_height: u64,
-        unified_p2p: Option<Arc<SimplifiedP2P>>,
-    ) {
-        println!("[ERR][MB] EMERGENCY: Failed leader {} - activating PFP", failed_leader);
-        
-        // Report failed leader via slashing collector
-        if let Some(ref p2p) = unified_p2p {
-            if !failed_leader.starts_with("unknown") && !failed_leader.starts_with("no_leader") {
-                let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                p2p.report_invalid_block(&failed_leader, current_height, [0u8; 32], "Failed macroblock production");
-                println!("[WARN][MB] slashing_report leader={}", failed_leader);
-            }
-        }
-        
-        // Use Progressive Finalization Protocol instead of waiting
-        Self::activate_progressive_finalization(storage, consensus, current_height, unified_p2p).await;
-    }
     
     // PRODUCTION: Byzantine consensus methods for commit-reveal protocol
-    
+
+    /// v14.8: CANONICAL MACROBLOCK VIEW CHANGE.
+    ///
+    /// Called whenever the 2f+1 threshold for commit OR reveal fails for a
+    /// macroblock round. Signs + broadcasts a Dilithium3 TimeoutVote at
+    /// (mb_index, cert_round + 1). After 2f+1 such votes the existing
+    /// TimeoutCertificate aggregator bumps HIGHEST_CERTIFIED_ROUND[mb_index],
+    /// which is mixed into should_initiate_consensus() hash — so every
+    /// honest node deterministically picks a DIFFERENT leader for the next
+    /// attempt, IN THE SAME EPOCH, and consensus resumes without waiting for
+    /// the next 90-block boundary.
+    ///
+    /// Idempotent: the underlying broadcast path dedupes via
+    /// TIMEOUT_VOTED_HEIGHTS, so calling this twice for the same round is safe.
+    async fn emit_macroblock_view_change_vote(
+        round_id: u64,
+        node_id: &str,
+        unified_p2p: &Option<Arc<SimplifiedP2P>>,
+        storage: Option<&Arc<Storage>>,
+    ) {
+        let Some(p2p) = unified_p2p else { return; };
+        if round_id == 0 || round_id % 90 != 0 {
+            // Only macroblock rounds have view changes
+            return;
+        }
+        let mb_index = round_id / 90;
+
+        // Next round = current certified + 1. Using certified (not locally
+        // proposed) as the base keeps all nodes convergent — every honest
+        // validator starts from the same consensus-visible value.
+        let current_cert = p2p.get_highest_certified_round(mb_index);
+        let next_round = current_cert.saturating_add(1);
+
+        // Anchor the vote to the latest macroblock hash for cryptographic
+        // binding. Falls back to zeros at genesis before any macroblock exists.
+        let last_block_hash: [u8; 32] = match storage {
+            Some(s) => s.get_latest_macroblock_hash().unwrap_or([0u8; 32]),
+            None => [0u8; 32],
+        };
+
+        // Canonical signing payload — MUST match the format
+        // `handle_timeout_vote` verifies on the receiving side.
+        let vote_msg = format!(
+            "TIMEOUT:{}:{}:{}",
+            mb_index, next_round, hex::encode(&last_block_hash)
+        );
+
+        let crypto = match try_get_quantum_crypto() {
+            Some(c) => c,
+            None => {
+                if is_warn() {
+                    println!("[WARN][MB-VIEW] no_crypto mb={} round={}", mb_index, next_round);
+                }
+                return;
+            }
+        };
+        match crypto.create_consensus_signature(node_id, &vote_msg).await {
+            Ok(sig) => {
+                if is_info() {
+                    println!("[INFO][MB-VIEW] view_change_vote mb={} round={} cert_was={}",
+                             mb_index, next_round, current_cert);
+                }
+                p2p.broadcast_timeout_vote(
+                    mb_index,
+                    next_round,
+                    last_block_hash,
+                    sig.signature.as_bytes().to_vec(),
+                );
+            }
+            Err(e) => {
+                if is_warn() {
+                    println!("[WARN][MB-VIEW] sign_fail mb={} round={} err={}",
+                             mb_index, next_round, e);
+                }
+            }
+        }
+    }
+
     /// PRODUCTION: Execute REAL commit phase with inter-node communication
     /// v3.30: Takes Arc<RwLock> instead of &mut engine to avoid holding write lock
     /// for the entire 12+ second phase. Lock is acquired/released briefly per operation.
@@ -23754,10 +23097,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if is_info() { println!("[INFO][CONS] commit_ok {}/{}", final_commits, byzantine_threshold); }
             if is_debug() { println!("[DBG][CONS] -> reveal_phase"); }
         } else {
-            println!("[WARN][CONS] Commit phase timeout: only {}/{} commits received", 
+            println!("[WARN][CONS] Commit phase timeout: only {}/{} commits received",
                      final_commits, byzantine_threshold);
-            println!("[ERR][CONS] Byzantine threshold NOT reached - consensus will fail");
-            println!("[INFO][CONS] PFP_recovery enabled");
+            println!("[ERR][CONS] Byzantine threshold NOT reached — triggering canonical view change");
+            // v14.8: Emit a signed TimeoutVote at this macroblock boundary so that
+            // 2f+1 validators can cooperatively rotate to a new leader in the
+            // same epoch. See emit_macroblock_view_change_vote for the full
+            // protocol. Without this, a silent return would leave the chain
+            // permanently stalled at the macroblock boundary if the elected
+            // leader was unavailable.
+            Self::emit_macroblock_view_change_vote(
+                round_id,
+                node_id,
+                unified_p2p,
+                try_get_storage(),
+            ).await;
             return;
         }
     }
@@ -24042,15 +23396,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let byzantine_threshold = (participants.len() * 2 + 2) / 3;
         
         if final_reveals >= byzantine_threshold {
-            if is_info() { println!("[INFO][CONS] Reveal phase completed: {}/{} reveals", 
+            if is_info() { println!("[INFO][CONS] Reveal phase completed: {}/{} reveals",
                      final_reveals, byzantine_threshold); }
             if is_info() { println!("[INFO][CONS] Ready for finalization"); }
         } else {
-            println!("[WARN][CONS] Reveal phase timeout: only {}/{} reveals received", 
+            println!("[WARN][CONS] Reveal phase timeout: only {}/{} reveals received",
                      final_reveals, byzantine_threshold);
-            println!("[ERR][CONS] Byzantine threshold NOT reached - consensus failed");
-            println!("[INFO][CONS] PFP_recovery enabled");
-            // Don't proceed to finalization - let PFP handle it
+            println!("[ERR][CONS] Byzantine threshold NOT reached — triggering canonical view change");
+            // v14.8: View change on reveal-phase failure.
+            // Same mechanism as commit-phase failure: broadcast a signed
+            // TimeoutVote, 2f+1 certify it, HIGHEST_CERTIFIED_ROUND[mb_index]
+            // bumps, next should_initiate_consensus picks a new leader.
+            Self::emit_macroblock_view_change_vote(
+                round_id,
+                node_id,
+                unified_p2p,
+                try_get_storage(),
+            ).await;
             return;
         }
         
@@ -25316,22 +24678,51 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         ).await;
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // PRODUCTION v2.35: ROUND-BASED FAILOVER
-        // If round N leader offline → round N+1 with different leader
+        // v14.8: CANONICAL BFT ROUND-BASED FAILOVER WITH 2f+1-CERTIFIED VIEW CHANGE.
+        //
+        // The round number is read from HIGHEST_CERTIFIED_ROUND[mb_index], which is
+        // driven by 2f+1 Dilithium3-signed TimeoutVotes. This is what keeps every
+        // honest node on the SAME round — we never advance past what the quorum
+        // has cryptographically endorsed.
+        //
+        // On local timeout, we emit a signed view-change vote. The aggregator
+        // in unified_p2p collects 2f+1 and bumps the certified round, at which
+        // point every validator (including us on the next iter) sees the new
+        // round and computes the new leader. No split-brain: no validator ever
+        // runs ahead of the quorum, no validator ever lags behind it by more
+        // than one round.
+        //
+        // Safety: MAX_ROUNDS bounds the loop to prevent runaway view changes if
+        // the network is catastrophically partitioned. If exhausted, we fall
+        // back to direct macroblock sync from peers (same as before).
         // ═══════════════════════════════════════════════════════════════════════════
-        const MAX_ROUNDS: u64 = 5;
-        const ROUND_TIMEOUT_SECS: u64 = 30;
-        
-        let mut current_round: u64 = 0;
-        
-        while current_round < MAX_ROUNDS {
-            // Check if macroblock already exists (leader might have created it)
+        const MAX_ROUNDS: u64 = 8;
+        const ROUND_TIMEOUT_SECS: u64 = 20;
+
+        let mut iter_guard: u64 = 0;
+        let mut last_round_seen: u64 = u64::MAX;
+
+        while iter_guard < MAX_ROUNDS {
+            // Macroblock may have arrived between iterations — always check first.
             if let Ok(Some(_)) = storage.get_macroblock_by_height(macroblock_index) {
-                if is_info() { println!("[INFO][MB_PART] received mb={} round={}", macroblock_index, current_round); }
+                if is_info() { println!("[INFO][MB_PART] received mb={} iter={}", macroblock_index, iter_guard); }
                 return Ok(());
             }
-            
-            // Compute leader for this round using consensus engine
+
+            // Read the 2f+1-certified round. This is authoritative: every honest
+            // node sees the same value, so every node computes the same leader.
+            let current_round = p2p.get_highest_certified_round(macroblock_index);
+
+            if current_round != last_round_seen {
+                if is_info() {
+                    println!("[INFO][MB_PART] view_round_advanced mb={} round={} prev={}",
+                             macroblock_index, current_round,
+                             if last_round_seen == u64::MAX { 0 } else { last_round_seen });
+                }
+                last_round_seen = current_round;
+            }
+
+            // Compute leader for this round — deterministic, identical on every node.
             let leader = {
                 let consensus_engine = consensus.read().await;
                 consensus_engine.compute_leader_for_round(
@@ -25341,55 +24732,61 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     beacon.as_ref(),
                 )
             };
-            
+
             let leader_id = match leader {
                 Some(id) => id,
                 None => {
-                    println!("[ERR][MB_PART] no_leader round={}", current_round);
-                    current_round += 1;
+                    println!("[ERR][MB_PART] no_leader mb={} round={}", macroblock_index, current_round);
+                    // Force a view change so all nodes advance together.
+                    Self::emit_macroblock_view_change_vote(
+                        end_height, node_id, &unified_p2p_option, Some(&storage),
+                    ).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    iter_guard += 1;
                     continue;
                 }
             };
-            
-            if is_info() { println!("[INFO][MB_PART] round={} leader={} we={}", 
-                                    current_round, leader_id, node_id == leader_id); }
-            
-            // v2.48 FIX: Do NOT call trigger_macroblock_consensus here!
-            // The role (INITIATOR vs PARTICIPANT) is decided ONCE at the start.
-            // If we were PARTICIPANT, we MUST stay PARTICIPANT and wait for leader.
-            // Calling trigger_macroblock_consensus would RESET consensus engine and lose all reveals!
-            //
-            // Previous bug: node005 had 4 reveals, then trigger_macroblock_consensus reset engine to 2.
-            if node_id == leader_id {
-                // We WERE selected as leader for this failover round,
-                // BUT we already participated in commit/reveal as PARTICIPANT.
-                // The ACTUAL leader (from should_initiate_consensus) will create MB.
-                // We just wait - don't try to become leader mid-consensus!
-                println!("[INFO][MB_PART] round={} we_are_leader_but_was_participant → wait_not_trigger", current_round);
+
+            if is_info() {
+                println!("[INFO][MB_PART] mb={} round={} leader={} we={}",
+                         macroblock_index, current_round, leader_id, node_id == leader_id);
             }
-            
-            // NOT leader - wait for MacroBlock from leader
-            if is_info() { println!("[INFO][MB_PART] round={} wait_leader={} timeout={}s", 
-                                    current_round, leader_id, ROUND_TIMEOUT_SECS); }
-            
+
+            // Wait for the MacroBlock. Do NOT restart consensus as a leader
+            // mid-round — the role is fixed for the life of this round; a new
+            // view change (bumped certified round) gives the next leader their turn.
             let wait_start = std::time::Instant::now();
             let round_timeout = std::time::Duration::from_secs(ROUND_TIMEOUT_SECS);
-            
+            let mut local_timed_out = true;
+
             while wait_start.elapsed() < round_timeout {
-                // Check if MacroBlock arrived from Leader
                 if let Ok(Some(_)) = storage.get_macroblock_by_height(macroblock_index) {
-                    if is_info() { println!("[INFO][MB_PART] received mb={} round={} elapsed={:?}", 
-                                            macroblock_index, current_round, wait_start.elapsed()); }
+                    if is_info() {
+                        println!("[INFO][MB_PART] received mb={} round={} elapsed={:?}",
+                                 macroblock_index, current_round, wait_start.elapsed());
+                    }
                     return Ok(());
                 }
-                
+                // Shortcut: if the quorum already bumped the round (e.g. 2f+1
+                // other validators voted before our local timer ran out), exit
+                // the wait early so we compute the fresh leader.
+                if p2p.get_highest_certified_round(macroblock_index) > current_round {
+                    local_timed_out = false;
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-            
-            // Timeout - move to next round with NEW leader!
-            println!("[WARN][MB_PART] timeout round={} leader={} → round={}", 
-                     current_round, leader_id, current_round + 1);
-            current_round += 1;
+
+            if local_timed_out {
+                // Our timer fired before the quorum advanced the round — contribute
+                // our signed vote so the aggregator can form the TimeoutCertificate.
+                println!("[WARN][MB_PART] timeout mb={} round={} leader={} — emitting view_change_vote",
+                         macroblock_index, current_round, leader_id);
+                Self::emit_macroblock_view_change_vote(
+                    end_height, node_id, &unified_p2p_option, Some(&storage),
+                ).await;
+            }
+            iter_guard += 1;
         }
         
         // All rounds exhausted - try sync as last resort
@@ -28455,12 +27852,185 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Deserialize and validate macroblock
         let macroblock: qnet_state::MacroBlock = bincode::deserialize(&data)
             .map_err(|e| QNetError::ValidationError(format!("Invalid macroblock format: {}", e)))?;
-        
+
         // Basic validation
         if macroblock.height != index {
             return Err(QNetError::ValidationError(format!(
                 "Macroblock height mismatch: expected {}, got {}", index, macroblock.height
             )));
+        }
+
+        // v14.8: Structural validation of consensus_data.commits / reveals.
+        //
+        // The on-wire representation of commits/reveals is a bare byte blob keyed by
+        // node_id. We cannot reconstruct the exact commit_hash each node signed
+        // (that data is stripped before serialisation), so a full Dilithium3
+        // verify is not possible here. What we CAN do — and what closes the
+        // "synthetic self-assembly injected over the wire" hole — is refuse
+        // any macroblock whose commit/reveal payloads do not look like real
+        // Dilithium3 envelopes.
+        //
+        // Real envelopes we accept (see consensus_crypto.rs):
+        //   - "compact_bin:<base64>"  (microblock path; ~2.6 KB)
+        //   - "hybrid_bin:<base64>"   (macroblock consensus; ~5 KB)
+        //   - "compact:<json>" / "hybrid:<json>"   (legacy JSON forms)
+        //   - "dilithium_sig_<node>_<base64>"       (pure Dilithium form)
+        //   - raw Dilithium3 detached signature (~2420 bytes minimum)
+        //
+        // Synthetic strings such as `local_self_assembly_commit_{h}` are well
+        // under 100 bytes and would never match any of these shapes, so the
+        // minimum length check alone removes the attack surface.
+        //
+        // This is deliberately LOOSE structural validation, not a full crypto
+        // gate — genuine finality still flows from the live commit/reveal
+        // path in unified_p2p (which DOES verify every signature), and from
+        // the 2f+1 threshold being met before a macroblock gets produced.
+        {
+            let commits = &macroblock.consensus_data.commits;
+            let reveals = &macroblock.consensus_data.reveals;
+
+            // v14.8.2: STRICT CANONICAL 2f+1 THRESHOLD — no attacker-controlled fallbacks.
+            //
+            // For any macroblock at index N ≥ 3, the validator committee that
+            // produced its commits/reveals is DEFINED BY macroblock N-2's
+            // `eligible_producers` snapshot (the N-2 rule — gives ~90 blocks
+            // for propagation while keeping the set Byzantine-finalised).
+            //
+            // The ONLY safe source for `committee_size` is that N-2 snapshot.
+            // Previous revisions of this code contained fallbacks:
+            //   • to mb N-1's eligible_producers (still adjacent — weak),
+            //   • to THIS macroblock's own eligible_producers (fully
+            //     attacker-controlled — the producer can put any number there),
+            //   • to a hard-coded genesis floor of 5 validators.
+            //
+            // Every fallback after N-2 is a chain-poisoning vector at scale.
+            // On a 1 000-Super-node network the real 2f+1 is 667; falling back
+            // to a 5-validator floor would let a 4-signer forgery get saved
+            // under our chosen floor of `max(threshold, 4) = 4`, which would
+            // then become the N-2 snapshot for future macroblocks — permanent
+            // chain corruption on cold-start sync.
+            //
+            // Canonical policy (this revision):
+            //   • N ≥ 3  → require mb N-2 on disk. If missing, return an
+            //              error with prefix `need_mb_prev:{N-2}` so the
+            //              caller can cooldown the current peer, request the
+            //              missing macroblock from a different peer, and
+            //              retry validation once it arrives.
+            //   • N = 1  → committee == hardcoded genesis count (baked-in,
+            //              not attacker-controlled). There is no prior
+            //              macroblock to consult.
+            //   • N = 2  → same as N = 1. mb 0 never exists; mb 1 is the
+            //              first and its own validators are still the
+            //              hardcoded genesis set.
+            //
+            // The hardcoded genesis source is `genesis_constants::genesis_node_count()`
+            // which reads `LEGACY_GENESIS_NODES.len()` baked into the binary.
+            // No runtime value, no network input, no fallback.
+            fn committee_size_from_mb(mb: &qnet_state::MacroBlock) -> Option<usize> {
+                mb.consensus_data.eligible_producers.as_ref()
+                    .and_then(|bytes| bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(bytes).ok())
+                    .map(|v| v.len())
+                    .filter(|n| *n > 0)
+            }
+
+            let committee_size: usize = if index <= 2 {
+                // Genesis epochs: committee is the hardcoded genesis set.
+                // For n=5 genesis nodes → committee_size=5 → 2f+1=4.
+                crate::genesis_constants::genesis_node_count()
+            } else {
+                // Canonical N-2 rule for N ≥ 3. Strict, no fallback.
+                match self.storage.get_macroblock_by_height(index - 2) {
+                    Ok(Some(raw)) => {
+                        match bincode::deserialize::<qnet_state::MacroBlock>(&raw) {
+                            Ok(mb_nm2) => match committee_size_from_mb(&mb_nm2) {
+                                Some(n) => n,
+                                None => {
+                                    return Err(QNetError::ValidationError(format!(
+                                        "Macroblock #{} validation rejected: N-2 mb#{} has empty eligible_producers",
+                                        index, index - 2
+                                    )));
+                                }
+                            },
+                            Err(e) => {
+                                return Err(QNetError::ValidationError(format!(
+                                    "Macroblock #{} validation rejected: N-2 mb#{} deserialize err={}",
+                                    index, index - 2, e
+                                )));
+                            }
+                        }
+                    }
+                    _ => {
+                        // N-2 not on disk. This is NOT a malicious-peer situation —
+                        // it's our own sync gap. Signal to the caller with a
+                        // structured prefix so it can cool the current peer, pull
+                        // N-2 from someone else, and retry.
+                        return Err(QNetError::SyncError(format!(
+                            "need_mb_prev:{} for validating mb#{}", index - 2, index
+                        )));
+                    }
+                }
+            };
+
+            // Canonical 2f+1 formula for Byzantine safety. committee_size is
+            // now trusted (either N-2 finalised snapshot or baked-in genesis),
+            // so no additional floor is needed.
+            let min_consensus_participants = ((committee_size * 2) + 2) / 3;
+
+            if is_debug() {
+                println!("[DBG][MB-VALIDATE] mb={} committee={} threshold={} commits={} reveals={} source={}",
+                         index, committee_size, min_consensus_participants,
+                         commits.len(), reveals.len(),
+                         if index <= 2 { "genesis_baked" } else { "n-2_snapshot" });
+            }
+
+            if commits.len() < min_consensus_participants {
+                return Err(QNetError::ValidationError(format!(
+                    "Macroblock #{} has {} commits < {} (canonical 2f+1, committee={})",
+                    index, commits.len(), min_consensus_participants, committee_size
+                )));
+            }
+            if reveals.len() < min_consensus_participants {
+                return Err(QNetError::ValidationError(format!(
+                    "Macroblock #{} has {} reveals < {} (canonical 2f+1, committee={})",
+                    index, reveals.len(), min_consensus_participants, committee_size
+                )));
+            }
+
+            // Minimum byte length for a real Dilithium3 signature payload.
+            // Pure detached signatures are ~2420 bytes; envelope wrappers
+            // add small overhead, never strip it. We use 500 as a deliberately
+            // generous floor: well below any real signature size, well above
+            // any synthetic placeholder string, leaving room for future
+            // compression-based envelope formats.
+            const MIN_SIG_BYTES: usize = 500;
+            let mut bad_commits = 0usize;
+            let mut bad_reveals = 0usize;
+            for (voter, sig) in commits.iter() {
+                if voter.is_empty() || voter.len() > 128 || sig.len() < MIN_SIG_BYTES {
+                    bad_commits += 1;
+                }
+            }
+            for (voter, sig) in reveals.iter() {
+                if voter.is_empty() || voter.len() > 128 || sig.len() < MIN_SIG_BYTES {
+                    bad_reveals += 1;
+                }
+            }
+            if bad_commits > 0 || bad_reveals > 0 {
+                // Even a single synthetic entry is enough evidence that this
+                // macroblock was not produced by a real 2f+1 consensus round.
+                // Reject outright — callers up the stack will drop the peer.
+                return Err(QNetError::ValidationError(format!(
+                    "Macroblock #{} has {} synthetic commits / {} reveals (structural)",
+                    index, bad_commits, bad_reveals
+                )));
+            }
+
+            // next_leader must be a non-empty node_id (well-formed macroblock).
+            if macroblock.consensus_data.next_leader.is_empty() {
+                return Err(QNetError::ValidationError(format!(
+                    "Macroblock #{} has empty next_leader", index
+                )));
+            }
         }
         
         // v3.00: Check if macroblock already saved (e.g., by BFT participant during consensus)

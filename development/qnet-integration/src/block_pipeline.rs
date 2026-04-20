@@ -45,101 +45,30 @@ use crate::unified_p2p::SimplifiedP2P;
 use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
 
 // ============================================================================
-// v13.0: FORK RECOVERY SIGNAL
+// v14.7.2: FORK RECOVERY SIGNAL (macroblock-divergence only)
 // ============================================================================
-// Tracks hash_chain_break events per height from distinct peers.
-// When N distinct peers report hash_chain_break at the same height,
-// it's a confirmed fork — signal rollback+resync to the main consensus loop.
+// Peer-counting heuristics (FORK_BREAK_PEER_THRESHOLD, HASH_CHAIN_BREAK_TRACKER,
+// per-peer hash_chain_break aggregation) have been removed. They were
+// Byzantine-unsafe at scale: f+1 peers bounded by [3,20] is not a canonical
+// BFT threshold, and the "distinct peers" counter is trivially gamed by
+// a single attacker spawning sockets.
 //
-// ARCHITECTURE: This is the "circuit breaker" that prevents permanent stall.
-// Without this, a forked node discards all incoming blocks forever.
+// Canonical fork detection now lives at the macroblock layer:
+//   - Every 90-block boundary runs 2f+1 commit/reveal consensus on the
+//     finalized macroblock. Divergence there = confirmed Byzantine fork.
+//   - Until then, invalid blocks are rejected and the node waits for the
+//     canonical macroblock consensus to resolve.
 // ============================================================================
 
-/// Default fork break threshold (used at genesis with 5 nodes).
-/// Overridden dynamically by update_fork_threshold() from main consensus loop.
-const FORK_BREAK_PEER_THRESHOLD_DEFAULT: usize = 3;
-
-/// Floor: never go below 3 peers (even with few connections)
-const FORK_BREAK_PEER_THRESHOLD_MIN: usize = 3;
-
-/// Cap: pipeline realistically sees blocks from ~20-30 relay peers.
-/// Higher threshold = detection never fires. Safety ensured by
-/// check_finality_allows_rollback() + try_fork_recovery() cooldown + Dilithium sigs.
-const FORK_BREAK_PEER_THRESHOLD_MAX: usize = 20;
-
-/// Dynamic fork break threshold: f+1 of connected peers, bounded by [MIN, MAX].
-/// Updated every 30s from main consensus loop via update_fork_threshold().
-/// verify_stage reads this atomically — no P2P dependency needed.
-static DYNAMIC_FORK_THRESHOLD: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(FORK_BREAK_PEER_THRESHOLD_DEFAULT);
-
-/// Update fork break threshold based on current connected peer count.
-/// Called from main consensus loop where P2P context is available.
-/// Formula: f+1 = ceil(connected/3), clamped to [3, 20].
-///
-/// Examples:
-///   5 connected → max(3, min(ceil(5/3)=2, 20)) = 3  (60%)
-///   10 connected → max(3, min(4, 20)) = 4  (40%)
-///   50 connected → max(3, min(17, 20)) = 17  (34%)
-///   100 connected → max(3, min(34, 20)) = 20  (20%)
-///   1000 connected → max(3, min(334, 20)) = 20  (2%, safety via finality+cooldown)
-pub fn update_fork_threshold(connected_peers: usize) {
-    let f_plus_1 = (connected_peers + 2) / 3; // ceil(n/3)
-    let threshold = std::cmp::max(
-        FORK_BREAK_PEER_THRESHOLD_MIN,
-        std::cmp::min(f_plus_1, FORK_BREAK_PEER_THRESHOLD_MAX),
-    );
-    DYNAMIC_FORK_THRESHOLD.store(threshold, std::sync::atomic::Ordering::Relaxed);
-    if is_debug() {
-        println!("[DBG][PIPELINE] fork_threshold_updated peers={} threshold={}", connected_peers, threshold);
-    }
-}
-
-/// v14.7 legacy: retained for potential external debug tooling that may call
-/// it. Fork detection itself is now QC-only (see hash_chain_break handling
-/// in `verify_stage`) and no longer consults this threshold.
-#[allow(dead_code)]
-fn get_fork_threshold() -> usize {
-    DYNAMIC_FORK_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Cooldown between fork recovery signals (prevents rollback ping-pong)
-const FORK_RECOVERY_COOLDOWN_SECS: u64 = 60;
-
-/// Global fork recovery signal: fork_height (0 = no signal)
-/// Main consensus loop checks this and triggers rollback+resync
+/// Global fork recovery signal: fork_height (0 = no signal).
+/// Set by the macroblock-divergence detector; consumed by the main consensus loop.
 static FORK_RECOVERY_HEIGHT: AtomicU64 = AtomicU64::new(0);
-
-/// Timestamp of last fork recovery signal (prevents re-triggering too fast)
-static FORK_RECOVERY_LAST_SIGNAL: AtomicU64 = AtomicU64::new(0);
-
-/// Track distinct peers per height that reported hash_chain_break
-static HASH_CHAIN_BREAK_TRACKER: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, std::collections::HashSet<String>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Check and consume fork recovery signal.
 /// Returns Some(fork_height) if recovery is needed.
-/// v13.1: Also clears break_tracker to prevent re-triggering while recovery runs.
-/// Without this, new blocks at the same height re-fill the tracker and re-trigger
-/// fork_confirmed every cooldown window, spamming logs and wasting cycles.
 pub fn take_fork_recovery_signal() -> Option<u64> {
     let h = FORK_RECOVERY_HEIGHT.swap(0, Ordering::SeqCst);
-    if h > 0 {
-        // Clear ALL tracker entries — recovery will resync and entries are stale
-        if let Ok(mut tracker) = HASH_CHAIN_BREAK_TRACKER.lock() {
-            tracker.clear();
-        }
-        Some(h)
-    } else {
-        None
-    }
-}
-
-/// Clear stale entries from break tracker (called periodically)
-pub fn cleanup_break_tracker(min_height: u64) {
-    if let Ok(mut tracker) = HASH_CHAIN_BREAK_TRACKER.lock() {
-        tracker.retain(|h, _| *h >= min_height);
-    }
+    if h > 0 { Some(h) } else { None }
 }
 
 // ============================================================================
@@ -353,12 +282,14 @@ impl BlockPipeline {
         // Stage 1: Ingest → Decode (decompress + deserialize)
         let metrics_decode = metrics.clone();
         let storage_decode = ctx.storage.clone();
+        let p2p_decode = ctx.unified_p2p.clone();
         tokio::spawn(Self::decode_stage(
             ingest_rx,
             decode_tx,
             storage_decode,
             metrics_decode,
             config.max_block_bytes,
+            p2p_decode,
         ));
 
         // Stage 2: Decode → Verify (signature, hash chain, timestamp)
@@ -413,8 +344,24 @@ impl BlockPipeline {
         storage: Arc<Storage>,
         metrics: Arc<PipelineMetrics>,
         max_block_bytes: usize,
+        unified_p2p: Option<Arc<SimplifiedP2P>>,
     ) {
         while let Some(block) = rx.recv().await {
+            // v14.8: local apply-quarantine — drop blocks from peers that
+            // have repeatedly produced state_root mismatches or invalid
+            // payloads. Cheap DashMap lookup; lets us skip decode/verify
+            // on known-bad sources without any global lock.
+            if let Some(ref p2p) = unified_p2p {
+                if p2p.is_peer_quarantined(&block.from_peer) {
+                    if is_debug() {
+                        println!("[DBG][PIPELINE] quarantined_peer_drop h={} from={}",
+                                 block.height, block.from_peer);
+                    }
+                    metrics.decode_failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+
             // Size check (DoS protection)
             if block.data.len() > max_block_bytes {
                 if is_warn() {
@@ -581,158 +528,28 @@ impl BlockPipeline {
                     metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
 
                     // ═══════════════════════════════════════════════════════════════════════
-                    // v14.7: QC-ONLY FORK DETECTION — BFT-rigorous rollback signalling
+                    // v14.7.2: FORK SIGNALLING — reject only, no automatic rollback.
                     // ═══════════════════════════════════════════════════════════════════════
-                    // Rollback is destructive (deletes local blocks, triggers resync). It
-                    // MUST be authorised by a cryptographic 2f+1 quorum of the ROUND
-                    // COMMITTEE — never by peer counting, never by a single peer's claim
-                    // of a higher `timeout_round`.
+                    // Canonical BFT policy: a single microblock that fails hash-chain
+                    // continuity is REJECTED, nothing more. Rollback of local state
+                    // is authorised strictly by cryptographic divergence at macroblock
+                    // level (2f+1 commit/reveal sees a different state root than we
+                    // persisted). That detection lives in the macroblock consensus
+                    // loop in node.rs and is the only path that writes to
+                    // FORK_RECOVERY_HEIGHT.
                     //
-                    // The only admissible source of rollback evidence is a valid
-                    // `prev_block_qc` embedded in the header of an incoming block:
-                    //   * `QuorumCertificate { height, block_hash, votes }` with
-                    //     `votes.len() >= 2f+1` of the committee for that round;
-                    //   * every vote is a Dilithium3 signature by a registered
-                    //     committee member (verified against VRF_PK_REGISTRY inside
-                    //     `QuorumCertificate::verify`);
-                    //   * committee threshold comes from `qc_threshold_2f_plus_1()`,
-                    //     which reads a committee-size-capped count (≤ MAX_VALIDATORS).
+                    // Peer-counting heuristics (HASH_CHAIN_BREAK_TRACKER, per-peer
+                    // thresholds) are NOT used: they are not BFT-sound at scale and
+                    // they created DoS surface at genesis. Per-block QCs are also
+                    // not used: they duplicated the macroblock layer and collided
+                    // with its rate-limit keyspace.
                     //
-                    // Authority semantics:
-                    //   * At any network size (5 nodes, 10K nodes, millions), the
-                    //     consensus authority is the ≤1000-member committee of the
-                    //     current round. Peers outside the committee have no vote on
-                    //     whether WE should roll back our chain.
-                    //   * A Byzantine peer sending a forged block with no / invalid
-                    //     QC is dropped and produces NO fork-recovery signal.
-                    //   * Only a block that itself carries 2f+1 committee attestation
-                    //     can push us off our locally-correct chain.
-                    //
-                    // Bootstrap exemption:
-                    //   * During the first `FINALITY_WINDOW` blocks the committee has
-                    //     not yet formed a QC over genesis. Blocks without QC are
-                    //     rejected on hash_chain_break (as before) but never trigger
-                    //     rollback — there is no trusted authority to claim we're
-                    //     wrong at that moment.
-                    //
-                    // DoS resistance:
-                    //   * Unbounded fork-recovery spam is impossible: each signal is
-                    //     gated by 2f+1 Dilithium verifications + a 60-second cooldown
-                    //     + a CAS on `FORK_RECOVERY_HEIGHT`.
-                    //
-                    // Replacing the prior peer-count scheme:
-                    //   * `HASH_CHAIN_BREAK_TRACKER`, `FORK_BREAK_PEER_THRESHOLD*`
-                    //     and `get_fork_threshold()` are no longer consulted on the
-                    //     fork-detection hot path — they remain in the file as
-                    //     dead code only to avoid a breaking change to any external
-                    //     debug tooling that may still reference them, and are
-                    //     marked via `#[allow(dead_code)]` in their declarations if
-                    //     compiler warnings would otherwise fire.
+                    // If this block is genuinely on a superior chain, its producer's
+                    // state commitment will diverge from ours at the next macroblock
+                    // boundary, and the macroblock-level detector will roll us back
+                    // deterministically using `check_finality_allows_rollback` +
+                    // standard resync. That is the ONLY canonical rollback trigger.
                     // ═══════════════════════════════════════════════════════════════════════
-
-                    let local_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    let past_bootstrap = local_h > crate::node::FINALITY_WINDOW;
-
-                    let should_signal_rollback: bool = if !past_bootstrap {
-                        if is_debug() {
-                            println!("[DBG][PIPELINE] fork_bootstrap_skip h={} local_h={} (no rollback before FINALITY_WINDOW)",
-                                     mb.height, local_h);
-                        }
-                        false
-                    } else if let Some(qc_bytes) = &mb.prev_block_qc {
-                        match bincode::deserialize::<crate::unified_p2p::QuorumCertificate>(qc_bytes) {
-                            Ok(qc) => {
-                                // Linkage check: QC must cover EXACTLY (mb.height - 1).
-                                let expected_qc_h = mb.height.saturating_sub(1);
-                                if qc.height != expected_qc_h {
-                                    if is_warn() {
-                                        println!("[WARN][PIPELINE] fork_qc_height_mismatch h={} qc_h={} expected={}",
-                                                 mb.height, qc.height, expected_qc_h);
-                                    }
-                                    false
-                                } else {
-                                    let threshold = crate::unified_p2p::qc_threshold_2f_plus_1();
-                                    match qc.verify(threshold) {
-                                        Err(e) => {
-                                            if is_warn() {
-                                                println!("[WARN][PIPELINE] fork_qc_verify_fail h={} threshold={} err={}",
-                                                         mb.height, threshold, e);
-                                            }
-                                            false
-                                        }
-                                        Ok(()) => {
-                                            // QC is cryptographically valid — NOW check
-                                            // semantics: is THIS node actually behind?
-                                            let fast_final = crate::unified_p2p::fast_finalized_height();
-                                            let our_cert = crate::unified_p2p::highest_certified_round_for(mb.height / 90);
-                                            let behind = qc.height > fast_final
-                                                && mb.timeout_round > our_cert;
-                                            if behind {
-                                                if is_warn() {
-                                                    println!("[WARN][PIPELINE] fork_confirmed_qc h={} qc_h={} our_fast_final={} block_round={} our_cert={} action=rollback",
-                                                             mb.height, qc.height, fast_final,
-                                                             mb.timeout_round, our_cert);
-                                                }
-                                                true
-                                            } else {
-                                                if is_debug() {
-                                                    println!("[DBG][PIPELINE] fork_qc_valid_but_not_behind h={} qc_h={} fast_final={} block_round={} our_cert={}",
-                                                             mb.height, qc.height, fast_final,
-                                                             mb.timeout_round, our_cert);
-                                                }
-                                                false
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                if is_warn() {
-                                    println!("[WARN][PIPELINE] fork_qc_decode_fail h={} err={}",
-                                             mb.height, e);
-                                }
-                                false
-                            }
-                        }
-                    } else {
-                        // Post-bootstrap block without QC → rejected on hash_chain_break
-                        // like any other, but NOT a trusted fork-signal source.
-                        if is_debug() {
-                            println!("[DBG][PIPELINE] fork_no_qc h={} post_bootstrap (peer=unauthenticated, no rollback)",
-                                     mb.height);
-                        }
-                        false
-                    };
-
-                    if should_signal_rollback {
-                        // Cooldown guards against rollback ping-pong even when QC is valid
-                        // (e.g. two conflicting QCs from different round committees — a
-                        // separate slashable event; our role here is just to not flap).
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let last_signal = FORK_RECOVERY_LAST_SIGNAL.load(Ordering::SeqCst);
-                        let cooldown_ok = now_secs.saturating_sub(last_signal)
-                            >= FORK_RECOVERY_COOLDOWN_SECS;
-
-                        if cooldown_ok {
-                            if FORK_RECOVERY_HEIGHT.compare_exchange(
-                                0, mb.height, Ordering::SeqCst, Ordering::SeqCst
-                            ).is_ok() {
-                                FORK_RECOVERY_LAST_SIGNAL.store(now_secs, Ordering::SeqCst);
-                                println!("[WARN][PIPELINE] fork_recovery_signal h={} source=pipelined_qc (rollback+resync required)",
-                                         mb.height);
-                            }
-                        } else if is_info() {
-                            println!("[INFO][PIPELINE] fork_signal_cooldown h={} remaining={}s",
-                                     mb.height,
-                                     FORK_RECOVERY_COOLDOWN_SECS
-                                         - now_secs.saturating_sub(last_signal));
-                        }
-                    }
-
                     continue;
                 }
             }
@@ -863,87 +680,16 @@ impl BlockPipeline {
                 }
             }
 
-            // ═══════════════════════════════════════════════════════════════════════════
-            // v14.7 (pipelined QC): VERIFY EMBEDDED 2f+1 QC FOR (height - 1)
-            // ═══════════════════════════════════════════════════════════════════════════
-            // Any non-genesis block carrying `prev_block_qc` must present a
-            // verifiable 2f+1 attestation over the exact predecessor this
-            // block claims to extend. On success we cache the QC locally so
-            // our own production path can pipe it forward without having to
-            // collect the individual votes. On failure we reject — a block
-            // is free to omit the QC during the genesis/boot window, but if
-            // it carries one, it must be valid.
-            //
-            // Backward compatibility: blocks with `prev_block_qc = None`
-            // skip this check and fall back to the pre-v14.7 defenses
-            // (hash_chain continuity, v14.6 stale-round, Dilithium block
-            // signature). This keeps the upgrade non-breaking.
-            //
-            // Safety vs. DoS: QC verify does up to 2f+1 Dilithium3
-            // signature checks — capped by MAX_VALIDATORS = 1000. Heavy
-            // but bounded and a malicious peer cannot force unlimited work
-            // because the entire block including QC passes through the
-            // shred-reassembly rate limiter upstream.
-            // ═══════════════════════════════════════════════════════════════════════════
-            if mb.height > 0 {
-                if let Some(qc_bytes) = &mb.prev_block_qc {
-                    match bincode::deserialize::<crate::unified_p2p::QuorumCertificate>(qc_bytes) {
-                        Ok(qc) => {
-                            if qc.height != mb.height - 1 {
-                                if is_warn() {
-                                    println!(
-                                        "[WARN][PIPELINE] qc_height_mismatch h={} qc_h={} expected={}",
-                                        mb.height, qc.height, mb.height - 1
-                                    );
-                                }
-                                metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
-                            // Fetch 2f+1 threshold from the module-level free
-                            // helper, which reads the validator-count cache
-                            // updated by the p2p peer-set maintenance loop
-                            // and falls back to `genesis_node_count()` when
-                            // the cache is cold.
-                            let threshold = crate::unified_p2p::qc_threshold_2f_plus_1();
-                            if let Err(e) = qc.verify(threshold) {
-                                if is_warn() {
-                                    println!(
-                                        "[WARN][PIPELINE] qc_verify_fail h={} err={}",
-                                        mb.height, e
-                                    );
-                                }
-                                metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
-                            // Cache so our own producer can pipe this QC forward.
-                            crate::unified_p2p::BLOCK_COMMIT_QC.insert(
-                                qc.height, (qc.block_hash, qc.votes.clone())
-                            );
-                            // Advance fast-finality monotonically to qc.height.
-                            loop {
-                                let prev = crate::unified_p2p::FAST_FINALIZED_HEIGHT
-                                    .load(std::sync::atomic::Ordering::SeqCst);
-                                if qc.height <= prev { break; }
-                                if crate::unified_p2p::FAST_FINALIZED_HEIGHT.compare_exchange(
-                                    prev, qc.height,
-                                    std::sync::atomic::Ordering::SeqCst,
-                                    std::sync::atomic::Ordering::SeqCst,
-                                ).is_ok() { break; }
-                            }
-                        }
-                        Err(e) => {
-                            if is_warn() {
-                                println!(
-                                    "[WARN][PIPELINE] qc_decode_fail h={} err={}",
-                                    mb.height, e
-                                );
-                            }
-                            metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                }
-            }
+            // v14.7.2: per-microblock pipelined-QC verify REMOVED.
+            // BFT safety for microblocks is delivered by the combination of:
+            //   1. Dilithium3 producer signature (identity binding);
+            //   2. hash-chain continuity (parent_hash check above);
+            //   3. v14.6 stale-round guards (pre-save + ingest reject);
+            //   4. 2f+1 macroblock commit/reveal at the 90-block boundary
+            //      that hard-finalises and, by implication, retroactively
+            //      ratifies every microblock below it.
+            // A per-block QC is redundant with (4) and was also the source
+            // of a production rate-limit collision. Removed.
 
             // All checks passed — forward to apply stage
             let block_height = decoded.height; // Copy before move
@@ -1079,8 +825,9 @@ impl BlockPipeline {
 
                 // State root verification
                 if has_state_root && computed_state_root != block.microblock.state_root {
-                    eprintln!("[ERR][PIPELINE] state_root_mismatch h={} expected={} computed={}",
+                    eprintln!("[ERR][PIPELINE] state_root_mismatch h={} from={} expected={} computed={}",
                              height,
+                             block.from_peer,
                              hex::encode(&block.microblock.state_root[..8]),
                              hex::encode(&computed_state_root[..8]));
 
@@ -1091,7 +838,23 @@ impl BlockPipeline {
                     }
                     metrics.apply_failed.fetch_add(1, Ordering::Relaxed);
                     crate::unified_p2p::clear_block_pending_sync(height);
+
+                    // v14.8: Per-peer local quarantine — repeated state_root
+                    // mismatches from the same peer signal either (a) the
+                    // peer is on a different fork, or (b) the peer is
+                    // actively hostile. Either way, stop wasting apply
+                    // cycles on them for a cooldown window. This is a
+                    // LOCAL defense; on-chain slashing still happens via
+                    // the macroblock analyze_chain_for_slashing path.
+                    if let Some(ref p2p) = ctx.unified_p2p {
+                        p2p.record_apply_strike(&block.from_peer, "state_root_mismatch");
+                    }
                     continue;
+                }
+
+                // v14.8: Successful apply — clear any past strikes for this peer.
+                if let Some(ref p2p) = ctx.unified_p2p {
+                    p2p.record_apply_success(&block.from_peer);
                 }
 
                 // State verified — save block
@@ -1231,45 +994,14 @@ impl BlockPipeline {
                 timestamp: block.microblock.timestamp,
             });
 
-            // ═══════════════════════════════════════════════════════════════
-            // v14.7 (pt 7): EMIT BLOCK-COMMIT VOTE after successful apply
-            // ═══════════════════════════════════════════════════════════════
-            // Every validator that persists a block into local storage also
-            // signs a commit attestation over (height, block_hash). 2f+1 of
-            // these attestations aggregate into a QuorumCertificate that is
-            // later embedded in the NEXT block's header (pipelined QC) and
-            // in the fast-finality tracker. Without this emission point,
-            // the BFT safety layer has no proof of acceptance and rotation
-            // decisions fall back to implicit local-chain heuristics.
-            //
-            // Signing is async — runs in the apply task context so it does
-            // NOT block the verify stage ahead of it. The leader-lock guard
-            // inside broadcast_block_commit_vote prevents self-equivocation
-            // if this node later tries to vote for a conflicting block at
-            // the same height.
-            //
-            // Scales at 1000 validators: one Dilithium3 sign + O(N) fan-out
-            // per applied block. Well within the 1-second budget.
-            // ═══════════════════════════════════════════════════════════════
-            if let Some(p2p) = &ctx.unified_p2p {
-                let blk_hash = block.microblock.hash();
-                let round = block.microblock.timeout_round;
-                let msg = crate::unified_p2p::commit_vote_msg(height, &blk_hash);
-                if let Some(crypto) = crate::node::try_get_quantum_crypto() {
-                    match crypto.create_consensus_signature(&ctx.node_id, &msg).await {
-                        Ok(sig) => {
-                            p2p.broadcast_block_commit_vote(
-                                height, blk_hash, round, sig.signature.as_bytes().to_vec(),
-                            );
-                        }
-                        Err(e) => {
-                            if is_warn() {
-                                println!("[WARN][QC] vote_sign_fail h={} err={}", height, e);
-                            }
-                        }
-                    }
-                }
-            }
+            // v14.7.2: per-microblock BlockCommitVote emission REMOVED.
+            // Canonical macroblock commit/reveal (2f+1 at 90-block boundary)
+            // is the sole BFT finality layer. Per-block QCs duplicated that
+            // path, inflated bandwidth, and shared the "commit" rate-limit
+            // key with macroblock ConsensusCommit, which starved the real
+            // macroblock consensus from peers. Pre-save / ingest stale-round
+            // guards (v14.6) and TimeoutCertificate 2f+1 provide live-path
+            // safety without a per-block attestation stream.
 
             // ── Reputation update for block producer ──
             // Handled by deterministic reputation system via macroblock processing

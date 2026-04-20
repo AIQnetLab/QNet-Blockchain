@@ -103,28 +103,10 @@ pub struct MicroBlock {
     #[serde(default)]
     pub timeout_round: u64,
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // v14.7 (pipelined QC): EMBEDDED QUORUM CERTIFICATE FOR (height - 1)
-    // ═══════════════════════════════════════════════════════════════════════
-    // Every validator can verify, independently of local state, that the
-    // immediate predecessor of THIS block was accepted by a BFT super-
-    // majority (2f+1 Dilithium3 attestations). Carrying the QC in the
-    // header — rather than out-of-band — binds each block to its chain of
-    // justification, preventing a stale/Byzantine leader from extending a
-    // tip the network has never agreed upon.
-    //
-    // Serialization: bincode-encoded `QuorumCertificate { height:u64,
-    // block_hash:[u8;32], votes:Vec<(voter_id, sig)> }`.
-    //
-    // Backward compatibility: `#[serde(default)]` lets older blocks (or
-    // genesis / boot phase before QC is formed) deserialize with `None`.
-    // Validators apply the QC check only when the field is `Some` AND the
-    // embedded height matches (block.height - 1); otherwise the v14.6
-    // stale-round guard and hash_chain continuity check remain the primary
-    // defense. This enables gradual roll-out at 1000+ Super-node scale.
-    // ═══════════════════════════════════════════════════════════════════════
-    #[serde(default)]
-    pub prev_block_qc: Option<Vec<u8>>,
+    // v14.7.2: `prev_block_qc` field REMOVED. Microblock BFT safety is
+    // delivered by the canonical macroblock commit/reveal path rather
+    // than a per-block pipelined QC, so the header no longer needs to
+    // carry a 2f+1 certificate for its predecessor.
 }
 
 /// Macroblock structure - consensus blocks that finalize microblocks
@@ -874,9 +856,6 @@ impl MicroBlock {
             state_root: [0u8; 32],
             // v14.0: Timeout round (default 0 = primary leader)
             timeout_round: 0,
-            // v14.7: Pipelined QC (None for constructor / bootstrap paths;
-            // producer attaches via direct struct init at rotation boundary)
-            prev_block_qc: None,
         }
     }
 

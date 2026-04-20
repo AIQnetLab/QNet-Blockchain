@@ -37,6 +37,41 @@ static ROLLBACK_START_TIME: AtomicU64 = AtomicU64::new(0);
 /// Maximum rollback duration in seconds (prevents deadlock if rollback hangs)
 const ROLLBACK_TIMEOUT_SECS: u64 = 60;
 
+/// v14.8.1: FINALITY-STATE SERIALISATION MUTEX.
+///
+/// Serialises every mutation of finality-related shared state:
+///   - `LAST_FINALIZED_HEIGHT` / `LAST_FINALIZED_CONSENSUS_ROUND` advances
+///     (node.rs::try_advance_finality)
+///   - Rollback slot claim + finality re-check (begin_finality_guarded_rollback)
+///
+/// Without this, a TOCTOU window exists between
+/// `is_rollback_in_progress()==false` and `LAST_FINALIZED_HEIGHT.store(...)`.
+/// A concurrent rollback can claim the slot and pass its re-check BEFORE the
+/// advancing thread's store lands — then proceed to delete blocks that are
+/// now finalised. Rare, but at thousands-of-nodes × years of uptime,
+/// eventually triggers.
+///
+/// The mutex is held for microseconds (one atomic read + a few stores per
+/// path). It never covers the actual block-delete loop — deletions run
+/// AFTER the claim returns, protected by the `ROLLBACK_IN_PROGRESS` flag
+/// (which `try_advance_finality` checks). So the mutex itself has
+/// effectively zero contention even at 10,000+ Super-nodes: macroblock
+/// finality fires ≤ once per 90 s per macroblock layer.
+pub(crate) static FINALITY_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// v14.8.1: Public guard type alias so other modules can hold the lock
+/// without importing parking_lot directly.
+#[allow(dead_code)]
+pub type FinalityGuard<'a> = parking_lot::MutexGuard<'a, ()>;
+
+/// v14.8.1: Acquire the finality-state serialisation lock. Blocking.
+/// Callers MUST keep the scope short — lock is hot path for rollback starts
+/// and finality advances. DO NOT hold across `.await` points.
+#[inline]
+pub fn lock_finality_state() -> parking_lot::MutexGuard<'static, ()> {
+    FINALITY_MUTEX.lock()
+}
+
 /// Start rollback protection - call BEFORE deleting blocks
 /// Returns false if another rollback is already in progress
 pub fn start_rollback_protection(target_height: u64) -> bool {
@@ -118,6 +153,94 @@ pub fn get_rollback_status() -> (bool, u64) {
         ROLLBACK_IN_PROGRESS.load(Ordering::Relaxed),
         ROLLBACK_TARGET_HEIGHT.load(Ordering::Relaxed)
     )
+}
+
+/// v14.8: Cheap predicate for hot paths (e.g. finality advancement). Read-only,
+/// uses Acquire ordering so a writer that set the flag before deleting blocks
+/// is visible to every subsequent reader.
+#[inline]
+pub fn is_rollback_in_progress() -> bool {
+    ROLLBACK_IN_PROGRESS.load(Ordering::Acquire)
+}
+
+/// v14.8: Atomic `check finality + claim rollback slot`. Returns Ok(()) only
+/// when both hold simultaneously:
+///   1. `target_height >= LAST_FINALIZED_HEIGHT` (no finality violation)
+///   2. no other rollback is currently running
+///
+/// On success the caller OWNS the rollback slot and MUST release it via
+/// `end_rollback_protection()` when done. This closes the race window between
+/// the previous two-step pattern (check then start) where finality could
+/// advance between the two calls.
+///
+/// Scales linearly: two atomic reads + one CAS + one atomic store. No mutex,
+/// safe to call from any task, no contention at the thousands-of-nodes scale.
+pub fn begin_finality_guarded_rollback(
+    target_height: u64,
+    last_finalized_height: u64,
+) -> Result<(), String> {
+    // v14.8.1: Hold the finality-state mutex for the whole claim+check path.
+    // This serialises against `try_advance_finality`, which ALSO takes the
+    // mutex before reading the rollback flag and writing LAST_FINALIZED_HEIGHT.
+    // With the mutex, the previous TOCTOU is eliminated: by the time we do the
+    // finality re-check, no concurrent advance can be half-done.
+    //
+    // Lock is held for microseconds — release happens before the caller's
+    // block-delete loop. Deletion is still protected by ROLLBACK_IN_PROGRESS
+    // (checked by try_advance_finality under the same mutex on its next call).
+    let _guard = FINALITY_MUTEX.lock();
+
+    // 1. Claim the rollback slot FIRST. Once ROLLBACK_IN_PROGRESS is set,
+    //    `try_advance_finality` (in node.rs) will refuse to advance —
+    //    closing the race window between our finality check and the
+    //    actual deletion.
+    match ROLLBACK_IN_PROGRESS.compare_exchange(
+        false, true, Ordering::SeqCst, Ordering::SeqCst,
+    ) {
+        Ok(_) => {}
+        Err(_) => {
+            // Another rollback is already running. Respect the timeout
+            // semantics of the legacy start_rollback_protection.
+            let start_time = ROLLBACK_START_TIME.load(Ordering::Relaxed);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now.saturating_sub(start_time) < ROLLBACK_TIMEOUT_SECS {
+                return Err(format!(
+                    "rollback_slot_busy other_target={}",
+                    ROLLBACK_TARGET_HEIGHT.load(Ordering::Relaxed)
+                ));
+            }
+            // Previous rollback timed out — force-claim the slot.
+            println!("[WARN][ROLLBACK] stale_slot_force_claim age_secs={}",
+                     now.saturating_sub(start_time));
+            ROLLBACK_IN_PROGRESS.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // 2. Now — with advancement blocked AND lock held — re-check the finality
+    //    boundary. Under the mutex there is no way for a concurrent advance
+    //    to be mid-store; every advance either completed before we took the
+    //    lock (visible now) or is waiting behind us (will see our flag).
+    if last_finalized_height > 0 && target_height < last_finalized_height {
+        ROLLBACK_IN_PROGRESS.store(false, Ordering::SeqCst);
+        return Err(format!(
+            "FINALITY_VIOLATION: rollback to {} blocked — blocks up to {} are finalized",
+            target_height, last_finalized_height
+        ));
+    }
+
+    // 3. Slot owned + finality boundary respected — record metadata.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    ROLLBACK_TARGET_HEIGHT.store(target_height, Ordering::SeqCst);
+    ROLLBACK_START_TIME.store(now, Ordering::SeqCst);
+    println!("[INFO][STORAGE] rollback_guarded_started target_h={} finalized_h={}",
+             target_height, last_finalized_height);
+    Ok(())
 }
 
 /// Failover event for tracking producer failures
@@ -4135,11 +4258,6 @@ impl Storage {
                         state_root: efficient_block.state_root,
                         // v14.0: Timeout round for producer authority
                         timeout_round: efficient_block.timeout_round,
-                        // v14.7: QC is reconstructable from BLOCK_COMMIT_QC
-                        // DashMap or on-chain from next block; storage-path
-                        // rehydration leaves it None to keep EfficientMicroBlock
-                        // schema unchanged.
-                        prev_block_qc: None,
                     };
                     
                     // Serialize as full MicroBlock for network transmission
@@ -4398,9 +4516,6 @@ impl Storage {
             state_root: efficient_block.state_root,
             // v14.0: Timeout round for producer authority
             timeout_round: efficient_block.timeout_round,
-            // v14.7: QC not persisted in EfficientMicroBlock layout; rehydrated
-            // on demand from BLOCK_COMMIT_QC or the next block's header.
-            prev_block_qc: None,
         };
 
         Ok(Some(microblock))

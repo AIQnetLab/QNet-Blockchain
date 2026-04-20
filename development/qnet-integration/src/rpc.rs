@@ -7208,6 +7208,10 @@ async fn handle_light_node_register(
     };
     
     // v4.0: Register VRF public key for light node
+    // v14.8: Light nodes do not participate in consensus (they cannot produce
+    // microblocks or vote on macroblocks), so we deliberately DO NOT install
+    // their PK in the consensus-layer registry. VRF registry is sufficient
+    // for their reward / claim verification path.
     if !register_request.quantum_pubkey.is_empty() {
         if let Ok(pk_bytes) = hex::decode(&register_request.quantum_pubkey) {
             crate::genesis_constants::register_vrf_public_key(&light_node_pseudonym, &pk_bytes);
@@ -11106,9 +11110,15 @@ async fn handle_register_node(
     };
     
     // v4.0: Register VRF public key in global registry + persist to storage
+    // v14.8: Super/Full nodes participate in consensus — mirror into the
+    // consensus-layer registry. Registration via RPC is authenticated
+    // upstream (wallet-bound + Dilithium3-signed activation code verified).
     if !quantum_pubkey.is_empty() && quantum_pubkey != "default_quantum_key" {
         if let Ok(pk_bytes) = hex::decode(quantum_pubkey) {
             crate::genesis_constants::register_vrf_public_key(&node_id, &pk_bytes);
+            if node_type == "super" || node_type == "full" {
+                let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(&node_id, &pk_bytes);
+            }
             if let Err(e) = blockchain.get_storage().save_vrf_public_key(&node_id, quantum_pubkey) {
                 println!("[WARN][REGISTER] vrf_pk_persist err={}", e);
             }
