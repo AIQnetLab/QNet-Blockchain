@@ -16471,12 +16471,14 @@ impl BlockchainNode {
                     // certified past us" — is already enforced correctly and
                     // atomically by the v14.6 pre-save stale-round guard
                     // (see node.rs in the production path, just before the
-                    // RocksDB write). That guard compares the BLOCK's actual
-                    // `timeout_round` against `HIGHEST_CERTIFIED_ROUND` /
-                    // `HIGHEST_ADOPTED_ROUND` under the same MB index, which
-                    // is the semantically correct comparison. Defence-in-
-                    // depth on the validator side is provided by the
-                    // pipelined-QC verify stage in block_pipeline.rs.
+                    // RocksDB write). That guard is a SELF-CHECK on the
+                    // producing node: we read our own latest certified /
+                    // adopted round and yield if we've been rotated past.
+                    // It does NOT cross-compare microblock rounds against
+                    // macroblock consensus rounds (v14.8.6 removed that
+                    // broken cross-domain reject at the ingest side).
+                    // Retroactive ratification by 2f+1 macroblock commit
+                    // remains the hard-finality layer.
                     //
                     // Removing this duplicate check restores liveness while
                     // preserving all real BFT-safety properties.
@@ -18950,8 +18952,12 @@ impl BlockchainNode {
                     //   * Hash chain + Dilithium sig + state_root still validate both
                     //     candidate blocks — we never accept garbage. This guard only
                     //     PREVENTS us from emitting a second valid candidate.
-                    //   * Validators additionally reject stale-round blocks in the pipeline
-                    //     verify stage (defence-in-depth added in block_pipeline.rs).
+                    //   * Peer-side ingest does NOT reject on round comparison
+                    //     (v14.8.6): microblock-round and macroblock-consensus-round
+                    //     are independent domains; cross-domain comparison caused
+                    //     livelock. Safety at the peer side is carried by hash chain,
+                    //     Dilithium3 signature, VRF-deterministic producer, and
+                    //     retroactive 2f+1 macroblock ratification.
                     //
                     // Scalability:
                     //   * Two atomic reads (HIGHEST_CERTIFIED_ROUND, HIGHEST_ADOPTED_ROUND

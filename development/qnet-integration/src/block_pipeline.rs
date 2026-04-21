@@ -737,81 +737,54 @@ impl BlockPipeline {
             }
 
             // ═══════════════════════════════════════════════════════════════════════════
-            // v14.6 → v14.8.5: STALE-ROUND REJECTION (defence-in-depth for split-brain)
+            // v14.8.6: INGEST-SIDE STALE-ROUND REJECT REMOVED (semantic bug fix)
             // ═══════════════════════════════════════════════════════════════════════════
-            // Complement to the producer-side pre-save guard in node.rs. A slow primary
-            // may sign a block for timeout_round=R_old while the network has already
-            // formed a 2f+1 TimeoutCertificate for R_new > R_old (failover to a new
-            // leader). If this validator has seen R_new certified (HIGHEST_CERTIFIED_ROUND
-            // is a gossip-converged view), accepting the stale R_old block at the LIVE
-            // tip would permit two canonical chains to coexist at the same height.
+            // Earlier revisions (v14.6 → v14.8.5) compared an incoming microblock's
+            // `timeout_round` against this node's cached `HIGHEST_CERTIFIED_ROUND` for
+            // the containing macroblock index and rejected any block whose round was
+            // lower. That check mixed TWO INDEPENDENT DOMAINS:
             //
-            // Rule: if block.timeout_round < highest_certified_round(mb_index) AND
-            // the block is at/above our current tip AND we are not syncing, the block
-            // is provably obsolete — a BFT supermajority already certified a later
-            // round for the same macroblock index. Reject.
+            //   * `mb.timeout_round`       — microblock producer-rotation counter.
+            //                                0 on the happy path (first producer ok),
+            //                                increments only when this particular slot
+            //                                was skipped and a failover leader signed.
             //
-            // v14.8.5 EXEMPTIONS — both address catch-up livelock.
+            //   * `HIGHEST_CERTIFIED_ROUND[mb_idx]` — view round of the MACROBLOCK
+            //                                commit/reveal consensus (90-block epoch).
+            //                                Advances on macroblock-level timeouts when
+            //                                2f+1 is temporarily unreachable, entirely
+            //                                decoupled from microblock production.
             //
-            //   EXEMPTION A (syncing node): a syncing validator is, by definition,
-            //   behind the canonical chain. Its local HIGHEST_CERTIFIED_ROUND may
-            //   have been inflated by `jump_to_highest` from peer timeout votes
-            //   observed for mb_index N while it was still far below block N*90.
-            //   The canonical chain is what 2f+1 of the network ALREADY committed
-            //   and finalised — those blocks were valid when applied, and remain
-            //   valid on replay regardless of any local round counters. Refusing
-            //   them strands the syncing node forever. Accept and advance.
+            // These counters are orthogonal by design. A healthy producer will sign
+            // microblocks at round=0 all day long while, simultaneously, macroblock
+            // view changes may have escalated certified_round to N>0 because the
+            // epoch's 2f+1 aggregator is flaky. Rejecting valid microblocks because
+            // `0 < N` breaks liveness without adding safety. The canonical rule is
+            // to compare rounds only WITHIN the same consensus domain; cross-domain
+            // comparison is never valid.
             //
-            //   EXEMPTION B (already-finalised height): a block whose height is
-            //   at or below `LAST_FINALIZED_HEIGHT` was ratified by a 2f+1
-            //   macroblock commit. That ratification is stronger than any
-            //   single-height round check. Accept unconditionally.
+            // Safety for microblocks is preserved by four independent invariants
+            // which remain in force:
+            //   1. Dilithium3 producer signature   — checked above at step 3.
+            //   2. `prev_hash` continuity          — checked above at step 2.
+            //   3. VRF-deterministic producer      — soft-check at step 4 (logs
+            //                                        timeout_divergence / producer
+            //                                        mismatch without rejecting).
+            //   4. 2f+1 macroblock commit/reveal   — retroactively ratifies every
+            //                                        microblock below the epoch
+            //                                        boundary; any split-brain
+            //                                        branch cannot collect 2f+1.
             //
-            // Rationale: the stale-round guard is a tip-protection mechanism,
-            // not a history-policing mechanism. At the tip it prevents forks;
-            // on history it just produces livelocks.
-            //
-            // Scalability: one DashMap read per block, O(1). The `is_syncing`
-            // and `LAST_FINALIZED_HEIGHT` lookups are single atomic reads. Safe
-            // at 1000+ Super-node scale.
+            // The producer-side pre-save guard (node.rs:yield_stale_round) still
+            // prevents THIS node from emitting its own stale block — that is a
+            // self-check on the same node and does not cross domains.
             // ═══════════════════════════════════════════════════════════════════════════
-            if mb.height > 0 {
-                let guard_mb_idx = mb.height / 90;
-                let cert_round = crate::unified_p2p::highest_certified_round_for(guard_mb_idx);
-                if cert_round > mb.timeout_round {
-                    let last_finalized = crate::node::LAST_FINALIZED_HEIGHT
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    let is_syncing = snap.is_syncing();
-                    let already_finalized = last_finalized > 0 && mb.height <= last_finalized;
-
-                    if is_syncing || already_finalized {
-                        if is_debug() {
-                            println!(
-                                "[DBG][PIPELINE] stale_round_bypass h={} block_round={} cert_round={} prod={} from={} syncing={} finalized_h={}",
-                                mb.height, mb.timeout_round, cert_round,
-                                mb.producer, decoded.from_peer, is_syncing, last_finalized
-                            );
-                        }
-                        // fall through — accept for apply stage
-                    } else {
-                        if is_warn() {
-                            println!(
-                                "[WARN][PIPELINE] stale_round_block_rejected h={} block_round={} certified_round={} prod={} from={} syncing={} finalized_h={}",
-                                mb.height, mb.timeout_round, cert_round,
-                                mb.producer, decoded.from_peer, is_syncing, last_finalized
-                            );
-                        }
-                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                }
-            }
 
             // v14.7.2: per-microblock pipelined-QC verify REMOVED.
             // BFT safety for microblocks is delivered by the combination of:
             //   1. Dilithium3 producer signature (identity binding);
             //   2. hash-chain continuity (parent_hash check above);
-            //   3. v14.6 stale-round guards (pre-save + ingest reject);
+            //   3. Producer-side pre-save yield_stale_round guard (self-check);
             //   4. 2f+1 macroblock commit/reveal at the 90-block boundary
             //      that hard-finalises and, by implication, retroactively
             //      ratifies every microblock below it.
@@ -1126,9 +1099,9 @@ impl BlockPipeline {
             // is the sole BFT finality layer. Per-block QCs duplicated that
             // path, inflated bandwidth, and shared the "commit" rate-limit
             // key with macroblock ConsensusCommit, which starved the real
-            // macroblock consensus from peers. Pre-save / ingest stale-round
-            // guards (v14.6) and TimeoutCertificate 2f+1 provide live-path
-            // safety without a per-block attestation stream.
+            // macroblock consensus from peers. Producer-side pre-save
+            // yield_stale_round guard (v14.6) and TimeoutCertificate 2f+1
+            // provide live-path safety without a per-block attestation stream.
 
             // ── Reputation update for block producer ──
             // Handled by deterministic reputation system via macroblock processing
