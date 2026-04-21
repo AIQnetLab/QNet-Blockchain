@@ -2515,9 +2515,35 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .map(|| warp::reply::with_status("OK", warp::http::StatusCode::OK));
+
+    // v14.8.5: LOCK-FREE liveness probe for container health-check.
+    //
+    // `/healthz` is intentionally minimal: one atomic load, one format,
+    // one HTTP 200. It never touches the blockchain, P2P, mempool, or
+    // any async state that can be locked by the deadlock path that
+    // froze /api/v1/node/health in production. This keeps the container
+    // orchestrator's liveness view accurate even when the heavier API
+    // surfaces are temporarily blocked.
+    //
+    // Orchestrators (e.g. docker-compose healthcheck) should be pointed
+    // at /healthz, not /api/v1/node/health. The rich node_health endpoint
+    // remains available for monitoring dashboards that need peer counts,
+    // mempool size and sync state.
+    let healthz = warp::path("healthz")
+        .and(warp::path::end())
+        .and(warp::get())
+        .map(|| {
+            let h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                .load(std::sync::atomic::Ordering::Relaxed);
+            warp::reply::with_status(
+                format!("ok h={}", h),
+                warp::http::StatusCode::OK,
+            )
+        });
     
     // Combine route groups
     let routes = health
+        .or(healthz)        // v14.8.5: lock-free liveness probe
         .or(ws_subscribe) // WebSocket before REST routes
         .or(basic_routes)
         .or(blockchain_routes)

@@ -625,6 +625,52 @@ impl Transaction {
         }
     }
 
+    /// v14.8.4: System-transaction classifier.
+    ///
+    /// Returns true for protocol-level transactions that MUST be acceptable
+    /// with gas_price = 0. These are bootstrap/maintenance messages whose
+    /// payment or authorisation is proven elsewhere:
+    ///   - NodeActivation / NodeRegistration / NodeReactivation:
+    ///       payment proof is an external Solana 1DEV burn TX (Phase 1)
+    ///       or an on-chain QNC-to-Pool3 transfer (Phase 2), plus a valid
+    ///       activation code that is deduped at state-apply time. A user
+    ///       coming online for the first time has NO QNC balance yet, so
+    ///       charging a mempool fee would create a hard chicken-and-egg.
+    ///   - PingAttestation / PingCommitmentWithSampling / HeartbeatCommitment
+    ///     / LightNodeEligibilityBitmap: validator-signed liveness messages
+    ///       authorised by the sender's consensus identity; no user wallet
+    ///       is charged.
+    ///   - RewardDistribution: emitted by the protocol itself at macroblock
+    ///       boundaries; no wallet originates it.
+    ///   - KeyRotation: self-authorised by the key being rotated.
+    ///
+    /// DoS protection for the bypass path lives ONE LAYER ABOVE the mempool:
+    ///   - Activation TXs must reference a confirmed Solana burn TX with the
+    ///     correct 1DEV mint and amount (see `verify_burn_transaction_exists`).
+    ///   - Each burn_tx hash / activation code is recorded on-chain and can
+    ///     be used exactly once; a replay lands in a dedup set and is
+    ///     rejected at apply_to_state.
+    ///   - Ping/Heartbeat/Attestation TXs carry Dilithium3 sender signatures
+    ///     verified pre-mempool; impostors cannot spam.
+    ///
+    /// Consistent with `compute_gas_used() == 0` for every variant listed
+    /// below (except NodeActivation which uses `gas_limits::NODE_ACTIVATION`
+    /// for metering purposes but is still a system TX).
+    pub fn is_system_tx(&self) -> bool {
+        matches!(
+            &self.tx_type,
+            TransactionType::NodeActivation { .. }
+                | TransactionType::NodeRegistration { .. }
+                | TransactionType::NodeReactivation { .. }
+                | TransactionType::PingAttestation { .. }
+                | TransactionType::PingCommitmentWithSampling { .. }
+                | TransactionType::HeartbeatCommitment { .. }
+                | TransactionType::LightNodeEligibilityBitmap { .. }
+                | TransactionType::RewardDistribution
+                | TransactionType::KeyRotation { .. }
+        )
+    }
+
     /// v3.36: Gas metering -- compute ACTUAL gas consumed per TX type
     /// Ethereum-style: user pays for gas_used, not gas_limit.
     /// gas_limit serves as maximum cap (out-of-gas if exceeded).
@@ -1242,10 +1288,37 @@ impl Transaction {
             }
 
             TransactionType::NodeActivation { node_type, amount, .. } => {
+                // v14.8.4: Account may not exist yet when a freshly-activated wallet
+                // submits its FIRST NodeActivation TX (no prior transfers → no state
+                // row). Create an empty Account rather than rejecting — the activation
+                // payment is proven by the external 1DEV Solana burn (Phase 1) or by
+                // the QNC-to-Pool3 transfer recorded elsewhere in the same block
+                // (Phase 2). This is the on-chain counterpart of the mempool-side
+                // system-TX bypass.
+                if !accounts.contains_key(&self.from) {
+                    accounts.insert(
+                        self.from.clone(),
+                        Account::new(self.from.clone()),
+                    );
+                }
                 let sender = accounts.get_mut(&self.from)
-                    .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
+                    .expect("account just inserted");
 
-                // CRITICAL SECURITY: Check nonce to prevent replay attacks
+                // v14.8.4: SINGLE-USE ACTIVATION GUARD.
+                // Each wallet may hold exactly one active node at a time. An
+                // already-activated wallet trying to submit another NodeActivation
+                // is a replay (same wallet, different burn_tx/activation_code) or a
+                // misconfigured relaunch. Reject at state apply so it cannot be
+                // re-applied from the mempool or from gossip.
+                if sender.is_node {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "[REJECT][TX] wallet_already_activated from={} existing_type={:?}",
+                        self.from, sender.node_type
+                    )));
+                }
+
+                // CRITICAL SECURITY: Check nonce to prevent replay attacks.
+                // First-time wallet has sender.nonce == 0 → valid TX nonce is 1.
                 if self.nonce != sender.nonce + 1 {
                     return Err(StateError::InvalidTransaction(format!(
                         "[REJECT][TX] invalid_nonce expected={} got={}",
@@ -1253,9 +1326,15 @@ impl Transaction {
                     )));
                 }
 
-                // Fee calculation (QUANTUM v2.25: use effective_gas_price for +50% Dilithium TX)
-                let fee = self.effective_gas_price().checked_mul(self.gas_limit)
-                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
+                // v14.8.4: For SYSTEM activation TX, the fee is ALWAYS zero
+                // (payment lives outside this chain). For legacy / future non-
+                // system activation paths we keep the original fee arithmetic.
+                let fee = if self.is_system_tx() {
+                    0u64
+                } else {
+                    self.effective_gas_price().checked_mul(self.gas_limit)
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?
+                };
                 let total_amount = amount.checked_add(fee)
                     .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] total_amount_overflow".into()))?;
 
@@ -1266,13 +1345,16 @@ impl Transaction {
                     });
                 }
 
-                // Burn tokens (remove from balance)
+                // Burn tokens (remove from balance). For Phase 1 system TXs
+                // both amount and fee are zero so this is a no-op; for Phase 2
+                // it deducts the QNC amount routed to Pool3.
                 sender.balance = sender.balance.checked_sub(total_amount)
                     .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] sender_balance_underflow".into()))?;
                 sender.nonce = sender.nonce.checked_add(1)
                     .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
 
-                // Activate node
+                // Activate node (sets is_node=true, node_type=…; the guard above
+                // ensures this transition is one-way for any given wallet).
                 sender.activate_node(format!("{:?}", node_type), self.timestamp);
             }
             TransactionType::ContractDeploy => {

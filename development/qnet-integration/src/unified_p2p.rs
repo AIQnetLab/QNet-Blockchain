@@ -148,12 +148,20 @@ static DOWNLOADING_BLOCKS: Lazy<Arc<RwLock<HashSet<u64>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashSet::new())));
 
 // RACE CONDITION FIX: Cache blockchain height to prevent excessive queries
-static CACHED_BLOCKCHAIN_HEIGHT: Lazy<Arc<Mutex<(u64, Instant)>>> = 
+static CACHED_BLOCKCHAIN_HEIGHT: Lazy<Arc<Mutex<(u64, Instant)>>> =
     Lazy::new(|| Arc::new(Mutex::new((0, Instant::now() - Duration::from_secs(3600)))));
+
+// v14.8.5: Lock-free mirror of the cached network height. Written alongside
+// every update of CACHED_BLOCKCHAIN_HEIGHT; read by the stuck-chain watchdog
+// and any hot-path code that needs an indicator of "where the network is"
+// without taking a mutex. Not authoritative (the mutex-backed cache plus
+// peer-height fallback is the source of truth for production decisions) —
+// this is strictly a monitoring/liveness aid.
+pub static CACHED_NETWORK_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 // CRITICAL FIX: Local blockchain height for P2P message filtering
 // This prevents processing failover messages for blocks we don't have yet
-pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> = 
+pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> =
     Lazy::new(|| Arc::new(AtomicU64::new(0)));
 
 // v9.5: Best known peer height — O(1) read for sync-gate checks.
@@ -4270,6 +4278,8 @@ impl SimplifiedP2P {
                         
                         // Also update old cache for backward compatibility
                         *CACHED_BLOCKCHAIN_HEIGHT.lock() = (consensus_height, Instant::now());
+                        // v14.8.5: lock-free mirror for the stuck-chain watchdog
+                        CACHED_NETWORK_HEIGHT.store(consensus_height, std::sync::atomic::Ordering::Relaxed);
                     }
                 } else {
                     if crate::node::is_warn() { println!("[WARN][SYNC] Background: No peer responses - cache not updated"); }
@@ -4676,7 +4686,9 @@ impl SimplifiedP2P {
                 TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_height);
                 let timeout_voted_removed = timeout_voted_before.saturating_sub(TIMEOUT_VOTED_HEIGHTS.len());
 
-                // v14.7.2: break_tracker removed — no peer-counting fork heuristics.
+                // v14.8.5: re-introduced as BFT-safe distinct-peer tracker
+                // (see block_pipeline::record_hash_chain_break_witness).
+                crate::block_pipeline::cleanup_break_tracker(min_height);
 
                 let timeout_total_removed = timeout_votes_removed + timeout_certs_removed + timeout_voted_removed;
 
@@ -8064,8 +8076,10 @@ impl SimplifiedP2P {
             
             // Also update old cache for backward compatibility
             *CACHED_BLOCKCHAIN_HEIGHT.lock() = (consensus_height, Instant::now());
+            // v14.8.5: lock-free mirror for the stuck-chain watchdog
+            CACHED_NETWORK_HEIGHT.store(consensus_height, std::sync::atomic::Ordering::Relaxed);
         }
-        
+
         Ok(consensus_height)
     }
     
@@ -21557,36 +21571,88 @@ impl SimplifiedP2P {
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        // v13.0: JUMP-TO-HIGHEST — O(1) timeout round convergence
+        // v13.0 → v14.8.5: JUMP-TO-HIGHEST with Byzantine-safe rate limits.
         //
-        // PROBLEM: Without this, each node independently computes proposed_timeout_round
-        // from local delay. NTP drift (±2s) → different rounds → different producers → fork.
-        // Adopted round requires f+1 votes at the SAME round. If 5 nodes compute
-        // rounds [3,4,4,5,5], no single round gets f+1=2 → adopted stays 0 → stall.
+        // v13.0 rationale (preserved): nodes independently compute
+        // proposed_timeout_round from local wall-clock delay. NTP drift
+        // produces slightly different rounds on different nodes, which
+        // stalls adoption (f+1 at SAME round needed). Jumping to a peer's
+        // higher round cascades adoption and unfreezes liveness.
         //
-        // SOLUTION: When we see a verified vote for round R > our current voted round,
-        // immediately adopt R and broadcast our own vote at R. This cascades:
-        //   t=0: Node A votes round=5 (highest delay)
-        //   t=1: Nodes B,C,D,E receive vote, jump to round=5, broadcast
-        //   t=2: All nodes have f+1 votes for round=5 → adopted=5 → same producer
+        // v13.0 PROBLEM: the original implementation adopted any single
+        // verified vote's round, unbounded. Observed in production:
+        //     peer_round=46262 after ~9h — physically impossible at the
+        //     real 30-60 s timeout cadence. A single compromised
+        //     validator key could pin the whole network at u64::MAX and
+        //     force every honest node to waste cycles broadcasting at a
+        //     fantasy round, while also making any valid round-0
+        //     microblock look "stale" on every participant that already
+        //     jumped ahead. End result: real chain stall + cascade into
+        //     "stale_round_block_rejected" loops during catch-up sync.
         //
-        // SECURITY: Only jumps to rounds from VERIFIED votes (Dilithium sig checked above).
-        // Cannot be exploited: attacker needs valid Dilithium key (quantum-resistant).
-        // Maximum jump is bounded by honest nodes' actual delay (no amplification).
-        // ═══════════════════════════════════════════════════════════════════════
+        // v14.8.5 FIX: two canonical guards before accepting a jump.
+        //
+        //   1. SINGLE-VOTE CAP. A single vote can only pull us forward by
+        //      `MAX_SINGLE_VOTE_JUMP` rounds (conservative: 32). Above
+        //      that threshold we require f+1 distinct voters to already
+        //      be at round ≥ R. This preserves the fast-cascade property
+        //      for normal drift (1-5 rounds) while eliminating the
+        //      Byzantine "one vote to u64::MAX" attack.
+        //
+        //   2. F+1 EVIDENCE. For larger jumps we count how many distinct
+        //      voters at (height) have `max_round ≥ proposed`. If that
+        //      tally is below f+1 we refuse to jump — not enough
+        //      independent evidence. The tally is maintained by
+        //      VOTER_MAX_ROUND which is already populated earlier in
+        //      this handler after Dilithium3 signature verification.
+        //
+        // SECURITY: every vote is Dilithium3-verified before reaching
+        // this point (see earlier `verify_timeout_vote_signature` call).
+        // Byzantine attacker cannot forge, can only propose from their
+        // own key. Cap + f+1 evidence means the attacker with ≤ f keys
+        // can never drive the round further than honest f nodes already
+        // believe. Liveness preserved: honest f+1 agreement always
+        // passes the gate.
+        //
+        // SCALABILITY: at 1000-validator committee, f+1 = 334. VOTER_MAX_ROUND
+        // lookup is O(voters_at_height) per call; the `.iter().filter()` on
+        // a DashMap shard set is cheap (small constant per entry). Each
+        // TimeoutVote handler invocation touches one height → bounded
+        // scan. No per-message O(N²) blow-up at scale.
         {
+            const MAX_SINGLE_VOTE_JUMP: u64 = 32;
+
             let our_voted = TIMEOUT_VOTED_HEIGHTS.get(&height).map(|v| *v).unwrap_or(0);
             if timeout_round > our_voted && voter_id != self.node_id {
-                if crate::node::is_info() {
-                    println!("[INFO][TIMEOUT] jump_to_highest h={} our={} peer_round={} voter={}",
-                             height, our_voted, timeout_round, voter_id);
+                let gap = timeout_round.saturating_sub(our_voted);
+
+                let allowed = if gap <= MAX_SINGLE_VOTE_JUMP {
+                    true // small drift — cascade as before
+                } else {
+                    // Large jump — require f+1 independent witnesses.
+                    let total_validators = self.get_active_validator_count();
+                    let f_plus_1 = (total_validators.saturating_add(2)) / 3; // ceil(N/3)
+                    let witnesses = VOTER_MAX_ROUND.iter()
+                        .filter(|e| e.key().0 == height && *e.value() >= timeout_round)
+                        .count();
+                    let ok = witnesses >= f_plus_1;
+                    if !ok && crate::node::is_warn() {
+                        println!("[WARN][TIMEOUT] jump_refused_insufficient_witnesses h={} proposed={} our={} gap={} witnesses={} need_f+1={} voter={}",
+                                 height, timeout_round, our_voted, gap, witnesses, f_plus_1, voter_id);
+                    }
+                    ok
+                };
+
+                if allowed {
+                    if crate::node::is_info() {
+                        println!("[INFO][TIMEOUT] jump_to_highest h={} our={} peer_round={} gap={} voter={}",
+                                 height, our_voted, timeout_round, gap, voter_id);
+                    }
+                    // Monotonic set — never decrease existing jump target
+                    TIMEOUT_JUMP_TARGET.entry(height)
+                        .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
+                        .or_insert(timeout_round);
                 }
-                // Signal to main consensus loop: a higher round exists, re-vote
-                // We set the JUMP_TARGET so the next consensus iteration picks it up
-                // and broadcasts a vote at this round (with proper Dilithium signature)
-                TIMEOUT_JUMP_TARGET.entry(height)
-                    .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
-                    .or_insert(timeout_round);
             }
         }
 

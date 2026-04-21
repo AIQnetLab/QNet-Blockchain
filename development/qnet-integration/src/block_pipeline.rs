@@ -61,14 +61,95 @@ use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
 // ============================================================================
 
 /// Global fork recovery signal: fork_height (0 = no signal).
-/// Set by the macroblock-divergence detector; consumed by the main consensus loop.
+/// Set by the macroblock-divergence detector OR by the microblock
+/// distinct-peer-witness tracker (v14.8.5); consumed by the main consensus loop.
 static FORK_RECOVERY_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 /// Check and consume fork recovery signal.
 /// Returns Some(fork_height) if recovery is needed.
 pub fn take_fork_recovery_signal() -> Option<u64> {
     let h = FORK_RECOVERY_HEIGHT.swap(0, Ordering::SeqCst);
-    if h > 0 { Some(h) } else { None }
+    if h > 0 {
+        // Clear the accumulated witnesses once a recovery is scheduled —
+        // otherwise stale entries would re-fire the signal on the next
+        // height that rolls through the pipeline.
+        HASH_CHAIN_BREAK_WITNESSES.clear();
+        Some(h)
+    } else {
+        None
+    }
+}
+
+// ============================================================================
+// v14.8.5: DISTINCT-PEER WITNESS TRACKER for microblock minority-fork detection.
+// ============================================================================
+// Keyed by height; value is the set of distinct peer_ids that reported a
+// `hash_chain_break` at that height. Once the set reaches 2f+1 of the current
+// validator committee, we are on the minority fork (BFT supermajority rule)
+// and FORK_RECOVERY_HEIGHT is raised to (height - 1) so the main loop rolls
+// back and resyncs.
+//
+// DashMap+DashSet combo gives lock-free concurrent writes across pipeline
+// worker threads. Bounded by height cleanup (cleanup_break_tracker) to keep
+// memory flat regardless of chain length.
+// ============================================================================
+use dashmap::DashSet;
+static HASH_CHAIN_BREAK_WITNESSES: once_cell::sync::Lazy<
+    dashmap::DashMap<u64, DashSet<String>>
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// Record that `peer_id` reported a hash_chain_break at `height`.
+/// If the set of distinct witnesses reaches 2f+1, signal fork recovery.
+///
+/// Rate-limit semantics: once FORK_RECOVERY_HEIGHT is non-zero we don't
+/// overwrite it with a different (lower) height — the main loop consumes
+/// it first. This prevents flapping when two heights both accumulate
+/// witnesses during a partition.
+pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
+    if peer_id.is_empty() || peer_id == "self" {
+        return;
+    }
+    let entry = HASH_CHAIN_BREAK_WITNESSES.entry(height).or_insert_with(DashSet::new);
+    if !entry.insert(peer_id.to_string()) {
+        // peer already counted for this height — no change
+        return;
+    }
+    let witnesses = entry.len();
+    drop(entry);
+
+    // Use the consensus layer's canonical active validator count.
+    // Fall back to the genesis floor (5) when the integration layer has
+    // not yet installed a count (very early boot).
+    let total_validators: usize = {
+        let n = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
+        if n >= 3 { n } else { 5 }
+    };
+    let threshold_2f_plus_1 = (total_validators.saturating_mul(2).saturating_add(2)) / 3;
+    // Floor at 3 so an attacker cannot collapse the threshold with a tiny
+    // registry and trigger spurious rollbacks.
+    let threshold = threshold_2f_plus_1.max(3);
+
+    if witnesses >= threshold {
+        let rollback_to = height.saturating_sub(1);
+        // Only raise the signal — never lower. The main loop consumes it
+        // under the same atomic swap that clears the tracker.
+        let prev = FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst);
+        if rollback_to > prev {
+            FORK_RECOVERY_HEIGHT.store(rollback_to, Ordering::SeqCst);
+            if is_warn() {
+                println!(
+                    "[WARN][PIPELINE] minority_fork_detected h={} rollback_to={} witnesses={} threshold={}",
+                    height, rollback_to, witnesses, threshold
+                );
+            }
+        }
+    }
+}
+
+/// Periodic cleanup of stale witness entries below `min_height`.
+/// Called by unified_p2p cleanup tasks.
+pub fn cleanup_break_tracker(min_height: u64) {
+    HASH_CHAIN_BREAK_WITNESSES.retain(|h, _| *h >= min_height);
 }
 
 // ============================================================================
@@ -528,28 +609,47 @@ impl BlockPipeline {
                     metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
 
                     // ═══════════════════════════════════════════════════════════════════════
-                    // v14.7.2: FORK SIGNALLING — reject only, no automatic rollback.
+                    // v14.8.5: MINORITY-FORK DETECTION via BFT-safe distinct-peer quorum.
                     // ═══════════════════════════════════════════════════════════════════════
-                    // Canonical BFT policy: a single microblock that fails hash-chain
-                    // continuity is REJECTED, nothing more. Rollback of local state
-                    // is authorised strictly by cryptographic divergence at macroblock
-                    // level (2f+1 commit/reveal sees a different state root than we
-                    // persisted). That detection lives in the macroblock consensus
-                    // loop in node.rs and is the only path that writes to
-                    // FORK_RECOVERY_HEIGHT.
+                    // A single hash_chain_break is weak evidence — could be a single
+                    // malformed block. But if 2f+1 DISTINCT validated peers all send
+                    // blocks whose parent hash doesn't link into our local tip at the
+                    // same height, WE are on the minority fork by the Byzantine
+                    // supermajority rule: f+1 peers agreeing is already enough honest
+                    // witnesses to prove it; 2f+1 makes the evidence resistant to up to
+                    // f Byzantine peers all pushing the same wrong hash.
                     //
-                    // Peer-counting heuristics (HASH_CHAIN_BREAK_TRACKER, per-peer
-                    // thresholds) are NOT used: they are not BFT-sound at scale and
-                    // they created DoS surface at genesis. Per-block QCs are also
-                    // not used: they duplicated the macroblock layer and collided
-                    // with its rate-limit keyspace.
+                    // Implementation: per-height set of distinct peer_ids that reported
+                    // hash_chain_break. When the set size crosses 2f+1 of the current
+                    // validator committee, signal FORK_RECOVERY_HEIGHT = mb.height - 1
+                    // (everything at or below that height is still valid on our local
+                    // chain; we roll back to the last known-good point and resync).
                     //
-                    // If this block is genuinely on a superior chain, its producer's
-                    // state commitment will diverge from ours at the next macroblock
-                    // boundary, and the macroblock-level detector will roll us back
-                    // deterministically using `check_finality_allows_rollback` +
-                    // standard resync. That is the ONLY canonical rollback trigger.
-                    // ═══════════════════════════════════════════════════════════════════════
+                    // Anti-Sybil: each entry is a verified peer_id from the decoded
+                    // block's signed envelope (not raw socket addresses). An attacker
+                    // cannot fake N distinct peer_ids without N distinct Dilithium3
+                    // keys, and those keys must be in the registered validator set
+                    // to count (see has_vrf_key check below).
+                    //
+                    // Rate-limit: once a recovery signal is set for a given height,
+                    // we don't re-fire until the main loop consumes it via
+                    // `take_fork_recovery_signal()` — which also clears the tracker.
+                    //
+                    // Scalability: DashSet per height, tiny (< 2f+1 entries). Cleaned
+                    // up at cleanup_break_tracker() during cache sweep. Safe at
+                    // thousands-of-nodes scale — committee sample is ≤ MAX_VALIDATORS
+                    // (1000), and threshold grows linearly with it.
+                    //
+                    // Orthogonal to the macroblock-level rollback trigger: macroblock
+                    // divergence catches PERSISTENT forks but only fires every 90 s;
+                    // this microblock-level detector catches ACUTE forks quickly.
+                    if mb.height > 0 {
+                        record_hash_chain_break_witness(
+                            mb.height,
+                            &decoded.from_peer,
+                        );
+                    }
+
                     continue;
                 }
             }
@@ -637,46 +737,73 @@ impl BlockPipeline {
             }
 
             // ═══════════════════════════════════════════════════════════════════════════
-            // v14.6: STALE-ROUND REJECTION (defence-in-depth for split-brain prevention)
+            // v14.6 → v14.8.5: STALE-ROUND REJECTION (defence-in-depth for split-brain)
             // ═══════════════════════════════════════════════════════════════════════════
             // Complement to the producer-side pre-save guard in node.rs. A slow primary
             // may sign a block for timeout_round=R_old while the network has already
             // formed a 2f+1 TimeoutCertificate for R_new > R_old (failover to a new
             // leader). If this validator has seen R_new certified (HIGHEST_CERTIFIED_ROUND
-            // is a gossip-converged view), accepting the stale R_old block would permit
-            // two canonical chains to coexist at the same height.
+            // is a gossip-converged view), accepting the stale R_old block at the LIVE
+            // tip would permit two canonical chains to coexist at the same height.
             //
-            // Rule: if block.timeout_round < highest_certified_round(mb_index), the block
-            // is provably obsolete — a BFT supermajority already certified a later round
-            // for the same macroblock index. Reject.
+            // Rule: if block.timeout_round < highest_certified_round(mb_index) AND
+            // the block is at/above our current tip AND we are not syncing, the block
+            // is provably obsolete — a BFT supermajority already certified a later
+            // round for the same macroblock index. Reject.
             //
-            // We do NOT reject on adopted-round alone (f+1 is a soft signal, may regress
-            // across nodes momentarily). Only the certified round (2f+1, non-regressing)
-            // is strong enough to justify REJECT without false positives.
+            // v14.8.5 EXEMPTIONS — both address catch-up livelock.
             //
-            // v14.7 (pt 11): Sync path is NO LONGER exempt. The check is naturally
-            // safe for historical blocks because HIGHEST_CERTIFIED_ROUND only contains
-            // entries for recent macroblock indices (cleanup retain at min_height).
-            // For historical mb_index, cert_round = 0 → 0 > mb.timeout_round = false,
-            // so no spurious rejection. For current mb_index during catch-up, if we
-            // have a certificate the sender is on an obsolete fork — reject.
+            //   EXEMPTION A (syncing node): a syncing validator is, by definition,
+            //   behind the canonical chain. Its local HIGHEST_CERTIFIED_ROUND may
+            //   have been inflated by `jump_to_highest` from peer timeout votes
+            //   observed for mb_index N while it was still far below block N*90.
+            //   The canonical chain is what 2f+1 of the network ALREADY committed
+            //   and finalised — those blocks were valid when applied, and remain
+            //   valid on replay regardless of any local round counters. Refusing
+            //   them strands the syncing node forever. Accept and advance.
             //
-            // Scalability: one DashMap read per block, O(1), independent of validator
-            // count. Safe at 1000+ Super-node scale.
+            //   EXEMPTION B (already-finalised height): a block whose height is
+            //   at or below `LAST_FINALIZED_HEIGHT` was ratified by a 2f+1
+            //   macroblock commit. That ratification is stronger than any
+            //   single-height round check. Accept unconditionally.
+            //
+            // Rationale: the stale-round guard is a tip-protection mechanism,
+            // not a history-policing mechanism. At the tip it prevents forks;
+            // on history it just produces livelocks.
+            //
+            // Scalability: one DashMap read per block, O(1). The `is_syncing`
+            // and `LAST_FINALIZED_HEIGHT` lookups are single atomic reads. Safe
+            // at 1000+ Super-node scale.
             // ═══════════════════════════════════════════════════════════════════════════
             if mb.height > 0 {
                 let guard_mb_idx = mb.height / 90;
                 let cert_round = crate::unified_p2p::highest_certified_round_for(guard_mb_idx);
                 if cert_round > mb.timeout_round {
-                    if is_warn() {
-                        println!(
-                            "[WARN][PIPELINE] stale_round_block_rejected h={} block_round={} certified_round={} prod={} from={} syncing={}",
-                            mb.height, mb.timeout_round, cert_round,
-                            mb.producer, decoded.from_peer, snap.is_syncing()
-                        );
+                    let last_finalized = crate::node::LAST_FINALIZED_HEIGHT
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let is_syncing = snap.is_syncing();
+                    let already_finalized = last_finalized > 0 && mb.height <= last_finalized;
+
+                    if is_syncing || already_finalized {
+                        if is_debug() {
+                            println!(
+                                "[DBG][PIPELINE] stale_round_bypass h={} block_round={} cert_round={} prod={} from={} syncing={} finalized_h={}",
+                                mb.height, mb.timeout_round, cert_round,
+                                mb.producer, decoded.from_peer, is_syncing, last_finalized
+                            );
+                        }
+                        // fall through — accept for apply stage
+                    } else {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] stale_round_block_rejected h={} block_round={} certified_round={} prod={} from={} syncing={} finalized_h={}",
+                                mb.height, mb.timeout_round, cert_round,
+                                mb.producer, decoded.from_peer, is_syncing, last_finalized
+                            );
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
-                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                    continue;
                 }
             }
 

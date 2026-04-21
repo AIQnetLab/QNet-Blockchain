@@ -1962,8 +1962,15 @@ impl BlockchainActivationRegistry {
             to: None, // NodeActivation doesn't use 'to' field
             amount: 0, // Not used in NodeActivation (amount is in tx_type)
             nonce, // Unique nonce from wallet+timestamp+code_hash
-            gas_price: 1, // QNet minimum gas price (Phase 1 will be FREE via special handling)
-            gas_limit: 100000, // QNet standard for data transactions
+            // v14.8.4: gas_price=0 + gas_limit=0 — system TX, payment proven via
+            // Solana 1DEV burn (Phase 1) or on-chain QNC→Pool3 transfer (Phase 2).
+            // Mempool recognises NodeActivation via Transaction::is_system_tx() and
+            // bypasses the min_gas_price floor. State apply charges fee = 0 because
+            // effective_gas_price * gas_limit = 0. Previously this field held `1`
+            // with a comment "Phase 1 will be FREE via special handling" — the
+            // special handling is the system-TX path added in v14.8.4.
+            gas_price: 0,
+            gas_limit: 0,
             data: Some(activation_json), // Store reference data for blockchain records
             signature: None, // No signature needed - security via activation code validation
             public_key: None, // Not needed for activation transactions

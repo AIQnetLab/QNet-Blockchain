@@ -172,22 +172,32 @@ impl TxValidator for DefaultValidator {
             return result;
         }
         
-        // Check gas price
-        if tx.gas_price < self.min_gas_price {
+        // v14.8.4: Check gas price (user TXs only). System TXs are protocol
+        // bootstrap / liveness messages whose payment is proven elsewhere
+        // (Solana 1DEV burn for activation, Dilithium3 sender signature for
+        // liveness) and must be accepted with gas_price = 0. Without this
+        // carve-out a freshly activated Super-node — which has zero QNC
+        // balance until registration lands — can never join the network.
+        let is_system = tx.is_system_tx();
+        if !is_system && tx.gas_price < self.min_gas_price {
             result.add_error(format!(
                 "Gas price too low: minimum {}, got {}",
                 self.min_gas_price, tx.gas_price
             ));
         }
-        
-        // Check gas limit (enforce MAX_GAS_LIMIT from protocol constants)
-        if tx.gas_limit < 10_000 { // QNet minimum: 10k for TRANSFER
-            result.add_error("Gas limit too low".to_string());
-        } else if tx.gas_limit > qnet_state::transaction::gas_limits::MAX_GAS_LIMIT {
-            result.add_error(format!(
-                "Gas limit too high: max {}, got {}",
-                qnet_state::transaction::gas_limits::MAX_GAS_LIMIT, tx.gas_limit
-            ));
+
+        // Check gas limit (enforce MAX_GAS_LIMIT from protocol constants).
+        // System TXs with gas_limit == 0 are exempt (NodeRegistration is
+        // created with gas_limit=0; NodeActivation with standard 100_000).
+        if !is_system {
+            if tx.gas_limit < 10_000 { // QNet minimum: 10k for TRANSFER
+                result.add_error("Gas limit too low".to_string());
+            } else if tx.gas_limit > qnet_state::transaction::gas_limits::MAX_GAS_LIMIT {
+                result.add_error(format!(
+                    "Gas limit too high: max {}, got {}",
+                    qnet_state::transaction::gas_limits::MAX_GAS_LIMIT, tx.gas_limit
+                ));
+            }
         }
         
         // Check transaction size
@@ -235,22 +245,28 @@ impl TxValidator for SimpleValidator {
     
     fn validate_basic(&self, tx: &Transaction) -> ValidationResult {
         let mut result = ValidationResult::success();
-        
-        // Basic checks only
-        if tx.gas_price < self.min_gas_price {
+
+        // v14.8.4: System TXs (validator lifecycle + liveness + rewards +
+        // key rotation) bypass gas-price / gas-limit floors — payment proof
+        // lives on Solana (1DEV burn) or on-chain Dilithium3 authorisation.
+        let is_system = tx.is_system_tx();
+
+        if !is_system && tx.gas_price < self.min_gas_price {
             result.add_error(format!(
                 "Gas price too low: minimum {}, got {}",
                 self.min_gas_price, tx.gas_price
             ));
         }
-        
-        if tx.gas_limit < 10_000 { // QNet minimum: 10k for TRANSFER
-            result.add_error("Gas limit too low".to_string());
-        } else if tx.gas_limit > qnet_state::transaction::gas_limits::MAX_GAS_LIMIT {
-            result.add_error(format!(
-                "Gas limit too high: max {}, got {}",
-                qnet_state::transaction::gas_limits::MAX_GAS_LIMIT, tx.gas_limit
-            ));
+
+        if !is_system {
+            if tx.gas_limit < 10_000 { // QNet minimum: 10k for TRANSFER
+                result.add_error("Gas limit too low".to_string());
+            } else if tx.gas_limit > qnet_state::transaction::gas_limits::MAX_GAS_LIMIT {
+                result.add_error(format!(
+                    "Gas limit too high: max {}, got {}",
+                    qnet_state::transaction::gas_limits::MAX_GAS_LIMIT, tx.gas_limit
+                ));
+            }
         }
 
         result

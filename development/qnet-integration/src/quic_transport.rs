@@ -1343,14 +1343,43 @@ impl QuicTransport {
     /// CRITICAL: Thread-safe with double-check to prevent race conditions
     /// v2.96: Added per-peer cooldown, connect dedup, outbound semaphore, jitter
     pub async fn connect(&self, peer_addr: SocketAddr) -> Result<Arc<QuicConnection>, String> {
-        // FIRST CHECK: Existing connection - but only if it's truly ALIVE (not a zombie)
-        if let Some(conn) = self.connections.get(&peer_addr) {
+        // v14.8.5: CRITICAL — classic DashMap get→remove deadlock pattern.
+        //
+        // Previous code:
+        //   if let Some(conn) = self.connections.get(&peer_addr) {   // holds read lock
+        //       if is_alive(&conn) { return Ok(conn.clone()); }
+        //       self.connections.remove(&peer_addr);                 // needs write lock
+        //   }                                                        //  → DEADLOCK
+        //
+        // DashMap's `get()` returns a `Ref` that keeps the shard's reader guard
+        // held for the entire lifetime of the binding. Calling `remove()` on
+        // the same key within the guard's scope tries to acquire a writer
+        // guard on the same shard and blocks forever. This was the root
+        // cause of a genesis node freezing: after a user super-node dropped
+        // its QUIC connection, this path was taken, the shard guard never
+        // released, every tokio worker eventually blocked on a lock coming
+        // through this function, and all 39 runtime threads ended up in
+        // `futex_wait_queue_me`. HTTP API stopped responding, TCP sockets
+        // piled up in CLOSE-WAIT, the container went UNHEALTHY.
+        //
+        // Fix: clone-and-drop — copy the Arc out under a short-scoped Ref,
+        // drop the Ref explicitly, THEN perform any further DashMap
+        // operations. Arc::clone is cheap; the write path to `remove` is
+        // now strictly ordered after the read guard is released.
+        let cached = {
+            let guard = self.connections.get(&peer_addr);
+            guard.map(|r| r.clone()) // Arc clone; Ref dropped at end of block
+        };
+        if let Some(conn) = cached {
             if crate::quic_transport::is_connection_alive(&conn) {
-                return Ok(conn.clone());
-            } else {
-                if is_info() { println!("[INFO][QUIC] removing_dead_conn peer={}", get_privacy_id_for_addr(&peer_addr.to_string())); }
-                self.connections.remove(&peer_addr);
+                return Ok(conn);
             }
+            // Dead connection — Ref is long gone, safe to take the write lock.
+            if is_info() {
+                println!("[INFO][QUIC] removing_dead_conn peer={}",
+                         get_privacy_id_for_addr(&peer_addr.to_string()));
+            }
+            self.connections.remove(&peer_addr);
         }
 
         // v2.96: Per-peer reconnect cooldown — reject if last attempt was < COOLDOWN ago.

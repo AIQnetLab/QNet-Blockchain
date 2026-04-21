@@ -11745,9 +11745,90 @@ impl BlockchainNode {
             std::env::set_var("QNET_CURRENT_API_PORT", unified_port.to_string());
             
             println!("[INFO][NODE] api_ready port={}", unified_port);
-            
+
             // API FIX: Set node start time for uptime calculation
             std::env::set_var("QNET_NODE_START_TIME", chrono::Utc::now().timestamp().to_string());
+
+            // v14.8.5: STUCK-CHAIN WATCHDOG.
+            //
+            // Detects the cascade observed in production: one peer freezes
+            // (concurrent-map deadlock or similar), remaining peers cannot
+            // serve enough shards, a validator goes into sync mode, gets
+            // stranded forever because its own local round state diverges
+            // from the canonical chain. The chain then loses a validator
+            // indefinitely, which in a small-committee network (5 genesis
+            // nodes) is fatal for the 2f+1 liveness property.
+            //
+            // Policy: every WATCHDOG_TICK_SECS, sample LOCAL_BLOCKCHAIN_HEIGHT
+            // plus the cached network height. If our height has not advanced
+            // by WATCHDOG_MIN_PROGRESS blocks for WATCHDOG_STUCK_SECS AND
+            // the network is demonstrably ahead of us (network_height ≥ our
+            // height + WATCHDOG_BEHIND_THRESHOLD), we conclude the local
+            // runtime is jammed and exit the process. The container
+            // supervisor restarts us with a fresh runtime, which reconnects
+            // cleanly and catches up.
+            //
+            // Safety: process::exit is only triggered when BOTH
+            //   (a) our height hasn't moved for 5 minutes AND
+            //   (b) the network is provably ahead.
+            // A healthy node that idles because the whole network is idle
+            // (e.g. all peers offline) does NOT restart — network_height
+            // cache won't show us behind.
+            //
+            // A healthy catching-up node advances at hundreds of blocks/min
+            // and never trips this threshold.
+            //
+            // Scalability: two atomic loads per tick, negligible cost even
+            // at tens of thousands of Super-nodes (this is a per-node task).
+            const WATCHDOG_TICK_SECS: u64 = 60;
+            const WATCHDOG_STUCK_SECS: u64 = 300;       // 5 min
+            const WATCHDOG_MIN_PROGRESS: u64 = 1;       // ≥ 1 block in 5 min = alive
+            const WATCHDOG_BEHIND_THRESHOLD: u64 = 30;  // network must be ≥30 blocks ahead
+            tokio::spawn(async move {
+                let mut last_progress_at = std::time::Instant::now();
+                let mut last_height: u64 = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_TICK_SECS)).await;
+
+                    let h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if h.saturating_sub(last_height) >= WATCHDOG_MIN_PROGRESS {
+                        last_height = h;
+                        last_progress_at = std::time::Instant::now();
+                        continue;
+                    }
+                    // No local progress — check whether the network is ahead.
+                    let net_h = crate::unified_p2p::CACHED_NETWORK_HEIGHT
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let behind = net_h.saturating_sub(h);
+
+                    if behind < WATCHDOG_BEHIND_THRESHOLD {
+                        // Network is at our height (or we are ahead) — idle
+                        // state is legitimate. Reset the timer and wait.
+                        last_progress_at = std::time::Instant::now();
+                        continue;
+                    }
+
+                    let stuck_for = last_progress_at.elapsed().as_secs();
+                    if stuck_for >= WATCHDOG_STUCK_SECS {
+                        eprintln!(
+                            "[CRIT][WATCHDOG] chain_stuck h={} net_h={} behind={} stuck_for={}s threshold={}s — restarting process for clean recovery",
+                            h, net_h, behind, stuck_for, WATCHDOG_STUCK_SECS
+                        );
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                        let _ = std::io::stderr().flush();
+                        std::process::exit(2);
+                    }
+                    if crate::node::is_warn() {
+                        println!(
+                            "[WARN][WATCHDOG] no_progress h={} net_h={} behind={} stuck_for={}s (restart at {}s)",
+                            h, net_h, behind, stuck_for, WATCHDOG_STUCK_SECS
+                        );
+                    }
+                }
+            });
         }
         
         // NOW connect to bootstrap peers AFTER API is ready
@@ -24697,7 +24778,24 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // back to direct macroblock sync from peers (same as before).
         // ═══════════════════════════════════════════════════════════════════════════
         const MAX_ROUNDS: u64 = 8;
-        const ROUND_TIMEOUT_SECS: u64 = 20;
+        // v14.8.3: Empirical tuning from live-network measurement.
+        // Delta between "reveal_phase_completed" on the participant and
+        // "macroblock saved on disk" sampled across 21 macroblocks on the
+        // 5-node genesis mesh: min=23.27s, max=24.28s, mean=24.10s, σ≈0.30s.
+        // The 24 s is NOT the voting (commit+reveal fires through in ~6 s
+        // via early-exit); it is the leader-side production + Dilithium3
+        // signing + QUIC broadcast + participant verify-and-save path.
+        // Setting the wait under that baseline causes round=0 to always
+        // time out harmlessly — 2f+1 participants emit a TimeoutVote, a
+        // TimeoutCertificate forms, the macroblock then arrives in round=1.
+        // Safety is unaffected, but the log gets noisy and every macroblock
+        // incurs an unnecessary view-change.
+        // 40s = 24.3s observed p95 + ~65% margin. Covers current 5-node
+        // genesis timings and scales up to ~1000-node committees where
+        // production+broadcast stretches by a few seconds. Real leader
+        // failure is still detected within 40s, well inside the 90s
+        // macroblock boundary.
+        const ROUND_TIMEOUT_SECS: u64 = 40;
 
         let mut iter_guard: u64 = 0;
         let mut last_round_seen: u64 = u64::MAX;

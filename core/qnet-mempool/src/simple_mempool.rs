@@ -83,25 +83,53 @@ impl SimpleMempool {
     /// PRODUCTION: Priority-based insertion for spam protection
     /// gas_price: Transaction gas price for priority sorting (higher = earlier processing)
     /// Returns: true if added, false if duplicate/full/invalid (NOT an error for duplicates!)
-    /// 
+    ///
     /// v2.67: CRITICAL FIX - Atomic add to both structures under single lock
+    /// v14.8.4: System-TX bypass. Parse TX once up front so we can route
+    /// protocol-level bootstrap / maintenance messages (NodeActivation,
+    /// NodeRegistration, Ping/Heartbeat/Attestation, RewardDistribution,
+    /// KeyRotation) past the user-side min_gas_price floor. A freshly
+    /// activated Super-node has ZERO QNC balance until it is registered,
+    /// so the min-fee floor would otherwise form a chicken-and-egg lock
+    /// preventing ANY non-genesis node from joining. DoS protection for
+    /// the bypass path is enforced UPSTREAM: activation codes reference a
+    /// confirmed Solana 1DEV burn whose hash is tracked on-chain for
+    /// single-use, and all liveness TXs carry Dilithium3 sender sigs.
     pub fn add_raw_transaction(&self, tx_json: String, hash: String, gas_price: u64) -> bool {
-        // FIX M-M15: Enforce minimum gas price
-        if gas_price < self.config.min_gas_price {
-            println!("[WARN][MEMPOOL] below_min_gas gas={} min={}", gas_price, self.config.min_gas_price);
+        // v14.8.4: Parse once up front; we need `is_system_tx()` before the
+        // min_gas_price check. This is the same parse previously done later
+        // for hash verification — moving it up costs nothing.
+        let parsed_tx = match serde_json::from_str::<Transaction>(&tx_json) {
+            Ok(tx) => tx,
+            Err(e) => {
+                eprintln!("[ERR][MEMPOOL] parse_failed hash={} error={}",
+                         &hash[..16.min(hash.len())], e);
+                return false;
+            }
+        };
+
+        let is_system = parsed_tx.is_system_tx();
+
+        // FIX M-M15 (v14.8.4 refinement): Min gas price enforced only for
+        // user transactions. System TXs (validator lifecycle + liveness +
+        // rewards + key rotation) MUST be free — their payment/authority
+        // is proven on chain or on Solana, not by mempool fee.
+        if !is_system && gas_price < self.config.min_gas_price {
+            println!("[WARN][MEMPOOL] below_min_gas gas={} min={} system_tx=false",
+                     gas_price, self.config.min_gas_price);
             return false;
         }
 
-        // FIX M-H15: Evict lowest-priority TX when mempool is full
-        // NOTE L-M10: Benign TOCTOU race between len() check and write lock acquisition.
-        // Concurrent callers may both pass this check before either acquires the lock,
-        // causing minor temporary over-capacity (at most +N concurrent callers). This is
-        // acceptable: the priority queue remains consistent and the next eviction corrects it.
+        // FIX M-H15: Evict lowest-priority TX when mempool is full.
+        // System TXs are treated as highest priority for eviction purposes
+        // (effective_priority = u64::MAX) so a spam flood of user TXs
+        // cannot starve protocol bootstrap.
+        let effective_priority = if is_system { u64::MAX } else { gas_price };
         if self.transactions.len() >= self.config.max_size {
             let mut priority_queue = self.by_gas_price.write();
             if let Some(mut lowest_entry) = priority_queue.first_entry() {
                 let lowest_gas = *lowest_entry.key();
-                if gas_price > lowest_gas {
+                if effective_priority > lowest_gas {
                     if let Some(tx_hash) = lowest_entry.get().front().cloned() {
                         // Remove evicted TX from both structures
                         lowest_entry.get_mut().pop_front();
@@ -110,10 +138,12 @@ impl SimpleMempool {
                         }
                         self.transactions.remove(&tx_hash);
                         self.tx_timestamps.remove(&tx_hash);
-                        println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={}", lowest_gas, gas_price);
+                        println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={} new_is_system={}",
+                                 lowest_gas, effective_priority, is_system);
                     }
                 } else {
-                    println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={}", self.transactions.len(), gas_price);
+                    println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={} system={}",
+                             self.transactions.len(), gas_price, is_system);
                     return false;
                 }
             } else {
@@ -121,51 +151,38 @@ impl SimpleMempool {
             }
             drop(priority_queue);
         }
-        
+
         // PROTOCOL: Reject TX already confirmed in recent blocks (prevents post-gossip re-inclusion)
         if self.included_tx_hashes.contains(&hash) {
             return false;
         }
-        
+
         // Duplicate is NORMAL in P2P network (same TX from multiple peers)
         if self.transactions.contains_key(&hash) {
             return false;
         }
-        
+
         // SECURITY: Verify hash matches canonical transaction data
-        // Parse JSON, compute canonical bytes (excludes hash/signatures), verify
-        match serde_json::from_str::<Transaction>(&tx_json) {
-            Ok(tx) => {
-                let canonical_bytes = tx.canonical_bytes();
-                let computed_hash = format!("{:x}", Sha3_256::digest(&canonical_bytes));
+        let canonical_bytes = parsed_tx.canonical_bytes();
+        let computed_hash = format!("{:x}", Sha3_256::digest(&canonical_bytes));
+        if computed_hash != hash {
+            eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}",
+                     &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
+            return false;
+        }
 
-                if computed_hash != hash {
-                    eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}",
-                             &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
-                    return false; // Reject tampered transaction
-                }
-
-                // FIX L-M9: Per-sender limit defense-in-depth
-                // Transaction.from is available after deserialization — enforce per-sender cap
-                if !tx.from.is_empty() {
-                    let mut sender_count = self.tx_count_by_sender
-                        .entry(tx.from.clone())
-                        .or_insert(0);
-                    if *sender_count >= self.max_per_sender {
-                        println!("[WARN][MEMPOOL] per_sender_limit sender={} count={} max={}",
-                                 &tx.from[..16.min(tx.from.len())], *sender_count, self.max_per_sender);
-                        return false;
-                    }
-                    *sender_count += 1;
-                    // FIX R24-M2: Track hash→sender for decrement on removal
-                    self.tx_sender_map.insert(hash.clone(), tx.from.clone());
-                }
+        // FIX L-M9: Per-sender limit defense-in-depth
+        if !parsed_tx.from.is_empty() {
+            let mut sender_count = self.tx_count_by_sender
+                .entry(parsed_tx.from.clone())
+                .or_insert(0);
+            if *sender_count >= self.max_per_sender {
+                println!("[WARN][MEMPOOL] per_sender_limit sender={} count={} max={}",
+                         &parsed_tx.from[..16.min(parsed_tx.from.len())], *sender_count, self.max_per_sender);
+                return false;
             }
-            Err(e) => {
-                eprintln!("[ERR][MEMPOOL] parse_failed hash={} error={}",
-                         &hash[..16.min(hash.len())], e);
-                return false; // Reject malformed transaction
-            }
+            *sender_count += 1;
+            self.tx_sender_map.insert(hash.clone(), parsed_tx.from.clone());
         }
         
         // Store as binary if enabled (50% space saving)
@@ -186,8 +203,10 @@ impl SimpleMempool {
             
             self.transactions.insert(hash.clone(), storage);
             self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
+            // v14.8.4: System TXs keyed at u64::MAX so block producers drain
+            // them first — protocol bootstrap cannot be delayed by user TXs.
             priority_queue
-                .entry(gas_price)
+                .entry(effective_priority)
                 .or_insert_with(VecDeque::new)
                 .push_back(hash);
         }
@@ -203,18 +222,35 @@ impl SimpleMempool {
     /// v2.67: CRITICAL FIX - Add to priority queue FIRST, then to transactions
     /// This ensures get_pending_transactions_with_hashes always sees consistent state
     pub fn add_binary_transaction(&self, tx_bytes: Vec<u8>, hash: String, gas_price: u64) -> bool {
-        // FIX M-M15: Enforce minimum gas price
-        if gas_price < self.config.min_gas_price {
-            println!("[WARN][MEMPOOL] below_min_gas gas={} min={}", gas_price, self.config.min_gas_price);
+        // v14.8.4: Parse once up front so we can classify user vs system TX
+        // and apply the correct fee policy. See `add_raw_transaction` for
+        // the rationale behind the system-TX bypass.
+        let parsed_tx = match bincode::deserialize::<Transaction>(&tx_bytes) {
+            Ok(tx) => tx,
+            Err(e) => {
+                eprintln!("[ERR][MEMPOOL] deserialize_failed hash={} error={}",
+                         &hash[..16.min(hash.len())], e);
+                return false;
+            }
+        };
+
+        let is_system = parsed_tx.is_system_tx();
+
+        // FIX M-M15 (v14.8.4 refinement): Min gas only for user TXs.
+        if !is_system && gas_price < self.config.min_gas_price {
+            println!("[WARN][MEMPOOL] below_min_gas gas={} min={} system_tx=false",
+                     gas_price, self.config.min_gas_price);
             return false;
         }
+
+        let effective_priority = if is_system { u64::MAX } else { gas_price };
 
         // FIX M-H15: Evict lowest-priority TX when mempool is full
         if self.transactions.len() >= self.config.max_size {
             let mut priority_queue = self.by_gas_price.write();
             if let Some(mut lowest_entry) = priority_queue.first_entry() {
                 let lowest_gas = *lowest_entry.key();
-                if gas_price > lowest_gas {
+                if effective_priority > lowest_gas {
                     if let Some(tx_hash) = lowest_entry.get().front().cloned() {
                         lowest_entry.get_mut().pop_front();
                         if lowest_entry.get().is_empty() {
@@ -222,10 +258,12 @@ impl SimpleMempool {
                         }
                         self.transactions.remove(&tx_hash);
                         self.tx_timestamps.remove(&tx_hash);
-                        println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={}", lowest_gas, gas_price);
+                        println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={} new_is_system={}",
+                                 lowest_gas, effective_priority, is_system);
                     }
                 } else {
-                    println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={}", self.transactions.len(), gas_price);
+                    println!("[WARN][MEMPOOL] pool_full size={} rejected_gas={} system={}",
+                             self.transactions.len(), gas_price, is_system);
                     return false;
                 }
             } else {
@@ -233,82 +271,69 @@ impl SimpleMempool {
             }
             drop(priority_queue);
         }
-        
+
         // PROTOCOL: Reject TX already confirmed in recent blocks (prevents post-gossip re-inclusion)
         if self.included_tx_hashes.contains(&hash) {
             return false;
         }
-        
+
         // Duplicate is NORMAL in P2P network (same TX from multiple peers)
         if self.transactions.contains_key(&hash) {
-            // Only log at debug level - this is expected behavior
             return false;
         }
-        
+
         // SECURITY: Verify hash matches canonical transaction data
-        // Deserialize, compute canonical bytes (excludes hash/signatures), verify
-        match bincode::deserialize::<Transaction>(&tx_bytes) {
-            Ok(tx) => {
-                let canonical_bytes = tx.canonical_bytes();
-                let computed_hash = format!("{:x}", Sha3_256::digest(&canonical_bytes));
-
-                if computed_hash != hash {
-                    eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}",
-                             &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
-                    return false; // Reject tampered transaction
-                }
-
-                // Per-sender limit (defense in depth)
-                let sender = &tx.from;
-                if !sender.is_empty() {
-                    let mut sender_count = self.tx_count_by_sender.entry(sender.clone()).or_insert(0);
-                    if *sender_count >= self.max_per_sender {
-                        println!("[WARN][MEMPOOL] per_sender_limit sender={}.. count={}",
-                                 &sender[..16.min(sender.len())], *sender_count);
-                        return false;
-                    }
-                    *sender_count += 1;
-                    // FIX R24-M2: Track hash→sender for decrement on removal
-                    self.tx_sender_map.insert(hash.clone(), sender.clone());
-                }
-            }
-            Err(e) => {
-                eprintln!("[ERR][MEMPOOL] deserialize_failed hash={} error={}",
-                         &hash[..16.min(hash.len())], e);
-                return false; // Reject malformed transaction
-            }
+        let canonical_bytes = parsed_tx.canonical_bytes();
+        let computed_hash = format!("{:x}", Sha3_256::digest(&canonical_bytes));
+        if computed_hash != hash {
+            eprintln!("[ERR][MEMPOOL] hash_mismatch expected={} got={}",
+                     &hash[..16.min(hash.len())], &computed_hash[..16.min(computed_hash.len())]);
+            return false;
         }
-        
+
+        // Per-sender limit (defense in depth)
+        let sender = &parsed_tx.from;
+        if !sender.is_empty() {
+            let mut sender_count = self.tx_count_by_sender.entry(sender.clone()).or_insert(0);
+            if *sender_count >= self.max_per_sender {
+                println!("[WARN][MEMPOOL] per_sender_limit sender={}.. count={}",
+                         &sender[..16.min(sender.len())], *sender_count);
+                return false;
+            }
+            *sender_count += 1;
+            self.tx_sender_map.insert(hash.clone(), sender.clone());
+        }
+
         // v2.67: CRITICAL - Add to BOTH structures atomically under priority queue lock
         // This prevents race condition where TX is in transactions but not in priority queue
         {
             let mut priority_queue = self.by_gas_price.write();
-            
+
             // Double-check inside lock to prevent duplicates
             if self.transactions.contains_key(&hash) {
                 return false;
             }
-            
+
             // Add to transactions first
             self.transactions.insert(hash.clone(), TxStorage::Binary(tx_bytes));
             self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
 
             // Then add to priority queue (same lock scope)
             priority_queue
-                .entry(gas_price)
+                .entry(effective_priority)
                 .or_insert_with(VecDeque::new)
                 .push_back(hash.clone());
-            
-            // v2.67: Verify consistency for system TX
-            if gas_price == u64::MAX {
+
+            // v2.67: Verify consistency for system TX at top-priority slot
+            if is_system {
                 let queue_has = priority_queue.get(&u64::MAX)
                     .map(|v| v.contains(&hash))
                     .unwrap_or(false);
                 let tx_has = self.transactions.contains_key(&hash);
-                
-                println!("[INFO][MEMPOOL] system_tx_added hash={} size={} queue={} tx={}", 
+
+                println!("[INFO][MEMPOOL] system_tx_added hash={} size={} queue={} tx={}",
                         &hash[..16.min(hash.len())], self.transactions.len(), queue_has, tx_has);
-                
+
                 if !queue_has || !tx_has {
                     eprintln!("[ERR][MEMPOOL] system_tx_add_failed hash={}", &hash[..16.min(hash.len())]);
                 }
