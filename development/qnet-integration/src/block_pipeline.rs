@@ -81,13 +81,36 @@ pub fn take_fork_recovery_signal() -> Option<u64> {
 }
 
 // ============================================================================
-// v14.8.5: DISTINCT-PEER WITNESS TRACKER for microblock minority-fork detection.
+// v14.8.7: DISTINCT-PEER WITNESS TRACKER for microblock minority-fork detection.
 // ============================================================================
 // Keyed by height; value is the set of distinct peer_ids that reported a
-// `hash_chain_break` at that height. Once the set reaches 2f+1 of the current
-// validator committee, we are on the minority fork (BFT supermajority rule)
-// and FORK_RECOVERY_HEIGHT is raised to (height - 1) so the main loop rolls
-// back and resyncs.
+// `hash_chain_break` at that height. The threshold for DETECTION is f+1
+// (not 2f+1 which is the threshold for COMMIT decisions). Rationale:
+//
+//   * 2f+1 is required when we want to COMMIT a decision — only a Byzantine
+//     supermajority can outvote any colluding f. Using 2f+1 for a rollback
+//     trigger was a v14.8.5 mistake: it requires MORE honest witnesses
+//     than actually exist when the local node is on the minority fork.
+//     Observed: when n=5 and one node is on a minority 1-node fork, only
+//     2 distinct honest peers report the break; 2f+1=3 never trips; the
+//     node stays stuck forever.
+//   * f+1 is correct for DETECTION because it is the "at least one honest"
+//     threshold: any set of f+1 distinct peers contains at least one
+//     honest validator. Since each witness is a Dilithium3-authenticated
+//     peer_id bound to a registered validator public key (not a socket),
+//     an attacker cannot inflate the witness count with Sybils; they
+//     would need f+1 distinct validator keys to trigger a false positive,
+//     which by definition is outside the Byzantine fault model (adversary
+//     controls ≤ f keys).
+//
+//   Safety: an f+1 threshold does not cause false rollbacks because an
+//   honest validator only reports hash_chain_break for a real parent_hash
+//   mismatch at the reported height, which it observed in a signed
+//   envelope from a peer on a different chain. A real break = real fork.
+//
+//   Liveness: this recovers a node trapped on a minority fork as soon as
+//   f+1 peers advance past it, which is the smallest network-observable
+//   quorum that proves we are behind the canonical chain.
 //
 // DashMap+DashSet combo gives lock-free concurrent writes across pipeline
 // worker threads. Bounded by height cleanup (cleanup_break_tracker) to keep
@@ -99,7 +122,10 @@ static HASH_CHAIN_BREAK_WITNESSES: once_cell::sync::Lazy<
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
 /// Record that `peer_id` reported a hash_chain_break at `height`.
-/// If the set of distinct witnesses reaches 2f+1, signal fork recovery.
+/// If the set of distinct witnesses reaches f+1 (not 2f+1), signal fork
+/// recovery. f+1 is the "at least one honest witness" threshold and is
+/// the canonical bar for fork DETECTION (as opposed to the 2f+1 COMMIT
+/// threshold).
 ///
 /// Rate-limit semantics: once FORK_RECOVERY_HEIGHT is non-zero we don't
 /// overwrite it with a different (lower) height — the main loop consumes
@@ -124,10 +150,12 @@ pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
         let n = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
         if n >= 3 { n } else { 5 }
     };
-    let threshold_2f_plus_1 = (total_validators.saturating_mul(2).saturating_add(2)) / 3;
-    // Floor at 3 so an attacker cannot collapse the threshold with a tiny
-    // registry and trigger spurious rollbacks.
-    let threshold = threshold_2f_plus_1.max(3);
+    // f+1 = ceil(n/3): guarantees at least one honest witness.
+    let threshold_f_plus_1 = (total_validators.saturating_add(2)) / 3;
+    // Floor at 2 so at any registry size ≥ 4 the threshold is ≥ 2; below
+    // 4 we still need at least 2 distinct reporters to avoid single-peer
+    // false positives.
+    let threshold = threshold_f_plus_1.max(2);
 
     if witnesses >= threshold {
         let rollback_to = height.saturating_sub(1);
@@ -138,7 +166,7 @@ pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
             FORK_RECOVERY_HEIGHT.store(rollback_to, Ordering::SeqCst);
             if is_warn() {
                 println!(
-                    "[WARN][PIPELINE] minority_fork_detected h={} rollback_to={} witnesses={} threshold={}",
+                    "[WARN][PIPELINE] minority_fork_detected h={} rollback_to={} witnesses={} threshold={} (f+1)",
                     height, rollback_to, witnesses, threshold
                 );
             }
@@ -669,6 +697,63 @@ impl BlockPipeline {
                     metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+            }
+
+            // ═══════════════════════════════════════════════════════════════════════════
+            // 2b. v14.8.7: PACEMAKER-RANK VALIDATION
+            // ═══════════════════════════════════════════════════════════════════════════
+            // Microblock producer rotation is driven by a wall-clock pacemaker in the
+            // production loop (node.rs): rank K owns the slot window
+            // [slot_start + K*RANK_WINDOW, slot_start + (K+1)*RANK_WINDOW]. A Byzantine
+            // producer cannot unilaterally claim a higher rank than their timestamp
+            // permits — otherwise they could pick any rank K and sign a block that
+            // remaps VRF candidate index to themselves (rank feeds into
+            // `select_microblock_producer_with_round`'s `(base_idx + K) % N`).
+            //
+            // Rule: block.timeout_round must fall inside the wall-clock window
+            // derived from prev_block.timestamp and block.timestamp.
+            //
+            // If prev block is not locally available (sync gap), fall through —
+            // hash-chain + signature checks below still enforce correctness, and
+            // ingest validation resumes once the parent is in storage.
+            //
+            // NTP tolerance: ±RANK_WINDOW / 2 allows the realistic worst case of a
+            // ±1.5 s clock skew plus slight propagation delay without false rejects.
+            //
+            // Safety:
+            //   * Producer signs (height, prev_hash, timestamp, timeout_round) with
+            //     Dilithium3. A fake rank claim requires a fake signature, which is
+            //     infeasible.
+            //   * If honest producer at rank K signs a block, their timestamp is in
+            //     rank K's window by construction of the production loop, so they
+            //     always pass this check.
+            //
+            // Scalability: one storage read per block, O(1). No per-validator scan.
+            // ═══════════════════════════════════════════════════════════════════════════
+            if !snap.is_syncing() && mb.height > 1 {
+                const SLOT_LEN_SECS: u64 = 1;
+                const RANK_WINDOW_SECS: u64 = 3;
+                const RANK_TOL_SECS: u64 = RANK_WINDOW_SECS / 2 + 1; // ±2s tolerance
+                if let Ok(Some(prev_mb)) = storage.load_microblock_auto_format(mb.height - 1) {
+                    let slot_start = prev_mb.timestamp.saturating_add(SLOT_LEN_SECS);
+                    // Compute allowed window for the claimed rank.
+                    let rank = mb.timeout_round;
+                    let window_start = slot_start.saturating_add(rank.saturating_mul(RANK_WINDOW_SECS));
+                    let window_end = window_start.saturating_add(RANK_WINDOW_SECS);
+                    let lo = window_start.saturating_sub(RANK_TOL_SECS);
+                    let hi = window_end.saturating_add(RANK_TOL_SECS);
+                    if mb.timestamp < lo || mb.timestamp > hi {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] pacemaker_rank_invalid h={} rank={} ts={} slot_start={} window=[{}..{}] tol={} from={}",
+                                mb.height, rank, mb.timestamp, slot_start, lo, hi, RANK_TOL_SECS, decoded.from_peer
+                            );
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                // else: parent not yet local — defer to hash chain check
             }
 
             // 3. Signature verification

@@ -9151,9 +9151,26 @@ impl BlockchainNode {
                                                             if is_info() { println!("[INFO][REORG] resolved synced=longer_chain"); }
                                                         }
                                                     }
-                                                    // CASE 2: Same height - use attestation count as tie-breaker first.
-                                                    // v3.33: Only attestations for OUR specific block hash count.
-                                                    // This prevents attestations for the rival fork from being counted.
+                                                    // CASE 2: Same height — attestation fork-choice with Byzantine-safe threshold.
+                                                    //
+                                                    // v14.8.8: tightened from `count > 0` to 2f+1 of the active validator
+                                                    // set. Rationale: with `count > 0` a Byzantine validator could emit
+                                                    // a single attestation for its own minority fork and make our node
+                                                    // keep-local against a legitimately different network chain — forcing
+                                                    // us off the canonical path until the macroblock boundary resolves
+                                                    // it (~90 s lag). With 2f+1 the attacker would need to produce
+                                                    // Byzantine-supermajority signatures, which by definition exceeds
+                                                    // their ≤ f key budget.
+                                                    //
+                                                    // v3.33 (preserved): only attestations for THIS exact block hash
+                                                    // count — prevents a rival fork's attestations from being conflated.
+                                                    //
+                                                    // Liveness: at 2f+1 we resync immediately when unsure, instead of
+                                                    // waiting for macroblock finality to disambiguate.
+                                                    //
+                                                    // Scalability: `has_sufficient_attestations_for_hash` uses the
+                                                    // already-populated per-hash counter, O(validators_at_height) once
+                                                    // per fork event; negligible at 5 or 5000 validators.
                                                     else if network_height == local_height && fork_height <= local_height {
                                                         // Compute SHA3-256 of our local block at fork_height
                                                         let our_local_hash: Option<[u8; 32]> =
@@ -9168,20 +9185,31 @@ impl BlockchainNode {
                                                                     arr
                                                                 });
 
+                                                        let total_validators = p2p.get_active_validator_count();
+                                                        let attest_byz_threshold = (total_validators.saturating_mul(2).saturating_add(2)) / 3;
                                                         let our_attest = our_local_hash
                                                             .map(|hash| crate::unified_p2p::get_attestation_count_for_hash(fork_height, &hash))
                                                             .unwrap_or(0);
+                                                        let is_sufficient = our_local_hash
+                                                            .map(|hash| crate::unified_p2p::has_sufficient_attestations_for_hash(
+                                                                fork_height, &hash, total_validators,
+                                                            ))
+                                                            .unwrap_or(false);
 
-                                                        if our_attest > 0 {
+                                                        if is_sufficient {
                                                             if is_info() {
-                                                                println!("[INFO][REORG] attest_fork_choice h={} attestations_for_our_hash={} keeping_local",
-                                                                         fork_height, our_attest);
+                                                                println!("[INFO][REORG] attest_fork_choice h={} attestations_for_our_hash={}/{} threshold=2f+1={} keeping_local",
+                                                                         fork_height, our_attest, total_validators, attest_byz_threshold);
                                                             }
-                                                            // Our specific block has attestations — keep it, do NOT resync
+                                                            // Our block has a Byzantine-supermajority of attestations —
+                                                            // keep it, do NOT resync.
                                                             *reorg_flag.write().await = false;
                                                             return;
                                                         }
-                                                        if is_info() { println!("[INFO][REORG] same_height={} fork=detected no_attestations_for_our_hash resync=network", local_height); }
+                                                        if is_info() {
+                                                            println!("[INFO][REORG] same_height={} fork=detected attestations_for_our_hash={}/{} below_2f+1={} resync=network",
+                                                                     local_height, our_attest, total_validators, attest_byz_threshold);
+                                                        }
 
                                                         // Get our hash at fork_height for logging (hex prefix)
                                                         let our_hash = our_local_hash
@@ -13246,13 +13274,14 @@ impl BlockchainNode {
         Self::start_sync_health_monitor();
 
         // ═══════════════════════════════════════════════════════════════════════
-        // v14.7 (pt 9): REHYDRATE TIMEOUT-CERTIFICATE STATE FROM DISK
+        // v14.8.7: REHYDRATE TIMEOUT-CERTIFICATE STATE FROM DISK
         // ═══════════════════════════════════════════════════════════════════════
-        // Loads the persisted TIMEOUT_CERTIFICATES + HIGHEST_CERTIFIED_ROUND +
-        // HIGHEST_ADOPTED_ROUND DashMaps so the v14.6 pre-save guard sees the
-        // correct view immediately after restart, not zero. Without this, a
-        // rebooted node could sign a stale-round block in the first seconds
-        // post-boot (before its P2P layer re-fetches certificates from peers).
+        // Loads persisted TIMEOUT_CERTIFICATES and HIGHEST_CERTIFIED_ROUND so a
+        // rebooted validator sees the same post-2f+1 view as the rest of the
+        // network immediately on startup, rather than having to re-fetch
+        // certificates from peers. HIGHEST_ADOPTED_ROUND rehydration is
+        // removed: that tracker was a local-only aggregation with no signed
+        // backing and is no longer part of the consensus state.
         //
         // Safe at 1000+ validator scale: payload is per-macroblock-index, not
         // per-validator. Cleanup retain() keeps it bounded to the active window.
@@ -13260,23 +13289,18 @@ impl BlockchainNode {
         {
             let tc_bytes = self.storage.load_timeout_certificates().unwrap_or(None).unwrap_or_default();
             let hc_bytes = self.storage.load_highest_certified_rounds().unwrap_or(None).unwrap_or_default();
-            let ha_bytes = self.storage.load_highest_adopted_rounds().unwrap_or(None).unwrap_or_default();
             let tc_n = crate::unified_p2p::rehydrate_timeout_certificates(&tc_bytes);
             let hc_n = crate::unified_p2p::rehydrate_highest_certified_rounds(&hc_bytes);
-            let ha_n = crate::unified_p2p::rehydrate_highest_adopted_rounds(&ha_bytes);
             if is_info() {
-                println!("[INFO][CONS] timeout_state_rehydrated certs={} hi_cert={} hi_adopt={}",
-                         tc_n, hc_n, ha_n);
+                println!("[INFO][CONS] timeout_state_rehydrated certs={} hi_cert={}",
+                         tc_n, hc_n);
             }
         }
 
-        // v14.7 (pt 9): Spawn periodic FLUSHER for timeout-certificate state.
-        // 2s tick is a deliberate trade-off — long enough to coalesce bursts of
-        // vote-driven cert updates into a single RocksDB write, short enough
-        // that a crash loses at most ~2 rotation rounds of cert state. Worst
-        // case the rehydration at next start is 2s stale; timeout protocol
-        // converges within one rotation anyway. No locks taken; snapshot
-        // helpers iterate DashMaps atomically.
+        // v14.8.7: Periodic FLUSHER for timeout-certificate state (2s tick).
+        // Persists only the signed-backed state: TIMEOUT_CERTIFICATES (full
+        // 2f+1 payloads) and HIGHEST_CERTIFIED_ROUND (O(1) tracker). Worst
+        // case a crash loses at most ~2 s of certificate updates.
         {
             let storage_flush = self.storage.clone();
             tokio::spawn(async move {
@@ -13286,15 +13310,11 @@ impl BlockchainNode {
                     ticker.tick().await;
                     let tc = crate::unified_p2p::snapshot_timeout_certificates();
                     let hc = crate::unified_p2p::snapshot_highest_certified_rounds();
-                    let ha = crate::unified_p2p::snapshot_highest_adopted_rounds();
                     if let Err(e) = storage_flush.save_timeout_certificates(&tc) {
                         if is_warn() { println!("[WARN][CONS] tcerts_flush_fail err={}", e); }
                     }
                     if let Err(e) = storage_flush.save_highest_certified_rounds(&hc) {
                         if is_warn() { println!("[WARN][CONS] hi_cert_flush_fail err={}", e); }
-                    }
-                    if let Err(e) = storage_flush.save_highest_adopted_rounds(&ha) {
-                        if is_warn() { println!("[WARN][CONS] hi_adopt_flush_fail err={}", e); }
                     }
                 }
             });
@@ -14980,16 +15000,23 @@ impl BlockchainNode {
                         } else {
                             base_grace_secs
                         };
-                        // Keep vote interval as 1s so escalation cadence stays dense
-                        // once a real stall IS detected beyond the grace window.
-                        let timeout_vote_interval: u64 = 1;
 
-                        // Calculate proposed timeout round from delay (uncapped)
-                        let proposed_timeout_round = if local_delay <= timeout_grace_period {
-                            0
-                        } else {
-                            ((local_delay - timeout_grace_period) / timeout_vote_interval + 1) as u64
-                        };
+                        // v14.8.8: `proposed_timeout_round` is defined BELOW, after the
+                        // wall-clock pacemaker is computed. The canonical rule is:
+                        //
+                        //   proposed_timeout_round = if past_grace { pacemaker_rank } else { 0 }
+                        //
+                        // Grace period still gates WHETHER we vote (don't spam the
+                        // network on sub-grace delays), but the round VALUE we vote
+                        // at must be deterministic across validators — otherwise
+                        // 2f+1 same-round never collects and TimeoutCertificate never
+                        // forms, which permanently stalls macroblock view-change
+                        // when the committee temporarily has < 2f+1 alive nodes.
+                        //
+                        // The old formula (local_delay − grace) / vote_interval was
+                        // node-local (receipt-time based) and caused the observed
+                        // ~25-minute stall at mb=43 when 3/5 alive: votes landed at
+                        // 1493/1504/1515/1519 on different nodes and never converged.
 
                         // v4.2: Timeout votes/certificates keyed by MACROBLOCK INDEX,
                         // not exact microblock height. This ensures nodes at different
@@ -15005,33 +15032,107 @@ impl BlockchainNode {
                         };
 
                         // ═══════════════════════════════════════════════════════════════
-                        // v5.4: TENDERMINT-STYLE ROUND ADOPTION (f+1 threshold)
-                        //
-                        // Problem: Each node computes proposed_timeout_round from local
-                        // delay. Even small LBPT differences → different rounds →
-                        // different producers → no consensus → permanent stall.
-                        //
-                        // Solution (f+1 round-skip): When f+1 validators have
-                        // voted for round R, ALL nodes adopt R for producer selection.
-                        // f+1 guarantees at least one honest node is at that round.
-                        //
-                        // Priority: certified (2/3+ BFT) > adopted (f+1) > proposed (local)
-                        // When agreement exists, local proposed is IGNORED for rotation.
-                        // Nodes continue VOTING at proposed to build vote history.
+                        // v14.8.7: WALL-CLOCK PACEMAKER FOR MICROBLOCK PRODUCER ROTATION
                         // ═══════════════════════════════════════════════════════════════
-                        let (adopted_timeout_round, f_plus_1) = if let Some(p2p) = &unified_p2p {
-                            let total_validators = p2p.get_active_validator_count();
-                            let f1 = (total_validators + 2) / 3; // ceil(n/3) = f+1
-                            let adopted = p2p.get_highest_adopted_round(timeout_mb_index, f1);
-                            (adopted, f1)
-                        } else {
-                            (0, 2)
-                        };
+                        // Previous versions derived `timeout_round_for_rotation` from two
+                        // local-only trackers (`HIGHEST_CERTIFIED_ROUND` via cumulative
+                        // local advancement, and `HIGHEST_ADOPTED_ROUND` via local f+1
+                        // aggregation). Both tracked non-deterministic local state and
+                        // ended up with different values on different nodes, causing
+                        // VRF producer selection to return different leaders → forks
+                        // (observed at h=3810 on 2026-04-21).
+                        //
+                        // The canonical rule for slot-based microblock production is:
+                        // the producer rank is a deterministic function of wall-clock
+                        // elapsed time since the previous block's slot start. All
+                        // validators with synchronised clocks compute the same rank at
+                        // the same wall time, so VRF producer selection is identical
+                        // across the network.
+                        //
+                        // slot_start(h) = timestamp(block[h-1]) + SLOT_LEN_SECS
+                        // elapsed      = now - slot_start(h)
+                        // rank         = elapsed / RANK_WINDOW_SECS   (0 if negative)
+                        //
+                        // Constants:
+                        //   SLOT_LEN_SECS     = 1  (target microblock cadence)
+                        //   RANK_WINDOW_SECS  = 3  (time budget per rank; 3× typical
+                        //                          NTP drift of 1 s to avoid boundary
+                        //                          ambiguity)
+                        //
+                        // Rank 0 owns window [slot_start, slot_start + 3 s]. If the
+                        // primary stays silent past 3 s, every validator atomically
+                        // observes `elapsed ≥ 3` and rank advances to 1, which remaps
+                        // to the next VRF candidate. All nodes compute the same rank
+                        // from the same wall clock — no voting, no shared state, no
+                        // chance of two producers signing the same height.
+                        //
+                        // Safety: producer rank binds to (block.timestamp - slot_start)
+                        // at ingest (see block_pipeline); a Byzantine producer cannot
+                        // sign at a higher rank than its timestamp allows.
+                        //
+                        // Liveness: under partial synchrony with NTP drift ≤ 1 s the
+                        // rank advances at a bounded rate on every node; failover is
+                        // ≤ 3 s. Note that 2f+1 macroblock commit consensus uses its
+                        // own round/certificate path below — entirely separate from
+                        // microblock rank.
+                        //
+                        // Scalability: constant work per block, no per-validator scan.
+                        // Identical cost at 5 or 5000 validators.
+                        // ═══════════════════════════════════════════════════════════════
+                        const SLOT_LEN_SECS: u64 = 1;
+                        const RANK_WINDOW_SECS: u64 = 3;
 
-                        // Rotation round: ONLY use consensus-agreed rounds for producer selection.
-                        // NEVER fall back to local proposed — that causes divergence between nodes.
-                        // Round 0 = primary producer continues until validators agree on rotation.
-                        let timeout_round_for_rotation = certified_timeout_round.max(adopted_timeout_round);
+                        let now_secs = get_timestamp_safe();
+                        // block.timestamp is stored as Unix seconds (see get_timestamp_safe).
+                        let prev_block_ts = if next_height > 1 {
+                            match storage.load_microblock_auto_format(next_height.saturating_sub(1)) {
+                                Ok(Some(mb)) => mb.timestamp,
+                                _ => now_secs.saturating_sub(SLOT_LEN_SECS),
+                            }
+                        } else {
+                            now_secs.saturating_sub(SLOT_LEN_SECS)
+                        };
+                        let slot_start = prev_block_ts.saturating_add(SLOT_LEN_SECS);
+                        let pacemaker_elapsed = now_secs.saturating_sub(slot_start);
+                        let pacemaker_rank = pacemaker_elapsed / RANK_WINDOW_SECS;
+
+                        // Signed 2f+1 same-round TimeoutCertificate advances an
+                        // additional failover dimension for macroblock commit only.
+                        // For microblock producer rotation we take MAX of the two:
+                        // if a signed TC already proved a later failover is active,
+                        // honour it (still deterministic — every node sees the same
+                        // signed TC after gossip). In steady state both are 0 and
+                        // rank 0 (primary VRF leader) produces.
+                        let timeout_round_for_rotation = pacemaker_rank.max(certified_timeout_round);
+
+                        // ═══════════════════════════════════════════════════════════════
+                        // v14.8.8: DETERMINISTIC TIMEOUT VOTE ROUND (wall-clock)
+                        // ═══════════════════════════════════════════════════════════════
+                        // TimeoutVote round MUST be deterministic across the network so
+                        // that 2f+1 same-round votes aggregate into a signed
+                        // TimeoutCertificate. Otherwise view-change for macroblock
+                        // commit never converges when the committee briefly has < 2f+1
+                        // alive (e.g. one node restarting + one on a forked branch).
+                        //
+                        // Grace check below decides WHETHER to vote (avoid spam on
+                        // short delays). If past grace, the round is `pacemaker_rank`,
+                        // which is derived purely from finalized prev_block.timestamp
+                        // plus wall clock — identical on every validator with
+                        // synchronised NTP (±RANK_WINDOW_SECS/2 tolerance).
+                        //
+                        // Scalability: O(1) per block — no per-validator scan, so
+                        // the formula costs the same at 5 or 5000 validators.
+                        //
+                        // Safety: TimeoutCertificate is still only accepted when
+                        // 2f+1 Dilithium3-signed votes at the SAME round aggregate.
+                        // Deterministic round derivation makes this reachable.
+                        // ═══════════════════════════════════════════════════════════════
+                        let proposed_timeout_round: u64 = if local_delay <= timeout_grace_period {
+                            0
+                        } else {
+                            // Wall-clock rank — same on all validators with synced clocks.
+                            pacemaker_rank
+                        };
 
                         // Store rotation round for producer selection
                         set_timeout_round(timeout_round_for_rotation, next_height);
@@ -15051,9 +15152,9 @@ impl BlockchainNode {
 
                         if proposed_timeout_round > 0 && microblock_height > 0 && is_synced_enough {
                             if is_info() {
-                                println!("[INFO][TIMEOUT] stall h={} mb={} delay={}s proposed={} adopted={} certified={} rotation={} f1={}",
+                                println!("[INFO][TIMEOUT] stall h={} mb={} delay={}s proposed={} certified={} pacemaker_rank={} rotation={}",
                                          next_height, timeout_mb_index, local_delay, proposed_timeout_round,
-                                         adopted_timeout_round, certified_timeout_round, timeout_round_for_rotation, f_plus_1);
+                                         certified_timeout_round, pacemaker_rank, timeout_round_for_rotation);
                             }
 
                             // STATE MACHINE: Network stall detected
@@ -15061,42 +15162,31 @@ impl BlockchainNode {
                                 reason: format!("Stall: delay={}s, voting_round={}", local_delay, timeout_round_for_rotation),
                                 recoverable: true,
                             });
-                            
-                            // Broadcast timeout vote at proposed round (always, to build vote history)
+
+                            // v14.8.7: TimeoutVote broadcast for MACROBLOCK commit view change.
+                            // Microblock producer rotation is driven purely by the wall-clock
+                            // pacemaker above — no vote needed for rank advancement. TimeoutVote
+                            // is still useful for signalling macroblock-commit timeout at the
+                            // 90-block boundary, where 2f+1 signed same-round votes form a
+                            // broadcastable TimeoutCertificate that finalises a view change
+                            // deterministically across the network. Vote at `proposed_timeout_round`
+                            // (each node's honest local view); round convergence follows from
+                            // the wall-clock pacemaker driving every node to the same round
+                            // in the same physical interval.
                             if proposed_timeout_round > certified_timeout_round {
                                 if let Some(p2p) = &unified_p2p {
-                                    // Get last block hash for vote (use macroblock hash as anchor)
                                     let last_block_hash = storage.get_latest_macroblock_hash()
                                         .unwrap_or([0u8; 32]);
 
-                                    // v13.0: JUMP-TO-HIGHEST — check if peer voted for higher round
-                                    // If so, adopt that round and vote at it for fast convergence.
-                                    // This replaces slow independent round computation with O(1) cascade.
-                                    let effective_vote_round = if let Some(jump_target) = p2p.take_timeout_jump_target(timeout_mb_index) {
-                                        if jump_target > proposed_timeout_round && jump_target > certified_timeout_round {
-                                            if is_info() {
-                                                println!("[INFO][TIMEOUT] jump_adopt h={} proposed={} jump_to={}",
-                                                         next_height, proposed_timeout_round, jump_target);
-                                            }
-                                            jump_target
-                                        } else {
-                                            proposed_timeout_round
-                                        }
-                                    } else {
-                                        proposed_timeout_round
-                                    };
-
-                                    // v4.2: vote_msg uses macroblock index for consistency
                                     let vote_msg = format!("TIMEOUT:{}:{}:{}",
-                                        timeout_mb_index, effective_vote_round, hex::encode(&last_block_hash));
+                                        timeout_mb_index, proposed_timeout_round, hex::encode(&last_block_hash));
 
-                                    // Sign with quantum crypto (Dilithium)
                                     if let Some(crypto) = try_get_quantum_crypto() {
                                         match crypto.create_consensus_signature(&node_id, &vote_msg).await {
                                             Ok(sig) => {
                                                 p2p.broadcast_timeout_vote(
                                                     timeout_mb_index,
-                                                    effective_vote_round,
+                                                    proposed_timeout_round,
                                                     last_block_hash,
                                                     sig.signature.as_bytes().to_vec()
                                                 );
@@ -15111,8 +15201,10 @@ impl BlockchainNode {
                                 }
                             }
 
-                            // v5.4: Select producer based on CONVERGED timeout_round
-                            // Priority: certified > adopted > proposed (same as rotation round)
+                            // v14.8.7: Select producer based on deterministic rotation round.
+                            // `timeout_round_for_rotation` is now wall-clock derived on every
+                            // node (plus any signed 2f+1 certificate round), so all nodes
+                            // compute the same producer.
                             if timeout_round_for_rotation > 0 {
                                 if let Some(_p2p) = &unified_p2p {
                                     let current_producer = Self::select_microblock_producer_with_round(
@@ -18960,27 +19052,28 @@ impl BlockchainNode {
                     //     retroactive 2f+1 macroblock ratification.
                     //
                     // Scalability:
-                    //   * Two atomic reads (HIGHEST_CERTIFIED_ROUND, HIGHEST_ADOPTED_ROUND
-                    //     DashMap lookup). Microseconds. Unaffected by validator count.
+                    //   * One atomic read (HIGHEST_CERTIFIED_ROUND DashMap lookup).
+                    //     Microseconds. Unaffected by validator count.
                     //
                     // Liveness:
                     //   * If the primary yields, the failover leader's block stands.
                     //   * If nobody else has a block ready, the next iteration of the
                     //     production loop picks up the new round deterministically and
                     //     produces cleanly.
+                    //
+                    // v14.8.7: HIGHEST_ADOPTED_ROUND removed. This self-check now
+                    // uses only the signed 2f+1 HIGHEST_CERTIFIED_ROUND, which is
+                    // guaranteed deterministic across nodes (only advanced by
+                    // broadcast-verified signed TimeoutCertificate). Local non-
+                    // deterministic state is never involved.
                     // ═══════════════════════════════════════════════════════════════════════════
                     if let Some(p2p_guard) = &unified_p2p {
                         let guard_mb = height_for_storage / 90;
                         let cert_now = p2p_guard.get_highest_certified_round(guard_mb);
-                        let total_now = p2p_guard.get_active_validator_count();
-                        let f1_now = (total_now + 2) / 3;
-                        let adopt_now = p2p_guard.get_highest_adopted_round(guard_mb, f1_now);
-                        let latest_round_now = cert_now.max(adopt_now);
-                        if latest_round_now > microblock.timeout_round {
+                        if cert_now > microblock.timeout_round {
                             println!(
-                                "[WARN][PROD] yield_stale_round h={} produced_for_round={} latest_certified={} latest_adopted={} action=skip_save",
-                                height_for_storage, microblock.timeout_round,
-                                cert_now, adopt_now
+                                "[WARN][PROD] yield_stale_round h={} produced_for_round={} latest_certified={} action=skip_save",
+                                height_for_storage, microblock.timeout_round, cert_now
                             );
                             // Clear broadcast lock so the next iteration can proceed
                             crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS

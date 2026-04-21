@@ -1078,28 +1078,20 @@ static TIMEOUT_CERTIFICATES: Lazy<Arc<DashMap<(u64, u64), TimeoutCertificate>>> 
 static HIGHEST_CERTIFIED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// O(1) tracker: highest adopted round (>= f+1 votes) per macroblock index.
-/// Key: macroblock_index, Value: highest round with cumulative >= f+1 votes.
-/// Updated on every vote insert — avoids linear scan of TIMEOUT_VOTES.
-/// BFT cumulative voting: a vote for round R supports ALL rounds <= R.
-static HIGHEST_ADOPTED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
-
-/// Per-voter max round tracker: Key: (mb_index, voter_id), Value: max round voted.
-/// Used for cumulative vote counting — a vote for round R counts as vote for all rounds <= R.
-static VOTER_MAX_ROUND: Lazy<Arc<DashMap<(u64, String), u64>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
-
 /// Track which macroblock indices we've already voted for timeout (prevent double-voting)
 /// Key: macroblock_index, Value: timeout_round we voted for
 static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<u64, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// v13.0: Jump-to-highest target — set when peer's verified vote has higher round than ours.
-/// Key: macroblock_index, Value: target round to jump to.
-/// Consumed by main consensus loop: read + clear atomically → broadcast vote at target round.
-static TIMEOUT_JUMP_TARGET: Lazy<Arc<DashMap<u64, u64>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
+// v14.8.7: `HIGHEST_ADOPTED_ROUND`, `VOTER_MAX_ROUND`, and `TIMEOUT_JUMP_TARGET`
+// REMOVED. These were local-only aggregation trackers (f+1 adopted round,
+// per-voter max round for cumulative certificate, jump-to-highest cascade
+// target). They advanced non-deterministically on each node and fed into
+// microblock producer selection, which broke determinism and caused the
+// observed fork at h=3810 (see commit message). Canonical BFT now uses
+// only `HIGHEST_CERTIFIED_ROUND`, advanced solely by signed 2f+1 same-round
+// TimeoutCertificate via `handle_timeout_proof_broadcast`, which is the
+// unique deterministic source of round advancement across all honest nodes.
 
 // v14.7.2: per-microblock BlockCommit aggregation, FAST_FINALIZED_HEIGHT,
 // leader-lock statics and helpers REMOVED. Microblock BFT safety is delivered
@@ -4678,9 +4670,6 @@ impl SimplifiedP2P {
                 let timeout_certs_removed = timeout_certs_before.saturating_sub(TIMEOUT_CERTIFICATES.len());
                 
                 HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_height);
-                HIGHEST_ADOPTED_ROUND.retain(|h, _| *h >= min_height);
-                VOTER_MAX_ROUND.retain(|(h, _), _| *h >= min_height);
-                TIMEOUT_JUMP_TARGET.retain(|h, _| *h >= min_height);
 
                 let timeout_voted_before = TIMEOUT_VOTED_HEIGHTS.len();
                 TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_height);
@@ -21539,231 +21528,37 @@ impl SimplifiedP2P {
             entry.len()
         };
         
-        // Track this voter's max round for cumulative counting
-        VOTER_MAX_ROUND.entry((height, voter_id.clone()))
-            .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
-            .or_insert(timeout_round);
-
-        // Cumulative adopted-round tracker: a vote for round R supports ALL rounds <= R.
-        // Find the HIGHEST round that has f+1 cumulative support.
-        // Collect all max_rounds for this height, sort descending.
-        // The f+1-th value (0-indexed) is the highest round with f+1 support.
-        let f_plus_1 = (total_validators + 2) / 3; // ceil(n/3)
-        let mut max_rounds: Vec<u64> = VOTER_MAX_ROUND.iter()
-            .filter(|e| e.key().0 == height)
-            .map(|e| *e.value())
-            .collect();
-        if max_rounds.len() >= f_plus_1 {
-            // O(N) partial sort: find the f+1-th largest value
-            let idx = f_plus_1 - 1;
-            max_rounds.select_nth_unstable_by(idx, |a, b| b.cmp(a));
-            let best_adopted = max_rounds[idx];
-            if best_adopted > 0 {
-                HIGHEST_ADOPTED_ROUND.entry(height)
-                    .and_modify(|cur| { if best_adopted > *cur { *cur = best_adopted; } })
-                    .or_insert(best_adopted);
-            }
-        }
-
         if crate::node::is_info() {
             println!("[INFO][TIMEOUT] vote_collected h={} round={} voter={} count={}/{}",
                      height, timeout_round, voter_id, votes_count, byzantine_threshold);
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // v13.0 → v14.8.5: JUMP-TO-HIGHEST with Byzantine-safe rate limits.
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v14.8.7: CANONICAL BFT — signed same-round 2f+1 certificate is the ONLY
+        // way HIGHEST_CERTIFIED_ROUND advances. Any local-only aggregation
+        // (cumulative_certificate, HIGHEST_ADOPTED_ROUND, jump_to_highest) is
+        // removed because it makes `HIGHEST_CERTIFIED_ROUND` non-deterministic
+        // across nodes, which breaks the invariant that microblock producer
+        // selection (which also reads this value) must compute the same leader
+        // on every node. Divergence of this value was the root cause of the
+        // observed h=3810 fork (001 at timeout=25, 004 at timeout=68, both
+        // signing their own block).
         //
-        // v13.0 rationale (preserved): nodes independently compute
-        // proposed_timeout_round from local wall-clock delay. NTP drift
-        // produces slightly different rounds on different nodes, which
-        // stalls adoption (f+1 at SAME round needed). Jumping to a peer's
-        // higher round cascades adoption and unfreezes liveness.
+        // Round convergence for view-change is delivered by the wall-clock
+        // pacemaker used in the production loop (each node derives
+        // proposed_timeout_round deterministically from (now - slot_start)),
+        // so honest nodes naturally broadcast at matching rounds and 2f+1
+        // same-round votes collect on the happy path.
         //
-        // v13.0 PROBLEM: the original implementation adopted any single
-        // verified vote's round, unbounded. Observed in production:
-        //     peer_round=46262 after ~9h — physically impossible at the
-        //     real 30-60 s timeout cadence. A single compromised
-        //     validator key could pin the whole network at u64::MAX and
-        //     force every honest node to waste cycles broadcasting at a
-        //     fantasy round, while also making any valid round-0
-        //     microblock look "stale" on every participant that already
-        //     jumped ahead. End result: real chain stall + cascade into
-        //     "stale_round_block_rejected" loops during catch-up sync.
-        //
-        // v14.8.5 FIX: two canonical guards before accepting a jump.
-        //
-        //   1. SINGLE-VOTE CAP. A single vote can only pull us forward by
-        //      `MAX_SINGLE_VOTE_JUMP` rounds (conservative: 32). Above
-        //      that threshold we require f+1 distinct voters to already
-        //      be at round ≥ R. This preserves the fast-cascade property
-        //      for normal drift (1-5 rounds) while eliminating the
-        //      Byzantine "one vote to u64::MAX" attack.
-        //
-        //   2. F+1 EVIDENCE. For larger jumps we count how many distinct
-        //      voters at (height) have `max_round ≥ proposed`. If that
-        //      tally is below f+1 we refuse to jump — not enough
-        //      independent evidence. The tally is maintained by
-        //      VOTER_MAX_ROUND which is already populated earlier in
-        //      this handler after Dilithium3 signature verification.
-        //
-        // SECURITY: every vote is Dilithium3-verified before reaching
-        // this point (see earlier `verify_timeout_vote_signature` call).
-        // Byzantine attacker cannot forge, can only propose from their
-        // own key. Cap + f+1 evidence means the attacker with ≤ f keys
-        // can never drive the round further than honest f nodes already
-        // believe. Liveness preserved: honest f+1 agreement always
-        // passes the gate.
-        //
-        // SCALABILITY: at 1000-validator committee, f+1 = 334. VOTER_MAX_ROUND
-        // lookup is O(voters_at_height) per call; the `.iter().filter()` on
-        // a DashMap shard set is cheap (small constant per entry). Each
-        // TimeoutVote handler invocation touches one height → bounded
-        // scan. No per-message O(N²) blow-up at scale.
-        {
-            const MAX_SINGLE_VOTE_JUMP: u64 = 32;
-
-            let our_voted = TIMEOUT_VOTED_HEIGHTS.get(&height).map(|v| *v).unwrap_or(0);
-            if timeout_round > our_voted && voter_id != self.node_id {
-                let gap = timeout_round.saturating_sub(our_voted);
-
-                let allowed = if gap <= MAX_SINGLE_VOTE_JUMP {
-                    true // small drift — cascade as before
-                } else {
-                    // Large jump — require f+1 independent witnesses.
-                    let total_validators = self.get_active_validator_count();
-                    let f_plus_1 = (total_validators.saturating_add(2)) / 3; // ceil(N/3)
-                    let witnesses = VOTER_MAX_ROUND.iter()
-                        .filter(|e| e.key().0 == height && *e.value() >= timeout_round)
-                        .count();
-                    let ok = witnesses >= f_plus_1;
-                    if !ok && crate::node::is_warn() {
-                        println!("[WARN][TIMEOUT] jump_refused_insufficient_witnesses h={} proposed={} our={} gap={} witnesses={} need_f+1={} voter={}",
-                                 height, timeout_round, our_voted, gap, witnesses, f_plus_1, voter_id);
-                    }
-                    ok
-                };
-
-                if allowed {
-                    if crate::node::is_info() {
-                        println!("[INFO][TIMEOUT] jump_to_highest h={} our={} peer_round={} gap={} voter={}",
-                                 height, our_voted, timeout_round, gap, voter_id);
-                    }
-                    // Monotonic set — never decrease existing jump target
-                    TIMEOUT_JUMP_TARGET.entry(height)
-                        .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
-                        .or_insert(timeout_round);
-                }
-            }
-        }
-
-        // Check if we have enough votes for proof (same-round path)
+        // Safety: with same-round 2f+1 certificate, all honest nodes advance
+        // to the same round; VRF microblock producer selection is deterministic
+        // and fork-free.
+        // Liveness: pacemaker guarantees all honest nodes broadcast at the
+        // same round within one pacemaker interval, so the 2f+1 same-round
+        // condition is reachable under partial synchrony.
+        // ═══════════════════════════════════════════════════════════════════════════
         if votes_count >= byzantine_threshold {
             self.generate_and_broadcast_timeout_proof(height, timeout_round, hash_arr);
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // v14.2: CUMULATIVE CERTIFICATE — survives JUMP_TO_HIGHEST race
-        // ═══════════════════════════════════════════════════════════════════════
-        // Problem: each vote triggers jump_to_highest, so voters spread across
-        // rounds [R, R+1, R+2, ...]. No SAME-round ever collects byzantine_threshold.
-        // Network sees f+1 adopted (rotation advances) but cert never issues →
-        // leader doesn't change → deadlock.
-        //
-        // Cumulative view: if N unique voters have voted at round ≥ R_lower, and N
-        // ≥ byzantine_threshold (2f+1), then ANY round in [R_lower..max] effectively
-        // has 2f+1 quorum — voters at a higher round DID see and support that
-        // lower-round timeout event (higher round implies lower).
-        //
-        // We pick the LOWEST R such that ≥ byzantine_threshold voters have max_round ≥ R.
-        // Generate cert at R using their actual signed votes (each vote signs a
-        // specific round — we use that signer's highest signed round as the witness).
-        //
-        // Safety: each signature is cryptographically bound to (height, round, hash).
-        // A voter's signature at round X attests to "timeout at height valid from R=0
-        // through at least X". Aggregating 2f+1 such signatures at rounds ≥ R proves
-        // BFT liveness at round R.
-        //
-        // Liveness: with this, a sprayed vote pattern ([3,4,5,6,7] at 5 voters)
-        // collapses to a valid certificate at round 3 (the minimum) — no deadlock.
-        // ═══════════════════════════════════════════════════════════════════════
-        {
-            // Cumulative-vote aggregation uses only the 2f+1 threshold for
-            // certificate sealing. The f+1 (adoption) threshold lives on its
-            // own path via HIGHEST_ADOPTED_ROUND and is not needed here.
-            let byz_threshold_cum = byzantine_threshold;
-
-            // Collect all (voter, max_round) for this height
-            let voter_rounds: Vec<(String, u64)> = VOTER_MAX_ROUND.iter()
-                .filter(|e| e.key().0 == height)
-                .map(|e| (e.key().1.clone(), *e.value()))
-                .collect();
-
-            if voter_rounds.len() >= byz_threshold_cum {
-                // Sort by max_round DESC; the byzantine_threshold-th voter defines
-                // the lowest round with full quorum support.
-                let mut sorted = voter_rounds.clone();
-                sorted.sort_by(|a, b| b.1.cmp(&a.1));
-                let cert_round = sorted[byz_threshold_cum - 1].1;
-
-                if cert_round > 0 {
-                    // Check if a certificate at cert_round or higher is already generated
-                    let already_certified = TIMEOUT_CERTIFICATES.iter()
-                        .any(|e| e.key().0 == height && e.key().1 >= cert_round);
-                    if !already_certified {
-                        // Collect signed votes for cert_round from the voters whose
-                        // max_round ≥ cert_round. For each such voter, we need their
-                        // actual signed vote at SOME round ≥ cert_round (already in TIMEOUT_VOTES).
-                        let mut cumulative_votes: Vec<(String, Vec<u8>, u64)> = Vec::new();
-                        for (voter, max_r) in &sorted {
-                            if *max_r < cert_round { break; }
-                            // Find any stored signed vote from this voter (iterate rounds from max down)
-                            let mut found = false;
-                            for r in (cert_round..=*max_r).rev() {
-                                if let Some(entry) = TIMEOUT_VOTES.get(&(height, r)) {
-                                    if let Some((sig, _)) = entry.get(voter) {
-                                        cumulative_votes.push((voter.clone(), sig.clone(), r));
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !found && crate::node::is_debug() {
-                                println!("[DBG][TIMEOUT] cumulative_vote_missing voter={} cert_round={} max_r={}",
-                                         voter, cert_round, max_r);
-                            }
-                            if cumulative_votes.len() >= byz_threshold_cum { break; }
-                        }
-
-                        if cumulative_votes.len() >= byz_threshold_cum {
-                            if crate::node::is_info() {
-                                println!("[INFO][TIMEOUT] cumulative_certificate h={} round={} voters={}/{} rounds_span=[{}..{}]",
-                                         height, cert_round, cumulative_votes.len(), total_validators,
-                                         cumulative_votes.iter().map(|(_,_,r)| *r).min().unwrap_or(0),
-                                         cumulative_votes.iter().map(|(_,_,r)| *r).max().unwrap_or(0));
-                            }
-                            // Generate proof at cert_round. We reuse the same-round proof
-                            // generator only if we have same-round votes; otherwise emit
-                            // a marker and rely on the existing certificate cache for
-                            // downstream consumers (adopted round logic).
-                            if let Some(same_round_entry) = TIMEOUT_VOTES.get(&(height, cert_round)) {
-                                if same_round_entry.len() >= byz_threshold_cum {
-                                    self.generate_and_broadcast_timeout_proof(height, cert_round, hash_arr);
-                                } else {
-                                    // Register a "cumulative" certificate marker in HIGHEST_CERTIFIED_ROUND
-                                    // so leader_selection sees the advanced round even without same-round proof.
-                                    HIGHEST_CERTIFIED_ROUND.entry(height)
-                                        .and_modify(|cur| { if cert_round > *cur { *cur = cert_round; } })
-                                        .or_insert(cert_round);
-                                }
-                            } else {
-                                HIGHEST_CERTIFIED_ROUND.entry(height)
-                                    .and_modify(|cur| { if cert_round > *cur { *cur = cert_round; } })
-                                    .or_insert(cert_round);
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
     
@@ -22325,41 +22120,33 @@ impl SimplifiedP2P {
         });
     }
     
-    /// v13.0: Take jump-to-highest target for a given macroblock index.
-    /// Returns Some(target_round) if a peer voted for a higher round than us.
-    /// Atomically removes the entry (consume-once pattern).
-    pub fn take_timeout_jump_target(&self, mb_index: u64) -> Option<u64> {
-        TIMEOUT_JUMP_TARGET.remove(&mb_index).map(|(_, v)| v)
-    }
+    // v14.8.7: `take_timeout_jump_target` REMOVED — the entire
+    // jump-to-highest mechanism (TIMEOUT_JUMP_TARGET storage, single-vote
+    // cap, f+1 evidence gate) is replaced by the wall-clock pacemaker in
+    // the production loop. Round divergence is no longer an issue because
+    // every node computes the same timeout_round from its local clock
+    // against a shared slot_start timestamp.
 
     /// Get current timeout proof if available
     pub fn get_timeout_certificate(&self, height: u64, timeout_round: u64) -> Option<TimeoutProof> {
         TIMEOUT_CERTIFICATES.get(&(height, timeout_round)).map(|v| v.clone())
     }
-    
+
     /// Check if timeout proof exists for given height/round
     pub fn has_timeout_certificate(&self, height: u64, timeout_round: u64) -> bool {
         TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round))
     }
 
-    /// v5.4: Get highest certified timeout round (BFT 2/3+ proof) for a given height.
-    /// Replaces bounded loop `for round in 1..=MAX` with efficient DashMap scan.
+    /// v5.4: Get highest certified timeout round (BFT 2f+1 proof) for a given height.
+    /// Advanced ONLY by signed 2f+1 same-round TimeoutCertificate via
+    /// `handle_timeout_proof_broadcast` — never by local aggregation.
     pub fn get_highest_certified_round(&self, height: u64) -> u64 {
         HIGHEST_CERTIFIED_ROUND.get(&height).map(|v| *v).unwrap_or(0)
     }
 
-    /// v5.4: Round adoption via f+1 (minority quorum) votes.
-    /// Returns the highest timeout round that reached >= f+1 votes.
-    /// O(1) lookup via HIGHEST_ADOPTED_ROUND tracker updated on vote insert.
-    /// `_threshold` kept for API compatibility — threshold applied at vote-insert time.
-    pub fn get_highest_adopted_round(&self, height: u64, _threshold: usize) -> u64 {
-        HIGHEST_ADOPTED_ROUND.get(&height).map(|v| *v).unwrap_or(0)
-    }
-
-    // v14.6: Module-level accessors for pipeline verify stage (which does NOT
-    // own a SimplifiedP2P reference). See free functions
-    // `highest_certified_round_for` and `highest_adopted_round_for` below —
-    // read-only, O(1), safe to call from anywhere in the crate.
+    // v14.8.7: `get_highest_adopted_round` REMOVED with HIGHEST_ADOPTED_ROUND.
+    // Producer selection now uses only HIGHEST_CERTIFIED_ROUND (signed 2f+1)
+    // or the wall-clock pacemaker — both are deterministic across all nodes.
 }
 
 /// v14.6: Module-level read of HIGHEST_CERTIFIED_ROUND for (macroblock_index).
@@ -22368,10 +22155,7 @@ pub fn highest_certified_round_for(mb_index: u64) -> u64 {
     HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0)
 }
 
-/// v14.6: Module-level read of HIGHEST_ADOPTED_ROUND for (macroblock_index).
-pub fn highest_adopted_round_for(mb_index: u64) -> u64 {
-    HIGHEST_ADOPTED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0)
-}
+// v14.8.7: `highest_adopted_round_for` REMOVED together with HIGHEST_ADOPTED_ROUND.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // v14.7 (pt 9): SERIALIZERS / DESERIALIZERS for persistent consensus state.
@@ -22405,13 +22189,11 @@ pub fn snapshot_highest_certified_rounds() -> Vec<u8> {
     bincode::serialize(&entries).unwrap_or_default()
 }
 
-pub fn snapshot_highest_adopted_rounds() -> Vec<u8> {
-    let entries: Vec<(u64, u64)> = HIGHEST_ADOPTED_ROUND
-        .iter()
-        .map(|e| (*e.key(), *e.value()))
-        .collect();
-    bincode::serialize(&entries).unwrap_or_default()
-}
+// v14.8.7: `snapshot_highest_adopted_rounds` / `rehydrate_highest_adopted_rounds`
+// REMOVED together with HIGHEST_ADOPTED_ROUND. The persisted blob for the
+// adopted-round tracker is no longer produced; callers in storage.rs must
+// stop invoking them, and any legacy on-disk blob is simply ignored (we
+// always re-derive state from TIMEOUT_CERTIFICATES on boot).
 
 pub fn rehydrate_timeout_certificates(bytes: &[u8]) -> usize {
     if bytes.is_empty() { return 0; }
@@ -22434,20 +22216,6 @@ pub fn rehydrate_highest_certified_rounds(bytes: &[u8]) -> usize {
             let count = entries.len();
             for (k, v) in entries {
                 HIGHEST_CERTIFIED_ROUND.insert(k, v);
-            }
-            count
-        }
-        Err(_) => 0,
-    }
-}
-
-pub fn rehydrate_highest_adopted_rounds(bytes: &[u8]) -> usize {
-    if bytes.is_empty() { return 0; }
-    match bincode::deserialize::<Vec<(u64, u64)>>(bytes) {
-        Ok(entries) => {
-            let count = entries.len();
-            for (k, v) in entries {
-                HIGHEST_ADOPTED_ROUND.insert(k, v);
             }
             count
         }
@@ -22851,8 +22619,6 @@ impl SimplifiedP2P {
         TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_mb);
         TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_mb);
         HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_mb);
-        HIGHEST_ADOPTED_ROUND.retain(|h, _| *h >= min_mb);
-        VOTER_MAX_ROUND.retain(|(h, _), _| *h >= min_mb);
         TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_mb);
     }
     

@@ -2490,19 +2490,13 @@ impl PersistentStorage {
         Ok(self.db.get_cf(&cf, b"hi_cert_v1")?)
     }
 
-    pub fn save_highest_adopted_rounds(&self, payload: &[u8]) -> IntegrationResult<()> {
-        let cf = self.db.cf_handle("consensus")
-            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
-        self.db.put_cf(&cf, b"hi_adopt_v1", payload)?;
-        Ok(())
-    }
+    // v14.8.7: `save_highest_adopted_rounds` / `load_highest_adopted_rounds`
+    // REMOVED. They persisted the `HIGHEST_ADOPTED_ROUND` DashMap which was
+    // itself removed because local f+1 aggregation without a signed
+    // certificate was non-deterministic across nodes and fed into VRF
+    // producer selection, producing forks. The RocksDB key "hi_adopt_v1" is
+    // left intact on disk (harmless stale bytes) — no migration needed.
 
-    pub fn load_highest_adopted_rounds(&self) -> IntegrationResult<Option<Vec<u8>>> {
-        let cf = self.db.cf_handle("consensus")
-            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
-        Ok(self.db.get_cf(&cf, b"hi_adopt_v1")?)
-    }
-    
     /// Save sync progress for resuming after restart
     pub fn save_sync_progress(&self, from_height: u64, to_height: u64, current: u64) -> IntegrationResult<()> {
         let sync_cf = self.db.cf_handle("sync_state")
@@ -4171,12 +4165,8 @@ impl Storage {
     pub fn load_highest_certified_rounds(&self) -> IntegrationResult<Option<Vec<u8>>> {
         self.persistent.load_highest_certified_rounds()
     }
-    pub fn save_highest_adopted_rounds(&self, payload: &[u8]) -> IntegrationResult<()> {
-        self.persistent.save_highest_adopted_rounds(payload)
-    }
-    pub fn load_highest_adopted_rounds(&self) -> IntegrationResult<Option<Vec<u8>>> {
-        self.persistent.load_highest_adopted_rounds()
-    }
+    // v14.8.7: wrapper functions for HIGHEST_ADOPTED_ROUND persistence REMOVED
+    // together with the underlying primitive. See comment in persistent impl.
 
     /// Save sync progress
     pub fn save_sync_progress(&self, from_height: u64, to_height: u64, current: u64) -> IntegrationResult<()> {
