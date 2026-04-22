@@ -130,10 +130,15 @@ use std::env;
 // 2. Race condition: Flag set by one node, others don't know
 // 3. No consensus: Producer change without 2/3+ agreement
 //
-// NEW ARCHITECTURE:
-// - Failover uses BFT Timeout Protocol (2/3+ votes required)
-// - certified_timeout_round determines producer selection
-// - All nodes agree on same producer via consensus
+// NEW ARCHITECTURE (v14.8.9):
+// - Microblock failover uses the wall-clock pacemaker: rank is a pure
+//   function of (parent_block.timestamp, now) computed via the canonical
+//   `compute_pacemaker_rank` / `pacemaker_rank_from_inputs` helpers.
+// - Macroblock commit view change uses the signed 2f+1 TimeoutCertificate
+//   path and its `HIGHEST_CERTIFIED_ROUND` tracker — kept in a separate
+//   consensus domain and NEVER mixed into microblock rotation.
+// - All nodes agree on the same microblock producer by deterministic
+//   derivation, and on macroblock view round by cryptographic proof.
 // ═══════════════════════════════════════════════════════════════════════════════
 use std::sync::atomic::{AtomicU64 as StdAtomicU64, Ordering as StdOrdering};
 use parking_lot::RwLock as ParkingRwLock;
@@ -417,35 +422,87 @@ pub static LAST_SYNC_PROGRESS_TIME: AtomicU64 = AtomicU64::new(0);
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.14: REAL-TIME BASED DETERMINISTIC FAILOVER
 // ═══════════════════════════════════════════════════════════════════════════════
-// KEY: timeout_round is computed from LAST_BLOCK_PRODUCED_TIME (real unix time!)
-// 
-// WHY THIS WORKS:
-//   - LAST_BLOCK_PRODUCED_TIME = when node ACTUALLY received/produced last block
-//   - All synced nodes receive blocks within ~1-2 seconds (network propagation)
-//   - delay = current_time - last_block_time is typically 0-5 seconds
-//   - NTP drift (±2 sec) < grace period (5 sec) → SAME timeout_round on all nodes!
+// v14.8.9: CURRENT_TIMEOUT_ROUND / TIMEOUT_ROUND_HEIGHT atomics REMOVED.
 //
-// WHY block.timestamp WAS WRONG:
-//   - block.timestamp = genesis_ts + height (SLOT time, NOT real time!)
-//   - This accumulated delays and was IDENTICAL to the broken calculation!
-// ═══════════════════════════════════════════════════════════════════════════════
-static CURRENT_TIMEOUT_ROUND: AtomicU64 = AtomicU64::new(0);
-static TIMEOUT_ROUND_HEIGHT: AtomicU64 = AtomicU64::new(0);
+// Prior versions stored the "current" microblock timeout round in a global
+// atomic, written by the stall-detection loop and read by block construction.
+// Under the decoupled v14.8.9 model the rank is a PURE FUNCTION of two
+// finalized-on-chain inputs — the parent block's timestamp and a wall-clock
+// reference — so it is cheaper and safer to recompute at each call site than
+// to coordinate via mutable shared state. A cached atomic would have gone
+// stale between iterations, letting producer and ingest see different rank
+// values for the same block (the v14.8.7/v14.8.8 race that manifested as the
+// observed h=13123 prod stall).
+//
+// All former call sites (stall detection, main-loop producer selection,
+// block construction, yield_stale_round, ingest validation) now route
+// through `compute_pacemaker_rank` or `pacemaker_rank_from_inputs` below —
+// a single deterministic derivation, no shared mutable state. The older
+// public shims (`get_current_timeout_round` / `set_timeout_round` /
+// `reset_timeout_round`) are deleted; any remaining callers are updated
+// in the same patch.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PACEMAKER RANK HELPERS (single source of truth)
+// ═══════════════════════════════════════════════════════════════════════════
+// Microblock producer rotation is driven by a wall-clock pacemaker whose
+// rank is a deterministic function of (parent_ts, now):
+//
+//     slot_start(h) = parent(h-1).timestamp + PACEMAKER_SLOT_LEN_SECS
+//     rank          = (now - slot_start) / PACEMAKER_RANK_WINDOW_SECS
+//
+// These two `const` + two `fn` are the ONLY sanctioned path to produce the
+// value. Any new call site must reuse them — inlining the formula again
+// risks drifting constants or semantics and reintroduces the class of bugs
+// fixed in v14.8.9. Both helpers are O(1) per call and safe at any
+// validator-count scale (no per-validator work).
+//
+// Safety: every validator with synchronised NTP and access to the same
+// finalized parent computes the same rank for the same reference wall time.
+// Byzantine producers cannot claim higher rank than their timestamp permits
+// because ingest re-runs the derivation against the block's own `timestamp`
+// and rejects mismatches beyond a one-rank NTP tolerance.
+// ═══════════════════════════════════════════════════════════════════════════
 
-/// Get current timeout round for producer selection
-pub fn get_current_timeout_round() -> u64 {
-    CURRENT_TIMEOUT_ROUND.load(Ordering::SeqCst)
+/// Microblock slot length in seconds. Target block cadence.
+pub const PACEMAKER_SLOT_LEN_SECS: u64 = 1;
+
+/// Pacemaker rank window in seconds. Rank K owns
+/// `[slot_start + K*RANK_WINDOW, slot_start + (K+1)*RANK_WINDOW)`.
+/// Sized at 3× typical NTP drift on production servers; the ingest
+/// check tolerates ±1 rank (`NTP_TOL`) on top of this.
+pub const PACEMAKER_RANK_WINDOW_SECS: u64 = 3;
+
+/// Pure function: compute pacemaker rank from a parent timestamp and a
+/// reference wall-clock value. Deterministic given the two inputs.
+///
+/// Used directly at the block-construction site (where `parent_ts` and
+/// `deterministic_timestamp` have already been captured into locals) and
+/// at the ingest-validation site (where the parent block has already been
+/// loaded from storage).
+#[inline]
+pub fn pacemaker_rank_from_inputs(parent_ts: u64, reference_ts: u64) -> u64 {
+    let slot_start = parent_ts.saturating_add(PACEMAKER_SLOT_LEN_SECS);
+    reference_ts.saturating_sub(slot_start) / PACEMAKER_RANK_WINDOW_SECS
 }
 
-/// Set timeout round (called from stall detection)
-pub fn set_timeout_round(round: u64, height: u64) {
-    CURRENT_TIMEOUT_ROUND.store(round, Ordering::SeqCst);
-    TIMEOUT_ROUND_HEIGHT.store(height, Ordering::SeqCst);
-}
-
-/// Reset timeout round when block is received
-pub fn reset_timeout_round() {
-    CURRENT_TIMEOUT_ROUND.store(0, Ordering::SeqCst);
+/// Compute the pacemaker rank for `next_height` at `now_secs`, loading the
+/// parent timestamp from local storage. Returns 0 if the parent is not yet
+/// locally available (sync gap) — a deterministic, validator-independent
+/// fallback. NEVER falls back to a wall-clock estimate, which would diverge
+/// between nodes with different storage states.
+pub fn compute_pacemaker_rank(
+    storage: &std::sync::Arc<crate::storage::Storage>,
+    next_height: u64,
+    now_secs: u64,
+) -> u64 {
+    if next_height <= 1 {
+        return 0; // h=0 genesis, h=1 primary VRF leader
+    }
+    match storage.load_microblock_auto_format(next_height.saturating_sub(1)) {
+        Ok(Some(mb)) => pacemaker_rank_from_inputs(mb.timestamp, now_secs),
+        _ => 0, // parent not yet in local storage (sync gap) — rank 0
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -777,7 +834,11 @@ pub fn get_extended_failover_metrics() -> FailoverMetrics {
         failover_count: METRIC_FAILOVER_COUNT.load(Ordering::Relaxed),
         timestamp_rejections: METRIC_TIMESTAMP_REJECTIONS.load(Ordering::Relaxed),
         window_seconds: 300,
-        current_timeout_round: get_current_timeout_round(),
+        // v14.8.9: global "current timeout round" concept no longer exists —
+        // rank is a pure function of (parent_ts, now) computed at each
+        // consensus call site. Legacy metric field retained for backward
+        // compatibility, always 0 post-v14.8.9.
+        current_timeout_round: 0,
         genesis_timestamp: crate::GLOBAL_GENESIS_TIMESTAMP.load(Ordering::Relaxed),
         current_time: get_timestamp_safe(),
     }
@@ -8692,17 +8753,32 @@ impl BlockchainNode {
                 };
                 
                 if let Some(ref producer) = block_producer {
-                    // Check if producer is excluded
-                    if is_producer_excluded(producer, current_height) {
-                        if is_debug() {
-                            println!("[DBG][FORK] ignored_block h={} producer={} reason=excluded",
-                                     received_block.height, producer);
-                        }
-                        // v3.36: Clear pending sync so block can be re-requested later
-                        // Without this, excluded blocks stay in PENDING_SYNC_BLOCKS forever → memory leak + dup_pending
-                        crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                        continue;
-                    }
+                    // v14.8.9: in-RAM `is_producer_excluded` CHECK ON INGEST removed.
+                    //
+                    // Rationale: the exclusion is written to a node-local
+                    // `EXCLUDED_PRODUCERS` map at times that differ per node
+                    // (who triggered fork detection first, network delay of
+                    // emergency-failover gossip, etc.). Rejecting on ingest
+                    // against that mutable local state means two honest
+                    // validators can disagree on whether a given block is
+                    // acceptable at the same height → divergent canonical
+                    // chains → avoidable fork.
+                    //
+                    // Canonical authority for "this producer is excluded"
+                    // is the on-chain `macroblock.excluded_producers_for_next_epoch`
+                    // snapshot, which is identical on every node by
+                    // construction. That snapshot is already consulted when
+                    // building the candidate list in producer selection
+                    // (see the excluded_node_ids filter around the VRF
+                    // candidate builder). A producer excluded by consensus
+                    // will never be the expected VRF winner → blocks they
+                    // sign will fail the ingest hash-chain check on their
+                    // own minority branch.
+                    //
+                    // The in-RAM tracker is retained for the SELF-exclude
+                    // gate only (this-node-will-not-produce-if-it-detected-
+                    // its-own-fork) which cannot create divergence because
+                    // it's an output-side filter, not an input-side reject.
                     
                     // Also check if this block is way ahead of our chain (fork indicator)
                     // If block height > local + 100, producer might be on a fork
@@ -10171,25 +10247,23 @@ impl BlockchainNode {
                             // v9.0: Track sync progress for deadlock detection
                             LAST_SYNC_PROGRESS_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
 
-                            // v13.0: Reset timeout_round ONLY when advancing to next expected height.
-                            // OLD BUG: reset_timeout_round() was called on ANY height advance,
-                            // including sync blocks (e.g., receiving h=500 while catching up).
-                            // This reset CURRENT_TIMEOUT_ROUND to 0 mid-consensus, causing:
-                            //   - Node A at round=3, Node B receives sync block → round=0
-                            //   - Different timeout_round → different producer selection → FORK
-                            // FIX: Only reset when we receive the block we're WAITING for (next tip).
-                            // During sync (receiving blocks far behind tip), timeout_round stays intact.
-                            // NOTE: prev_tip was captured ABOVE, before LAST_BLOCK_PRODUCED_HEIGHT update.
+                            // v14.8.9: global timeout-round reset removed entirely.
+                            // Pacemaker rank is a pure function of (parent_ts, now)
+                            // computed per call, so there is nothing to "reset" on
+                            // tip advance — the next call automatically derives
+                            // rank from the NEW parent_ts. The historical tip-vs-
+                            // sync reset bug (v13.0 comment) is no longer reachable.
                             {
                                 let is_tip_advance = received_block.height == prev_tip + 1;
                                 if is_tip_advance {
-                                    reset_timeout_round();
                                     if is_debug() {
-                                        println!("[DBG][TIMEOUT] round_reset h={} prev_tip={} reason=tip_advance",
+                                        println!("[DBG][TIMEOUT] tip_advance h={} prev_tip={} (rank self-resets on next call)",
                                                  received_block.height, prev_tip);
                                     }
                                 } else if is_debug() {
-                                    let current_round = get_current_timeout_round();
+                                    // Diagnostic: sync block, not a tip advance.
+                                    // Under v14.8.9 this has no effect on rank state.
+                                    let current_round = 0u64;
                                     if current_round > 0 {
                                         println!("[DBG][TIMEOUT] round_preserved={} h={} prev_tip={} reason=sync_or_skip",
                                                  current_round, received_block.height, prev_tip);
@@ -10504,7 +10578,10 @@ impl BlockchainNode {
                             match recovery_result {
                                 Ok(()) => {
                                     println!("[INFO][STATE] recovery_complete clearing_mismatch_counters resuming_sync");
-                                    reset_timeout_round();
+                                    // v14.8.9: `reset_timeout_round()` removed — rank is
+                                    // now a pure function of wall clock and the post-
+                                    // recovery parent_ts, so the next call derives it
+                                    // fresh. Nothing to reset.
                                     mismatch_counter.clear();
                                     wrong_producer_counter.clear();
                                     pending_blocks.clear();
@@ -15079,31 +15156,51 @@ impl BlockchainNode {
                         // Scalability: constant work per block, no per-validator scan.
                         // Identical cost at 5 or 5000 validators.
                         // ═══════════════════════════════════════════════════════════════
-                        const SLOT_LEN_SECS: u64 = 1;
-                        const RANK_WINDOW_SECS: u64 = 3;
-
                         let now_secs = get_timestamp_safe();
-                        // block.timestamp is stored as Unix seconds (see get_timestamp_safe).
-                        let prev_block_ts = if next_height > 1 {
-                            match storage.load_microblock_auto_format(next_height.saturating_sub(1)) {
-                                Ok(Some(mb)) => mb.timestamp,
-                                _ => now_secs.saturating_sub(SLOT_LEN_SECS),
-                            }
-                        } else {
-                            now_secs.saturating_sub(SLOT_LEN_SECS)
-                        };
-                        let slot_start = prev_block_ts.saturating_add(SLOT_LEN_SECS);
-                        let pacemaker_elapsed = now_secs.saturating_sub(slot_start);
-                        let pacemaker_rank = pacemaker_elapsed / RANK_WINDOW_SECS;
 
-                        // Signed 2f+1 same-round TimeoutCertificate advances an
-                        // additional failover dimension for macroblock commit only.
-                        // For microblock producer rotation we take MAX of the two:
-                        // if a signed TC already proved a later failover is active,
-                        // honour it (still deterministic — every node sees the same
-                        // signed TC after gossip). In steady state both are 0 and
-                        // rank 0 (primary VRF leader) produces.
-                        let timeout_round_for_rotation = pacemaker_rank.max(certified_timeout_round);
+                        // v14.8.9: use the canonical `compute_pacemaker_rank` helper.
+                        // Parent timestamp is read from finalized on-chain storage,
+                        // never from local wall-clock estimates — same value on every
+                        // validator. Deterministic fallback to 0 when parent missing.
+                        let pacemaker_rank: u64 =
+                            compute_pacemaker_rank(&storage, next_height, now_secs);
+
+                        // ═══════════════════════════════════════════════════════════════
+                        // v14.8.9: DECOUPLE MICROBLOCK ROTATION FROM MACROBLOCK TC
+                        // ═══════════════════════════════════════════════════════════════
+                        // Previously: `pacemaker_rank.max(certified_timeout_round)`.
+                        //
+                        // That mixed TWO INDEPENDENT CONSENSUS DOMAINS into one
+                        // input for VRF producer selection:
+                        //
+                        //   Domain A — microblock slot rotation
+                        //     * wall-clock derived (pacemaker_rank)
+                        //     * deterministic per-block on every validator
+                        //
+                        //   Domain B — macroblock commit view change
+                        //     * signed 2f+1 TimeoutCertificate (certified round)
+                        //     * lives in its own async BFT protocol
+                        //
+                        // When Domain B's round drifted ahead of Domain A (signed
+                        // TC accumulated during a stall), producers started emitting
+                        // blocks with `timeout_round = certified` but `timestamp =
+                        // wall_clock_now`. Those two fields referenced different
+                        // time bases and the ingest rank-validation check (which
+                        // binds `timeout_round` to `timestamp`) correctly rejected
+                        // the inconsistent pair — freezing the chain.
+                        //
+                        // The canonical slot+checkpoint L1 design keeps these two
+                        // domains entirely separate: microblock rank uses wall
+                        // clock; macroblock commit uses signed certificates. They
+                        // never appear in the same formula.
+                        //
+                        // Removed: `.max(certified_timeout_round)`.
+                        // Kept: `certified_timeout_round` read above — still used
+                        //       below for chronic-stall diagnostics and for the
+                        //       macroblock commit path in unified_p2p, which is
+                        //       where it belongs.
+                        // ═══════════════════════════════════════════════════════════════
+                        let timeout_round_for_rotation = pacemaker_rank;
 
                         // ═══════════════════════════════════════════════════════════════
                         // v14.8.8: DETERMINISTIC TIMEOUT VOTE ROUND (wall-clock)
@@ -15134,8 +15231,12 @@ impl BlockchainNode {
                             pacemaker_rank
                         };
 
-                        // Store rotation round for producer selection
-                        set_timeout_round(timeout_round_for_rotation, next_height);
+                        // v14.8.9: `set_timeout_round(...)` removed — the legacy
+                        // global atomic is no longer used by any consensus-critical
+                        // path. Producer selection, block construction, and ingest
+                        // validation now each call `compute_pacemaker_rank` directly
+                        // so they all derive the rank from the same deterministic
+                        // (parent_ts, now) pair rather than reading a stale cache.
                         update_failover_metrics(local_delay, timeout_round_for_rotation);
 
                         // v11.0: HARDENED vote gate — unsynced/restarting nodes MUST NOT vote
@@ -16225,11 +16326,16 @@ impl BlockchainNode {
                     }
                 }
 
-                // v3.14: Get timeout_round for DETERMINISTIC failover
-                // This is computed from real delay (current_time - last_block_time) above
-                // Using LAST_BLOCK_PRODUCED_TIME ensures all synced nodes compute SAME delay!
-                let timeout_round = get_current_timeout_round();
-                
+                // v14.8.9: Get timeout_round for deterministic failover via the
+                // canonical helper. Parent timestamp from finalized storage,
+                // reference from wall clock — same inputs every validator sees.
+                // Returns 0 when parent is not yet local (sync gap) — the
+                // downstream `has_prev_block` self-exclude gates production
+                // anyway, so a deterministic 0 is harmless and keeps the
+                // candidate list identical across nodes.
+                let timeout_round: u64 =
+                    compute_pacemaker_rank(&storage, next_block_height, get_timestamp_safe());
+
                 // v3.8: Use select_microblock_producer_with_round for deterministic failover.
                 // Value is read-only after this point (validated via is_my_turn_to_produce,
                 // cloned into NodeState/logs); mutability was spurious.
@@ -18196,26 +18302,42 @@ impl BlockchainNode {
                     // Producer sets real wall clock time. Validators verify monotonicity + bounded future.
                     // Old approach (genesis + height) caused accumulating drift: 20min/8h → days/year.
                     // Timestamp is part of signed block hash → all nodes see the same value.
+                    //
+                    // v14.8.9: parent_ts hoisted OUT of the timestamp block so it is
+                    // also usable by the block's `timeout_round` computation below.
+                    // The block's `timeout_round` MUST be derived from the SAME
+                    // `(timestamp, parent_ts)` pair used here — otherwise ingest
+                    // rank-validation (block_pipeline) would see inconsistent ts/rank
+                    // and reject the block. See v14.8.9 notes in the pacemaker block
+                    // of this function for the full rationale.
+                    let parent_ts: u64 = if next_block_height > 0 {
+                        match storage.load_microblock_auto_format(next_block_height - 1) {
+                            Ok(Some(parent)) => parent.timestamp,
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    };
+
                     let deterministic_timestamp = {
                         let now_ts = get_timestamp_safe();
-                        
-                        // Monotonicity: timestamp must be > parent block's timestamp
-                        let parent_ts = if next_block_height > 0 {
-                            match storage.load_microblock_auto_format(next_block_height - 1) {
-                                Ok(Some(parent)) => parent.timestamp,
-                                _ => 0,
-                            }
-                        } else {
-                            0
-                        };
-                        
-                        // Ensure strict monotonicity
+                        // Ensure strict monotonicity relative to parent.
                         if now_ts > parent_ts {
                             now_ts
                         } else {
                             parent_ts + 1
                         }
                     };
+
+                    // v14.8.9: `block.timeout_round` bound to the SAME
+                    // (parent_ts, timestamp) pair this block uses for its own
+                    // header via the canonical `pacemaker_rank_from_inputs`
+                    // helper. Ingest will recompute against the exact same
+                    // formula, so ts/rank consistency is structural — not
+                    // dependent on any shared-state race between the stall
+                    // detector and block construction.
+                    let block_rank: u64 =
+                        pacemaker_rank_from_inputs(parent_ts, deterministic_timestamp);
                     
                     // Get previous block hash
                     let prev_hash = Self::get_previous_microblock_hash(&storage, next_block_height).await;
@@ -18519,7 +18641,7 @@ impl BlockchainNode {
                         vrf_proof: qrb_proof,
                         fees_collected: block_fees_collected, // v3.18: Direct to producer
                         state_root: [0u8; 32], // v3.27: Will be set below after TX+fees application
-                        timeout_round: get_current_timeout_round(), // v14.0: Record for producer authority verification
+                        timeout_round: block_rank, // v14.8.9: derived from OWN (timestamp,parent_ts) — consistent pair
                     };
                     
                     // ═══════════════════════════════════════════════════════════════════════════
@@ -19061,19 +19183,34 @@ impl BlockchainNode {
                     //     production loop picks up the new round deterministically and
                     //     produces cleanly.
                     //
-                    // v14.8.7: HIGHEST_ADOPTED_ROUND removed. This self-check now
-                    // uses only the signed 2f+1 HIGHEST_CERTIFIED_ROUND, which is
-                    // guaranteed deterministic across nodes (only advanced by
-                    // broadcast-verified signed TimeoutCertificate). Local non-
-                    // deterministic state is never involved.
+                    // v14.8.9: stale-round self-check uses WALL-CLOCK pacemaker_rank,
+                    // NOT macroblock `certified_timeout_round`. Microblock rotation is
+                    // driven purely by the wall-clock pacemaker (see the decoupling
+                    // block around line 15106 and the block-construction block above).
+                    // Comparing our block's rank against the macroblock's certified
+                    // round would cross consensus domains and produce the same
+                    // non-determinism that caused the observed prod stall at mb=145.
+                    //
+                    // Canonical check: between the time we captured `block_rank` from
+                    // our timestamp and now, has wall-clock advanced to a later rank?
+                    // If yes, a rank+1 producer may have already won the slot — yield.
+                    //
+                    // Scalability: two storage reads + one arithmetic — O(1) per block
+                    // save, independent of validator count.
                     // ═══════════════════════════════════════════════════════════════════════════
-                    if let Some(p2p_guard) = &unified_p2p {
-                        let guard_mb = height_for_storage / 90;
-                        let cert_now = p2p_guard.get_highest_certified_round(guard_mb);
-                        if cert_now > microblock.timeout_round {
+                    {
+                        // v14.8.9: canonical helper — same formula used by
+                        // stall detection, main loop, block construction,
+                        // and ingest validation. Single source of truth.
+                        let current_rank: u64 = compute_pacemaker_rank(
+                            &storage_clone,
+                            height_for_storage,
+                            get_timestamp_safe(),
+                        );
+                        if current_rank > microblock.timeout_round {
                             println!(
-                                "[WARN][PROD] yield_stale_round h={} produced_for_round={} latest_certified={} action=skip_save",
-                                height_for_storage, microblock.timeout_round, cert_now
+                                "[WARN][PROD] yield_stale_round h={} produced_for_round={} current_rank={} action=skip_save",
+                                height_for_storage, microblock.timeout_round, current_rank
                             );
                             // Clear broadcast lock so the next iteration can proceed
                             crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS
@@ -20011,11 +20148,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     //   → Each node excluded producers LOCALLY after 4s → NON-DETERMINISTIC
                                     //   → Blocks from real producer REJECTED → NETWORK STALL + FORK
                                     //
-                                    // NEW (CORRECT): BFT Timeout Protocol (30s grace + 2/3+ voting)
-                                    //   → All nodes vote after 30s grace period
-                                    //   → TimeoutCertificate generated at 2/3+ votes
-                                    //   → certified_timeout_round used in select_microblock_producer_with_round()
-                                    //   → DETERMINISTIC failover, no local exclusions needed
+                                    // NEW (CORRECT, v14.8.9):
+                                    //   → Microblock failover is driven by the wall-clock pacemaker
+                                    //     (`compute_pacemaker_rank` / `pacemaker_rank_from_inputs`).
+                                    //   → Rank advances deterministically every RANK_WINDOW_SECS on
+                                    //     every validator, so `(base_idx + rank) % N` rotates the
+                                    //     producer without any local exclusion or voting.
+                                    //   → Macroblock commit view change still uses the signed 2f+1
+                                    //     TimeoutCertificate path — but it lives in its own domain
+                                    //     and never enters microblock producer selection.
                                     // ═══════════════════════════════════════════════════════════════════════════
                                     
                                     let timeout_duration = actual_timeout.as_secs();
@@ -21556,22 +21697,34 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             // SECONDARY: Use consensus participants from macroblock
                             if !macroblock.consensus_data.commits.is_empty() {
                                 // v3.10: Also filter excluded from SECONDARY path
+                                //
+                                // v14.8.9: REPUTATION FROM DETERMINISTIC FALLBACK ONLY.
+                                //
+                                // The PRIMARY candidate path (`eligible_producers` snapshot
+                                // on the macroblock) carries an immutable, on-chain reputation
+                                // value — identical on every node by definition.
+                                //
+                                // This SECONDARY fallback fires only when the snapshot is
+                                // absent (legacy macroblock or deserialization gap). The
+                                // previous implementation read live RAM state via
+                                // `get_deterministic_reputation().get_reputation(id, now)`
+                                // — a MUTABLE, TIMING-DEPENDENT counter that can differ
+                                // between validators if slashing/heartbeat updates arrive
+                                // out of order. Divergent reputation → divergent sort
+                                // order (ties resolved by reputation) → divergent producer
+                                // selection from the same candidate set → FORK.
+                                //
+                                // Canonical rule: candidate list used for VRF producer
+                                // selection MUST be a pure function of on-chain finalized
+                                // state. We therefore use the deterministic constant
+                                // `INITIAL_REPUTATION` here — all nodes see the same value,
+                                // and since the set is then sorted by `id` alphabetically,
+                                // order is fully deterministic regardless of reputation.
+                                // Scales identically at 5 or 5000 validators (O(commits)).
+                                let det_rep = (qnet_consensus::deterministic_reputation::INITIAL_REPUTATION) / 100.0;
                                 let mut all_qualified: Vec<(String, f64)> = macroblock.consensus_data.commits.keys()
-                                    .filter(|id| !excluded_node_ids.contains(*id))  // v3.10: Exclude failed producers
-                                    .map(|id| {
-                                        // Get real reputation from deterministic state
-                                        let rep = p2p.get_deterministic_reputation()
-                                            .map(|rep_arc| {
-                                                let state = rep_arc.read();
-                                                state.get_reputation(id, 
-                                                    std::time::SystemTime::now()
-                                                        .duration_since(std::time::UNIX_EPOCH)
-                                                        .unwrap_or_default()
-                                                        .as_secs())
-                                            })
-                                            .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
-                                        (id.clone(), rep / 100.0)
-                                    })
+                                    .filter(|id| !excluded_node_ids.contains(*id))
+                                    .map(|id| (id.clone(), det_rep))
                                     .collect();
                                 all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
                                 
