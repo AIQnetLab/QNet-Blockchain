@@ -2490,12 +2490,14 @@ impl PersistentStorage {
         Ok(self.db.get_cf(&cf, b"hi_cert_v1")?)
     }
 
-    // v14.8.7: `save_highest_adopted_rounds` / `load_highest_adopted_rounds`
-    // REMOVED. They persisted the `HIGHEST_ADOPTED_ROUND` DashMap which was
-    // itself removed because local f+1 aggregation without a signed
-    // certificate was non-deterministic across nodes and fed into VRF
-    // producer selection, producing forks. The RocksDB key "hi_adopt_v1" is
-    // left intact on disk (harmless stale bytes) — no migration needed.
+    // v14.8.10: `save_highest_adopted_rounds` / `load_highest_adopted_rounds`
+    // REMAIN REMOVED. HIGHEST_ADOPTED_ROUND is RAM-only: on restart, the
+    // map starts empty and is rebuilt from incoming Dilithium3-verified
+    // signed TimeoutVotes once the node rejoins the network (VOTER_MAX_ROUND
+    // aggregation at f+1 threshold). Only TIMEOUT_CERTIFICATES (the 2f+1
+    // supermajority proof) are persisted — those are the hard finality
+    // evidence that must survive restart. The RocksDB key "hi_adopt_v1"
+    // is left intact on disk (harmless stale bytes) — no migration needed.
 
     /// Save sync progress for resuming after restart
     pub fn save_sync_progress(&self, from_height: u64, to_height: u64, current: u64) -> IntegrationResult<()> {
@@ -4165,8 +4167,9 @@ impl Storage {
     pub fn load_highest_certified_rounds(&self) -> IntegrationResult<Option<Vec<u8>>> {
         self.persistent.load_highest_certified_rounds()
     }
-    // v14.8.7: wrapper functions for HIGHEST_ADOPTED_ROUND persistence REMOVED
-    // together with the underlying primitive. See comment in persistent impl.
+    // v14.8.10: wrapper functions for HIGHEST_ADOPTED_ROUND persistence REMAIN
+    // REMOVED — that map is RAM-only and rebuilt on boot from gossiped signed
+    // votes. See the detailed rationale in the persistent impl above.
 
     /// Save sync progress
     pub fn save_sync_progress(&self, from_height: u64, to_height: u64, current: u64) -> IntegrationResult<()> {

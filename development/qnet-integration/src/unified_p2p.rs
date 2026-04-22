@@ -1083,15 +1083,46 @@ static HIGHEST_CERTIFIED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
 static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<u64, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-// v14.8.7: `HIGHEST_ADOPTED_ROUND`, `VOTER_MAX_ROUND`, and `TIMEOUT_JUMP_TARGET`
-// REMOVED. These were local-only aggregation trackers (f+1 adopted round,
-// per-voter max round for cumulative certificate, jump-to-highest cascade
-// target). They advanced non-deterministically on each node and fed into
-// microblock producer selection, which broke determinism and caused the
-// observed fork at h=3810 (see commit message). Canonical BFT now uses
-// only `HIGHEST_CERTIFIED_ROUND`, advanced solely by signed 2f+1 same-round
-// TimeoutCertificate via `handle_timeout_proof_broadcast`, which is the
-// unique deterministic source of round advancement across all honest nodes.
+// v14.8.10: `TIMEOUT_JUMP_TARGET` + `jump_to_highest` REMAIN REMOVED — they
+// were the v13.0 Byzantine-inflation attack vector (one signed vote pinning
+// the whole network at u64::MAX). Good removal, kept.
+//
+// v14.8.10: `HIGHEST_ADOPTED_ROUND` + `VOTER_MAX_ROUND` RESTORED. Their
+// removal in v14.8.7/8/9 was the regression that caused the h=339 catch-up
+// fork: without adopted-round aggregation of signed votes, microblock
+// rotation fell back to a wall-clock pacemaker whose `(now − parent_ts)`
+// term differs by the sync lag between a fresh catch-up node and a live
+// producer, placing them on different ranks of the VRF candidate list and
+// producing two blocks for the same height.
+//
+// The canonical rule restored here: microblock rotation round is driven
+// by BFT-consensus state (signed 2f+1 TC `certified` OR f+1 aggregated
+// signed votes `adopted`), NEVER by local wall-clock. Wall-clock only
+// decides WHEN to vote (stall detection), not WHAT round applies for
+// producer selection. A catch-up node sees `certified` and `adopted` from
+// peers' broadcast votes, joins the live rotation at the same round as
+// every other honest validator, and therefore selects the same producer.
+//
+// Safety: every vote that enters VOTER_MAX_ROUND is Dilithium3-verified at
+// the top of `handle_timeout_vote`. HIGHEST_ADOPTED_ROUND advances only on
+// the f+1-th voter's max round — quantum-signed evidence, not raw bytes.
+// Byzantine attackers with ≤ f keys cannot reach the f+1 threshold alone.
+//
+// Scalability: per-vote O(voters_at_height) partial sort on a DashMap shard
+// iterator; at the 1000-validator committee cap this is a small constant
+// per message and bounded by the active macroblock window (cleanup_sweep
+// prunes stale entries).
+
+/// O(1) tracker: highest adopted round (≥ f+1 voters at max_round ≥ R).
+/// Key: macroblock_index. Value: highest round with f+1 adoption. Cumulative
+/// BFT voting — a voter's signed vote at round R supports ALL rounds ≤ R.
+static HIGHEST_ADOPTED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Per-voter max round tracker. Key: (macroblock_index, voter_id). Value:
+/// max round this voter has signed. Feeds HIGHEST_ADOPTED_ROUND aggregation.
+static VOTER_MAX_ROUND: Lazy<Arc<DashMap<(u64, String), u64>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
 
 // v14.7.2: per-microblock BlockCommit aggregation, FAST_FINALIZED_HEIGHT,
 // leader-lock statics and helpers REMOVED. Microblock BFT safety is delivered
@@ -4670,6 +4701,8 @@ impl SimplifiedP2P {
                 let timeout_certs_removed = timeout_certs_before.saturating_sub(TIMEOUT_CERTIFICATES.len());
                 
                 HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_height);
+                HIGHEST_ADOPTED_ROUND.retain(|h, _| *h >= min_height);
+                VOTER_MAX_ROUND.retain(|(h, _), _| *h >= min_height);
 
                 let timeout_voted_before = TIMEOUT_VOTED_HEIGHTS.len();
                 TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_height);
@@ -21534,29 +21567,66 @@ impl SimplifiedP2P {
         }
 
         // ═══════════════════════════════════════════════════════════════════════════
-        // v14.8.7: CANONICAL BFT — signed same-round 2f+1 certificate is the ONLY
-        // way HIGHEST_CERTIFIED_ROUND advances. Any local-only aggregation
-        // (cumulative_certificate, HIGHEST_ADOPTED_ROUND, jump_to_highest) is
-        // removed because it makes `HIGHEST_CERTIFIED_ROUND` non-deterministic
-        // across nodes, which breaks the invariant that microblock producer
-        // selection (which also reads this value) must compute the same leader
-        // on every node. Divergence of this value was the root cause of the
-        // observed h=3810 fork (001 at timeout=25, 004 at timeout=68, both
-        // signing their own block).
-        //
-        // Round convergence for view-change is delivered by the wall-clock
-        // pacemaker used in the production loop (each node derives
-        // proposed_timeout_round deterministically from (now - slot_start)),
-        // so honest nodes naturally broadcast at matching rounds and 2f+1
-        // same-round votes collect on the happy path.
-        //
-        // Safety: with same-round 2f+1 certificate, all honest nodes advance
-        // to the same round; VRF microblock producer selection is deterministic
-        // and fork-free.
-        // Liveness: pacemaker guarantees all honest nodes broadcast at the
-        // same round within one pacemaker interval, so the 2f+1 same-round
-        // condition is reachable under partial synchrony.
+        // v14.8.10: BFT CONSENSUS-DRIVEN ROTATION — f+1 adopted + 2f+1 certified
         // ═══════════════════════════════════════════════════════════════════════════
+        // Microblock producer rotation in this network is driven by BFT-agreed
+        // state (adopted/certified rounds from signed votes), never by local
+        // wall clock. Local wall clock only decides WHEN to vote (stall
+        // detection). This aggregation advances the two trackers:
+        //
+        //   HIGHEST_CERTIFIED_ROUND[mb]: advanced only by signed 2f+1 same-round
+        //     TimeoutCertificate (below at the byzantine_threshold branch, and
+        //     on remote broadcast via handle_timeout_proof_broadcast). This
+        //     is the strongest — cryptographic supermajority, unforgeable.
+        //
+        //   HIGHEST_ADOPTED_ROUND[mb]: f+1 aggregation of per-voter max rounds.
+        //     Weaker than certified (f+1 proves at least one honest), but
+        //     converges faster because it does not require 2f+1 at the SAME
+        //     round — a voter's signed vote at round R supports all rounds ≤ R.
+        //
+        // Catch-up node safety: a newly-synced validator receives signed votes
+        // from peers' gossip before participating. Their VOTER_MAX_ROUND map
+        // is populated from those signed broadcasts → HIGHEST_ADOPTED_ROUND
+        // matches the network → their rotation round matches → they select
+        // the same producer as every other honest validator. No wall-clock
+        // divergence.
+        //
+        // Scalability: per-vote insert into VOTER_MAX_ROUND is O(1). Partial
+        // sort for f+1-th element is O(voters_at_height). At the 1000-validator
+        // committee cap, f+1 = 334 and the scan is a small constant per
+        // message. Cleanup sweep (cleanup_old_timeout_data) prunes entries
+        // older than the active macroblock window, keeping memory flat at
+        // any committee size.
+        // ═══════════════════════════════════════════════════════════════════════════
+
+        // Track this voter's max round for f+1 adoption aggregation.
+        VOTER_MAX_ROUND.entry((height, voter_id.clone()))
+            .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
+            .or_insert(timeout_round);
+
+        // Cumulative adopted round: the f+1-th voter (by max_round desc) defines
+        // the highest round with ≥ f+1 support. Monotonic — never decreases.
+        {
+            let f_plus_1 = (total_validators + 2) / 3; // ceil(n/3)
+            if f_plus_1 > 0 {
+                let mut max_rounds: Vec<u64> = VOTER_MAX_ROUND.iter()
+                    .filter(|e| e.key().0 == height)
+                    .map(|e| *e.value())
+                    .collect();
+                if max_rounds.len() >= f_plus_1 {
+                    let idx = f_plus_1 - 1;
+                    max_rounds.select_nth_unstable_by(idx, |a, b| b.cmp(a));
+                    let best_adopted = max_rounds[idx];
+                    if best_adopted > 0 {
+                        HIGHEST_ADOPTED_ROUND.entry(height)
+                            .and_modify(|cur| { if best_adopted > *cur { *cur = best_adopted; } })
+                            .or_insert(best_adopted);
+                    }
+                }
+            }
+        }
+
+        // Signed 2f+1 same-round → TimeoutCertificate (strongest advancement).
         if votes_count >= byzantine_threshold {
             self.generate_and_broadcast_timeout_proof(height, timeout_round, hash_arr);
         }
@@ -22120,12 +22190,15 @@ impl SimplifiedP2P {
         });
     }
     
-    // v14.8.7: `take_timeout_jump_target` REMOVED — the entire
-    // jump-to-highest mechanism (TIMEOUT_JUMP_TARGET storage, single-vote
-    // cap, f+1 evidence gate) is replaced by the wall-clock pacemaker in
-    // the production loop. Round divergence is no longer an issue because
-    // every node computes the same timeout_round from its local clock
-    // against a shared slot_start timestamp.
+    // v14.8.10: `take_timeout_jump_target` REMAINS REMOVED — the
+    // jump-to-highest mechanism (single signed vote inflating the whole
+    // network's round to an attacker-chosen value) was Byzantine-unsafe.
+    // Rotation rounds are now derived from BFT-agreed aggregates:
+    //   * HIGHEST_CERTIFIED_ROUND  — 2f+1 signed same-round TimeoutCertificate
+    //   * HIGHEST_ADOPTED_ROUND    — f+1 voters' max signed round
+    // Both require Dilithium3-verified supermajority/honest-plurality
+    // evidence before advancing, so a ≤ f attacker cannot move the
+    // network's rotation round.
 
     /// Get current timeout proof if available
     pub fn get_timeout_certificate(&self, height: u64, timeout_round: u64) -> Option<TimeoutProof> {
@@ -22144,9 +22217,24 @@ impl SimplifiedP2P {
         HIGHEST_CERTIFIED_ROUND.get(&height).map(|v| *v).unwrap_or(0)
     }
 
-    // v14.8.7: `get_highest_adopted_round` REMOVED with HIGHEST_ADOPTED_ROUND.
-    // Producer selection now uses only HIGHEST_CERTIFIED_ROUND (signed 2f+1)
-    // or the wall-clock pacemaker — both are deterministic across all nodes.
+    /// v14.8.10: Get highest adopted round (≥ f+1 voters at max_round ≥ R).
+    /// Used together with certified round for BFT-driven rotation:
+    ///   timeout_round_for_rotation = certified.max(adopted)
+    /// Weaker than 2f+1 certified but converges faster during early stalls —
+    /// the f+1 threshold guarantees at least one honest voter, so the network
+    /// has evidence that the round is genuinely active.
+    ///
+    /// `_threshold` kept for API compatibility — threshold is applied at
+    /// vote-insert time in handle_timeout_vote.
+    pub fn get_highest_adopted_round(&self, height: u64, _threshold: usize) -> u64 {
+        HIGHEST_ADOPTED_ROUND.get(&height).map(|v| *v).unwrap_or(0)
+    }
+}
+
+/// v14.8.10: Module-level read of HIGHEST_ADOPTED_ROUND for (macroblock_index).
+/// Read-only, O(1), safe from any crate context without a P2P handle.
+pub fn highest_adopted_round_for(mb_index: u64) -> u64 {
+    HIGHEST_ADOPTED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0)
 }
 
 /// v14.6: Module-level read of HIGHEST_CERTIFIED_ROUND for (macroblock_index).
@@ -22155,7 +22243,9 @@ pub fn highest_certified_round_for(mb_index: u64) -> u64 {
     HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0)
 }
 
-// v14.8.7: `highest_adopted_round_for` REMOVED together with HIGHEST_ADOPTED_ROUND.
+// v14.8.10: `highest_adopted_round_for` RESTORED above together with
+// HIGHEST_ADOPTED_ROUND; see the RESTORED note at the HIGHEST_ADOPTED_ROUND
+// declaration for the full rationale.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // v14.7 (pt 9): SERIALIZERS / DESERIALIZERS for persistent consensus state.
@@ -22619,6 +22709,8 @@ impl SimplifiedP2P {
         TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_mb);
         TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_mb);
         HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_mb);
+        HIGHEST_ADOPTED_ROUND.retain(|h, _| *h >= min_mb);
+        VOTER_MAX_ROUND.retain(|(h, _), _| *h >= min_mb);
         TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_mb);
     }
     

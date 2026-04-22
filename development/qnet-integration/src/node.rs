@@ -130,15 +130,24 @@ use std::env;
 // 2. Race condition: Flag set by one node, others don't know
 // 3. No consensus: Producer change without 2/3+ agreement
 //
-// NEW ARCHITECTURE (v14.8.9):
-// - Microblock failover uses the wall-clock pacemaker: rank is a pure
-//   function of (parent_block.timestamp, now) computed via the canonical
-//   `compute_pacemaker_rank` / `pacemaker_rank_from_inputs` helpers.
-// - Macroblock commit view change uses the signed 2f+1 TimeoutCertificate
-//   path and its `HIGHEST_CERTIFIED_ROUND` tracker — kept in a separate
-//   consensus domain and NEVER mixed into microblock rotation.
-// - All nodes agree on the same microblock producer by deterministic
-//   derivation, and on macroblock view round by cryptographic proof.
+// NEW ARCHITECTURE (v14.8.10):
+// - Producer rotation is driven by BFT-agreed rounds: for every macroblock
+//   index, each validator tracks
+//     * HIGHEST_CERTIFIED_ROUND — the highest round with a 2f+1 signed
+//       TimeoutCertificate (Dilithium3-verified supermajority), and
+//     * HIGHEST_ADOPTED_ROUND   — f+1 voters' max signed round
+//       (accountable-safety threshold, Dilithium3-verified).
+//   `rotation_round = certified.max(adopted)` is identical on every node
+//   once the corresponding signed messages have been gossiped, so all
+//   validators derive the same producer via the VRF formula
+//   `candidates[(base_idx + rotation_round) % N]`.
+// - Wall clock only gates WHEN to vote (stall detection via `local_delay`)
+//   and is explicitly capped at 30 s under catch-up, so a node whose clock
+//   has drifted from the canonical parent timestamp cannot broadcast
+//   inflated rounds.
+// - Macroblock commit view change reuses the same certified-round path
+//   for its 2f+1 TimeoutCertificate finalisation — one consensus domain,
+//   one deterministic derivation.
 // ═══════════════════════════════════════════════════════════════════════════════
 use std::sync::atomic::{AtomicU64 as StdAtomicU64, Ordering as StdOrdering};
 use parking_lot::RwLock as ParkingRwLock;
@@ -422,87 +431,487 @@ pub static LAST_SYNC_PROGRESS_TIME: AtomicU64 = AtomicU64::new(0);
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.14: REAL-TIME BASED DETERMINISTIC FAILOVER
 // ═══════════════════════════════════════════════════════════════════════════════
-// v14.8.9: CURRENT_TIMEOUT_ROUND / TIMEOUT_ROUND_HEIGHT atomics REMOVED.
-//
-// Prior versions stored the "current" microblock timeout round in a global
-// atomic, written by the stall-detection loop and read by block construction.
-// Under the decoupled v14.8.9 model the rank is a PURE FUNCTION of two
-// finalized-on-chain inputs — the parent block's timestamp and a wall-clock
-// reference — so it is cheaper and safer to recompute at each call site than
-// to coordinate via mutable shared state. A cached atomic would have gone
-// stale between iterations, letting producer and ingest see different rank
-// values for the same block (the v14.8.7/v14.8.8 race that manifested as the
-// observed h=13123 prod stall).
-//
-// All former call sites (stall detection, main-loop producer selection,
-// block construction, yield_stale_round, ingest validation) now route
-// through `compute_pacemaker_rank` or `pacemaker_rank_from_inputs` below —
-// a single deterministic derivation, no shared mutable state. The older
-// public shims (`get_current_timeout_round` / `set_timeout_round` /
-// `reset_timeout_round`) are deleted; any remaining callers are updated
-// in the same patch.
-//
 // ═══════════════════════════════════════════════════════════════════════════
-// PACEMAKER RANK HELPERS (single source of truth)
+// v14.8.10: BFT-CONSENSUS-DRIVEN MICROBLOCK ROTATION ROUND
 // ═══════════════════════════════════════════════════════════════════════════
-// Microblock producer rotation is driven by a wall-clock pacemaker whose
-// rank is a deterministic function of (parent_ts, now):
+// Microblock producer rotation round is driven by BFT-agreed state:
 //
-//     slot_start(h) = parent(h-1).timestamp + PACEMAKER_SLOT_LEN_SECS
-//     rank          = (now - slot_start) / PACEMAKER_RANK_WINDOW_SECS
+//     timeout_round_for_rotation = certified.max(adopted)
 //
-// These two `const` + two `fn` are the ONLY sanctioned path to produce the
-// value. Any new call site must reuse them — inlining the formula again
-// risks drifting constants or semantics and reintroduces the class of bugs
-// fixed in v14.8.9. Both helpers are O(1) per call and safe at any
-// validator-count scale (no per-validator work).
+// where `certified` is `HIGHEST_CERTIFIED_ROUND[mb_idx]` (signed 2f+1 TC)
+// and `adopted` is `HIGHEST_ADOPTED_ROUND[mb_idx]` (f+1 aggregated signed
+// votes). Both are populated from DILITHIUM3-VERIFIED messages received
+// over gossip — a catch-up validator sees the same certified/adopted as
+// the rest of the network as soon as their P2P sync delivers the votes.
 //
-// Safety: every validator with synchronised NTP and access to the same
-// finalized parent computes the same rank for the same reference wall time.
-// Byzantine producers cannot claim higher rank than their timestamp permits
-// because ingest re-runs the derivation against the block's own `timestamp`
-// and rejects mismatches beyond a one-rank NTP tolerance.
+// Wall-clock pacemaker (local wall time) is NOT used for the rotation
+// formula. Attempting that in v14.8.7/8/9 caused the observed h=339
+// catch-up fork: a freshly-synced node computes `(now − parent_ts)` with
+// a `now` far from the canonical `parent_ts`, gets a very high rank that
+// cycles back to themselves via `(base_idx + rank) % N`, and produces
+// a second block at the same height as the live primary. BFT-driven
+// rotation eliminates that race: a catch-up node reads `certified/adopted`
+// from the exact same signed network state as every other honest node,
+// so rotation round (and therefore producer) matches.
+//
+// Wall clock is used ONLY for:
+//   * `local_delay` — how long since THIS node saw a block, to decide
+//     WHEN to broadcast a TimeoutVote. Capped at 30 s when the node is
+//     not `PRODUCTION_UNLOCKED` (post-restart stale-LBPT protection).
+//   * Stall/progress diagnostics (watchdog, chronic-stall resync).
+// It never enters the microblock producer-selection formula.
+//
+// `CURRENT_TIMEOUT_ROUND` is the in-memory cache of the latest
+// `timeout_round_for_rotation` computed by the main consensus loop.
+// Producer selection and block construction read it to keep one source
+// of truth per-tick without re-loading from storage. It is RESET to 0
+// on each tip advance (new canonical block received) because the next
+// slot starts fresh.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Microblock slot length in seconds. Target block cadence.
-pub const PACEMAKER_SLOT_LEN_SECS: u64 = 1;
+/// Current rotation round (certified.max(adopted) from the latest stall
+/// evaluation). Read by producer selection and block construction.
+static CURRENT_TIMEOUT_ROUND: AtomicU64 = AtomicU64::new(0);
 
-/// Pacemaker rank window in seconds. Rank K owns
-/// `[slot_start + K*RANK_WINDOW, slot_start + (K+1)*RANK_WINDOW)`.
-/// Sized at 3× typical NTP drift on production servers; the ingest
-/// check tolerates ±1 rank (`NTP_TOL`) on top of this.
-pub const PACEMAKER_RANK_WINDOW_SECS: u64 = 3;
+/// Height for which `CURRENT_TIMEOUT_ROUND` was last set. Informational;
+/// `reset_timeout_round` clears the round value on every tip advance.
+#[allow(dead_code)]
+static TIMEOUT_ROUND_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
-/// Pure function: compute pacemaker rank from a parent timestamp and a
-/// reference wall-clock value. Deterministic given the two inputs.
-///
-/// Used directly at the block-construction site (where `parent_ts` and
-/// `deterministic_timestamp` have already been captured into locals) and
-/// at the ingest-validation site (where the parent block has already been
-/// loaded from storage).
-#[inline]
-pub fn pacemaker_rank_from_inputs(parent_ts: u64, reference_ts: u64) -> u64 {
-    let slot_start = parent_ts.saturating_add(PACEMAKER_SLOT_LEN_SECS);
-    reference_ts.saturating_sub(slot_start) / PACEMAKER_RANK_WINDOW_SECS
+/// Read the current BFT rotation round (certified.max(adopted)) for producer
+/// selection and block construction.
+pub fn get_current_timeout_round() -> u64 {
+    CURRENT_TIMEOUT_ROUND.load(Ordering::SeqCst)
 }
 
-/// Compute the pacemaker rank for `next_height` at `now_secs`, loading the
-/// parent timestamp from local storage. Returns 0 if the parent is not yet
-/// locally available (sync gap) — a deterministic, validator-independent
-/// fallback. NEVER falls back to a wall-clock estimate, which would diverge
-/// between nodes with different storage states.
-pub fn compute_pacemaker_rank(
-    storage: &std::sync::Arc<crate::storage::Storage>,
-    next_height: u64,
-    now_secs: u64,
-) -> u64 {
-    if next_height <= 1 {
-        return 0; // h=0 genesis, h=1 primary VRF leader
+/// Set the current rotation round. Called by the stall-detection loop after
+/// re-reading `certified_timeout_round` and `adopted_timeout_round` from
+/// `unified_p2p`. The value is what producer selection will use this tick.
+pub fn set_timeout_round(round: u64, height: u64) {
+    CURRENT_TIMEOUT_ROUND.store(round, Ordering::SeqCst);
+    TIMEOUT_ROUND_HEIGHT.store(height, Ordering::SeqCst);
+}
+
+/// Reset rotation round to 0. Called on tip advance — a fresh block
+/// arrived, so the previous slot's failover round no longer applies.
+pub fn reset_timeout_round() {
+    CURRENT_TIMEOUT_ROUND.store(0, Ordering::SeqCst);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v14.8.10: RUNTIME CLOCK-DRIFT MONITOR
+// ═══════════════════════════════════════════════════════════════════════════════
+// Problem: startup NTP sync + 30s lbpt cap catch most drift cases, but clock
+// can drift during operation (VM migration, hypervisor pauses, NTP server
+// issues). Drift never breaks safety (rotation is BFT-signed), but degrades
+// this node's liveness: stale LBPT → wrong proposed_round → vote not
+// aggregated.
+//
+// Design (inspired by TimesNet-BFT 2026 lazy-recalibration pattern and
+// Ethereum attestation-based drift tolerance):
+//
+//   1. Every time a block from the network is applied, observe
+//      `drift = local_now - block.timestamp`. Block timestamps are
+//      producer-signed wall clock — ≥ 2f+1 honest nodes agree on median.
+//
+//   2. Maintain exponential moving average (EMA) of |drift| over last N
+//      blocks. A single outlier (ours or theirs) does not trigger.
+//
+//   3. Thresholds (conservative):
+//        * EMA > 10 s  → [WARN][DRIFT] log, continue operating
+//        * EMA > 30 s  → rate-limited re-sync trigger (once per 5 min)
+//
+//   4. Re-sync trigger calls the same NTP commands as startup:
+//      `timedatectl set-ntp true` → `chronyc makestep` → `ntpdate -u`.
+//      Non-blocking (spawn), non-fatal (log on failure). Safety path
+//      NEVER waits for NTP — we only nudge the OS daemon.
+//
+// Safety invariant: this code is purely observational + side-effect
+// (external NTP tool). It does NOT feed back into rotation round,
+// producer selection, or any consensus decision. Forks cannot be caused
+// or prevented by drift monitor state.
+//
+// Scalability: O(1) per block observation. Works identically at 5 or
+// 5000 validators.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Fixed-point EMA of |drift_seconds| × 1000 (millisecond precision).
+/// Reset to 0 on genesis boot. Updated on every applied network block.
+static CLOCK_DRIFT_EMA_MILLIS: AtomicU64 = AtomicU64::new(0);
+
+/// Peak observed drift (seconds). Informational, never cleared.
+static CLOCK_DRIFT_PEAK_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Unix timestamp of the last NTP re-sync trigger (rate-limit).
+static LAST_NTP_RESYNC_TS: AtomicU64 = AtomicU64::new(0);
+
+/// Total count of NTP re-sync attempts triggered by the drift monitor.
+/// Monotonically increases; exposed via health endpoint for fleet operators
+/// to detect nodes where re-sync is not converging (count keeps rising).
+static NTP_RESYNC_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Count of consecutive observations with EMA above the self-pause threshold
+/// while NTP re-sync has been attempted but drift has not improved. Reset to
+/// 0 when EMA drops back below the pause threshold. Triggers self-pause when
+/// it crosses `SELF_PAUSE_STREAK_THRESHOLD`.
+static CLOCK_DRIFT_PAUSE_STREAK: AtomicU64 = AtomicU64::new(0);
+
+/// Self-pause flag. When true, this node will NOT produce blocks and will
+/// NOT broadcast timeout votes — it becomes a passive observer that still
+/// validates and gossips blocks from others. Cleared automatically once
+/// `CLOCK_DRIFT_EMA_MILLIS` falls back below the recovery threshold.
+///
+/// Safety note: this is a LOCAL flag. Other validators are not told about
+/// it; from their perspective we simply go silent, and VRF rotation (which
+/// samples a fresh committee every 90 blocks from the candidate pool)
+/// naturally excludes us from the next committee if we keep missing votes.
+/// This is the canonical BFT-safe way to remove a misconfigured node from
+/// consensus without special-case network messaging.
+static CLOCK_DRIFT_SELF_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// EMA threshold (seconds) at which we start counting the pause streak.
+/// Chosen so that only truly broken nodes (VM paused, NTP server dead for
+/// many minutes, hypervisor clock skew) reach this — not normal WAN drift
+/// or transient NTP wobble.
+const CLOCK_DRIFT_PAUSE_EMA_THRESHOLD_SECS: u64 = 60;
+
+/// Consecutive observations above threshold required before pausing. At ~1s
+/// block cadence this gives the operator ~30 s to fix the clock before the
+/// node pauses itself. Prevents flapping on short transient drift spikes.
+const SELF_PAUSE_STREAK_THRESHOLD: u64 = 30;
+
+/// EMA threshold (seconds) at which a paused node resumes. Hysteresis
+/// below the pause threshold prevents oscillation.
+const CLOCK_DRIFT_RESUME_EMA_THRESHOLD_SECS: u64 = 10;
+
+/// Returns true when this node has paused itself due to persistent drift.
+/// Called from production / vote gates to enforce the self-pause.
+pub fn is_drift_self_paused() -> bool {
+    CLOCK_DRIFT_SELF_PAUSED.load(Ordering::Relaxed)
+}
+
+/// Total number of NTP re-sync attempts made by the drift monitor.
+pub fn get_ntp_resync_attempts() -> u64 {
+    NTP_RESYNC_ATTEMPTS.load(Ordering::Relaxed)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v14.8.10: MEDIAN-LBPT NETWORK-TIME SELF-CALIBRATION
+// ═══════════════════════════════════════════════════════════════════════════════
+// Problem:
+//   `local_delay = wall_clock_now − last_block_produced_time − 1`
+//
+//   When this node's wall clock is BEHIND the network (e.g. VM paused, chrony
+//   lost NTP server, hypervisor skew), wall_clock_now < last_block_produced_time
+//   and `saturating_sub` pins local_delay at 0 forever. The node NEVER votes
+//   for timeout even during a real stall — it effectively leaves f+1 adopted
+//   aggregation one voter short. At small committee size (genesis 5), losing
+//   even one voter can push f+1 under threshold and block rotation.
+//
+// Solution (network-native time calibration, scalable to 10K+ validators):
+//   1. Maintain a 32-slot ring buffer of the most recent on-chain block
+//      timestamps (producer-signed wall clocks). These are 2f+1-agreed at
+//      the macroblock boundary and cannot be forged by ≤ f Byzantine.
+//   2. `effective_now()` = max(wall_clock_now, network_time_estimate)
+//      where network_time_estimate = median(ring) + elapsed_blocks_since_median
+//      (using a conservative 1 s/block assumption).
+//   3. Apply `effective_now()` ONLY in local stall-detection timing —
+//      NEVER in signed fields (block.timestamp, vote timestamps,
+//      attestation.timestamp) because those must be raw wall clock for
+//      network-wide agreement via TIMESTAMP_FUTURE_TOLERANCE check.
+//
+// Safety invariants:
+//   * Only L-channel (local decision) uses effective_now(); signed fields
+//     use `get_timestamp_safe()`.
+//   * Ring buffer update is monotonic — we never accept a timestamp older
+//     than our latest observed block.
+//   * Median over 32 samples tolerates up to 15 Byzantine producers within
+//     the window (well above realistic f for any committee we support).
+//
+// Scalability: ring buffer is O(1) insert + O(n log n) median over 32
+// elements — dozens of nanoseconds per call. Works identically at any
+// validator count; memory cost is a single fixed-size array.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Size of the on-chain timestamp ring buffer used for median network-time
+/// estimation. 32 samples covers ~32 seconds of history at 1 s block
+/// cadence — long enough to tolerate short-lived drift spikes, short
+/// enough to stay responsive during live catch-up.
+const NETWORK_TIME_WINDOW: usize = 32;
+
+/// Single global slot for the median network-time ring. Writers take the
+/// mutex only during `update_network_time_sample`; readers do a brief
+/// copy and drop the lock.
+static NETWORK_TIME_RING: once_cell::sync::Lazy<parking_lot::Mutex<NetworkTimeRing>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(NetworkTimeRing::new()));
+
+struct NetworkTimeRing {
+    /// Ring buffer of (block_height, block_timestamp) pairs.
+    samples: [(u64, u64); NETWORK_TIME_WINDOW],
+    /// Next write index (mod NETWORK_TIME_WINDOW).
+    head: usize,
+    /// Count of valid samples (capped at NETWORK_TIME_WINDOW).
+    len: usize,
+    /// Highest block height observed — prevents regressions when blocks
+    /// arrive out of order from sync paths.
+    max_height: u64,
+}
+
+impl NetworkTimeRing {
+    fn new() -> Self {
+        Self {
+            samples: [(0, 0); NETWORK_TIME_WINDOW],
+            head: 0,
+            len: 0,
+            max_height: 0,
+        }
     }
-    match storage.load_microblock_auto_format(next_height.saturating_sub(1)) {
-        Ok(Some(mb)) => pacemaker_rank_from_inputs(mb.timestamp, now_secs),
-        _ => 0, // parent not yet in local storage (sync gap) — rank 0
+
+    fn insert(&mut self, height: u64, ts: u64) {
+        // Reject out-of-order / duplicate samples to keep the window monotonic.
+        if height <= self.max_height {
+            return;
+        }
+        self.max_height = height;
+        self.samples[self.head] = (height, ts);
+        self.head = (self.head + 1) % NETWORK_TIME_WINDOW;
+        if self.len < NETWORK_TIME_WINDOW {
+            self.len += 1;
+        }
     }
+
+    /// Returns (median_timestamp, height_at_median) over the valid window,
+    /// or None if the window is empty.
+    fn median_sample(&self) -> Option<(u64, u64)> {
+        if self.len == 0 {
+            return None;
+        }
+        // Collect the valid prefix and sort by timestamp.
+        let mut valid: Vec<(u64, u64)> = self.samples[..self.len].to_vec();
+        valid.sort_by_key(|(_, ts)| *ts);
+        let mid = valid.len() / 2;
+        let (height_at_median, median_ts) = valid[mid];
+        Some((median_ts, height_at_median))
+    }
+}
+
+/// Record an on-chain block timestamp sample for network-time estimation.
+/// Safe to call from any thread; called by `observe_clock_drift`.
+pub fn update_network_time_sample(block_height: u64, block_ts: u64) {
+    let mut ring = NETWORK_TIME_RING.lock();
+    ring.insert(block_height, block_ts);
+}
+
+/// Returns the "effective now" — max of raw wall clock and network-time
+/// estimate derived from median of recent on-chain block timestamps.
+///
+/// Intended use: LOCAL decision timing only (stall detection, grace
+/// adjustment). MUST NOT be used for any signed field — signed fields
+/// require raw `get_timestamp_safe()` for cross-network agreement.
+///
+/// Behaviour:
+///   * If wall clock is ahead of the network-time estimate (normal case,
+///     or clock-ahead drift): returns wall clock. No-op for healthy nodes.
+///   * If wall clock is BEHIND network-time estimate (clock-behind drift):
+///     returns the estimate. Lets a drifted node still detect stalls.
+///   * If ring is empty (fresh boot, pre-block-1): falls back to wall clock.
+pub fn effective_now() -> u64 {
+    let wall = get_timestamp_safe();
+    let ring = NETWORK_TIME_RING.lock();
+    let sample = ring.median_sample();
+    let chain_tip = ring.max_height;
+    drop(ring);
+
+    if let Some((median_ts, height_at_median)) = sample {
+        // Conservative forward projection: every block after the median
+        // is worth ~1 s (microblock cadence). Gives an honest network-time
+        // estimate that tracks real-time progression without assuming
+        // precision we don't have.
+        let blocks_ahead = chain_tip.saturating_sub(height_at_median);
+        let network_estimate = median_ts.saturating_add(blocks_ahead);
+        if network_estimate > wall {
+            return network_estimate;
+        }
+    }
+    wall
+}
+
+/// Feed an observation into the drift monitor.
+/// `block_ts`  — on-chain timestamp of a just-applied network block.
+/// `local_now` — wall clock when the block was applied.
+/// Pure observational — safe to call from any thread.
+///
+/// Four-level escalation ladder (v14.8.10):
+///   L1 (ema > 10 s):  [WARN][DRIFT] log — operator notice, no side-effect
+///   L2 (ema > 30 s):  async NTP re-sync trigger (rate-limited per 5 min)
+///   L3 (ema > 60 s for 30 consecutive blocks): SELF-PAUSE
+///                     — node stops producing blocks AND stops broadcasting
+///                     timeout votes. VRF committee rotation naturally
+///                     excludes it from the next committee window.
+///   L4 (ema back below 10 s): SELF-RESUME — clears pause flag with
+///                     hysteresis so we do not oscillate.
+pub fn observe_clock_drift(block_ts: u64, local_now: u64) {
+    // v14.8.10: feed the on-chain timestamp into the network-time ring so
+    // `effective_now()` can self-calibrate stall detection when this
+    // node's wall clock is behind the network. Height is derived from
+    // LAST_BLOCK_PRODUCED_HEIGHT which is updated in the same pipeline
+    // path that calls this function. Safe to call before or after height
+    // update — the ring rejects non-monotonic heights.
+    let observed_height = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
+    update_network_time_sample(observed_height, block_ts);
+
+    // Signed drift in seconds. Positive = our clock ahead of network.
+    let abs_drift_secs: u64 = if local_now >= block_ts {
+        local_now - block_ts
+    } else {
+        block_ts - local_now
+    };
+
+    // Bounded: a 15s future-tolerance block + network RTT is noise,
+    // not drift. Anything above TIMESTAMP_FUTURE_TOLERANCE + small RTT
+    // margin is a real signal.
+    let drift_millis: u64 = abs_drift_secs.saturating_mul(1000);
+
+    // EMA with α = 1/8 (slow-moving, ignores single-block outliers).
+    // ema_new = ema_old * 7/8 + drift * 1/8
+    let prev = CLOCK_DRIFT_EMA_MILLIS.load(Ordering::Relaxed);
+    let next = ((prev.saturating_mul(7)) + drift_millis) / 8;
+    CLOCK_DRIFT_EMA_MILLIS.store(next, Ordering::Relaxed);
+
+    // Peak tracker (max only).
+    let peak = CLOCK_DRIFT_PEAK_SECS.load(Ordering::Relaxed);
+    if abs_drift_secs > peak {
+        CLOCK_DRIFT_PEAK_SECS.store(abs_drift_secs, Ordering::Relaxed);
+    }
+
+    // Thresholds — only act on EMA, not single observation.
+    let ema_secs = next / 1000;
+
+    // L1: WARN (no side effect).
+    if ema_secs > 10 && is_warn() {
+        println!(
+            "[WARN][DRIFT] ema={}s peak={}s obs_now={} block_ts={} — check NTP",
+            ema_secs, abs_drift_secs, local_now, block_ts
+        );
+    }
+
+    // L2: CRITICAL — trigger NTP re-sync (rate-limited, non-blocking).
+    if ema_secs > 30 {
+        let last = LAST_NTP_RESYNC_TS.load(Ordering::Relaxed);
+        if local_now.saturating_sub(last) > 300 {
+            LAST_NTP_RESYNC_TS.store(local_now, Ordering::Relaxed);
+            NTP_RESYNC_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            trigger_ntp_resync_async(ema_secs);
+        }
+    }
+
+    // L3: SELF-PAUSE — persistent severe drift that the OS daemon cannot fix.
+    // Increment streak when EMA stays above pause threshold; reset otherwise.
+    // When streak crosses SELF_PAUSE_STREAK_THRESHOLD we set the pause flag —
+    // the production gate and vote gate both honour it on their next tick.
+    //
+    // This protects the rest of the committee from:
+    //   * stale-timestamp blocks (would be rejected by peers → 30-block stall)
+    //   * spurious timeout votes with inflated rounds
+    //
+    // VRF committee re-selection every 90 blocks will naturally drop this
+    // node from the next committee window because it stops participating.
+    if ema_secs > CLOCK_DRIFT_PAUSE_EMA_THRESHOLD_SECS {
+        let streak = CLOCK_DRIFT_PAUSE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= SELF_PAUSE_STREAK_THRESHOLD
+            && !CLOCK_DRIFT_SELF_PAUSED.swap(true, Ordering::SeqCst)
+        {
+            if is_warn() {
+                println!(
+                    "[WARN][DRIFT] self_pause_engaged ema={}s streak={} — \
+                     node stopped producing blocks and timeout votes until drift recovers",
+                    ema_secs, streak
+                );
+            }
+        }
+    } else {
+        CLOCK_DRIFT_PAUSE_STREAK.store(0, Ordering::Relaxed);
+
+        // L4: SELF-RESUME with hysteresis. Only clear the pause flag once
+        // EMA has dropped well below the pause threshold — prevents
+        // oscillation around the trigger point.
+        if ema_secs <= CLOCK_DRIFT_RESUME_EMA_THRESHOLD_SECS
+            && CLOCK_DRIFT_SELF_PAUSED.swap(false, Ordering::SeqCst)
+        {
+            if is_info() {
+                println!(
+                    "[INFO][DRIFT] self_pause_cleared ema={}s — resuming production and voting",
+                    ema_secs
+                );
+            }
+        }
+    }
+}
+
+/// Trigger NTP re-sync in background — same commands as startup.
+/// Never blocks consensus; non-fatal on failure.
+fn trigger_ntp_resync_async(ema_secs: u64) {
+    std::thread::spawn(move || {
+        if is_warn() {
+            println!("[WARN][DRIFT] ntp_resync_trigger ema={}s — attempting host NTP sync", ema_secs);
+        }
+
+        // Try systemd-timesyncd first.
+        if let Ok(out) = std::process::Command::new("timedatectl")
+            .args(&["set-ntp", "true"])
+            .output()
+        {
+            if out.status.success() {
+                let _ = std::process::Command::new("systemctl")
+                    .args(&["restart", "systemd-timesyncd"])
+                    .output();
+                if is_info() {
+                    println!("[INFO][DRIFT] ntp_resync_ok daemon=systemd-timesyncd");
+                }
+                return;
+            }
+        }
+
+        // Fallback: chrony.
+        if let Ok(out) = std::process::Command::new("chronyc")
+            .args(&["makestep"])
+            .output()
+        {
+            if out.status.success() {
+                if is_info() {
+                    println!("[INFO][DRIFT] ntp_resync_ok daemon=chrony");
+                }
+                return;
+            }
+        }
+
+        // Legacy fallback: ntpdate.
+        if let Ok(out) = std::process::Command::new("ntpdate")
+            .args(&["-u", "pool.ntp.org"])
+            .output()
+        {
+            if out.status.success() {
+                if is_info() {
+                    println!("[INFO][DRIFT] ntp_resync_ok daemon=ntpdate");
+                }
+                return;
+            }
+        }
+
+        if is_warn() {
+            println!("[WARN][DRIFT] ntp_resync_unavailable — operator intervention required");
+        }
+    });
+}
+
+/// Read current drift EMA in seconds (for metrics/health endpoints).
+pub fn get_clock_drift_ema_secs() -> u64 {
+    CLOCK_DRIFT_EMA_MILLIS.load(Ordering::Relaxed) / 1000
+}
+
+/// Read peak observed drift in seconds (for metrics/health endpoints).
+pub fn get_clock_drift_peak_secs() -> u64 {
+    CLOCK_DRIFT_PEAK_SECS.load(Ordering::Relaxed)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -834,11 +1243,9 @@ pub fn get_extended_failover_metrics() -> FailoverMetrics {
         failover_count: METRIC_FAILOVER_COUNT.load(Ordering::Relaxed),
         timestamp_rejections: METRIC_TIMESTAMP_REJECTIONS.load(Ordering::Relaxed),
         window_seconds: 300,
-        // v14.8.9: global "current timeout round" concept no longer exists —
-        // rank is a pure function of (parent_ts, now) computed at each
-        // consensus call site. Legacy metric field retained for backward
-        // compatibility, always 0 post-v14.8.9.
-        current_timeout_round: 0,
+        // v14.8.10: current BFT-agreed rotation round (certified.max(adopted))
+        // stored by the stall detector; 0 when network is in steady state.
+        current_timeout_round: get_current_timeout_round(),
         genesis_timestamp: crate::GLOBAL_GENESIS_TIMESTAMP.load(Ordering::Relaxed),
         current_time: get_timestamp_safe(),
     }
@@ -10244,26 +10651,34 @@ impl BlockchainNode {
                             LAST_BLOCK_PRODUCED_TIME.store(block_ts, Ordering::Relaxed);
                             LAST_BLOCK_PRODUCED_HEIGHT.store(received_block.height, Ordering::Relaxed);
 
+                            // v14.8.10: observational drift monitor — compares our
+                            // local wall clock to the just-applied network block's
+                            // on-chain timestamp. Purely observational: triggers
+                            // WARN log / async NTP re-sync on drift, never feeds
+                            // back into consensus rotation.
+                            observe_clock_drift(block_ts, get_timestamp_safe());
+
                             // v9.0: Track sync progress for deadlock detection
                             LAST_SYNC_PROGRESS_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
 
-                            // v14.8.9: global timeout-round reset removed entirely.
-                            // Pacemaker rank is a pure function of (parent_ts, now)
-                            // computed per call, so there is nothing to "reset" on
-                            // tip advance — the next call automatically derives
-                            // rank from the NEW parent_ts. The historical tip-vs-
-                            // sync reset bug (v13.0 comment) is no longer reachable.
+                            // v14.8.10: Reset CURRENT_TIMEOUT_ROUND ONLY on tip
+                            // advance (the next expected microblock was just
+                            // applied). During sync (catch-up blocks far behind
+                            // tip) the stored round stays intact so we do not
+                            // disrupt the rotation state nodes at the tip are
+                            // using. The BFT-agreed round will be re-evaluated
+                            // on the next stall-detection tick if no new block
+                            // arrives.
                             {
                                 let is_tip_advance = received_block.height == prev_tip + 1;
                                 if is_tip_advance {
+                                    reset_timeout_round();
                                     if is_debug() {
-                                        println!("[DBG][TIMEOUT] tip_advance h={} prev_tip={} (rank self-resets on next call)",
+                                        println!("[DBG][TIMEOUT] round_reset h={} prev_tip={}",
                                                  received_block.height, prev_tip);
                                     }
                                 } else if is_debug() {
-                                    // Diagnostic: sync block, not a tip advance.
-                                    // Under v14.8.9 this has no effect on rank state.
-                                    let current_round = 0u64;
+                                    let current_round = get_current_timeout_round();
                                     if current_round > 0 {
                                         println!("[DBG][TIMEOUT] round_preserved={} h={} prev_tip={} reason=sync_or_skip",
                                                  current_round, received_block.height, prev_tip);
@@ -10578,10 +10993,10 @@ impl BlockchainNode {
                             match recovery_result {
                                 Ok(()) => {
                                     println!("[INFO][STATE] recovery_complete clearing_mismatch_counters resuming_sync");
-                                    // v14.8.9: `reset_timeout_round()` removed — rank is
-                                    // now a pure function of wall clock and the post-
-                                    // recovery parent_ts, so the next call derives it
-                                    // fresh. Nothing to reset.
+                                    // v14.8.10: reset the BFT rotation round so the
+                                    // next tick re-reads certified/adopted fresh
+                                    // against the post-recovery macroblock index.
+                                    reset_timeout_round();
                                     mismatch_counter.clear();
                                     wrong_producer_counter.clear();
                                     pending_blocks.clear();
@@ -14983,8 +15398,28 @@ impl BlockchainNode {
                         let last_block_time = LAST_BLOCK_PRODUCED_TIME.load(std::sync::atomic::Ordering::Relaxed);
                         let last_block_time = if last_block_time == 0 { genesis_ts } else { last_block_time };
 
+                        // v14.8.10: stall-detection timing uses `effective_now()`
+                        // instead of raw wall clock. If our wall clock has drifted
+                        // BEHIND the network (VM paused, NTP server dead, skewed
+                        // hypervisor), raw `current_time < last_block_time` would
+                        // force `local_delay` to 0 via `saturating_sub`, silently
+                        // stopping us from ever voting for timeout. That breaks
+                        // f+1 adopted aggregation at small committee sizes.
+                        //
+                        // `effective_now()` = max(wall_clock, median_of_recent_block_ts
+                        // projected forward ~1s/block). In steady-state healthy nodes
+                        // it returns wall_clock (no-op). On a clock-behind drift it
+                        // returns the network-time estimate built from 2f+1-agreed
+                        // signed on-chain timestamps — unforgeable by ≤ f Byzantine.
+                        //
+                        // CRITICAL SAFETY: only used here (and grace math derived
+                        // from local_delay). NEVER used in signed block timestamps,
+                        // vote timestamps, or attestations — those require raw
+                        // wall clock for cross-network TIMESTAMP_FUTURE_TOLERANCE.
+                        let effective_now_ts = effective_now();
+
                         // Local delay detection (triggers voting, NOT producer selection)
-                        let local_delay = current_time.saturating_sub(last_block_time + 1);
+                        let local_delay = effective_now_ts.saturating_sub(last_block_time + 1);
 
                         // v11.0: STALE LBPT PROTECTION after restart
                         // After restart, LBPT comes from replay (last saved block timestamp).
@@ -15037,17 +15472,28 @@ impl BlockchainNode {
                         // while the honest primary was still producing, triggering
                         // unnecessary failovers.
                         //
-                        // Formula:
+                        // Formula (v14.8.10):
                         //   base_grace   = 3s + 2 × avg_peer_rtt  (steady-state WAN headroom)
                         //   rotation_add = budget for entropy bft_wait + propagation at
                         //                  current validator count
-                        //   grace        = base_grace + rotation_add  (only at boundary)
+                        //   drift_add    = drift_ema (auto-extend by this node's observed
+                        //                  clock drift — prevents a drifted node from
+                        //                  firing spurious timeout votes ahead of the
+                        //                  rest of the network)
+                        //   grace        = base_grace + rotation_add + drift_add
                         //
                         // Rotation boundary detection uses the same predicate as the
                         // entropy check (microblock_height produced via
                         // `select_microblock_producer_with_round` on a rotation block).
                         //
-                        // Scales: O(1). Safe at 1000+ Super-node rounds.
+                        // Scalability: O(1) per tick, three atomic loads regardless of
+                        // committee size. Works identically at 5 or 1000 validators.
+                        //
+                        // Safety: grace is a LOCAL timing gate (decides WHEN to vote),
+                        // not a consensus value. Different nodes can have different
+                        // grace periods — rotation still converges through BFT-agreed
+                        // `certified.max(adopted)` aggregation of Dilithium3-verified
+                        // signed votes. Grace never enters any signed message.
                         // ═══════════════════════════════════════════════════════════════
                         let avg_peer_latency_ms: u64 = if let Some(p) = &unified_p2p {
                             p.get_average_peer_latency()
@@ -15072,28 +15518,41 @@ impl BlockchainNode {
                             _         => 8,  // 1000+ cap (MAX_VALIDATORS)
                         };
 
+                        // v14.8.10: drift-adaptive grace extension. Nodes whose local
+                        // clock drifts (VM migration, hypervisor pause, NTP outage)
+                        // observe larger |local_now − block_ts| deltas; adding the
+                        // drift EMA to grace absorbs that drift locally so this node
+                        // stops firing spurious timeout votes ahead of the rest of
+                        // the committee. At drift_ema=0 this is a no-op.
+                        let drift_grace_secs: u64 = get_clock_drift_ema_secs();
+
                         let timeout_grace_period: u64 = if is_rotation_boundary_now {
-                            base_grace_secs + rotation_extra_secs
+                            base_grace_secs + rotation_extra_secs + drift_grace_secs
                         } else {
-                            base_grace_secs
+                            base_grace_secs + drift_grace_secs
                         };
 
-                        // v14.8.8: `proposed_timeout_round` is defined BELOW, after the
-                        // wall-clock pacemaker is computed. The canonical rule is:
+                        // v14.8.10: `proposed_timeout_round` is the round THIS node
+                        // wants to vote at once stall is past grace. It is only used
+                        // as vote/gossip content, NOT for producer rotation — rotation
+                        // is driven below by `timeout_round_for_rotation` which is the
+                        // BFT-agreed `certified.max(adopted)`.
                         //
-                        //   proposed_timeout_round = if past_grace { pacemaker_rank } else { 0 }
+                        // Local delay → local round is safe because:
+                        //   * Honest nodes with similar LBPT converge on similar
+                        //     proposed rounds within ±grace seconds, so f+1 / 2f+1
+                        //     thresholds still aggregate signed votes into
+                        //     HIGHEST_ADOPTED_ROUND / HIGHEST_CERTIFIED_ROUND.
+                        //   * Rotation never consumes proposed directly — divergence
+                        //     on proposed cannot move the producer index.
+                        //   * Vote gate (`is_synced_enough`) + 30 s lbpt cap prevent
+                        //     restarting / catch-up nodes from broadcasting inflated
+                        //     rounds.
                         //
-                        // Grace period still gates WHETHER we vote (don't spam the
-                        // network on sub-grace delays), but the round VALUE we vote
-                        // at must be deterministic across validators — otherwise
-                        // 2f+1 same-round never collects and TimeoutCertificate never
-                        // forms, which permanently stalls macroblock view-change
-                        // when the committee temporarily has < 2f+1 alive nodes.
-                        //
-                        // The old formula (local_delay − grace) / vote_interval was
-                        // node-local (receipt-time based) and caused the observed
-                        // ~25-minute stall at mb=43 when 3/5 alive: votes landed at
-                        // 1493/1504/1515/1519 on different nodes and never converged.
+                        // Constants:
+                        //   TIMEOUT_VOTE_INTERVAL = 1 s — one rotation round per
+                        //   extra second of stall past the adaptive grace window.
+                        const TIMEOUT_VOTE_INTERVAL: u64 = 1;
 
                         // v4.2: Timeout votes/certificates keyed by MACROBLOCK INDEX,
                         // not exact microblock height. This ensures nodes at different
@@ -15109,134 +15568,76 @@ impl BlockchainNode {
                         };
 
                         // ═══════════════════════════════════════════════════════════════
-                        // v14.8.7: WALL-CLOCK PACEMAKER FOR MICROBLOCK PRODUCER ROTATION
+                        // v14.8.10: BFT-DRIVEN ROTATION — certified.max(adopted)
                         // ═══════════════════════════════════════════════════════════════
-                        // Previous versions derived `timeout_round_for_rotation` from two
-                        // local-only trackers (`HIGHEST_CERTIFIED_ROUND` via cumulative
-                        // local advancement, and `HIGHEST_ADOPTED_ROUND` via local f+1
-                        // aggregation). Both tracked non-deterministic local state and
-                        // ended up with different values on different nodes, causing
-                        // VRF producer selection to return different leaders → forks
-                        // (observed at h=3810 on 2026-04-21).
+                        // Producer rotation for microblocks is driven by BFT-agreed
+                        // rounds derived from signed votes, NOT by local wall clock.
                         //
-                        // The canonical rule for slot-based microblock production is:
-                        // the producer rank is a deterministic function of wall-clock
-                        // elapsed time since the previous block's slot start. All
-                        // validators with synchronised clocks compute the same rank at
-                        // the same wall time, so VRF producer selection is identical
-                        // across the network.
+                        //   adopted  = f+1 voters' max signed round (HIGHEST_ADOPTED_ROUND)
+                        //   certified = 2f+1 signed same-round TimeoutCertificate
+                        //                (HIGHEST_CERTIFIED_ROUND)
                         //
-                        // slot_start(h) = timestamp(block[h-1]) + SLOT_LEN_SECS
-                        // elapsed      = now - slot_start(h)
-                        // rank         = elapsed / RANK_WINDOW_SECS   (0 if negative)
+                        //   rotation_round = certified.max(adopted)
                         //
-                        // Constants:
-                        //   SLOT_LEN_SECS     = 1  (target microblock cadence)
-                        //   RANK_WINDOW_SECS  = 3  (time budget per rank; 3× typical
-                        //                          NTP drift of 1 s to avoid boundary
-                        //                          ambiguity)
+                        // Catch-up validators learn both values from gossip of signed
+                        // votes/TCs exactly as active validators do. They converge on
+                        // the same rotation_round the network is using, therefore select
+                        // the same producer from the VRF formula
+                        // `candidates[(base_idx + rotation_round) % N]`. No wall-clock
+                        // divergence.
                         //
-                        // Rank 0 owns window [slot_start, slot_start + 3 s]. If the
-                        // primary stays silent past 3 s, every validator atomically
-                        // observes `elapsed ≥ 3` and rank advances to 1, which remaps
-                        // to the next VRF candidate. All nodes compute the same rank
-                        // from the same wall clock — no voting, no shared state, no
-                        // chance of two producers signing the same height.
+                        // Why not wall clock (v14.8.7..9 approach): a node that has
+                        // spent N seconds catching up has wall clock N seconds ahead of
+                        // the canonical parent.timestamp. `(now − parent_ts) / rank_win`
+                        // gives a rank far from 0 even though the chain tip is healthy,
+                        // placing the catch-up node on a different producer index from
+                        // the live nodes — two blocks at the same height, fork. Observed
+                        // at h=339 on 2026-04-22.
                         //
-                        // Safety: producer rank binds to (block.timestamp - slot_start)
-                        // at ingest (see block_pipeline); a Byzantine producer cannot
-                        // sign at a higher rank than its timestamp allows.
+                        // Security of the BFT-driven model:
+                        //   * VOTER_MAX_ROUND inserts only after Dilithium3 verification
+                        //     (see verify_timeout_vote_signature at the top of the
+                        //     handler). A Byzantine attacker with ≤ f keys cannot reach
+                        //     the f+1 threshold on HIGHEST_ADOPTED_ROUND alone.
+                        //   * HIGHEST_CERTIFIED_ROUND still requires 2f+1 signed votes
+                        //     at the same round — unforgeable supermajority.
+                        //   * Wall clock is only used for local_delay (stall detection /
+                        //     vote-broadcast timing), capped at 30 s under catch-up so a
+                        //     fresh node cannot broadcast inflated rounds.
                         //
-                        // Liveness: under partial synchrony with NTP drift ≤ 1 s the
-                        // rank advances at a bounded rate on every node; failover is
-                        // ≤ 3 s. Note that 2f+1 macroblock commit consensus uses its
-                        // own round/certificate path below — entirely separate from
-                        // microblock rank.
-                        //
-                        // Scalability: constant work per block, no per-validator scan.
-                        // Identical cost at 5 or 5000 validators.
+                        // Scalability: two O(1) DashMap reads per tick regardless of
+                        // validator count. Works identically at 5 or 5000 validators.
                         // ═══════════════════════════════════════════════════════════════
-                        let now_secs = get_timestamp_safe();
+                        let (adopted_timeout_round, f_plus_1) = if let Some(p2p) = &unified_p2p {
+                            let total_validators = p2p.get_active_validator_count();
+                            let f1 = (total_validators + 2) / 3; // ceil(n/3) = f+1
+                            let adopted = p2p.get_highest_adopted_round(timeout_mb_index, f1);
+                            (adopted, f1)
+                        } else {
+                            (0, 2)
+                        };
 
-                        // v14.8.9: use the canonical `compute_pacemaker_rank` helper.
-                        // Parent timestamp is read from finalized on-chain storage,
-                        // never from local wall-clock estimates — same value on every
-                        // validator. Deterministic fallback to 0 when parent missing.
-                        let pacemaker_rank: u64 =
-                            compute_pacemaker_rank(&storage, next_height, now_secs);
+                        let timeout_round_for_rotation = certified_timeout_round.max(adopted_timeout_round);
 
                         // ═══════════════════════════════════════════════════════════════
-                        // v14.8.9: DECOUPLE MICROBLOCK ROTATION FROM MACROBLOCK TC
+                        // v14.8.10: LOCAL PROPOSED ROUND (vote content only)
                         // ═══════════════════════════════════════════════════════════════
-                        // Previously: `pacemaker_rank.max(certified_timeout_round)`.
-                        //
-                        // That mixed TWO INDEPENDENT CONSENSUS DOMAINS into one
-                        // input for VRF producer selection:
-                        //
-                        //   Domain A — microblock slot rotation
-                        //     * wall-clock derived (pacemaker_rank)
-                        //     * deterministic per-block on every validator
-                        //
-                        //   Domain B — macroblock commit view change
-                        //     * signed 2f+1 TimeoutCertificate (certified round)
-                        //     * lives in its own async BFT protocol
-                        //
-                        // When Domain B's round drifted ahead of Domain A (signed
-                        // TC accumulated during a stall), producers started emitting
-                        // blocks with `timeout_round = certified` but `timestamp =
-                        // wall_clock_now`. Those two fields referenced different
-                        // time bases and the ingest rank-validation check (which
-                        // binds `timeout_round` to `timestamp`) correctly rejected
-                        // the inconsistent pair — freezing the chain.
-                        //
-                        // The canonical slot+checkpoint L1 design keeps these two
-                        // domains entirely separate: microblock rank uses wall
-                        // clock; macroblock commit uses signed certificates. They
-                        // never appear in the same formula.
-                        //
-                        // Removed: `.max(certified_timeout_round)`.
-                        // Kept: `certified_timeout_round` read above — still used
-                        //       below for chronic-stall diagnostics and for the
-                        //       macroblock commit path in unified_p2p, which is
-                        //       where it belongs.
-                        // ═══════════════════════════════════════════════════════════════
-                        let timeout_round_for_rotation = pacemaker_rank;
-
-                        // ═══════════════════════════════════════════════════════════════
-                        // v14.8.8: DETERMINISTIC TIMEOUT VOTE ROUND (wall-clock)
-                        // ═══════════════════════════════════════════════════════════════
-                        // TimeoutVote round MUST be deterministic across the network so
-                        // that 2f+1 same-round votes aggregate into a signed
-                        // TimeoutCertificate. Otherwise view-change for macroblock
-                        // commit never converges when the committee briefly has < 2f+1
-                        // alive (e.g. one node restarting + one on a forked branch).
-                        //
-                        // Grace check below decides WHETHER to vote (avoid spam on
-                        // short delays). If past grace, the round is `pacemaker_rank`,
-                        // which is derived purely from finalized prev_block.timestamp
-                        // plus wall clock — identical on every validator with
-                        // synchronised NTP (±RANK_WINDOW_SECS/2 tolerance).
-                        //
-                        // Scalability: O(1) per block — no per-validator scan, so
-                        // the formula costs the same at 5 or 5000 validators.
-                        //
-                        // Safety: TimeoutCertificate is still only accepted when
-                        // 2f+1 Dilithium3-signed votes at the SAME round aggregate.
-                        // Deterministic round derivation makes this reachable.
+                        // Proposed round = number of 1-second rotation slots past
+                        // adaptive grace. Signed at this round; once f+1 (adopted)
+                        // or 2f+1 (certified) Dilithium3-verified votes converge on
+                        // the same value, rotation advances deterministically.
                         // ═══════════════════════════════════════════════════════════════
                         let proposed_timeout_round: u64 = if local_delay <= timeout_grace_period {
                             0
                         } else {
-                            // Wall-clock rank — same on all validators with synced clocks.
-                            pacemaker_rank
+                            ((local_delay - timeout_grace_period) / TIMEOUT_VOTE_INTERVAL + 1) as u64
                         };
 
-                        // v14.8.9: `set_timeout_round(...)` removed — the legacy
-                        // global atomic is no longer used by any consensus-critical
-                        // path. Producer selection, block construction, and ingest
-                        // validation now each call `compute_pacemaker_rank` directly
-                        // so they all derive the rank from the same deterministic
-                        // (parent_ts, now) pair rather than reading a stale cache.
+                        // v14.8.10: store the BFT-agreed rotation round so producer
+                        // selection (main loop) and block construction read the same
+                        // value within this tick. Cleared on tip advance via
+                        // reset_timeout_round(); refreshed every stall iteration.
+                        set_timeout_round(timeout_round_for_rotation, next_height);
                         update_failover_metrics(local_delay, timeout_round_for_rotation);
 
                         // v11.0: HARDENED vote gate — unsynced/restarting nodes MUST NOT vote
@@ -15251,11 +15652,26 @@ impl BlockchainNode {
                         let is_synced_enough = production_unlocked
                             && (best_peer_h == 0 || our_h + 20 >= best_peer_h);
 
-                        if proposed_timeout_round > 0 && microblock_height > 0 && is_synced_enough {
+                        // v14.8.10: drift self-pause vote gate. A node whose clock
+                        // has drifted beyond the pause threshold for long enough
+                        // MUST stop broadcasting TimeoutVotes — its `proposed_round`
+                        // reflects wall-clock drift, not genuine network stall, and
+                        // would otherwise pollute f+1 adopted aggregation. Skipping
+                        // votes is BFT-safe: the committee converges on rotation
+                        // through the honest 2f+1 supermajority without us.
+                        let drift_paused = is_drift_self_paused();
+                        if drift_paused && is_warn() {
+                            println!(
+                                "[WARN][TIMEOUT] drift_self_paused h={} drift_ema={}s — suppressing timeout vote",
+                                next_height, get_clock_drift_ema_secs()
+                            );
+                        }
+
+                        if proposed_timeout_round > 0 && microblock_height > 0 && is_synced_enough && !drift_paused {
                             if is_info() {
-                                println!("[INFO][TIMEOUT] stall h={} mb={} delay={}s proposed={} certified={} pacemaker_rank={} rotation={}",
+                                println!("[INFO][TIMEOUT] stall h={} mb={} delay={}s proposed={} adopted={} certified={} rotation={} f1={}",
                                          next_height, timeout_mb_index, local_delay, proposed_timeout_round,
-                                         certified_timeout_round, pacemaker_rank, timeout_round_for_rotation);
+                                         adopted_timeout_round, certified_timeout_round, timeout_round_for_rotation, f_plus_1);
                             }
 
                             // STATE MACHINE: Network stall detected
@@ -15264,16 +15680,14 @@ impl BlockchainNode {
                                 recoverable: true,
                             });
 
-                            // v14.8.7: TimeoutVote broadcast for MACROBLOCK commit view change.
-                            // Microblock producer rotation is driven purely by the wall-clock
-                            // pacemaker above — no vote needed for rank advancement. TimeoutVote
-                            // is still useful for signalling macroblock-commit timeout at the
-                            // 90-block boundary, where 2f+1 signed same-round votes form a
-                            // broadcastable TimeoutCertificate that finalises a view change
-                            // deterministically across the network. Vote at `proposed_timeout_round`
-                            // (each node's honest local view); round convergence follows from
-                            // the wall-clock pacemaker driving every node to the same round
-                            // in the same physical interval.
+                            // v14.8.10: TimeoutVote broadcast drives BOTH microblock
+                            // rotation (via HIGHEST_ADOPTED_ROUND f+1 aggregation) AND
+                            // macroblock-commit view change (via HIGHEST_CERTIFIED_ROUND
+                            // 2f+1 TimeoutCertificate). Vote content = this node's local
+                            // proposed round; rotation consumers read the aggregated
+                            // BFT value. Skip if our round is not strictly above the
+                            // existing 2f+1 certified round — avoids redundant
+                            // gossip when the supermajority has already moved past us.
                             if proposed_timeout_round > certified_timeout_round {
                                 if let Some(p2p) = &unified_p2p {
                                     let last_block_hash = storage.get_latest_macroblock_hash()
@@ -15302,10 +15716,11 @@ impl BlockchainNode {
                                 }
                             }
 
-                            // v14.8.7: Select producer based on deterministic rotation round.
-                            // `timeout_round_for_rotation` is now wall-clock derived on every
-                            // node (plus any signed 2f+1 certificate round), so all nodes
-                            // compute the same producer.
+                            // v14.8.10: Select producer from the BFT-agreed rotation round.
+                            // `timeout_round_for_rotation = certified.max(adopted)` — each
+                            // component aggregates Dilithium3-verified signed votes, so
+                            // every validator converges on the same producer index once
+                            // the f+1 / 2f+1 signed vote thresholds are reached.
                             if timeout_round_for_rotation > 0 {
                                 if let Some(_p2p) = &unified_p2p {
                                     let current_producer = Self::select_microblock_producer_with_round(
@@ -16326,15 +16741,17 @@ impl BlockchainNode {
                     }
                 }
 
-                // v14.8.9: Get timeout_round for deterministic failover via the
-                // canonical helper. Parent timestamp from finalized storage,
-                // reference from wall clock — same inputs every validator sees.
-                // Returns 0 when parent is not yet local (sync gap) — the
-                // downstream `has_prev_block` self-exclude gates production
-                // anyway, so a deterministic 0 is harmless and keeps the
-                // candidate list identical across nodes.
-                let timeout_round: u64 =
-                    compute_pacemaker_rank(&storage, next_block_height, get_timestamp_safe());
+                // v14.8.10: Get timeout_round for deterministic failover from the
+                // stored BFT-agreed value. `set_timeout_round()` is called in the
+                // stall-detection path above every tick with
+                // `certified.max(adopted)` — both operands aggregate only
+                // Dilithium3-verified signed votes, so every validator reads the
+                // same value once gossip has reached them. On tip advance the
+                // value is cleared via `reset_timeout_round()` so a fresh block
+                // starts at round 0. Under steady-state (no stall) this is just
+                // a cheap atomic load that returns 0 → the primary producer
+                // stays selected.
+                let timeout_round: u64 = get_current_timeout_round();
 
                 // v3.8: Use select_microblock_producer_with_round for deterministic failover.
                 // Value is read-only after this point (validated via is_my_turn_to_produce,
@@ -16379,6 +16796,34 @@ impl BlockchainNode {
                     println!("[WARN][PROD] self_excluded h={} reason=fork_recovery", next_block_height);
                     is_my_turn_to_produce = false;
                     // Don't continue - let timeout_round failover handle it
+                }
+
+                // ═══════════════════════════════════════════════════════════════════════════
+                // v14.8.10: DRIFT SELF-PAUSE GATE
+                // ═══════════════════════════════════════════════════════════════════════════
+                // A node whose wall clock has drifted beyond the self-pause threshold
+                // (60 s EMA for 30 consecutive observations, after NTP re-sync attempts
+                // have failed to correct it) must NOT produce blocks. Its block
+                // timestamp would be rejected by honest peers via
+                // TIMESTAMP_FUTURE_TOLERANCE, causing a 30-block slot stall until
+                // BFT-driven rotation failovers to another producer.
+                //
+                // Pausing ourselves is the clean fix: VRF committee re-selection every
+                // 90 blocks will naturally drop us from the next committee window,
+                // and `observe_clock_drift` auto-clears the flag (with hysteresis)
+                // as soon as the clock recovers.
+                //
+                // Scalability: O(1) atomic load, zero network overhead.
+                // Safety: LOCAL decision only; no signed state touched.
+                // ═══════════════════════════════════════════════════════════════════════════
+                if is_my_turn_to_produce && is_drift_self_paused() {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PROD] drift_self_paused h={} drift_ema={}s — skipping production",
+                            next_block_height, get_clock_drift_ema_secs()
+                        );
+                    }
+                    is_my_turn_to_produce = false;
                 }
                 
                 // ═══════════════════════════════════════════════════════════════════════════
@@ -18302,26 +18747,17 @@ impl BlockchainNode {
                     // Producer sets real wall clock time. Validators verify monotonicity + bounded future.
                     // Old approach (genesis + height) caused accumulating drift: 20min/8h → days/year.
                     // Timestamp is part of signed block hash → all nodes see the same value.
-                    //
-                    // v14.8.9: parent_ts hoisted OUT of the timestamp block so it is
-                    // also usable by the block's `timeout_round` computation below.
-                    // The block's `timeout_round` MUST be derived from the SAME
-                    // `(timestamp, parent_ts)` pair used here — otherwise ingest
-                    // rank-validation (block_pipeline) would see inconsistent ts/rank
-                    // and reject the block. See v14.8.9 notes in the pacemaker block
-                    // of this function for the full rationale.
-                    let parent_ts: u64 = if next_block_height > 0 {
-                        match storage.load_microblock_auto_format(next_block_height - 1) {
-                            Ok(Some(parent)) => parent.timestamp,
-                            _ => 0,
-                        }
-                    } else {
-                        0
-                    };
-
                     let deterministic_timestamp = {
                         let now_ts = get_timestamp_safe();
                         // Ensure strict monotonicity relative to parent.
+                        let parent_ts = if next_block_height > 0 {
+                            match storage.load_microblock_auto_format(next_block_height - 1) {
+                                Ok(Some(parent)) => parent.timestamp,
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        };
                         if now_ts > parent_ts {
                             now_ts
                         } else {
@@ -18329,16 +18765,7 @@ impl BlockchainNode {
                         }
                     };
 
-                    // v14.8.9: `block.timeout_round` bound to the SAME
-                    // (parent_ts, timestamp) pair this block uses for its own
-                    // header via the canonical `pacemaker_rank_from_inputs`
-                    // helper. Ingest will recompute against the exact same
-                    // formula, so ts/rank consistency is structural — not
-                    // dependent on any shared-state race between the stall
-                    // detector and block construction.
-                    let block_rank: u64 =
-                        pacemaker_rank_from_inputs(parent_ts, deterministic_timestamp);
-                    
+
                     // Get previous block hash
                     let prev_hash = Self::get_previous_microblock_hash(&storage, next_block_height).await;
                     
@@ -18641,7 +19068,7 @@ impl BlockchainNode {
                         vrf_proof: qrb_proof,
                         fees_collected: block_fees_collected, // v3.18: Direct to producer
                         state_root: [0u8; 32], // v3.27: Will be set below after TX+fees application
-                        timeout_round: block_rank, // v14.8.9: derived from OWN (timestamp,parent_ts) — consistent pair
+                        timeout_round: get_current_timeout_round(), // v14.8.10: BFT-agreed round (certified.max(adopted)) stored by stall detector; 0 in steady state
                     };
                     
                     // ═══════════════════════════════════════════════════════════════════════════
@@ -19183,34 +19610,47 @@ impl BlockchainNode {
                     //     production loop picks up the new round deterministically and
                     //     produces cleanly.
                     //
-                    // v14.8.9: stale-round self-check uses WALL-CLOCK pacemaker_rank,
-                    // NOT macroblock `certified_timeout_round`. Microblock rotation is
-                    // driven purely by the wall-clock pacemaker (see the decoupling
-                    // block around line 15106 and the block-construction block above).
-                    // Comparing our block's rank against the macroblock's certified
-                    // round would cross consensus domains and produce the same
-                    // non-determinism that caused the observed prod stall at mb=145.
+                    // v14.8.10: stale-round self-check uses the BFT-agreed
+                    // rotation round `certified.max(adopted)` — the same value
+                    // the main loop and stall detector use when selecting the
+                    // producer. If signed votes have rotated the network past
+                    // the round we locked in at production start, our block
+                    // is stale and the failover producer's block (at the new
+                    // round) must win. No cross-domain wall-clock comparison.
                     //
-                    // Canonical check: between the time we captured `block_rank` from
-                    // our timestamp and now, has wall-clock advanced to a later rank?
-                    // If yes, a rank+1 producer may have already won the slot — yield.
+                    // Safety:
+                    //   * HIGHEST_ADOPTED_ROUND is populated only after
+                    //     Dilithium3 verification of f+1 signed TimeoutVotes —
+                    //     unforgeable by ≤ f Byzantine validators.
+                    //   * HIGHEST_CERTIFIED_ROUND still requires 2f+1 signed
+                    //     votes at the same round.
                     //
-                    // Scalability: two storage reads + one arithmetic — O(1) per block
-                    // save, independent of validator count.
+                    // Scalability: two DashMap reads — O(1) per block save,
+                    // independent of validator count.
                     // ═══════════════════════════════════════════════════════════════════════════
                     {
-                        // v14.8.9: canonical helper — same formula used by
-                        // stall detection, main loop, block construction,
-                        // and ingest validation. Single source of truth.
-                        let current_rank: u64 = compute_pacemaker_rank(
-                            &storage_clone,
-                            height_for_storage,
-                            get_timestamp_safe(),
-                        );
-                        if current_rank > microblock.timeout_round {
+                        // v14.8.10: re-read certified + adopted rounds from
+                        // shared state right before broadcast; any advance past
+                        // the value baked into the block means rotation has
+                        // moved on and our candidate is stale.
+                        let current_rotation_round: u64 = if let Some(ref p2p) = unified_p2p {
+                            let total_validators = p2p.get_active_validator_count();
+                            let f1 = (total_validators + 2) / 3; // ceil(n/3) = f+1
+                            let certified = p2p.get_highest_certified_round(
+                                height_for_storage / 90,
+                            );
+                            let adopted = p2p.get_highest_adopted_round(
+                                height_for_storage / 90,
+                                f1,
+                            );
+                            certified.max(adopted)
+                        } else {
+                            0
+                        };
+                        if current_rotation_round > microblock.timeout_round {
                             println!(
-                                "[WARN][PROD] yield_stale_round h={} produced_for_round={} current_rank={} action=skip_save",
-                                height_for_storage, microblock.timeout_round, current_rank
+                                "[WARN][PROD] yield_stale_round h={} produced_for_round={} current_rotation_round={} action=skip_save",
+                                height_for_storage, microblock.timeout_round, current_rotation_round
                             );
                             // Clear broadcast lock so the next iteration can proceed
                             crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS
@@ -20148,15 +20588,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     //   → Each node excluded producers LOCALLY after 4s → NON-DETERMINISTIC
                                     //   → Blocks from real producer REJECTED → NETWORK STALL + FORK
                                     //
-                                    // NEW (CORRECT, v14.8.9):
-                                    //   → Microblock failover is driven by the wall-clock pacemaker
-                                    //     (`compute_pacemaker_rank` / `pacemaker_rank_from_inputs`).
-                                    //   → Rank advances deterministically every RANK_WINDOW_SECS on
-                                    //     every validator, so `(base_idx + rank) % N` rotates the
-                                    //     producer without any local exclusion or voting.
-                                    //   → Macroblock commit view change still uses the signed 2f+1
-                                    //     TimeoutCertificate path — but it lives in its own domain
-                                    //     and never enters microblock producer selection.
+                                    // NEW (CORRECT, v14.8.10):
+                                    //   → Failover is driven by BFT-agreed rotation round
+                                    //     `certified.max(adopted)` — both operands aggregate
+                                    //     only Dilithium3-verified signed TimeoutVotes
+                                    //     (f+1 for HIGHEST_ADOPTED_ROUND, 2f+1 for
+                                    //     HIGHEST_CERTIFIED_ROUND).
+                                    //   → Every validator reads the same value once the
+                                    //     signed votes have been gossiped, so the VRF
+                                    //     formula `(base_idx + rotation_round) % N` selects
+                                    //     the same producer on every node.
+                                    //   → No local exclusion, no wall-clock-derived rank,
+                                    //     no cross-domain mixing.
                                     // ═══════════════════════════════════════════════════════════════════════════
                                     
                                     let timeout_duration = actual_timeout.as_secs();

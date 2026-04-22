@@ -700,71 +700,27 @@ impl BlockPipeline {
             }
 
             // ═══════════════════════════════════════════════════════════════════════════
-            // 2b. v14.8.9: PACEMAKER-RANK ↔ TIMESTAMP CONSISTENCY CHECK
+            // 2b. v14.8.10: PACEMAKER-RANK CHECK REMOVED
             // ═══════════════════════════════════════════════════════════════════════════
-            // Under the decoupled rotation model (v14.8.9) microblock producer rotation
-            // is driven exclusively by the wall-clock pacemaker:
+            // Under the BFT-driven rotation model (v14.8.10), `block.timeout_round`
+            // is the network's certified/adopted round at construction time, NOT a
+            // wall-clock derivation. Ingest cannot recompute the expected value
+            // locally — doing so would cross back into the non-deterministic
+            // wall-clock pacemaker that caused the v14.8.7..9 fork regression.
             //
-            //   slot_start   = prev_block.timestamp + SLOT_LEN_SECS
-            //   expected_rank(block) = (block.timestamp − slot_start) / RANK_WINDOW_SECS
+            // Safety for this value is carried by:
+            //   * Dilithium3 signature over the block header (step 3) — a
+            //     Byzantine producer cannot forge a block claiming any round.
+            //   * Producer authority check (step 4) — same-round mismatch against
+            //     the locally derived `(expected_producer, expected_round)` cache
+            //     is a HARD reject, so a producer claiming a round they did not
+            //     earn cannot override the honest expected producer.
+            //   * Hash chain + parent monotonicity (steps 1 and 2) — timestamp
+            //     still has to progress monotonically within the future-tolerance
+            //     window, preventing arbitrary reordering.
             //
-            // Producers compute `block.timeout_round` from the SAME `(timestamp,
-            // parent_ts)` pair this header carries (see `block_rank` at the block-
-            // construction site in node.rs). Therefore on any honest validator:
-            //
-            //   block.timeout_round ≡ expected_rank(block)         (±NTP drift ≤ 1)
-            //
-            // A Byzantine producer that tries to shift the VRF producer index to
-            // themselves by fabricating a higher rank would have to sign a block
-            // whose `timestamp` agrees with that rank's window. Since timestamp is
-            // checked independently against wall clock (future-tolerance check 2)
-            // and against parent's timestamp (monotonicity), this double binding
-            // removes the attack surface without cross-referencing any other
-            // consensus domain.
-            //
-            // Rule: |block.timeout_round − expected_rank(block)| ≤ NTP_TOL.
-            // NTP_TOL = 1 (one RANK_WINDOW of slack — ~±1.5 s physical drift).
-            //
-            // If prev block is not locally available (sync gap), fall through —
-            // hash chain + signature still enforce correctness, and validation
-            // resumes once the parent is stored.
-            //
-            // Scalability: one storage read per block, O(1) regardless of
-            // validator count. Works identically at 5 or 5000 validators.
-            //
-            // v14.8.9 decoupling note: this check does NOT reference
-            // `HIGHEST_CERTIFIED_ROUND`. Microblock rotation is its own domain;
-            // macroblock commit's certified round lives in the commit-protocol
-            // state and never enters the microblock rank check.
+            // Scalability / Liveness: one fewer storage read per block.
             // ═══════════════════════════════════════════════════════════════════════════
-            if !snap.is_syncing() && mb.height > 1 {
-                // v14.8.9: use the canonical `pacemaker_rank_from_inputs` helper
-                // from node.rs — same formula the producer used to compute
-                // `block.timeout_round` at construction time. Consistency is
-                // structural: identical inputs, identical output (±NTP_TOL).
-                const NTP_TOL: i64 = 1; // ±1 rank tolerance for typical NTP drift
-                if let Ok(Some(prev_mb)) = storage.load_microblock_auto_format(mb.height - 1) {
-                    let expected_rank: u64 = crate::node::pacemaker_rank_from_inputs(
-                        prev_mb.timestamp,
-                        mb.timestamp,
-                    );
-                    let diff: i64 = (mb.timeout_round as i64) - (expected_rank as i64);
-                    if diff.abs() > NTP_TOL {
-                        if is_warn() {
-                            let slot_start = prev_mb.timestamp
-                                .saturating_add(crate::node::PACEMAKER_SLOT_LEN_SECS);
-                            println!(
-                                "[WARN][PIPELINE] pacemaker_rank_invalid h={} rank={} expected={} ts={} slot_start={} diff={} tol=±{} from={}",
-                                mb.height, mb.timeout_round, expected_rank,
-                                mb.timestamp, slot_start, diff, NTP_TOL, decoded.from_peer
-                            );
-                        }
-                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                }
-                // else: parent not yet local — defer to hash chain check
-            }
 
             // 3. Signature verification
             // Genesis block (h=0) uses embedded self-signed keys — skip standard verification
@@ -797,20 +753,22 @@ impl BlockPipeline {
             }
 
             // ═══════════════════════════════════════════════════════════════════════════
-            // 4. Producer authority check — v14.8.9 CANONICAL (same-round ≡ HARD reject)
+            // 4. Producer authority check — v14.8.10 CANONICAL (same-round ≡ HARD reject)
             // ═══════════════════════════════════════════════════════════════════════════
             // Two categories of producer mismatch remain possible on ingest:
             //
             //   A. timeout_divergence: block.timeout_round != locally cached round.
-            //      This happens during normal failover when the cached rank
-            //      (populated by the main loop using wall-clock pacemaker) differs
-            //      from the round the producer committed into the block. Because
-            //      we do NOT re-derive the expected producer at the block's claimed
-            //      rank here (that would require VRF state — macroblock N-2 snapshot
-            //      + candidate list), we can't prove a mismatch; INFO log only.
-            //      Safety still holds: step 2b already bound block.timeout_round
-            //      to block.timestamp (±1 NTP rank), so a Byzantine cannot inflate
-            //      the rank arbitrarily.
+            //      The cached `(expected_producer, expected_round)` pair was
+            //      populated by the main loop using `get_current_timeout_round()`
+            //      — the BFT-agreed `certified.max(adopted)` value. A remote
+            //      producer may have produced at a different round because its
+            //      view of HIGHEST_CERTIFIED_ROUND / HIGHEST_ADOPTED_ROUND had
+            //      advanced by the time of signing, or because we have not yet
+            //      received the signed votes that moved our local value. We do
+            //      NOT re-derive the expected producer at the block's claimed
+            //      round on ingest (that would require refreshing VRF state
+            //      with the remote's pre-image), so we only log and let hash
+            //      chain + signature + 2f+1 macroblock commit handle it.
             //
             //   B. same_round_mismatch: cached round == block.timeout_round, but
             //      block.producer != expected. The cache was populated by the
@@ -822,13 +780,13 @@ impl BlockPipeline {
             //
             // Historical note: rejecting on producer mismatch was blamed for
             // forks in v13.3 because the expected-producer cache at that time
-            // depended on LOCAL non-deterministic state (adopted round etc.).
-            // Under v14.8.9 the cache is populated via `compute_pacemaker_rank`
-            // + the canonical VRF formula — its value is a pure function of
-            // finalized on-chain state plus wall clock, so every validator at
-            // the same height & rank derives the same expected producer. Hard
-            // rejection is therefore consistent across the network: either
-            // all honest validators reject the block, or none do. No fork.
+            // depended on LOCAL non-deterministic state. Under v14.8.10 the
+            // cache is populated from the stored BFT-agreed round, which is a
+            // pure function of Dilithium3-verified signed votes and on-chain
+            // VRF state — every validator at the same height & round derives
+            // the same expected producer. Hard rejection is therefore
+            // consistent across honest validators: either all reject the block,
+            // or none do. No fork.
             //
             // Gated to `!is_syncing()` so historical blocks received during
             // catch-up aren't judged against the live cache.
@@ -838,10 +796,12 @@ impl BlockPipeline {
                 if let Some((expected, expected_round)) = crate::node::get_expected_producer(mb.height) {
                     if mb.producer != expected {
                         if mb.timeout_round != expected_round {
-                            // Category A: Timeout divergence — different rank claimed.
+                            // Category A: Timeout divergence — different round claimed.
                             // Without an ingest-side VRF re-derivation we cannot
-                            // declare this invalid; step 2b's timestamp↔rank binding
-                            // prevents the only attack class where this matters.
+                            // declare this invalid; signature + hash chain + 2f+1
+                            // macroblock commit still enforce correctness, and
+                            // the BFT-driven rotation converges once all nodes
+                            // have gossiped their signed TimeoutVotes.
                             if is_info() {
                                 println!("[INFO][PIPELINE] timeout_divergence h={} our_round={} block_round={} our_prod={} block_prod={}",
                                          mb.height, expected_round, mb.timeout_round, expected, mb.producer);
@@ -1174,14 +1134,30 @@ impl BlockPipeline {
                 );
                 crate::node::LAST_BLOCK_PRODUCED_HEIGHT.store(height, Ordering::Relaxed);
 
-                // v14.8.9: global timeout-round atomic removed. Pacemaker rank
-                // derives from (parent_ts, now) at each call site, so "reset on
-                // tip advance" is a no-op — the next rank computation already
-                // sees the new parent_ts.
+                // v14.8.10: observational clock-drift monitor. Feeds on-chain
+                // block timestamp (producer-signed wall clock, agreed by 2f+1
+                // honest committee for finalised macroblocks) into an EMA of
+                // |local_now − block_ts|. Purely observational — triggers
+                // WARN log and async NTP re-sync on drift, NEVER participates
+                // in consensus rotation. Safe at any validator-count scale.
+                crate::node::observe_clock_drift(
+                    block.microblock.timestamp,
+                    crate::node::get_timestamp_safe(),
+                );
+
+                // v14.8.10: Reset global CURRENT_TIMEOUT_ROUND atomic ONLY on
+                // tip advance (next expected microblock applied). While
+                // receiving blocks far behind tip (catch-up sync), the stored
+                // round stays intact so a syncing node does not disrupt
+                // rotation of nodes already at the tip. On genuine tip advance
+                // the round is cleared because the happy-path producer has
+                // succeeded — next block starts back at round 0 until a new
+                // stall is detected.
                 let is_tip_advance = height == prev_tip + 1;
                 if is_tip_advance {
+                    crate::node::reset_timeout_round();
                     if crate::node::is_debug() {
-                        println!("[DBG][PIPELINE] tip_advance h={} prev_tip={} (rank self-derived)", height, prev_tip);
+                        println!("[DBG][PIPELINE] round_reset h={} prev_tip={}", height, prev_tip);
                     }
                 } else if height > prev_tip + 1 && crate::node::is_debug() {
                     println!("[DBG][PIPELINE] round_preserved h={} prev_tip={} reason=sync_or_skip",
