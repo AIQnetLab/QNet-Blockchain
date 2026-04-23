@@ -683,12 +683,21 @@ impl BlockPipeline {
             }
 
             // 2. Timestamp validation (only in live mode — sync mode skips)
+            // v14.8.11: three-check canonical timestamp model.
+            //   (a) FUTURE:       block.ts ≤ wall_clock + TIMESTAMP_FUTURE_TOLERANCE
+            //   (b) MEDIAN-PAST:  block.ts > median(last 11 on-chain timestamps)
+            //   (c) MONOTONICITY: block.ts > parent.ts (enforced in step 1 hash chain)
+            // Same ruleset is applied in `validate_received_microblock`; this
+            // pipeline check catches bad blocks before they reach the apply
+            // stage.
             let snap = coordinator.snapshot();
             if !snap.is_syncing() && mb.height > 0 {
                 let now = crate::node::get_timestamp_safe();
-                // FIX R22-T5: Use unified TIMESTAMP_FUTURE_TOLERANCE (15s) from node.rs
-                // Was hardcoded 30s here vs 15s in validate_received_microblock() — inconsistent
-                // acceptance window caused blocks to pass pipeline but fail node validation.
+                // (a) FUTURE check against raw wall clock: canonical design, so
+                // an attacker cannot game the window via network-adjusted time.
+                // TIMESTAMP_FUTURE_TOLERANCE = 7200 s (2 h) comfortably covers
+                // realistic hypervisor / NTP events without letting Byzantine
+                // inflation go unchecked.
                 if mb.timestamp > now + crate::node::TIMESTAMP_FUTURE_TOLERANCE {
                     if is_warn() {
                         println!("[WARN][PIPELINE] future_block h={} delta=+{}s from={}",
@@ -696,6 +705,20 @@ impl BlockPipeline {
                     }
                     metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                     continue;
+                }
+                // (b) MEDIAN-PAST rule. Silently skipped during the first ~11
+                // blocks after boot when the ring is undersized.
+                if let Some(median_past) = crate::node::median_past_timestamp() {
+                    if mb.timestamp <= median_past {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] median_past_violation h={} ts={} median_past={} from={}",
+                                mb.height, mb.timestamp, median_past, decoded.from_peer
+                            );
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 }
             }
 

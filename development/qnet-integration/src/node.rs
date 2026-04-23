@@ -542,58 +542,31 @@ static CLOCK_DRIFT_EMA_MILLIS: AtomicU64 = AtomicU64::new(0);
 /// Peak observed drift (seconds). Informational, never cleared.
 static CLOCK_DRIFT_PEAK_SECS: AtomicU64 = AtomicU64::new(0);
 
-/// Unix timestamp of the last NTP re-sync trigger (rate-limit).
-static LAST_NTP_RESYNC_TS: AtomicU64 = AtomicU64::new(0);
-
-/// Total count of NTP re-sync attempts triggered by the drift monitor.
-/// Monotonically increases; exposed via health endpoint for fleet operators
-/// to detect nodes where re-sync is not converging (count keeps rising).
-static NTP_RESYNC_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-
-/// Count of consecutive observations with EMA above the self-pause threshold
-/// while NTP re-sync has been attempted but drift has not improved. Reset to
-/// 0 when EMA drops back below the pause threshold. Triggers self-pause when
-/// it crosses `SELF_PAUSE_STREAK_THRESHOLD`.
-static CLOCK_DRIFT_PAUSE_STREAK: AtomicU64 = AtomicU64::new(0);
-
-/// Self-pause flag. When true, this node will NOT produce blocks and will
-/// NOT broadcast timeout votes — it becomes a passive observer that still
-/// validates and gossips blocks from others. Cleared automatically once
-/// `CLOCK_DRIFT_EMA_MILLIS` falls back below the recovery threshold.
+/// v14.8.11: SELF-PAUSE REMOVED.
 ///
-/// Safety note: this is a LOCAL flag. Other validators are not told about
-/// it; from their perspective we simply go silent, and VRF rotation (which
-/// samples a fresh committee every 90 blocks from the candidate pool)
-/// naturally excludes us from the next committee if we keep missing votes.
-/// This is the canonical BFT-safe way to remove a misconfigured node from
-/// consensus without special-case network messaging.
-static CLOCK_DRIFT_SELF_PAUSED: AtomicBool = AtomicBool::new(false);
-
-/// EMA threshold (seconds) at which we start counting the pause streak.
-/// Chosen so that only truly broken nodes (VM paused, NTP server dead for
-/// many minutes, hypervisor clock skew) reach this — not normal WAN drift
-/// or transient NTP wobble.
-const CLOCK_DRIFT_PAUSE_EMA_THRESHOLD_SECS: u64 = 60;
-
-/// Consecutive observations above threshold required before pausing. At ~1s
-/// block cadence this gives the operator ~30 s to fix the clock before the
-/// node pauses itself. Prevents flapping on short transient drift spikes.
-const SELF_PAUSE_STREAK_THRESHOLD: u64 = 30;
-
-/// EMA threshold (seconds) at which a paused node resumes. Hysteresis
-/// below the pause threshold prevents oscillation.
-const CLOCK_DRIFT_RESUME_EMA_THRESHOLD_SECS: u64 = 10;
-
-/// Returns true when this node has paused itself due to persistent drift.
-/// Called from production / vote gates to enforce the self-pause.
-pub fn is_drift_self_paused() -> bool {
-    CLOCK_DRIFT_SELF_PAUSED.load(Ordering::Relaxed)
-}
-
-/// Total number of NTP re-sync attempts made by the drift monitor.
-pub fn get_ntp_resync_attempts() -> u64 {
-    NTP_RESYNC_ATTEMPTS.load(Ordering::Relaxed)
-}
+/// Earlier revision (v14.8.10) paused nodes with persistent drift to stop
+/// them polluting the consensus round aggregation. On a small committee
+/// this rapidly killed the 2f+1 quorum — two paused nodes out of five
+/// removed 40% of the committee, and the network froze.
+///
+/// Canonical patterns adopted instead (proven in multiple production L1
+/// systems, see FILE HEADER):
+///   * Median-aware block timestamp generation — a drifted node still
+///     produces blocks whose timestamp is pulled back into the canonical
+///     network range via the median of the last 32 on-chain timestamps.
+///   * Wide future-tolerance window (2 h) for validation — absorbs the
+///     vast majority of real-world hypervisor / live-migration events
+///     without rejecting honest blocks.
+///   * Median-Past rule (last 11 samples, strictly greater than median)
+///     — blocks cannot be pushed into the past, preventing rewrite
+///     attempts via stale timestamps.
+///   * Rotation round is still driven by BFT-agreed signed votes, so a
+///     drifted node's local proposed round never affects producer
+///     selection unless it converges with the network via signed 2f+1
+///     evidence.
+///
+/// Net effect: drifted nodes remain productive; the committee keeps
+/// its quorum; safety is preserved via macroblock finality.
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // v14.8.10: MEDIAN-LBPT NETWORK-TIME SELF-CALIBRATION
@@ -736,27 +709,90 @@ pub fn effective_now() -> u64 {
     wall
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// v14.8.11: MEDIAN-PAST RULE (canonical timestamp-rewrite defence)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Rule: `block.timestamp > median(last N on-chain block timestamps)`.
+// Canonical window size N = 11 (MEDIAN_PAST_WINDOW).
+//
+// Purpose:
+//   * Prevents a producer from rewriting the near-past by signing a block
+//     with a timestamp below the agreed median. Combined with parent
+//     monotonicity (`block.timestamp > parent.timestamp`) and the wide
+//     future-tolerance window, it bounds timestamp manipulation to a very
+//     narrow window — an attacker can only push forward, never backward,
+//     and only within `TIMESTAMP_FUTURE_TOLERANCE` of real time.
+//   * Complements (but does not replace) the BFT macroblock finality path:
+//     safety for long-range rewrites comes from 2f+1 committed macroblocks
+//     every 90 blocks; the Median-Past rule is the microblock-layer
+//     backstop against nuisance timestamp games within an epoch.
+//
+// Reads from the on-chain ring buffer populated by `observe_clock_drift`
+// / `update_network_time_sample`. During the first ~11 blocks after boot
+// the ring is undersized and the rule returns None, letting the producer
+// fall back to `parent+1` monotonicity alone — this is safe because the
+// very first blocks after boot also cannot be rewritten without breaking
+// the hash chain.
+//
+// Scalability: single O(N log N) sort over a tiny fixed-size window;
+// microseconds regardless of committee size. Works identically at 5 or
+// 10 000 validators.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Compute the Median-Past timestamp over the last `MEDIAN_PAST_WINDOW`
+/// on-chain samples. Returns `None` if the ring has fewer samples than the
+/// window, in which case callers should fall back to `parent+1` monotonicity.
+pub fn median_past_timestamp() -> Option<u64> {
+    let ring = NETWORK_TIME_RING.lock();
+    if ring.len < MEDIAN_PAST_WINDOW {
+        return None;
+    }
+    // Snapshot the most recent MEDIAN_PAST_WINDOW samples. `ring.samples`
+    // is a ring buffer of `NETWORK_TIME_WINDOW` slots (>= MEDIAN_PAST_WINDOW
+    // by construction). We walk backwards from `head` to collect the last
+    // `MEDIAN_PAST_WINDOW` entries in O(N).
+    let window_size = MEDIAN_PAST_WINDOW;
+    let total = ring.samples.len();
+    let mut collected: Vec<u64> = Vec::with_capacity(window_size);
+    for offset in 1..=window_size {
+        // head is the next write index; (head - offset) wraps into the
+        // slot of the most recent sample when offset == 1.
+        let idx = (ring.head + total - offset) % total;
+        let (_, ts) = ring.samples[idx];
+        collected.push(ts);
+    }
+    drop(ring);
+    collected.sort_unstable();
+    // Median of an odd-size (11) slice: the middle element.
+    Some(collected[window_size / 2])
+}
+
 /// Feed an observation into the drift monitor.
 /// `block_ts`  — on-chain timestamp of a just-applied network block.
 /// `local_now` — wall clock when the block was applied.
 /// Pure observational — safe to call from any thread.
 ///
-/// Four-level escalation ladder (v14.8.10):
-///   L1 (ema > 10 s):  [WARN][DRIFT] log — operator notice, no side-effect
-///   L2 (ema > 30 s):  async NTP re-sync trigger (rate-limited per 5 min)
-///   L3 (ema > 60 s for 30 consecutive blocks): SELF-PAUSE
-///                     — node stops producing blocks AND stops broadcasting
-///                     timeout votes. VRF committee rotation naturally
-///                     excludes it from the next committee window.
-///   L4 (ema back below 10 s): SELF-RESUME — clears pause flag with
-///                     hysteresis so we do not oscillate.
+/// v14.8.11: Monitoring-only. Thresholds:
+///   EMA > 10 s : [WARN][DRIFT] log — operator notice, no consensus effect
+///
+/// All consensus-side drift compensation lives in:
+///   * `effective_now()` — used in local stall detection
+///   * Median-aware block timestamp generation (see block construction)
+///   * Wide validation window (`TIMESTAMP_FUTURE_TOLERANCE`)
+///   * Median-Past rule (see `median_past_timestamp`)
+///
+/// The monitor never pauses production or blocks voting — a drifted node
+/// remains productive, its block timestamps are pulled back to the canonical
+/// network range by the median rule, and it keeps contributing to the BFT
+/// quorum. This preserves liveness on small committees (5-node genesis)
+/// while scaling cleanly to thousands of super-nodes.
 pub fn observe_clock_drift(block_ts: u64, local_now: u64) {
-    // v14.8.10: feed the on-chain timestamp into the network-time ring so
-    // `effective_now()` can self-calibrate stall detection when this
-    // node's wall clock is behind the network. Height is derived from
-    // LAST_BLOCK_PRODUCED_HEIGHT which is updated in the same pipeline
-    // path that calls this function. Safe to call before or after height
-    // update — the ring rejects non-monotonic heights.
+    // Feed the on-chain timestamp into the network-time ring so
+    // `effective_now()` and median-aware generation can self-calibrate.
+    // Height is derived from LAST_BLOCK_PRODUCED_HEIGHT which is updated
+    // in the same pipeline path that calls this function. Safe to call
+    // before or after height update — the ring rejects non-monotonic
+    // heights.
     let observed_height = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
     update_network_time_sample(observed_height, block_ts);
 
@@ -767,9 +803,6 @@ pub fn observe_clock_drift(block_ts: u64, local_now: u64) {
         block_ts - local_now
     };
 
-    // Bounded: a 15s future-tolerance block + network RTT is noise,
-    // not drift. Anything above TIMESTAMP_FUTURE_TOLERANCE + small RTT
-    // margin is a real signal.
     let drift_millis: u64 = abs_drift_secs.saturating_mul(1000);
 
     // EMA with α = 1/8 (slow-moving, ignores single-block outliers).
@@ -784,125 +817,22 @@ pub fn observe_clock_drift(block_ts: u64, local_now: u64) {
         CLOCK_DRIFT_PEAK_SECS.store(abs_drift_secs, Ordering::Relaxed);
     }
 
-    // Thresholds — only act on EMA, not single observation.
+    // Monitoring: log when EMA crosses the operator-attention threshold.
+    // Purely informational — no consensus side-effect.
     let ema_secs = next / 1000;
-
-    // L1: WARN (no side effect).
     if ema_secs > 10 && is_warn() {
         println!(
-            "[WARN][DRIFT] ema={}s peak={}s obs_now={} block_ts={} — check NTP",
+            "[WARN][DRIFT] ema={}s peak={}s obs_now={} block_ts={} — check host NTP",
             ema_secs, abs_drift_secs, local_now, block_ts
         );
     }
-
-    // L2: CRITICAL — trigger NTP re-sync (rate-limited, non-blocking).
-    if ema_secs > 30 {
-        let last = LAST_NTP_RESYNC_TS.load(Ordering::Relaxed);
-        if local_now.saturating_sub(last) > 300 {
-            LAST_NTP_RESYNC_TS.store(local_now, Ordering::Relaxed);
-            NTP_RESYNC_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-            trigger_ntp_resync_async(ema_secs);
-        }
-    }
-
-    // L3: SELF-PAUSE — persistent severe drift that the OS daemon cannot fix.
-    // Increment streak when EMA stays above pause threshold; reset otherwise.
-    // When streak crosses SELF_PAUSE_STREAK_THRESHOLD we set the pause flag —
-    // the production gate and vote gate both honour it on their next tick.
-    //
-    // This protects the rest of the committee from:
-    //   * stale-timestamp blocks (would be rejected by peers → 30-block stall)
-    //   * spurious timeout votes with inflated rounds
-    //
-    // VRF committee re-selection every 90 blocks will naturally drop this
-    // node from the next committee window because it stops participating.
-    if ema_secs > CLOCK_DRIFT_PAUSE_EMA_THRESHOLD_SECS {
-        let streak = CLOCK_DRIFT_PAUSE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
-        if streak >= SELF_PAUSE_STREAK_THRESHOLD
-            && !CLOCK_DRIFT_SELF_PAUSED.swap(true, Ordering::SeqCst)
-        {
-            if is_warn() {
-                println!(
-                    "[WARN][DRIFT] self_pause_engaged ema={}s streak={} — \
-                     node stopped producing blocks and timeout votes until drift recovers",
-                    ema_secs, streak
-                );
-            }
-        }
-    } else {
-        CLOCK_DRIFT_PAUSE_STREAK.store(0, Ordering::Relaxed);
-
-        // L4: SELF-RESUME with hysteresis. Only clear the pause flag once
-        // EMA has dropped well below the pause threshold — prevents
-        // oscillation around the trigger point.
-        if ema_secs <= CLOCK_DRIFT_RESUME_EMA_THRESHOLD_SECS
-            && CLOCK_DRIFT_SELF_PAUSED.swap(false, Ordering::SeqCst)
-        {
-            if is_info() {
-                println!(
-                    "[INFO][DRIFT] self_pause_cleared ema={}s — resuming production and voting",
-                    ema_secs
-                );
-            }
-        }
-    }
 }
 
-/// Trigger NTP re-sync in background — same commands as startup.
-/// Never blocks consensus; non-fatal on failure.
-fn trigger_ntp_resync_async(ema_secs: u64) {
-    std::thread::spawn(move || {
-        if is_warn() {
-            println!("[WARN][DRIFT] ntp_resync_trigger ema={}s — attempting host NTP sync", ema_secs);
-        }
-
-        // Try systemd-timesyncd first.
-        if let Ok(out) = std::process::Command::new("timedatectl")
-            .args(&["set-ntp", "true"])
-            .output()
-        {
-            if out.status.success() {
-                let _ = std::process::Command::new("systemctl")
-                    .args(&["restart", "systemd-timesyncd"])
-                    .output();
-                if is_info() {
-                    println!("[INFO][DRIFT] ntp_resync_ok daemon=systemd-timesyncd");
-                }
-                return;
-            }
-        }
-
-        // Fallback: chrony.
-        if let Ok(out) = std::process::Command::new("chronyc")
-            .args(&["makestep"])
-            .output()
-        {
-            if out.status.success() {
-                if is_info() {
-                    println!("[INFO][DRIFT] ntp_resync_ok daemon=chrony");
-                }
-                return;
-            }
-        }
-
-        // Legacy fallback: ntpdate.
-        if let Ok(out) = std::process::Command::new("ntpdate")
-            .args(&["-u", "pool.ntp.org"])
-            .output()
-        {
-            if out.status.success() {
-                if is_info() {
-                    println!("[INFO][DRIFT] ntp_resync_ok daemon=ntpdate");
-                }
-                return;
-            }
-        }
-
-        if is_warn() {
-            println!("[WARN][DRIFT] ntp_resync_unavailable — operator intervention required");
-        }
-    });
-}
+// v14.8.11: auto NTP re-sync trigger REMOVED. The in-container invocations
+// required SYS_TIME capability we do not grant, so every call logged
+// "ntp_resync_unavailable" without any effect. Real drift correction is
+// now handled structurally by the median-aware timestamp rules; operator
+// NTP hygiene is monitored via the `[WARN][DRIFT]` logs above.
 
 /// Read current drift EMA in seconds (for metrics/health endpoints).
 pub fn get_clock_drift_ema_secs() -> u64 {
@@ -1195,22 +1125,40 @@ static METRIC_LAST_RESET: AtomicU64 = AtomicU64::new(0);          // Timestamp o
 static METRIC_TIMESTAMP_REJECTIONS: AtomicU64 = AtomicU64::new(0); // Blocks rejected due to invalid timestamp
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// v3.12: TIMESTAMP VALIDATION CONSTANTS
+// v14.8.11: TIMESTAMP VALIDATION CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 // These constants define acceptable timestamp ranges for incoming blocks.
-// SECURITY: Blocks with timestamps outside these bounds are REJECTED.
-// 
-// WHY THESE VALUES:
-// v3.38: WALL CLOCK TIMESTAMPS (Ethereum-style validation)
-// Only TWO checks — exactly like Ethereum:
-//   1. FUTURE: block.timestamp <= now + 15s
-//   2. MONOTONICITY: block.timestamp > parent.timestamp
-// NO past check — Ethereum doesn't have one either.
-// This ensures ROLLING UPDATE compatibility: new nodes accept old slot-based timestamps.
+// Blocks with timestamps outside these bounds are REJECTED.
+//
+// Three validation checks (canonical model, proven in long-running L1s):
+//   1. FUTURE:         block.timestamp ≤ local_wall_clock + FUTURE_TOLERANCE
+//   2. MONOTONICITY:   block.timestamp > parent.timestamp
+//   3. MEDIAN-PAST:    block.timestamp > median(last 11 on-chain timestamps)
+//                      (prevents timestamp-in-past rewrite attempts)
+//
+// Why 7200 seconds (2 hours) for FUTURE_TOLERANCE:
+//   * Earlier value (15s) rejected honest blocks whenever this node's wall
+//     clock drifted even slightly behind the network — observed drift peaks
+//     of 465 s during VM live migration are common in virtualised hosts.
+//   * 7200 s covers essentially every real-world transient clock event
+//     (hypervisor suspend, live migration, NTP outage) without sacrificing
+//     security: the Median-Past rule (#3) together with parent monotonicity
+//     and a signed Dilithium3 header keep Byzantine timestamp inflation
+//     strictly bounded.
+//   * This is the same window that a long-running PoW L1 has used since
+//     2009 across tens of thousands of nodes worldwide with no drift-
+//     induced forks.
+//   * Our macroblock finality every 90 blocks (2f+1 commit/reveal) adds
+//     a second layer of safety independent of timestamp tolerance.
 // ═══════════════════════════════════════════════════════════════════════════════
 // FIX R22-T5: Made pub(crate) for unified usage in block_pipeline.rs
 // Single source of truth — prevents inconsistent tolerance windows.
-pub const TIMESTAMP_FUTURE_TOLERANCE: u64 = 15;  // Block can be max 15 seconds in future
+pub const TIMESTAMP_FUTURE_TOLERANCE: u64 = 7200;  // 2 hours (absolute, wall clock)
+
+/// Median-Past rule window size. Block timestamp must be strictly greater than
+/// the median of the last `MEDIAN_PAST_WINDOW` block timestamps. Canonical
+/// value 11 taken from long-running PoW L1 consensus rules.
+pub const MEDIAN_PAST_WINDOW: usize = 11;
 
 /// Get current failover metrics (for Prometheus/Grafana integration)
 pub fn get_failover_metrics() -> (u64, u64, u64, u64) {
@@ -11451,6 +11399,28 @@ impl BlockchainNode {
                         ));
                     }
 
+                    // v14.8.11: MEDIAN-PAST rule
+                    // `block.timestamp` must be strictly greater than the median
+                    // of the last MEDIAN_PAST_WINDOW (11) on-chain timestamps.
+                    // Blocks the near-past-rewrite attempts that slip through the
+                    // monotonicity check (which only compares against parent).
+                    // Silently skipped during the first ~11 blocks after boot when
+                    // the ring is undersized — parent monotonicity already
+                    // guarantees ordering there.
+                    if let Some(median_past) = median_past_timestamp() {
+                        if microblock.timestamp <= median_past {
+                            METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "[ERR][TIMESTAMP] median_past_violation h={} ts={} median_past={}",
+                                microblock.height, microblock.timestamp, median_past
+                            );
+                            return Err(format!(
+                                "TIMESTAMP_INVALID:median_past:h={}:block_ts={}:median_past={}",
+                                microblock.height, microblock.timestamp, median_past
+                            ));
+                        }
+                    }
+
                     if is_debug() {
                         let delta = local_time.saturating_sub(microblock.timestamp);
                         if delta > 60 {
@@ -15652,22 +15622,19 @@ impl BlockchainNode {
                         let is_synced_enough = production_unlocked
                             && (best_peer_h == 0 || our_h + 20 >= best_peer_h);
 
-                        // v14.8.10: drift self-pause vote gate. A node whose clock
-                        // has drifted beyond the pause threshold for long enough
-                        // MUST stop broadcasting TimeoutVotes — its `proposed_round`
-                        // reflects wall-clock drift, not genuine network stall, and
-                        // would otherwise pollute f+1 adopted aggregation. Skipping
-                        // votes is BFT-safe: the committee converges on rotation
-                        // through the honest 2f+1 supermajority without us.
-                        let drift_paused = is_drift_self_paused();
-                        if drift_paused && is_warn() {
-                            println!(
-                                "[WARN][TIMEOUT] drift_self_paused h={} drift_ema={}s — suppressing timeout vote",
-                                next_height, get_clock_drift_ema_secs()
-                            );
-                        }
+                        // v14.8.11: drift self-pause vote gate REMOVED. A
+                        // drifted node still contributes TimeoutVotes because
+                        // its `proposed_timeout_round` is clamped by the
+                        // `effective_now()` computation (which pulls a
+                        // behind-clock node back into the canonical range via
+                        // the network-time median) plus the `lbpt_stale_cap`
+                        // (30s ceiling on local_delay during catch-up). The
+                        // f+1 adopted aggregation tolerates the remaining
+                        // small proposed-round variance, and the BFT-agreed
+                        // rotation round derives only from signed 2f+1
+                        // evidence — so drifted votes cannot hijack rotation.
 
-                        if proposed_timeout_round > 0 && microblock_height > 0 && is_synced_enough && !drift_paused {
+                        if proposed_timeout_round > 0 && microblock_height > 0 && is_synced_enough {
                             if is_info() {
                                 println!("[INFO][TIMEOUT] stall h={} mb={} delay={}s proposed={} adopted={} certified={} rotation={} f1={}",
                                          next_height, timeout_mb_index, local_delay, proposed_timeout_round,
@@ -16798,34 +16765,15 @@ impl BlockchainNode {
                     // Don't continue - let timeout_round failover handle it
                 }
 
-                // ═══════════════════════════════════════════════════════════════════════════
-                // v14.8.10: DRIFT SELF-PAUSE GATE
-                // ═══════════════════════════════════════════════════════════════════════════
-                // A node whose wall clock has drifted beyond the self-pause threshold
-                // (60 s EMA for 30 consecutive observations, after NTP re-sync attempts
-                // have failed to correct it) must NOT produce blocks. Its block
-                // timestamp would be rejected by honest peers via
-                // TIMESTAMP_FUTURE_TOLERANCE, causing a 30-block slot stall until
-                // BFT-driven rotation failovers to another producer.
-                //
-                // Pausing ourselves is the clean fix: VRF committee re-selection every
-                // 90 blocks will naturally drop us from the next committee window,
-                // and `observe_clock_drift` auto-clears the flag (with hysteresis)
-                // as soon as the clock recovers.
-                //
-                // Scalability: O(1) atomic load, zero network overhead.
-                // Safety: LOCAL decision only; no signed state touched.
-                // ═══════════════════════════════════════════════════════════════════════════
-                if is_my_turn_to_produce && is_drift_self_paused() {
-                    if is_warn() {
-                        println!(
-                            "[WARN][PROD] drift_self_paused h={} drift_ema={}s — skipping production",
-                            next_block_height, get_clock_drift_ema_secs()
-                        );
-                    }
-                    is_my_turn_to_produce = false;
-                }
-                
+                // v14.8.11: drift self-pause gate REMOVED. A drifted node now
+                // stays productive — its block timestamp is pulled back into
+                // the canonical network range via the median-aware generation
+                // rule (see block-construction site below), and peers accept
+                // it within the wide future-tolerance window. Removing the
+                // pause gate preserves liveness on small committees where
+                // otherwise losing two nodes to drift would collapse the
+                // 2f+1 quorum.
+
                 // ═══════════════════════════════════════════════════════════════════════════
                 // v2.104: SELF-EXCLUDE CHECK - Producer must be synced to produce
                 // ═══════════════════════════════════════════════════════════════════════════
@@ -18742,14 +18690,42 @@ impl BlockchainNode {
                     // Other nodes validate and accept/reject - this is the blockchain way!
                     // NO SYNC CHECKS, NO NETWORK QUERIES, NO WAITING!
                     
-                    // PRODUCTION: Create cryptographically signed microblock
-                    // v3.38: WALL CLOCK TIMESTAMP
-                    // Producer sets real wall clock time. Validators verify monotonicity + bounded future.
-                    // Old approach (genesis + height) caused accumulating drift: 20min/8h → days/year.
-                    // Timestamp is part of signed block hash → all nodes see the same value.
+                    // ═══════════════════════════════════════════════════════════════════
+                    // v14.8.11: MEDIAN-AWARE WALL-CLOCK TIMESTAMP
+                    // ═══════════════════════════════════════════════════════════════════
+                    // Block timestamp is the maximum of four canonical sources:
+                    //
+                    //   1. `wall_clock`    — this node's local Unix time (base case).
+                    //   2. `network_median + blocks_ahead`  — derived from the last 32
+                    //      on-chain block timestamps (our ring buffer). Pulls a
+                    //      behind-clock producer back into the canonical network
+                    //      range so its block is accepted within the wide future-
+                    //      tolerance window on peers.
+                    //   3. `parent_ts + 1` — hard strict-monotonicity guarantee,
+                    //      independent of clocks. Hash-chain continuity already
+                    //      requires monotonic ordering.
+                    //   4. `median_past + 1` — Median-Past rule lower bound (last-11
+                    //      median). A block must be strictly above this value or
+                    //      peers reject it as an attempt to rewrite the near-past.
+                    //      Undefined for the first ~11 blocks (ring too small);
+                    //      falls back to (3) which is stricter or equivalent.
+                    //
+                    // The `max` across all four yields the smallest legal timestamp
+                    // that satisfies every rule simultaneously. A node with clock
+                    // drift ≤ FUTURE_TOLERANCE (2 h) therefore always produces a
+                    // block that every honest peer accepts on first validation,
+                    // with zero NTP dependency at consensus-critical path and zero
+                    // self-pause machinery.
+                    //
+                    // Safety: `block.timestamp` is part of the Dilithium3-signed
+                    // header, so the producer cannot lie about this value to
+                    // different peers — it is network-wide identical bytes.
+                    //
+                    // Scalability: four O(1) atomic / locked reads regardless of
+                    // committee size. Ring snapshot is a tiny fixed-size array.
+                    // ═══════════════════════════════════════════════════════════════════
                     let deterministic_timestamp = {
-                        let now_ts = get_timestamp_safe();
-                        // Ensure strict monotonicity relative to parent.
+                        let wall_ts = get_timestamp_safe();
                         let parent_ts = if next_block_height > 0 {
                             match storage.load_microblock_auto_format(next_block_height - 1) {
                                 Ok(Some(parent)) => parent.timestamp,
@@ -18758,11 +18734,38 @@ impl BlockchainNode {
                         } else {
                             0
                         };
-                        if now_ts > parent_ts {
-                            now_ts
-                        } else {
-                            parent_ts + 1
+
+                        // Network median (via `effective_now`): returns wall_ts in
+                        // the happy case, or the forward-projected network estimate
+                        // if this node's clock is behind the canonical median.
+                        let network_ts = effective_now();
+
+                        // Median-Past lower bound: strictly greater than the median
+                        // of the last MEDIAN_PAST_WINDOW on-chain timestamps. Ring
+                        // is undersized for the very first blocks — in that case
+                        // parent_ts+1 already provides the strict monotonicity we
+                        // need and we skip this source.
+                        let median_past_plus_one = median_past_timestamp()
+                            .map(|m| m.saturating_add(1))
+                            .unwrap_or(0);
+
+                        // Strict-monotonicity lower bound from parent. Matches the
+                        // check a peer performs in `validate_received_microblock`.
+                        let parent_plus_one = parent_ts.saturating_add(1);
+
+                        let candidate = wall_ts
+                            .max(network_ts)
+                            .max(parent_plus_one)
+                            .max(median_past_plus_one);
+
+                        if is_debug() && next_block_height > 0 {
+                            println!(
+                                "[DBG][TIMESTAMP] gen h={} wall={} net={} parent+1={} medp+1={} → chosen={}",
+                                next_block_height, wall_ts, network_ts, parent_plus_one,
+                                median_past_plus_one, candidate
+                            );
                         }
+                        candidate
                     };
 
 

@@ -5622,21 +5622,18 @@ async fn handle_node_health(
     
     // v14.8.10: Runtime consensus + clock-drift observability
     // ═══════════════════════════════════════════════════════════════════════════
-    // These fields expose the BFT rotation state and clock-drift monitor so a
-    // fleet operator running thousands of Super-nodes can scrape /api/v1/node/health
-    // via Prometheus and watch:
-    //   * clock_drift_*      — detect VM/hypervisor/NTP issues across the fleet
-    //   * current_timeout_round — detect stalled rotation (always 0 = healthy)
-    //   * drift_self_paused  — node took itself out of production due to drift
-    //   * failover_*         — overall BFT-timeout activity
-    // Scalability: O(1) atomic reads; adds no consensus overhead at any scale.
-    // Safety: read-only — never feeds back into consensus.
+    // v14.8.11: observability fields for fleet operators running thousands of
+    // Super-nodes. Scraped by Prometheus/Grafana; never fed back into consensus.
+    //   * clock_drift_*          — detect host NTP / VM / hypervisor issues
+    //   * current_timeout_round  — 0 in steady state, > 0 during BFT failover
+    //   * failover_*             — aggregated counters since process start
+    // Self-pause and NTP-resync fields removed in v14.8.11 — drifted nodes now
+    // stay productive via the median-aware timestamp rules and the wide
+    // future-tolerance window.
     // ═══════════════════════════════════════════════════════════════════════════
     let clock_drift_ema = crate::node::get_clock_drift_ema_secs();
     let clock_drift_peak = crate::node::get_clock_drift_peak_secs();
     let current_timeout_round = crate::node::get_current_timeout_round();
-    let drift_self_paused = crate::node::is_drift_self_paused();
-    let ntp_resync_attempts = crate::node::get_ntp_resync_attempts();
     let (max_slot_delay, max_timeout_round, failover_count, ts_rejections) =
         crate::node::get_failover_metrics();
 
@@ -5654,11 +5651,9 @@ async fn handle_node_health(
         "uptime_seconds": uptime, // API FIX: Actual uptime in seconds
         "version": "1.0.0", // API FIX: Correct version
         "api_version": "v1",
-        // v14.8.10: Clock-drift observability (fleet-operator Prometheus scrape)
+        // v14.8.11: clock-drift observability (host NTP health indicator)
         "clock_drift_ema_secs": clock_drift_ema,
         "clock_drift_peak_secs": clock_drift_peak,
-        "ntp_resync_attempts": ntp_resync_attempts,
-        "drift_self_paused": drift_self_paused,
         // v14.8.10: BFT rotation state (0 in steady state, > 0 during failover)
         "current_timeout_round": current_timeout_round,
         // v14.8.10: Aggregated failover counters (since process start)
