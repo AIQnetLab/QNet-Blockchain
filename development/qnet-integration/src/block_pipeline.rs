@@ -382,6 +382,35 @@ impl PipelineIngest {
     pub fn apply_notify(&self) -> Arc<tokio::sync::Notify> {
         self.apply_notify.clone()
     }
+
+    /// v14.10: Total blocks currently "in the system" — ingested but not yet
+    /// finalized (applied / rejected / skipped). Used by SyncManager as the
+    /// single source of truth for backpressure decisions.
+    ///
+    /// Calculation: ingested − applied − (all terminal-failure counters) − dup_skip.
+    /// The deferred-buffer residents are COUNTED (good — they occupy pipeline
+    /// capacity). Blocks that truly finished (applied or rejected) are excluded.
+    ///
+    /// Scalability: 4 atomic loads, O(1). Safe at 10K+ super-nodes — this is
+    /// read by SyncManager on every iteration, no locks.
+    pub fn in_flight(&self) -> u64 {
+        let ingested = self.metrics.ingested.load(Ordering::Relaxed);
+        let applied = self.metrics.applied.load(Ordering::Relaxed);
+        let finished = applied
+            .saturating_add(self.metrics.decode_failed.load(Ordering::Relaxed))
+            .saturating_add(self.metrics.verify_failed.load(Ordering::Relaxed))
+            .saturating_add(self.metrics.apply_failed.load(Ordering::Relaxed))
+            .saturating_add(self.metrics.duplicates_skipped.load(Ordering::Relaxed));
+        ingested.saturating_sub(finished)
+    }
+
+    /// v14.10: Current ingest-channel free capacity (blocks the pipeline can
+    /// accept right now before hitting the ingest buffer limit). Useful as a
+    /// short-term "room available" indicator; SyncManager pairs this with
+    /// `in_flight()` for a full picture.
+    pub fn ingest_capacity_remaining(&self) -> usize {
+        self.tx.capacity()
+    }
 }
 
 /// Block processing pipeline. Creates stages and runs them.
@@ -1227,6 +1256,45 @@ impl BlockPipeline {
 
             // Clear pending sync for this block
             crate::unified_p2p::clear_block_pending_sync(height);
+
+            // ────────────────────────────────────────────────────────────────
+            // v14.10: GENESIS GLOBAL STATE (was missing in pipeline apply path!)
+            //
+            // The canonical `genesis_config::apply_genesis_state` sets two
+            // process-global fields that are NOT touched by the regular
+            // per-transaction apply path:
+            //   1. GLOBAL_GENESIS_TIMESTAMP — used by consensus timing (rounds,
+            //      timeout_round, PoH slot calc). If left at 0 the node
+            //      computes rotation rounds against Unix epoch — unusable.
+            //   2. Dynamic pricing state seed — cold-start base fee at genesis.
+            //
+            // When a fresh node fetches genesis via HTTP at startup, the
+            // startup path calls `apply_genesis_state` explicitly. But when a
+            // fresh node receives h=0 over P2P (because HTTP genesis endpoint
+            // is unavailable), the pipeline applies the block but skips these
+            // two globals — leaving consensus broken until the node restarts.
+            //
+            // This block fixes that gap: on h=0 apply via pipeline, run the
+            // same global-state initialisation. Idempotent (checks existing
+            // value to avoid redundant stores on every h=0 replay).
+            // ────────────────────────────────────────────────────────────────
+            if height == 0 {
+                let current_gen_ts = crate::GLOBAL_GENESIS_TIMESTAMP
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if current_gen_ts == 0 || current_gen_ts != block.microblock.timestamp {
+                    crate::GLOBAL_GENESIS_TIMESTAMP.store(
+                        block.microblock.timestamp,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    crate::update_global_pricing_state(
+                        0.0_f64, 5_u64, block.microblock.timestamp,
+                    );
+                    if is_info() {
+                        println!("[INFO][PIPELINE] genesis_globals_set ts={} path=pipeline_apply",
+                                 block.microblock.timestamp);
+                    }
+                }
+            }
 
             // Broadcast block event (for consensus listener)
             let _ = ctx.block_event_tx.send(height);

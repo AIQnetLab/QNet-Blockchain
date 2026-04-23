@@ -346,22 +346,39 @@ impl SyncManager {
         }
     }
 
-    /// v14.9: Event-driven pipelined sync.
+    /// v14.10: Event-driven pipelined sync with CREDIT-BASED BACKPRESSURE.
     ///
     /// Architecture (scales to 10K+ Super nodes at 1-sec block time):
     ///
-    ///   1. Maintain a sliding WINDOW of [apply_tip+1 .. apply_tip+WINDOW] requested.
-    ///   2. Find MISSING RANGES inside the window (storage.load_microblock().is_none()).
-    ///   3. Shard missing ranges across N peers (deterministic, reputation-weighted).
-    ///   4. Fire-and-forget range requests; P2P delivers to pipeline.
-    ///   5. Await `pipeline.apply_notify()` — woken after each successful save.
-    ///     ⇒ NO poll-sleeps, NO wave-walls, NO "break at first gap".
-    ///   6. As apply_tip advances, refill the window with next missing ranges.
+    ///   1. Determine MAX_INFLIGHT adaptively from apply-stage capacity:
+    ///      - Bootstrap (local_h < 100):  300 blocks (small, protects pipeline)
+    ///      - Steady (local_h ≥ 100):     2000 blocks (max throughput)
+    ///   2. Each iteration: check `pipeline.in_flight()` (ingested - finished).
+    ///      Credits available = MAX_INFLIGHT − in_flight.
+    ///   3. If credits < MIN_DISPATCH_THRESHOLD: await apply_notify; try again.
+    ///   4. Otherwise: find missing ranges in window = [apply_tip+1 .. apply_tip+credits].
+    ///      Split into RANGE_CHUNK=100 pieces, dispatch in parallel.
+    ///   5. Range-sharded parallel sync (unified_p2p v14.2) fans out to peers.
+    ///   6. Await apply_notify for progress signal.
+    ///
+    /// Why credit-based?
+    ///   A naive fixed window of 2000 blocks at bootstrap floods the pipeline:
+    ///   verify+apply stages are serial per-block and can't keep up with a
+    ///   2000-block burst. Deferred buffer fills → drops → re-requests → livelock.
+    ///   Credits-based dispatch guarantees in_flight ≤ apply-capacity at all times.
     ///
     /// Correctness:
-    ///   - Pipeline dedups at storage level; re-requesting delivered blocks is a no-op.
+    ///   - Storage dedup: re-requested blocks are O(1) skipped at handle_blocks_batch.
     ///   - `apply_notify` is a Tokio `Notify` — O(1) wake, safe at any scale.
     ///   - 15s hard safety-net timeout guards against silent peer stalls.
+    ///   - 120s STALL_ABORT breaks the loop if apply_tip doesn't advance.
+    ///
+    /// Genesis priority (fresh node bootstrap):
+    ///   If local_h == 0 and storage lacks h=0, we issue a targeted sync_blocks(0,0)
+    ///   first and wait (bounded) for apply_tip ≥ 1 before entering the main loop.
+    ///   Without this, a fresh node would dispatch h=1..=N in parallel, but NONE
+    ///   would verify (missing previous_hash for genesis) — triggering a cycle
+    ///   of deferred_full drops until genesis eventually arrives randomly.
     async fn execute_sync(&self, target: u64) {
         let local_h = self.coordinator.chain_height();
 
@@ -393,34 +410,112 @@ impl SyncManager {
         });
 
         if is_info() {
-            println!("[INFO][SYNC] start local={} target={} gap={} peers={} mode=pipelined",
+            println!("[INFO][SYNC] start local={} target={} gap={} peers={} mode=pipelined_credits",
                      local_h, target, target - local_h, peer_count);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        // v14.9: PIPELINED WINDOW CONFIG
+        // v14.10: ADAPTIVE WINDOW + CREDIT-BASED BACKPRESSURE CONFIG
         // ═══════════════════════════════════════════════════════════════════════
-        // WINDOW: how many future blocks may be "in flight" simultaneously.
-        //   - 2000 blocks × ~500 bytes avg = ~1MB peak in pipeline queues → safe.
-        //   - At 1 blk/s net rate this is 2000s of buffer — kills RTT dependence.
-        //   - Bounded size prevents unbounded memory growth under malicious peers.
+        // HONEST NOTE on constants: these are INITIAL choices, not measured
+        // under load. They are safe bounds (never exceed pipeline capacity) but
+        // may leave throughput on the table. Re-tune via metrics after rollout.
         //
-        // RANGE_CHUNK: how big each P2P request is.
-        //   - 100 blocks/request matches server-side MAX_BATCH (17783).
-        //   - Smaller chunks = finer granularity for gap repair; 100 is sweet spot.
+        // MAX_INFLIGHT_*: per-iteration cap on unapplied blocks in the system.
+        //   Bootstrap (local<100): 300
+        //     — Pipeline verify_stage uses 4 workers (PipelineConfig::production).
+        //     — Dilithium3 verify ≈ 5-20 ms/block, so 4 workers ≈ 200-800 blk/s.
+        //     — Apply stage is serial (RocksDB writer): 10-50 ms/block ≈ 20-100 blk/s.
+        //     — 300 in-flight gives apply ~6-15 s of work — absorbs RTT jitter
+        //       WITHOUT allowing the deferred buffer (DEFERRED_MAX=2000) to
+        //       overflow under worst-case out-of-order delivery.
+        //   Steady: equal to DEFERRED_MAX so we never overflow by construction.
         //
-        // NOTIFY_TIMEOUT: safety net if Notify is lost (never seen in practice).
+        // MIN_DISPATCH_THRESHOLD: don't dispatch if fewer than ~1/6 of MAX — avoids
+        //   dispatch-thrash near the cap. Value chosen as 50 because it gives
+        //   half a RANGE_CHUNK of margin; re-tune if thrash appears in logs.
+        //
+        // RANGE_CHUNK: must be ≤ server-side MAX_BATCH (unified_p2p.rs:17789=100).
+        //
+        // MAX_REQUESTS_PER_ITER: caps fan-out burst. 8 × RANGE_CHUNK(100) = 800
+        //   blocks/iter — matches typical apply capacity per 500 ms-1 s window.
+        //
+        // NOTIFY_TIMEOUT: safety-net if apply_notify is lost (should never happen
+        //   due to Notify::notify_waiters semantics, but defensive).
+        //
+        // GENESIS_WAIT: bounded primary-retry window. After this the main loop's
+        //   own missing-scan keeps retrying forever — so GENESIS_WAIT is the
+        //   "best effort" ceiling, not a hard fail point.
+        //
+        // These are module-level `const` to allow a future config file or
+        // env-var override to replace them without touching hot-path code.
         // ═══════════════════════════════════════════════════════════════════════
-        const WINDOW: u64 = 2000;
-        const RANGE_CHUNK: u64 = 100;
-        const NOTIFY_TIMEOUT: Duration = Duration::from_secs(15);
-        const STALL_ABORT: Duration = Duration::from_secs(120);
+        const DEFERRED_MAX_HINT:      u64 = 2000;  // matches block_pipeline.rs DEFERRED_MAX
+        const MAX_INFLIGHT_BOOTSTRAP: u64 = 300;
+        const MAX_INFLIGHT_STEADY:    u64 = DEFERRED_MAX_HINT;
+        const MIN_DISPATCH_THRESHOLD: u64 = 50;
+        const RANGE_CHUNK:            u64 = 100;
+        const MAX_REQUESTS_PER_ITER:  usize = 8;
+        const NOTIFY_TIMEOUT:         Duration = Duration::from_secs(15);
+        const STALL_ABORT:            Duration = Duration::from_secs(120);
+        const GENESIS_WAIT:           Duration = Duration::from_secs(30);
+        const GENESIS_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
         let apply_notify = self.pipeline.apply_notify();
         let start_time = Instant::now();
         let mut last_progress_tip = local_h;
         let mut last_progress_at = Instant::now();
         let mut consecutive_failures = 0u32;
+
+        // ─────────────────────────────────────────────────────────────────────
+        // v14.10: GENESIS PRIORITY BOOTSTRAP — RETRY UNTIL APPLIED
+        // Fresh node needs h=0 applied first — otherwise every subsequent block
+        // fails hash-chain verify (previous_hash points to nowhere), fills the
+        // deferred buffer, and the whole pipeline deadlocks at credits=0.
+        //
+        // Strategy: fire sync_blocks(0,0) every 3s until storage has h=0 or
+        // GENESIS_WAIT timeout. This handles rare cases where the first peer
+        // doesn't respond (packet loss, handshake timing, peer restart).
+        // ─────────────────────────────────────────────────────────────────────
+        if local_h == 0
+            && self.storage.load_microblock(0).map(|o| o.is_none()).unwrap_or(true)
+        {
+            if is_info() {
+                println!("[INFO][SYNC] genesis_priority fetching h=0 before pipelined_catchup");
+            }
+            let deadline = Instant::now() + GENESIS_WAIT;
+            let mut last_request = Instant::now() - Duration::from_secs(10);
+            let mut attempts = 0u32;
+            loop {
+                if self.storage.load_microblock(0).map(|o| o.is_some()).unwrap_or(false) {
+                    if is_info() {
+                        println!("[INFO][SYNC] genesis_applied h=0 attempts={} proceed=pipelined_catchup",
+                                 attempts);
+                    }
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    if is_warn() {
+                        println!("[WARN][SYNC] genesis_wait_timeout attempts={} — main loop will keep retrying h=0",
+                                 attempts);
+                    }
+                    break;
+                }
+                // Re-fire sync_blocks(0,0) every GENESIS_RETRY_INTERVAL until arrival
+                if last_request.elapsed() >= GENESIS_RETRY_INTERVAL {
+                    attempts += 1;
+                    if is_debug() {
+                        println!("[DBG][SYNC] genesis_request attempt={}", attempts);
+                    }
+                    let _ = self.p2p.sync_blocks(0, 0).await;
+                    last_request = Instant::now();
+                }
+                tokio::select! {
+                    _ = apply_notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+            }
+        }
 
         while self.active.load(Ordering::Relaxed) {
             let apply_tip = self.storage.get_chain_height().unwrap_or(local_h);
@@ -445,16 +540,54 @@ impl SyncManager {
                 break;
             }
 
-            let window_end = std::cmp::min(apply_tip + WINDOW, target);
+            // ─────────────────────────────────────────────────────────────────
+            // v14.10: ADAPTIVE WINDOW — small during bootstrap, full in steady state.
+            // ─────────────────────────────────────────────────────────────────
+            let max_inflight = if apply_tip < 100 {
+                MAX_INFLIGHT_BOOTSTRAP
+            } else {
+                MAX_INFLIGHT_STEADY
+            };
+
+            // ─────────────────────────────────────────────────────────────────
+            // v14.10: CREDIT-BASED BACKPRESSURE — do not dispatch if pipeline full.
+            // ─────────────────────────────────────────────────────────────────
+            let in_flight = self.pipeline.in_flight();
+            let credits = max_inflight.saturating_sub(in_flight);
+
+            if credits < MIN_DISPATCH_THRESHOLD {
+                if is_debug() {
+                    println!("[DBG][SYNC] backpressure tip={} in_flight={} max={} credits={} waiting=apply",
+                             apply_tip, in_flight, max_inflight, credits);
+                }
+                tokio::select! {
+                    _ = apply_notify.notified() => {}
+                    _ = tokio::time::sleep(NOTIFY_TIMEOUT) => {}
+                }
+                continue;
+            }
+
+            // Window end bounded by credits and target
+            let window_end = std::cmp::min(apply_tip + credits, target);
+
+            // v14.10 safety-net: if genesis (h=0) still missing AND apply_tip=0,
+            // include h=0 in the missing scan. Guards against the case where the
+            // genesis priority path timed out but main-loop still needs h=0 to
+            // unblock the deferred buffer. Without this, scan starts at h=1 and
+            // h=0 is never requested again → permanent deadlock.
+            let genesis_absent = apply_tip == 0
+                && self.storage.load_microblock(0).map(|o| o.is_none()).unwrap_or(true);
+            let scan_start = if genesis_absent { 0 } else { apply_tip + 1 };
 
             // ─────────────────────────────────────────────────────────────
             // Find missing ranges [first_missing..=last_missing] inside the window.
-            // Ported from parallel_download_microblocks — doesn't bail on first gap.
+            // Each gap is treated independently — one partial-delivery block does
+            // not prevent the OTHER gaps from being requested.
             // ─────────────────────────────────────────────────────────────
             let mut missing: Vec<(u64, u64)> = Vec::new();
             let mut range_start: Option<u64> = None;
             let mut range_end: u64 = 0;
-            for h in (apply_tip + 1)..=window_end {
+            for h in scan_start..=window_end {
                 let present = self.storage.load_microblock(h)
                     .map(|opt| opt.is_some())
                     .unwrap_or(false);
@@ -473,13 +606,9 @@ impl SyncManager {
 
             if missing.is_empty() {
                 // Window complete in storage — wait for apply_tip to advance.
-                // If target is within window, this means pipeline is working through
-                // already-fetched blocks; just wait for notify.
                 tokio::select! {
                     _ = apply_notify.notified() => {}
                     _ = tokio::time::sleep(NOTIFY_TIMEOUT) => {
-                        // Safety net — extremely rare. Log and continue, next loop
-                        // iteration will re-check storage.
                         if is_debug() {
                             println!("[DBG][SYNC] notify_timeout apply_tip={} target={}", apply_tip, target);
                         }
@@ -488,25 +617,28 @@ impl SyncManager {
                 continue;
             }
 
-            // Split missing ranges into ≤RANGE_CHUNK pieces. Each piece becomes
-            // one P2P request. At large gaps this fans out many requests in parallel.
+            // Split missing ranges into ≤RANGE_CHUNK pieces, capped at
+            // MAX_REQUESTS_PER_ITER per iteration (prevents fan-out burst).
             let mut requests: Vec<(u64, u64)> = Vec::new();
-            for (from, to) in &missing {
+            'outer: for (from, to) in &missing {
                 let mut cur = *from;
                 while cur <= *to {
                     let end = std::cmp::min(cur + RANGE_CHUNK - 1, *to);
                     requests.push((cur, end));
+                    if requests.len() >= MAX_REQUESTS_PER_ITER {
+                        break 'outer;
+                    }
                     cur = end + 1;
                 }
             }
 
-            if is_info() && requests.len() > 0 {
-                println!("[INFO][SYNC] window tip={} target={} missing_ranges={} requests={}",
-                         apply_tip, target, missing.len(), requests.len());
+            if is_info() && !requests.is_empty() {
+                println!("[INFO][SYNC] window tip={} target={} in_flight={} credits={} missing_ranges={} dispatching={}",
+                         apply_tip, target, in_flight, credits, missing.len(), requests.len());
             }
 
             // Dispatch requests in parallel. sync_blocks shards across peers
-            // (see unified_p2p.rs:18539 — v14.2 RANGE-SHARDED PARALLEL SYNC).
+            // (unified_p2p.rs v14.2 RANGE-SHARDED PARALLEL SYNC).
             let dispatch_start = Instant::now();
             let mut any_sent = false;
             for (from, to) in requests {
@@ -536,8 +668,6 @@ impl SyncManager {
                     }
                     break;
                 }
-                // Back off briefly when ALL dispatches fail — usually a transient
-                // peer-set problem. Exponential backoff up to 2s.
                 let backoff = Duration::from_millis(50u64 << (consecutive_failures.min(5)));
                 tokio::time::sleep(backoff).await;
                 continue;
@@ -547,7 +677,6 @@ impl SyncManager {
             tokio::select! {
                 _ = apply_notify.notified() => {}
                 _ = tokio::time::sleep(NOTIFY_TIMEOUT) => {
-                    // Safety net. Log and continue — loop re-scans storage.
                     let elapsed_dispatch = dispatch_start.elapsed().as_millis();
                     if is_debug() {
                         println!("[DBG][SYNC] await_notify_timeout tip={} dispatched_ms={}",

@@ -7910,7 +7910,14 @@ impl BlockchainNode {
         //    P2P sends blocks via block_tx, which are drained into PipelineIngest
 
         // LEGACY: Keep old block_rx alive but drain it into pipeline
-        // This handles any code that still uses the old block_tx channel
+        // This handles any code that still uses the old block_tx channel.
+        //
+        // v14.10: Use `submit_async` (blocks until pipeline has room) instead of
+        // `submit` (drops on full). The credit-based backpressure in SyncManager
+        // guarantees in_flight ≤ MAX_INFLIGHT, so blocking here only happens
+        // transiently under burst load. Dropping was catastrophic because a
+        // dropped h=0 (genesis) would permanently deadlock the pipeline —
+        // every subsequent block fails hash-chain verify with no way to recover.
         let pipeline_for_legacy = pipeline_ingest.clone();
         tokio::spawn(async move {
             while let Some(received_block) = block_rx.recv().await {
@@ -7921,7 +7928,13 @@ impl BlockchainNode {
                     from_peer: received_block.from_peer,
                     received_at: received_block.timestamp,
                 };
-                pipeline_for_legacy.submit(ingest);
+                if !pipeline_for_legacy.submit_async(ingest).await {
+                    // submit_async returns false only on channel-closed (shutdown).
+                    if is_warn() {
+                        println!("[WARN][PIPELINE] legacy_drain_closed — pipeline shut down");
+                    }
+                    break;
+                }
             }
         });
         
