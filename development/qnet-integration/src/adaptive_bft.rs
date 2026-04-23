@@ -48,8 +48,12 @@ pub struct AdaptiveBft {
 /// Network state for adaptive adjustments
 #[derive(Debug, Clone)]
 pub struct NetworkState {
-    /// Average network latency
+    /// Average network latency (sliding window across all peers)
     pub avg_latency_ms: u64,
+    /// v14.9: MAX observed per-peer RTT. BFT timeout uses this (not avg) because
+    /// a safe rotation window must accommodate the SLOWEST honest peer, not the
+    /// median. At globally-distributed super-node scale this adapts cleanly.
+    pub max_peer_rtt_ms: u64,
     /// Packet loss rate (0.0 to 1.0)
     pub packet_loss_rate: f64,
     /// Number of active peers
@@ -62,6 +66,7 @@ impl Default for NetworkState {
     fn default() -> Self {
         Self {
             avg_latency_ms: 100,
+            max_peer_rtt_ms: 100,
             packet_loss_rate: 0.0,
             active_peers: 0,
             last_update: Instant::now(),
@@ -127,18 +132,38 @@ impl AdaptiveBft {
             base_timeout
         };
         
-        // Adjust based on network conditions
+        // ═══════════════════════════════════════════════════════════════════════
+        // v14.9: RTT-AWARE TIMEOUT SCALING
+        // ═══════════════════════════════════════════════════════════════════════
+        // Previous behaviour: only `avg_latency_ms > 500ms` triggered adjustment.
+        // Problem — a 110ms transatlantic peer was treated like a 1ms intra-DC
+        // peer. BFT rotation failover-stormed because timeouts were sized for
+        // LAN, not for globally-distributed super-nodes.
+        //
+        // New behaviour: unconditionally add `max_peer_rtt × 3` on top of the base.
+        // 3× RTT covers: propagate → sign → propagate back → safety margin. Below
+        // that, honest slow peers get marked faulty and trigger bogus failover.
+        //
+        // Scalability:
+        //   - Single atomic read per block; no lock fan-out.
+        //   - At 10K super nodes max RTT bounded by physics (~300ms antipodal),
+        //     timeout asymptotes to ~2s. Consensus progresses at any scale.
+        //
+        // Safety:
+        //   - Floor = base_timeout (never shrinks).
+        //   - Cap = 30s (prevents RTT-spike peers from freezing rotation).
+        //   - Packet-loss bonus stacks on top of RTT-adjusted.
+        // ═══════════════════════════════════════════════════════════════════════
         let network_state = self.network_state.read().await;
-        let network_adjusted = if network_state.packet_loss_rate > 0.1 {
-            // High packet loss - increase timeout
-            (timeout_ms as f64 * (1.0 + network_state.packet_loss_rate)) as u64
-        } else if network_state.avg_latency_ms > 500 {
-            // High latency - increase proportionally
-            timeout_ms + (network_state.avg_latency_ms / 10)
+        let rtt_budget_ms = network_state.max_peer_rtt_ms.saturating_mul(3).max(100);
+        let rtt_adjusted = timeout_ms.saturating_add(rtt_budget_ms);
+        let packet_loss_bonus = if network_state.packet_loss_rate > 0.01 {
+            ((rtt_adjusted as f64) * network_state.packet_loss_rate) as u64
         } else {
-            timeout_ms
+            0
         };
-        
+        let network_adjusted = rtt_adjusted.saturating_add(packet_loss_bonus).min(30_000);
+
         let final_timeout = Duration::from_millis(network_adjusted);
         
         // Cache the timeout
@@ -149,23 +174,33 @@ impl AdaptiveBft {
     
     /// Update network latency measurement
     pub async fn record_latency(&self, latency: Duration) {
+        let latency_ms = latency.as_millis() as u64;
         let mut measurements = self.latency_measurements.write().await;
         measurements.push(latency);
-        
+
         // Keep only recent measurements
         if measurements.len() > self.config.latency_window_size {
             measurements.remove(0);
         }
-        
+
         // Update network state
         if !measurements.is_empty() {
             let avg_latency_ms = measurements.iter()
                 .map(|d| d.as_millis() as u64)
                 .sum::<u64>() / measurements.len() as u64;
-            
+            let max_latency_ms = measurements.iter()
+                .map(|d| d.as_millis() as u64)
+                .max()
+                .unwrap_or(avg_latency_ms);
+
             let mut network_state = self.network_state.write().await;
             network_state.avg_latency_ms = avg_latency_ms;
+            // v14.9: track MAX peer RTT across the sliding window. BFT timeout
+            // scales on max, not avg, because the consensus window must fit the
+            // slowest honest peer — failing that, we exclude them as faulty.
+            network_state.max_peer_rtt_ms = max_latency_ms;
             network_state.last_update = Instant::now();
+            let _ = latency_ms; // touched for clarity above
         }
     }
     

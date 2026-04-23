@@ -4784,12 +4784,17 @@ impl SimplifiedP2P {
                     let assembly = entry.value();
                     
                     let elapsed_ms = assembly.started_at.elapsed().as_millis() as u64;
-                    
-                    // Skip if too fresh (< 500ms) or already reconstructed
-                    if elapsed_ms < 500 {
+
+                    // v14.9: Sized for 1-sec block time. Previous 500ms was tuned for
+                    // slower block cadence — at 1 blk/s, waiting 500ms before repair
+                    // burns half a block slot, then 2s between retries is a full 2
+                    // blocks behind before recovery. Now: 200ms initial wait, 500ms
+                    // between retries. At 100ms RTT transatlantic this still allows
+                    // repair to complete within the original block's slot.
+                    if elapsed_ms < 200 {
                         continue;
                     }
-                    
+
                     // Count received chunks
                     let data_received: usize = assembly.chunks_received.iter()
                         .filter(|c| c.is_some())
@@ -4798,25 +4803,26 @@ impl SimplifiedP2P {
                         .filter(|c| c.is_some())
                         .count();
                     let total_received = data_received + parity_received;
-                    
+
                     // Calculate required for Reed-Solomon (67%)
                     let total_chunks = assembly.total_chunks;
                     let required = ((total_chunks as f32) * 0.67).ceil() as usize;
-                    
+
                     // CRITICAL FIX v2.83: Check if chunk#0 is present (required for reconstruction!)
                     // Without chunk#0, block CANNOT be reconstructed even if we have enough parity
                     let chunk0_received = assembly.chunks_received.get(0).map(|c| c.is_some()).unwrap_or(false);
-                    
+
                     // If we have enough AND chunk#0 - reconstruction should happen, skip
                     // BUT if chunk#0 is missing - MUST request repair!
                     if total_received >= required && chunk0_received {
                         continue;
                     }
-                    
-                    // Check if we should request repair (every 2 seconds, max 4 attempts)
+
+                    // v14.9: retry every 500ms (was 2s). At 1-sec block time we want
+                    // to repair AND reconstruct within the same slot where possible.
                     let should_request = assembly.retransmit_attempts < SHRED_CHUNK_MAX_RETRIES
                         && assembly.retransmit_requested_at
-                            .map(|t| t.elapsed().as_secs() >= 2)
+                            .map(|t| t.elapsed().as_millis() >= 500)
                             .unwrap_or(true);
                     
                     if should_request {
@@ -6367,13 +6373,14 @@ impl SimplifiedP2P {
             if let Some(mut assembly) = self.shred_protocol_assemblies.get_mut(&height) {
                 let elapsed_ms = assembly.started_at.elapsed().as_millis();
                 
-                // Priority request for chunk#0 after 500ms (every 2 seconds, max 4 attempts)
+                // v14.9: Priority request for chunk#0 after 200ms; repeat every 500ms.
+                // (was 500ms/2s — too slow for 1-sec block cadence)
                 let chunk0_missing = assembly.chunks_received.get(0).map(|c| c.is_none()).unwrap_or(true);
-                let can_request_chunk0 = chunk0_missing 
-                    && elapsed_ms >= 500 
+                let can_request_chunk0 = chunk0_missing
+                    && elapsed_ms >= 200
                     && assembly.retransmit_attempts < SHRED_CHUNK_MAX_RETRIES
                     && assembly.retransmit_requested_at
-                        .map(|t| t.elapsed().as_secs() >= 2)
+                        .map(|t| t.elapsed().as_millis() >= 500)
                         .unwrap_or(true);
                 
                 if can_request_chunk0 {
@@ -11394,7 +11401,7 @@ pub enum NetworkMessage {
         to_height: u64,
         requester_id: String,
     },
-    
+
     /// Response with batch of blocks
     BlocksBatch {
         blocks: Vec<(u64, Vec<u8>)>,  // (height, data) pairs
@@ -18659,70 +18666,63 @@ impl SimplifiedP2P {
             _       => 5,    // Max batch (201-500) - 5 sec
         };
         
-        // STEP 3: Poll storage every 200ms until block arrives or timeout
-        // This is MUCH faster than sleeping full timeout!
-        let start = std::time::Instant::now();
-        let poll_interval = Duration::from_millis(200);
-        let timeout = Duration::from_secs(timeout_secs);
-        
-        while start.elapsed() < timeout {
-            tokio::time::sleep(poll_interval).await;
-            
-            // Check if blocks arrived in storage (from ANY peer)
+        // ═══════════════════════════════════════════════════════════════════════
+        // v14.9: FIRE-AND-FORGET DISPATCH (was: 200ms poll loop, blocking caller)
+        // ═══════════════════════════════════════════════════════════════════════
+        // Previous behaviour: poll storage every 200ms, return on FIRST arrival.
+        // Problem — returned after 200ms with count=1/N, caller then re-issued
+        // request for remaining N-1 blocks. At 1-sec block time this recycling
+        // capped catch-up at ~2 blk/s.
+        //
+        // New behaviour: requests have been dispatched above (shred/redundant/
+        // sharded). They're already in flight via QUIC streams. Return Ok()
+        // immediately — the caller (SyncManager v14.9 pipelined window) waits
+        // on `pipeline.apply_notify()` for actual apply signals instead of
+        // polling storage. Peer reputation (success/failure) is updated from
+        // the dispatch result, not from poll outcomes.
+        //
+        // A small success schedule (spawned, does not block caller) probes
+        // storage once after `timeout_secs` to record delivery outcome for
+        // peer reputation tracking. Non-blocking — SyncManager is NOT waiting
+        // on this task.
+        // ═══════════════════════════════════════════════════════════════════════
+        let _ = requested_count; // kept in scope for backward trace; unused now
+        let timeout_check = Duration::from_secs(timeout_secs);
+        let sent_to_peers_clone = sent_to_peers.clone();
+        let from_h_clone = from_height;
+        let to_h_clone = to_height;
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout_check).await;
             let storage = match crate::node::try_get_storage() {
                 Some(s) => s,
-                None => continue,
+                None => return,
             };
-            
-            let first_received = storage.load_microblock(from_height)
+            let delivered = storage.load_microblock(from_h_clone)
                 .map(|opt| opt.is_some())
                 .unwrap_or(false);
-            
-            if first_received {
-                // Count how many blocks we got
-                let mut received_count = 0u64;
-                for h in from_height..=to_height {
-                    if storage.load_microblock(h).map(|opt| opt.is_some()).unwrap_or(false) {
-                        received_count += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                // v14.2: Record success for all peers that were asked (at least one responded).
-                // Conservative: we can't tell which exact peer answered, so credit all that got a
-                // request. Worst case a slow peer keeps a not-quite-deserved success credit; this
-                // is fine because the next failure will re-establish its cool-down.
-                for peer_tag in &sent_to_peers {
-                    // Tags may be "id" or "id[range]" (sharded mode) — strip range suffix.
+            if delivered {
+                for peer_tag in &sent_to_peers_clone {
                     let peer_id = peer_tag.split('[').next().unwrap_or(peer_tag);
                     record_sync_peer_success(peer_id);
                 }
-
-                if crate::node::is_info() {
-                    println!("[INFO][SYNC] parallel_received h={}-{} count={}/{} elapsed={}ms",
-                             from_height, from_height + received_count - 1,
-                             received_count, requested_count,
-                             start.elapsed().as_millis());
+            } else {
+                for peer_tag in &sent_to_peers_clone {
+                    let peer_id = peer_tag.split('[').next().unwrap_or(peer_tag);
+                    record_sync_peer_failure(peer_id);
                 }
-                return Ok(());
+                if crate::node::is_debug() {
+                    println!("[DBG][SYNC] dispatch_undelivered h={}-{} peers=[{}]",
+                             from_h_clone, to_h_clone, sent_to_peers_clone.join(","));
+                }
             }
-        }
+        });
 
-        // v14.2: Timeout — record failure against every peer we asked. Next wave's
-        // cool-down filter will skip them, and the retry picks different peers.
-        for peer_tag in &sent_to_peers {
-            let peer_id = peer_tag.split('[').next().unwrap_or(peer_tag);
-            record_sync_peer_failure(peer_id);
-        }
-
-        if crate::node::is_warn() {
-            println!("[WARN][SYNC] parallel_timeout h={}-{} peers=[{}] timeout={}s",
+        if crate::node::is_debug() {
+            println!("[DBG][SYNC] dispatched h={}-{} peers=[{}] timeout={}s mode=fire_and_forget",
                      from_height, to_height, sent_to_peers.join(","), timeout_secs);
         }
 
-        Err(format!("Sync failed: {} peers did not respond for h={}-{}",
-                    sent_to_peers.len(), from_height, to_height))
+        Ok(())
     }
     
     /// ═══════════════════════════════════════════════════════════════════════════

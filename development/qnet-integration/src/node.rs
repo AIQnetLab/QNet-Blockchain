@@ -7882,6 +7882,9 @@ impl BlockchainNode {
             unified_p2p: blockchain.unified_p2p.clone(),
             block_event_tx: blockchain.block_event_tx.clone(),
             node_id: blockchain.node_id.clone(),
+            // v14.9: Event-driven apply signal — sync manager waits on this
+            // instead of sleep/poll, scaling cleanly to 10K+ Super nodes.
+            apply_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         let pipeline_ingest = crate::block_pipeline::BlockPipeline::start(pipeline_config, apply_ctx);
@@ -8541,29 +8544,40 @@ impl BlockchainNode {
                             // Skip snapshot for Light nodes - they sync only recent blocks
                             let is_light_node = blockchain_for_sync.node_type == NodeType::Light;
                             
-                            // v10.3: IMPROVED SNAPSHOT SYNC for returning nodes
+                            // v14.9: SMARTER SNAPSHOT GATE
                             // Try snapshot if:
                             // 1. Not a Light node (they don't need full history)
                             // 2. EITHER: New node (local_height < 100)
                             //    OR: Large gap (>2,000 blocks = ~33 min offline)
-                            // 3. Network has at least one full snapshot (43,200+ blocks)
                             //
-                            // RATIONALE: Block-by-block sync for large gaps floods the
-                            // pending queue with parallel requests, causing backpressure
-                            // deadlocks. Snapshot avoids this entirely.
-                            // Threshold lowered from 10K to 2K to use snapshot more aggressively.
+                            // Previously gated on `network_height > SNAPSHOT_FULL_INTERVAL`
+                            // (12h) — naive "assume snapshot exists after 12h of uptime".
+                            // That was wrong twice:
+                            //   (a) full snapshots may not exist even at 12h if rotation
+                            //       never placed them there;
+                            //   (b) incremental/emission snapshots (every 1h/4h) exist
+                            //       earlier but were unreachable via this code path.
+                            //
+                            // New behaviour: always enter `fast_sync_with_snapshot`. That
+                            // function queries peers via `/api/v1/snapshot/latest` and
+                            // returns Err fast (~50ms) if no snapshot is available on the
+                            // network. On Err we fall back to block-sync. No wasted time,
+                            // no false negatives once network has ANY snapshot.
+                            //
+                            // Scalability: peer query is bounded by `peer_count`, parallel
+                            // over 5-20 peers at most. Zero overhead when peers respond
+                            // "available=false".
                             let gap = network_height.saturating_sub(local_height);
                             let large_gap_threshold = 2_000; // ~33 minutes worth of blocks
-                            let should_use_snapshot = !is_light_node 
-                                && (local_height < 100 || gap > large_gap_threshold)
-                                && network_height > SNAPSHOT_FULL_INTERVAL;  // Need at least 1 full snapshot
-                            
+                            let should_use_snapshot = !is_light_node
+                                && (local_height < 100 || gap > large_gap_threshold);
+
                             if should_use_snapshot {
-                                if is_info() { 
-                                    println!("[INFO][SYNC] trying_snapshot local={} net={} gap={} threshold={}", 
-                                             local_height, network_height, gap, large_gap_threshold); 
+                                if is_info() {
+                                    println!("[INFO][SYNC] trying_snapshot local={} net={} gap={} threshold={} gate=peer_query",
+                                             local_height, network_height, gap, large_gap_threshold);
                                 }
-                                
+
                                 match blockchain_for_sync.storage.fast_sync_with_snapshot(p2p, network_height).await {
                                     Ok(()) => {
                                         // v10.1: Snapshot sets chain_height in storage.
@@ -8583,10 +8597,11 @@ impl BlockchainNode {
                                         }
                                     }
                                     Err(e) => {
-                                        if is_warn() {
-                                            println!("[WARN][SYNC] snapshot_failed err={:?} fallback=block_sync", e);
+                                        // Expected during first ~12h of network life
+                                        // (no snapshot yet) — graceful fallthrough.
+                                        if is_info() {
+                                            println!("[INFO][SYNC] snapshot_unavailable reason={:?} fallback=block_sync", e);
                                         }
-                                        // Continue with regular block sync
                                     }
                                 }
                             } else if is_light_node && is_info() {
@@ -19678,7 +19693,19 @@ impl BlockchainNode {
                             println!("[INFO][STORAGE] block_saved h={} state_root={}",
                                      height_for_storage, hex::encode(&microblock.state_root[..8]));
                         }
-                        
+
+                        // v14.9: WS broadcast for producer-path (own blocks).
+                        // BlockPipeline emits NewBlock for received blocks; this
+                        // covers the complement so every block the node sees
+                        // (produced OR received) reaches WS subscribers.
+                        crate::rpc::broadcast_ws_event(crate::rpc::WsEvent::NewBlock {
+                            height: microblock.height,
+                            hash: hex::encode(microblock.hash()),
+                            timestamp: microblock.timestamp,
+                            tx_count: microblock.transactions.len(),
+                            producer: microblock.producer.clone(),
+                        });
+
                         // v3.27: TX and fees already applied BEFORE signing (for state_root)
                         // No need to apply again here!
                         

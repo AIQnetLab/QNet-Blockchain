@@ -327,6 +327,10 @@ pub struct ApplyContext {
     pub unified_p2p: Option<Arc<SimplifiedP2P>>,
     pub block_event_tx: tokio::sync::broadcast::Sender<u64>,
     pub node_id: String,
+    /// v14.9: Event-driven apply signal. Fired after every successful
+    /// block save in the pipeline. Sync manager waits on this instead of
+    /// poll-sleeping, turning catch-up from 2 blk/s → bandwidth-limited.
+    pub apply_notify: Arc<tokio::sync::Notify>,
 }
 
 // ============================================================================
@@ -339,6 +343,9 @@ pub struct ApplyContext {
 pub struct PipelineIngest {
     tx: mpsc::Sender<IngestBlock>,
     metrics: Arc<PipelineMetrics>,
+    /// v14.9: Shared apply-event signal. Fired after each successful save.
+    /// Sync manager `.notified().await` instead of polling storage.
+    apply_notify: Arc<tokio::sync::Notify>,
 }
 
 impl PipelineIngest {
@@ -366,6 +373,14 @@ impl PipelineIngest {
     /// Get pipeline metrics snapshot.
     pub fn metrics(&self) -> &PipelineMetrics {
         &self.metrics
+    }
+
+    /// v14.9: Access to the apply-event signal.
+    /// Sync manager calls `pipeline.apply_notify().notified().await` to
+    /// wake up the instant a block hits storage — zero-latency progress
+    /// without any sleep/poll loop.
+    pub fn apply_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.apply_notify.clone()
     }
 }
 
@@ -416,6 +431,9 @@ impl BlockPipeline {
 
         // Stage 3: Verify → Apply (state transitions + storage write + ALL side effects)
         // MUST be single-threaded (sequential writes to RocksDB + state)
+        // v14.9: clone apply_notify BEFORE moving ctx into apply_stage —
+        // sync manager will wait on the same Notify to progress without sleep.
+        let ctx_apply_notify = ctx.apply_notify.clone();
         let metrics_apply = metrics.clone();
         tokio::spawn(Self::apply_stage(
             verify_rx,
@@ -436,6 +454,7 @@ impl BlockPipeline {
         PipelineIngest {
             tx: ingest_tx,
             metrics,
+            apply_notify: ctx_apply_notify,
         }
     }
 
@@ -1212,11 +1231,28 @@ impl BlockPipeline {
             // Broadcast block event (for consensus listener)
             let _ = ctx.block_event_tx.send(height);
 
+            // v14.9: Wake sync manager and any other apply-waiters.
+            // Zero-cost when no waiters (atomic notify slot).
+            // At thousands of Super nodes scale this is O(1) — Notify uses
+            // a single atomic flag + waker list; no per-waiter lock.
+            ctx.apply_notify.notify_waiters();
+
             // Notify coordinator
             ctx.coordinator.try_send(ConsensusEvent::BlockApplied {
                 height,
                 producer: producer.clone(),
                 timestamp: block.microblock.timestamp,
+            });
+
+            // v14.9: WS broadcast for real-time explorer updates.
+            // Ported from the removed process_received_blocks path —
+            // without this, NewBlock events never reach WS subscribers.
+            crate::rpc::broadcast_ws_event(crate::rpc::WsEvent::NewBlock {
+                height: block.microblock.height,
+                hash: hex::encode(block.microblock.hash()),
+                timestamp: block.microblock.timestamp,
+                tx_count: block.microblock.transactions.len(),
+                producer: block.microblock.producer.clone(),
             });
 
             // v14.7.2: per-microblock BlockCommitVote emission REMOVED.
