@@ -1282,8 +1282,13 @@ impl BlockPipeline {
             //     state directly (that would let ≤ f byzantine producers
             //     forge arbitrary rotation). It only signals "a certificate
             //     exists somewhere in the network — fetch it."
-            //   * Rate-limited by the block cadence — one request per
-            //     catch-up gap, not per block.
+            //   * Self-limiting via the monotonic local_certified guard:
+            //     as soon as the first successful backfill response advances
+            //     HIGHEST_CERTIFIED_ROUND past this block's timeout_round,
+            //     subsequent blocks in the same catch-up batch stop firing
+            //     requests. Worst case during partition-induced catch-up is
+            //     ~N requests (one per block applied faster than the peer
+            //     RTT), bounded by the sync window.
             //
             // Scalability: one fan-out request to ≤ 5 peers only when the
             // condition fires. For the steady-state (block.timeout_round

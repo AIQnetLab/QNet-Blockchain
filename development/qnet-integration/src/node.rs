@@ -1370,9 +1370,14 @@ pub fn mark_consensus_stalled(mb_index: u64, reason: &str) {
     }
 }
 
-/// v15.0: Query whether a macroblock index finalized via fallback.
-/// Used by the N-2-snapshot consumer to decide whether to take the
-/// beacon/leader from mb_index or degrade to mb_index - 1 ("N-3 escape").
+/// v15.0: Query whether a macroblock index finalized via the deterministic
+/// fallback path (commit-reveal reveal-shortage or phase error, or N-2
+/// beacon missing locally at start of round).
+///
+/// Observability-only helper. Feeds RPC endpoints and operator dashboards
+/// so degraded finalizations are visible without trawling the logs. The
+/// macroblock itself is a regular on-chain artefact — this flag does not
+/// influence consensus decisions, only reporting.
 pub fn is_consensus_stalled(mb_index: u64) -> bool {
     CONSENSUS_STALLED.contains_key(&mb_index)
 }
@@ -3236,8 +3241,26 @@ impl BlockchainNode {
     /// Scalability: O(1) storage lookup + O(block size) deserialisation,
     /// independent of committee size.
     fn try_load_macroblock_beacon(storage: &Storage, macroblock_index: u64) -> Option<[u8; 32]> {
-        if macroblock_index < 2 {
-            // Genesis epoch — universal zero seed, all honest nodes agree.
+        // v15.0.1: Bootstrap edge — first three macroblocks use a universal
+        // zero seed because their N-2 target lies before any on-chain
+        // macroblock exists:
+        //   * mb_idx=0 / mb_idx=1  →  genesis epoch, no prior macroblock at all.
+        //   * mb_idx=2             →  N-2 = mb_idx=0, which is never created
+        //                             (no macroblock at genesis h=0).
+        // From mb_idx=3 onward, N-2 = mb_idx=1 exists on-chain (finalised
+        // at h=90) and the strict-N-2 guard kicks in for real. Every honest
+        // node applies the same rule deterministically, so the zero-seed
+        // bootstrap window is fork-safe.
+        //
+        // Previous behaviour: old code used `macroblock_index >= 2` outside
+        // this helper AND silently fell back to `[0u8; 32]` on storage
+        // None. Replacing that with a strict None-returns-Err guard broke
+        // bootstrap at mb_idx=2 because mb_idx=0 is unreachable — every
+        // node aborted the h=180 macroblock, mb=2 never entered the chain,
+        // and mb=4 at h=360 could never find its N-2 snapshot. Extending
+        // the zero-seed window to `< 3` preserves the strict guard for
+        // real-world behind-chain cases while keeping bootstrap alive.
+        if macroblock_index < 3 {
             return Some([0u8; 32]);
         }
         let n_minus_2 = macroblock_index - 2;
@@ -26018,10 +26041,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // bounded by the committee cap. One fallback per failed
                     // finalize, which is at most once per 90 microblocks.
                     // ═══════════════════════════════════════════════════════
+                    // v15.0: Match the exact error payload emitted by
+                    // `CommitRevealConsensus::finalize_round` for the
+                    // reveal-shortage case. Using the full phrase avoids
+                    // false-positives from unrelated errors that happen
+                    // to contain the single word "Insufficient" (e.g.
+                    // future "Insufficient peers" style diagnostics) —
+                    // those should bubble up the unknown-error branch so
+                    // operators see the real cause instead of silently
+                    // degrading to the fallback leader.
                     let err_str = e.to_string();
-                    let is_reveal_shortage = err_str.contains("Insufficient")
-                        || err_str.contains("VALID reveals")
-                        || err_str.contains("Byzantine safety");
+                    let is_reveal_shortage = err_str.contains("Insufficient VALID reveals");
                     let is_phase_error = err_str.contains("Not in reveal phase")
                         || err_str.contains("NoActiveRound");
 
@@ -26047,8 +26077,36 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         mb_idx, reason, e,
                     );
 
-                    // Deterministic fallback leader — hash of sorted participants
-                    // + macroblock index. Identical on every honest node.
+                    // v15.0: Defensive guard against an empty participant
+                    // list. The earlier network-size check already rejects
+                    // sub-threshold committees, but degraded-safety genesis
+                    // paths (network_size ≤ 10) can continue with very
+                    // small sets. A hypothetical collapse to zero would
+                    // turn the `index % all_participants.len()` below into
+                    // a divide-by-zero panic — surface it as a bubbled
+                    // error instead, mark the macroblock as stalled so
+                    // the unknown-state is visible to observability, and
+                    // let the outer retry loop decide whether to keep
+                    // attempting this round.
+                    if all_participants.is_empty() {
+                        crate::node::mark_consensus_stalled(
+                            mb_idx, "fallback_no_participants",
+                        );
+                        return Err(format!(
+                            "Consensus fallback aborted: empty participants list at mb={}",
+                            mb_idx,
+                        ));
+                    }
+
+                    // Deterministic fallback leader — hash of the canonical
+                    // participants list + macroblock index. The input order
+                    // is whatever `select_consensus_committee` produced from
+                    // the N-2 VRF seed (VRF-sorted subsample when >
+                    // COMMITTEE_THRESHOLD, otherwise the alphabetically
+                    // sorted qualified set). Because the seed itself is
+                    // consensus data, every honest node reconstructs the
+                    // same sequence and therefore the same hash — no fork
+                    // risk, full liveness.
                     let mut hasher = Sha3_256::new();
                     hasher.update(b"MACROBLOCK_FALLBACK");
                     hasher.update(&mb_idx.to_le_bytes());

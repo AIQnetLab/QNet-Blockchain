@@ -21728,21 +21728,20 @@ impl SimplifiedP2P {
         // Track this voter's max round for f+1 adoption aggregation and
         // remember the highest signed payload so we can reconstruct a
         // pacemaker-style aggregated TC without replay-requesting peers.
-        let signed_vote_upgraded = {
+        // The insert into VOTER_MAX_SIGNED_VOTE fires only when the
+        // incoming vote's round is the voter's new max — older signed
+        // payloads are never overwritten with lower-round ones.
+        {
             let prev = VOTER_MAX_ROUND.entry((height, voter_id.clone()))
                 .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
                 .or_insert(timeout_round);
-            let new_max = *prev;
-            let should_store_signed = new_max == timeout_round;
-            if should_store_signed {
+            if *prev == timeout_round {
                 VOTER_MAX_SIGNED_VOTE.insert(
                     (height, voter_id.clone()),
                     (timeout_round, hash_arr, signature.clone()),
                 );
             }
-            should_store_signed
-        };
-        let _ = signed_vote_upgraded; // reserved for future metrics
+        }
 
         // Cumulative adopted round: the f+1-th voter (by max_round desc) defines
         // the highest round with ≥ f+1 support. Monotonic — never decreases.
