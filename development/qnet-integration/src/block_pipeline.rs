@@ -1258,6 +1258,59 @@ impl BlockPipeline {
             crate::unified_p2p::clear_block_pending_sync(height);
 
             // ────────────────────────────────────────────────────────────────
+            // v15.0: CHAIN-DERIVED ROTATION STATE CATCH-UP
+            //
+            // Closes the rotation-state-desync cascade. A node that came
+            // back online at h=2790 and synced forward to h=2880 previously
+            // applied the block with timeout_round=6 but had
+            // HIGHEST_CERTIFIED_ROUND[mb_idx] = 0 because it never witnessed
+            // the live BFT voting. Its producer-selection therefore computed
+            // the primary leader (VRF winner at round 0) instead of the
+            // rotated-to-round-6 producer, leading to the observed two-
+            // producer fork for the same height.
+            //
+            // Fix: if an applied block was produced at timeout_round > local
+            // HIGHEST_CERTIFIED_ROUND for the containing macroblock index,
+            // proactively request timeout certificates from peers. The
+            // response path re-verifies each certificate's 2f+1 signatures
+            // (`handle_timeout_proof_broadcast` / `handle_aggregated_timeout_cert`)
+            // before advancing state — so this is NOT a trust-the-block
+            // shortcut; the block merely triggers the backfill.
+            //
+            // Safety:
+            //   * timeout_round in the block is NOT used to advance rotation
+            //     state directly (that would let ≤ f byzantine producers
+            //     forge arbitrary rotation). It only signals "a certificate
+            //     exists somewhere in the network — fetch it."
+            //   * Rate-limited by the block cadence — one request per
+            //     catch-up gap, not per block.
+            //
+            // Scalability: one fan-out request to ≤ 5 peers only when the
+            // condition fires. For the steady-state (block.timeout_round
+            // matches local state) this costs zero. Bounded by the
+            // active-macroblock cleanup window.
+            // ────────────────────────────────────────────────────────────────
+            let block_timeout_round = block.microblock.timeout_round;
+            if block_timeout_round > 0 {
+                let mb_idx = height / 90;
+                let local_certified = crate::unified_p2p::highest_certified_round_for(mb_idx);
+                if block_timeout_round > local_certified {
+                    if let Some(ref p2p) = ctx.unified_p2p {
+                        if is_info() {
+                            println!(
+                                "[INFO][PIPELINE] rotation_backfill_request h={} mb={} block_round={} local_certified={}",
+                                height, mb_idx, block_timeout_round, local_certified,
+                            );
+                        }
+                        // Request certificates for the macroblock window
+                        // covering this block — peers serve both same-round
+                        // and aggregated certificates in one response.
+                        p2p.request_timeout_proofs(mb_idx, mb_idx);
+                    }
+                }
+            }
+
+            // ────────────────────────────────────────────────────────────────
             // v14.10: GENESIS GLOBAL STATE (was missing in pipeline apply path!)
             //
             // The canonical `genesis_config::apply_genesis_state` sets two

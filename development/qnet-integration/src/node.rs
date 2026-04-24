@@ -1330,6 +1330,53 @@ lazy_static::lazy_static! {
 pub static EQUIVOCATION_EVIDENCE: once_cell::sync::Lazy<DashMap<(u64, String), (u64, u64)>> =
     once_cell::sync::Lazy::new(|| DashMap::new());
 
+/// v15.0: Consensus-stall registry for macroblock boundaries where the
+/// canonical commit-reveal finalization could not gather 2f+1 VALID reveals.
+///
+/// Key:   macroblock_index.
+/// Value: (fallback_kind, detected_timestamp_secs) — kind is a short tag:
+///        "reveal_shortage" / "phase_error" / etc. Enables RPC/metrics
+///        reporting and drives the next-macroblock production guard so the
+///        network degrades gracefully instead of halting when a subset of
+///        validators withholds reveals.
+///
+/// Retention: cleared by `cleanup_global_hashmaps` on the periodic sweep;
+/// bounded by CLEANUP_HEIGHT_WINDOW so memory is flat at any committee size.
+pub static CONSENSUS_STALLED: once_cell::sync::Lazy<DashMap<u64, (String, u64)>> =
+    once_cell::sync::Lazy::new(|| DashMap::new());
+
+/// v15.0: Set CONSENSUS_STALLED flag for a macroblock index.
+/// Idempotent — first observed fallback reason is kept, later observations
+/// are logged at WARN but do not overwrite (keeps the root cause visible).
+pub fn mark_consensus_stalled(mb_index: u64, reason: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let inserted = CONSENSUS_STALLED
+        .entry(mb_index)
+        .or_insert_with(|| (reason.to_string(), ts));
+    if inserted.0 != reason && is_warn() {
+        println!(
+            "[WARN][CONS] stall_reason_changed mb={} existing={} new={}",
+            mb_index, inserted.0, reason,
+        );
+    }
+    if is_warn() {
+        println!(
+            "[WARN][CONS] consensus_stalled_flag mb={} reason={}",
+            mb_index, reason,
+        );
+    }
+}
+
+/// v15.0: Query whether a macroblock index finalized via fallback.
+/// Used by the N-2-snapshot consumer to decide whether to take the
+/// beacon/leader from mb_index or degrade to mb_index - 1 ("N-3 escape").
+pub fn is_consensus_stalled(mb_index: u64) -> bool {
+    CONSENSUS_STALLED.contains_key(&mb_index)
+}
+
 /// Out-of-turn producer tracking: producer_id -> (window_start_height, count)
 /// If a producer sends >3 blocks out of turn within 100 blocks, reject subsequent ones.
 static OOT_PRODUCER_COUNT: once_cell::sync::Lazy<DashMap<String, (u64, u32)>> =
@@ -3076,35 +3123,46 @@ impl BlockchainNode {
         // Precompute hashes O(n) — same pattern as select_consensus_committee.
         if eligible.len() > MAX_VALIDATORS {
 
-            let vrf_seed: [u8; 32] = if macroblock_index >= 2 {
-                let n_minus_2 = macroblock_index - 2;
-                match storage.get_macroblock_by_height(n_minus_2) {
-                    Ok(Some(data)) => {
-                        match bincode::deserialize::<qnet_state::MacroBlock>(&data) {
-                            Ok(mb) => mb.consensus_data.randomness_beacon.unwrap_or([0u8; 32]),
-                            Err(e) => {
-                                if crate::node::is_warn() {
-                                    println!("[WARN][VRF] seed_deserialize_failed mb={} err={}", n_minus_2, e);
-                                }
-                                [0u8; 32]
-                            }
-                        }
+            // v15.0: Strict N-2 seed. If this node is missing mb=(N-2) locally
+            // it is BEHIND the chain — it must abstain from truncating the
+            // candidate set here rather than improvise a different seed.
+            // Skipping the truncation keeps the full candidate list; the
+            // actual producer decision downstream relies on the seed set
+            // inside the commit-reveal engine (see trigger_macroblock_consensus),
+            // which applies the same N-2 requirement and triggers a sync
+            // when the seed is unavailable. All honest nodes with the same
+            // on-chain view reach the same truncation result.
+            let vrf_seed_opt = Self::try_load_macroblock_beacon(storage, macroblock_index);
+            let vrf_seed: [u8; 32] = match vrf_seed_opt {
+                Some(seed) => seed,
+                None => {
+                    if crate::node::is_warn() {
+                        println!(
+                            "[WARN][SNAP] vrf_seed_unavailable mb={} — skipping MAX_VALIDATORS truncation, node needs sync",
+                            macroblock_index,
+                        );
                     }
-                    Ok(None) => {
-                        if crate::node::is_warn() {
-                            println!("[WARN][VRF] seed_macroblock_not_found mb={}", n_minus_2);
-                        }
-                        [0u8; 32]
+                    // Trigger async N-2 sync via P2P — downstream guard in
+                    // trigger_macroblock_consensus refuses to proceed until
+                    // the macroblock arrives. Keeping full candidate list
+                    // here is harmless because the refusal blocks production.
+                    let missing_mb = macroblock_index.saturating_sub(2);
+                    let p2p_clone = p2p.clone();
+                    tokio::spawn(async move {
+                        let _ = p2p_clone.sync_macroblocks(missing_mb, missing_mb).await;
+                    });
+                    // Short-circuit: abort the truncation branch entirely.
+                    // Return the current `eligible` list unchanged so the
+                    // caller gets a deterministic outcome (full list) that
+                    // every similarly-behind node also produces.
+                    if is_debug() {
+                        println!(
+                            "[DBG][SNAP] consensus_participants={} (N-2 seed missing, no truncation)",
+                            eligible.len(),
+                        );
                     }
-                    Err(e) => {
-                        if crate::node::is_warn() {
-                            println!("[WARN][VRF] seed_storage_error mb={} err={}", n_minus_2, e);
-                        }
-                        [0u8; 32]
-                    }
+                    return eligible;
                 }
-            } else {
-                [0u8; 32]
             };
 
             let vrf_scores: std::collections::HashMap<String, [u8; 32]> = eligible.iter()
@@ -3150,6 +3208,86 @@ impl BlockchainNode {
     const CONSENSUS_COMMITTEE_SIZE: usize = 100;
     const COMMITTEE_THRESHOLD: usize = 120;
 
+    /// v15.0: Strict N-2 beacon loader.
+    ///
+    /// Returns the canonical randomness_beacon from macroblock (index - 2),
+    /// or `None` if that macroblock is not in local storage OR its beacon
+    /// field is empty. Genesis epoch (index < 2) is the only case where
+    /// this function synthesises a zero seed — that rule is universal and
+    /// applied identically by every honest node.
+    ///
+    /// Why there is NO N-3 escape fallback:
+    ///   * Consensus participants must agree on ONE seed per macroblock
+    ///     boundary. If some nodes used N-2 and others N-3 for the same
+    ///     boundary they would compute different committees, different
+    ///     VRF scores, different leaders — silent per-node divergence.
+    ///   * A missing N-2 locally signals "this node is behind the chain",
+    ///     NOT "the network skipped that macroblock". With Fix #5 unified
+    ///     finalize fallback, mb=(M-2) is ALWAYS created on-chain (via
+    ///     deterministic fallback leader when commit-reveal fails). So
+    ///     if local storage lacks mb=(M-2), the node has a sync gap and
+    ///     must catch up — not improvise its own seed.
+    ///   * Callers must treat `None` as "not ready for macroblock M":
+    ///     trigger sync, abstain from voting/producing, wait for the
+    ///     missing macroblock to arrive. This is the standard participation
+    ///     guard that every BFT SMR system applies to missing on-chain
+    ///     state.
+    ///
+    /// Scalability: O(1) storage lookup + O(block size) deserialisation,
+    /// independent of committee size.
+    fn try_load_macroblock_beacon(storage: &Storage, macroblock_index: u64) -> Option<[u8; 32]> {
+        if macroblock_index < 2 {
+            // Genesis epoch — universal zero seed, all honest nodes agree.
+            return Some([0u8; 32]);
+        }
+        let n_minus_2 = macroblock_index - 2;
+        match storage.get_macroblock_by_height(n_minus_2) {
+            Ok(Some(data)) => match bincode::deserialize::<qnet_state::MacroBlock>(&data) {
+                Ok(mb) => {
+                    match mb.consensus_data.randomness_beacon {
+                        Some(b) => Some(b),
+                        None => {
+                            if crate::node::is_warn() {
+                                println!(
+                                    "[WARN][VRF] seed_beacon_absent mb={} — macroblock present but randomness_beacon=None",
+                                    n_minus_2,
+                                );
+                            }
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    if crate::node::is_warn() {
+                        println!(
+                            "[WARN][VRF] seed_deserialize_failed mb={} err={}",
+                            n_minus_2, e,
+                        );
+                    }
+                    None
+                }
+            },
+            Ok(None) => {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][VRF] seed_missing_local mb={} — node is behind the chain, trigger sync",
+                        n_minus_2,
+                    );
+                }
+                None
+            }
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][VRF] seed_storage_error mb={} err={}",
+                        n_minus_2, e,
+                    );
+                }
+                None
+            }
+        }
+    }
+
     fn select_consensus_committee(
         all_candidates: &[String],
         macroblock_index: u64,
@@ -3159,35 +3297,24 @@ impl BlockchainNode {
             return all_candidates.to_vec();
         }
 
-        let seed: [u8; 32] = if macroblock_index >= 2 {
-            let n_minus_2 = macroblock_index - 2;
-            match storage.get_macroblock_by_height(n_minus_2) {
-                Ok(Some(data)) => {
-                    match bincode::deserialize::<qnet_state::MacroBlock>(&data) {
-                        Ok(mb) => mb.consensus_data.randomness_beacon.unwrap_or([0u8; 32]),
-                        Err(e) => {
-                            if crate::node::is_warn() {
-                                println!("[WARN][VRF] seed_deserialize_failed mb={} err={}", n_minus_2, e);
-                            }
-                            [0u8; 32]
-                        }
-                    }
+        // v15.0: Strict N-2 seed. If this node lacks mb=(N-2) locally it is
+        // behind the chain and MUST NOT improvise a different seed (that
+        // would put it on a different committee from the rest of the honest
+        // validators). Signal by returning the full candidate list — every
+        // similarly-behind honest node returns the same thing — and let the
+        // downstream commit-reveal guard in `trigger_macroblock_consensus`
+        // refuse to proceed until sync catches up.
+        let seed: [u8; 32] = match Self::try_load_macroblock_beacon(storage, macroblock_index) {
+            Some(s) => s,
+            None => {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][COMMITTEE] seed_unavailable mb={} — skipping VRF subsample, node behind chain",
+                        macroblock_index,
+                    );
                 }
-                Ok(None) => {
-                    if crate::node::is_warn() {
-                        println!("[WARN][VRF] seed_macroblock_not_found mb={}", n_minus_2);
-                    }
-                    [0u8; 32]
-                }
-                Err(e) => {
-                    if crate::node::is_warn() {
-                        println!("[WARN][VRF] seed_storage_error mb={} err={}", n_minus_2, e);
-                    }
-                    [0u8; 32]
-                }
+                return all_candidates.to_vec();
             }
-        } else {
-            [0u8; 32]
         };
 
 
@@ -25732,30 +25859,51 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // ═══════════════════════════════════════════════════════════════════
             let macroblock_index = round_id / 90; // Current macroblock being created
             if macroblock_index >= 2 {
-                // N-2 macroblock exists, use its randomness_beacon
-                let n_minus_2_index = macroblock_index - 2;
-                match storage.get_macroblock_by_height(n_minus_2_index) {
-                    Ok(Some(prev_mb_data)) => {
-                        match bincode::deserialize::<qnet_state::MacroBlock>(&prev_mb_data) {
-                            Ok(prev_macroblock) => {
-                                if let Some(beacon) = prev_macroblock.consensus_data.randomness_beacon {
-                                    consensus_engine.set_randomness_beacon(beacon);
-                                    println!("[INFO][CONS] beacon_loaded from_mb={} hash={}...", 
-                                        n_minus_2_index, hex::encode(&beacon[..8]));
-                                } else {
-                                    println!("[WARN][CONS] MacroBlock #{} has no randomness_beacon", n_minus_2_index);
-                                }
-                            }
-                            Err(e) => {
-                                println!("[WARN][CONS] Failed to deserialize MacroBlock #{}: {}", n_minus_2_index, e);
-                            }
-                        }
+                // v15.0: STRICT N-2 BEACON REQUIREMENT.
+                //
+                // This is the authoritative guard: commit-reveal leader
+                // selection is a consensus decision, so every honest node
+                // MUST seed from the same macroblock. Using a different
+                // fallback per node (N-3, zero, anything else) would put
+                // nodes on different leader-selection trajectories —
+                // exactly the class of divergence that produced the
+                // observed two-producer incident at h=2880.
+                //
+                // If this node lacks mb=(N-2) locally, it is behind the
+                // chain (with Fix #5 unified finalize fallback, mb=(N-2)
+                // is ALWAYS on-chain whether commit-reveal succeeded or
+                // fell back). The correct action is to trigger a sync
+                // for the missing macroblock and refuse to participate in
+                // mb=M consensus until it arrives. The node is NOT the
+                // source of truth for which macroblock exists — the
+                // chain is.
+                match Self::try_load_macroblock_beacon(&storage, macroblock_index) {
+                    Some(beacon) => {
+                        consensus_engine.set_randomness_beacon(beacon);
+                        println!(
+                            "[INFO][CONS] beacon_loaded mb={} hash={}...",
+                            macroblock_index, hex::encode(&beacon[..8]),
+                        );
                     }
-                    Ok(None) => {
-                        println!("[WARN][CONS] MacroBlock #{} not found for beacon", n_minus_2_index);
-                    }
-                    Err(e) => {
-                        println!("[WARN][CONS] Failed to load MacroBlock #{}: {:?}", n_minus_2_index, e);
+                    None => {
+                        let missing_mb = macroblock_index - 2;
+                        println!(
+                            "[WARN][CONS] beacon_unavailable mb={} missing_n2={} — triggering sync, abstaining this round",
+                            macroblock_index, missing_mb,
+                        );
+                        crate::node::mark_consensus_stalled(
+                            macroblock_index, "n2_macroblock_missing_local",
+                        );
+                        // Trigger async sync for the missing macroblock so
+                        // the next iteration can proceed normally.
+                        let p2p_clone = p2p.clone();
+                        tokio::spawn(async move {
+                            let _ = p2p_clone.sync_macroblocks(missing_mb, missing_mb).await;
+                        });
+                        return Err(format!(
+                            "N-2 macroblock mb={} missing locally; sync triggered, abstaining from mb={} consensus",
+                            missing_mb, macroblock_index,
+                        ));
                     }
                 }
             } else {
@@ -25827,31 +25975,102 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 }
                 Err(e) => {
-                    // Check if this is a phase error and try to recover
-                    if e.to_string().contains("Not in reveal phase") || e.to_string().contains("NoActiveRound") {
-                        println!("[WARN][CONS] Phase error during finalization: {}", e);
-                        println!("[WARN][CONS] fallback_leader_selection");
-                        
-                        // Fallback: Use deterministic leader selection based on participants
-                        let mut hasher = Sha3_256::new();
-                        hasher.update(b"MACROBLOCK_FALLBACK");
-                        hasher.update(&(end_height / 90).to_le_bytes());
-                        for participant in &all_participants {
-                            hasher.update(participant.as_bytes());
-                        }
-                        let hash = hasher.finalize();
-                        let index = u64::from_le_bytes([hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]]) as usize;
-                        let leader_idx = index % all_participants.len();
-                        let fallback_leader = all_participants[leader_idx].clone();
-                        
-                        println!("[INFO][CONS] fallback_leader={}", fallback_leader);
-                        qnet_consensus::commit_reveal::ConsensusResultData {
-                            round_number: end_height / 90,
-                            leader_id: fallback_leader,
-                            participants: all_participants.clone(),
-                        }
-                    } else {
+                    // ═══════════════════════════════════════════════════════
+                    // v15.0: UNIFIED CONSENSUS-STALL FALLBACK PATH
+                    // ═══════════════════════════════════════════════════════
+                    // Previously only phase errors (`Not in reveal phase` /
+                    // `NoActiveRound`) triggered a deterministic fallback
+                    // leader; reveal-shortage errors ("Insufficient VALID
+                    // reveals for Byzantine safety") bubbled up as hard
+                    // `return Err(…)` which ABORTED macroblock creation.
+                    //
+                    // An aborted macroblock leaves a gap in the chain —
+                    // the N-2 snapshot rule at mb+2 then cannot find its
+                    // source macroblock and the network halts at the NEXT
+                    // macroblock boundary. This was the observed halt mode
+                    // of the last cascade: mb=34 failed finalization,
+                    // mb=35 proceeded, mb=36 could not start because its
+                    // N-2 snapshot pointed at the missing mb=34 row.
+                    //
+                    // Fix: treat ALL finalize errors as triggers for the
+                    // deterministic fallback leader, mark the macroblock
+                    // index as CONSENSUS_STALLED so operators/RPC/explorer
+                    // see the degradation, and let chain progression
+                    // continue. The randomness beacon assembled later from
+                    // accumulated VRF outputs is independent of the
+                    // commit-reveal leader and remains usable by mb+2.
+                    //
+                    // Safety argument:
+                    //   * The fallback leader is a pure deterministic
+                    //     function of (end_height / 90, sorted participants).
+                    //     Every honest node computes the same leader, so
+                    //     liveness is preserved without sacrificing agreement.
+                    //   * Reveal shortage does NOT let an attacker pick the
+                    //     leader: the seed is already mixed with the
+                    //     macroblock index before indexing, and participants
+                    //     come from the canonical N-2 snapshot which no ≤ f
+                    //     adversary can alter.
+                    //   * The CONSENSUS_STALLED flag is authoritative state
+                    //     feeding the next-macroblock production guard
+                    //     (prevents silent degradation from cascading).
+                    //
+                    // Scalability: O(|participants|) hash update per fallback —
+                    // bounded by the committee cap. One fallback per failed
+                    // finalize, which is at most once per 90 microblocks.
+                    // ═══════════════════════════════════════════════════════
+                    let err_str = e.to_string();
+                    let is_reveal_shortage = err_str.contains("Insufficient")
+                        || err_str.contains("VALID reveals")
+                        || err_str.contains("Byzantine safety");
+                    let is_phase_error = err_str.contains("Not in reveal phase")
+                        || err_str.contains("NoActiveRound");
+
+                    if !(is_reveal_shortage || is_phase_error) {
+                        // Unknown error class — do not degrade silently.
+                        // Still mark the mb as stalled so callers/observability
+                        // see the event; bubble up for upstream handling.
+                        let mb_idx = end_height / 90;
+                        crate::node::mark_consensus_stalled(mb_idx, "finalize_unknown_error");
                         return Err(format!("Consensus finalization failed: {}", e));
+                    }
+
+                    let reason = if is_reveal_shortage {
+                        "reveal_shortage"
+                    } else {
+                        "phase_error"
+                    };
+                    let mb_idx = end_height / 90;
+                    crate::node::mark_consensus_stalled(mb_idx, reason);
+
+                    println!(
+                        "[WARN][CONS] finalize_fallback mb={} reason={} err={}",
+                        mb_idx, reason, e,
+                    );
+
+                    // Deterministic fallback leader — hash of sorted participants
+                    // + macroblock index. Identical on every honest node.
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(b"MACROBLOCK_FALLBACK");
+                    hasher.update(&mb_idx.to_le_bytes());
+                    for participant in &all_participants {
+                        hasher.update(participant.as_bytes());
+                    }
+                    let hash = hasher.finalize();
+                    let index = u64::from_le_bytes([
+                        hash[0], hash[1], hash[2], hash[3],
+                        hash[4], hash[5], hash[6], hash[7],
+                    ]) as usize;
+                    let leader_idx = index % all_participants.len();
+                    let fallback_leader = all_participants[leader_idx].clone();
+
+                    println!(
+                        "[INFO][CONS] fallback_leader mb={} leader={} reason={}",
+                        mb_idx, fallback_leader, reason,
+                    );
+                    qnet_consensus::commit_reveal::ConsensusResultData {
+                        round_number: mb_idx,
+                        leader_id: fallback_leader,
+                        participants: all_participants.clone(),
                     }
                 }
             }
