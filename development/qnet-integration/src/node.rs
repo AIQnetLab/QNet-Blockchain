@@ -22772,14 +22772,35 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let stored_height = storage.get_chain_height().unwrap_or(0);
         
         // ═══════════════════════════════════════════════════════════════════
-        // CRITICAL v2.45: CHECK vs NETWORK HEIGHT (not just local)
-        // Node on fork may think it's synced but actually far behind network!
+        // v15.2: NO EARLY desync_skip RETURN.
+        //
+        // The previous `if stored_height + 50 < network_height { return false; }`
+        // short-circuit was the catastrophic amplifier of the mb=10 halt. When
+        // the deterministic hash picked a node that happened to be behind the
+        // chain, that node silently stepped out — and because non-primary nodes
+        // always return `false` from this function (see `we_are_initiator`
+        // branch below), NO node took over. The macroblock never got created.
+        //
+        // Correct behaviour: let the round-robin leader rotation drive the
+        // decision. The chosen initiator ATTEMPTS creation; if it fails (for
+        // any reason — desync, crash, network loss, storage issue), the
+        // participating nodes detect the timeout, emit signed view-change
+        // votes, HIGHEST_CERTIFIED_ROUND[mb] advances, and the next invocation
+        // of `should_initiate_consensus` picks `(base_idx + view_round + 1) % N`
+        // — the next candidate in the committee — who then attempts creation.
+        //
+        // This delegates "is the chosen leader able?" from a local
+        // best-effort check into the BFT protocol itself, which is what every
+        // scale-correct L1 consensus protocol does. We keep network_height
+        // available for logging and for informed best-effort attempts, but it
+        // no longer pre-disqualifies participation.
         // ═══════════════════════════════════════════════════════════════════
         let network_height = p2p.get_cached_network_height().unwrap_or(0);
-        if network_height > 0 && stored_height + 50 < network_height {
-            println!("[WARN][CONS] desync_skip local={} network={} gap={}", 
-                     stored_height, network_height, network_height - stored_height);
-            return false; // Cannot participate - we're too far behind network!
+        if network_height > 0 && stored_height + 50 < network_height && is_warn() {
+            println!(
+                "[WARN][CONS] behind_network local={} network={} gap={} — proceeding; view-change drives rotation",
+                stored_height, network_height, network_height.saturating_sub(stored_height),
+            );
         }
         
         // CRITICAL FIX: Allow participation in EARLY consensus (29 blocks ahead for macroblock)
@@ -22937,51 +22958,101 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Mix the 2f+1-certified timeout round for THIS macroblock boundary
         // into the leader-selection hash. When a macroblock's commit/reveal
         // phase fails to reach 2f+1, validators broadcast a Dilithium3-signed
-        // TimeoutVote at (mb_index, round+1). After 2f+1 such votes a
-        // TimeoutCertificate forms and bumps HIGHEST_CERTIFIED_ROUND[mb_index].
-        // Incorporating that round here deterministically rotates the leader
-        // to a DIFFERENT validator — without touching the epoch boundary, the
-        // entropy source, or the participant set. Every honest node sees the
-        // same certified round, so every honest node picks the same next
-        // leader, and consensus resumes in the same epoch.
-        let macro_view_round = p2p.get_highest_certified_round(macroblock_round);
-        selection_hasher.update(macro_view_round.to_le_bytes());
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v15.2: ROUND-ROBIN LEADER ROTATION (copied from microblock layer)
+        // ═══════════════════════════════════════════════════════════════════════════
+        // The canonical BFT leader-rotation pattern that the microblock layer has
+        // been running in production:
+        //
+        //   base_idx = hash(entropy, mb_round, sorted_candidates) % N
+        //   leader   = sorted_candidates[ (base_idx + view_round) % N ]
+        //
+        // Properties:
+        //   * Base index is a VRF-style pick from on-chain data — unpredictable
+        //     for future epochs yet identical on every honest node at the same
+        //     macroblock index.
+        //   * Each view-change advances the leader by EXACTLY one slot in the
+        //     sorted committee, so after N view rounds we have covered every
+        //     distinct candidate. No probabilistic re-roll, no risk of the same
+        //     unreachable node being picked twice in a row.
+        //   * Symmetric with `select_microblock_producer_with_round` — one
+        //     leader-selection model across both consensus layers, easier to
+        //     reason about and to audit.
+        //
+        // Why this replaces the previous hash-with-view-round approach:
+        //   The prior design mixed `HIGHEST_CERTIFIED_ROUND[mb]` into the hash
+        //   input. That made every view-change give a fresh random pick from N
+        //   candidates, so a dead or partitioned node could be re-selected
+        //   multiple rounds in a row (probability 1/N per round). When the
+        //   chosen candidate was behind the network it fell into the old
+        //   `desync_skip` early return and NO node stepped up — the observed
+        //   failure mode at the mb=10 halt. Round-robin is deterministic and
+        //   monotonically advances through every candidate.
+        //
+        // Scalability: at the MAX_VALIDATORS=1000 committee cap, N view rounds
+        // cover every candidate. Combined with reputation-filtered committee
+        // (`create_eligible_producers_snapshot`), a handful of view-changes is
+        // almost always enough to reach a live honest leader.
+        // ═══════════════════════════════════════════════════════════════════════════
 
-        // Add all candidate IDs to ensure consistent ordering
+        // Add all candidate IDs to ensure consistent ordering — sorted committee is
+        // the shared canonical input for BOTH the base-index hash and the view-round
+        // modular offset below. DO NOT add view_round to the hasher — keeping it out
+        // of the hash is what turns the formula from "random re-roll" into
+        // "deterministic rotation".
         let mut sorted_candidates = qualified_candidates.clone();
-        sorted_candidates.sort_by(|a, b| a.0.cmp(&b.0)); // Sort by ID for consistency
+        sorted_candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (candidate_id, _reputation) in &sorted_candidates {
             selection_hasher.update(candidate_id.as_bytes());
         }
-        
-        // Calculate initiator index from hash
+
+        // Calculate stable base index from entropy-bound hash.
         let hash = selection_hasher.finalize();
-        let initiator_index = u64::from_le_bytes([
+        let base_idx = u64::from_le_bytes([
             hash[0], hash[1], hash[2], hash[3],
             hash[4], hash[5], hash[6], hash[7],
         ]) as usize % sorted_candidates.len();
-        
+
+        // Apply view-round offset — view_round is the BFT-certified rotation
+        // round for this macroblock boundary, advanced only by 2f+1 signed
+        // TimeoutVotes. Every honest node sees the same certified round → every
+        // honest node computes the same leader → no fork.
+        let view_round = p2p.get_highest_certified_round(macroblock_round);
+        let initiator_index = (base_idx + view_round as usize) % sorted_candidates.len();
+
         let consensus_initiator = &sorted_candidates[initiator_index].0;
-        if is_info() { println!("[INFO][CONSENSUS] initiator={} idx={}/{}", consensus_initiator, initiator_index + 1, sorted_candidates.len()); }
-        
+        if is_info() {
+            println!(
+                "[INFO][CONSENSUS] initiator={} base_idx={} view_round={} final_idx={}/{}",
+                consensus_initiator, base_idx, view_round, initiator_index + 1, sorted_candidates.len(),
+            );
+        }
+
         // Check if we are the selected initiator
         // CRITICAL: Use the node_id passed as parameter, not regenerate it
         let our_consensus_id = our_node_id.to_string();
-        
+
         let we_are_initiator = consensus_initiator == &our_consensus_id;
-        
+
         if we_are_initiator {
-            // CRITICAL v2.65: If we're initiator but desynced, we CANNOT create MacroBlock
-            // Other nodes will wait → need fallback to next candidate
-            if network_height > 0 && stored_height + 50 < network_height {
-                if is_warn() { println!("[WARN][CONS] initiator_desynced local={} network={} gap={} fallback=next", 
-                         stored_height, network_height, network_height - stored_height); }
-                return false;  // Next node in circle will become initiator
+            // v15.2: No local desync_skip early-return. Previously a behind-chain
+            // node stepped out silently and NO replacement fired — the round-robin
+            // rotation was broken by this very check. Now the node attempts
+            // creation; if it genuinely cannot produce (e.g. missing blocks in
+            // local storage), `trigger_macroblock_consensus` returns an Err, a
+            // view-change vote is emitted, HIGHEST_CERTIFIED_ROUND advances, and
+            // the next `should_initiate_consensus` invocation from the listener
+            // picks `(base_idx + view_round + 1) % N` — the next candidate — who
+            // will ATTEMPT the creation in turn. Liveness holds deterministically
+            // whatever the reason the primary pick cannot proceed.
+            if is_info() {
+                println!(
+                    "[INFO][CONS] initiator=true local_h={} network_h={}",
+                    stored_height, network_height,
+                );
             }
-            
-            if is_info() { println!("[INFO][CONS] initiator=true synced=true"); }
-            return true;  // I'm initiator and synced - create MacroBlock!
+            return true;
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
@@ -25666,24 +25737,46 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // back to direct macroblock sync from peers (same as before).
         // ═══════════════════════════════════════════════════════════════════════════
         const MAX_ROUNDS: u64 = 8;
-        // v14.8.3: Empirical tuning from live-network measurement.
-        // Delta between "reveal_phase_completed" on the participant and
-        // "macroblock saved on disk" sampled across 21 macroblocks on the
-        // 5-node genesis mesh: min=23.27s, max=24.28s, mean=24.10s, σ≈0.30s.
-        // The 24 s is NOT the voting (commit+reveal fires through in ~6 s
-        // via early-exit); it is the leader-side production + Dilithium3
-        // signing + QUIC broadcast + participant verify-and-save path.
-        // Setting the wait under that baseline causes round=0 to always
-        // time out harmlessly — 2f+1 participants emit a TimeoutVote, a
-        // TimeoutCertificate forms, the macroblock then arrives in round=1.
-        // Safety is unaffected, but the log gets noisy and every macroblock
-        // incurs an unnecessary view-change.
-        // 40s = 24.3s observed p95 + ~65% margin. Covers current 5-node
-        // genesis timings and scales up to ~1000-node committees where
-        // production+broadcast stretches by a few seconds. Real leader
-        // failure is still detected within 40s, well inside the 90s
-        // macroblock boundary.
-        const ROUND_TIMEOUT_SECS: u64 = 40;
+        // ═══════════════════════════════════════════════════════════════════════
+        // v15.2: COMMITTEE-AWARE DYNAMIC ROUND TIMEOUT.
+        //
+        // The previous hardcoded 40s baseline was tuned on the 5-node genesis
+        // mesh (observed p95 leader-to-participant latency ~24s + 65 % margin).
+        // At committee scale > 100 the broadcast fan-out and 2f+1 Dilithium3
+        // vote aggregation add measurable slack; a single static constant
+        // either wastes budget at small committees or triggers spurious view
+        // changes at large ones.
+        //
+        // Formula (monotonic in committee size, clamped to safe range):
+        //     timeout = clamp( 40 + committee / 100 , 40 .. 60 )
+        //
+        //   * 5-node mesh     → 40s   (unchanged behaviour)
+        //   * 100-node mesh   → 41s
+        //   * 500-node mesh   → 45s
+        //   * 1000-node cap   → 50s
+        //
+        // Upper cap 60s keeps 8-round worst case (8 × 60 = 480s) within the
+        // macroblock window once broadcast and sync paths are factored in.
+        // Lower floor 40s preserves the empirical genesis-mesh baseline so
+        // small deployments never regress.
+        //
+        // Deterministic across honest nodes: `all_participants` is the
+        // canonical N-2 snapshot committee, identical on every node at the
+        // same macroblock boundary. No gossip-dependent inputs, no fork risk.
+        //
+        // Scalability: a single `.len()` read and arithmetic per round — zero
+        // async work, negligible overhead even at the 1000-validator cap.
+        // ═══════════════════════════════════════════════════════════════════════
+        let committee_len = all_participants.len() as u64;
+        let round_timeout_secs = 40u64
+            .saturating_add(committee_len / 100)
+            .clamp(40, 60);
+        if is_debug() {
+            println!(
+                "[DBG][MB_PART] round_timeout_secs={} committee={}",
+                round_timeout_secs, committee_len,
+            );
+        }
 
         let mut iter_guard: u64 = 0;
         let mut last_round_seen: u64 = u64::MAX;
@@ -25742,7 +25835,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // mid-round — the role is fixed for the life of this round; a new
             // view change (bumped certified round) gives the next leader their turn.
             let wait_start = std::time::Instant::now();
-            let round_timeout = std::time::Duration::from_secs(ROUND_TIMEOUT_SECS);
+            let round_timeout = std::time::Duration::from_secs(round_timeout_secs);
             let mut local_timed_out = true;
 
             while wait_start.elapsed() < round_timeout {

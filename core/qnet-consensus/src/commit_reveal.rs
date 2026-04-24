@@ -1557,53 +1557,98 @@ impl CommitRevealConsensus {
             return None;
         }
 
-        // UNIFIED v2.36: SHA3-512 everywhere for maximum security
+        // ═══════════════════════════════════════════════════════════════════════
+        // v15.2: ROUND-ROBIN LEADER ROTATION — mirrors the microblock producer
+        // rotation and the macroblock initiator picker in `should_initiate_consensus`.
+        //
+        // Formula:
+        //   base_idx = SHA3-512(entropy ‖ height ‖ sorted_participants) % N
+        //   leader   = sorted_participants[ (base_idx + round) % N ]
+        //
+        // Why this replaced the previous hash-with-round approach:
+        //   The old compute mixed `round` INTO the hash input, which meant every
+        //   view-change gave a fresh random pick from N candidates. A dead or
+        //   partitioned validator could be re-selected multiple rounds in a
+        //   row with probability 1/N each round — livelock when that node
+        //   kept being picked. Round-robin advances by exactly one slot per
+        //   view-change, so after N rounds every candidate has had its turn.
+        //   Guaranteed progress even against hostile leader hashing.
+        //
+        // Symmetry: matches
+        //   * `select_microblock_producer_with_round` at the microblock layer
+        //   * `should_initiate_consensus` at the macroblock initiator layer
+        //   Three leader decisions, one rotation model. Identical failover
+        //   guarantees across both consensus tiers.
+        //
+        // Safety:
+        //   * `base_idx` derives only from on-chain/entropy inputs shared by
+        //     every honest node at the same (height, participants, beacon).
+        //   * `round` comes from `HIGHEST_CERTIFIED_ROUND[mb]`, advanced only
+        //     by 2f+1 Dilithium3-signed TimeoutVotes, so no ≤ f adversary can
+        //     skew it.
+        //   * Sorted participants list is the same canonical committee view
+        //     used by the initiator picker.
+        //
+        // Scalability: O(N) hash prep + O(1) modular arithmetic. At the
+        // MAX_VALIDATORS=1000 committee cap this is sub-millisecond. No
+        // allocation per round beyond the one-time sorted participant vector.
+        // ═══════════════════════════════════════════════════════════════════════
+
         use sha3::{Sha3_512, Digest};
         let mut hasher = Sha3_512::new();
 
-        // Version tag for hash domain separation (updated for v2.40.3)
-        hasher.update(b"QNet_Failover_Leader_v2.40.3");
+        // Version tag for hash domain separation — keep stable base_idx so view
+        // rotation is the only thing that advances the leader.
+        hasher.update(b"QNet_Failover_Leader_v15.2");
 
-        // ENTROPY: Randomness beacon (from blockchain)
-        // UNIFIED v2.47: Beacon is ALWAYS provided (Genesis hash for epoch 1-2, MB N-2 for epoch 3+)
-        // This ensures compute_leader matches should_initiate_consensus entropy
+        // ENTROPY: Randomness beacon (from blockchain).
+        // Beacon is ALWAYS provided (Genesis hash for epoch 1-2, MB N-2 for 3+).
+        // This ensures compute_leader matches should_initiate_consensus entropy.
         if let Some(b) = beacon {
             hasher.update(b);
         } else {
-            // CRITICAL: Beacon should ALWAYS be provided after v2.47
-            // If missing, use deterministic fallback but log warning
-            println!("[WARN][CONS] beacon=None using_fallback (should not happen after v2.47)");
+            // Beacon should ALWAYS be provided; deterministic fallback.
+            println!("[WARN][CONS] beacon=None using_fallback");
             hasher.update(b"QNet_Genesis_Beacon_v2.47");
         }
 
-        // Height (deterministic)
+        // Height (deterministic, same on all nodes for the same macroblock).
         hasher.update(&height.to_le_bytes());
 
-        // Round number (CRITICAL for failover - different round = different leader!)
-        hasher.update(&round.to_le_bytes());
+        // NOTE: `round` is deliberately NOT fed into the hash. Mixing it in
+        // would make every view-change a fresh random pick from N candidates —
+        // the bug path this version fixes. The round-robin offset is applied
+        // AFTER base_idx is computed.
 
-        // Sort participants for deterministic ordering
+        // Sort participants for deterministic ordering — the same sorted list
+        // is the input to `(base_idx + round) % N` below, so every honest
+        // node indexes into the identical sequence.
         let mut sorted_participants = participants.to_vec();
         sorted_participants.sort();
 
-        // Hash all participant IDs
         for node_id in &sorted_participants {
             hasher.update(node_id.as_bytes());
         }
 
         let hash = hasher.finalize();
 
-        // Convert hash to selection index
+        // Stable base index — identical across view rounds for the same
+        // macroblock boundary.
         let hash_number = u64::from_le_bytes([
             hash[0], hash[1], hash[2], hash[3],
             hash[4], hash[5], hash[6], hash[7],
         ]);
+        let base_idx = (hash_number as usize) % sorted_participants.len();
 
-        let selection_index = (hash_number as usize) % sorted_participants.len();
+        // Apply view-round offset — one slot advance per BFT-certified view
+        // change. Covers every distinct candidate in N rounds.
+        let selection_index = (base_idx + round as usize) % sorted_participants.len();
         let selected_leader = sorted_participants[selection_index].clone();
 
-        println!("[INFO][CONS] leader_compute node={} round={} h={} idx={}/{}", 
-                 selected_leader, round, height, selection_index, sorted_participants.len());
+        println!(
+            "[INFO][CONS] leader_compute node={} round={} h={} base_idx={} final_idx={}/{}",
+            selected_leader, round, height, base_idx, selection_index, sorted_participants.len(),
+        );
 
         Some(selected_leader)
     }

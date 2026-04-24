@@ -1038,6 +1038,72 @@ pub static QUIC_FALLBACK_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atom
 pub static QUIC_FALLBACK_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static QUIC_FALLBACK_RATE_LIMITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// v15.1: GLOBAL PEER LIVENESS REGISTRY (keyed by IP address)
+// ═══════════════════════════════════════════════════════════════════════════
+// Root-cause fix for the cascade observed on 001 at 09:47:32: the
+// runtime TCP-probe path in `filter_working_genesis_nodes_static`
+// disagreed with reality. Node 001 was actively RECEIVING shred chunks
+// from 002 at t=31.9s, then a 2s TCP-connect probe to 002 timed out at
+// t=32.2s (002 was busy with its own consensus work), and 002 was
+// marked `offline` even though message flow proved it alive.
+//
+// Two liveness sub-systems existed and contradicted each other:
+//   * `PeerInfo.last_seen` (per-instance) — updated on every received
+//     message. Ground truth for runtime liveness. Unreachable from the
+//     `static` helper below.
+//   * `filter_working_genesis_nodes_static` — separate 2-second TCP
+//     SYN probe with no retry, cache TTL 30s. Over-rules reality.
+//
+// This global mirrors `PeerInfo.last_seen` keyed by IP (strip port),
+// updated from the same `update_peer_last_seen_with_height` hook. The
+// static filter then consults it BEFORE issuing a TCP probe: a peer
+// with recent received traffic is trivially alive and bypasses the
+// probe entirely. TCP probe remains only as a cold-start / silent-peer
+// fallback — its original legitimate purpose.
+//
+// Single source of truth = no possibility for the two paths to disagree.
+// At 1000-super-node committee cap the map is bounded; periodic sweeps
+// expire entries older than `PEER_ALIVE_FRESHNESS_SECS` under the same
+// cleanup loop that prunes the other global trackers.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// IP → last_seen (unix seconds). Mirror of `PeerInfo.last_seen` exposed
+/// to the static-context `filter_working_genesis_nodes_static` helper.
+pub(crate) static GLOBAL_PEER_LAST_SEEN_BY_IP: Lazy<Arc<DashMap<String, u64>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Peers with `last_seen` within this window are considered alive without
+/// an additional TCP probe. Chosen ~2× macroblock-round timeout so a peer
+/// that temporarily stopped gossiping during a single heavy BFT phase
+/// still counts as live if it resumed recently.
+pub(crate) const PEER_ALIVE_FRESHNESS_SECS: u64 = 60;
+
+/// Update the global peer-liveness registry. Called from every site that
+/// already updates per-instance `PeerInfo.last_seen`. Idempotent and
+/// monotonic — only advances the timestamp upward.
+pub(crate) fn touch_peer_liveness_by_ip(peer_ip: &str, now_secs: u64) {
+    // Strip any accidental :port suffix to key consistently by IP.
+    let ip = peer_ip.split(':').next().unwrap_or(peer_ip).to_string();
+    if ip.is_empty() {
+        return;
+    }
+    GLOBAL_PEER_LAST_SEEN_BY_IP
+        .entry(ip)
+        .and_modify(|cur| { if now_secs > *cur { *cur = now_secs; } })
+        .or_insert(now_secs);
+}
+
+/// Returns `true` if the given IP is within the freshness window (we
+/// received a message from it recently). Constant-time lookup.
+pub(crate) fn peer_alive_by_ip(peer_ip: &str, now_secs: u64) -> bool {
+    let ip = peer_ip.split(':').next().unwrap_or(peer_ip);
+    match GLOBAL_PEER_LAST_SEEN_BY_IP.get(ip) {
+        Some(entry) => now_secs.saturating_sub(*entry.value()) <= PEER_ALIVE_FRESHNESS_SECS,
+        None => false,
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════════════
 // MEMORY LEAK FIX v3.20: Global trackers moved from function-local static
 // PROBLEM: Static inside functions had no cleanup mechanism
@@ -3521,7 +3587,14 @@ impl SimplifiedP2P {
         // v2.24.4: Extract IP for port-agnostic matching
         // Problem: Heartbeat comes from QUIC port (10876), but peers stored with HTTP port (8001)
         let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
-        
+
+        // v15.1: Update the global IP→last_seen registry in lockstep with the
+        // per-instance PeerInfo. This is the shared source of truth consulted
+        // by `filter_working_genesis_nodes_static` to bypass the TCP probe
+        // for peers that are actively talking to us — see the registry's
+        // header comment for the full rationale.
+        touch_peer_liveness_by_ip(peer_ip, current_time);
+
         // v2.51: Fully lock-free implementation
         // v2.58: REMOVED MAX_TRUSTED_HEIGHT_JUMP - heartbeats are Dilithium-signed!
         // Old logic was breaking check_block_exists_on_network because peer heights
@@ -4759,6 +4832,15 @@ impl SimplifiedP2P {
                 VOTER_MAX_SIGNED_VOTE.retain(|(h, _), _| *h >= min_height);
                 AGGREGATED_TC.retain(|(h, _), _| *h >= min_height);
                 AGGREGATED_TC_BROADCAST.retain(|h, _| *h >= min_height);
+                // v15.1: prune GLOBAL_PEER_LAST_SEEN_BY_IP so long-gone peers
+                // don't linger. A 30-minute stale cutoff keeps the registry
+                // bounded at the network's currently-reachable peer set
+                // regardless of lifetime churn. Entries younger than
+                // PEER_ALIVE_FRESHNESS_SECS are always retained; older
+                // entries drop so dead IPs don't bypass the probe path
+                // with stale freshness.
+                let stale_cutoff = current_time_secs.saturating_sub(1800);
+                GLOBAL_PEER_LAST_SEEN_BY_IP.retain(|_, last_seen| *last_seen >= stale_cutoff);
 
                 let timeout_voted_before = TIMEOUT_VOTED_HEIGHTS.len();
                 TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_height);
@@ -8402,18 +8484,18 @@ impl SimplifiedP2P {
         use std::time::Duration;
         use parking_lot::Mutex;
         use std::collections::HashMap;
-        
+
         // Cache connectivity results to prevent repeated probes
         static CACHED_GENESIS_CONNECTIVITY: std::sync::OnceLock<Mutex<HashMap<String, (Vec<String>, std::time::SystemTime)>>> = std::sync::OnceLock::new();
-        
+
         let connectivity_cache = CACHED_GENESIS_CONNECTIVITY.get_or_init(|| Mutex::new(HashMap::new()));
-        
+
         let mut cache_key_nodes = nodes.clone();
         cache_key_nodes.sort();
         let cache_key = cache_key_nodes.join("|");
-        
+
         let current_time = std::time::SystemTime::now();
-        
+
         // Check cache first
         {
             let cache = connectivity_cache.lock();
@@ -8435,71 +8517,160 @@ impl SimplifiedP2P {
                 }
             }
         }
-        
-        if crate::node::is_info() {
-            println!("[INFO][CONNECTIVITY] refresh_start peers={} strategy=nonblocking_probe", nodes.len());
-        }
-        
-        // v4.2: PARALLEL non-blocking probes using std threads (not tokio)
-        // Each probe runs in its own OS thread with a strict 2-second timeout.
-        // Total wall-clock time = ~2 seconds regardless of peer count.
-        let handles: Vec<_> = nodes.iter().map(|ip| {
-            let ip_clone = ip.clone();
-            std::thread::spawn(move || {
-                let addr = format!("{}:8001", ip_clone);
-                if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
-                    let start = std::time::Instant::now();
-                    // Single attempt, 2-second timeout. No retries.
-                    // If a peer can't respond in 2s, it's effectively offline for this round.
-                    match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2)) {
-                        Ok(_) => {
-                            let rtt = start.elapsed().as_millis() as u64;
-                            (ip_clone, true, rtt)
-                        }
-                        Err(_) => (ip_clone, false, 0)
-                    }
-                } else {
-                    (ip_clone, false, 0)
-                }
-            })
-        }).collect();
-        
+
+        // ═══════════════════════════════════════════════════════════════════
+        // v15.1: TRAFFIC-BASED LIVENESS FAST PATH (root-cause fix)
+        // ═══════════════════════════════════════════════════════════════════
+        // Before falling back to an expensive TCP probe that can mis-classify
+        // a busy-but-alive peer as offline (observed: 001 → 002/003 marked
+        // offline at 09:47:32 while 002/003 were actively shredding blocks
+        // to 001), short-circuit for every peer that has sent us any message
+        // within PEER_ALIVE_FRESHNESS_SECS (= 60s). The per-instance
+        // `PeerInfo.last_seen` is mirrored into GLOBAL_PEER_LAST_SEEN_BY_IP
+        // on every receive, so actual traffic is the authoritative liveness
+        // signal. TCP probe then runs ONLY for genuinely silent peers
+        // (cold-start or unreachable), where it is the right tool.
+        //
+        // Scalability: O(peers) constant-time DashMap lookups before any
+        // syscall. At the 1000-node committee cap this is sub-millisecond.
+        //
+        // Safety: the registry is populated only from verified message
+        // receive paths (signed blocks, BFT votes, sync responses). A
+        // Byzantine peer cannot forge liveness for another peer's IP — they
+        // can only vouch for their own, which is the intended semantics.
+        // ═══════════════════════════════════════════════════════════════════
+        let now_secs = current_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
         let mut working_nodes = Vec::new();
-        let mut online_count = 0u32;
-        let mut offline_count = 0u32;
-        
-        // Join all threads (max wait = 3 seconds to account for thread overhead)
-        let join_deadline = std::time::Instant::now() + Duration::from_secs(3);
-        for handle in handles {
-            let remaining = join_deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                // Budget exhausted, skip remaining
-                offline_count += 1;
-                continue;
-            }
-            match handle.join() {
-                Ok((ip, true, rtt)) => {
-                    if crate::node::is_debug() {
-                        println!("[DBG][CONNECTIVITY] peer={} status=online rtt={}ms", get_privacy_id_for_addr(&ip), rtt);
-                    }
-                    working_nodes.push(ip);
-                    online_count += 1;
-                }
-                Ok((ip, false, _)) => {
-                    if crate::node::is_warn() {
-                        println!("[WARN][CONNECTIVITY] peer={} status=offline", get_privacy_id_for_addr(&ip));
-                    }
-                    offline_count += 1;
-                }
-                Err(_) => {
-                    offline_count += 1;
-                }
+        let mut need_probe = Vec::new();
+        let mut skipped_probe = 0u32;
+
+        for ip in &nodes {
+            if peer_alive_by_ip(ip, now_secs) {
+                working_nodes.push(ip.clone());
+                skipped_probe += 1;
+            } else {
+                need_probe.push(ip.clone());
             }
         }
-        
+
+        if skipped_probe > 0 && crate::node::is_info() {
+            println!(
+                "[INFO][CONNECTIVITY] traffic_fastpath alive={} probe_needed={} freshness={}s",
+                skipped_probe, need_probe.len(), PEER_ALIVE_FRESHNESS_SECS,
+            );
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // COLD-START / SILENT-PEER TCP PROBE (unchanged semantics, hardened)
+        // ═══════════════════════════════════════════════════════════════════
+        // Only reached for peers we have NOT received recent traffic from.
+        // This is the right situation for a TCP SYN probe — we have no
+        // better signal. Three sequential attempts with increasing
+        // timeouts absorb the transient p99 latency spikes seen on
+        // cross-continental VPS links under BFT load (2s single-shot was
+        // the exact trigger of the 09:47:32 false-offline cascade).
+        //
+        // Budget worst case: (3 + 5 + 8)s = 16s per peer, but only on
+        // peers that are genuinely silent for > PEER_ALIVE_FRESHNESS_SECS.
+        // In a healthy network this list is empty and the entire function
+        // returns from the fast path above.
+        // ═══════════════════════════════════════════════════════════════════
+        if !need_probe.is_empty() {
+            if crate::node::is_info() {
+                println!(
+                    "[INFO][CONNECTIVITY] probe_start peers={} strategy=retries_3x",
+                    need_probe.len(),
+                );
+            }
+
+            let handles: Vec<_> = need_probe.iter().map(|ip| {
+                let ip_clone = ip.clone();
+                std::thread::spawn(move || {
+                    let addr = format!("{}:8001", ip_clone);
+                    let socket_addr = match addr.parse::<SocketAddr>() {
+                        Ok(a) => a,
+                        Err(_) => return (ip_clone, false, 0u64),
+                    };
+
+                    // Three attempts with escalating timeouts: 3s, 5s, 8s.
+                    // Cross-continental p99 under BFT load can spike past
+                    // 2s; the escalation keeps the happy-path cost low
+                    // while absorbing transient latency.
+                    const PROBE_TIMEOUTS: [u64; 3] = [3, 5, 8];
+                    for timeout_secs in PROBE_TIMEOUTS {
+                        let start = std::time::Instant::now();
+                        if TcpStream::connect_timeout(
+                            &socket_addr,
+                            Duration::from_secs(timeout_secs),
+                        ).is_ok() {
+                            let rtt = start.elapsed().as_millis() as u64;
+                            return (ip_clone, true, rtt);
+                        }
+                        // Brief back-off between attempts so we don't hammer
+                        // a peer mid-recovery.
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    (ip_clone, false, 0)
+                })
+            }).collect();
+
+            let mut online_count = 0u32;
+            let mut offline_count = 0u32;
+
+            // Wall-clock budget covers worst case 3+5+8 = 16s per peer +
+            // inter-attempt back-off + thread join overhead.
+            let join_deadline = std::time::Instant::now() + Duration::from_secs(20);
+            for handle in handles {
+                let remaining = join_deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    offline_count += 1;
+                    continue;
+                }
+                match handle.join() {
+                    Ok((ip, true, rtt)) => {
+                        if crate::node::is_debug() {
+                            println!(
+                                "[DBG][CONNECTIVITY] peer={} status=online rtt={}ms source=probe",
+                                get_privacy_id_for_addr(&ip), rtt,
+                            );
+                        }
+                        working_nodes.push(ip);
+                        online_count += 1;
+                    }
+                    Ok((ip, false, _)) => {
+                        if crate::node::is_warn() {
+                            println!(
+                                "[WARN][CONNECTIVITY] peer={} status=offline attempts=3 source=probe",
+                                get_privacy_id_for_addr(&ip),
+                            );
+                        }
+                        offline_count += 1;
+                    }
+                    Err(_) => {
+                        offline_count += 1;
+                    }
+                }
+            }
+
+            if crate::node::is_info() {
+                println!(
+                    "[INFO][CONNECTIVITY] probe_done online={} offline={} traffic_alive={}",
+                    online_count, offline_count, skipped_probe,
+                );
+            }
+        }
+
+        let online_count = working_nodes.len() as u32;
+        let offline_count = (nodes.len() as u32).saturating_sub(online_count);
         if crate::node::is_info() {
-            println!("[INFO][CONNECTIVITY] refresh_done online={} offline={} total={}", 
-                     online_count, offline_count, online_count + offline_count);
+            println!(
+                "[INFO][CONNECTIVITY] refresh_done online={} offline={} total={}",
+                online_count, offline_count, online_count + offline_count,
+            );
         }
         
         // Minimum peer requirement
@@ -22626,9 +22797,27 @@ impl SimplifiedP2P {
             return;
         }
 
-        // Verify each vote independently, reject duplicates and low-round entries.
+        // ═══════════════════════════════════════════════════════════════════
+        // v15.2: PARALLEL verification of aggregated timeout certificate.
+        //
+        // Same motivation as the same-round TC path: at MAX_VALIDATORS=1000
+        // the 2f+1 = 667 Dilithium3 signatures are the dominant cost of a
+        // view-change. Parallel verification through rayon amortises the
+        // work across cores and keeps the commit-phase budget healthy.
+        //
+        // Structural checks (round ≥ certified_round, 32-byte hash, distinct
+        // voter_ids) are kept in the serial pre-pass — they are O(1) each
+        // and cheap enough that touching the parallel pool for them would
+        // be pure overhead. Only the per-signature Dilithium3 verify — the
+        // actual hot path — runs in parallel.
+        // ═══════════════════════════════════════════════════════════════════
+
+        // ── SERIAL pre-pass: shape / invariant / duplicate checks. ──
+        // Any violation here rejects the whole certificate (these are cheap
+        // structural invariants that an honest aggregator must satisfy).
         let mut seen_voters: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut verified: Vec<AggregatedSignedVote> = Vec::with_capacity(votes.len());
+        let mut prepared: Vec<(String, u64, [u8; 32], Vec<u8>, String)> =
+            Vec::with_capacity(votes.len());
         for (voter_id, vote_round, vote_hash_vec, signature) in votes.into_iter() {
             if vote_round < certified_round {
                 if crate::node::is_warn() {
@@ -22661,22 +22850,46 @@ impl SimplifiedP2P {
                 "TIMEOUT:{}:{}:{}",
                 height, vote_round, hex::encode(&hash_arr),
             );
-            if !self.verify_timeout_vote_signature(&voter_id, &vote_msg, &signature) {
-                if crate::node::is_warn() {
-                    println!(
-                        "[WARN][TIMEOUT] agg_tc_bad_sig h={} voter={} round={}",
-                        height, voter_id, vote_round,
-                    );
-                }
-                return;
-            }
+            prepared.push((voter_id, vote_round, hash_arr, signature, vote_msg));
+        }
 
-            verified.push(AggregatedSignedVote {
-                voter_id,
-                vote_round,
-                vote_block_hash: hash_arr,
-                signature,
-            });
+        // ── PARALLEL verify pass: Dilithium3 signature checks. ──
+        use rayon::prelude::*;
+        let results: Vec<Option<AggregatedSignedVote>> = prepared
+            .par_iter()
+            .map(|(voter_id, vote_round, hash_arr, signature, vote_msg)| {
+                if self.verify_timeout_vote_signature(voter_id, vote_msg, signature) {
+                    Some(AggregatedSignedVote {
+                        voter_id: voter_id.clone(),
+                        vote_round: *vote_round,
+                        vote_block_hash: *hash_arr,
+                        signature: signature.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // ── Any failed verify → whole certificate rejected. ──
+        // This matches the serial loop semantics exactly: the previous
+        // `return;` on bad-sig aborted the entire function, so a single
+        // invalid signature invalidates the aggregate.
+        let mut verified: Vec<AggregatedSignedVote> = Vec::with_capacity(prepared.len());
+        for (idx, result) in results.into_iter().enumerate() {
+            match result {
+                Some(v) => verified.push(v),
+                None => {
+                    if crate::node::is_warn() {
+                        let (voter_id, vote_round, _, _, _) = &prepared[idx];
+                        println!(
+                            "[WARN][TIMEOUT] agg_tc_bad_sig h={} voter={} round={}",
+                            height, voter_id, vote_round,
+                        );
+                    }
+                    return;
+                }
+            }
         }
 
         if verified.len() < two_f_plus_1 {
@@ -22897,19 +23110,52 @@ impl SimplifiedP2P {
             return;
         }
         
-        // Verify each signature
+        // ═══════════════════════════════════════════════════════════════════
+        // v15.2: PARALLEL Dilithium3 signature verification.
+        //
+        // At the MAX_VALIDATORS=1000 committee cap, a same-round TC carries
+        // up to 2f+1 = 667 signed votes. Serial verification at ~1-2ms per
+        // Dilithium3 signature = ~670-1340ms — long enough to eat into the
+        // 12s commit-phase budget and blow the 90s macroblock window under
+        // concurrent view-change storms.
+        //
+        // rayon's work-stealing pool parallelises verification across every
+        // available core. Each vote is independently verifiable — no shared
+        // mutable state during the verify step — so parallelism is safe.
+        // The final ordering-sensitive work (collecting verified votes,
+        // logging rejected ones) happens after the parallel barrier.
+        //
+        // Scalability: O(committee / num_cores) latency instead of O(committee).
+        // At 1000-committee on an 8-core host: ~170ms instead of ~1340ms.
+        // At small committees (≤ 20) the overhead of the parallel fan-out is
+        // negligible; no special-case needed.
+        // ═══════════════════════════════════════════════════════════════════
         let vote_msg = format!("TIMEOUT:{}:{}:{}", height, timeout_round, hex::encode(&hash_arr));
-        let mut verified_votes = Vec::new();
-        
-        for (voter_id, signature) in &votes {
-            if self.verify_timeout_vote_signature(voter_id, &vote_msg, signature) {
-                verified_votes.push(SignedTimeoutVote {
-                    voter_id: voter_id.clone(),
-                    signature: signature.clone(),
-                });
-            } else {
-                if crate::node::is_warn() {
-                    println!("[WARN][TIMEOUT] proof_bad_sig h={} voter={}", height, voter_id);
+
+        use rayon::prelude::*;
+        let verify_results: Vec<Option<SignedTimeoutVote>> = votes
+            .par_iter()
+            .map(|(voter_id, signature)| {
+                if self.verify_timeout_vote_signature(voter_id, &vote_msg, signature) {
+                    Some(SignedTimeoutVote {
+                        voter_id: voter_id.clone(),
+                        signature: signature.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut verified_votes = Vec::with_capacity(verify_results.len());
+        for (idx, result) in verify_results.into_iter().enumerate() {
+            match result {
+                Some(v) => verified_votes.push(v),
+                None => {
+                    if crate::node::is_warn() {
+                        let voter_id = &votes[idx].0;
+                        println!("[WARN][TIMEOUT] proof_bad_sig h={} voter={}", height, voter_id);
+                    }
                 }
             }
         }
