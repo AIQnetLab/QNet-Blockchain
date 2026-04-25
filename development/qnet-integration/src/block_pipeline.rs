@@ -227,6 +227,20 @@ pub struct PipelineMetrics {
     pub applied: AtomicU64,
     pub apply_failed: AtomicU64,
     pub duplicates_skipped: AtomicU64,
+    /// v15.3: Blocks ARRIVED via gossip but their height is far beyond the
+    /// node's current chain tip (`apply_tip + GOSSIP_HORIZON`). They are
+    /// NOT failures — sync will fetch the corresponding range when the
+    /// chain tip advances close enough. Counted SEPARATELY from
+    /// `verify_failed` so backpressure metrics treat them as "dropped, no
+    /// retry pending" rather than "in flight, stuck".
+    pub future_dropped: AtomicU64,
+    /// v15.3: Blocks evicted from the verify-stage deferred buffer because
+    /// they aged out (more than 500 blocks behind the local tip). Same
+    /// non-failure semantics as `future_dropped` — sync will refetch when
+    /// the chain tip approaches that range. Tracked separately so the
+    /// backpressure formula can debit them from the in-flight estimate
+    /// without overloading the `verify_failed` semantics.
+    pub deferred_evicted: AtomicU64,
 }
 
 impl PipelineMetrics {
@@ -240,20 +254,26 @@ impl PipelineMetrics {
             applied: AtomicU64::new(0),
             apply_failed: AtomicU64::new(0),
             duplicates_skipped: AtomicU64::new(0),
+            future_dropped: AtomicU64::new(0),
+            deferred_evicted: AtomicU64::new(0),
         }
     }
 
     pub fn log_summary(&self) {
         if is_info() {
-            println!("[INFO][PIPELINE] ingested={} decoded={} decode_fail={} verified={} verify_fail={} applied={} apply_fail={} dup_skip={}",
-                     self.ingested.load(Ordering::Relaxed),
-                     self.decoded.load(Ordering::Relaxed),
-                     self.decode_failed.load(Ordering::Relaxed),
-                     self.verified.load(Ordering::Relaxed),
-                     self.verify_failed.load(Ordering::Relaxed),
-                     self.applied.load(Ordering::Relaxed),
-                     self.apply_failed.load(Ordering::Relaxed),
-                     self.duplicates_skipped.load(Ordering::Relaxed));
+            println!(
+                "[INFO][PIPELINE] ingested={} decoded={} decode_fail={} verified={} verify_fail={} applied={} apply_fail={} dup_skip={} future_drop={} defer_evict={}",
+                self.ingested.load(Ordering::Relaxed),
+                self.decoded.load(Ordering::Relaxed),
+                self.decode_failed.load(Ordering::Relaxed),
+                self.verified.load(Ordering::Relaxed),
+                self.verify_failed.load(Ordering::Relaxed),
+                self.applied.load(Ordering::Relaxed),
+                self.apply_failed.load(Ordering::Relaxed),
+                self.duplicates_skipped.load(Ordering::Relaxed),
+                self.future_dropped.load(Ordering::Relaxed),
+                self.deferred_evicted.load(Ordering::Relaxed),
+            );
         }
     }
 }
@@ -394,14 +414,64 @@ impl PipelineIngest {
     /// Scalability: 4 atomic loads, O(1). Safe at 10K+ super-nodes — this is
     /// read by SyncManager on every iteration, no locks.
     pub fn in_flight(&self) -> u64 {
+        // ═══════════════════════════════════════════════════════════════════
+        // v15.3: SCALE-CORRECT BACKPRESSURE METRIC.
+        //
+        // The original `ingested - finished` formula treated only "applied
+        // or rejected at decode/verify/apply" as terminal — but during a
+        // multi-thousand-block catch-up the same block height arrives many
+        // times via SHRED redundancy and sync retries, each arrival
+        // incrementing `ingested` while only one eventually applies. The
+        // accumulated "phantom" delta inflated the in-flight estimate well
+        // past the bounded channel/buffer capacity (~16K), forced
+        // backpressure credits to zero, and starved sync_manager of
+        // dispatch budget exactly when it needed to fetch parents to
+        // unblock the pipeline. Observed 58K phantom on node 001 against a
+        // real pipeline occupancy of < 2K.
+        //
+        // Two corrections:
+        //
+        //   1. Add `future_dropped` and `deferred_evicted` to the
+        //      `finished` set. Both are terminal drops with no retry
+        //      pending in this pipeline — sync re-requests later when the
+        //      tip approaches. Counting them as finished prevents them
+        //      from accumulating into the in-flight estimate.
+        //
+        //   2. Hard-clamp the result to the sum of all bounded buffers in
+        //      the pipeline. The actual occupancy can NEVER exceed the
+        //      sum of channel capacities + deferred buffer size, regardless
+        //      of historical counter behaviour. Clamping protects against
+        //      any future double-count source we might miss — the metric
+        //      always reports a number physically achievable by the
+        //      pipeline.
+        //
+        // Scalability: 9 atomic loads, O(1). Read by SyncManager on every
+        // dispatch iteration; bounded by `MAX_PIPELINE_OCCUPANCY` so
+        // credits stay sensible at any historical-drop volume. Safe for
+        // 10K+ super-node committees.
+        // ═══════════════════════════════════════════════════════════════════
         let ingested = self.metrics.ingested.load(Ordering::Relaxed);
-        let applied = self.metrics.applied.load(Ordering::Relaxed);
-        let finished = applied
+        let finished = self.metrics.applied.load(Ordering::Relaxed)
             .saturating_add(self.metrics.decode_failed.load(Ordering::Relaxed))
             .saturating_add(self.metrics.verify_failed.load(Ordering::Relaxed))
             .saturating_add(self.metrics.apply_failed.load(Ordering::Relaxed))
-            .saturating_add(self.metrics.duplicates_skipped.load(Ordering::Relaxed));
-        ingested.saturating_sub(finished)
+            .saturating_add(self.metrics.duplicates_skipped.load(Ordering::Relaxed))
+            .saturating_add(self.metrics.future_dropped.load(Ordering::Relaxed))
+            .saturating_add(self.metrics.deferred_evicted.load(Ordering::Relaxed));
+
+        let raw = ingested.saturating_sub(finished);
+
+        // Sum of every bounded buffer in the pipeline:
+        //   ingest channel  (production: 8192, default: 4096)
+        //   decode channel  (production: 4096, default: 2048)
+        //   verify channel  (production: 2048, default: 1024)
+        //   deferred buffer (DEFERRED_MAX = 2000)
+        //   apply queue is small (1-2 items) — included implicitly in the
+        //     verify-channel budget since apply consumes from there.
+        // Use the production sizing as the cap so the metric is correct on
+        // any deployment scale; smaller deployments simply never hit it.
+        const MAX_PIPELINE_OCCUPANCY: u64 = 8192 + 4096 + 2048 + 2000;
+        raw.min(MAX_PIPELINE_OCCUPANCY)
     }
 
     /// v14.10: Current ingest-channel free capacity (blocks the pipeline can
@@ -634,7 +704,70 @@ impl BlockPipeline {
         const DEFERRED_MAX: usize = 2000;
         let mut deferred: HashMap<u64, DecodedBlock> = HashMap::new();
 
+        // ═══════════════════════════════════════════════════════════════════
+        // v15.3: GOSSIP HORIZON — drop blocks far beyond local chain tip.
+        //
+        // Root-cause fix for the catch-up backpressure deadlock observed on
+        // node 001 at h=3960 with network at h=39800. Without a horizon
+        // filter the pipeline received SHRED-broadcast blocks from the
+        // network tip continuously while the node was thousands of blocks
+        // behind. Those blocks could never verify (parents missing), filled
+        // the bounded deferred buffer with future-state material, forced
+        // legitimate sync responses (close to local tip) to be dropped on
+        // arrival, and inflated the historical drop counter beyond the
+        // backpressure threshold. The result was a self-perpetuating
+        // throttle on sync request dispatch — sync_manager believed the
+        // pipeline was overloaded when in reality it was being starved of
+        // the very blocks it needed.
+        //
+        // Fix: any block more than `GOSSIP_HORIZON` ahead of the current
+        // local chain tip is dropped immediately, BEFORE entering the
+        // deferred buffer. It is counted in `future_dropped`, not
+        // `verify_failed`, so the backpressure formula treats it as a
+        // permanent drop with no retry pending in the pipeline. Sync
+        // re-requests the block when the local tip is close enough.
+        //
+        // Sizing: GOSSIP_HORIZON = 200 covers ~200 seconds of network
+        // production at 1 block/s — large enough to absorb normal
+        // re-broadcast turbulence at the tip, small enough to keep the
+        // deferred buffer pointed at near-tip blocks where it does useful
+        // work. Independent of committee size.
+        //
+        // Scalability: O(1) check per block (one storage read for chain_h).
+        // The chain-height read is cached lazily inside this loop so it
+        // does not become a per-block syscall.
+        //
+        // Safety: dropping a future block here is safe — it is identical to
+        // the block never reaching us via gossip in the first place. The
+        // block is finalised and replayable from the canonical chain;
+        // sync_manager will pull it via range request once the local tip
+        // crosses (block.height - GOSSIP_HORIZON).
+        // ═══════════════════════════════════════════════════════════════════
+        const GOSSIP_HORIZON: u64 = 200;
+        let mut horizon_cache_h: u64 = 0;
+        let mut horizon_cache_age: u32 = 0;
+
         'outer: while let Some(decoded) = rx.recv().await {
+            // Refresh local chain tip for the horizon filter every 16 blocks —
+            // amortises storage reads while keeping the horizon close to real.
+            if horizon_cache_age == 0 {
+                horizon_cache_h = storage.get_chain_height().unwrap_or(0);
+            }
+            horizon_cache_age = (horizon_cache_age + 1) & 0xF;
+
+            // Apply horizon filter at the entry point — never enters deferred
+            // buffer. Drops are non-failure (sync will refetch).
+            if decoded.microblock.height > horizon_cache_h.saturating_add(GOSSIP_HORIZON) {
+                metrics.future_dropped.fetch_add(1, Ordering::Relaxed);
+                if is_debug() {
+                    println!(
+                        "[DBG][PIPELINE] gossip_horizon_drop h={} local_tip={} horizon={}",
+                        decoded.microblock.height, horizon_cache_h, GOSSIP_HORIZON,
+                    );
+                }
+                continue;
+            }
+
             // Process this block, then try to drain deferred chain
             let mut to_process = vec![decoded];
 
@@ -990,9 +1123,18 @@ impl BlockPipeline {
                     let before = deferred.len();
                     deferred.retain(|h, _| *h > cutoff);
                     let evicted = before - deferred.len();
-                    if evicted > 0 && is_info() {
-                        println!("[INFO][PIPELINE] deferred_evict count={} cutoff={} remaining={}",
-                                 evicted, cutoff, deferred.len());
+                    if evicted > 0 {
+                        // v15.3: register eviction in dedicated counter so the
+                        // backpressure formula can subtract these from the
+                        // in-flight estimate. Without this, evicted blocks
+                        // remained "ingested but never finished" forever and
+                        // contributed to the false-overload signal that
+                        // throttled sync request dispatch.
+                        metrics.deferred_evicted.fetch_add(evicted as u64, Ordering::Relaxed);
+                        if is_info() {
+                            println!("[INFO][PIPELINE] deferred_evict count={} cutoff={} remaining={}",
+                                     evicted, cutoff, deferred.len());
+                        }
                     }
                 }
             }
