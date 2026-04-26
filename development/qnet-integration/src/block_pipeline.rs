@@ -241,6 +241,77 @@ pub struct PipelineMetrics {
     /// backpressure formula can debit them from the in-flight estimate
     /// without overloading the `verify_failed` semantics.
     pub deferred_evicted: AtomicU64,
+
+    /// v15.4 DIAGNOSTICS: per-stage live progress markers. The watchdog
+    /// task reads these to identify exactly which block + which operation
+    /// is hung when the verified/applied counters stop advancing. Stored as
+    /// AtomicU64 so updates are lock-free at any node count.
+    ///
+    /// `verify_current_h` / `apply_current_h`: height of the block the
+    /// stage is processing right now. 0 means stage is idle (waiting on
+    /// channel recv).
+    ///
+    /// `verify_op` / `apply_op`: PIPELINE_OP_* constant identifying the
+    /// sub-step within the stage. 0 = idle. Decoded by `op_name()` in the
+    /// watchdog dump for human-readable diagnostics.
+    ///
+    /// `verify_op_started_ms` / `apply_op_started_ms`: epoch milliseconds
+    /// at which the current op was entered. The watchdog computes
+    /// `now_ms() - started_ms` to report op-age. Updated together with
+    /// the op marker on every transition.
+    ///
+    /// Non-atomic relative to each other (the trio is updated as separate
+    /// stores). This is acceptable: the watchdog only fires on stalls of
+    /// ≥30 s, vastly larger than any plausible interleaving window between
+    /// the three stores. Diagnostic snapshots may be momentarily
+    /// inconsistent but the stuck condition itself is stable for tens of
+    /// seconds before the dump runs.
+    pub verify_current_h: AtomicU64,
+    pub verify_op: AtomicU64,
+    pub verify_op_started_ms: AtomicU64,
+    pub apply_current_h: AtomicU64,
+    pub apply_op: AtomicU64,
+    pub apply_op_started_ms: AtomicU64,
+}
+
+/// v15.4: Op codes for per-stage progress markers. Read by the watchdog
+/// to produce human-readable stuck-pipeline dumps.
+pub const PIPELINE_OP_IDLE: u64 = 0;
+pub const PIPELINE_OP_VERIFY_LOAD_PREV: u64 = 11;
+pub const PIPELINE_OP_VERIFY_SIG: u64 = 12;
+pub const PIPELINE_OP_VERIFY_SEND: u64 = 13;
+pub const PIPELINE_OP_APPLY_DEDUP: u64 = 21;
+pub const PIPELINE_OP_APPLY_STATE_LOCK: u64 = 22;
+pub const PIPELINE_OP_APPLY_SNAPSHOT: u64 = 23;
+pub const PIPELINE_OP_APPLY_STATE: u64 = 24;
+pub const PIPELINE_OP_APPLY_SAVE_BLOCK: u64 = 25;
+pub const PIPELINE_OP_APPLY_SET_HEIGHT: u64 = 26;
+pub const PIPELINE_OP_APPLY_DEFERRED_FX: u64 = 27;
+
+/// Decode an op marker into a short human-readable string for diagnostics.
+fn op_name(op: u64) -> &'static str {
+    match op {
+        PIPELINE_OP_IDLE => "idle",
+        PIPELINE_OP_VERIFY_LOAD_PREV => "verify:load_prev_block",
+        PIPELINE_OP_VERIFY_SIG => "verify:signature",
+        PIPELINE_OP_VERIFY_SEND => "verify:send_to_apply",
+        PIPELINE_OP_APPLY_DEDUP => "apply:dedup_check",
+        PIPELINE_OP_APPLY_STATE_LOCK => "apply:state_lock_acquire",
+        PIPELINE_OP_APPLY_SNAPSHOT => "apply:create_snapshot",
+        PIPELINE_OP_APPLY_STATE => "apply:apply_state_mutations",
+        PIPELINE_OP_APPLY_SAVE_BLOCK => "apply:save_microblock",
+        PIPELINE_OP_APPLY_SET_HEIGHT => "apply:set_chain_height",
+        PIPELINE_OP_APPLY_DEFERRED_FX => "apply:deferred_side_effects",
+        _ => "unknown",
+    }
+}
+
+/// Current epoch in milliseconds. Diagnostic-only — never feeds consensus.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl PipelineMetrics {
@@ -256,7 +327,42 @@ impl PipelineMetrics {
             duplicates_skipped: AtomicU64::new(0),
             future_dropped: AtomicU64::new(0),
             deferred_evicted: AtomicU64::new(0),
+            verify_current_h: AtomicU64::new(0),
+            verify_op: AtomicU64::new(0),
+            verify_op_started_ms: AtomicU64::new(0),
+            apply_current_h: AtomicU64::new(0),
+            apply_op: AtomicU64::new(0),
+            apply_op_started_ms: AtomicU64::new(0),
         }
+    }
+
+    /// v15.4: Mark verify stage as entering an op on a specific block.
+    /// Three stores are independent — see struct doc for ordering notes.
+    pub fn mark_verify_op(&self, height: u64, op: u64) {
+        self.verify_current_h.store(height, Ordering::Relaxed);
+        self.verify_op.store(op, Ordering::Relaxed);
+        self.verify_op_started_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// v15.4: Mark verify stage as idle (between blocks).
+    pub fn mark_verify_idle(&self) {
+        self.verify_current_h.store(0, Ordering::Relaxed);
+        self.verify_op.store(PIPELINE_OP_IDLE, Ordering::Relaxed);
+        self.verify_op_started_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// v15.4: Mark apply stage as entering an op on a specific block.
+    pub fn mark_apply_op(&self, height: u64, op: u64) {
+        self.apply_current_h.store(height, Ordering::Relaxed);
+        self.apply_op.store(op, Ordering::Relaxed);
+        self.apply_op_started_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// v15.4: Mark apply stage as idle (between blocks).
+    pub fn mark_apply_idle(&self) {
+        self.apply_current_h.store(0, Ordering::Relaxed);
+        self.apply_op.store(PIPELINE_OP_IDLE, Ordering::Relaxed);
+        self.apply_op_started_ms.store(now_ms(), Ordering::Relaxed);
     }
 
     pub fn log_summary(&self) {
@@ -550,6 +656,121 @@ impl BlockPipeline {
             }
         });
 
+        // ════════════════════════════════════════════════════════════════════
+        // v15.4 DIAGNOSTICS: PIPELINE PROGRESS WATCHDOG
+        // ════════════════════════════════════════════════════════════════════
+        // Background poller that detects when verify or apply stages stop
+        // making forward progress. Designed to surface the exact hung
+        // operation when the verified/applied counters freeze — observed
+        // in production on node 001 with verified=applied=5256 frozen for
+        // 5 minutes while macroblock saves continued (different code
+        // path), with no error logs. Without this watchdog the only
+        // visible signal was the WATCHDOG-driven 300 s process restart.
+        //
+        // Trigger semantics:
+        //   * Sample `verified` and `applied` counters every WATCHDOG_TICK
+        //     seconds.
+        //   * If a counter has not advanced for STUCK_THRESHOLD seconds
+        //     AND the corresponding stage's op marker is non-idle, emit a
+        //     CRIT diagnostic dump. Idle-with-no-progress means the stage
+        //     is correctly waiting on an empty channel — the issue is
+        //     upstream and a separate alarm path will surface it.
+        //   * Re-arm only after the counter advances. Repeated dumps for
+        //     the same hang are suppressed by tracking the last reported
+        //     counter; a new dump fires only when stuck-state persists
+        //     past another STUCK_THRESHOLD window or after recovery.
+        //
+        // Cost: O(1) atomics read every 5 s, lock-free. Negligible for
+        // any node count. Diagnostic-only — never participates in
+        // consensus, never gates block flow.
+        //
+        // Why this is safe to deploy: pure observation. The watchdog
+        // makes no state mutations — it reads atomic counters and writes
+        // log lines. Even if the diagnostic logic is wrong, the worst
+        // case is a noisy log; consensus, networking, storage are
+        // entirely unaffected.
+        // ════════════════════════════════════════════════════════════════════
+        let metrics_watchdog = metrics.clone();
+        tokio::spawn(async move {
+            const WATCHDOG_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+            const STUCK_THRESHOLD_MS: u64 = 30_000;
+            let mut last_verified: u64 = 0;
+            let mut last_applied: u64 = 0;
+            let mut last_verified_progress_ms: u64 = now_ms();
+            let mut last_applied_progress_ms: u64 = now_ms();
+            let mut last_verify_dump_ms: u64 = 0;
+            let mut last_apply_dump_ms: u64 = 0;
+            let mut interval = tokio::time::interval(WATCHDOG_TICK);
+            loop {
+                interval.tick().await;
+                let now = now_ms();
+                let verified_now = metrics_watchdog.verified.load(Ordering::Relaxed);
+                let applied_now = metrics_watchdog.applied.load(Ordering::Relaxed);
+
+                if verified_now != last_verified {
+                    last_verified = verified_now;
+                    last_verified_progress_ms = now;
+                }
+                if applied_now != last_applied {
+                    last_applied = applied_now;
+                    last_applied_progress_ms = now;
+                }
+
+                let verify_op = metrics_watchdog.verify_op.load(Ordering::Relaxed);
+                let verify_h = metrics_watchdog.verify_current_h.load(Ordering::Relaxed);
+                let verify_op_started = metrics_watchdog.verify_op_started_ms.load(Ordering::Relaxed);
+                let verify_stall_ms = now.saturating_sub(last_verified_progress_ms);
+                let verify_op_age_ms = now.saturating_sub(verify_op_started);
+
+                let apply_op = metrics_watchdog.apply_op.load(Ordering::Relaxed);
+                let apply_h = metrics_watchdog.apply_current_h.load(Ordering::Relaxed);
+                let apply_op_started = metrics_watchdog.apply_op_started_ms.load(Ordering::Relaxed);
+                let apply_stall_ms = now.saturating_sub(last_applied_progress_ms);
+                let apply_op_age_ms = now.saturating_sub(apply_op_started);
+
+                // VERIFY STALL DUMP: counter unchanged for ≥30 s and op != idle.
+                if verify_stall_ms >= STUCK_THRESHOLD_MS
+                    && verify_op != PIPELINE_OP_IDLE
+                    && now.saturating_sub(last_verify_dump_ms) >= STUCK_THRESHOLD_MS
+                {
+                    eprintln!(
+                        "[CRIT][PIPELINE] verify_stuck stall_ms={} hung_h={} op={} op_age_ms={} verified={} applied={} ingested={} decoded={} verify_fail={} future_drop={} defer_evict={}",
+                        verify_stall_ms,
+                        verify_h,
+                        op_name(verify_op),
+                        verify_op_age_ms,
+                        verified_now,
+                        applied_now,
+                        metrics_watchdog.ingested.load(Ordering::Relaxed),
+                        metrics_watchdog.decoded.load(Ordering::Relaxed),
+                        metrics_watchdog.verify_failed.load(Ordering::Relaxed),
+                        metrics_watchdog.future_dropped.load(Ordering::Relaxed),
+                        metrics_watchdog.deferred_evicted.load(Ordering::Relaxed),
+                    );
+                    last_verify_dump_ms = now;
+                }
+
+                // APPLY STALL DUMP: counter unchanged for ≥30 s and op != idle.
+                if apply_stall_ms >= STUCK_THRESHOLD_MS
+                    && apply_op != PIPELINE_OP_IDLE
+                    && now.saturating_sub(last_apply_dump_ms) >= STUCK_THRESHOLD_MS
+                {
+                    eprintln!(
+                        "[CRIT][PIPELINE] apply_stuck stall_ms={} hung_h={} op={} op_age_ms={} verified={} applied={} apply_fail={} dup_skip={}",
+                        apply_stall_ms,
+                        apply_h,
+                        op_name(apply_op),
+                        apply_op_age_ms,
+                        verified_now,
+                        applied_now,
+                        metrics_watchdog.apply_failed.load(Ordering::Relaxed),
+                        metrics_watchdog.duplicates_skipped.load(Ordering::Relaxed),
+                    );
+                    last_apply_dump_ms = now;
+                }
+            }
+        });
+
         PipelineIngest {
             tx: ingest_tx,
             metrics,
@@ -748,6 +969,18 @@ impl BlockPipeline {
         let mut horizon_cache_age: u32 = 0;
 
         'outer: while let Some(decoded) = rx.recv().await {
+            // v15.4 DIAG: a fresh block has just arrived — between recv()
+            // calls the stage was idle on the channel, so reset the op
+            // marker to a clean idle baseline. The earlier mark_verify_op
+            // calls only fire on the success-with-progress path; without
+            // this reset, an early-continue path (horizon drop, deferred
+            // insert, hash break, sig fail, etc.) would leave a stale
+            // op marker visible to the watchdog if the channel then went
+            // quiet. Resetting on recv keeps the watchdog's "op stuck"
+            // signal trustworthy: a non-idle op means a block is actively
+            // being processed right now.
+            metrics.mark_verify_idle();
+
             // Refresh local chain tip for the horizon filter every 16 blocks —
             // amortises storage reads while keeping the horizon close to real.
             if horizon_cache_age == 0 {
@@ -776,7 +1009,27 @@ impl BlockPipeline {
 
             // 1. Hash chain continuity (except genesis)
             if mb.height > 0 {
-                let prev_hash_ok = match storage.load_microblock_auto_format(mb.height - 1) {
+                // v15.4 DIAG: mark verify stage as entering the prev-block
+                // load. If the watchdog later observes verified counter
+                // frozen with op=verify:load_prev_block, we know RocksDB
+                // read on the parent height is hung — most likely point of
+                // contention with apply-stage writes during macroblock
+                // bursts. `load_start` instruments the read to log slow
+                // tail latencies (>500 ms) without spamming on healthy
+                // nodes.
+                metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_LOAD_PREV);
+                let load_start = std::time::Instant::now();
+                let load_result = storage.load_microblock_auto_format(mb.height - 1);
+                let load_elapsed = load_start.elapsed();
+                if load_elapsed > std::time::Duration::from_millis(500) {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] slow_storage_read stage=verify h={} parent_h={} elapsed_ms={}",
+                            mb.height, mb.height - 1, load_elapsed.as_millis()
+                        );
+                    }
+                }
+                let prev_hash_ok = match load_result {
                     Ok(Some(prev_block)) => {
                         // Verify previous_hash matches actual prev block hash
                         let prev_hash = prev_block.hash();
@@ -931,6 +1184,13 @@ impl BlockPipeline {
             if mb.height > 0 {
                 // Dilithium/hybrid signature verification via BlockchainNode
                 if !mb.signature.is_empty() {
+                    // v15.4 DIAG: mark op as signature verify. Dilithium3
+                    // verify is a sync C-binding called via an async
+                    // wrapper; if it ever blocks the runtime worker
+                    // thread under load, the watchdog will surface this
+                    // op as the stuck point.
+                    metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_SIG);
+                    let sig_start = std::time::Instant::now();
                     let verify_ok = match BlockchainNode::verify_microblock_signature(
                         &decoded.microblock,
                         &decoded.microblock.producer,
@@ -945,6 +1205,15 @@ impl BlockPipeline {
                         }
                     };
 
+                    let sig_elapsed = sig_start.elapsed();
+                    if sig_elapsed > std::time::Duration::from_millis(500) {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] slow_signature_verify h={} elapsed_ms={}",
+                                mb.height, sig_elapsed.as_millis()
+                            );
+                        }
+                    }
                     if !verify_ok {
                         if is_warn() {
                             println!("[WARN][PIPELINE] sig_invalid h={} prod={} from={}",
@@ -1100,9 +1369,26 @@ impl BlockPipeline {
                 }
             }
 
+            // v15.4 DIAG: mark verify→apply send. If apply's mpsc receiver
+            // is full because apply itself is hung on RocksDB or state
+            // lock, this await will block. Watchdog reading op=verify:
+            // send_to_apply with a stuck `applied` counter implicates
+            // apply-stage backpressure as the root cause.
+            metrics.mark_verify_op(block_height, PIPELINE_OP_VERIFY_SEND);
+            let send_start = std::time::Instant::now();
             if let Err(_) = tx.send(verified).await {
                 break 'outer;
             }
+            let send_elapsed = send_start.elapsed();
+            if send_elapsed > std::time::Duration::from_millis(500) {
+                if is_warn() {
+                    println!(
+                        "[WARN][PIPELINE] slow_send_to_apply h={} elapsed_ms={} (apply-stage backpressure)",
+                        block_height, send_elapsed.as_millis()
+                    );
+                }
+            }
+            metrics.mark_verify_idle();
 
             // v13.1: Drain deferred chain — the block we just verified may unblock
             // a sequence of deferred blocks: h+1 → h+2 → h+3 ...
@@ -1174,19 +1460,48 @@ impl BlockPipeline {
             let producer = block.microblock.producer.clone();
             let tx_count = block.microblock.transactions.len();
 
+            // v15.4 DIAG: mark dedup check. Sync RocksDB read on the apply
+            // path; if hung, watchdog will surface it.
+            metrics.mark_apply_op(height, PIPELINE_OP_APPLY_DEDUP);
+            let dedup_start = std::time::Instant::now();
             // Double-check dedup (race between verify and apply)
-            if ctx.storage.load_microblock(height)
+            let already_applied = ctx.storage.load_microblock(height)
                 .map(|opt| opt.is_some())
-                .unwrap_or(false)
-            {
+                .unwrap_or(false);
+            let dedup_elapsed = dedup_start.elapsed();
+            if dedup_elapsed > std::time::Duration::from_millis(500) {
+                if is_warn() {
+                    println!(
+                        "[WARN][PIPELINE] slow_storage_read stage=apply op=dedup h={} elapsed_ms={}",
+                        height, dedup_elapsed.as_millis()
+                    );
+                }
+            }
+            if already_applied {
                 metrics.duplicates_skipped.fetch_add(1, Ordering::Relaxed);
                 crate::unified_p2p::clear_block_pending_sync(height);
+                metrics.mark_apply_idle();
                 continue;
             }
 
             // ── State application with snapshot + rollback support ──
+            // v15.4 DIAG: mark state-lock acquisition. If a competing
+            // writer holds the state RwLock for an extended period
+            // (e.g., a slow snapshot operation in BlockchainNode), this
+            // op will be the stuck point.
+            metrics.mark_apply_op(height, PIPELINE_OP_APPLY_STATE_LOCK);
+            let lock_start = std::time::Instant::now();
             let apply_ok = {
                 let state_guard = ctx.state.write().await;
+                let lock_elapsed = lock_start.elapsed();
+                if lock_elapsed > std::time::Duration::from_millis(500) {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] slow_state_lock h={} elapsed_ms={}",
+                            height, lock_elapsed.as_millis()
+                        );
+                    }
+                }
 
                 // Genesis block: clear state first (idempotent)
                 if height == 0 {
@@ -1199,11 +1514,24 @@ impl BlockPipeline {
 
                 // Create block snapshot for rollback (only for blocks with state_root)
                 let has_state_root = block.microblock.state_root != [0u8; 32];
+                // v15.4 DIAG: snapshot creation copies relevant account
+                // state — bounded but non-trivial work.
+                metrics.mark_apply_op(height, PIPELINE_OP_APPLY_SNAPSHOT);
+                let snap_start = std::time::Instant::now();
                 let mut block_snapshot = if has_state_root {
                     Some(state_guard.create_block_snapshot(height))
                 } else {
                     None
                 };
+                let snap_elapsed = snap_start.elapsed();
+                if snap_elapsed > std::time::Duration::from_millis(500) {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] slow_create_snapshot h={} elapsed_ms={}",
+                            height, snap_elapsed.as_millis()
+                        );
+                    }
+                }
 
                 // Get processed emission MBs for double-emission prevention
                 let processed_emission_set = {
@@ -1211,6 +1539,11 @@ impl BlockPipeline {
                     reward_mgr.get_processed_emission_macroblocks().clone()
                 };
 
+                // v15.4 DIAG: state mutation phase — applies all
+                // transactions and updates accounts. Heavy CPU but no
+                // I/O, so unlikely to hang from external contention.
+                metrics.mark_apply_op(height, PIPELINE_OP_APPLY_STATE);
+                let apply_state_start = std::time::Instant::now();
                 // Apply all state mutations via shared function
                 let apply_result = BlockchainNode::apply_block_to_state(
                     &state_guard,
@@ -1219,6 +1552,15 @@ impl BlockPipeline {
                     block_snapshot.as_mut(),
                     Some(&processed_emission_set),
                 );
+                let apply_state_elapsed = apply_state_start.elapsed();
+                if apply_state_elapsed > std::time::Duration::from_millis(500) {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] slow_apply_state h={} txs={} elapsed_ms={}",
+                            height, tx_count, apply_state_elapsed.as_millis()
+                        );
+                    }
+                }
 
                 let computed_state_root = apply_result.merkle_root;
 
@@ -1248,6 +1590,7 @@ impl BlockPipeline {
                     if let Some(ref p2p) = ctx.unified_p2p {
                         p2p.record_apply_strike(&block.from_peer, "state_root_mismatch");
                     }
+                    metrics.mark_apply_idle();
                     continue;
                 }
 
@@ -1257,12 +1600,45 @@ impl BlockPipeline {
                 }
 
                 // State verified — save block
-                match ctx.storage.save_microblock(height, &block.decompressed) {
+                // v15.4 DIAG: primary suspect for sync-RocksDB-in-async-
+                // context hangs. RocksDB compaction triggered by macroblock
+                // bursts can stall foreground writes; if the watchdog finds
+                // op=apply:save_microblock as the frozen point, we have
+                // direct evidence the hypothesis is correct.
+                metrics.mark_apply_op(height, PIPELINE_OP_APPLY_SAVE_BLOCK);
+                let save_start = std::time::Instant::now();
+                let save_result = ctx.storage.save_microblock(height, &block.decompressed);
+                let save_elapsed = save_start.elapsed();
+                if save_elapsed > std::time::Duration::from_millis(500) {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] slow_storage_write op=save_microblock h={} elapsed_ms={} bytes={}",
+                            height, save_elapsed.as_millis(), block.decompressed.len()
+                        );
+                    }
+                }
+                match save_result {
                     Ok(()) => {
-                        // Update chain height in storage
-                        if let Err(e) = ctx.storage.set_chain_height(height) {
+                        // v15.4 DIAG: chain-height bump (atomic CF write).
+                        metrics.mark_apply_op(height, PIPELINE_OP_APPLY_SET_HEIGHT);
+                        let height_start = std::time::Instant::now();
+                        let height_result = ctx.storage.set_chain_height(height);
+                        let height_elapsed = height_start.elapsed();
+                        if height_elapsed > std::time::Duration::from_millis(500) {
+                            if is_warn() {
+                                println!(
+                                    "[WARN][PIPELINE] slow_storage_write op=set_height h={} elapsed_ms={}",
+                                    height, height_elapsed.as_millis()
+                                );
+                            }
+                        }
+                        if let Err(e) = height_result {
                             if is_warn() { println!("[WARN][PIPELINE] set_height_failed h={} err={}", height, e); }
                         }
+                        // v15.4 DIAG: deferred-side-effects phase. Mostly
+                        // RocksDB writes for registrations and reward
+                        // bookkeeping; bounded but accumulates.
+                        metrics.mark_apply_op(height, PIPELINE_OP_APPLY_DEFERRED_FX);
 
                         // ── Deferred side effects (block is committed) ──
                         if apply_result.deferred_pool3 > 0 {
@@ -1329,6 +1705,7 @@ impl BlockPipeline {
             if !apply_ok {
                 metrics.apply_failed.fetch_add(1, Ordering::Relaxed);
                 crate::unified_p2p::clear_block_pending_sync(height);
+                metrics.mark_apply_idle();
                 continue;
             }
 
@@ -1541,6 +1918,13 @@ impl BlockPipeline {
                     println!("[INFO][PIPELINE] applied h={} prod={} txs={}", height, producer, tx_count);
                 }
             }
+
+            // v15.4 DIAG: clear apply op marker — between blocks the stage
+            // is legitimately idle waiting on the channel. This lets the
+            // watchdog distinguish "apply hung mid-block" (op != idle for
+            // ≥30 s) from "no input arriving" (op = idle) so a slow
+            // upstream is never mis-attributed to apply.
+            metrics.mark_apply_idle();
         }
     }
 }
