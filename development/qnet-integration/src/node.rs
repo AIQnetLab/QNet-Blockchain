@@ -13289,10 +13289,44 @@ impl BlockchainNode {
                                             if is_info() {
                                                 println!("[INFO][HEARTBEAT-COMMITMENT] TX serialized size={} bytes", tx_bytes.len());
                                             }
-                                            
+
                                             // CRITICAL FIX v2.81: Clone tx_bytes for broadcast BEFORE adding to mempool
                                             let tx_bytes_for_broadcast = tx_bytes.clone();
-                                            
+
+                                            // ═══════════════════════════════════════════════════════════════════
+                                            // v15.5: RETRY MEMPOOL CLEANUP — eliminates duplicated commitment TXs
+                                            // landing in the same block.
+                                            //
+                                            // Without this cleanup, every retry created a NEW TX (different hash
+                                            // due to changed timestamp) but left the previous attempts in the
+                                            // local mempool. When the next producer pulled from mempool, both
+                                            // the original AND the retry were included in the same block. The
+                                            // state-level `check_duplicate_commitment` rejected the second
+                                            // application, but the rejected TX still consumed block space and
+                                            // bandwidth, and surfaced as visible duplicates in the explorer
+                                            // (observed at h=29731: 4 nodes × 2 HBC TXs each).
+                                            //
+                                            // Confirmation-tracker semantics are preserved: `all_tx_hashes`
+                                            // continues to record every attempt for confirmation matching.
+                                            // The cleanup affects only the LOCAL mempool — TXs already
+                                            // included in blocks (chain history) are not impacted.
+                                            //
+                                            // Idempotent and cheap: no-op on the very first send (tracker
+                                            // empty); O(retry_count) on a retry, with retry_count ≤ MAX_RETRIES
+                                            // (3). Safe at thousands-of-nodes scale.
+                                            // ═══════════════════════════════════════════════════════════════════
+                                            let stale_hashes: Vec<String> = heartbeat_tracker
+                                                .get(&current_epoch)
+                                                .map(|e| e.all_tx_hashes.clone())
+                                                .unwrap_or_default();
+                                            if !stale_hashes.is_empty() {
+                                                mempool.batch_remove_transactions(&stale_hashes);
+                                                if is_info() {
+                                                    println!("[INFO][HEARTBEAT-COMMITMENT] mempool_cleanup epoch={} removed={} (pre-retry)",
+                                                             current_epoch, stale_hashes.len());
+                                                }
+                                            }
+
                                             if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
                                                 // v2.96: Track with HeartbeatCommitmentStatus (pending until confirmed)
                                                 let tx_hash_clone = tx.hash.clone();
@@ -13743,11 +13777,29 @@ impl BlockchainNode {
                                             Ok(tx_bytes) => {
                                                 let gas_price = tx.gas_price;
                                                 let tx_bytes_for_broadcast = tx_bytes.clone();
-                                                
+
                                                 if is_info() {
                                                     println!("[INFO][LIGHT-BITMAP] TX size={} bytes", tx_bytes.len());
                                                 }
-                                                
+
+                                                // v15.5: RETRY MEMPOOL CLEANUP — see HeartbeatCommitment site
+                                                // for full rationale. Same pattern, same scalability profile,
+                                                // same fix: drop stale retry attempts from the local mempool
+                                                // before adding the new one so the next producer cannot pull
+                                                // multiple versions of the same logical commitment into one
+                                                // block.
+                                                let stale_hashes: Vec<String> = bitmap_tracker
+                                                    .get(&current_epoch)
+                                                    .map(|e| e.all_tx_hashes.clone())
+                                                    .unwrap_or_default();
+                                                if !stale_hashes.is_empty() {
+                                                    mempool.batch_remove_transactions(&stale_hashes);
+                                                    if is_info() {
+                                                        println!("[INFO][LIGHT-BITMAP] mempool_cleanup epoch={} removed={} (pre-retry)",
+                                                                 current_epoch, stale_hashes.len());
+                                                    }
+                                                }
+
                                                 if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
                                                     let tx_hash_clone = tx.hash.clone();
                                                     if let Some(mut existing) = bitmap_tracker.get_mut(&current_epoch) {
@@ -18701,10 +18753,31 @@ impl BlockchainNode {
                     let mut user_txs: Vec<qnet_state::Transaction> = Vec::new();
                     let mut rejection_reasons: Vec<(String, String)> = Vec::new(); // v3.1: Track reasons
                     
-                    // v10.1: Track commitment TX senders to deduplicate (one per node_id per epoch)
-                    let mut seen_heartbeat_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
-                    let mut seen_ping_senders: std::collections::HashSet<String> = std::collections::HashSet::new();
-                    let mut seen_bitmap_genesis: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    // ═══════════════════════════════════════════════════════════════════════
+                    // v15.5: PRODUCER-SIDE COMMITMENT DEDUP — defense-in-depth.
+                    //
+                    // The mempool's per-receive replacement (`SimpleMempool::commitment_index`)
+                    // already keeps a single canonical version of each logical commitment in
+                    // the local mempool. This filter is the LAST line of defense before the
+                    // block sealing path: a transient race between an inbound gossip TX and a
+                    // concurrent producer pull could, in theory, surface two versions of the
+                    // same commitment in the candidate set. Deduplication here guarantees
+                    // that no block ever ships duplicate commitments regardless of upstream
+                    // race conditions.
+                    //
+                    // Coverage matches `Transaction::commitment_dedup_key()` and therefore
+                    // mirrors `state.rs::check_duplicate_commitment` 1-to-1: HeartbeatCommitment,
+                    // PingCommitmentWithSampling, LightNodeEligibilityBitmap, NodeRegistration,
+                    // NodeReactivation. A duplicate is removed from mempool via
+                    // `invalid_tx_hashes` so it cannot be retried back into the next block.
+                    //
+                    // Scalability: HashSet is bounded by the count of distinct logical
+                    // commitments in this microblock window (≤ active validator committee
+                    // size per type). At thousands of super nodes this remains a tight
+                    // bound — commitments are at most one per validator per epoch boundary.
+                    // ═══════════════════════════════════════════════════════════════════════
+                    let mut seen_commit_keys: std::collections::HashSet<(String, u64, u8)> =
+                        std::collections::HashSet::new();
 
                     for (hash, tx, is_valid, reject_reason) in validated {
                         if is_valid {
@@ -18719,18 +18792,13 @@ impl BlockchainNode {
                                 || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. })
                                 || matches!(tx.tx_type, qnet_state::TransactionType::LightNodeEligibilityBitmap { .. });
 
-                            // v10.1: Block-level dedup — one commitment TX per node_id per block
-                            let is_dup_commitment = match &tx.tx_type {
-                                qnet_state::TransactionType::HeartbeatCommitment { node_id, .. } => {
-                                    !seen_heartbeat_nodes.insert(node_id.clone())
-                                }
-                                qnet_state::TransactionType::PingCommitmentWithSampling { .. } => {
-                                    !seen_ping_senders.insert(tx.from.clone())
-                                }
-                                qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } => {
-                                    !seen_bitmap_genesis.insert(genesis_id.clone())
-                                }
-                                _ => false,
+                            // v15.5: unified commitment dedup via canonical key.
+                            // `commitment_dedup_key()` returns `None` for non-commitment
+                            // TXs; those skip the dedup check entirely.
+                            let is_dup_commitment = if let Some(key) = tx.commitment_dedup_key() {
+                                !seen_commit_keys.insert(key)
+                            } else {
+                                false
                             };
 
                             if is_dup_commitment {

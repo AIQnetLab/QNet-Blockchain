@@ -57,6 +57,40 @@ pub struct SimpleMempool {
     tx_sender_map: DashMap<String, String>,
     /// Max transactions per sender
     max_per_sender: u32,
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.5: COMMITMENT-CLASS TX DEDUPLICATION (sender+epoch replacement)
+    // ════════════════════════════════════════════════════════════════════════
+    // Forward index: `(identity, epoch_or_index, type_id)` → current canonical
+    // hash for that logical commitment. On admission of a commitment-class
+    // TX (HeartbeatCommitment, PingCommitmentWithSampling,
+    // LightNodeEligibilityBitmap, NodeRegistration, NodeReactivation), this
+    // index is consulted: any prior version with the same key is removed
+    // from every storage structure before the new TX is inserted, so the
+    // next producer can never pull two semantically-equivalent commitments
+    // into a single block.
+    //
+    // Without this index, retries created TXs with different hashes (because
+    // the per-attempt timestamp changed) which the hash-based dedup did not
+    // catch — the explorer-observable duplication at h=29731 (4 nodes ×
+    // 2 HeartbeatCommitment each) is the symptom this fixes.
+    //
+    // Scalability: lock-free `DashMap` keyed on a tight `(String, u64, u8)`
+    // tuple; admissions are O(1) and entries are bounded by the count of
+    // distinct logical commitments currently in flight (≤ active validator
+    // committee size per type — well-bounded at thousands of nodes).
+    //
+    // Identity / epoch derivation in `Transaction::commitment_dedup_key`
+    // MIRRORS `state.rs::check_duplicate_commitment` 1-to-1, so the mempool
+    // can never admit a TX that would later be rejected at apply time as
+    // a duplicate of one already on chain.
+    commitment_index: Arc<DashMap<(String, u64, u8), String>>,
+    /// Reverse index: `tx_hash → (identity, epoch_or_index, type_id)`. Used
+    /// when a TX leaves the mempool by any path (replacement, block
+    /// inclusion, eviction, expiration, explicit removal, clear) so the
+    /// forward index can be cleaned up without re-parsing the TX bytes.
+    /// Sized identically to `commitment_index`; both are maintained as a
+    /// pair under the same admission/removal logic.
+    commitment_reverse: Arc<DashMap<String, (String, u64, u8)>>,
 }
 
 impl SimpleMempool {
@@ -76,6 +110,87 @@ impl SimpleMempool {
             tx_count_by_sender: DashMap::new(),
             tx_sender_map: DashMap::new(),
             max_per_sender,
+            // v15.5: commitment-class dedup indices (see struct doc)
+            commitment_index: Arc::new(DashMap::new()),
+            commitment_reverse: Arc::new(DashMap::new()),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // v15.5: COMMITMENT DEDUP HELPERS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Atomically register the new commitment hash under its dedup key,
+    /// returning the previously-registered hash if a replacement just
+    /// happened. Uses the `entry` API on `DashMap` so per-key transitions
+    /// are linearisable across producer threads — concurrent admissions of
+    /// the same logical commitment serialise to a single winner without an
+    /// outer lock.
+    ///
+    /// The forward-index transition is the *commit point* for replacement.
+    /// All storage cleanup of the prior version (`transactions`,
+    /// `tx_timestamps`, `tx_sender_map`, `tx_count_by_sender`,
+    /// `by_gas_price`) follows this commit point, so any reader observing
+    /// the forward index already sees the new winner; subsequent storage
+    /// reads of the old hash may briefly succeed (until cleanup completes),
+    /// which is harmless — the producer scans by hash, not by key.
+    fn replace_or_register_commitment(
+        &self,
+        key: (String, u64, u8),
+        new_hash: &str,
+    ) -> Option<String> {
+        use dashmap::mapref::entry::Entry;
+
+        let old_hash = match self.commitment_index.entry(key.clone()) {
+            Entry::Occupied(mut e) => Some(std::mem::replace(e.get_mut(), new_hash.to_string())),
+            Entry::Vacant(e) => {
+                e.insert(new_hash.to_string());
+                None
+            }
+        };
+
+        // Reverse index: `new_hash → key` so any future removal path can
+        // resolve the forward-index entry without re-parsing the TX.
+        self.commitment_reverse.insert(new_hash.to_string(), key);
+
+        // If a prior version existed, scrub it from every storage layer.
+        // Each removal is idempotent against concurrent removal paths (e.g.
+        // expiration), so a race between replacement and TTL eviction is
+        // resolved deterministically — last-writer-of-the-storage-row wins,
+        // and either ordering converges on a consistent state.
+        if let Some(ref old) = old_hash {
+            self.commitment_reverse.remove(old);
+            self.transactions.remove(old);
+            self.tx_timestamps.remove(old);
+            if let Some((_, sender)) = self.tx_sender_map.remove(old) {
+                if let Some(mut count) = self.tx_count_by_sender.get_mut(&sender) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+            // Priority-queue cleanup must hold the outer write lock because
+            // `by_gas_price` is the linearisation point for the producer's
+            // pull path. Brief contention here (only on commitment retries)
+            // is acceptable; commitments are at most one per validator per
+            // epoch boundary.
+            let mut priority_queue = self.by_gas_price.write();
+            for (_gas_price, hashes) in priority_queue.iter_mut() {
+                hashes.retain(|h| h != old);
+            }
+            priority_queue.retain(|_, hashes| !hashes.is_empty());
+        }
+
+        old_hash
+    }
+
+    /// Remove any commitment-dedup index entries pointing at this hash.
+    /// Called from every TX-removal path so that the dedup tables stay
+    /// proportionate to live mempool occupancy. The `remove_if` guard on
+    /// the forward index prevents accidental removal of a NEWER replacement
+    /// that happens to share the same key — only the entry whose value
+    /// equals `hash` is cleared.
+    fn cleanup_commitment_indices_for_hash(&self, hash: &str) {
+        if let Some((_, key)) = self.commitment_reverse.remove(hash) {
+            self.commitment_index.remove_if(&key, |_, current| current == hash);
         }
     }
     
@@ -138,6 +253,10 @@ impl SimpleMempool {
                         }
                         self.transactions.remove(&tx_hash);
                         self.tx_timestamps.remove(&tx_hash);
+                        // v15.5: keep commitment dedup tables proportional to
+                        // live mempool occupancy when low-priority eviction
+                        // drops a commitment-class TX.
+                        self.cleanup_commitment_indices_for_hash(&tx_hash);
                         println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={} new_is_system={}",
                                  lowest_gas, effective_priority, is_system);
                     }
@@ -171,6 +290,25 @@ impl SimpleMempool {
             return false;
         }
 
+        // ═══════════════════════════════════════════════════════════════════
+        // v15.5: COMMITMENT REPLACEMENT — single-version-in-mempool guarantee
+        // for the deterministic-(identity, epoch_or_index) TX class. Any
+        // prior version sharing the same dedup key is removed from every
+        // storage layer here, BEFORE per-sender count and storage insertion,
+        // so the count and capacity bookkeeping that follows reflects the
+        // post-replacement state. Non-commitment TXs return None and skip
+        // this branch with one DashMap miss of overhead.
+        // ═══════════════════════════════════════════════════════════════════
+        let commitment_key = parsed_tx.commitment_dedup_key();
+        if let Some(ref key) = commitment_key {
+            if let Some(old_hash) = self.replace_or_register_commitment(key.clone(), &hash) {
+                println!("[INFO][MEMPOOL] commitment_replaced id={} epoch={} type={} old={} new={}",
+                         &key.0[..16.min(key.0.len())], key.1, key.2,
+                         &old_hash[..16.min(old_hash.len())],
+                         &hash[..16.min(hash.len())]);
+            }
+        }
+
         // FIX L-M9: Per-sender limit defense-in-depth
         if !parsed_tx.from.is_empty() {
             let mut sender_count = self.tx_count_by_sender
@@ -179,28 +317,35 @@ impl SimpleMempool {
             if *sender_count >= self.max_per_sender {
                 println!("[WARN][MEMPOOL] per_sender_limit sender={} count={} max={}",
                          &parsed_tx.from[..16.min(parsed_tx.from.len())], *sender_count, self.max_per_sender);
+                // v15.5: roll back the commitment registration we just made
+                // so a count-rejected TX does not leave a dangling forward-
+                // index entry pointing at a hash that never enters storage.
+                if let Some(ref key) = commitment_key {
+                    self.commitment_index.remove_if(key, |_, current| current == &hash);
+                    self.commitment_reverse.remove(&hash);
+                }
                 return false;
             }
             *sender_count += 1;
             self.tx_sender_map.insert(hash.clone(), parsed_tx.from.clone());
         }
-        
+
         // Store as binary if enabled (50% space saving)
         let storage = if self.use_binary {
             TxStorage::Binary(tx_json.as_bytes().to_vec())
         } else {
             TxStorage::Json(tx_json)
         };
-        
+
         // v2.67: CRITICAL - Add to BOTH structures atomically under priority queue lock
         {
             let mut priority_queue = self.by_gas_price.write();
-            
+
             // Double-check inside lock
             if self.transactions.contains_key(&hash) {
                 return false;
             }
-            
+
             self.transactions.insert(hash.clone(), storage);
             self.tx_timestamps.insert(hash.clone(), std::time::Instant::now());
             // v14.8.4: System TXs keyed at u64::MAX so block producers drain
@@ -258,6 +403,10 @@ impl SimpleMempool {
                         }
                         self.transactions.remove(&tx_hash);
                         self.tx_timestamps.remove(&tx_hash);
+                        // v15.5: keep commitment dedup tables proportional to
+                        // live mempool occupancy when low-priority eviction
+                        // drops a commitment-class TX.
+                        self.cleanup_commitment_indices_for_hash(&tx_hash);
                         println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={} new_is_system={}",
                                  lowest_gas, effective_priority, is_system);
                     }
@@ -291,6 +440,25 @@ impl SimpleMempool {
             return false;
         }
 
+        // ═══════════════════════════════════════════════════════════════════
+        // v15.5: COMMITMENT REPLACEMENT — see `add_raw_transaction` for the
+        // full rationale. The binary path is the hot route for commitments
+        // arriving via gossip and producer-side broadcast retries, so
+        // replacement here is what closes the cross-node duplication
+        // window: every receiving node deduplicates independently and the
+        // next producer's mempool can only contain one version of any
+        // logical commitment.
+        // ═══════════════════════════════════════════════════════════════════
+        let commitment_key = parsed_tx.commitment_dedup_key();
+        if let Some(ref key) = commitment_key {
+            if let Some(old_hash) = self.replace_or_register_commitment(key.clone(), &hash) {
+                println!("[INFO][MEMPOOL] commitment_replaced id={} epoch={} type={} old={} new={}",
+                         &key.0[..16.min(key.0.len())], key.1, key.2,
+                         &old_hash[..16.min(old_hash.len())],
+                         &hash[..16.min(hash.len())]);
+            }
+        }
+
         // Per-sender limit (defense in depth)
         let sender = &parsed_tx.from;
         if !sender.is_empty() {
@@ -298,6 +466,12 @@ impl SimpleMempool {
             if *sender_count >= self.max_per_sender {
                 println!("[WARN][MEMPOOL] per_sender_limit sender={}.. count={}",
                          &sender[..16.min(sender.len())], *sender_count);
+                // v15.5: roll back the commitment registration on count
+                // rejection to keep dedup indices in lockstep with storage.
+                if let Some(ref key) = commitment_key {
+                    self.commitment_index.remove_if(key, |_, current| current == &hash);
+                    self.commitment_reverse.remove(&hash);
+                }
                 return false;
             }
             *sender_count += 1;
@@ -366,13 +540,85 @@ impl SimpleMempool {
 
         // CRITICAL: Acquire priority queue lock BEFORE inserting into DashMap
         // This makes both insertions atomic, preventing the race condition where
-        // a TX is visible in transactions but missing from the priority queue
+        // a TX is visible in transactions but missing from the priority queue.
+        // v15.5: lock also serialises commitment-dedup transitions for the
+        // batch — see inline replacement below.
         let mut priority_queue = self.by_gas_price.write();
 
         for (tx_bytes, hash, gas_price) in transactions.into_iter().take(available_space) {
             // Skip duplicates
             if self.transactions.contains_key(&hash) {
                 continue;
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // v15.5: COMMITMENT DEDUP FOR TRUSTED BATCH PATH.
+            //
+            // Without this branch the trusted-batch ingestion would bypass
+            // the per-receive replacement that single-TX paths enforce, and
+            // a commitment-class TX flowing through this path could leave a
+            // stale prior version in the local mempool. Producer-side
+            // filtering would still keep duplicates out of any block, but
+            // the mempool itself would temporarily carry redundant entries
+            // — a divergence from the top-tier L1 invariant of "one
+            // canonical version per logical commitment in mempool".
+            //
+            // The replacement is inlined here (rather than delegated to
+            // `replace_or_register_commitment`) because the helper acquires
+            // its own write on `by_gas_price`, and we already hold that
+            // lock for the duration of the batch. Inlining avoids a
+            // re-entrant lock attempt while preserving identical
+            // semantics for the dedup indices.
+            //
+            // Fast path: only parse TXs whose gas_price hint marks them as
+            // system-class (u64::MAX). User TXs — the bulk of any trusted
+            // batch — skip parsing entirely and pay only a single `u64`
+            // comparison of overhead. Worst case (a batch of all
+            // commitments at an epoch boundary) parses each TX exactly
+            // once with no extra lock acquisitions.
+            // ═══════════════════════════════════════════════════════════════
+            let key_opt = if gas_price == u64::MAX {
+                bincode::deserialize::<Transaction>(&tx_bytes)
+                    .ok()
+                    .and_then(|tx| tx.commitment_dedup_key())
+            } else {
+                None
+            };
+
+            if let Some(ref key) = key_opt {
+                use dashmap::mapref::entry::Entry;
+                let prev_hash = match self.commitment_index.entry(key.clone()) {
+                    Entry::Occupied(mut e) => {
+                        Some(std::mem::replace(e.get_mut(), hash.clone()))
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(hash.clone());
+                        None
+                    }
+                };
+                self.commitment_reverse.insert(hash.clone(), key.clone());
+
+                if let Some(old) = prev_hash {
+                    // Evict the prior version from every storage layer.
+                    // The priority-queue removal happens inside the held
+                    // lock so the transition is atomic with the new
+                    // insertion below.
+                    self.commitment_reverse.remove(&old);
+                    self.transactions.remove(&old);
+                    self.tx_timestamps.remove(&old);
+                    if let Some((_, sender)) = self.tx_sender_map.remove(&old) {
+                        if let Some(mut count) = self.tx_count_by_sender.get_mut(&sender) {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                    for (_gp, hashes) in priority_queue.iter_mut() {
+                        hashes.retain(|h| h != &old);
+                    }
+                    println!("[INFO][MEMPOOL] commitment_replaced_trusted id={} epoch={} type={} old={} new={}",
+                             &key.0[..16.min(key.0.len())], key.1, key.2,
+                             &old[..16.min(old.len())],
+                             &hash[..16.min(hash.len())]);
+                }
             }
 
             // TRUSTED: Skip hash verification - caller guarantees correctness
@@ -385,6 +631,10 @@ impl SimpleMempool {
                 .push_back(hash);
             added += 1;
         }
+
+        // Drop empty priority levels created by commitment evictions above
+        // so the queue stays compact across batch boundaries.
+        priority_queue.retain(|_, hashes| !hashes.is_empty());
 
         added
     }
@@ -460,6 +710,8 @@ impl SimpleMempool {
                     *count = count.saturating_sub(1);
                 }
             }
+            // v15.5: keep commitment dedup tables in lockstep with storage.
+            self.cleanup_commitment_indices_for_hash(hash);
             // CRITICAL: Also remove from priority queue
             let mut priority_queue = self.by_gas_price.write();
             for (_gas_price, hashes) in priority_queue.iter_mut() {
@@ -471,7 +723,7 @@ impl SimpleMempool {
             false
         }
     }
-    
+
     /// Clear all transactions (both storage and priority queue)
     /// CRITICAL: Clears both data structures to maintain consistency
     pub fn clear(&self) {
@@ -479,6 +731,10 @@ impl SimpleMempool {
         self.by_gas_price.write().clear();
         self.tx_sender_map.clear();
         self.tx_count_by_sender.clear();
+        // v15.5: clear commitment dedup tables together with the rest of
+        // mempool state so no stale entries survive a full reset.
+        self.commitment_index.clear();
+        self.commitment_reverse.clear();
     }
     
     /// Get mempool size
@@ -510,10 +766,13 @@ impl SimpleMempool {
         for hash in hashes {
             if self.transactions.remove(hash).is_some() {
                 self.tx_timestamps.remove(hash.as_str());
+                // v15.5: clear commitment dedup tables for every hash that
+                // actually existed in storage. Idempotent and O(1) per hash.
+                self.cleanup_commitment_indices_for_hash(hash);
                 removed_count += 1;
             }
         }
-        
+
         // Step 2: Clean priority queue in one pass (more efficient than individual removes)
         if removed_count > 0 {
             let hash_set: std::collections::HashSet<&String> = hashes.iter().collect();
@@ -622,6 +881,11 @@ impl SimpleMempool {
             // incorrectly block re-submission of expired (never-confirmed) TXs.
             for hash in &expired_hashes {
                 self.transactions.remove(hash);
+                // v15.5: TTL eviction must release the dedup-index slot too,
+                // otherwise an expired commitment would block a fresh
+                // submission for the same `(identity, epoch_or_index)` until
+                // the next mempool clear.
+                self.cleanup_commitment_indices_for_hash(hash);
             }
             // Remove from priority queue
             let expired_set: std::collections::HashSet<&String> = expired_hashes.iter().collect();

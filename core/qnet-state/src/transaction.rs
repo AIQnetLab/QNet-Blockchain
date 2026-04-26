@@ -671,6 +671,73 @@ impl Transaction {
         )
     }
 
+    /// v15.5: Returns true for the subset of system TXs that have
+    /// deterministic `(identity, epoch_or_index)` semantics. For these the
+    /// local mempool must enforce single-version replacement so that retries
+    /// (legitimate or accidental) cannot accumulate duplicates of the same
+    /// logical commitment in a single block.
+    ///
+    /// Non-commitment system TXs (`RewardDistribution`, `KeyRotation`,
+    /// `NodeActivation`, `PingAttestation`, batch types) keep the regular
+    /// hash-only dedup path because they either have unique-per-instance
+    /// payload, single-shot pre-existing guards, or no retry mechanism.
+    ///
+    /// Designed for the multi-thousand super-node scale: callers compute the
+    /// dedup key in `O(1)` and consult lock-free indices in the mempool, so
+    /// the per-TX overhead is constant regardless of validator count.
+    pub fn is_commitment(&self) -> bool {
+        matches!(
+            &self.tx_type,
+            TransactionType::HeartbeatCommitment { .. }
+                | TransactionType::PingCommitmentWithSampling { .. }
+                | TransactionType::LightNodeEligibilityBitmap { .. }
+                | TransactionType::NodeRegistration { .. }
+                | TransactionType::NodeReactivation { .. }
+        )
+    }
+
+    /// v15.5: Compound dedup key for commitment-class TXs:
+    /// `(identity, epoch_or_index, type_id)`.
+    ///
+    /// Two TXs sharing this key are semantically the same commitment and the
+    /// mempool must keep only the most recent one. Returns `None` for any
+    /// non-commitment TX, in which case the regular hash-based dedup path
+    /// applies.
+    ///
+    /// Identity / epoch derivation MIRRORS `state.rs::check_duplicate_commitment`
+    /// 1-to-1 — otherwise a TX admitted to the local mempool could later be
+    /// rejected at apply time as a duplicate of one already on chain, which
+    /// is exactly the failure mode this method exists to prevent.
+    ///
+    /// Type IDs are dense `u8` constants so the full key tuple has a small
+    /// footprint and is suitable as a `DashMap` key at the
+    /// thousands-of-validators scale where commitment-boundary bursts can
+    /// produce millions of entries per epoch transition window.
+    pub fn commitment_dedup_key(&self) -> Option<(String, u64, u8)> {
+        const EPOCH_INTERVAL: u64 = 14400; // matches state.rs EMISSION_BLOCK_INTERVAL
+        match &self.tx_type {
+            TransactionType::HeartbeatCommitment { node_id, window_start_height, .. } => {
+                Some((node_id.clone(), window_start_height / EPOCH_INTERVAL, 1))
+            }
+            TransactionType::PingCommitmentWithSampling { window_start_height, .. } => {
+                Some((self.from.clone(), window_start_height / EPOCH_INTERVAL, 2))
+            }
+            TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, .. } => {
+                Some((genesis_id.clone(), *epoch, 3))
+            }
+            TransactionType::NodeRegistration { node_id, .. } => {
+                // One-shot for the chain's lifetime. Constant `0` epoch
+                // collapses any duplicate registration attempt onto the same
+                // dedup key regardless of arrival time.
+                Some((node_id.clone(), 0, 4))
+            }
+            TransactionType::NodeReactivation { node_id, last_macroblock_index, .. } => {
+                Some((node_id.clone(), *last_macroblock_index, 5))
+            }
+            _ => None,
+        }
+    }
+
     /// v3.36: Gas metering -- compute ACTUAL gas consumed per TX type
     /// Ethereum-style: user pays for gas_used, not gas_limit.
     /// gas_limit serves as maximum cap (out-of-gas if exceeded).
