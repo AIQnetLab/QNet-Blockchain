@@ -1019,7 +1019,32 @@ impl BlockPipeline {
                 // nodes.
                 metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_LOAD_PREV);
                 let load_start = std::time::Instant::now();
-                let load_result = storage.load_microblock_auto_format(mb.height - 1);
+                // v15.6: Run the synchronous RocksDB read on the dedicated blocking
+                // pool so it never starves a tokio worker. Under macroblock-burst
+                // contention the same async worker also drives apply-stage state
+                // mutations and consensus message handling — leaving the read on
+                // the async path made a single hot-row scan stall every other
+                // task on this thread for tens of seconds (observed at h=12247
+                // with op_age_ms=21977). Spawn-blocking decouples the I/O
+                // latency from runtime liveness and matches the pattern already
+                // used at every other RocksDB hot-read site in this codebase.
+                let storage_for_load = storage.clone();
+                let parent_h = mb.height - 1;
+                let load_result = match tokio::task::spawn_blocking(move || {
+                    storage_for_load.load_microblock_auto_format(parent_h)
+                }).await {
+                    Ok(res) => res,
+                    Err(join_err) => {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] verify_load_prev_join_err h={} parent_h={} err={}",
+                                mb.height, parent_h, join_err
+                            );
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
                 let load_elapsed = load_start.elapsed();
                 if load_elapsed > std::time::Duration::from_millis(500) {
                     if is_warn() {
@@ -1464,10 +1489,29 @@ impl BlockPipeline {
             // path; if hung, watchdog will surface it.
             metrics.mark_apply_op(height, PIPELINE_OP_APPLY_DEDUP);
             let dedup_start = std::time::Instant::now();
-            // Double-check dedup (race between verify and apply)
-            let already_applied = ctx.storage.load_microblock(height)
-                .map(|opt| opt.is_some())
-                .unwrap_or(false);
+            // v15.6: Dedup check runs on the blocking pool. The RocksDB lookup
+            // on a hot row competes with the same column family the apply
+            // stage writes to a few microseconds later; running it on the
+            // async path made one slow read freeze the entire stage. The
+            // tokio::task::spawn_blocking handoff is cheap (single channel
+            // hop) and isolates this I/O from runtime liveness.
+            let storage_for_dedup = ctx.storage.clone();
+            let already_applied = match tokio::task::spawn_blocking(move || {
+                storage_for_dedup.load_microblock(height)
+                    .map(|opt| opt.is_some())
+                    .unwrap_or(false)
+            }).await {
+                Ok(v) => v,
+                Err(join_err) => {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] apply_dedup_join_err h={} err={}",
+                            height, join_err
+                        );
+                    }
+                    false
+                }
+            };
             let dedup_elapsed = dedup_start.elapsed();
             if dedup_elapsed > std::time::Duration::from_millis(500) {
                 if is_warn() {
@@ -1599,15 +1643,33 @@ impl BlockPipeline {
                     p2p.record_apply_success(&block.from_peer);
                 }
 
-                // State verified — save block
-                // v15.4 DIAG: primary suspect for sync-RocksDB-in-async-
-                // context hangs. RocksDB compaction triggered by macroblock
-                // bursts can stall foreground writes; if the watchdog finds
-                // op=apply:save_microblock as the frozen point, we have
-                // direct evidence the hypothesis is correct.
+                // State verified — save block.
+                // v15.6: RocksDB writes go through the blocking pool. Macroblock
+                // bursts trigger background compactions that can stall foreground
+                // writes for hundreds of milliseconds; running save on the async
+                // path made the entire pipeline freeze under that contention.
+                // The decompressed bytes are moved into the closure (zero copy
+                // overhead beyond the Arc clone for storage); set_chain_height
+                // follows immediately so both writes share the same blocking
+                // context and complete before the apply slot is released.
                 metrics.mark_apply_op(height, PIPELINE_OP_APPLY_SAVE_BLOCK);
                 let save_start = std::time::Instant::now();
-                let save_result = ctx.storage.save_microblock(height, &block.decompressed);
+                let storage_for_save = ctx.storage.clone();
+                let block_bytes_for_save = block.decompressed.clone();
+                let save_result = match tokio::task::spawn_blocking(move || {
+                    storage_for_save.save_microblock(height, &block_bytes_for_save)
+                }).await {
+                    Ok(res) => res,
+                    Err(join_err) => {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] apply_save_join_err h={} err={}",
+                                height, join_err
+                            );
+                        }
+                        Err(crate::errors::IntegrationError::StorageError(format!("join error: {}", join_err)))
+                    }
+                };
                 let save_elapsed = save_start.elapsed();
                 if save_elapsed > std::time::Duration::from_millis(500) {
                     if is_warn() {
@@ -1619,10 +1681,26 @@ impl BlockPipeline {
                 }
                 match save_result {
                     Ok(()) => {
-                        // v15.4 DIAG: chain-height bump (atomic CF write).
+                        // v15.6: chain-height bump on the blocking pool too —
+                        // it is an atomic CF write but pays the same compaction
+                        // queue penalty as the block save above.
                         metrics.mark_apply_op(height, PIPELINE_OP_APPLY_SET_HEIGHT);
                         let height_start = std::time::Instant::now();
-                        let height_result = ctx.storage.set_chain_height(height);
+                        let storage_for_height = ctx.storage.clone();
+                        let height_result = match tokio::task::spawn_blocking(move || {
+                            storage_for_height.set_chain_height(height)
+                        }).await {
+                            Ok(res) => res,
+                            Err(join_err) => {
+                                if is_warn() {
+                                    println!(
+                                        "[WARN][PIPELINE] set_height_join_err h={} err={}",
+                                        height, join_err
+                                    );
+                                }
+                                Err(crate::errors::IntegrationError::StorageError(format!("join error: {}", join_err)))
+                            }
+                        };
                         let height_elapsed = height_start.elapsed();
                         if height_elapsed > std::time::Duration::from_millis(500) {
                             if is_warn() {
