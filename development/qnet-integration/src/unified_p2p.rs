@@ -18483,10 +18483,21 @@ impl SimplifiedP2P {
         if peers.is_empty() {
             return Err("No peers available for macroblock sync".to_string());
         }
-        
+
         // v2.96: Get LIVE genesis nodes from failover cache (updated every 20s)
         let working_genesis_ips = Self::filter_working_genesis_nodes_static(get_genesis_bootstrap_ips());
-        
+
+        // v15.7: Targeted DESYNC peer query — minimum chain-height threshold.
+        // A peer can only serve macroblock `to_index` if its observed chain
+        // height covers the entire range. Without this filter the sync path
+        // round-robins through every peer including those that are themselves
+        // behind, wastes the 5-peer attempt budget on `not_found` responses,
+        // and surfaces as `all peers did not respond` even when the right
+        // peers are reachable. Using `last_block_height` (kept fresh by the
+        // heartbeat / block-broadcast paths) gives an O(1) per-peer filter
+        // that scales identically at thousands of validators.
+        let required_microblock_height: u64 = to_index.saturating_mul(90);
+
         // CRITICAL: Only request from Super/Full nodes that are ACTUALLY ONLINE
         let mut eligible_peers: Vec<_> = peers.iter()
             .filter(|p| matches!(p.node_type, NodeType::Super))
@@ -18494,6 +18505,16 @@ impl SimplifiedP2P {
                 // v2.96: Filter by failover connectivity cache
                 let peer_ip = p.addr.split(':').next().unwrap_or("");
                 working_genesis_ips.iter().any(|ip| ip == peer_ip)
+            })
+            .filter(|p| {
+                // v15.7: Skip peers below the microblock-height of the target
+                // macroblock. A peer with last_block_height == 0 is treated as
+                // "height unknown" rather than "definitively below" — the
+                // heartbeat may simply not have fired yet — so we keep it
+                // eligible to avoid empty candidate sets during early
+                // bootstrap. In steady state every active peer publishes a
+                // height so this acts as a strict filter.
+                p.last_block_height == 0 || p.last_block_height >= required_microblock_height
             })
             .cloned()
             .collect();
@@ -22980,6 +23001,161 @@ impl SimplifiedP2P {
     /// vote-insert time in handle_timeout_vote.
     pub fn get_highest_adopted_round(&self, height: u64, _threshold: usize) -> u64 {
         HIGHEST_ADOPTED_ROUND.get(&height).map(|v| *v).unwrap_or(0)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SKIP-MARKER MACROBLOCK SUPPORT (v15.7)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // The fallback path in `participate_in_macroblock_consensus` uses these
+    // helpers to surface a 2f+1-signed AggregatedTimeoutCertificate as the
+    // cryptographic evidence for a skip-marker macroblock, and to verify the
+    // certificate carried by an incoming skip-marker received from peers.
+    //
+    // Skip markers are an explicit on-chain record that `previous_hash`
+    // linkage at this macroblock index is preserved even when the canonical
+    // commit-reveal protocol failed to drive 2f+1 reveals. They never
+    // process rewards or mutate state — they only seal the chain so the
+    // next macroblock can start.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// v15.7: Retrieve the highest-round AggregatedTimeoutCertificate stored
+    /// for a given macroblock index, picking the strongest evidence currently
+    /// known to this node. Returns None when no aggregated certificate has
+    /// reached this node for the given index.
+    ///
+    /// Scalability: at most O(C) where C is the count of certificates the
+    /// pacemaker collected for this index; bounded by the cleanup sweep that
+    /// prunes stale timeout state alongside microblock rotation.
+    pub fn get_aggregated_tc_for(&self, mb_idx: u64) -> Option<AggregatedTimeoutCertificate> {
+        let mut best: Option<AggregatedTimeoutCertificate> = None;
+        for entry in AGGREGATED_TC.iter() {
+            let (h, _r) = entry.key();
+            if *h != mb_idx { continue; }
+            let cert = entry.value().clone();
+            match &best {
+                None => best = Some(cert),
+                Some(curr) if cert.certified_round > curr.certified_round => best = Some(cert),
+                _ => {}
+            }
+        }
+        best
+    }
+
+    /// v15.7: Verify the bincode-serialised AggregatedTimeoutCertificate carried
+    /// inside a skip-marker macroblock. Re-uses the same per-vote Dilithium3
+    /// verification as `handle_aggregated_timeout_cert` and the same 2f+1
+    /// supermajority threshold against the active validator set. Returns
+    /// true iff the certificate is structurally well-formed AND every vote
+    /// passes signature verification AND the count meets the threshold.
+    ///
+    /// Inputs:
+    /// - `bytes`            — serialised AggregatedTimeoutCertificate
+    /// - `expected_mb_idx`  — macroblock index this skip marker claims to seal
+    /// - `min_certified_round` — caller-imposed lower bound on the certified
+    ///   round (typically the maximum view-change round that the participate
+    ///   path drives before invoking the skip path); rejects certificates
+    ///   that do not represent actual exhaustion of the canonical path.
+    ///
+    /// Scalability: signature verification is parallelised through rayon,
+    /// matching the hot-path verification in `handle_aggregated_timeout_cert`.
+    /// Bounded by `cert.votes.len() ≤ active_committee_size`.
+    pub fn verify_skip_certificate_bytes(
+        &self,
+        bytes: &[u8],
+        expected_mb_idx: u64,
+        min_certified_round: u64,
+    ) -> bool {
+        let cert: AggregatedTimeoutCertificate = match bincode::deserialize(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][SKIP] cert_decode_fail mb={} err={}",
+                        expected_mb_idx, e,
+                    );
+                }
+                return false;
+            }
+        };
+
+        if cert.height != expected_mb_idx {
+            if crate::node::is_warn() {
+                println!(
+                    "[WARN][SKIP] cert_mb_mismatch expected={} got={}",
+                    expected_mb_idx, cert.height,
+                );
+            }
+            return false;
+        }
+
+        if cert.certified_round < min_certified_round {
+            if crate::node::is_warn() {
+                println!(
+                    "[WARN][SKIP] cert_round_below_threshold mb={} round={} min={}",
+                    expected_mb_idx, cert.certified_round, min_certified_round,
+                );
+            }
+            return false;
+        }
+
+        let total_validators = self.get_active_validator_count();
+        let two_f_plus_1 = (2 * total_validators + 2) / 3;
+        if two_f_plus_1 == 0 || cert.votes.len() < two_f_plus_1 {
+            if crate::node::is_warn() {
+                println!(
+                    "[WARN][SKIP] cert_short_vote_count mb={} votes={} need={}",
+                    expected_mb_idx, cert.votes.len(), two_f_plus_1,
+                );
+            }
+            return false;
+        }
+
+        // Structural pre-pass: distinct voters, every vote round ≥
+        // certified_round. Cheap and runs serially.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for v in &cert.votes {
+            if v.vote_round < cert.certified_round {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][SKIP] cert_vote_round_underflow mb={} voter={} round={} cert_round={}",
+                        expected_mb_idx, v.voter_id, v.vote_round, cert.certified_round,
+                    );
+                }
+                return false;
+            }
+            if !seen.insert(v.voter_id.as_str()) {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][SKIP] cert_duplicate_voter mb={} voter={}",
+                        expected_mb_idx, v.voter_id,
+                    );
+                }
+                return false;
+            }
+        }
+
+        // Parallel Dilithium3 signature verification. Any single bad signature
+        // invalidates the entire certificate (canonical aggregator semantics).
+        use rayon::prelude::*;
+        let all_valid = cert.votes.par_iter().all(|v| {
+            let vote_msg = format!(
+                "TIMEOUT:{}:{}:{}",
+                cert.height, v.vote_round, hex::encode(&v.vote_block_hash),
+            );
+            self.verify_timeout_vote_signature(&v.voter_id, &vote_msg, &v.signature)
+        });
+
+        if !all_valid {
+            if crate::node::is_warn() {
+                println!(
+                    "[WARN][SKIP] cert_bad_signature mb={} round={}",
+                    expected_mb_idx, cert.certified_round,
+                );
+            }
+            return false;
+        }
+
+        true
     }
 }
 

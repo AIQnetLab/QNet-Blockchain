@@ -131,7 +131,7 @@ pub struct MacroBlock {
 }
 
 /// Consensus data for macroblocks
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ConsensusData {
     /// Commit phase data
     pub commits: HashMap<String, Vec<u8>>,
@@ -276,6 +276,58 @@ pub struct ConsensusData {
     /// CRITICAL: All nodes use SAME list from blockchain → deterministic selection!
     #[serde(default)]
     pub excluded_producers_for_next_epoch: Option<Vec<u8>>,
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SKIP-MARKER MACROBLOCK (v15.7)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // When the network's primary consensus path AND the deterministic
+    // fallback-initiator path both exhaust their retries for this macroblock
+    // index, the chain still must not develop a permanent gap. Without an
+    // explicit on-chain record of the failure, mb=N+1's `previous_hash`
+    // would dangle into nothing and every honest validator would refuse to
+    // proceed (PERMANENT NETWORK HALT).
+    //
+    // Resolution: when a 2f+1 BFT-signed TimeoutCertificate exists for this
+    // macroblock index and its certified round has reached the maximum
+    // view-change ceiling, every honest node deterministically constructs
+    // and saves a *skip-marker macroblock* that:
+    //
+    //   * occupies the missing index in the macroblock chain,
+    //   * carries the AggregatedTimeoutCertificate as cryptographic
+    //     evidence (`skip_certificate`),
+    //   * is flagged via `is_skip_marker = true` so validation distinguishes
+    //     it from a regular finalised macroblock,
+    //   * processes no rewards, includes no microblock state mutations
+    //     (consensus_data fields are empty / None) — the skip marker only
+    //     preserves chain integrity for `previous_hash` linkage.
+    //
+    // Validation of an incoming skip-marker macroblock requires:
+    //   1. is_skip_marker = true,
+    //   2. skip_certificate present and decodes to AggregatedTimeoutCertificate,
+    //   3. certificate verifies against the active validator set with 2f+1
+    //      Dilithium3-signed votes at certified_round ≥ MAX_VIEW_CHANGE_ROUNDS.
+    //
+    // Skip markers are NOT created speculatively. The fallback path runs
+    // through every healthy participant in deterministic rank order before
+    // a skip is even considered. By the time a skip marker is produced,
+    // the network has demonstrably failed to reach 2f+1 reveals for this
+    // macroblock, and the 2f+1 view-change votes themselves are the
+    // cryptographic proof of that failure.
+    //
+    // Backward compat: defaulted fields keep historical macroblocks
+    // deserialising unchanged (is_skip_marker = false, skip_certificate =
+    // None), so chain replay across the upgrade boundary is seamless.
+
+    /// True iff this macroblock is a skip-marker placeholder produced after
+    /// every fallback path failed to drive consensus to 2f+1 reveals.
+    #[serde(default)]
+    pub is_skip_marker: bool,
+
+    /// Bincode-serialised AggregatedTimeoutCertificate proving 2f+1 view-change
+    /// votes for this macroblock index at certified_round ≥ MAX_VIEW_CHANGE_ROUNDS.
+    /// Required iff `is_skip_marker == true`. None for regular macroblocks.
+    #[serde(default)]
+    pub skip_certificate: Option<Vec<u8>>,
 }
 
 /// Eligible producer entry for epoch-based validator set
@@ -1139,17 +1191,36 @@ impl MacroBlock {
         if self.timestamp == 0 {
             return Err(StateError::InvalidBlock("Invalid timestamp".to_string()));
         }
-        
+
         // Check microblock count (should be ~90 for 90 seconds)
         if self.micro_blocks.is_empty() || self.micro_blocks.len() > 100 {
             return Err(StateError::InvalidBlock("Invalid microblock count".to_string()));
         }
-        
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // SKIP-MARKER MACROBLOCK VALIDATION (v15.7)
+        // ═══════════════════════════════════════════════════════════════════════
+        // Skip-marker macroblocks substitute the commit-reveal evidence with a
+        // 2f+1-signed AggregatedTimeoutCertificate carried in `skip_certificate`,
+        // so the standard "≥3 reveals" check does not apply. The certificate
+        // itself must be present at this layer; cryptographic verification of
+        // its signatures and certified-round threshold is performed in the
+        // network layer (`SimplifiedP2P::verify_skip_certificate_bytes`)
+        // because that is where the active validator set is available.
+        if self.consensus_data.is_skip_marker {
+            if self.consensus_data.skip_certificate.is_none() {
+                return Err(StateError::InvalidBlock(
+                    "skip_marker_macroblock_missing_skip_certificate".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+
         // Verify consensus data has enough participants
         if self.consensus_data.reveals.len() < 3 {
             return Err(StateError::InvalidBlock("Insufficient consensus participants".to_string()));
         }
-        
+
         Ok(())
     }
 }

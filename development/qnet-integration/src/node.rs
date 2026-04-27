@@ -23485,6 +23485,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             &node_id_cons,
                                             node_type,
                                             &consensus_rx_cons,
+                                            // v15.7: pass state + reward managers to enable
+                                            // the fallback-initiator path inside participate.
+                                            state_manager_cons.clone(),
+                                            reward_manager_cons.clone(),
                                         ).await
                                     };
                                     
@@ -23729,6 +23733,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                                 &node_id_retry,
                                                                 node_type,
                                                                 &consensus_rx_retry,
+                                                                // v15.7: route state + reward managers
+                                                                // to enable fallback-initiator path on
+                                                                // the retry call site too.
+                                                                state_manager_retry.clone(),
+                                                                reward_manager_retry.clone(),
                                                             ).await
                                                         };
                                                         
@@ -25666,8 +25675,191 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SKIP-MARKER MACROBLOCK CONSTRUCTION (v15.7)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Build a skip-marker macroblock for `mb_idx` once the canonical
+    // commit-reveal path AND every deterministic fallback-initiator attempt
+    // have exhausted their retries. The skip marker:
+    //
+    //   1. occupies the macroblock-chain slot at `mb_idx` so subsequent
+    //      macroblocks have a valid `previous_hash` linkage,
+    //   2. carries the strongest 2f+1 AggregatedTimeoutCertificate currently
+    //      known to this node as cryptographic evidence of consensus
+    //      failure (`is_skip_marker = true`, `skip_certificate = Some(...)`)
+    //      so peers can independently re-verify the failure proof,
+    //   3. inherits the previous macroblock's `state_root` because no state
+    //      mutations are processed for a skipped epoch,
+    //   4. uses the boundary microblock's `timestamp`, `poh_hash` and
+    //      `poh_count` for deterministic header fields — every honest node
+    //      has the same boundary microblock for `mb_idx`, so every honest
+    //      node deriving a skip marker for this index produces the same
+    //      `MacroBlock::hash()` (since hash() does not include consensus_data,
+    //      a TC-bytes mismatch across nodes does not break chain linkage),
+    //   5. lists the actual microblock hashes for the skipped epoch so the
+    //      regular `validate()` invariants (≤ 100 micro_blocks, non-empty
+    //      vec) hold without special-casing.
+    //
+    // Determinism guarantees
+    // ─────────────────────────────────────────────────────────────────────
+    // The macroblock hash is fully deterministic across honest nodes:
+    //   * height          deterministic (the missing index)
+    //   * timestamp       sourced from microblock at end_height — deterministic
+    //   * previous_hash   sourced from prev macroblock — deterministic
+    //   * state_root      sourced from prev macroblock — deterministic
+    //   * micro_blocks    iterated h=start..=end, deterministic
+    // The skip_certificate bytes themselves may differ across nodes (each
+    // sees a slightly different aggregated vote set), but `MacroBlock::hash()`
+    // does NOT cover consensus_data, so chain linkage stays intact.
+    //
+    // Scalability
+    // ─────────────────────────────────────────────────────────────────────
+    // Construction reads exactly one prev macroblock and the 90 microblocks
+    // of the skipped epoch. Cost is independent of validator count and
+    // matches the regular finalization read pattern. Each honest node
+    // performs this construction at most once per skipped index.
+    // ═══════════════════════════════════════════════════════════════════════════
+    async fn build_skip_marker_macroblock(
+        storage: &Arc<Storage>,
+        p2p: &Arc<SimplifiedP2P>,
+        mb_idx: u64,
+        start_height: u64,
+        end_height: u64,
+    ) -> Result<qnet_state::MacroBlock, String> {
+        // Genesis epochs cannot be "skipped" — by construction the chain
+        // has no prior macroblock to derive `previous_hash` from. If skip
+        // is somehow attempted at mb_idx <= 1 we refuse: the catastrophic
+        // recovery path is reserved for live-network skip events.
+        if mb_idx < 2 {
+            return Err(format!(
+                "skip_marker_refused mb={} reason=genesis_epoch_no_predecessor",
+                mb_idx,
+            ));
+        }
+
+        // Pull the strongest 2f+1 timeout certificate currently known to
+        // this node. This is the cryptographic proof that consensus on
+        // this index failed; no skip marker is built without it.
+        let cert = match p2p.get_aggregated_tc_for(mb_idx) {
+            Some(c) => c,
+            None => {
+                return Err(format!(
+                    "skip_marker_refused mb={} reason=no_aggregated_tc_locally",
+                    mb_idx,
+                ));
+            }
+        };
+
+        // Refuse to skip until the certificate has actually reached the
+        // view-change exhaustion ceiling. Without this guard a node could
+        // attempt a skip the first time a single round timed out, which
+        // would race ahead of the canonical commit-reveal path.
+        const MIN_SKIP_CERTIFIED_ROUND: u64 = 8;
+        if cert.certified_round < MIN_SKIP_CERTIFIED_ROUND {
+            return Err(format!(
+                "skip_marker_refused mb={} reason=tc_round_too_low round={} need>={}",
+                mb_idx, cert.certified_round, MIN_SKIP_CERTIFIED_ROUND,
+            ));
+        }
+
+        // Load the predecessor macroblock — required for `previous_hash`
+        // and `state_root` linkage. If it is missing locally we cannot
+        // produce a deterministic skip marker for this slot; fall through
+        // to the caller which will report the failure to the operator.
+        let prev_macroblock = match storage
+            .get_macroblock_by_height(mb_idx - 1)
+            .map_err(|e| format!("prev_macroblock_load_err mb={} err={:?}", mb_idx - 1, e))?
+        {
+            Some(bytes) => bincode::deserialize::<qnet_state::MacroBlock>(&bytes)
+                .map_err(|e| format!("prev_macroblock_deserialize_err mb={} err={}", mb_idx - 1, e))?,
+            None => {
+                return Err(format!(
+                    "skip_marker_refused mb={} reason=prev_macroblock_missing prev={}",
+                    mb_idx, mb_idx - 1,
+                ));
+            }
+        };
+
+        let previous_hash = prev_macroblock.hash();
+        let state_root = prev_macroblock.state_root;
+
+        // Pull the boundary microblock for deterministic header fields.
+        // Same boundary microblock on every honest node yields identical
+        // timestamp / poh_hash / poh_count, which keeps the macroblock
+        // hash byte-for-byte identical across the cohort.
+        let boundary = match storage
+            .load_microblock_auto_format(end_height)
+            .map_err(|e| format!("boundary_microblock_load_err h={} err={:?}", end_height, e))?
+        {
+            Some(mb) => mb,
+            None => {
+                return Err(format!(
+                    "skip_marker_refused mb={} reason=boundary_microblock_missing h={}",
+                    mb_idx, end_height,
+                ));
+            }
+        };
+
+        // Collect microblock hashes for the skipped epoch. Iterating in
+        // canonical order keeps the resulting vec byte-stable across
+        // nodes. A missing microblock here is a separate sync issue —
+        // we refuse to build the skip marker rather than emit a partial
+        // record (which would break `validate()` invariants downstream).
+        let mut micro_block_hashes: Vec<[u8; 32]> = Vec::with_capacity(
+            (end_height - start_height + 1) as usize,
+        );
+        for h in start_height..=end_height {
+            let block = match storage
+                .load_microblock_auto_format(h)
+                .map_err(|e| format!("microblock_load_err h={} err={:?}", h, e))?
+            {
+                Some(b) => b,
+                None => {
+                    return Err(format!(
+                        "skip_marker_refused mb={} reason=microblock_missing h={}",
+                        mb_idx, h,
+                    ));
+                }
+            };
+            micro_block_hashes.push(block.hash());
+        }
+
+        // Serialise the certificate into the skip-marker payload. Each
+        // honest node may carry a slightly different aggregated vote set,
+        // but the macroblock hash is independent of these bytes (see
+        // `MacroBlock::hash()` — it covers only header fields and the
+        // micro_blocks vec).
+        let skip_certificate_bytes = bincode::serialize(&cert)
+            .map_err(|e| format!("skip_certificate_serialize_err mb={} err={}", mb_idx, e))?;
+
+        let consensus_data = qnet_state::ConsensusData {
+            // No commit/reveal evidence — that is what a skip marker
+            // records: the canonical path failed to gather it.
+            commits: std::collections::HashMap::new(),
+            reveals: std::collections::HashMap::new(),
+            next_leader: String::new(),
+            // Skip-marker flag and certificate.
+            is_skip_marker: true,
+            skip_certificate: Some(skip_certificate_bytes),
+            // Every other ConsensusData field falls back to its Default
+            // because no state mutations are processed for a skipped epoch.
+            ..Default::default()
+        };
+
+        Ok(qnet_state::MacroBlock {
+            height: mb_idx,
+            timestamp: boundary.timestamp,
+            micro_blocks: micro_block_hashes,
+            state_root,
+            consensus_data,
+            previous_hash,
+            poh_hash: boundary.poh_hash.clone(),
+            poh_count: boundary.poh_count,
+        })
+    }
+
     /// PRODUCTION v2.35: Participate in macroblock consensus with ROUND-BASED FAILOVER
-    /// 
+    ///
     /// ARCHITECTURE:
     /// 1. Participate in COMMIT phase (send our commit)
     /// 2. Participate in REVEAL phase (send our reveal)
@@ -25687,6 +25879,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         node_id: &str,
         node_type: NodeType,
         consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ConsensusMessage>>>>,
+        // v15.7: Required for the fallback-initiator path. When the primary
+        // initiator fails to produce the macroblock and broadcast does not
+        // arrive within the view-change window, every honest participant has
+        // identical commit/reveal evidence and can deterministically take
+        // over the initiator role. Routing the state and reward managers
+        // here lets the fallback path drive `trigger_macroblock_consensus`
+        // — the same construction pipeline the primary initiator uses,
+        // including emission processing for emission-boundary macroblocks.
+        state_manager: Arc<RwLock<StateManager>>,
+        reward_manager: Arc<RwLock<qnet_consensus::PhaseAwareRewardManager>>,
     ) -> Result<(), String> {
         let macroblock_index = end_height / 90;
         
@@ -25936,20 +26138,242 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             iter_guard += 1;
         }
         
-        // All rounds exhausted - try sync as last resort
-        println!("[ERR][MB_PART] all_rounds_failed mb={} action=sync", macroblock_index);
+        // All view-change rounds exhausted — attempt sync first, then fall back
+        // to a deterministic local-initiator protocol.
+        println!("[ERR][MB_PART] all_rounds_failed mb={} action=sync_then_fallback", macroblock_index);
         if let Err(e) = p2p.sync_macroblocks(macroblock_index, macroblock_index).await {
             println!("[WARN][MB_PART] sync_failed err={}", e);
         }
-        
-        // Final check
+
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         if storage.get_macroblock_by_height(macroblock_index).ok().flatten().is_some() {
             if is_info() { println!("[INFO][MB_PART] received mb={} via=sync", macroblock_index); }
             return Ok(());
         }
-        
-        Err(format!("mb={} all_rounds_failed max={}", macroblock_index, MAX_ROUNDS))
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // v15.7: FALLBACK-INITIATOR PROTOCOL — every honest participant can
+        // assume the initiator role when the primary path fails to produce a
+        // macroblock for this index.
+        //
+        // Why this is canonical for our two-layer consensus
+        // ─────────────────────────────────────────────────────────────────────
+        // Every node in the participant set ran the same commit and reveal
+        // phases against the same end-height boundary. Once 2f+1 reveals were
+        // observed locally, this node holds *exactly* the evidence the chosen
+        // initiator would have used, so it can construct the same canonical
+        // macroblock independently. The single-initiator design is an
+        // optimisation, not a safety property — when it stalls, the safety
+        // property remains intact and every participant can deterministically
+        // resume progress on its own.
+        //
+        // Race-free convergence
+        // ─────────────────────────────────────────────────────────────────────
+        // Without ordering, all participants would race to build and broadcast
+        // the same macroblock, wasting bandwidth and producing transient
+        // log-noise. We sort the participant set by node_id and offset the
+        // fallback attempt by `our_rank * FALLBACK_GRACE_PER_RANK` seconds.
+        // The lowest-ranked active participant goes first; every higher rank
+        // re-checks storage on wake and short-circuits if the lower rank
+        // already produced and broadcast the macroblock. Convergence is at
+        // most a single canonical macroblock per index because
+        // `trigger_macroblock_consensus` short-circuits on a storage hit at
+        // its top.
+        //
+        // Bound on recovery time
+        // ─────────────────────────────────────────────────────────────────────
+        // For N participants the worst-case recovery is `(N-1) *
+        // FALLBACK_GRACE_PER_RANK` seconds when every lower-ranked node is
+        // unhealthy — same as a sequential fail-over. With FALLBACK_GRACE = 5s
+        // and committee size = 1000 this caps at ~83 minutes; in practice
+        // the first one or two ranks succeed within seconds.
+        //
+        // Scalability
+        // ─────────────────────────────────────────────────────────────────────
+        // Each rank performs at most one trigger attempt; one trigger fully
+        // builds and broadcasts the macroblock for every participant to fetch.
+        // No new state, no new synchronisation primitives — just a sorted
+        // participant list and a `tokio::time::sleep`. Safe at any committee
+        // size.
+        // ═══════════════════════════════════════════════════════════════════════
+        let mut sorted_participants: Vec<String> = all_participants.clone();
+        sorted_participants.sort();
+        let our_rank = sorted_participants
+            .iter()
+            .position(|id| id == node_id)
+            .unwrap_or(usize::MAX);
+
+        if our_rank == usize::MAX {
+            return Err(format!(
+                "mb={} not_in_participants — fallback_init unavailable",
+                macroblock_index,
+            ));
+        }
+
+        // 5 seconds per rank — enough for the lower-ranked node to drive a
+        // trigger pipeline (commit + reveal + finalize + save + broadcast)
+        // that typically completes within 3–4 seconds on healthy nodes.
+        const FALLBACK_GRACE_PER_RANK_MS: u64 = 5_000;
+        let fallback_delay = std::time::Duration::from_millis(
+            (our_rank as u64).saturating_mul(FALLBACK_GRACE_PER_RANK_MS),
+        );
+
+        if is_info() {
+            println!(
+                "[INFO][MB_PART] fallback_init_wait mb={} our_rank={} delay_ms={} participants={}",
+                macroblock_index,
+                our_rank,
+                fallback_delay.as_millis(),
+                sorted_participants.len(),
+            );
+        }
+
+        tokio::time::sleep(fallback_delay).await;
+
+        // Re-check storage after the rank-based delay — a lower-ranked node
+        // may have already taken the initiator role and broadcast the result.
+        if storage.get_macroblock_by_height(macroblock_index).ok().flatten().is_some() {
+            if is_info() {
+                println!(
+                    "[INFO][MB_PART] fallback_init_skip mb={} reason=lower_rank_already_produced",
+                    macroblock_index,
+                );
+            }
+            return Ok(());
+        }
+
+        println!(
+            "[WARN][MB_PART] fallback_init_take_over mb={} our_rank={}",
+            macroblock_index, our_rank,
+        );
+
+        match Self::trigger_macroblock_consensus(
+            storage.clone(),
+            consensus.clone(),
+            start_height,
+            end_height,
+            p2p,
+            node_id,
+            node_type,
+            consensus_rx,
+            state_manager,
+            reward_manager,
+        ).await {
+            Ok(_) => {
+                if is_info() {
+                    println!("[INFO][MB_PART] fallback_init_ok mb={}", macroblock_index);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                // Trigger may have failed because another node finished first
+                // and saved the macroblock — verify storage one more time.
+                if storage.get_macroblock_by_height(macroblock_index).ok().flatten().is_some() {
+                    if is_info() {
+                        println!(
+                            "[INFO][MB_PART] fallback_init_race_won_by_peer mb={}",
+                            macroblock_index,
+                        );
+                    }
+                    return Ok(());
+                }
+                println!(
+                    "[ERR][MB_PART] fallback_init_failed mb={} err={}",
+                    macroblock_index, e,
+                );
+                // Fall through to the skip-marker path below — the canonical
+                // protocol AND every fallback initiator have demonstrably
+                // failed for this index, but the chain still needs an
+                // on-chain record to preserve `previous_hash` linkage.
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // v15.7: SKIP-MARKER LAST-RESORT PATH
+        // ═══════════════════════════════════════════════════════════════════════
+        // At this point the canonical consensus path AND every deterministic
+        // fallback-initiator attempt have failed to produce a macroblock for
+        // `macroblock_index`. The network has, however, gathered ≥ 2f+1
+        // Dilithium3-signed view-change votes at the maximum round (the
+        // pacemaker has stored an AggregatedTimeoutCertificate for this
+        // index). That certificate is the cryptographic proof that
+        // consensus genuinely failed, and it is sufficient evidence to seal
+        // the index with a skip-marker macroblock so that the next
+        // macroblock's `previous_hash` linkage is well-defined.
+        //
+        // Each honest node deterministically computes the same skip-marker
+        // header fields (height, timestamp from boundary microblock,
+        // previous_hash, state_root from prev macroblock, micro_blocks vec).
+        // `MacroBlock::hash()` does not include consensus_data, so even when
+        // the embedded skip_certificate bytes differ across nodes (each
+        // local pacemaker may aggregate a slightly different vote subset),
+        // the macroblock hash itself is byte-stable across the cohort.
+        //
+        // After save we broadcast the skip marker so peers that did not
+        // independently construct it can pick it up via the regular
+        // macroblock receive path (which validates the embedded
+        // certificate via `verify_skip_certificate_bytes`).
+        // ═══════════════════════════════════════════════════════════════════════
+        match Self::build_skip_marker_macroblock(
+            &storage,
+            p2p,
+            macroblock_index,
+            start_height,
+            end_height,
+        ).await {
+            Ok(skip_macroblock) => {
+                let serialized = match bincode::serialize(&skip_macroblock) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Err(format!(
+                            "mb={} skip_marker_serialize_err: {}",
+                            macroblock_index, e,
+                        ));
+                    }
+                };
+
+                match storage.save_macroblock(macroblock_index, &skip_macroblock).await {
+                    Ok(_) => {
+                        println!(
+                            "[CRIT][MB_PART] skip_marker_saved mb={} h={}-{} certified_round=>=8 reason=consensus_failed_after_fallback",
+                            macroblock_index, start_height, end_height,
+                        );
+
+                        // Broadcast so peers that did not independently
+                        // construct the skip marker can adopt it via their
+                        // macroblock receive path. Compression is matched to
+                        // the regular broadcast path so peers process either
+                        // payload format the same way.
+                        let compressed = zstd::encode_all(&serialized[..], 3)
+                            .unwrap_or_else(|_| serialized.clone());
+                        let epoch = macroblock_index;
+                        if let Err(e) = p2p.broadcast_macroblock(macroblock_index, compressed, epoch).await {
+                            if is_warn() {
+                                println!(
+                                    "[WARN][MB_PART] skip_marker_broadcast_failed mb={} err={}",
+                                    macroblock_index, e,
+                                );
+                            }
+                        }
+
+                        Ok(())
+                    }
+                    Err(e) => Err(format!(
+                        "mb={} skip_marker_save_err: {:?}",
+                        macroblock_index, e,
+                    )),
+                }
+            }
+            Err(e) => {
+                // Skip-marker construction itself failed — surface to the
+                // outer task so the consensus retry loop is allowed to try
+                // again on the next tick.
+                Err(format!(
+                    "mb={} all_rounds_failed AND fallback_init_failed AND skip_marker_unavailable: {}",
+                    macroblock_index, e,
+                ))
+            }
+        }
     }
     
     async fn trigger_macroblock_consensus(
@@ -26848,6 +27272,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         }
                     }
                 },
+                // v15.7: skip-marker fields — explicitly false / None for the
+                // canonical commit-reveal path. Skip-marker macroblocks are
+                // produced exclusively by `build_skip_marker_macroblock` in
+                // the fallback path; the live finalization path here always
+                // emits regular macroblocks backed by 2f+1 reveals.
+                is_skip_marker: false,
+                skip_certificate: None,
             },
             previous_hash: previous_macroblock_hash,
             poh_hash: poh_hash.to_vec(),
@@ -29134,6 +29565,83 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             )));
         }
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // SKIP-MARKER MACROBLOCK ACCEPTANCE PATH (v15.7)
+        // ═══════════════════════════════════════════════════════════════════════
+        // Skip-marker macroblocks substitute the commit-reveal evidence with a
+        // 2f+1-signed AggregatedTimeoutCertificate carried in
+        // `consensus_data.skip_certificate`. They are produced only when both
+        // the canonical commit-reveal path and every deterministic
+        // fallback-initiator attempt have failed for this index, AND the
+        // local pacemaker has stored a TimeoutCertificate at the maximum
+        // view-change round.
+        //
+        // Validation strategy
+        //   1. Refuse if `is_skip_marker == true` but `skip_certificate` is
+        //      missing — the certificate is the proof, no proof = invalid.
+        //   2. Re-verify every signature in the certificate against the
+        //      active validator set (`SimplifiedP2P::verify_skip_certificate_bytes`).
+        //      The same Dilithium3 verification used for live timeout
+        //      certificates is reused here, so a Byzantine peer cannot
+        //      fabricate a skip marker by reusing or forging signatures.
+        //   3. Bypass the structural commits/reveals envelope checks below —
+        //      a valid skip marker carries empty commits and reveals by
+        //      construction (see `build_skip_marker_macroblock`).
+        //
+        // Once the certificate verifies, fall through to the standard save
+        // path further down (the regular code already saves to storage,
+        // updates finality only when constituent microblocks are present,
+        // and applies the reputation snapshot). Skip markers carry no
+        // reputation snapshot, so the conditional snapshot apply naturally
+        // becomes a no-op.
+        //
+        // Scalability: signature verification is parallelised through
+        // rayon inside `verify_skip_certificate_bytes`, so this scales with
+        // the active committee size at the same cost profile as live TC
+        // verification on the timeout-vote hot path.
+        // ═══════════════════════════════════════════════════════════════════════
+        if macroblock.consensus_data.is_skip_marker {
+            let cert_bytes = match macroblock.consensus_data.skip_certificate.as_ref() {
+                Some(b) => b,
+                None => {
+                    return Err(QNetError::ValidationError(format!(
+                        "skip_marker_missing_certificate mb={}", index,
+                    )));
+                }
+            };
+
+            // The minimum certified round mirrors the value used by
+            // `build_skip_marker_macroblock`: the participant path drives
+            // exactly MAX_VIEW_CHANGE_ROUNDS=8 view-change rounds before
+            // entering the skip path, and the certificate cannot have
+            // accumulated 2f+1 votes at a round below that ceiling without
+            // 2f+1 honest validators corroborating the failure.
+            const MIN_SKIP_CERTIFIED_ROUND: u64 = 8;
+
+            if let Some(p2p) = self.unified_p2p.as_ref() {
+                if !p2p.verify_skip_certificate_bytes(cert_bytes, index, MIN_SKIP_CERTIFIED_ROUND) {
+                    return Err(QNetError::ValidationError(format!(
+                        "skip_marker_certificate_invalid mb={}", index,
+                    )));
+                }
+            } else {
+                // P2P handle absent (very early bootstrap before mainloop is
+                // up) — refuse to accept a skip marker until the verifier is
+                // available. Caller will retry on the next sync attempt.
+                return Err(QNetError::ValidationError(format!(
+                    "skip_marker_p2p_unavailable mb={}", index,
+                )));
+            }
+
+            if is_info() {
+                println!(
+                    "[INFO][SKIP] verified mb={} from={} action=accept_save",
+                    index, received.from_peer,
+                );
+            }
+            // Fall through to the regular save path below.
+        }
+
         // v14.8: Structural validation of consensus_data.commits / reveals.
         //
         // The on-wire representation of commits/reveals is a bare byte blob keyed by
@@ -29159,7 +29667,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // gate — genuine finality still flows from the live commit/reveal
         // path in unified_p2p (which DOES verify every signature), and from
         // the 2f+1 threshold being met before a macroblock gets produced.
-        {
+        //
+        // v15.7: Skip-marker macroblocks bypass this structural validation
+        // — they carry no commits/reveals by design. The certificate the
+        // skip marker carries was already verified above (2f+1 Dilithium3
+        // signatures over view-change votes), which is the equivalent
+        // BFT-supermajority gate.
+        if !macroblock.consensus_data.is_skip_marker {
             let commits = &macroblock.consensus_data.commits;
             let reveals = &macroblock.consensus_data.reveals;
 
