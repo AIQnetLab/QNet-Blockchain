@@ -1732,6 +1732,17 @@ impl BlockPipeline {
                 }
                 match save_result {
                     Ok(()) => {
+                        // v15.11: Record finalized round so the next height in
+                        // this macroblock starts with a clean baseline. Mirrors
+                        // the producer-side recording — every honest validator
+                        // applying the same block records the same baseline,
+                        // keeping per-mb effective rounds in sync across the
+                        // committee.
+                        crate::unified_p2p::record_finalized_round(
+                            height / 90,
+                            block.microblock.timeout_round,
+                        );
+
                         // v15.6: chain-height bump on the blocking pool too —
                         // it is an atomic CF write but pays the same compaction
                         // queue penalty as the block save above.
