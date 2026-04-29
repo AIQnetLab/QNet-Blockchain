@@ -918,13 +918,17 @@ mod tests {
         let mut state = DeterministicReputationState::new();
         state.init_genesis_nodes(&["genesis_001".to_string()]);
         
-        // Process 30 blocks (one rotation)
-        for height in 1..=30 {
+        // Process 30 blocks (one rotation). `blocks_in_rotation`
+        // increments with each block in the producer's current
+        // rotation; reaching 30 marks a completed full rotation
+        // and triggers the canonical reward path checked below.
+        for height in 1..=30u32 {
             state.process_block(&BlockData {
-                height,
+                height: height as u64,
                 producer: "genesis_001".to_string(),
-                timestamp: height,
+                timestamp: height as u64,
                 is_valid: true,
+                blocks_in_rotation: height,
             });
         }
         

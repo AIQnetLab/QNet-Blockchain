@@ -1532,6 +1532,57 @@ impl BlockPipeline {
             // v15.4 DIAG: mark state-lock acquisition. If a competing
             // writer holds the state RwLock for an extended period
             // (e.g., a slow snapshot operation in BlockchainNode), this
+            // ────────────────────────────────────────────────────────────────
+            // v15.10 STAGE-2: PRE-WARM ACCOUNT CACHE
+            // ────────────────────────────────────────────────────────────────
+            // Before we acquire the state write lock and start mutating
+            // accounts, walk the block's transactions and ensure every
+            // address the apply path will touch is resident in the
+            // in-memory account map. Addresses that are already cached
+            // get a refreshed `last_access` timestamp; cold addresses
+            // are loaded from disk via the `AccountStore` fallback (read
+            // path is lock-free and concurrent-safe).
+            //
+            // Rationale: with a bounded cache, the apply path's
+            // `accounts.get_mut(from)` would fail for any cold sender
+            // address. Pre-warming under a READ lock guarantees the
+            // working set is resident at the moment the WRITE lock is
+            // taken, while keeping the disk-read latency outside the
+            // critical section.
+            //
+            // Cost (typical block, ~100-1000 TX):
+            //   * ≤ 2 × tx_count point reads on the `accounts` CF
+            //   * RocksDB SSD ~50-100 µs per read
+            //   * ≤ 100 ms total — runs concurrent with other apply
+            //     paths (reader lock allows fan-out).
+            // ────────────────────────────────────────────────────────────────
+            {
+                use std::collections::HashSet;
+                let mut warm_set: HashSet<String> = HashSet::new();
+                for tx in &block.microblock.transactions {
+                    if !tx.from.is_empty() {
+                        warm_set.insert(tx.from.clone());
+                    }
+                    if let qnet_state::TransactionType::Transfer { to, .. } = &tx.tx_type {
+                        if !to.is_empty() {
+                            warm_set.insert(to.clone());
+                        }
+                    }
+                }
+                if !warm_set.is_empty() {
+                    let warm_vec: Vec<String> = warm_set.into_iter().collect();
+                    let sg_warm = ctx.state.read().await;
+                    let hit = sg_warm.warm_accounts(&warm_vec);
+                    drop(sg_warm);
+                    if is_debug() {
+                        println!(
+                            "[DBG][PIPELINE] account_warm h={} requested={} resident={}",
+                            height, warm_vec.len(), hit,
+                        );
+                    }
+                }
+            }
+
             // op will be the stuck point.
             metrics.mark_apply_op(height, PIPELINE_OP_APPLY_STATE_LOCK);
             let lock_start = std::time::Instant::now();
@@ -1766,6 +1817,132 @@ impl BlockPipeline {
                             }
                         }
 
+                        // ═══════════════════════════════════════════════════════════════
+                        // v15.10: Cross-shard 2PC apply hook removed.
+                        // Architectural decision: QNet stays single-shard for the
+                        // foreseeable future. Sharding scaffolding remains as
+                        // dormant scaffolding in `qnet_consensus::cross_shard` and
+                        // `qnet_consensus::sharded_consensus` modules — the
+                        // primitives are tested and ready, but the apply path no
+                        // longer touches them and the wire-format `CrossShard*`
+                        // transaction variants have been removed from
+                        // `TransactionType` to prevent any accidental
+                        // activation. See `qnet-sharding/lib.rs` module header
+                        // for the full rationale.
+                        // ═══════════════════════════════════════════════════════════════
+
+                        // ═══════════════════════════════════════════════════════════
+                        // v15.9: WRITE-THROUGH ACCOUNT PERSISTENCE (Stage 1)
+                        // ───────────────────────────────────────────────────────────
+                        // Mirror every account that this block mutated into the
+                        // persistent `accounts` column family. The mutation set is
+                        // sourced from the `BlockSnapshot` journal, which already
+                        // tracks every address touched by the block (modified
+                        // pre-images + freshly created keys). For each address we
+                        // re-read the post-image from the in-memory map and stage
+                        // it into a single `WriteBatch` committed atomically on
+                        // the blocking thread pool.
+                        //
+                        // CRASH SAFETY
+                        // ───────────────────────────────────────────────────────────
+                        // After this commit returns, a node that crashes can
+                        // restart with a durable copy of every account at this
+                        // block's height. Together with `set_chain_height`
+                        // (already persisted above) this gives the runtime an
+                        // on-disk source-of-truth for state at every committed
+                        // block — no more "lost mutations between snapshots"
+                        // when an unexpected restart hits the production node.
+                        //
+                        // Skipped when `block_snapshot` is None (genesis-window
+                        // blocks without state_root verification) — there is no
+                        // mutation set to persist in that case.
+                        //
+                        // SCALABILITY (1 000+ super nodes)
+                        // ───────────────────────────────────────────────────────────
+                        // Cost: one batch put per touched account per block.
+                        // Typical block touches ≤ 100 accounts × ~150 B = ~15 KB
+                        // committed atomically — single-digit millisecond on
+                        // commodity SSDs. Runs on the blocking pool so the
+                        // tokio reactor stays free for consensus / P2P / RPC.
+                        if let Some(ref snapshot) = block_snapshot {
+                            let mut modified: Vec<(String, qnet_state::Account)> =
+                                Vec::with_capacity(snapshot.accounts().len() + snapshot.created_keys().len());
+                            let mut deleted: Vec<String> = Vec::new();
+
+                            // Modified addresses: pre-image existed; check if
+                            // the post-image still exists (it might have been
+                            // removed entirely if the apply path deletes
+                            // accounts in some flow).
+                            for addr in snapshot.accounts().keys() {
+                                match state_guard.accounts.get(addr) {
+                                    Some(entry) => {
+                                        modified.push((addr.clone(), entry.value().clone()));
+                                    }
+                                    None => {
+                                        deleted.push(addr.clone());
+                                    }
+                                }
+                            }
+                            // Created addresses: pre-image did NOT exist; just
+                            // capture the post-image. (If the apply created
+                            // and then immediately removed an account in the
+                            // same block, it is already absent from the map
+                            // and we skip the put.)
+                            for addr in snapshot.created_keys() {
+                                if let Some(entry) = state_guard.accounts.get(addr) {
+                                    modified.push((addr.clone(), entry.value().clone()));
+                                }
+                            }
+
+                            if !modified.is_empty() || !deleted.is_empty() {
+                                // ───────────────────────────────────────────────
+                                // Persist in the BACKGROUND so we never await on
+                                // RocksDB while still holding `state_guard`.
+                                // Holding the state write lock across an async
+                                // I/O would serialise the entire apply pipeline
+                                // behind disk latency — exactly the failure mode
+                                // Fix #2 was introduced to avoid. The spawned
+                                // task takes ownership of the modified/deleted
+                                // buffers and an Arc<Storage> clone; it cannot
+                                // outlive the runtime, and a logged failure is
+                                // recoverable via microblock replay (the
+                                // canonical Stage-1 invariant: account CF is
+                                // best-effort, microblocks are authoritative).
+                                // ───────────────────────────────────────────────
+                                let storage_for_persist = ctx.storage.clone();
+                                let height_for_persist = height;
+                                let modified_count = modified.len();
+                                let deleted_count = deleted.len();
+                                tokio::spawn(async move {
+                                    let persist_start = std::time::Instant::now();
+                                    match storage_for_persist
+                                        .persist_accounts_batch(modified, deleted)
+                                        .await
+                                    {
+                                        Ok((puts, dels)) => {
+                                            let elapsed = persist_start.elapsed();
+                                            if elapsed > std::time::Duration::from_millis(200) {
+                                                if is_warn() {
+                                                    println!(
+                                                        "[WARN][PIPELINE] slow_persist_accounts h={} puts={} dels={} elapsed_ms={}",
+                                                        height_for_persist, puts, dels, elapsed.as_millis(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            if is_warn() {
+                                                println!(
+                                                    "[WARN][PIPELINE] persist_accounts_failed h={} puts={} dels={} err={:?}",
+                                                    height_for_persist, modified_count, deleted_count, e,
+                                                );
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+
                         true // success
                     }
                     Err(e) => {
@@ -1910,6 +2087,155 @@ impl BlockPipeline {
                         p2p.request_timeout_proofs(mb_idx, mb_idx);
                     }
                 }
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // v15.9: COMMITTEE-WIDE SNAPSHOT CREATION (deterministic apply-stage trigger)
+            //
+            // Every honest node materialises the canonical snapshot at every
+            // `SNAPSHOT_INCREMENTAL_INTERVAL` boundary so that:
+            //   * fresh nodes can chunked-parallel-download from any of the
+            //     N committee members, not just the producer;
+            //   * the macroblock `snapshot_root` consensus binding has a
+            //     byte-identical artefact to hash on every honest node;
+            //   * the rollback-reconciliation path can deterministically
+            //     find a snapshot ≤ any rollback target.
+            //
+            // SOURCE OF TRUTH — IN-MEMORY STATE (not RocksDB accounts CF)
+            // ────────────────────────────────────────────────────────────────
+            // Earlier revisions delegated to `Storage::create_incremental_snapshot`,
+            // which iterated the persistent `accounts` column family. That CF
+            // is only ever written during snapshot RESTORE (boot-time / sync),
+            // never during runtime block apply, so it carried whatever data
+            // the last bootstrap restored — completely disconnected from the
+            // current chain tip. The resulting snapshots were either empty
+            // (on a fresh node) or stale (post-restart), and the
+            // `snapshot_root` binding hashed those bad bytes.
+            //
+            // The fix: serialise from `state.accounts` (the in-memory
+            // `Arc<DashMap>` that every block-apply path mutates), the same
+            // source the emission-rewards path uses (node.rs:27680+). This
+            // is the canonical runtime view of account state.
+            //
+            // CANONICAL ENCODING
+            // ────────────────────────────────────────────────────────────────
+            // DashMap iteration order is shard-dependent and varies node-to-
+            // node even with identical content. We sort by account address
+            // before bincode-serialising so every honest node produces the
+            // SAME bytes — without this the SHA3-256 in `snapshot_root`
+            // would diverge across the committee and the supermajority
+            // binding could never converge.
+            //
+            // OFF-REACTOR EXECUTION
+            // ────────────────────────────────────────────────────────────────
+            // At 1 M+ accounts the iterate+clone+sort+serialise+zstd path
+            // takes seconds and 100s of MB of working memory. We spawn it
+            // on the tokio blocking pool with a strong `Arc` to the
+            // accounts map; the apply pipeline returns immediately and the
+            // next block can be processed while the snapshot writes in the
+            // background. A failure is logged at WARN level — never blocks
+            // consensus liveness.
+            //
+            // SCALABILITY (1 000+ super nodes)
+            // ────────────────────────────────────────────────────────────────
+            // Per-block overhead is a single integer modulus check; the
+            // heavy work fires once every 3 600 blocks (~1 hour). Each node
+            // performs identical work — total network cost is unchanged
+            // versus the producer-only model, the artefact is simply
+            // replicated to every committee member.
+            // ────────────────────────────────────────────────────────────────
+            const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
+            if height > 0 && height % SNAPSHOT_INCREMENTAL_INTERVAL == 0 {
+                let storage_for_snapshot = ctx.storage.clone();
+                let state_for_snapshot = ctx.state.clone();
+                let snapshot_height = height;
+                tokio::spawn(async move {
+                    let start = std::time::Instant::now();
+
+                    // Read the in-memory state under a brief read lock to
+                    // capture: (a) a strong handle to the accounts map,
+                    // (b) the current state_root, (c) the current
+                    // total_supply. We drop the lock before the heavy
+                    // serialise step so block apply is not blocked.
+                    let (accounts_arc, state_root, total_supply) = {
+                        let sg = state_for_snapshot.read().await;
+                        let accounts_arc = sg.accounts.clone();
+                        let state_root = sg.calculate_state_root().unwrap_or([0u8; 32]);
+                        let total_supply = sg.chain_state.read().total_supply;
+                        (accounts_arc, state_root, total_supply)
+                    };
+
+                    // Heavy work: iterate DashMap, clone, sort, bincode.
+                    // Lives on the blocking thread pool so the reactor
+                    // stays free; the closure consumes `accounts_arc` so
+                    // no shared-state hazards remain after spawn.
+                    let serialise_result = tokio::task::spawn_blocking(move || {
+                        let mut accounts: Vec<(String, qnet_state::Account)> = accounts_arc
+                            .iter()
+                            .map(|e| (e.key().clone(), e.value().clone()))
+                            .collect();
+                        accounts.sort_by(|a, b| a.0.cmp(&b.0));
+                        bincode::serialize(&accounts)
+                    }).await;
+
+                    let state_data = match serialise_result {
+                        Ok(Ok(data)) => data,
+                        Ok(Err(e)) => {
+                            if is_warn() {
+                                println!(
+                                    "[WARN][PIPELINE] snapshot_serialize_fail h={} err={}",
+                                    snapshot_height, e,
+                                );
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            if is_warn() {
+                                println!(
+                                    "[WARN][PIPELINE] snapshot_join_fail h={} err={:?}",
+                                    snapshot_height, e,
+                                );
+                            }
+                            return;
+                        }
+                    };
+
+                    if state_data.is_empty() {
+                        // Genesis-window or pre-state node — nothing to bind.
+                        return;
+                    }
+
+                    // Write the canonical snapshot artefact. `save_state_snapshot`
+                    // wraps zstd-15 + integrity hash + atomic batch write —
+                    // already off-reactor (Fix #2 spawn_blocking).
+                    match storage_for_snapshot
+                        .save_state_snapshot(
+                            snapshot_height,
+                            state_root,
+                            total_supply,
+                            state_data,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            if is_info() {
+                                println!(
+                                    "[INFO][PIPELINE] snapshot_created h={} elapsed_ms={} source=apply_stage",
+                                    snapshot_height,
+                                    start.elapsed().as_millis(),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if is_warn() {
+                                println!(
+                                    "[WARN][PIPELINE] snapshot_save_failed h={} err={:?}",
+                                    snapshot_height, e,
+                                );
+                            }
+                        }
+                    }
+                });
             }
 
             // ────────────────────────────────────────────────────────────────

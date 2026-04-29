@@ -1385,6 +1385,10 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_chunk);
 
+    // v15.10: Cross-shard RPC endpoint removed — sharding deactivated.
+    // The dormant scaffolding lives in `qnet_consensus::cross_shard`
+    // for future re-activation if the architectural decision changes.
+
     // Transaction endpoints with IP-based rate limiting
     // SECURITY: Limit transaction body to 64KB (typical TX is <1KB)
     let transaction_submit = api_v1

@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use blake3::Hasher;
 use sha3::{Sha3_256, Digest};
+use hex;
 use crate::errors::StateResult;
 use crate::StateError;
 use std::collections::HashMap;
@@ -1272,7 +1273,7 @@ impl Transaction {
 
         Ok(())
     }
-    
+
     /// Apply transaction to state
     pub fn apply_to_state(&self, accounts: &mut HashMap<String, Account>) -> Result<(), StateError> {
         // SECURITY: Out-of-gas check — reject TX if compute_gas_used() > gas_limit

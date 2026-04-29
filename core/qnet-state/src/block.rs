@@ -328,6 +328,51 @@ pub struct ConsensusData {
     /// Required iff `is_skip_marker == true`. None for regular macroblocks.
     #[serde(default)]
     pub skip_certificate: Option<Vec<u8>>,
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SNAPSHOT BINDING (v15.8) — cryptographic anchor for trust-less bootstrap
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Set by every honest node when constructing a macroblock whose end_height
+    // is a snapshot boundary (multiples of `SNAPSHOT_INCREMENTAL_INTERVAL` /
+    // `SNAPSHOT_FULL_INTERVAL` from the storage layer). The value is a
+    // SHA3-256 digest computed over the **canonical** byte representation
+    // of the snapshot artefact at this boundary — every committee member
+    // computes the same digest because:
+    //
+    //   1. each node materialises the snapshot deterministically through
+    //      the apply-stage trigger (every node, not just producer);
+    //   2. snapshot serialisation enforces canonical key ordering so that
+    //      different DashMap iteration orders cannot diverge on bytes.
+    //
+    // The macroblock's commit-reveal phase already gathers 2f+1 Dilithium3
+    // signatures over the macroblock content, which means after finalisation
+    // the `snapshot_root` is implicitly endorsed by the supermajority — no
+    // additional signing or aggregator infrastructure is required.
+    //
+    // A new node bootstrapping via snapshot sync now has a trust-less path:
+    //
+    //   * download snapshot bytes from peers via the chunked sync protocol;
+    //   * compute SHA3-256 of the canonical bytes locally;
+    //   * load the macroblock at the snapshot's boundary height (already
+    //     synchronised through normal block-sync earlier);
+    //   * compare the local digest to `consensus_data.snapshot_root`;
+    //   * accept the snapshot ONLY when the digests match — i.e. the
+    //     supermajority that finalised the macroblock attests to this
+    //     snapshot's content.
+    //
+    // Backward compat: defaulted to `None`, so historical macroblocks
+    // produced before this revision deserialise unchanged. Validation
+    // treats `None` the same as "no binding available" and falls back to
+    // a non-trust-less load (existing behaviour).
+    //
+    // Scalability: 32 bytes of additional macroblock payload, computed
+    // once per snapshot boundary (every 3 600 blocks ≈ 1h). Independent
+    // of validator count.
+    /// SHA3-256 digest of the canonical snapshot artefact at this macroblock's
+    /// end_height. Present only when this macroblock terminates a snapshot
+    /// interval boundary AND the local snapshot was successfully created.
+    #[serde(default)]
+    pub snapshot_root: Option<[u8; 32]>,
 }
 
 /// Eligible producer entry for epoch-based validator set

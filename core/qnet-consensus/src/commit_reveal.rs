@@ -1653,4 +1653,76 @@ impl CommitRevealConsensus {
         Some(selected_leader)
     }
 
-} 
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.10 STAGE-2B: SHARD-AWARE LEADER COMPUTATION
+    // ────────────────────────────────────────────────────────────────────────
+    // Wraps `compute_leader_for_round` with optional shard awareness. When
+    // the global `ShardCommitteeCache` carries an assignment for the
+    // requested epoch, the sub-committee for `shard_id` is consulted
+    // instead of the global participants list — every shard runs
+    // round-robin leader rotation INDEPENDENTLY within its own
+    // committee, which is the precondition for parallel per-shard
+    // microblock production once Stage-2B activates fully.
+    //
+    // FALLBACK PATH
+    // ────────────────────────────────────────────────────────────────────────
+    // When the cache holds no assignment (the canonical case before
+    // Stage-2B activation) OR the assignment carries `num_shards == 1`
+    // (single-shard configuration), the call delegates straight to
+    // `compute_leader_for_round` with the supplied global participants.
+    // This means call sites can adopt the shard-aware API today and
+    // get bit-for-bit identical behaviour to the legacy path until
+    // operators bump `num_shards`.
+    //
+    // VALIDATOR-ONLY PARTICIPANTS
+    // ────────────────────────────────────────────────────────────────────────
+    // The `participants` slice MUST contain only Genesis + Super node
+    // ids. Light wallets are HTTP-API clients, never validators, never
+    // appear here. The committee assignment honours the same invariant
+    // — see `assign_committees`.
+    //
+    // SCALABILITY (1 000+ super-node committees, 256 shards)
+    // ────────────────────────────────────────────────────────────────────────
+    // At the cap (1 000 validators ÷ 256 shards ≈ 4 validators per
+    // shard), per-shard sort + hash is sub-millisecond. The cache
+    // lookup is a single parking_lot RwLock read; no allocation on
+    // the hot path.
+    pub fn compute_shard_aware_leader_for_round(
+        &self,
+        height: u64,
+        round: u64,
+        shard_id: u32,
+        global_participants: &[String],
+        beacon: Option<&[u8; 32]>,
+    ) -> Option<String> {
+        // Try the shard-aware path: read the current assignment from
+        // the global cache. If unset OR num_shards == 1 OR no
+        // committee for this shard, fall through to the global
+        // round-robin path.
+        let cache = crate::sharded_consensus::ShardCommitteeCache::global();
+        if let Some(assignment) = cache.current() {
+            if assignment.num_shards > 1 {
+                if let Some(committee) = assignment.committee_for(shard_id) {
+                    return self.compute_leader_for_round(
+                        height,
+                        round,
+                        &committee.validators,
+                        beacon,
+                    );
+                }
+                // Cache has multi-shard assignment but no committee
+                // for the requested shard_id — log and fall through
+                // to the global path so liveness is preserved.
+                println!(
+                    "[WARN][CONS] shard_committee_missing shard_id={} num_shards={} fallback=global",
+                    shard_id, assignment.num_shards,
+                );
+            }
+        }
+
+        // Legacy / single-shard path — bit-identical to the pre-2B
+        // behaviour, every honest node arrives at the same leader
+        // through the global round-robin rotation.
+        self.compute_leader_for_round(height, round, global_participants, beacon)
+    }
+}

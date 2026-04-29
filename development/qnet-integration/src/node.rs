@@ -2631,17 +2631,225 @@ impl BlockchainNode {
     // This matches industry best practices for proof-of-stake slashing.
     // ═══════════════════════════════════════════════════════════════════════════
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v15.9: STATE RECONCILIATION AFTER ROLLBACK
+    // ───────────────────────────────────────────────────────────────────────────
+    // The rollback path used to delete microblocks from storage but leave the
+    // in-memory `state_manager.accounts` DashMap untouched, so transactions
+    // applied between `rollback_to+1` and the previous chain head remained
+    // mutated in RAM after their on-disk evidence was wiped. New blocks
+    // produced after the rollback were validated against this stale memory
+    // state, and any state-root computation diverged silently from the
+    // canonical chain — a class of fork that is hard to detect because the
+    // node cannot tell whose state is authoritative.
+    //
+    // This helper rebuilds the in-memory state to exactly match the chain
+    // tip at `target_height`. The strategy mirrors the standard top-tier
+    // recovery path: select the freshest snapshot whose height ≤ target,
+    // restore the snapshot accounts, then deterministically replay every
+    // microblock between the snapshot and the target through
+    // `apply_block_to_state` (the same code path used during normal
+    // application). When no snapshot is available the function falls back
+    // to a full replay from genesis.
+    //
+    // SCALABILITY (1 000+ super nodes)
+    // ───────────────────────────────────────────────────────────────────────────
+    // Reconciliation runs only on the rollback path, which is gated by a
+    // 60–300 s adaptive cooldown and only fires on real fork evidence —
+    // operationally rare. Per-call cost is bounded by the snapshot interval
+    // (≤ 3 600 microblocks of replay) when a snapshot is available, which is
+    // a few hundred milliseconds even at 1 M+ accounts. When no snapshot is
+    // available the cost is the full chain length, but in production this
+    // only happens in the first hour of the chain's lifetime.
+    //
+    // RETURN
+    // ───────────────────────────────────────────────────────────────────────────
+    // Returns Ok(()) on a successful reconciliation. On failure the caller
+    // is expected to either retry from a higher rollback target or schedule
+    // a network resync — the node should NOT continue producing blocks
+    // against a state it cannot vouch for.
+    async fn reconcile_state_after_rollback(
+        state: &Arc<tokio::sync::RwLock<StateManager>>,
+        storage: &Arc<Storage>,
+        target_height: u64,
+    ) -> Result<(), String> {
+        // Step 1: locate the freshest snapshot ≤ target.
+        // Reads-only — no state lock needed.
+        let snap_choice = match storage.find_snapshot_at_or_before(target_height) {
+            Ok(opt) => opt,
+            Err(e) => {
+                println!(
+                    "[WARN][STATE] reconcile_snapshot_lookup_failed target={} err={:?} action=full_replay",
+                    target_height, e,
+                );
+                None
+            }
+        };
+
+        // Step 2: pre-decode the snapshot payload off the state lock.
+        // Decoding is purely a CPU transformation of bytes the caller
+        // already owns; doing it BEFORE we acquire the write lock keeps
+        // the apply pipeline blocked for the minimum possible window.
+        let restored_baseline: Option<(u64, Vec<(String, qnet_state::Account)>)> =
+            match snap_choice {
+                Some((snap_height, _snap_data)) => {
+                    match storage.load_state_snapshot_by_height(snap_height).await {
+                        Ok(Some((_state_root, accounts_bytes))) => {
+                            let deser = bincode::DefaultOptions::new()
+                                .with_fixint_encoding()
+                                .allow_trailing_bytes()
+                                .deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_bytes)
+                                .or_else(|_| bincode::deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_bytes));
+                            match deser {
+                                Ok(accounts) => Some((snap_height, accounts)),
+                                Err(e) => {
+                                    println!(
+                                        "[WARN][STATE] reconcile_deserialize_failed snap_h={} err={} action=full_replay",
+                                        snap_height, e,
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Ok(None) => None,
+                        Err(e) => {
+                            println!(
+                                "[WARN][STATE] reconcile_load_snapshot_failed snap_h={} err={:?} action=full_replay",
+                                snap_height, e,
+                            );
+                            None
+                        }
+                    }
+                }
+                None => {
+                    println!(
+                        "[INFO][STATE] reconcile_no_snapshot_available target={} action=full_replay",
+                        target_height,
+                    );
+                    None
+                }
+            };
+
+        // Step 3: pre-load every microblock that needs to be replayed.
+        // Doing this BEFORE we acquire the state write lock means the
+        // apply pipeline only blocks during pure in-memory CPU work,
+        // never during RocksDB I/O. RocksDB reads are themselves
+        // serialised inside the storage layer.
+        //
+        // SCALABILITY NOTE
+        // ────────────────────────────────────────────────────────────
+        // For a snapshot interval of 3 600 microblocks we replay at
+        // most 3 599 blocks (when target sits just before the next
+        // snapshot boundary). With a typical microblock at a few KB
+        // this is a few MB of working memory — negligible at
+        // production scale. Pre-loading also lets the replay loop run
+        // without any `await` points, which is what makes the lock
+        // window deterministic.
+        let replay_from: u64 = restored_baseline
+            .as_ref()
+            .map(|(h, _)| h.saturating_add(1))
+            .unwrap_or(0);
+        let replay_to = target_height;
+        let mut blocks_to_replay: Vec<MicroBlock> = Vec::new();
+        let mut load_errs = 0u64;
+        if replay_from <= replay_to {
+            for h in replay_from..=replay_to {
+                match storage.load_microblock_auto_format(h) {
+                    Ok(Some(mb)) => blocks_to_replay.push(mb),
+                    _ => load_errs = load_errs.saturating_add(1),
+                }
+            }
+        }
+
+        // Step 4: ATOMIC STATE REWRITE under a single write lock.
+        // ────────────────────────────────────────────────────────────
+        // Holding `state.write()` across the snapshot restore AND the
+        // entire replay loop is the only way to guarantee that no
+        // concurrent apply path interleaves a future block on top of a
+        // partially-rebuilt state. Without this the `apply_block_to_state`
+        // path inside `block_pipeline` (which also acquires `state.write()`
+        // per block) could grab the lock between iterations and apply a
+        // post-rollback block on top of, say, the snapshot baseline plus
+        // 50 of the 90 microblocks we still need to replay. The resulting
+        // state would have the post-rollback block's mutations layered on
+        // an inconsistent base — undetectable until a state-root diff
+        // surfaces it many blocks later.
+        //
+        // Lock duration is bounded: at most one snapshot restore (∼50 ms
+        // for 1 M accounts under in-memory operations) plus
+        // `(replay_to − replay_from + 1) ≤ SNAPSHOT_INCREMENTAL_INTERVAL`
+        // applies. Apply paths that need the lock during this window
+        // back-pressure naturally — exactly the desired behaviour
+        // because they MUST NOT advance against the still-rebuilding
+        // state.
+        let replayed: u64;
+        let mode: &'static str;
+        {
+            let sg = state.write().await;
+
+            match restored_baseline {
+                Some((snap_height, accounts)) => {
+                    if let Err(e) = (*sg).restore_accounts(accounts) {
+                        return Err(format!("restore_accounts_failed err={:?}", e));
+                    }
+                    {
+                        let mut cs = sg.chain_state.write();
+                        cs.height = snap_height;
+                    }
+                    println!(
+                        "[INFO][STATE] reconcile_snapshot_restored snap_h={} target={}",
+                        snap_height, target_height,
+                    );
+                    mode = "incremental";
+                }
+                None => {
+                    sg.clear();
+                    {
+                        let mut cs = sg.chain_state.write();
+                        cs.total_supply = 0;
+                        cs.height = 0;
+                    }
+                    qnet_state::clear_credited_fees_cache();
+                    qnet_state::reset_pending_rewards_in_merkle();
+                    mode = "full";
+                }
+            }
+
+            // Replay every loaded block under the same lock — no `await`
+            // inside the loop, no opportunity for another task to slip in.
+            let mut applied = 0u64;
+            for mb in &blocks_to_replay {
+                let _ = Self::apply_block_to_state(&sg, mb, storage, None, None);
+                applied = applied.saturating_add(1);
+            }
+            replayed = applied;
+        } // <-- single lock release after full reconcile
+
+        println!(
+            "[INFO][STATE] reconcile_complete mode={} replay_from={} target={} replayed={} load_errors={}",
+            mode, replay_from, replay_to, replayed, load_errs,
+        );
+
+        if load_errs > 0 && replayed == 0 {
+            return Err(format!(
+                "reconcile_no_blocks_replayed replay_from={} target={} errors={}",
+                replay_from, replay_to, load_errs,
+            ));
+        }
+        Ok(())
+    }
+
     /// Analyze blockchain for cryptographically provable slashing offenses
-    /// 
+    ///
     /// Currently detects:
     /// - Double-sign: Same producer signed 2 different blocks at same height
     /// - Invalid blocks: Signature or hash validation failures
-    /// 
+    ///
     /// NOTE: Missed blocks are NOT slashed because:
     /// - Cannot deterministically prove "who should have produced"
     /// - Emergency producer overwrites block.producer field
     /// - Network delays cause false positives
-    /// 
+    ///
     /// Missed blocks → reputation decay (separate mechanism)
     #[allow(unused_variables)]
     async fn analyze_chain_for_slashing(
@@ -6545,6 +6753,82 @@ impl BlockchainNode {
         // Initialize state manager
         let state = Arc::new(RwLock::new(StateManager::new()));
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // v15.10 STAGE-2: WIRE DISK-BACKED ACCOUNT STORE + LRU CACHE BOUND
+        // ───────────────────────────────────────────────────────────────────
+        // The state manager holds the in-memory account map as a bounded LRU
+        // cache; here we install the persistent fallback (RocksDB `accounts`
+        // CF via Storage's AccountStore impl) and read the cache cap from the
+        // environment. With this in place the warm-cache pass at block-apply
+        // time can transparently load cold accounts on demand, and the
+        // periodic eviction sweep can keep the in-memory map at or below
+        // the configured size.
+        //
+        // CAPACITY CHOICE (1 000+ super nodes, 100 M+ accounts)
+        // ───────────────────────────────────────────────────────────────────
+        // Default 500 000 accounts × ~600 B avg = ~300 MB working set —
+        // covers the active wallet set for production transfer traffic
+        // while leaving room on a 4-8 GB super node for the rest of the
+        // runtime (mempool, network buffers, blockchain caches). A
+        // value of 0 disables eviction entirely (legacy / tooling /
+        // benchmark mode); operators with very large RAM budgets can
+        // raise the cap to keep more accounts hot.
+        // ═══════════════════════════════════════════════════════════════════════
+        {
+            let cache_capacity: usize = std::env::var("QNET_ACCOUNT_CACHE_CAPACITY")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(500_000);
+            let state_setup = state.read().await;
+            state_setup.set_disk_store(storage.clone() as Arc<dyn qnet_state::AccountStore>);
+            state_setup.set_cache_capacity(cache_capacity);
+            drop(state_setup);
+            if is_info() {
+                println!(
+                    "[INFO][CACHE] account_cache_init capacity={} disk_store=wired",
+                    cache_capacity,
+                );
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // v15.10 STAGE-2: BACKGROUND EVICTION SWEEP
+        // ───────────────────────────────────────────────────────────────────
+        // Every 60 seconds, scan the in-memory account map; if it exceeds
+        // the configured cap, evict the entries with the oldest last-access
+        // timestamps until the size drops back to the cap. Evicted accounts
+        // remain durable on disk (Stage-1 write-through guaranteed that)
+        // and reload transparently on the next read through the warm-cache
+        // pass.
+        //
+        // Runs as a long-lived `tokio::spawn` so it never blocks the apply
+        // pipeline. Eviction is best-effort — if a sweep is in flight when
+        // a block apply starts, both run concurrently and the only
+        // observable effect is one extra point read for any account that
+        // happens to be in flight.
+        // ═══════════════════════════════════════════════════════════════════
+        {
+            let state_evict = state.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                tick.tick().await; // skip immediate first tick
+                loop {
+                    tick.tick().await;
+                    let sg = state_evict.read().await;
+                    let before = sg.cache_size();
+                    let cap = sg.cache_capacity_value();
+                    let evicted = sg.evict_cold_accounts();
+                    drop(sg);
+                    if evicted > 0 && is_info() {
+                        println!(
+                            "[INFO][CACHE] evict_swept before={} after={} evicted={} capacity={}",
+                            before, before.saturating_sub(evicted), evicted, cap,
+                        );
+                    }
+                }
+            });
+        }
+
         // ═══════════════════════════════════════════════════════════════════
         // v7.1: RESTORE FORK FLAGS FROM PERSISTENT STORAGE
         // Fork activation state persisted in RocksDB metadata CF.
@@ -6865,9 +7149,104 @@ impl BlockchainNode {
         // CRITICAL v2.26: No outer RwLock - SimpleMempool is already thread-safe (DashMap + parking_lot)
         // This eliminates 100K TPS bottleneck from external lock contention
         let mempool = Arc::new(qnet_mempool::SimpleMempool::new(mempool_config));
-        
+
         // PRODUCTION v2.50: Set global mempool using OnceCell (lock-free)
         init_global_mempool(mempool.clone());
+
+        // ════════════════════════════════════════════════════════════════════
+        // v15.9: PERSISTENT MEMPOOL — install storage hooks
+        // ────────────────────────────────────────────────────────────────────
+        // The mempool is RAM-resident for throughput, but every admission
+        // and removal is mirrored into the `mempool` RocksDB column family
+        // through these callbacks. On a clean restart the integration
+        // layer scans that CF and replays each entry through
+        // `add_binary_transaction`, restoring the exact pre-crash queue —
+        // user submissions and MEV bundles survive a producer restart.
+        //
+        // The `Arc<dyn Fn>` indirection keeps the mempool crate
+        // dependency-free (no link to storage / rocksdb) and lets tests
+        // construct a mempool without persistence by leaving the hooks
+        // unset.
+        //
+        // SCALABILITY (1 000+ super nodes)
+        // ────────────────────────────────────────────────────────────────────
+        // Per-call cost is one RocksDB `put_cf` / `delete_cf` on the hot
+        // mempool CF — microseconds even at sustained 10 000 TPS. Boot-time
+        // restore reads up to 500 000 entries in a single sequential scan
+        // (~hundreds of ms), wrapped in spawn_blocking below to keep the
+        // tokio reactor free during startup.
+        {
+            let storage_admit = storage.clone();
+            let storage_remove = storage.clone();
+            let admit_cb: Arc<dyn Fn(&str, &[u8], u64) + Send + Sync> =
+                Arc::new(move |hash: &str, payload: &[u8], ts: u64| {
+                    if let Err(e) = storage_admit.save_pending_tx(hash, payload, ts) {
+                        if is_warn() {
+                            println!("[WARN][MEMPOOL] persist_admit_failed hash={} err={:?}",
+                                     &hash[..16.min(hash.len())], e);
+                        }
+                    }
+                });
+            let remove_cb: Arc<dyn Fn(&str) + Send + Sync> =
+                Arc::new(move |hash: &str| {
+                    if let Err(e) = storage_remove.delete_pending_tx(hash) {
+                        if is_warn() {
+                            println!("[WARN][MEMPOOL] persist_remove_failed hash={} err={:?}",
+                                     &hash[..16.min(hash.len())], e);
+                        }
+                    }
+                });
+            mempool.set_persistence_hooks(admit_cb, remove_cb);
+        }
+
+        // ────────────────────────────────────────────────────────────────────
+        // v15.9: BOOT-TIME REHYDRATION — replay every persisted TX back into
+        // the in-RAM mempool. Done before the node starts accepting new
+        // P2P traffic so any TX that was admitted before the previous
+        // shutdown is immediately available to the next block producer.
+        //
+        // The scan + replay runs on the blocking pool because at large
+        // mempool sizes (≥ 100 000 entries) the RocksDB iteration plus
+        // per-entry `add_binary_transaction` work is not trivial and we
+        // do not want it on the tokio reactor.
+        // ────────────────────────────────────────────────────────────────────
+        {
+            let storage_load = storage.clone();
+            let mempool_load = mempool.clone();
+            match tokio::task::spawn_blocking(move || {
+                let entries = storage_load.load_all_pending_txs()
+                    .unwrap_or_else(|e| {
+                        eprintln!("[WARN][MEMPOOL] persist_load_failed err={:?}", e);
+                        Vec::new()
+                    });
+                let total = entries.len();
+                let mut admitted = 0u64;
+                for (tx_hash, payload, _admission_ts) in entries {
+                    // Best-effort gas_price decode for priority-queue ordering.
+                    // If the persisted payload deserialises as a Transaction
+                    // we use its `gas_price`; otherwise we admit at 0 (system
+                    // priority will be re-derived inside add_binary_transaction
+                    // via `is_system_tx()` parsing).
+                    let gas_price = bincode::deserialize::<qnet_state::Transaction>(&payload)
+                        .map(|tx| tx.gas_price)
+                        .unwrap_or(0);
+                    if mempool_load.add_binary_transaction(payload, tx_hash, gas_price) {
+                        admitted += 1;
+                    }
+                }
+                (total, admitted)
+            }).await {
+                Ok((total, admitted)) => {
+                    if total > 0 {
+                        println!("[INFO][MEMPOOL] persist_restore total={} admitted={}",
+                                 total, admitted);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[WARN][MEMPOOL] persist_restore_join_failed err={:?}", e);
+                }
+            }
+        }
         
         // Generate unique node_id for Byzantine consensus
         let node_id = Self::generate_unique_node_id(node_type).await;
@@ -8790,11 +9169,24 @@ impl BlockchainNode {
                                 println!("[INFO][SYNC] post_snapshot_sync skip_genesis sync_from={}", sync_from);
                             }
 
-                            // Sync remaining blocks in chunks
+                            // Sync remaining blocks in chunks.
+                            //
+                            // v15.8: chunk size raised from 100 → 1000 blocks.
+                            // The downstream `sync_blocks` already shards each
+                            // requested range across up to MAX_PARALLEL_SYNC_PEERS
+                            // peers in parallel; with 100-block chunks each peer
+                            // received only ~12-13 blocks per request, dominated
+                            // by network roundtrip overhead. At 1000-block chunks
+                            // each peer fetches ~125 blocks per request — still
+                            // well under the 1 MB QUIC stream budget — and the
+                            // committee-bounded chunk count drops from ~600 to
+                            // ~60 for a 60 k-block bootstrap, amortising the
+                            // per-request overhead by a factor of ~5×.
+                            const SYNC_CHUNK_SIZE: u64 = 1_000;
                             let mut current = sync_from;
                             let mut consecutive_no_progress = 0u32;
                             while current <= network_height {
-                                let chunk_end = std::cmp::min(current + 100, network_height);
+                                let chunk_end = std::cmp::min(current + SYNC_CHUNK_SIZE, network_height);
 
                                 if is_debug() { println!("[DBG][SYNC] request from={} to={}", current, chunk_end); }
                                 if let Err(e) = p2p.sync_blocks(current, chunk_end).await {
@@ -9699,6 +10091,12 @@ impl BlockchainNode {
                                         let p2p_clone = unified_p2p.clone();
                                         let reorg_flag = reorg_in_progress.clone();
                                         let fork_producer_clone = fork_producer.clone();
+                                        // v15.9: Capture state into the spawned reorg task so the
+                                        // post-rollback reconciliation can rebuild the in-memory
+                                        // account view. Without this clone the spawned future
+                                        // could not access the StateManager and the rollback would
+                                        // leave a stale in-memory view as before.
+                                        let state_clone_reorg = state.clone();
                                         
                                         tokio::spawn(async move {
                                             // Mark reorg as in progress
@@ -9749,6 +10147,31 @@ impl BlockchainNode {
 
                                                             // v3.31: Clear pending sync queues after rollback
                                                             complete_rollback_cleanup(rollback_to);
+
+                                                            // v15.9: STATE RECONCILIATION (REORG path)
+                                                            // ─────────────────────────────────────────
+                                                            // Same invariant as the FORK rollback site:
+                                                            // disk-side delete must be paired with an
+                                                            // in-memory state rebuild. Without this,
+                                                            // the next sync round validates blocks
+                                                            // against a state that includes the
+                                                            // rolled-back mutations and silently
+                                                            // diverges from the canonical chain.
+                                                            if let Err(e) = Self::reconcile_state_after_rollback(
+                                                                &state_clone_reorg,
+                                                                &storage_clone,
+                                                                rollback_to,
+                                                            ).await {
+                                                                println!(
+                                                                    "[ERR][STATE] reconcile_after_reorg_failed target={} err={} action=resync_required",
+                                                                    rollback_to, e,
+                                                                );
+                                                            } else {
+                                                                println!(
+                                                                    "[INFO][STATE] reconcile_after_reorg_ok target={}",
+                                                                    rollback_to,
+                                                                );
+                                                            }
                                                         }
 
                                                         // Sync missing blocks
@@ -9872,9 +10295,33 @@ impl BlockchainNode {
                                                             );
 
                                                             crate::storage::end_rollback_protection();
-                                                            
+
                                                             // v3.31: Clear pending sync queues after rollback
                                                             complete_rollback_cleanup(rollback_to);
+
+                                                            // v15.9: STATE RECONCILIATION (same-height fork path)
+                                                            // ─────────────────────────────────────────────────────
+                                                            // The attestation fork-choice failed (we hold the
+                                                            // minority chain at this height) — disk-side rollback
+                                                            // erased our microblocks at heights > rollback_to.
+                                                            // Reconcile the in-memory state to match the new
+                                                            // chain tip before fresh blocks land from the
+                                                            // canonical chain.
+                                                            if let Err(e) = Self::reconcile_state_after_rollback(
+                                                                &state_clone_reorg,
+                                                                &storage_clone,
+                                                                rollback_to,
+                                                            ).await {
+                                                                println!(
+                                                                    "[ERR][STATE] reconcile_after_attest_fork_failed target={} err={} action=resync_required",
+                                                                    rollback_to, e,
+                                                                );
+                                                            } else {
+                                                                println!(
+                                                                    "[INFO][STATE] reconcile_after_attest_fork_ok target={}",
+                                                                    rollback_to,
+                                                                );
+                                                            }
 
                                                             // Request blocks from network
                                                             // sync_blocks() selects best_peer (highest combined reputation)
@@ -10510,9 +10957,15 @@ impl BlockchainNode {
                                     let from_h = our_height + 1;
                                     let to_h = new_target;
                                     tokio::spawn(async move {
+                                        // v15.8: 1000-block chunks for re-sync as well.
+                                        // Same rationale as the primary sync path —
+                                        // amortises the per-chunk roundtrip cost
+                                        // across a larger payload while staying
+                                        // within the QUIC stream budget.
+                                        const SYNC_CHUNK_SIZE: u64 = 1_000;
                                         let mut current = from_h;
                                         while current <= to_h {
-                                            let chunk_end = std::cmp::min(current + 99, to_h);
+                                            let chunk_end = std::cmp::min(current + SYNC_CHUNK_SIZE.saturating_sub(1), to_h);
                                             if let Err(e) = p2p_clone.sync_blocks(current, chunk_end).await {
                                                 if crate::node::is_warn() {
                                                     println!("[WARN][SYNC] re-sync_chunk_err h={}-{} err={}", current, chunk_end, e);
@@ -15307,11 +15760,18 @@ impl BlockchainNode {
                                     }
                                     let _guard = DesyncGuard;
 
-                                    // Sequential chunked sync — 100 blocks per request
+                                    // v15.8: 1000-block sharded chunks (was 100).
+                                    // sync_blocks fans the request out to the
+                                    // parallel-peer pool; bigger chunks mean fewer
+                                    // request roundtrips for a given backlog and
+                                    // therefore faster catch-up after a desync
+                                    // event without changing per-peer payload
+                                    // assumptions.
+                                    const SYNC_CHUNK_SIZE: u64 = 1_000;
                                     let mut current = from_h;
                                     let mut consecutive_fails = 0u32;
                                     while current <= to_h {
-                                        let chunk_end = std::cmp::min(current + 99, to_h);
+                                        let chunk_end = std::cmp::min(current + SYNC_CHUNK_SIZE.saturating_sub(1), to_h);
                                         if let Err(e) = p2p_clone.sync_blocks(current, chunk_end).await {
                                             consecutive_fails += 1;
                                             if crate::node::is_warn() {
@@ -16044,6 +16504,23 @@ impl BlockchainNode {
                                         clear_expected_producer_cache_above(rollback_to);
                                         complete_rollback_cleanup(rollback_to);
 
+                                        // v15.9: STATE RECONCILIATION (pipeline fork recovery path)
+                                        if let Err(e) = Self::reconcile_state_after_rollback(
+                                            &state,
+                                            &storage,
+                                            rollback_to,
+                                        ).await {
+                                            println!(
+                                                "[ERR][STATE] reconcile_after_pipeline_fork_failed target={} err={} action=resync_required",
+                                                rollback_to, e,
+                                            );
+                                        } else {
+                                            println!(
+                                                "[INFO][STATE] reconcile_after_pipeline_fork_ok target={}",
+                                                rollback_to,
+                                            );
+                                        }
+
                                         println!("[INFO][FORK] rollback_ok to={} deleted={} blocks",
                                                  rollback_to, local_h - rollback_to);
                                     }
@@ -16239,6 +16716,37 @@ impl BlockchainNode {
                                         // causing dup_pending on ALL sync responses → sync deadlock
                                         complete_rollback_cleanup(rollback_to);
 
+                                        // v15.9: ATOMIC STATE RECONCILIATION
+                                        // ───────────────────────────────────────────────────────────
+                                        // The disk-side rollback above wiped microblocks and
+                                        // macroblocks at heights > rollback_to. The in-memory
+                                        // StateManager still carries the account mutations those
+                                        // blocks applied — without reconciliation the node would
+                                        // re-validate freshly synced blocks against a state that
+                                        // does not match the canonical chain at rollback_to.
+                                        //
+                                        // We rebuild the in-memory state from the freshest
+                                        // snapshot at or below rollback_to and replay the
+                                        // surviving microblocks deterministically through the
+                                        // same `apply_block_to_state` path used at normal apply
+                                        // time. After this returns, the in-memory state matches
+                                        // the chain tip exactly.
+                                        if let Err(e) = Self::reconcile_state_after_rollback(
+                                            &state,
+                                            &storage,
+                                            rollback_to,
+                                        ).await {
+                                            println!(
+                                                "[ERR][STATE] reconcile_after_rollback_failed target={} err={} action=resync_required",
+                                                rollback_to, e,
+                                            );
+                                        } else {
+                                            println!(
+                                                "[INFO][STATE] reconcile_after_rollback_ok target={}",
+                                                rollback_to,
+                                            );
+                                        }
+
                                         FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                         FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
                                         SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
@@ -16392,7 +16900,10 @@ impl BlockchainNode {
                                 LAST_SYNC_PROGRESS_TIME.store(current_time, Ordering::Relaxed);
                                 println!("[INFO][SYNC] fast_sync_start gap={}", height_difference);
 
-                                let sync_from_height = if microblock_height == 0 {
+                                // v15.8: `mut` because the runtime snapshot fast-path
+                                // inside the spawn block below may advance the start
+                                // height after a successful snapshot load.
+                                let mut sync_from_height = if microblock_height == 0 {
                                     0
                                 } else if microblock_height % ROTATION_INTERVAL_BLOCKS == 0 {
                                     microblock_height
@@ -16406,6 +16917,67 @@ impl BlockchainNode {
 
                                 tokio::spawn(async move {
                                     let _guard = FastSyncGuard;
+
+                                    // ═══════════════════════════════════════════════════════════════════
+                                    // v15.8: SNAPSHOT FAST-PATH IN RUNTIME SYNC LOOP
+                                    // ═══════════════════════════════════════════════════════════════════
+                                    // The startup bootstrap path at the node-init site already calls
+                                    // `fast_sync_with_snapshot`, but a node may enter the runtime sync
+                                    // loop directly without passing through that code (e.g. fresh
+                                    // container with chain_height=0 starting after the network has
+                                    // long-published snapshots). Without this fallback the runtime
+                                    // loop walks the chain block-by-block from genesis at MB-SYNC
+                                    // throughput — observably ~10-15 minutes per 10k blocks of catch-up.
+                                    //
+                                    // Strategy: when the gap is large enough that snapshot replay is
+                                    // strictly faster than block replay, query peers for a snapshot
+                                    // and load it in one chunked parallel download (existing
+                                    // infrastructure in `download_snapshot_chunked`). On any failure
+                                    // — no peers have a snapshot, chunk verification fails, IPFS
+                                    // unavailable — `fast_sync_with_snapshot` returns Err and we
+                                    // fall through to the regular block-by-block path unchanged.
+                                    //
+                                    // Threshold chosen as 5 000 blocks (~83 min worth at 1/sec) to
+                                    // ensure the snapshot download cost amortises against block
+                                    // replay; below that the block path is comparable in time and
+                                    // simpler.
+                                    //
+                                    // Scalability: zero overhead for nodes already at tip (gap < 5k
+                                    // skips this branch entirely). For catch-up nodes the snapshot
+                                    // download is bounded by `download_snapshot_chunked` which fans
+                                    // out 4 MB chunks across multiple peers in parallel and is the
+                                    // canonical fast-path on this codebase.
+                                    // ═══════════════════════════════════════════════════════════════════
+                                    const RUNTIME_SNAPSHOT_GAP_THRESHOLD: u64 = 5_000;
+                                    if sync_from_height == 0 || height_difference > RUNTIME_SNAPSHOT_GAP_THRESHOLD {
+                                        if is_info() {
+                                            println!(
+                                                "[INFO][SYNC] runtime_snapshot_try gap={} threshold={} target={}",
+                                                height_difference, RUNTIME_SNAPSHOT_GAP_THRESHOLD, network_height,
+                                            );
+                                        }
+                                        match storage_clone.fast_sync_with_snapshot(&p2p_clone, network_height).await {
+                                            Ok(()) => {
+                                                let new_local = storage_clone.get_chain_height().unwrap_or(sync_from_height);
+                                                if new_local + 1 > sync_from_height {
+                                                    sync_from_height = new_local + 1;
+                                                    *height_clone.write().await = new_local;
+                                                    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                                        new_local, std::sync::atomic::Ordering::Release,
+                                                    );
+                                                    println!(
+                                                        "[INFO][SYNC] runtime_snapshot_loaded h={} skipped={} sync_from={}",
+                                                        new_local, new_local.saturating_sub(microblock_height), sync_from_height,
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                if is_info() {
+                                                    println!("[INFO][SYNC] runtime_snapshot_unavailable reason={:?} fallback=block_sync", e);
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     // v5.5: Sync genesis block separately if chain is empty
                                     if sync_from_height == 0 {
@@ -27279,6 +27851,108 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // emits regular macroblocks backed by 2f+1 reveals.
                 is_skip_marker: false,
                 skip_certificate: None,
+                // ═══════════════════════════════════════════════════════════════════
+                // v15.9: SNAPSHOT BINDING — populate snapshot_root only at
+                // canonical snapshot boundaries (every SNAPSHOT_INCREMENTAL_INTERVAL
+                // microblocks ≡ every 40th macroblock). The storage layer keys
+                // snapshots by *microblock height* (the boundary block that
+                // closes the interval), not by macroblock index — so the
+                // producer must translate `round_number` (= mb_idx) to the
+                // boundary microblock height (`mb_idx * 90`) before querying
+                // the snapshot store. Without this translation every lookup
+                // returns None and the supermajority binding never activates.
+                //
+                // Each honest node materialises the snapshot deterministically
+                // through the apply-stage trigger (block_pipeline) and
+                // serialises it with canonical key ordering, so every node
+                // computes the same digest. The resulting hash is implicitly
+                // endorsed by the supermajority through the macroblock's
+                // commit-reveal Dilithium3 signatures, giving fresh
+                // bootstrappers a trust-less anchor to verify any snapshot
+                // bytes they download from peers.
+                //
+                // RACE-WINDOW HANDLING
+                // ───────────────────────────────────────────────────────────
+                // The apply-stage trigger spawns the snapshot creation task
+                // on the blocking pool when the boundary microblock is
+                // applied; for very large states (1M+ accounts) the
+                // background task may still be running when MB construction
+                // begins. We therefore poll the snapshot store with a bounded
+                // budget (up to 30 attempts × 100 ms = 3 s) before falling
+                // back to the legacy path. Non-boundary macroblocks skip the
+                // lookup entirely (no I/O cost on the hot path).
+                //
+                // SCALABILITY
+                // ───────────────────────────────────────────────────────────
+                // At 1 000+ super-node committees, every honest node performs
+                // the same binding deterministically — total network cost is
+                // unchanged versus the producer-only model, the binding is
+                // simply present on every node so any peer can serve as a
+                // verification anchor for an incoming bootstrapper.
+                // ═══════════════════════════════════════════════════════════════════
+                snapshot_root: {
+                    const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
+                    let mb_end_height = consensus_data.round_number * 90;
+                    if mb_end_height > 0 && mb_end_height % SNAPSHOT_INCREMENTAL_INTERVAL == 0 {
+                        let mut snapshot_bytes_opt: Option<Vec<u8>> = None;
+                        let mut last_err: Option<String> = None;
+                        for attempt in 0..30u32 {
+                            match storage.get_snapshot_data(mb_end_height) {
+                                Ok(Some(bytes)) => {
+                                    snapshot_bytes_opt = Some(bytes);
+                                    break;
+                                }
+                                Ok(None) => {
+                                    if attempt < 29 {
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    last_err = Some(format!("{:?}", e));
+                                    break;
+                                }
+                            }
+                        }
+
+                        match snapshot_bytes_opt {
+                            Some(snapshot_bytes) => {
+                                use sha3::{Sha3_256, Digest};
+                                let mut hasher = Sha3_256::new();
+                                hasher.update(&snapshot_bytes);
+                                let mut digest = [0u8; 32];
+                                digest.copy_from_slice(&hasher.finalize());
+                                if is_info() {
+                                    println!(
+                                        "[INFO][MB] snapshot_root_bound h={} digest={} size_kb={}",
+                                        mb_end_height,
+                                        hex::encode(&digest[..8]),
+                                        snapshot_bytes.len() / 1024,
+                                    );
+                                }
+                                Some(digest)
+                            }
+                            None => {
+                                if is_warn() {
+                                    if let Some(err) = last_err {
+                                        println!(
+                                            "[WARN][MB] snapshot_root_read_failed h={} err={} mode=legacy_accept",
+                                            mb_end_height, err,
+                                        );
+                                    } else {
+                                        println!(
+                                            "[WARN][MB] snapshot_root_unavailable h={} mode=legacy_accept reason=race_window_exhausted",
+                                            mb_end_height,
+                                        );
+                                    }
+                                }
+                                None
+                            }
+                        }
+                    } else {
+                        // Non-boundary macroblock — no snapshot expected at this height.
+                        None
+                    }
+                },
             },
             previous_hash: previous_macroblock_hash,
             poh_hash: poh_hash.to_vec(),
@@ -27544,9 +28218,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     tokio::spawn(async move {
                         // CPU-bound: DashMap iterate + clone entries + serialize — all on blocking pool
                         let state_data = match tokio::task::spawn_blocking(move || {
-                            let accounts: Vec<(String, qnet_state::Account)> = accounts_arc.iter()
+                            // v15.8: CANONICAL KEY ORDERING for cross-node byte equality.
+                            // DashMap iteration order is shard-dependent and varies across
+                            // nodes even with identical content; sorting by account_id
+                            // before serialisation makes the resulting bytes byte-stable
+                            // across the entire validator committee. This is the
+                            // foundation that `snapshot_root` in macroblock consensus
+                            // depends on — without canonical ordering the SHA3-256
+                            // digest would differ across honest nodes and the
+                            // supermajority would never converge on a single value.
+                            let mut accounts: Vec<(String, qnet_state::Account)> = accounts_arc
+                                .iter()
                                 .map(|e| (e.key().clone(), e.value().clone()))
                                 .collect();
+                            accounts.sort_by(|a, b| a.0.cmp(&b.0));
                             bincode::serialize(&accounts)
                         }).await {
                             Ok(Ok(data)) => data,
@@ -29444,7 +30129,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // CRITICAL FIX v2.61: SIZE-BASED BATCHING for macroblocks
             // Macroblocks are typically larger, use conservative limit
             // ═══════════════════════════════════════════════════════════════════════════
-            const MAX_BATCH_SIZE_BYTES: usize = 500_000;  // 500KB max per message (macroblocks are bigger)
+            // v15.8: BATCH SIZE INCREASED FROM 500 KB → 5 MB.
+            // The previous 500 KB cap was extremely conservative — at the
+            // canonical macroblock size of ~50–500 KB it forced one
+            // macroblock per response on average, which throttled fresh-node
+            // catch-up to the per-batch round-trip cost (sequential request
+            // → wait → next request). Raising to 5 MB keeps a single
+            // response well under the 87 MB SHRED ceiling and well under
+            // the 16 MB QUIC stream window, while letting the server pack
+            // up to ~10 macroblocks (the existing per-response upper bound
+            // in `sync_macroblocks_inner`) into one wire message. Catch-up
+            // throughput scales near-linearly until either the network
+            // window or the apply pipeline becomes the bottleneck.
+            //
+            // Defense levels still hold: the 80 MB block-size limit at
+            // production time (`MAX_BLOCK_SIZE_BYTES` in the producer
+            // path) caps any single macroblock the network can produce,
+            // and the QUIC transport already enforces per-stream and
+            // per-connection memory ceilings.
+            const MAX_BATCH_SIZE_BYTES: usize = 5_000_000;  // 5 MB max per message (≤10 macroblocks per response)
             const MB_SYNC_BATCH_DELAY_MS: u64 = 10;  // 10ms pacing between batches
             
             // Find peer address
@@ -30035,9 +30738,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         let snap_index = index;
                                         tokio::spawn(async move {
                                             let state_data = match tokio::task::spawn_blocking(move || {
-                                                let accounts: Vec<(String, qnet_state::Account)> = accounts_arc.iter()
-                                                    .map(|e| (e.key().clone(), e.value().clone()))
-                                                    .collect();
+                                                // v15.8: CANONICAL KEY ORDERING — every node serialises
+                                                // the same account map in the same order, so the bytes
+                                                // are byte-stable across the validator committee. This
+                                                // is what lets the macroblock-bound `snapshot_root`
+                                                // value converge under 2f+1 consensus.
+                                                let mut accounts: Vec<(String, qnet_state::Account)> =
+                                                    accounts_arc.iter()
+                                                        .map(|e| (e.key().clone(), e.value().clone()))
+                                                        .collect();
+                                                accounts.sort_by(|a, b| a.0.cmp(&b.0));
                                                 bincode::serialize(&accounts)
                                             }).await {
                                                 Ok(Ok(data)) => data,

@@ -656,3 +656,20 @@ _cmsg.txt
 _commit_*.txt
 *_commit.txt
 *_commit_msg.txt
+
+# AI assistant working directories (per-user, never share)
+.claude/
+.cursor/
+**/.claude/
+**/.cursor/
+
+# Build / debug artefacts (regenerated, never commit)
+build_warnings.txt
+*_warnings.txt
+transactions_export.csv
+*_export.csv
+
+# Operator-specific TLS material (must NEVER be in git)
+infrastructure/nginx/ssl/*.pem
+infrastructure/nginx/ssl/*.key
+infrastructure/nginx/ssl/*.crt

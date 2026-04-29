@@ -60,6 +60,41 @@ const MIN_OUTBOUND_SLOTS: usize = 8;
 /// Genesis nodes and bootstrap peers bypass this check.
 const MIN_INBOUND_PEER_REPUTATION: f64 = 50.0;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// v15.9: NETWORK-LAYER ECLIPSE DEFENCE — IP SUBNET DIVERSITY
+// ───────────────────────────────────────────────────────────────────────────
+// At thousands-of-nodes scale a single hosting provider (cloud region, ISP
+// pop) can spin up dozens of cheap nodes in seconds. Without subnet
+// diversity those nodes flood our peer table from a single /24 / /16
+// netblock — every "diverse" peer slot in the K-bucket is actually owned
+// by the attacker, and the node's view of the network is replaced by a
+// curated minority chain (eclipse). The 2f+1 BFT threshold protects
+// against safety violation only when the ATTACKER'S keys are bounded;
+// it gives no protection when the attacker's PEER LIST is biased.
+//
+// Defence: cap how many concurrent inbound connections may share an IP
+// netblock. The /24 cap is the strict diversity floor (≤ 2 peers from
+// the same 256-address block); the /16 cap is a soft regional floor
+// (≤ 8 peers from the same 65 536-address block, accommodating large
+// data centres while preventing single-AZ saturation).
+//
+// CONFIGURABILITY
+// ───────────────────────────────────────────────────────────────────────────
+// Operators can override via env vars without recompilation:
+//   QNET_MAX_PEERS_PER_24  — default 2
+//   QNET_MAX_PEERS_PER_16  — default 8
+// Genesis IPs and outbound connections are exempt (we chose them; we
+// already have signed activation evidence).
+//
+// SCALABILITY (1 000+ super nodes)
+// ───────────────────────────────────────────────────────────────────────────
+// Per-admission cost: O(N) scan over `connected_peers_lockfree` where
+// N ≤ MAX_CONNECTED_PEERS (= 1000). At 1000 peers × ~50 ns per DashMap
+// iter step this is ≤ 50 µs per admission — negligible relative to
+// the QUIC handshake cost that already dominates new-peer setup.
+const DEFAULT_MAX_PEERS_PER_SUBNET_24: usize = 2;
+const DEFAULT_MAX_PEERS_PER_SUBNET_16: usize = 8;
+
 /// Stale node timeout (15 minutes without heartbeat/announcement)
 #[allow(dead_code)]
 const STALE_NODE_TIMEOUT_SECS: u64 = 15 * 60;
@@ -3644,6 +3679,34 @@ impl SimplifiedP2P {
             }
     }
 
+    /// v15.9: Count currently connected peers whose IPv4 address matches
+    /// the given netblock prefix. `octets` selects the prefix granularity:
+    ///   3 → /24 (first three dotted octets equal),
+    ///   2 → /16 (first two dotted octets equal).
+    /// Used by the eclipse-defence subnet-diversity check at admission
+    /// time. Skips outbound peers and entries whose host part fails IPv4
+    /// parsing (the diversity rule applies only to inbound IPv4 peers,
+    /// matching the rejection guard in `add_peer_lockfree`).
+    fn count_peers_in_subnet_prefix(&self, prefix: &str, octets: usize) -> usize {
+        if prefix.is_empty() || !(1..=4).contains(&octets) {
+            return 0;
+        }
+        let mut count = 0usize;
+        for entry in self.connected_peers_lockfree.iter() {
+            let p = entry.value();
+            if p.is_outbound {
+                continue;
+            }
+            let peer_ip = p.addr.split(':').next().unwrap_or("");
+            if let Some(peer_prefix) = extract_subnet_prefix(peer_ip, octets) {
+                if peer_prefix == prefix {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        count
+    }
+
     /// QUANTUM OPTIMIZATION: Lock-free peer addition for millions of nodes
     /// Uses DashMap for concurrent operations without blocking
     pub fn add_peer_lockfree(&self, mut peer_info: PeerInfo) -> bool {
@@ -3708,6 +3771,58 @@ impl SimplifiedP2P {
                              get_privacy_id_for_addr(&peer_info.addr), peer_info.reputation, MIN_INBOUND_PEER_REPUTATION);
                 }
                 return false;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v15.9: SUBNET DIVERSITY CHECK — eclipse-attack defence
+        // ───────────────────────────────────────────────────────────────────────────
+        // Cap concurrent inbound peers per /24 and /16 netblock to prevent a
+        // single hosting provider / cloud region from saturating our peer
+        // table. Outbound connections (we initiated them) and genesis IPs
+        // (vetted set) bypass — only inbound non-genesis peers are limited.
+        //
+        // Behaviour matches the existing eclipse / sybil checks above: a
+        // rejection at this layer logs a single INFO line and returns
+        // false; the connection is closed by the caller. The check runs
+        // BEFORE k-bucket / shard insertion so a rejected peer leaves no
+        // residual state in any DashMap.
+        // ═══════════════════════════════════════════════════════════════════════════
+        if !peer_info.is_outbound {
+            let is_genesis_ip = crate::genesis_constants::get_genesis_id_by_ip(peer_ip).is_some();
+            if !is_genesis_ip {
+                let max_per_24 = std::env::var("QNET_MAX_PEERS_PER_24")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(DEFAULT_MAX_PEERS_PER_SUBNET_24);
+                let max_per_16 = std::env::var("QNET_MAX_PEERS_PER_16")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(DEFAULT_MAX_PEERS_PER_SUBNET_16);
+
+                if let Some(prefix_24) = extract_subnet_prefix(peer_ip, 3) {
+                    let count_24 = self.count_peers_in_subnet_prefix(&prefix_24, 3);
+                    if count_24 >= max_per_24 {
+                        if crate::node::is_info() {
+                            println!("[INFO][P2P] subnet_reject_24 peer={} prefix={}/24 existing={} max={}",
+                                     get_privacy_id_for_addr(&peer_info.addr),
+                                     prefix_24, count_24, max_per_24);
+                        }
+                        return false;
+                    }
+                }
+
+                if let Some(prefix_16) = extract_subnet_prefix(peer_ip, 2) {
+                    let count_16 = self.count_peers_in_subnet_prefix(&prefix_16, 2);
+                    if count_16 >= max_per_16 {
+                        if crate::node::is_info() {
+                            println!("[INFO][P2P] subnet_reject_16 peer={} prefix={}/16 existing={} max={}",
+                                     get_privacy_id_for_addr(&peer_info.addr),
+                                     prefix_16, count_16, max_per_16);
+                        }
+                        return false;
+                    }
+                }
             }
         }
 
@@ -19277,6 +19392,35 @@ fn region_string(region: &Region) -> &'static str {
     }
 }
 
+/// v15.9: Extract a leading-octet prefix from an IPv4 address string.
+/// `octets = 3` returns the /24 prefix (e.g. "192.168.1"),
+/// `octets = 2` returns the /16 prefix (e.g. "192.168").
+/// Returns None for malformed input or non-IPv4 values (IPv6 addresses,
+/// hostnames). The bind path is the same `peer_ip` extracted at the
+/// top of `add_peer_lockfree` — already validated as host part of an
+/// `IP:PORT` string, so production input is uniformly IPv4.
+pub fn extract_subnet_prefix(ip: &str, octets: usize) -> Option<String> {
+    if octets == 0 || octets > 4 {
+        return None;
+    }
+    // Reject IPv6 (':' in host) and obvious non-IPv4 strings.
+    if ip.contains(':') || ip.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    // Each octet must be a valid 0..=255 number.
+    for p in &parts {
+        match p.parse::<u8>() {
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(parts[..octets].join("."))
+}
+
 /// PRIVACY: Generate privacy-preserving identifier for IP addresses
 /// This replaces direct IP display in logs to protect user privacy
 pub fn get_privacy_id_for_addr(addr: &str) -> String {
@@ -23041,6 +23185,51 @@ impl SimplifiedP2P {
         best
     }
 
+    /// v15.9: Pure structural validation for an AggregatedTimeoutCertificate
+    /// — no signature verification, no `self`. Returns Ok(()) iff every
+    /// non-cryptographic invariant holds; Err(reason) otherwise. This split
+    /// lets the integration tests exercise the structural rules directly
+    /// without needing a SimplifiedP2P instance, while the runtime path
+    /// composes this check with parallel signature verification.
+    ///
+    /// Invariants enforced (all must pass):
+    /// 1. Certificate's `height` equals `expected_mb_idx` (no replay onto
+    ///    a different macroblock).
+    /// 2. Certificate's `certified_round` ≥ `min_certified_round` — the
+    ///    canonical view-change path actually exhausted enough rounds for
+    ///    a skip to be legitimate.
+    /// 3. `two_f_plus_1` is non-zero AND `cert.votes.len() ≥ two_f_plus_1`.
+    /// 4. Every vote's `vote_round` ≥ `cert.certified_round` (no underflow
+    ///    against the certificate's own claimed minimum).
+    /// 5. Voter IDs are pairwise distinct (no replay of a single voter
+    ///    against the threshold count).
+    pub fn verify_skip_certificate_structure(
+        cert: &AggregatedTimeoutCertificate,
+        expected_mb_idx: u64,
+        min_certified_round: u64,
+        two_f_plus_1: usize,
+    ) -> Result<(), &'static str> {
+        if cert.height != expected_mb_idx {
+            return Err("cert_mb_mismatch");
+        }
+        if cert.certified_round < min_certified_round {
+            return Err("cert_round_below_threshold");
+        }
+        if two_f_plus_1 == 0 || cert.votes.len() < two_f_plus_1 {
+            return Err("cert_short_vote_count");
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for v in &cert.votes {
+            if v.vote_round < cert.certified_round {
+                return Err("cert_vote_round_underflow");
+            }
+            if !seen.insert(v.voter_id.as_str()) {
+                return Err("cert_duplicate_voter");
+            }
+        }
+        Ok(())
+    }
+
     /// v15.7: Verify the bincode-serialised AggregatedTimeoutCertificate carried
     /// inside a skip-marker macroblock. Re-uses the same per-vote Dilithium3
     /// verification as `handle_aggregated_timeout_cert` and the same 2f+1
@@ -23078,60 +23267,18 @@ impl SimplifiedP2P {
             }
         };
 
-        if cert.height != expected_mb_idx {
-            if crate::node::is_warn() {
-                println!(
-                    "[WARN][SKIP] cert_mb_mismatch expected={} got={}",
-                    expected_mb_idx, cert.height,
-                );
-            }
-            return false;
-        }
-
-        if cert.certified_round < min_certified_round {
-            if crate::node::is_warn() {
-                println!(
-                    "[WARN][SKIP] cert_round_below_threshold mb={} round={} min={}",
-                    expected_mb_idx, cert.certified_round, min_certified_round,
-                );
-            }
-            return false;
-        }
-
         let total_validators = self.get_active_validator_count();
         let two_f_plus_1 = (2 * total_validators + 2) / 3;
-        if two_f_plus_1 == 0 || cert.votes.len() < two_f_plus_1 {
+
+        // v15.9: Run structural checks via the static helper so unit tests
+        // can exercise the same logic without spinning up a P2P stack.
+        if let Err(reason) = Self::verify_skip_certificate_structure(
+            &cert, expected_mb_idx, min_certified_round, two_f_plus_1,
+        ) {
             if crate::node::is_warn() {
-                println!(
-                    "[WARN][SKIP] cert_short_vote_count mb={} votes={} need={}",
-                    expected_mb_idx, cert.votes.len(), two_f_plus_1,
-                );
+                println!("[WARN][SKIP] {} mb={}", reason, expected_mb_idx);
             }
             return false;
-        }
-
-        // Structural pre-pass: distinct voters, every vote round ≥
-        // certified_round. Cheap and runs serially.
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for v in &cert.votes {
-            if v.vote_round < cert.certified_round {
-                if crate::node::is_warn() {
-                    println!(
-                        "[WARN][SKIP] cert_vote_round_underflow mb={} voter={} round={} cert_round={}",
-                        expected_mb_idx, v.voter_id, v.vote_round, cert.certified_round,
-                    );
-                }
-                return false;
-            }
-            if !seen.insert(v.voter_id.as_str()) {
-                if crate::node::is_warn() {
-                    println!(
-                        "[WARN][SKIP] cert_duplicate_voter mb={} voter={}",
-                        expected_mb_idx, v.voter_id,
-                    );
-                }
-                return false;
-            }
         }
 
         // Parallel Dilithium3 signature verification. Any single bad signature
@@ -25317,18 +25464,33 @@ mod tests {
         assert!(active_entry.is_active(), "Entry should be active");
     }
     
-    /// Test permanent blacklist (duration = 0)
+    /// Test permanent blacklist (duration = 0).
+    ///
+    /// FIX: previous version used `Instant::now() - Duration::from_secs(86400)`
+    /// which panics on Windows when the resulting `Instant` would be earlier
+    /// than the system boot time (e.g. on a freshly-booted CI runner). The
+    /// `Instant - Duration` operator's `checked_sub` semantics underflow in
+    /// that case, so we use `checked_sub` explicitly and fall back to
+    /// `Instant::now()` when the saturation kicks in. The test invariant
+    /// (a `duration_secs == 0` entry is always active) holds regardless of
+    /// the timestamp's absolute value, so the fallback is semantically
+    /// equivalent.
     #[test]
     fn test_permanent_blacklist() {
         use std::time::Instant;
-        
+
+        let now = Instant::now();
+        let timestamp = now
+            .checked_sub(std::time::Duration::from_secs(86400))
+            .unwrap_or(now);
+
         let entry = BlacklistEntry {
             reason: BlacklistReason::MaliciousBehavior,
-            timestamp: Instant::now() - std::time::Duration::from_secs(86400), // 1 day ago
+            timestamp,
             duration_secs: 0, // Permanent
             attempts: 5,
         };
-        
+
         assert!(entry.is_active(), "Permanent blacklist should always be active");
     }
     
@@ -25486,6 +25648,7 @@ mod tests {
             retransmit_attempts: 0,
             retransmit_requested_at: None,
             certificate: None, // v2.26: Certificate from chunk #0
+            expected_block_hash: None, // FIX R23-P3: post-reconstruction hash check
         };
         
         assert_eq!(assembly.retransmit_attempts, 0);
@@ -25590,5 +25753,277 @@ mod tests {
             }
             _ => panic!("Wrong message type"),
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.9: SKIP-CERTIFICATE STRUCTURAL TESTS
+    // ────────────────────────────────────────────────────────────────────────
+    // These tests pin the non-cryptographic invariants of an aggregated
+    // timeout certificate (the artefact embedded in a skip-marker
+    // macroblock). Signature verification is NOT exercised here because it
+    // requires a P2P stack and a registered validator set; the structural
+    // checks are independent of those and are what protects the runtime
+    // from the cheap, non-quantum classes of forgery (replay onto a
+    // different macroblock, count short of 2f+1, duplicate voters, vote
+    // round below the certified minimum).
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn make_vote(voter_id: &str, vote_round: u64) -> AggregatedSignedVote {
+        AggregatedSignedVote {
+            voter_id: voter_id.to_string(),
+            vote_round,
+            vote_block_hash: [0u8; 32],
+            signature: vec![0u8; 64],
+        }
+    }
+
+    fn make_cert(height: u64, certified_round: u64, votes: Vec<AggregatedSignedVote>) -> AggregatedTimeoutCertificate {
+        AggregatedTimeoutCertificate { height, certified_round, votes }
+    }
+
+    /// Happy path: a well-formed certificate with exactly 2f+1 distinct
+    /// voters, every vote round ≥ certified_round, height matches.
+    #[test]
+    fn test_skip_cert_structure_accepts_well_formed() {
+        let cert = make_cert(
+            42,
+            8,
+            vec![
+                make_vote("v1", 8),
+                make_vote("v2", 9),
+                make_vote("v3", 10),
+            ],
+        );
+        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 42, 8, 3);
+        assert!(result.is_ok(), "Well-formed cert should be accepted, got: {:?}", result);
+    }
+
+    /// Replay onto a different macroblock height must be rejected.
+    #[test]
+    fn test_skip_cert_structure_rejects_height_mismatch() {
+        let cert = make_cert(
+            42,
+            8,
+            vec![make_vote("v1", 8), make_vote("v2", 8), make_vote("v3", 8)],
+        );
+        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 999, 8, 3);
+        assert_eq!(result, Err("cert_mb_mismatch"));
+    }
+
+    /// Certificate built before the canonical view-change path actually
+    /// exhausted the configured floor (`min_certified_round`) must be
+    /// rejected — it does not represent legitimate canonical exhaustion.
+    #[test]
+    fn test_skip_cert_structure_rejects_round_below_threshold() {
+        let cert = make_cert(
+            10,
+            5,
+            vec![make_vote("v1", 5), make_vote("v2", 5), make_vote("v3", 5)],
+        );
+        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 10, 8, 3);
+        assert_eq!(result, Err("cert_round_below_threshold"));
+    }
+
+    /// Vote count strictly below 2f+1 must be rejected — supermajority
+    /// quorum is the safety property.
+    #[test]
+    fn test_skip_cert_structure_rejects_short_vote_count() {
+        let cert = make_cert(
+            7,
+            8,
+            vec![make_vote("v1", 8), make_vote("v2", 8)],
+        );
+        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 7, 8, 3);
+        assert_eq!(result, Err("cert_short_vote_count"));
+    }
+
+    /// Vote count == 2f+1 (the boundary) must be accepted.
+    #[test]
+    fn test_skip_cert_structure_accepts_exact_threshold() {
+        let cert = make_cert(
+            9,
+            8,
+            vec![make_vote("v1", 8), make_vote("v2", 8), make_vote("v3", 8)],
+        );
+        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 9, 8, 3);
+        assert!(result.is_ok());
+    }
+
+    /// `two_f_plus_1 = 0` (e.g. empty validator set) must be rejected
+    /// even with non-empty votes — there is no quorum to certify against.
+    #[test]
+    fn test_skip_cert_structure_rejects_zero_threshold() {
+        let cert = make_cert(
+            1,
+            8,
+            vec![make_vote("v1", 8), make_vote("v2", 8), make_vote("v3", 8)],
+        );
+        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 1, 8, 0);
+        assert_eq!(result, Err("cert_short_vote_count"));
+    }
+
+    /// Vote whose round is below the certificate's certified_round
+    /// indicates a malformed aggregator output and must be rejected —
+    /// otherwise an attacker could forge a low-effort skip claim.
+    #[test]
+    fn test_skip_cert_structure_rejects_vote_round_underflow() {
+        let cert = make_cert(
+            5,
+            10,
+            vec![
+                make_vote("v1", 10),
+                make_vote("v2", 9), // below certified_round
+                make_vote("v3", 11),
+            ],
+        );
+        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 5, 8, 3);
+        assert_eq!(result, Err("cert_vote_round_underflow"));
+    }
+
+    /// Counting one voter twice toward the 2f+1 threshold must be
+    /// rejected — distinct voter identities are an explicit safety
+    /// requirement of the aggregated signature scheme.
+    #[test]
+    fn test_skip_cert_structure_rejects_duplicate_voter() {
+        let cert = make_cert(
+            12,
+            8,
+            vec![
+                make_vote("v1", 8),
+                make_vote("v1", 9), // same id
+                make_vote("v2", 8),
+            ],
+        );
+        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 12, 8, 3);
+        assert_eq!(result, Err("cert_duplicate_voter"));
+    }
+
+    /// Different rounds across votes are explicitly allowed — that is the
+    /// pacemaker invariant the aggregated certificate encodes.
+    #[test]
+    fn test_skip_cert_structure_accepts_mixed_rounds_above_certified() {
+        let cert = make_cert(
+            20,
+            8,
+            vec![
+                make_vote("v1", 8),
+                make_vote("v2", 14),
+                make_vote("v3", 22),
+            ],
+        );
+        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 20, 8, 3);
+        assert!(result.is_ok());
+    }
+
+    /// Bincode round-trip of the certificate must be lossless — the
+    /// runtime path round-trips through `bincode::serialize/deserialize`
+    /// when embedding into the macroblock's `skip_certificate` field.
+    #[test]
+    fn test_skip_cert_bincode_round_trip() {
+        let cert = make_cert(
+            33,
+            12,
+            vec![
+                make_vote("v1", 12),
+                make_vote("v2", 13),
+                make_vote("v3", 14),
+            ],
+        );
+        let bytes = bincode::serialize(&cert).expect("serialize");
+        let decoded: AggregatedTimeoutCertificate =
+            bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(decoded.height, cert.height);
+        assert_eq!(decoded.certified_round, cert.certified_round);
+        assert_eq!(decoded.votes.len(), cert.votes.len());
+        for (orig, dec) in cert.votes.iter().zip(decoded.votes.iter()) {
+            assert_eq!(orig.voter_id, dec.voter_id);
+            assert_eq!(orig.vote_round, dec.vote_round);
+            assert_eq!(orig.vote_block_hash, dec.vote_block_hash);
+            assert_eq!(orig.signature, dec.signature);
+        }
+        let result = SimplifiedP2P::verify_skip_certificate_structure(&decoded, 33, 12, 3);
+        assert!(result.is_ok());
+    }
+
+    /// 2f+1 calculation matches BFT formula across small / medium /
+    /// large committee sizes. This is the threshold the runtime feeds
+    /// into `verify_skip_certificate_structure` from
+    /// `get_active_validator_count()`.
+    #[test]
+    fn test_skip_cert_two_f_plus_one_formula() {
+        // (N=4 → f=1 → 2f+1=3); (N=10 → f=3 → 2f+1=7); (N=100 → f=33 → 2f+1=67)
+        for (n, expected) in [(4usize, 3usize), (10, 7), (100, 67), (1_000, 667)] {
+            let two_f_plus_1 = (2 * n + 2) / 3;
+            assert_eq!(two_f_plus_1, expected,
+                "BFT 2f+1 mismatch for N={} expected={} got={}",
+                n, expected, two_f_plus_1);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.9: SUBNET DIVERSITY TESTS
+    // ────────────────────────────────────────────────────────────────────────
+    // Pin the IPv4 prefix-extraction invariants used by the eclipse-defence
+    // peer-admission filter. Bad parsing here directly weakens diversity —
+    // every malformed input must return None (silently bypass rather than
+    // hash unrelated peers into the same bucket).
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_extract_subnet_24_well_formed() {
+        assert_eq!(extract_subnet_prefix("192.168.1.42", 3), Some("192.168.1".to_string()));
+        assert_eq!(extract_subnet_prefix("10.0.0.1", 3), Some("10.0.0".to_string()));
+        assert_eq!(extract_subnet_prefix("8.8.8.8", 3), Some("8.8.8".to_string()));
+    }
+
+    #[test]
+    fn test_extract_subnet_16_well_formed() {
+        assert_eq!(extract_subnet_prefix("192.168.1.42", 2), Some("192.168".to_string()));
+        assert_eq!(extract_subnet_prefix("10.0.0.1", 2), Some("10.0".to_string()));
+    }
+
+    #[test]
+    fn test_extract_subnet_rejects_ipv6() {
+        assert_eq!(extract_subnet_prefix("2001:db8::1", 3), None);
+        assert_eq!(extract_subnet_prefix("::1", 3), None);
+    }
+
+    #[test]
+    fn test_extract_subnet_rejects_malformed() {
+        assert_eq!(extract_subnet_prefix("", 3), None);
+        assert_eq!(extract_subnet_prefix("not-an-ip", 3), None);
+        assert_eq!(extract_subnet_prefix("1.2.3", 3), None);          // too few
+        assert_eq!(extract_subnet_prefix("1.2.3.4.5", 3), None);      // too many
+        assert_eq!(extract_subnet_prefix("256.0.0.1", 3), None);      // octet out of range
+        assert_eq!(extract_subnet_prefix("1.2.3.abc", 3), None);      // non-numeric
+    }
+
+    #[test]
+    fn test_extract_subnet_rejects_invalid_octet_count() {
+        assert_eq!(extract_subnet_prefix("1.2.3.4", 0), None);
+        assert_eq!(extract_subnet_prefix("1.2.3.4", 5), None);
+    }
+
+    #[test]
+    fn test_extract_subnet_full_address() {
+        assert_eq!(extract_subnet_prefix("1.2.3.4", 4), Some("1.2.3.4".to_string()));
+    }
+
+    #[test]
+    fn test_extract_subnet_single_octet() {
+        assert_eq!(extract_subnet_prefix("10.0.0.1", 1), Some("10".to_string()));
+    }
+
+    #[test]
+    fn test_subnet_prefix_distinguishes_distinct_blocks() {
+        // Two peers in different /24 blocks but the same /16 must have
+        // different /24 prefixes and matching /16 prefixes.
+        let a = extract_subnet_prefix("203.0.113.1", 3);
+        let b = extract_subnet_prefix("203.0.114.1", 3);
+        assert_ne!(a, b, "/24 must distinguish 113 vs 114");
+
+        let a16 = extract_subnet_prefix("203.0.113.1", 2);
+        let b16 = extract_subnet_prefix("203.0.114.1", 2);
+        assert_eq!(a16, b16, "/16 must collapse 113 and 114 into 203.0");
     }
 }

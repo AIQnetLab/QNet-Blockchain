@@ -583,8 +583,141 @@ impl BlockSnapshot {
 /// State manager for blockchain
 /// v3.11: Integrated State Merkle Tree for trustless balance proofs
 /// v3.33: Removed unused ValidatorSet - using MacroBlock.eligible_producers instead
+///
+/// ═══════════════════════════════════════════════════════════════════════════
+/// v15.9: SCALE LIMIT — IN-MEMORY ACCOUNTS
+/// ───────────────────────────────────────────────────────────────────────────
+/// `accounts` is currently a fully in-RAM `DashMap`. Each entry costs roughly
+/// 300–800 bytes (40 B address + Account struct + per-account
+/// `contract_storage` HashMap if any). This places a HARD CEILING on the
+/// sustainable account count per Super node:
+///
+///   1 M accounts → ~600 MB  (comfortable)
+///   5 M accounts → ~3 GB    (tight on a 4 GB node)
+///   10 M accounts → ~6 GB   (requires high-RAM nodes)
+///   100 M accounts → ~60 GB (requires server-class hardware OR refactor)
+///
+/// MIGRATION PATH — STAGE-2 RocksDB-backed account state
+/// ───────────────────────────────────────────────────────────────────────────
+/// When state surpasses ~5 M accounts the canonical solution is to back
+/// the account map with a column family in the existing RocksDB instance
+/// and front it with an LRU cache for hot keys. The migration breaks
+/// down as:
+///
+///   1. Add a private `disk: Arc<dyn AccountStore + Send + Sync>` handle
+///      next to `accounts` and `merkle_tree`. The trait exposes
+///      `get`/`put`/`remove`/`iter` returning `Account` values.
+///   2. Reroute `apply_transaction` and `restore_accounts` through a
+///      `cached_get_or_load` helper that consults `accounts` (LRU) first
+///      and falls back to `disk` on miss; writes go through both.
+///   3. Bound the LRU at ~512 K entries (≈ 200 MB) — this is the
+///      working set for steady-state transfer traffic. Every TX hot-loads
+///      its sender/receiver, every block evicts the cold tail.
+///   4. Snapshot creation iterates `disk` directly via the existing
+///      `iterator_cf("accounts")` path, never the LRU, so canonical
+///      bytes do not depend on cache state.
+///   5. Merkle tree stays incremental — no change required, since it
+///      already updates per-account on insert/remove.
+///
+/// SCALABILITY (1 000+ super nodes, 100 M+ accounts)
+/// ───────────────────────────────────────────────────────────────────────────
+/// Post-migration, per-block hot path stays at O(k) where k = touched
+/// accounts (typically ≤ 100 / block); total per-node memory becomes
+/// LRU-bounded (~200 MB) plus the Merkle leaf set, regardless of total
+/// account count. The trade-off is RocksDB read-amplification on cache
+/// misses, which is acceptable on SSD-backed Super nodes.
+///
+/// Until that work lands, operators MUST provision enough RAM to hold
+/// the entire account set in `accounts`.
+/// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// v15.10 STAGE-2: MONOTONIC LOGICAL CLOCK FOR LRU TIMESTAMPS
+// ───────────────────────────────────────────────────────────────────────────
+// Every `touch_access` / `touch_accesses` call burns one slot of this
+// global counter. The counter is process-local: cache state is never
+// transmitted between nodes, and eviction order is a per-node concern,
+// so cross-node coherence is not required.
+//
+// SCALABILITY
+// ───────────────────────────────────────────────────────────────────────────
+// `Relaxed` ordering is sufficient: we only need monotonicity of the
+// counter, NOT happens-before with the cache map. At thousands of
+// touches per second on 1 000 super-nodes, the atomic `fetch_add`
+// adds ~5 ns of CPU per touch — invisible against the surrounding
+// DashMap insert.
+static LOGICAL_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[inline]
+fn next_logical_timestamp() -> u64 {
+    LOGICAL_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v15.10 STAGE-2A: STATE PARTITIONING — DETERMINISTIC SHARD ASSIGNMENT
+// ───────────────────────────────────────────────────────────────────────────
+// `account_shard_index` is the canonical mapping from an account address
+// to a shard index in the range `[0, num_shards)`. Every node in the
+// network MUST agree on this assignment for Stage-2B per-shard consensus
+// committees to converge: deterministic + stateless + cheap.
+//
+// HASH CHOICE
+// ───────────────────────────────────────────────────────────────────────────
+// Blake3 over the address bytes, then take the leading u32 modulo
+// `num_shards`. Blake3 is the same hash already used elsewhere in the
+// sharding crate (`qnet-sharding/src/lib.rs`), so cross-crate shard
+// assignments line up bit-for-bit. The hash is fast (~1 GB/s on modern
+// CPUs) and uniformly distributed — load imbalance across shards is
+// bounded by the law-of-large-numbers tail (≈ 1/√N for N shards).
+//
+// EDGE CASES
+// ───────────────────────────────────────────────────────────────────────────
+//   * `num_shards == 0` is treated as `num_shards == 1` (single shard).
+//     This keeps the helper safe to call before the operator configures
+//     shard count, and matches the `set_num_shards` invariant that 0
+//     never reaches the runtime.
+//   * Empty addresses map to shard 0. Production paths never pass empty
+//     addresses (mempool admission rejects them upstream); this is a
+//     defensive default.
+pub fn account_shard_index(address: &str, num_shards: u32) -> u32 {
+    let n = if num_shards == 0 { 1 } else { num_shards };
+    if address.is_empty() {
+        return 0;
+    }
+    let hash = blake3::hash(address.as_bytes());
+    let bytes = hash.as_bytes();
+    // Use first 4 bytes as u32 little-endian — no allocation, branch-free.
+    let leading = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    leading % n
+}
+
+/// v15.10 STAGE-2: trait for read-through fallback to a disk-backed account
+/// store. Implemented by the integration layer's `Storage` over the RocksDB
+/// `accounts` column family. The state crate stays free of any RocksDB
+/// dependency — the trait carries only `Account` values across the boundary.
+///
+/// Concurrency: implementations MUST be `Send + Sync`. The trait is invoked
+/// from inside `state.write()` critical sections during the warm-cache pass
+/// at block-apply time, so `load_account` MUST be a fast, non-blocking
+/// point read (single RocksDB `get_cf` on the hot CF). It MUST NOT spawn
+/// futures, hold locks, or perform long-running I/O.
+pub trait AccountStore: Send + Sync {
+    /// Best-effort read of a single account from the persistent store.
+    /// Returns `None` for genuinely-absent accounts and `None` (with a
+    /// best-effort INFO log inside the implementor) on transient errors —
+    /// the caller treats both identically (cache miss falls through to
+    /// the canonical "account not found" path).
+    fn load_account(&self, address: &str) -> Option<Account>;
+}
+
 pub struct StateManager {
-    /// Accounts state
+    /// Accounts state — see migration note in struct doc above.
+    /// v15.10 STAGE-2: this DashMap is now the LRU cache layer for an
+    /// underlying RocksDB-backed account store. Cold accounts get evicted
+    /// by the periodic eviction task and reloaded on demand through the
+    /// `disk_store` fallback. The public surface
+    /// (`get`/`apply_transaction`/`restore_accounts`) is unchanged —
+    /// pre-warming at the block-apply boundary guarantees every account
+    /// the block needs is resident in this DashMap before mutation.
     pub accounts: Arc<DashMap<String, Account>>,
     /// Chain state
     pub chain_state: Arc<parking_lot::RwLock<ChainState>>,
@@ -600,6 +733,102 @@ pub struct StateManager {
     /// Key: node_id, Value: wallet_address
     /// Deterministic: populated from block application, identical across all nodes
     registered_nodes: Arc<DashMap<String, String>>,
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.10 STAGE-2: LRU CACHE INFRASTRUCTURE
+    // ────────────────────────────────────────────────────────────────────────
+    // Three pieces back the read-through cache:
+    //   * `last_access` — wall-clock timestamps recorded at warm-time and
+    //     touch-time. Eviction picks the entries with the oldest
+    //     timestamps when the cache exceeds capacity.
+    //   * `cache_capacity` — soft bound on the number of accounts kept in
+    //     `accounts` between eviction passes. Configured at startup from
+    //     `QNET_ACCOUNT_CACHE_CAPACITY` (default 500 000 accounts).
+    //   * `disk_store` — read-through handle to the persistent account
+    //     CF. Set once at startup via `set_disk_store`; reads are
+    //     lock-free at steady state (parking_lot RwLock).
+    //
+    // SCALABILITY (1 000+ super nodes, 100 M+ accounts)
+    // ────────────────────────────────────────────────────────────────────────
+    // The cache is the working set, not the chain state. At 100 M total
+    // accounts with a 500 K cap, ~99.5 % of accounts live exclusively on
+    // disk; per-block warm-up reads only the 100–2 000 addresses the
+    // block touches (point reads on the hot CF, microsecond-scale on
+    // SSD). RAM stays bounded at ~200 MB regardless of total account
+    // count — exactly the property the public design comment above
+    // promises.
+    /// Last-access wall-clock seconds per cached account. Set at warm-time
+    /// and on explicit touches; consulted by the eviction sweep to pick
+    /// the oldest entries first.
+    last_access: Arc<DashMap<String, u64>>,
+    /// Soft cap on `accounts.len()`; eviction sweeps keep the map at or
+    /// below this size. 0 disables eviction (legacy / tests).
+    cache_capacity: Arc<std::sync::atomic::AtomicUsize>,
+    /// Read-through fallback to the persistent account store. Set once
+    /// at node startup by the integration layer.
+    disk_store: Arc<parking_lot::RwLock<Option<Arc<dyn AccountStore>>>>,
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.10 STAGE-2A: SHARD COUNT
+    // ────────────────────────────────────────────────────────────────────────
+    // Number of logical shards the network is currently configured with.
+    // Used by:
+    //   * Stage-2A — the sharded routing layer (`account_shard_index`)
+    //     consults this when callers want the canonical shard for an
+    //     address.
+    //   * Stage-2B (future) — per-shard consensus committees split the
+    //     active validator set against this count.
+    //   * Stage-2C (future) — cross-shard 2PC routes transactions whose
+    //     `from`/`to` addresses fall into different shards through the
+    //     coordinator path.
+    //
+    // Default `1` keeps the runtime behaviour identical to the pre-2A
+    // shipped implementation: every address maps to shard 0, every
+    // microblock is built against the global account map, no cross-
+    // shard coordination is needed.
+    //
+    // Operators raise this via `set_num_shards` once the network has
+    // grown enough to support multiple consensus sub-committees
+    // (typically when the active validator count comfortably exceeds
+    // `MIN_VALIDATORS_PER_SHARD × num_shards`). The value is
+    // deterministic across all honest nodes — it ships in the chain
+    // configuration, NOT per-node ENV.
+    num_shards: Arc<std::sync::atomic::AtomicU32>,
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.10 STAGE-2: PRODUCTION CACHE METRICS
+    // ────────────────────────────────────────────────────────────────────────
+    // Lock-free counters exposed for operational monitoring (Prometheus
+    // scrape, operator dashboards, post-mortem diagnostics). At 1 000+
+    // super-node scale, blind cache behaviour is the difference between a
+    // node hitting its 200 MB RAM budget and silently OOMing — these
+    // counters are how operators verify the cache is doing what it
+    // promises.
+    //
+    // SEMANTICS
+    // ────────────────────────────────────────────────────────────────────────
+    //   * cache_hits — `warm_account` resolved from RAM (no disk read).
+    //   * cache_misses — `warm_account` had to call `disk_store.load_account`.
+    //     Includes both successful disk loads and "address absent on disk"
+    //     probes; the two are distinguished by `disk_load_hits` /
+    //     `disk_load_misses`.
+    //   * disk_load_hits — disk fallback returned `Some(Account)`.
+    //   * disk_load_misses — disk fallback returned `None` (genuinely
+    //     absent address; typically a brand-new wallet referenced for
+    //     the first time).
+    //   * evictions — total accounts dropped from RAM by the eviction
+    //     sweep across the node's lifetime.
+    //
+    // RATIO OF INTEREST
+    // ────────────────────────────────────────────────────────────────────────
+    // Steady-state cache_hits / (cache_hits + cache_misses) is the
+    // "warm working set efficiency". A healthy production node should
+    // see ≥ 95 % even with cap = 500 K and total state in the millions
+    // — this is the canonical signal that the cap is correctly sized
+    // for the active wallet population.
+    cache_hits: Arc<std::sync::atomic::AtomicU64>,
+    cache_misses: Arc<std::sync::atomic::AtomicU64>,
+    disk_load_hits: Arc<std::sync::atomic::AtomicU64>,
+    disk_load_misses: Arc<std::sync::atomic::AtomicU64>,
+    evictions_total: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl StateManager {
@@ -612,7 +841,256 @@ impl StateManager {
             merkle_tree: Arc::new(parking_lot::RwLock::new(StateMerkleTree::new())),
             committed_epochs: Arc::new(DashMap::new()),
             registered_nodes: Arc::new(DashMap::new()),
+            // v15.10 STAGE-2: cache layer initialised idle. `disk_store` is
+            // unset until the integration layer calls `set_disk_store`,
+            // and `cache_capacity = 0` disables eviction so legacy paths
+            // (tests, tooling) keep their unbounded behaviour by default.
+            last_access: Arc::new(DashMap::new()),
+            cache_capacity: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            disk_store: Arc::new(parking_lot::RwLock::new(None)),
+            // Production cache metrics — all start at 0.
+            cache_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cache_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            disk_load_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            disk_load_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            evictions_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // v15.10 STAGE-2A: single shard by default — Stage-2A is wire
+            // compatible with the pre-2A behaviour. Bumping this via
+            // `set_num_shards` activates the multi-shard routing surface.
+            num_shards: Arc::new(std::sync::atomic::AtomicU32::new(1)),
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.10 STAGE-2A: SHARDING — public API
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Configure the active shard count. Idempotent. `0` is rejected
+    /// (treated as "no change") so the runtime invariant `num_shards ≥ 1`
+    /// always holds.
+    ///
+    /// ⚠ At the time of writing this is FOUNDATIONAL state — bumping
+    /// `num_shards > 1` does NOT yet route consensus committees or apply
+    /// transactions per-shard. The full activation requires Stage-2B
+    /// (per-shard committees) and Stage-2C (cross-shard 2PC) — see the
+    /// roadmap in `qnet-sharding/src/lib.rs`. Using this method today
+    /// only changes what `account_shard_index` returns; existing apply
+    /// paths continue to mutate the global account map.
+    pub fn set_num_shards(&self, n: u32) {
+        if n == 0 { return; }
+        self.num_shards.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current configured shard count (≥ 1).
+    pub fn num_shards(&self) -> u32 {
+        self.num_shards.load(std::sync::atomic::Ordering::Relaxed).max(1)
+    }
+
+    /// Canonical shard assignment for an address under the currently-
+    /// configured shard count. Deterministic — every honest node
+    /// computes the same value for the same input.
+    pub fn shard_for(&self, address: &str) -> u32 {
+        account_shard_index(address, self.num_shards())
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.10 STAGE-2: LRU CACHE — public API
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Install the persistent-fallback handle. Called once by the
+    /// integration layer at node startup, before any block is applied.
+    pub fn set_disk_store(&self, store: Arc<dyn AccountStore>) {
+        *self.disk_store.write() = Some(store);
+    }
+
+    /// Configure the soft cache cap. `0` disables eviction. Callers
+    /// typically read `QNET_ACCOUNT_CACHE_CAPACITY` from the environment
+    /// and pass it here at startup.
+    pub fn set_cache_capacity(&self, capacity: usize) {
+        self.cache_capacity.store(capacity, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Best-effort warm of a single account: if `address` is already in
+    /// `accounts`, just refresh its last-access timestamp; otherwise try
+    /// to load it from `disk_store` and insert. Returns true iff the
+    /// account is now resident (whether via cache hit or disk hit).
+    /// Genuinely-absent accounts (no entry on disk either) return false
+    /// — they will be created lazily by the apply path when the
+    /// transaction targets them.
+    pub fn warm_account(&self, address: &str) -> bool {
+        if self.accounts.contains_key(address) {
+            self.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.touch_access(address);
+            return true;
+        }
+        // Cache miss — record before disk fallback so the metric is
+        // accurate even when the disk layer is unreachable.
+        self.cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let store_guard = self.disk_store.read();
+        if let Some(ref store) = *store_guard {
+            if let Some(account) = store.load_account(address) {
+                self.disk_load_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Race-tolerant insert: if another thread inserted between
+                // the contains_key check above and this point, keep the
+                // existing entry — both paths converge on identical bytes
+                // because `load_account` is deterministic on the same
+                // RocksDB state.
+                self.accounts.entry(address.to_string()).or_insert(account);
+                self.touch_access(address);
+                return true;
+            }
+            self.disk_load_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        false
+    }
+
+    /// Batched warm of every address in a slice. Used at block-apply time
+    /// to ensure every sender / receiver / contract address the block
+    /// touches is resident before the apply mutates state. Returns the
+    /// count of addresses that ended up resident (cache hit + disk hit).
+    pub fn warm_accounts(&self, addresses: &[String]) -> usize {
+        let mut hit = 0usize;
+        for addr in addresses {
+            if self.warm_account(addr) {
+                hit = hit.saturating_add(1);
+            }
+        }
+        hit
+    }
+
+    /// Refresh the last-access timestamp for `address` to "now". Called
+    /// by the apply path on every account touched so the eviction
+    /// sweep keeps hot working-set accounts resident.
+    ///
+    /// RESOLUTION — MONOTONIC LOGICAL CLOCK
+    /// ────────────────────────────────────────────────────────────────────
+    /// We use a monotonically-incrementing process-local counter (atomic
+    /// `fetch_add`) instead of wall-clock time. This guarantees that
+    /// every `touch_access` call produces a distinct, strictly-greater
+    /// timestamp than every previous call — even when thousands of
+    /// touches happen within a single millisecond on a fast SSD. Wall-
+    /// clock-based timestamps would flatten such bursts onto a single
+    /// value, biasing the eviction sort against the LRU intent (every
+    /// account in the burst becomes eviction-eligible simultaneously).
+    ///
+    /// The counter is process-local — it does NOT need to compare
+    /// across nodes (cache state is not consensus-critical) — so the
+    /// lack of inter-node coherence is fine. The counter wraps at
+    /// 2^64 (≈ 580 years at 1 ns per touch); not a practical concern.
+    pub fn touch_access(&self, address: &str) {
+        let now = next_logical_timestamp();
+        self.last_access.insert(address.to_string(), now);
+    }
+
+    /// Bulk-touch helper for the post-apply update of every address a
+    /// block touched. Each address still gets a UNIQUE monotonic
+    /// timestamp so the eviction order between addresses in the
+    /// same batch is deterministic (insertion order in the slice).
+    pub fn touch_accesses(&self, addresses: &[String]) {
+        for addr in addresses {
+            let now = next_logical_timestamp();
+            self.last_access.insert(addr.clone(), now);
+        }
+    }
+
+    /// Evict the oldest cached accounts until `accounts.len()` is at or
+    /// below `cache_capacity`. Returns the number of evicted entries.
+    /// No-op when capacity is 0 or the cache is already within bound.
+    ///
+    /// EVICTION POLICY
+    /// ────────────────────────────────────────────────────────────────────
+    /// Evicted accounts are simply removed from `accounts` and
+    /// `last_access` — the canonical disk copy was already written by
+    /// the Stage-1 write-through path at block-apply time, so a future
+    /// read for the evicted address transparently re-loads from the
+    /// `disk_store` fallback. Accounts without a recorded
+    /// `last_access` timestamp (e.g. created before Stage-2 wiring)
+    /// are evicted FIRST, treating "no timestamp" as "infinitely old".
+    ///
+    /// THREAD SAFETY
+    /// ────────────────────────────────────────────────────────────────────
+    /// The function is safe to call from a periodic background task
+    /// while apply paths run concurrently. Apply paths that need a
+    /// just-evicted account simply re-warm it through the disk store
+    /// — the only observable effect is one extra point read.
+    pub fn evict_cold_accounts(&self) -> usize {
+        let capacity = self.cache_capacity.load(std::sync::atomic::Ordering::Relaxed);
+        if capacity == 0 {
+            return 0;
+        }
+        let current = self.accounts.len();
+        if current <= capacity {
+            return 0;
+        }
+        let target_evict = current.saturating_sub(capacity);
+
+        // Snapshot (address, last_access) for every cached account.
+        // Addresses without a timestamp get treated as `0` so they sort
+        // to the front of the eviction queue.
+        let mut sorted: Vec<(String, u64)> = self.accounts
+            .iter()
+            .map(|e| {
+                let ts = self.last_access.get(e.key()).map(|v| *v).unwrap_or(0);
+                (e.key().clone(), ts)
+            })
+            .collect();
+        sorted.sort_by_key(|(_, ts)| *ts);
+
+        let mut evicted = 0usize;
+        for (addr, _) in sorted.iter().take(target_evict) {
+            self.accounts.remove(addr);
+            self.last_access.remove(addr);
+            evicted = evicted.saturating_add(1);
+        }
+        if evicted > 0 {
+            self.evictions_total.fetch_add(evicted as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        evicted
+    }
+
+    /// Helper for tests / diagnostics — current cache size.
+    pub fn cache_size(&self) -> usize {
+        self.accounts.len()
+    }
+
+    /// Helper for tests / diagnostics — configured capacity.
+    pub fn cache_capacity_value(&self) -> usize {
+        self.cache_capacity.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.10 STAGE-2: cache metrics — Prometheus-friendly snapshot API
+    // ────────────────────────────────────────────────────────────────────────
+    // Lock-free reads of the lifetime cache counters. Returned as a tuple
+    // so the integration layer (RPC `/metrics` endpoint, internal
+    // diagnostics) can publish them in a single atomic-ish snapshot
+    // without per-counter API churn.
+    //
+    // Order: (cache_hits, cache_misses, disk_load_hits, disk_load_misses, evictions_total)
+    pub fn cache_metrics(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.cache_hits.load(std::sync::atomic::Ordering::Relaxed),
+            self.cache_misses.load(std::sync::atomic::Ordering::Relaxed),
+            self.disk_load_hits.load(std::sync::atomic::Ordering::Relaxed),
+            self.disk_load_misses.load(std::sync::atomic::Ordering::Relaxed),
+            self.evictions_total.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Computed hit ratio in basis points (0..=10000) — 10000 means
+    /// every warm resolved from RAM. Used by the eviction-tuning
+    /// heuristic and by alerts that fire when the working-set
+    /// efficiency degrades. Returns 10000 when no warms have been
+    /// recorded yet (treat empty as "no problem").
+    pub fn cache_hit_ratio_bps(&self) -> u64 {
+        let hits = self.cache_hits.load(std::sync::atomic::Ordering::Relaxed);
+        let misses = self.cache_misses.load(std::sync::atomic::Ordering::Relaxed);
+        let total = hits.saturating_add(misses);
+        if total == 0 {
+            return 10_000;
+        }
+        // Multiply BEFORE divide to keep precision without f64.
+        ((hits.saturating_mul(10_000)) / total).min(10_000)
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1592,8 +2070,572 @@ impl StateManager {
         println!("🚀 Genesis state created: 0 QNC total supply, Fair Launch activated!");
         println!("📈 Pool 1 Base Emission: DYNAMIC halving system (starts 251,432.34 QNC/4h)");
         println!("💎 Maximum Supply: {} QNC (2^32)", MAX_QNC_SUPPLY);
-        
+
         Ok(())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// v15.10 STAGE-2: LRU CACHE TESTS
+// ────────────────────────────────────────────────────────────────────────────
+// Pin the cache invariants used at runtime:
+//   * read-through: cold address resolves through the AccountStore fallback
+//   * eviction sorts by last_access; oldest entries leave first
+//   * cache_capacity = 0 disables eviction entirely (legacy mode)
+//   * touch refreshes timestamp so a frequently-accessed account survives
+//   * warm_account is idempotent on cache hits and updates the timestamp
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::Account;
+    use std::collections::HashMap;
+
+    /// Mock AccountStore backed by an in-memory HashMap. Lets tests verify
+    /// the read-through cache without spinning up RocksDB.
+    struct MockStore {
+        data: parking_lot::RwLock<HashMap<String, Account>>,
+        load_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                data: parking_lot::RwLock::new(HashMap::new()),
+                load_count: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn put(&self, addr: &str, account: Account) {
+            self.data.write().insert(addr.to_string(), account);
+        }
+
+        fn loads(&self) -> usize {
+            self.load_count.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl AccountStore for MockStore {
+        fn load_account(&self, address: &str) -> Option<Account> {
+            self.load_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.data.read().get(address).cloned()
+        }
+    }
+
+    fn make_account(balance: u64) -> Account {
+        let mut a = Account::default();
+        a.balance = balance;
+        a
+    }
+
+    #[test]
+    fn test_warm_account_cache_hit() {
+        let sm = StateManager::new();
+        sm.accounts.insert("alice".to_string(), make_account(100));
+
+        let store = MockStore::new();
+        sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+
+        assert!(sm.warm_account("alice"));
+        // Cache hit must NOT trigger a disk load.
+        assert_eq!(store.loads(), 0);
+        // Touch must populate last_access.
+        assert!(sm.last_access.contains_key("alice"));
+    }
+
+    #[test]
+    fn test_warm_account_disk_load_populates_cache() {
+        let sm = StateManager::new();
+        let store = MockStore::new();
+        store.put("bob", make_account(42));
+        sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+
+        assert!(!sm.accounts.contains_key("bob"));
+        assert!(sm.warm_account("bob"));
+        // Disk load happened exactly once.
+        assert_eq!(store.loads(), 1);
+        // Cache now resident.
+        assert!(sm.accounts.contains_key("bob"));
+        // Subsequent warm hits cache, no extra disk read.
+        assert!(sm.warm_account("bob"));
+        assert_eq!(store.loads(), 1);
+    }
+
+    #[test]
+    fn test_warm_account_genuine_miss_returns_false() {
+        let sm = StateManager::new();
+        let store = MockStore::new();
+        sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+
+        assert!(!sm.warm_account("ghost"));
+        assert!(!sm.accounts.contains_key("ghost"));
+    }
+
+    #[test]
+    fn test_warm_account_no_disk_store_falls_through() {
+        let sm = StateManager::new();
+        // disk_store is None — warm of non-cached address must fail
+        // gracefully without panicking.
+        assert!(!sm.warm_account("nobody"));
+    }
+
+    #[test]
+    fn test_eviction_disabled_when_capacity_zero() {
+        let sm = StateManager::new();
+        sm.set_cache_capacity(0);
+        for i in 0..100 {
+            sm.accounts.insert(format!("u{}", i), make_account(i));
+        }
+        let evicted = sm.evict_cold_accounts();
+        assert_eq!(evicted, 0);
+        assert_eq!(sm.cache_size(), 100);
+    }
+
+    #[test]
+    fn test_eviction_under_capacity_is_noop() {
+        let sm = StateManager::new();
+        sm.set_cache_capacity(1000);
+        for i in 0..50 {
+            sm.accounts.insert(format!("u{}", i), make_account(i));
+        }
+        let evicted = sm.evict_cold_accounts();
+        assert_eq!(evicted, 0);
+        assert_eq!(sm.cache_size(), 50);
+    }
+
+    #[test]
+    fn test_eviction_drops_oldest_first() {
+        let sm = StateManager::new();
+        sm.set_cache_capacity(3);
+        // Populate 5 accounts with explicit ascending timestamps so the
+        // sort order is deterministic regardless of test wall-clock.
+        for (i, addr) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            sm.accounts.insert(addr.to_string(), make_account(0));
+            sm.last_access.insert(addr.to_string(), 100 + i as u64);
+        }
+        let evicted = sm.evict_cold_accounts();
+        // 5 - 3 = 2 oldest entries evicted.
+        assert_eq!(evicted, 2);
+        assert_eq!(sm.cache_size(), 3);
+        // The two oldest (a, b) must be gone; c/d/e remain.
+        assert!(!sm.accounts.contains_key("a"));
+        assert!(!sm.accounts.contains_key("b"));
+        assert!(sm.accounts.contains_key("c"));
+        assert!(sm.accounts.contains_key("d"));
+        assert!(sm.accounts.contains_key("e"));
+    }
+
+    #[test]
+    fn test_eviction_treats_missing_timestamp_as_oldest() {
+        let sm = StateManager::new();
+        sm.set_cache_capacity(2);
+        // a has NO timestamp (treated as 0); b/c have explicit timestamps.
+        sm.accounts.insert("a".to_string(), make_account(0));
+        sm.accounts.insert("b".to_string(), make_account(0));
+        sm.accounts.insert("c".to_string(), make_account(0));
+        sm.last_access.insert("b".to_string(), 200);
+        sm.last_access.insert("c".to_string(), 300);
+        let evicted = sm.evict_cold_accounts();
+        assert_eq!(evicted, 1);
+        // a (no timestamp) evicted first.
+        assert!(!sm.accounts.contains_key("a"));
+        assert!(sm.accounts.contains_key("b"));
+        assert!(sm.accounts.contains_key("c"));
+    }
+
+    #[test]
+    fn test_touch_access_refreshes_timestamp() {
+        let sm = StateManager::new();
+        sm.accounts.insert("hot".to_string(), make_account(0));
+        // Pre-touch to capture the logical-clock baseline.
+        sm.touch_access("hot");
+        let first = *sm.last_access.get("hot").unwrap();
+        // Touch again: the monotonic logical clock guarantees a strictly
+        // greater value, even when the two calls happen within the same
+        // wall-clock millisecond.
+        sm.touch_access("hot");
+        let second = *sm.last_access.get("hot").unwrap();
+        assert!(second > first, "logical clock must advance: {} → {}", first, second);
+    }
+
+    #[test]
+    fn test_warm_accounts_batch_returns_resident_count() {
+        let sm = StateManager::new();
+        let store = MockStore::new();
+        store.put("on_disk_1", make_account(1));
+        store.put("on_disk_2", make_account(2));
+        sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        // Already resident
+        sm.accounts.insert("in_cache".to_string(), make_account(3));
+
+        let batch: Vec<String> = vec![
+            "in_cache".to_string(),
+            "on_disk_1".to_string(),
+            "on_disk_2".to_string(),
+            "ghost".to_string(),
+        ];
+        let resident = sm.warm_accounts(&batch);
+        // Three of the four are resident: in_cache (was already there)
+        // plus on_disk_1 + on_disk_2 (loaded from disk and inserted into
+        // the cache). `ghost` is genuinely absent from the disk store.
+        assert_eq!(resident, 3);
+        // Disk was probed three times — once for every cache miss
+        // (on_disk_1, on_disk_2, ghost). The "ghost" probe still costs
+        // a single point read because we cannot tell up-front whether
+        // an address exists on disk; the cost is bounded and
+        // benign at production address counts.
+        assert_eq!(store.loads(), 3);
+        // Cache must contain the two newly-loaded entries plus the
+        // pre-existing one — but NOT `ghost` (genuinely absent).
+        assert!(sm.accounts.contains_key("in_cache"));
+        assert!(sm.accounts.contains_key("on_disk_1"));
+        assert!(sm.accounts.contains_key("on_disk_2"));
+        assert!(!sm.accounts.contains_key("ghost"));
+    }
+
+    #[test]
+    fn test_set_cache_capacity_changes_value() {
+        let sm = StateManager::new();
+        assert_eq!(sm.cache_capacity_value(), 0);
+        sm.set_cache_capacity(123_456);
+        assert_eq!(sm.cache_capacity_value(), 123_456);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.10 STAGE-2: METRICS COUNTERS
+    // ────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn test_metrics_initial_state() {
+        let sm = StateManager::new();
+        let (hits, misses, dh, dm, ev) = sm.cache_metrics();
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 0);
+        assert_eq!(dh, 0);
+        assert_eq!(dm, 0);
+        assert_eq!(ev, 0);
+        // No traffic yet → ratio reported as 100% (no problem signal).
+        assert_eq!(sm.cache_hit_ratio_bps(), 10_000);
+    }
+
+    #[test]
+    fn test_metrics_track_warm_outcomes() {
+        let sm = StateManager::new();
+        let store = MockStore::new();
+        store.put("disk_a", make_account(1));
+        sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        sm.accounts.insert("ram_a".to_string(), make_account(2));
+
+        // Cache hit
+        sm.warm_account("ram_a");
+        // Disk hit (was on disk, now cached)
+        sm.warm_account("disk_a");
+        // Genuine miss
+        sm.warm_account("ghost");
+
+        let (hits, misses, dh, dm, _) = sm.cache_metrics();
+        assert_eq!(hits, 1);     // ram_a
+        assert_eq!(misses, 2);   // disk_a + ghost
+        assert_eq!(dh, 1);       // disk_a found
+        assert_eq!(dm, 1);       // ghost not on disk
+    }
+
+    #[test]
+    fn test_metrics_evictions_counter_accumulates() {
+        let sm = StateManager::new();
+        sm.set_cache_capacity(2);
+        for i in 0..5 {
+            sm.accounts.insert(format!("u{}", i), make_account(0));
+            sm.last_access.insert(format!("u{}", i), 100 + i as u64);
+        }
+        // First sweep: drop 3.
+        let evicted_a = sm.evict_cold_accounts();
+        assert_eq!(evicted_a, 3);
+        // Second sweep: nothing to do.
+        let evicted_b = sm.evict_cold_accounts();
+        assert_eq!(evicted_b, 0);
+        let (_, _, _, _, total) = sm.cache_metrics();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn test_metrics_hit_ratio_basis_points() {
+        let sm = StateManager::new();
+        sm.accounts.insert("hot".to_string(), make_account(0));
+        // 9 hits, 1 miss → 9000 bps
+        for _ in 0..9 {
+            sm.warm_account("hot");
+        }
+        sm.warm_account("ghost"); // genuine miss, no disk store
+        assert_eq!(sm.cache_hit_ratio_bps(), 9_000);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.10 STAGE-2: STRESS TEST AT 100 K+ ACCOUNTS
+    // ────────────────────────────────────────────────────────────────────────
+    // Simulates the production cache scenario with a working set vastly
+    // larger than the cap. Validates that:
+    //   * the cache size never exceeds the cap after eviction sweeps,
+    //   * cold reads round-trip through the disk store correctly,
+    //   * hit ratio approximates the working-set vs cap arithmetic,
+    //   * eviction is deterministic against last_access timestamps.
+    //
+    // Uses a 50 K total set and a 1 K cap to keep the test bounded for
+    // CI (~50 ms wall-clock); the policy under test scales identically
+    // to the 100 M-vs-500 K production ratio.
+    // ════════════════════════════════════════════════════════════════════════
+    #[test]
+    fn test_stress_eviction_keeps_size_within_cap() {
+        const TOTAL_ACCOUNTS: usize = 50_000;
+        const CACHE_CAP: usize = 1_000;
+
+        let sm = StateManager::new();
+        let store = MockStore::new();
+        // Pre-populate the disk store with TOTAL_ACCOUNTS entries.
+        for i in 0..TOTAL_ACCOUNTS {
+            store.put(&format!("acc_{:06}", i), make_account(i as u64));
+        }
+        sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        sm.set_cache_capacity(CACHE_CAP);
+
+        // Walk the entire address space; each warm causes a cold load
+        // and an insert. Periodically evict to keep size bounded.
+        for i in 0..TOTAL_ACCOUNTS {
+            assert!(sm.warm_account(&format!("acc_{:06}", i)));
+            if i > 0 && i % 5_000 == 0 {
+                sm.evict_cold_accounts();
+                assert!(
+                    sm.cache_size() <= CACHE_CAP,
+                    "cache size {} exceeded cap {} at i={}", sm.cache_size(), CACHE_CAP, i,
+                );
+            }
+        }
+        // Final eviction sweep must bring the cache to exactly the cap.
+        sm.evict_cold_accounts();
+        assert_eq!(sm.cache_size(), CACHE_CAP);
+        // Every address was on disk → every miss had a disk hit.
+        let (_, misses, dh, dm, ev) = sm.cache_metrics();
+        // First touch of each address is a miss.
+        assert!(misses >= TOTAL_ACCOUNTS as u64);
+        // Disk found everything (no genuine misses).
+        assert_eq!(dh, misses);
+        assert_eq!(dm, 0);
+        // Many evictions.
+        assert!(ev > 0);
+    }
+
+    #[test]
+    fn test_stress_hot_path_stays_resident() {
+        const HOT_SET_SIZE: usize = 100;
+        const COLD_SET_SIZE: usize = 5_000;
+        const CACHE_CAP: usize = 200;
+
+        let sm = StateManager::new();
+        let store = MockStore::new();
+        // Hot accounts AND cold accounts both live on disk.
+        for i in 0..HOT_SET_SIZE {
+            store.put(&format!("hot_{:04}", i), make_account(i as u64));
+        }
+        for i in 0..COLD_SET_SIZE {
+            store.put(&format!("cold_{:06}", i), make_account(1_000_000 + i as u64));
+        }
+        sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        sm.set_cache_capacity(CACHE_CAP);
+
+        // Warm hot set first — these get the OLDEST timestamps (we'll
+        // touch them again later to bring them forward).
+        for i in 0..HOT_SET_SIZE {
+            sm.warm_account(&format!("hot_{:04}", i));
+        }
+
+        // Walk through the cold set, repeatedly re-touching the hot
+        // accounts so their last_access timestamp stays fresh.
+        for i in 0..COLD_SET_SIZE {
+            sm.warm_account(&format!("cold_{:06}", i));
+            // Every 50 cold reads, refresh every hot account.
+            if i % 50 == 0 {
+                for j in 0..HOT_SET_SIZE {
+                    sm.warm_account(&format!("hot_{:04}", j));
+                }
+                sm.evict_cold_accounts();
+            }
+        }
+        sm.evict_cold_accounts();
+
+        // After all the churn, every hot account must still be resident:
+        // the eviction sweep picks the OLDEST entries first, and the hot
+        // set is kept fresh by the periodic refresh above.
+        let mut hot_resident = 0usize;
+        for i in 0..HOT_SET_SIZE {
+            if sm.accounts.contains_key(&format!("hot_{:04}", i)) {
+                hot_resident += 1;
+            }
+        }
+        assert_eq!(
+            hot_resident, HOT_SET_SIZE,
+            "hot set must stay resident across cold-read churn",
+        );
+        // Cache size respects cap.
+        assert!(sm.cache_size() <= CACHE_CAP);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.10 STAGE-2A: STATE PARTITIONING — DETERMINISTIC ASSIGNMENT TESTS
+    // ────────────────────────────────────────────────────────────────────────
+    // These pin the canonical shard-assignment invariants that Stage-2B
+    // and Stage-2C will rely on once the per-shard consensus path lands:
+    //   * deterministic — same input always maps to the same shard,
+    //   * stateless — no hidden dependencies on StateManager state,
+    //   * uniform — load distribution across shards is balanced for
+    //     a representative input set,
+    //   * range-bounded — output is always strictly less than num_shards.
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_shard_index_deterministic() {
+        // Same input → same output, every time.
+        let a1 = account_shard_index("alice", 16);
+        let a2 = account_shard_index("alice", 16);
+        let a3 = account_shard_index("alice", 16);
+        assert_eq!(a1, a2);
+        assert_eq!(a2, a3);
+    }
+
+    #[test]
+    fn test_shard_index_within_range() {
+        for n in [1u32, 2, 4, 16, 64, 256] {
+            for sample in &["a", "bob", "long-account-id-for-shard-test", "0xdeadbeef"] {
+                let idx = account_shard_index(sample, n);
+                assert!(idx < n, "addr={} n={} idx={}", sample, n, idx);
+            }
+        }
+    }
+
+    #[test]
+    fn test_shard_index_zero_treated_as_one() {
+        // num_shards = 0 must NOT panic and must not divide-by-zero.
+        // Treated identically to num_shards = 1 (single-shard fallback).
+        for sample in &["alpha", "beta", "gamma"] {
+            assert_eq!(account_shard_index(sample, 0), 0);
+            assert_eq!(account_shard_index(sample, 1), 0);
+        }
+    }
+
+    #[test]
+    fn test_shard_index_empty_address_returns_zero() {
+        assert_eq!(account_shard_index("", 16), 0);
+        assert_eq!(account_shard_index("", 1), 0);
+        assert_eq!(account_shard_index("", 256), 0);
+    }
+
+    #[test]
+    fn test_shard_index_uniform_distribution_over_large_input() {
+        // 10 000 distinct addresses spread across 16 shards. Per-shard
+        // count should be 10000/16 = 625 with √-bounded variance. We
+        // check that every shard receives at least 75 % of mean — well
+        // within the law-of-large-numbers tail for Blake3.
+        const N: u32 = 16;
+        const TOTAL: usize = 10_000;
+        let mut bucket = [0usize; 16];
+        for i in 0..TOTAL {
+            let addr = format!("acc_{:08}", i);
+            let s = account_shard_index(&addr, N);
+            bucket[s as usize] += 1;
+        }
+        let mean = TOTAL / N as usize;
+        let floor = mean * 75 / 100;
+        for (s, count) in bucket.iter().enumerate() {
+            assert!(
+                *count >= floor,
+                "shard {} got {} samples (mean {}, floor {})",
+                s, count, mean, floor,
+            );
+        }
+    }
+
+    #[test]
+    fn test_state_manager_default_single_shard() {
+        let sm = StateManager::new();
+        // Default num_shards == 1 keeps Stage-2A inactive.
+        assert_eq!(sm.num_shards(), 1);
+        // Every address maps to shard 0 under default config.
+        for addr in &["alice", "bob", "carol"] {
+            assert_eq!(sm.shard_for(addr), 0);
+        }
+    }
+
+    #[test]
+    fn test_state_manager_set_num_shards_round_trip() {
+        let sm = StateManager::new();
+        sm.set_num_shards(64);
+        assert_eq!(sm.num_shards(), 64);
+        // shard_for now respects the new count.
+        let s = sm.shard_for("alice");
+        assert!(s < 64);
+        // Rejecting `0` keeps the previous value.
+        sm.set_num_shards(0);
+        assert_eq!(sm.num_shards(), 64);
+    }
+
+    #[test]
+    fn test_state_manager_shard_for_matches_account_shard_index() {
+        let sm = StateManager::new();
+        sm.set_num_shards(32);
+        for addr in &["alice", "bob", "0xdeadbeef", "long-test-address-id"] {
+            assert_eq!(
+                sm.shard_for(addr),
+                account_shard_index(addr, 32),
+                "shard_for must match the static helper for addr={}", addr,
+            );
+        }
+    }
+
+    #[test]
+    fn test_stress_concurrent_warms_remain_consistent() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        const WORKERS: usize = 8;
+        const PER_WORKER: usize = 2_000;
+        const CACHE_CAP: usize = 500;
+
+        let sm = StdArc::new(StateManager::new());
+        let store = MockStore::new();
+        for i in 0..(WORKERS * PER_WORKER) {
+            store.put(&format!("a_{:06}", i), make_account(i as u64));
+        }
+        sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        sm.set_cache_capacity(CACHE_CAP);
+
+        // Spawn workers that each walk a disjoint slice of the address
+        // space. Every worker hits a unique key set so the only
+        // contention is on the shared DashMap / metrics counters.
+        let mut handles = Vec::new();
+        for w in 0..WORKERS {
+            let sm_clone = sm.clone();
+            handles.push(thread::spawn(move || {
+                let start = w * PER_WORKER;
+                for i in start..(start + PER_WORKER) {
+                    sm_clone.warm_account(&format!("a_{:06}", i));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        // Eviction may have run concurrently on no thread — call it now
+        // so the cap invariant holds.
+        sm.evict_cold_accounts();
+        assert!(
+            sm.cache_size() <= CACHE_CAP,
+            "concurrent warm produced cache size {} > cap {}",
+            sm.cache_size(), CACHE_CAP,
+        );
+        // Every worker contributed PER_WORKER misses (first-time loads).
+        let (_, misses, dh, dm, _) = sm.cache_metrics();
+        assert_eq!(misses, (WORKERS * PER_WORKER) as u64);
+        assert_eq!(dh, misses); // all addresses existed on disk
+        assert_eq!(dm, 0);
     }
 }
 

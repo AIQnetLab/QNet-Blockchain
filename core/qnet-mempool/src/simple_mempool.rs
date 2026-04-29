@@ -91,6 +91,22 @@ pub struct SimpleMempool {
     /// Sized identically to `commitment_index`; both are maintained as a
     /// pair under the same admission/removal logic.
     commitment_reverse: Arc<DashMap<String, (String, u64, u8)>>,
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.9: PERSISTENT MEMPOOL HOOKS
+    // ────────────────────────────────────────────────────────────────────────
+    // The integration layer sets these callbacks at node start so every
+    // admission and removal is mirrored to a RocksDB column family. On
+    // restart the integration layer scans that CF and replays each
+    // entry back through `add_binary_transaction`, restoring the
+    // pending-TX queue exactly as it was before the crash. Hooks are
+    // optional — when unset, the mempool behaves as a pure RAM cache
+    // (legacy behaviour for tooling that links the crate directly).
+    //
+    // The signatures use simple `Arc<dyn Fn>` so the mempool crate stays
+    // free of any storage dependency and can be reused in tests.
+    persist_admit: Arc<RwLock<Option<Arc<dyn Fn(&str, &[u8], u64) + Send + Sync>>>>,
+    persist_remove: Arc<RwLock<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
 }
 
 impl SimpleMempool {
@@ -113,6 +129,42 @@ impl SimpleMempool {
             // v15.5: commitment-class dedup indices (see struct doc)
             commitment_index: Arc::new(DashMap::new()),
             commitment_reverse: Arc::new(DashMap::new()),
+            // v15.9: persistent mempool hooks (set by integration layer)
+            persist_admit: Arc::new(RwLock::new(None)),
+            persist_remove: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// v15.9: Install persistence callbacks. Called once by the integration
+    /// layer at node startup, before the mempool starts receiving TXs.
+    /// `admit` runs on every successful admission (raw / binary / batch
+    /// / commitment-replacement); `remove` runs on every removal path
+    /// (block inclusion, TTL eviction, replacement, explicit drop).
+    pub fn set_persistence_hooks(
+        &self,
+        admit: Arc<dyn Fn(&str, &[u8], u64) + Send + Sync>,
+        remove: Arc<dyn Fn(&str) + Send + Sync>,
+    ) {
+        *self.persist_admit.write() = Some(admit);
+        *self.persist_remove.write() = Some(remove);
+    }
+
+    /// Internal helper — invoke the admit hook if installed.
+    /// Kept private so call sites cannot bypass it.
+    fn fire_persist_admit(&self, tx_hash: &str, payload: &[u8]) {
+        if let Some(cb) = self.persist_admit.read().as_ref() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            cb(tx_hash, payload, ts);
+        }
+    }
+
+    /// Internal helper — invoke the remove hook if installed.
+    fn fire_persist_remove(&self, tx_hash: &str) {
+        if let Some(cb) = self.persist_remove.read().as_ref() {
+            cb(tx_hash);
         }
     }
 
@@ -177,6 +229,14 @@ impl SimpleMempool {
                 hashes.retain(|h| h != old);
             }
             priority_queue.retain(|_, hashes| !hashes.is_empty());
+            drop(priority_queue);
+
+            // v15.9: persistent mempool — the prior commitment was just
+            // wiped from every in-RAM structure, mirror its removal to
+            // the disk CF so a restart does not re-admit a stale
+            // commitment that the canonical chain has already
+            // superseded.
+            self.fire_persist_remove(old);
         }
 
         old_hash
@@ -334,8 +394,16 @@ impl SimpleMempool {
         let storage = if self.use_binary {
             TxStorage::Binary(tx_json.as_bytes().to_vec())
         } else {
-            TxStorage::Json(tx_json)
+            TxStorage::Json(tx_json.clone())
         };
+
+        // v15.9: precompute the bincode payload for the persistent mirror
+        // BEFORE entering the priority-queue lock so we can release the
+        // lock as quickly as possible. We persist Transaction as bincode
+        // for forward-compatibility with the binary admit path — a
+        // restarted node can replay every entry through
+        // `add_binary_transaction` regardless of which API admitted it.
+        let persist_payload: Option<Vec<u8>> = bincode::serialize(&parsed_tx).ok();
 
         // v2.67: CRITICAL - Add to BOTH structures atomically under priority queue lock
         {
@@ -353,7 +421,12 @@ impl SimpleMempool {
             priority_queue
                 .entry(effective_priority)
                 .or_insert_with(VecDeque::new)
-                .push_back(hash);
+                .push_back(hash.clone());
+        }
+
+        // v15.9: persistent mempool — mirror admission to RocksDB.
+        if let Some(bytes) = persist_payload {
+            self.fire_persist_admit(&hash, &bytes);
         }
 
         true
@@ -391,6 +464,7 @@ impl SimpleMempool {
         let effective_priority = if is_system { u64::MAX } else { gas_price };
 
         // FIX M-H15: Evict lowest-priority TX when mempool is full
+        let mut evicted_for_persist: Option<String> = None;
         if self.transactions.len() >= self.config.max_size {
             let mut priority_queue = self.by_gas_price.write();
             if let Some(mut lowest_entry) = priority_queue.first_entry() {
@@ -407,6 +481,11 @@ impl SimpleMempool {
                         // live mempool occupancy when low-priority eviction
                         // drops a commitment-class TX.
                         self.cleanup_commitment_indices_for_hash(&tx_hash);
+                        // v15.9: defer the persistent-mirror removal to AFTER
+                        // we release the priority-queue write lock — the
+                        // hook performs disk I/O and must not run under
+                        // the lock.
+                        evicted_for_persist = Some(tx_hash.clone());
                         println!("[INFO][MEMPOOL] evicted_low_priority gas={} for_new_gas={} new_is_system={}",
                                  lowest_gas, effective_priority, is_system);
                     }
@@ -419,6 +498,14 @@ impl SimpleMempool {
                 return false;
             }
             drop(priority_queue);
+        }
+
+        // v15.9: persistent mempool — flush the deferred eviction now that
+        // the priority-queue write lock is released. Doing the disk
+        // delete outside the lock keeps admission throughput unaffected
+        // by RocksDB latency.
+        if let Some(ref evicted_hash) = evicted_for_persist {
+            self.fire_persist_remove(evicted_hash);
         }
 
         // PROTOCOL: Reject TX already confirmed in recent blocks (prevents post-gossip re-inclusion)
@@ -480,6 +567,7 @@ impl SimpleMempool {
 
         // v2.67: CRITICAL - Add to BOTH structures atomically under priority queue lock
         // This prevents race condition where TX is in transactions but not in priority queue
+        let persist_payload: Vec<u8>;
         {
             let mut priority_queue = self.by_gas_price.write();
 
@@ -487,6 +575,11 @@ impl SimpleMempool {
             if self.transactions.contains_key(&hash) {
                 return false;
             }
+
+            // v15.9: keep a copy of the binary payload BEFORE moving it into
+            // the in-RAM map; we use it to mirror the admission to the
+            // persistent mempool CF after the lock is released.
+            persist_payload = tx_bytes.clone();
 
             // Add to transactions first
             self.transactions.insert(hash.clone(), TxStorage::Binary(tx_bytes));
@@ -513,7 +606,13 @@ impl SimpleMempool {
                 }
             }
         }
-        
+
+        // v15.9: persistent mempool — mirror the admission to RocksDB after
+        // releasing the priority-queue lock. The hook is async-safe and
+        // returns immediately; the actual disk write is a single
+        // `put_cf` on a hot CF (microsecond-scale).
+        self.fire_persist_admit(&hash, &persist_payload);
+
         true
     }
     
@@ -537,6 +636,12 @@ impl SimpleMempool {
         }
 
         let mut added = 0usize;
+
+        // v15.9: persistence-hook deferral buffers. Gathered under the held
+        // priority-queue lock and replayed AFTER the lock is released so
+        // disk I/O never serialises behind the in-memory admission lock.
+        let mut pending_persist_admit: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut pending_persist_remove: Vec<String> = Vec::new();
 
         // CRITICAL: Acquire priority queue lock BEFORE inserting into DashMap
         // This makes both insertions atomic, preventing the race condition where
@@ -618,8 +723,18 @@ impl SimpleMempool {
                              &key.0[..16.min(key.0.len())], key.1, key.2,
                              &old[..16.min(old.len())],
                              &hash[..16.min(hash.len())]);
+                    // v15.9: defer the persistent-mirror removal to AFTER
+                    // the priority-queue lock is released.
+                    pending_persist_remove.push(old);
                 }
             }
+
+            // v15.9: capture payload for the persistent-mirror admit hook
+            // BEFORE moving `tx_bytes` into the in-RAM map. The trusted
+            // batch path is the hottest admission route at scale (P2P
+            // gossip-batch ingestion), so deferring the disk write here
+            // matters even more than on the single-TX paths.
+            pending_persist_admit.push((hash.clone(), tx_bytes.clone()));
 
             // TRUSTED: Skip hash verification - caller guarantees correctness
             // Insert into BOTH structures within the same lock scope
@@ -635,6 +750,18 @@ impl SimpleMempool {
         // Drop empty priority levels created by commitment evictions above
         // so the queue stays compact across batch boundaries.
         priority_queue.retain(|_, hashes| !hashes.is_empty());
+        drop(priority_queue);
+
+        // v15.9: replay persistent-mirror hooks AFTER releasing the lock.
+        // Removals fire first so a same-batch admit + replace scenario
+        // ends with the new entry on disk (last-write-wins matches the
+        // in-RAM final state).
+        for old_hash in &pending_persist_remove {
+            self.fire_persist_remove(old_hash);
+        }
+        for (h, payload) in &pending_persist_admit {
+            self.fire_persist_admit(h, payload);
+        }
 
         added
     }
@@ -718,6 +845,13 @@ impl SimpleMempool {
                 hashes.retain(|h| h != hash);
             }
             priority_queue.retain(|_, hashes| !hashes.is_empty());
+            drop(priority_queue);
+
+            // v15.9: persistent mempool — mirror the removal to RocksDB.
+            // Lock is released before the disk delete to keep the
+            // priority queue available to concurrent admissions.
+            self.fire_persist_remove(hash);
+
             true
         } else {
             false
@@ -727,6 +861,14 @@ impl SimpleMempool {
     /// Clear all transactions (both storage and priority queue)
     /// CRITICAL: Clears both data structures to maintain consistency
     pub fn clear(&self) {
+        // v15.9: snapshot all hashes BEFORE clearing in-RAM structures so
+        // we can mirror the removal to RocksDB without iterating an
+        // already-emptied DashMap.
+        let hashes_to_persist_remove: Vec<String> = self.transactions
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+
         self.transactions.clear();
         self.by_gas_price.write().clear();
         self.tx_sender_map.clear();
@@ -735,6 +877,12 @@ impl SimpleMempool {
         // mempool state so no stale entries survive a full reset.
         self.commitment_index.clear();
         self.commitment_reverse.clear();
+
+        // v15.9: mirror the wipe to RocksDB. Each hash gets its own
+        // persist_remove call so the CF stays consistent with RAM.
+        for hash in &hashes_to_persist_remove {
+            self.fire_persist_remove(hash);
+        }
     }
     
     /// Get mempool size
@@ -894,10 +1042,21 @@ impl SimpleMempool {
                 hashes.retain(|h| !expired_set.contains(h));
             }
             priority_queue.retain(|_, hashes| !hashes.is_empty());
+            drop(priority_queue);
 
             // FIX L-M16: Reset sender counts after bulk removal to stay accurate
             // Without per-TX sender tracking, a full reset is the safest approach
             self.reset_sender_counts();
+
+            // v15.9: persistent mempool — mirror TTL evictions to RocksDB
+            // AFTER the priority-queue lock is released. Without this the
+            // disk CF would carry expired TX hashes that boot rehydration
+            // would re-admit, producing zombie entries that get
+            // re-evicted on the next TTL pass — wasted disk traffic and
+            // a misleading mempool size on restart.
+            for hash in &expired_hashes {
+                self.fire_persist_remove(hash);
+            }
         }
 
         expired_hashes.len()
