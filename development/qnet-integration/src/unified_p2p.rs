@@ -2715,7 +2715,7 @@ impl SimplifiedP2P {
                         reputation_sys.set_reputation(&genesis_id, INITIAL_REPUTATION);
                     }
                     // PRIVACY: Show pseudonym instead of node_id
-                    let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                    let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") || node_id.starts_with("super_") {
                         node_id.clone()
                     } else {
                         get_privacy_id_for_addr(&node_id)
@@ -3143,7 +3143,7 @@ impl SimplifiedP2P {
         // v2.21.5: Jails now handled via DeterministicReputationState from blockchain
         // This sync is only for logging - actual jails are in blockchain
         for (node_id, jailed_until, jail_count, _reason) in jail_statuses {
-            let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+            let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") || node_id.starts_with("super_") {
                 node_id.clone()
             } else {
                 get_privacy_id_for_addr(&node_id)
@@ -3166,7 +3166,7 @@ impl SimplifiedP2P {
         self.load_jail_statuses_on_startup();
         
         // PRIVACY: Use pseudonym even in startup logs
-        let display_id = if self.node_id.starts_with("genesis_node_") || self.node_id.starts_with("node_") {
+        let display_id = if self.node_id.starts_with("genesis_node_") || self.node_id.starts_with("node_") || self.node_id.starts_with("super_") {
             self.node_id.clone()
         } else {
             get_privacy_id_for_addr(&self.node_id)
@@ -20132,7 +20132,7 @@ impl SimplifiedP2P {
                 // The old P2P-based reputation caused desync between nodes
                 #[cfg(debug_assertions)]
                 {
-                    let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                    let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") || node_id.starts_with("super_") {
                         node_id.to_string()
                     } else {
                         get_privacy_id_for_addr(node_id)
@@ -20181,7 +20181,7 @@ impl SimplifiedP2P {
         
         // v2.21.5: DEPRECATED - reputation now managed via blockchain only
         // Reputation changes: slashing events (penalties), process_block/macroblock (rewards)
-        let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+        let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") || node_id.starts_with("super_") {
             node_id.to_string()
         } else {
             get_privacy_id_for_addr(node_id)
@@ -24327,7 +24327,7 @@ impl SimplifiedP2P {
             }
             
             // PRIVACY: Use pseudonym for logging
-            let display_id = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
+            let display_id = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") || failed_producer.starts_with("super_") {
                 failed_producer.clone()
             } else {
                 get_privacy_id_for_addr(&failed_producer)
@@ -24340,7 +24340,7 @@ impl SimplifiedP2P {
         
         // PRIVACY: Use privacy-preserving identifiers in logs
         // CRITICAL FIX: Don't double-convert if already a pseudonym
-        let failed_display = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
+        let failed_display = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") || failed_producer.starts_with("super_") {
             failed_producer.clone()
         } else {
             get_privacy_id_for_addr(&failed_producer)
@@ -24936,7 +24936,7 @@ impl SimplifiedP2P {
         
         thread::spawn(move || {
             // PRIVACY: Use pseudonym for logging
-            let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+            let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") || node_id.starts_with("super_") {
                 node_id.clone()
             } else {
                 get_privacy_id_for_addr(&node_id)

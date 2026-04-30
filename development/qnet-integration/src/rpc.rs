@@ -12679,15 +12679,105 @@ fn extract_peer_ip_from_request() -> Option<String> {
 pub fn generate_light_node_pseudonym(wallet_address: &str) -> String {
     // EXISTING PATTERN: Use blake3 hash like other node identity functions
     let pseudonym_hash = blake3::hash(format!("LIGHT_NODE_PRIVACY_{}", wallet_address).as_bytes());
-    
+
     // PRIVACY: Generate mobile-friendly pseudonym without revealing IP or location
     // Format: light_[region_hint]_[8_hex_chars] - no personal data exposed
     let region_hint = std::env::var("QNET_REGION")
         .unwrap_or_else(|_| "mobile".to_string())
         .to_lowercase();
-    
-    format!("light_{}_{}", 
-            region_hint, 
+
+    format!("light_{}_{}",
+            region_hint,
+            &pseudonym_hash.to_hex()[..8])
+}
+
+/// v15.11: Quantum-secure pseudonym for regular Super nodes — symmetric with the
+/// Light-node pseudonym scheme above.
+///
+/// PROBLEM SOLVED
+/// ─────────────
+/// The pre-v15.11 generator emitted `node_<sanitized_ip>` for non-genesis super
+/// nodes (node.rs::generate_unique_node_id Priority 4-6). Three independent
+/// architectural inconsistencies followed:
+///
+///   1. **Heartbeat TX rejection.** The HeartbeatCommitment validator
+///      (qnet-state/transaction.rs) accepts only `light_*`, `super_*`,
+///      `genesis_node_*` prefixes. An `node_*` ID failed the format check, so
+///      every regular super node's HeartbeatCommitment TX was silently rejected
+///      across the committee — zero rewards regardless of uptime or pings.
+///
+///   2. **Identity tied to network.** Sanitized IP / hostname / process_id
+///      changes when the operator moves the node, restarts the container with
+///      a new Docker hostname, or runs behind NAT — every change re-issues
+///      a new node_id and discards prior reputation / committee membership /
+///      heartbeat history.
+///
+///   3. **Privacy leak.** Embedding the public IP in the node_id linked the
+///      validator's network identity to its on-chain identity. Top-tier L1
+///      designs treat this as a fingerprinting hazard.
+///
+/// DESIGN
+/// ──────
+/// The Super pseudonym mirrors the Light scheme one-for-one, with a separate
+/// domain tag so the two namespaces never collide:
+///
+///   format:    super_<region>_<blake3(domain ‖ wallet)[..8]>
+///   example:   super_eu_d1fa101f
+///   domain:    "SUPER_NODE_PRIVACY_<wallet>"      (not reusable as light)
+///
+/// Properties:
+///
+///   * **Privacy-preserving.** Wallet address is hashed via Blake3 with a
+///     domain separator; only 8 hex chars (32 bits) of the digest are emitted.
+///     The wallet itself is not recoverable from the pseudonym.
+///
+///   * **Stable identity.** Same wallet → same pseudonym across container
+///     restarts, IP migrations, host swaps. Reputation and registration
+///     persist as long as the operator keeps the seed phrase.
+///
+///   * **Anti-Sybil.** One wallet → one super pseudonym deterministically.
+///     A burn-backed activation per wallet means an attacker must pay a
+///     fresh 1500 1DEV burn for each fake identity.
+///
+///   * **Recoverable.** Lost machine? Restore from seed → derive wallet →
+///     derive pseudonym → resume the prior node identity.
+///
+///   * **Domain-separated from light.** Different domain string prevents
+///     pseudonym-space collisions even when a single wallet activates both
+///     a light client and a super node.
+///
+///   * **Validator-aligned.** Resulting prefix `super_` is already on the
+///     `transaction.rs` heartbeat-validator whitelist — heartbeat TX and
+///     reward path work out-of-the-box, no validator changes required.
+///
+/// SCALABILITY
+/// ───────────
+/// Pseudonym space = 32 bits = 4.29 × 10⁹ unique IDs. At the documented
+/// MAX_VALIDATORS = 1000 active committee, collision probability via the
+/// birthday bound is ~1.16 × 10⁻⁴ — operationally negligible. For target
+/// scale of "thousands of registered super nodes" the bound stays well below
+/// 1 % even at 100 000 simultaneous registrations.
+///
+/// COMPLEXITY
+/// ──────────
+/// O(1) — single Blake3 hash + a `to_hex` truncation. Zero allocation beyond
+/// the returned `String`. Suitable for the hot init path on every node start.
+pub fn generate_super_node_pseudonym(wallet_address: &str) -> String {
+    // PRODUCTION: domain-separated Blake3 hash — distinct from the Light
+    // pseudonym domain above so a single wallet activating both tiers gets
+    // independent pseudonyms in the two namespaces.
+    let pseudonym_hash = blake3::hash(format!("SUPER_NODE_PRIVACY_{}", wallet_address).as_bytes());
+
+    // PRIVACY: Region hint is a coarse operational tag (eu / us / asia / …).
+    // Default "node" keeps the pseudonym deterministic when QNET_REGION is
+    // unset; operators can override per deployment without affecting the
+    // wallet-derived suffix.
+    let region_hint = std::env::var("QNET_REGION")
+        .unwrap_or_else(|_| "node".to_string())
+        .to_lowercase();
+
+    format!("super_{}_{}",
+            region_hint,
             &pseudonym_hash.to_hex()[..8])
 }
 

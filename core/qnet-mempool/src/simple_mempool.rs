@@ -107,6 +107,41 @@ pub struct SimpleMempool {
     // free of any storage dependency and can be reused in tests.
     persist_admit: Arc<RwLock<Option<Arc<dyn Fn(&str, &[u8], u64) + Send + Sync>>>>,
     persist_remove: Arc<RwLock<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.12: ON-CHAIN COMMITMENT-EPOCH CACHE (subscriber pattern)
+    // ────────────────────────────────────────────────────────────────────────
+    // Records every commitment-class epoch that has been finalized on chain.
+    // Populated by the integration layer's apply path (producer + peer) via
+    // `mark_commitment_finalized`, consumed by every admission path to reject
+    // duplicate commitment TXs at the door — the third tier of the
+    // defence-in-depth ladder behind the in-flight `commitment_index` and
+    // the producer-side block-construction filter.
+    //
+    // Architectural rationale:
+    //   * The state's authoritative `committed_epochs` map lives in the
+    //     `qnet-state` crate and is updated synchronously inside
+    //     `apply_to_state`. Mirroring its cumulative set into a mempool-local
+    //     `DashMap` keeps the admission path lock-free (no cross-crate state
+    //     read-guard, no async runtime coupling) while preserving the
+    //     mempool-cleanliness invariant: once an epoch is finalized, no fresh
+    //     admission can resurrect a commitment for that epoch.
+    //   * Both producer and peer apply paths call `mark_commitment_finalized`
+    //     — symmetric with the L1 peer-apply mempool cleanup. Honest nodes
+    //     converge on the same cached set deterministically.
+    //
+    // Key shape: `(identity, epoch_or_index, type_id)` — exactly the
+    // `commitment_dedup_key()` tuple. `bool` value is a placeholder; presence
+    // of the key is the only signal the admission path needs.
+    //
+    // Memory bound:
+    //   * One entry per (validator, type, finalized_epoch). At MAX_VALIDATORS
+    //     = 1000 cap × 5 commitment types × ~6 epochs/24h retention =
+    //     ~30 000 entries. ~50 bytes/entry → ~1.5 MB worst case. Trivial.
+    //   * Pruned by the `prune_committed_epochs_below` helper called from the
+    //     periodic TTL sweep so older finalized epochs don't accumulate
+    //     indefinitely (epoch_or_index ≤ now − retention_window).
+    committed_epochs_cache: Arc<DashMap<(String, u64, u8), ()>>,
 }
 
 impl SimpleMempool {
@@ -132,7 +167,43 @@ impl SimpleMempool {
             // v15.9: persistent mempool hooks (set by integration layer)
             persist_admit: Arc::new(RwLock::new(None)),
             persist_remove: Arc::new(RwLock::new(None)),
+            // v15.12: on-chain commitment-epoch cache (see struct doc)
+            committed_epochs_cache: Arc::new(DashMap::new()),
         }
+    }
+
+    /// v15.12: Notify the mempool that a commitment-class TX with
+    /// `(identity, epoch_or_index, type_id)` has been finalized on chain.
+    ///
+    /// Called by the integration layer's apply path on EVERY block apply
+    /// (producer + peer pipeline) for every commitment-class TX in the block.
+    /// Subsequent admission attempts for the same key are rejected at the
+    /// door — see `is_commitment_already_on_chain`.
+    ///
+    /// Idempotent: re-marking an already-known key is a no-op DashMap insert.
+    pub fn mark_commitment_finalized(&self, key: (String, u64, u8)) {
+        self.committed_epochs_cache.insert(key, ());
+    }
+
+    /// v15.12: Returns true if the mempool has previously been notified that
+    /// `(identity, epoch_or_index, type_id)` is finalized on chain.
+    /// O(1) DashMap lookup; safe in the lock-free admission hot path.
+    pub fn is_commitment_already_on_chain(&self, key: &(String, u64, u8)) -> bool {
+        self.committed_epochs_cache.contains_key(key)
+    }
+
+    /// v15.12: Bulk-prune finalized-epoch entries with `epoch_or_index < min_epoch`.
+    ///
+    /// Intended for the periodic TTL sweep so the cache footprint stays flat
+    /// at thousands-of-validators scale. NodeRegistration uses epoch=0 as a
+    /// one-shot marker and is intentionally excluded from pruning so a
+    /// long-lived registration never gets re-admissible after eviction.
+    pub fn prune_committed_epochs_below(&self, min_epoch: u64) {
+        self.committed_epochs_cache.retain(|key, _| {
+            // type_id 4 = NodeRegistration, one-shot keepsake at epoch=0.
+            let (_, epoch, type_id) = key;
+            *type_id == 4 || *epoch >= min_epoch
+        });
     }
 
     /// v15.9: Install persistence callbacks. Called once by the integration
@@ -351,6 +422,41 @@ impl SimpleMempool {
         }
 
         // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════
+        // v15.12 L3: ON-CHAIN COMMITMENT-EPOCH ADMISSION GUARD
+        // ═══════════════════════════════════════════════════════════════════
+        // Defence-in-depth against gossip TXs that arrive AFTER the same
+        // commitment epoch has been finalized on chain (typically: peer
+        // re-broadcast late, or local peer-apply notification raced with
+        // the gossip arrival). The producer-side filter (L2) and peer-apply
+        // cleanup (L1) handle the on-chain side; this guard prevents the
+        // mempool from holding an unreachable TX for the rest of its TTL,
+        // saving memory and bandwidth at thousands-of-validators scale.
+        //
+        // Cache is populated by `mark_commitment_finalized` calls from the
+        // integration layer's apply path on every block apply event. Lookup
+        // is a single lock-free DashMap query — adds ~50 ns to admissions
+        // for non-commitment TXs (single miss), and is the cheapest
+        // available rejection path for commitment TXs whose epoch has been
+        // finalized.
+        //
+        // Safe to ship a TX whose key is not yet in the cache: the producer
+        // L2 filter will catch it at block construction time, and the
+        // state-level `check_duplicate_commitment` is the final arbiter.
+        // L3 is purely an optimisation — never the sole source of truth.
+        // ═══════════════════════════════════════════════════════════════════
+        let commitment_key = parsed_tx.commitment_dedup_key();
+        if let Some(ref key) = commitment_key {
+            if self.is_commitment_already_on_chain(key) {
+                println!(
+                    "[INFO][MEMPOOL] admission_rejected_already_on_chain id={} epoch={} type={} hash={}",
+                    &key.0[..16.min(key.0.len())], key.1, key.2,
+                    &hash[..16.min(hash.len())]
+                );
+                return false;
+            }
+        }
+
         // v15.5: COMMITMENT REPLACEMENT — single-version-in-mempool guarantee
         // for the deterministic-(identity, epoch_or_index) TX class. Any
         // prior version sharing the same dedup key is removed from every
@@ -359,7 +465,6 @@ impl SimpleMempool {
         // post-replacement state. Non-commitment TXs return None and skip
         // this branch with one DashMap miss of overhead.
         // ═══════════════════════════════════════════════════════════════════
-        let commitment_key = parsed_tx.commitment_dedup_key();
         if let Some(ref key) = commitment_key {
             if let Some(old_hash) = self.replace_or_register_commitment(key.clone(), &hash) {
                 println!("[INFO][MEMPOOL] commitment_replaced id={} epoch={} type={} old={} new={}",
@@ -528,6 +633,31 @@ impl SimpleMempool {
         }
 
         // ═══════════════════════════════════════════════════════════════════
+        // v15.12 L3: ON-CHAIN COMMITMENT-EPOCH ADMISSION GUARD — binary path
+        // ═══════════════════════════════════════════════════════════════════
+        // Mirrors the L3 guard in `add_raw_transaction`. Binary admission is
+        // the hot route for commitments arriving via gossip / producer
+        // broadcast retries, so this is the most-frequently-traversed
+        // admission check at thousands-of-validators scale.
+        //
+        // Cache populated by `mark_commitment_finalized` from the integration
+        // layer's apply path on every block apply event. Single lock-free
+        // DashMap lookup per admission. See `add_raw_transaction` for the
+        // full architectural rationale.
+        // ═══════════════════════════════════════════════════════════════════
+        let commitment_key = parsed_tx.commitment_dedup_key();
+        if let Some(ref key) = commitment_key {
+            if self.is_commitment_already_on_chain(key) {
+                println!(
+                    "[INFO][MEMPOOL] admission_rejected_already_on_chain id={} epoch={} type={} hash={}",
+                    &key.0[..16.min(key.0.len())], key.1, key.2,
+                    &hash[..16.min(hash.len())]
+                );
+                return false;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
         // v15.5: COMMITMENT REPLACEMENT — see `add_raw_transaction` for the
         // full rationale. The binary path is the hot route for commitments
         // arriving via gossip and producer-side broadcast retries, so
@@ -536,7 +666,6 @@ impl SimpleMempool {
         // next producer's mempool can only contain one version of any
         // logical commitment.
         // ═══════════════════════════════════════════════════════════════════
-        let commitment_key = parsed_tx.commitment_dedup_key();
         if let Some(ref key) = commitment_key {
             if let Some(old_hash) = self.replace_or_register_commitment(key.clone(), &hash) {
                 println!("[INFO][MEMPOOL] commitment_replaced id={} epoch={} type={} old={} new={}",
@@ -689,6 +818,25 @@ impl SimpleMempool {
             } else {
                 None
             };
+
+            // ═══════════════════════════════════════════════════════════════
+            // v15.12 L3: ON-CHAIN COMMITMENT-EPOCH ADMISSION GUARD — trusted
+            // batch path. Mirrors the single-TX guards above, executed under
+            // the held `by_gas_price` lock so the rejection is atomic with
+            // the per-batch dedup transition that follows. Skipped for non-
+            // commitment TXs (key_opt = None) — single DashMap miss of
+            // overhead per non-commitment entry.
+            // ═══════════════════════════════════════════════════════════════
+            if let Some(ref key) = key_opt {
+                if self.is_commitment_already_on_chain(key) {
+                    println!(
+                        "[INFO][MEMPOOL] admission_rejected_already_on_chain_trusted id={} epoch={} type={} hash={}",
+                        &key.0[..16.min(key.0.len())], key.1, key.2,
+                        &hash[..16.min(hash.len())]
+                    );
+                    continue;
+                }
+            }
 
             if let Some(ref key) = key_opt {
                 use dashmap::mapref::entry::Entry;

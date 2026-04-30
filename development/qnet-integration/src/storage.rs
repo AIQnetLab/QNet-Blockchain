@@ -3539,23 +3539,112 @@ impl Storage {
         }
 
         // =====================================================================
-        // v14.0: STORAGE-LEVEL DEDUP — Defence-in-depth against silent overwrite
+        // v15.11 L4: STORAGE-LEVEL ANTI-FORK GUARD — last line of defense
         // =====================================================================
-        // Pipeline has dedup at decode (line 435) and apply (line 808) stages.
-        // Production path has dedup at line 18609. But a race window exists:
-        //   t=0ms: Both paths check load_microblock(h) → None
-        //   t=5ms: Path A saves block from network
-        //   t=10ms: Path B saves own block → OVERWRITES without error
+        // Forensic case h=174582: TWO different blocks were saved on different
+        // nodes for the same height (producer 001 saved hash A, producer 002
+        // saved hash B four seconds later). The pre-v15.11 storage layer used
+        // a presence-only check (`load_microblock_hash → Some?`) which let the
+        // *second* save silently no-op when in fact the second block was a
+        // legitimate equivocation worth detecting and rejecting.
         //
-        // This O(1) check via hash index (metadata CF lookup, no decompression)
-        // closes the race at the storage level. Cost: ~0.01ms per save.
-        // Scales to 1000+ nodes where concurrent block arrival is common.
+        // Industry-grade defence:
+        //   * Compute the canonical block hash from the incoming MicroBlock
+        //     struct (consensus property: SHA3-256 over height+ts+prev_hash+
+        //     merkle_root+producer — same algorithm as `save_microblock_efficient`).
+        //   * Compare against the stored hash for this height.
+        //   * Equal hash  → idempotent re-save (peer broadcast race), silent OK.
+        //   * Unequal     → EQUIVOCATION; record cryptographic evidence for the
+        //                   next macroblock's slashing list and REJECT the save.
+        //   * No deserialize possible → fall through to the legacy presence
+        //                               check (raw-bytes fallback path; rare).
+        //
+        // This makes a divergent fork in storage MATHEMATICALLY IMPOSSIBLE on
+        // any honest node, regardless of upstream race conditions or network
+        // partitions. It is the storage tier's contribution to defence-in-depth
+        // alongside the producer-side L3 pre-check, the network-side L5
+        // majority-wins resolver, and the L6 block-equivocation slashing.
+        //
+        // Scalability:
+        //   * Two RocksDB lookups + one hash compare per save. O(1) regardless
+        //     of validator count or chain length.
+        //   * Evidence storage bounded by the active retention window; cleared
+        //     by `cleanup_global_hashmaps` on the periodic sweep.
         // =====================================================================
-        if let Ok(Some(_)) = self.persistent.load_microblock_hash(height) {
-            if crate::node::is_info() {
-                println!("[INFO][STORAGE] dedup_blocked h={} (block already exists)", height);
+        let incoming_block: Option<qnet_state::MicroBlock> =
+            bincode::deserialize::<qnet_state::MicroBlock>(data).ok();
+        let incoming_hash: Option<[u8; 32]> = incoming_block.as_ref().map(|mb| mb.hash());
+
+        if let Ok(Some(existing_hash)) = self.persistent.load_microblock_hash(height) {
+            match incoming_hash {
+                Some(new_hash) if new_hash == existing_hash => {
+                    // Idempotent re-save (peer broadcast / production race
+                    // converged on the same canonical block). Silent OK.
+                    if crate::node::is_info() {
+                        println!("[INFO][STORAGE] dedup_blocked h={} (idempotent re-save, hash={:x?})",
+                                 height, &new_hash[..8]);
+                    }
+                    return Ok(());
+                }
+                Some(new_hash) => {
+                    // EQUIVOCATION — different block at the same height. Record
+                    // unforgeable evidence for the slashing pipeline and reject.
+                    let new_producer = incoming_block.as_ref()
+                        .map(|mb| mb.producer.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let new_signature = incoming_block.as_ref()
+                        .map(|mb| mb.signature.clone())
+                        .unwrap_or_default();
+
+                    // Recover existing block's signature for the slashing proof.
+                    // Best-effort: if the existing block can't be re-loaded, we
+                    // still record what we have (incoming side fully proven).
+                    let existing_signature: Vec<u8> = self.load_microblock(height)
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| bincode::deserialize::<qnet_state::MicroBlock>(&raw).ok())
+                        .map(|mb| mb.signature)
+                        .unwrap_or_default();
+
+                    if crate::node::is_warn() {
+                        println!(
+                            "[ERR][FORK] equivocation_attempt h={} existing_hash={:x?} new_hash={:x?} new_producer={} action=reject_save_record_evidence",
+                            height,
+                            &existing_hash[..8],
+                            &new_hash[..8],
+                            new_producer,
+                        );
+                    }
+                    crate::node::record_block_equivocation(
+                        height,
+                        &new_producer,
+                        existing_hash,
+                        new_hash,
+                        existing_signature,
+                        new_signature,
+                    );
+                    return Err(IntegrationError::StorageError(format!(
+                        "fork_conflict h={} existing_hash={:x?} new_hash={:x?} producer={}",
+                        height,
+                        &existing_hash[..8],
+                        &new_hash[..8],
+                        new_producer,
+                    )));
+                }
+                None => {
+                    // Could not deserialize incoming bytes (rare legacy path).
+                    // Fall back to presence-only behaviour to avoid breaking
+                    // raw-bytes fallback callers; log so the operator can
+                    // investigate the format mismatch.
+                    if crate::node::is_warn() {
+                        println!(
+                            "[WARN][STORAGE] dedup_presence_only h={} reason=incoming_undeserializable",
+                            height,
+                        );
+                    }
+                    return Ok(());
+                }
             }
-            return Ok(()); // Block exists — skip silently, not an error
         }
 
         // =====================================================================

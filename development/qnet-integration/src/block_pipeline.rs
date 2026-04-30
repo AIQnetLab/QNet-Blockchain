@@ -1743,6 +1743,98 @@ impl BlockPipeline {
                             block.microblock.timeout_round,
                         );
 
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        // v15.12 L1: PEER-APPLY MEMPOOL CLEANUP — closes the cross-block dedup gap
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        // Forensic case h=14351 → h=14461:
+                        //   Block 14351 (producer=node_004) included 5 HeartbeatCommitments.
+                        //   Every other validator applied that block via this pipeline path,
+                        //   but the v15.5 mempool cleanup hook lived ONLY on the producer-side
+                        //   block-construction path (node.rs:21199 `block_produced_cleanup`).
+                        //   Result: peer validators kept the same 5 TXs in their local mempools,
+                        //   so when one of them (node_002) became producer at h=14461 it pulled
+                        //   the same 5 commitments from its mempool again and re-included them
+                        //   in the block. State-level `check_duplicate_commitment` rejected the
+                        //   apply (good — no double accounting), but the TX bytes still
+                        //   occupied block storage and produced visible duplicates in the
+                        //   explorer + a 75 KB / block bandwidth tax for every subsequent
+                        //   producer until mempool TTL eviction kicked in.
+                        //
+                        // Industry-grade fix:
+                        //   Mempool cleanup must fire on EVERY block apply event — both the
+                        //   producer-side path (already covered in `node.rs::start_microblock_production`)
+                        //   AND this peer-side pipeline path. Symmetric semantics: once a TX is
+                        //   on chain, no honest validator's mempool should re-offer it for
+                        //   inclusion in any subsequent block.
+                        //
+                        // Also stamps `record_included_txs` so any in-flight gossip carrying a
+                        // late copy of the same TX hash gets dropped at the next admission
+                        // attempt (already-included guard in `SimpleMempool::add_*`).
+                        //
+                        // Scalability:
+                        //   * O(tx_count) hash compute + 1 batched DashMap remove per apply.
+                        //     Typical block: 0-50 TXs → microseconds. Genesis-mesh emission
+                        //     boundary peak ~150 TXs → still sub-millisecond.
+                        //   * Runs on the apply task's tokio thread inline — no blocking I/O,
+                        //     no extra task spawn, no inter-task signalling.
+                        //   * Safe at thousands of super-node committee size: the mempool's
+                        //     per-receive replacement (`replace_or_register_commitment`) and
+                        //     this cleanup form a closed-loop invariant that bounds mempool
+                        //     occupancy to (active_validators × commitment_types) regardless
+                        //     of total network size.
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        if !block.microblock.transactions.is_empty() {
+                            let included_hashes: Vec<String> = block.microblock.transactions.iter()
+                                .map(|tx| tx.hash.clone())
+                                .collect();
+                            if let Some(mempool_arc) = crate::node::try_get_mempool() {
+                                mempool_arc.record_included_txs(&included_hashes);
+                                mempool_arc.batch_remove_transactions(&included_hashes);
+
+                                // ═══════════════════════════════════════════════════════════════════
+                                // v15.12 L3: NOTIFY MEMPOOL OF FINALIZED COMMITMENT EPOCHS
+                                // ═══════════════════════════════════════════════════════════════════
+                                // Walk the applied block's transactions; for every commitment-class
+                                // TX, mark its `(identity, epoch_or_index, type_id)` key in the
+                                // mempool's `committed_epochs_cache`. Subsequent admission attempts
+                                // for the same key are rejected at the door (lock-free DashMap
+                                // lookup, ~50 ns), preventing late gossip / re-broadcast traffic
+                                // from re-populating the local mempool with already-on-chain TXs.
+                                //
+                                // Together with the producer-side L2 state check and the bulk
+                                // mempool removal above, this closes the cross-block duplication
+                                // window observed at h=14351 → h=14461 (5 HeartbeatCommitments
+                                // shipped twice 110 blocks apart due to peer-apply mempool
+                                // retention).
+                                //
+                                // Scalability: one DashMap insert per commitment TX per applied
+                                // block. At MAX_VALIDATORS=1000 epoch boundary peak = ~1000 inserts
+                                // per epoch boundary block — sub-millisecond at any committee size.
+                                // ═══════════════════════════════════════════════════════════════════
+                                let mut commitment_marks = 0usize;
+                                for tx in &block.microblock.transactions {
+                                    if let Some(key) = tx.commitment_dedup_key() {
+                                        mempool_arc.mark_commitment_finalized(key);
+                                        commitment_marks += 1;
+                                    }
+                                }
+
+                                if is_info() {
+                                    if commitment_marks > 0 {
+                                        println!(
+                                            "[INFO][MEMPOOL] peer_apply_cleanup h={} tx_count={} commitments_marked={}",
+                                            height, included_hashes.len(), commitment_marks
+                                        );
+                                    } else {
+                                        println!(
+                                            "[INFO][MEMPOOL] peer_apply_cleanup h={} tx_count={}",
+                                            height, included_hashes.len()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         // v15.6: chain-height bump on the blocking pool too —
                         // it is an atomic CF write but pays the same compaction
                         // queue penalty as the block save above.
@@ -1963,6 +2055,68 @@ impl BlockPipeline {
                             state_guard.rollback_block(snapshot);
                             if is_info() { println!("[INFO][PIPELINE] block_rollback h={} reason=save_failed", height); }
                         }
+
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        // v15.11 L5: MAJORITY-WINS FORK RESOLUTION TRIGGER
+                        // ═══════════════════════════════════════════════════════════════════════════
+                        // Save failed with `fork_conflict` means the storage L4 guard caught a
+                        // different block at the same height (the local one we previously stored
+                        // does NOT match the incoming one). The L4 guard already recorded
+                        // cryptographic equivocation evidence for the slashing pipeline; here we
+                        // additionally invoke the BFT majority resolver to decide which chain is
+                        // canonical and roll back the local minority chain if needed.
+                        //
+                        // Triggered ONLY on the `fork_conflict` error path; other StorageError
+                        // variants (full disk, IO error, corruption) are propagated unchanged.
+                        //
+                        // Safety:
+                        //   * Resolver requires 2f+1 supermajority before any rollback — Byzantine
+                        //     ≤ f cannot induce a wrong rollback.
+                        //   * On Abstain (no quorum), local chain is preserved — defensive bias.
+                        //   * Rollback is gated by `try_fork_recovery()` to prevent simultaneous
+                        //     rollback storms (only one fork-recovery in flight at a time).
+                        //
+                        // Scalability:
+                        //   * Triggered only on fork conflict (rare event by design).
+                        //   * One async task per conflict, bounded by the resolver's 800 ms
+                        //     timeout. No load on the apply pipeline itself — fire-and-forget.
+                        let err_msg = format!("{}", e);
+                        if err_msg.contains("fork_conflict") {
+                            if let Some(ref p2p) = ctx.unified_p2p {
+                                let p2p_clone = p2p.clone();
+                                let storage_for_lookup = ctx.storage.clone();
+                                let incoming_hash = block.microblock.hash();
+                                let conflict_height = height;
+                                tokio::spawn(async move {
+                                    // Recover the existing block's hash from storage (the one
+                                    // that L4 detected as conflicting against incoming).
+                                    let existing_hash = match tokio::task::spawn_blocking(move || {
+                                        storage_for_lookup
+                                            .load_microblock_hash(conflict_height)
+                                            .ok()
+                                            .flatten()
+                                    })
+                                    .await
+                                    {
+                                        Ok(Some(h)) => h,
+                                        _ => {
+                                            // Without the existing hash we cannot resolve;
+                                            // L4 evidence is still recorded for slashing.
+                                            return;
+                                        }
+                                    };
+
+                                    let _ = crate::node::handle_fork_at_height(
+                                        conflict_height,
+                                        incoming_hash,
+                                        existing_hash,
+                                        p2p_clone,
+                                    )
+                                    .await;
+                                });
+                            }
+                        }
+
                         false
                     }
                 }

@@ -444,11 +444,20 @@ impl BlockchainActivationRegistry {
                     let expected_super = format!("super_{}", code);
                     let expected_light = format!("light_{}", code);
                     let light_pseudonym = crate::rpc::generate_light_node_pseudonym(wallet_address);
-                    
+                    // v15.11: Super-node pseudonym — wallet-derived privacy-
+                    // preserving identity for non-genesis super nodes. Mirrors
+                    // the Light pseudonym scheme with a separate domain tag so
+                    // the two namespaces never collide. Accepted here alongside
+                    // historical `super_<activation_code>` so existing
+                    // activations remain valid while new nodes use the
+                    // pseudonym path.
+                    let super_pseudonym = crate::rpc::generate_super_node_pseudonym(wallet_address);
+
                     for (node_id, _node_type, _rep) in &nodes {
-                        if node_id == &expected_super 
-                            || node_id == &expected_light 
+                        if node_id == &expected_super
+                            || node_id == &expected_light
                             || node_id == &light_pseudonym
+                            || node_id == &super_pseudonym
                             || node_id == code {
                             println!("[INFO][VERIFY] ownership_confirmed method=rocksdb node={} wallet={}...",
                                 node_id, &wallet_address[..16.min(wallet_address.len())]);
