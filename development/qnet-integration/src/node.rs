@@ -16791,45 +16791,56 @@ impl BlockchainNode {
                         };
 
                         // ═══════════════════════════════════════════════════════════════
-                        // v14.8.10: BFT-DRIVEN ROTATION — certified.max(adopted)
+                        // v15.13: STRICT 2f+1 BFT-CERTIFIED ROTATION
                         // ═══════════════════════════════════════════════════════════════
-                        // Producer rotation for microblocks is driven by BFT-agreed
-                        // rounds derived from signed votes, NOT by local wall clock.
+                        // Producer rotation for microblocks is driven STRICTLY by the
+                        // 2f+1 BFT-certified rotation round. Adopted (f+1 voters' max
+                        // signed round) is retained for vote-collection acceleration
+                        // and observability/metrics, but is NEVER consumed by producer
+                        // selection — that path requires the supermajority guarantee.
                         //
-                        //   adopted  = f+1 voters' max signed round (HIGHEST_ADOPTED_ROUND)
-                        //   certified = 2f+1 signed same-round TimeoutCertificate
-                        //                (HIGHEST_CERTIFIED_ROUND)
+                        // Why this changed (forensic case h=556, 2026-04-30):
+                        //   The pre-v15.13 logic
+                        //       rotation_round = certified.max(adopted)
+                        //   computed leader from a value that could be elevated by
+                        //   `adopted` alone. `adopted` is f+1 (honest plurality, not
+                        //   supermajority) and is built from the local node's view of
+                        //   incoming TimeoutVotes — necessarily divergent across nodes
+                        //   under partial gossip propagation. Different `adopted` →
+                        //   different `rotation_round` → different leader → two
+                        //   producers create two different blocks at the same height
+                        //   (split-brain). Observed: node 005 ran with adopted=2 while
+                        //   nodes 001-004 had adopted=0 for the same macroblock,
+                        //   producing divergent h=556 blocks and stalling the network
+                        //   for 13 hours.
                         //
-                        //   rotation_round = certified.max(adopted)
+                        //   Industry-standard BFT chains (HotStuff family, Tendermint,
+                        //   PBFT-derived designs) require 2f+1 supermajority before
+                        //   any producer-selection state advances. f+1 is sufficient
+                        //   to detect liveness failure and emit votes, but NEVER to
+                        //   commit a leader-rotation decision. v15.13 aligns with that
+                        //   invariant.
                         //
-                        // Catch-up validators learn both values from gossip of signed
-                        // votes/TCs exactly as active validators do. They converge on
-                        // the same rotation_round the network is using, therefore select
-                        // the same producer from the VRF formula
-                        // `candidates[(base_idx + rotation_round) % N]`. No wall-clock
-                        // divergence.
+                        // Security:
+                        //   * HIGHEST_CERTIFIED_ROUND advances only on 2f+1 Dilithium3-
+                        //     signed TimeoutVotes at the SAME round — cryptographically
+                        //     unforgeable supermajority. Identical on every honest node
+                        //     by construction.
+                        //   * Byzantine attackers with ≤ f keys cannot move the
+                        //     certified round, therefore cannot induce divergent
+                        //     producer selection.
                         //
-                        // Why not wall clock (v14.8.7..9 approach): a node that has
-                        // spent N seconds catching up has wall clock N seconds ahead of
-                        // the canonical parent.timestamp. `(now − parent_ts) / rank_win`
-                        // gives a rank far from 0 even though the chain tip is healthy,
-                        // placing the catch-up node on a different producer index from
-                        // the live nodes — two blocks at the same height, fork. Observed
-                        // at h=339 on 2026-04-22.
+                        // Liveness:
+                        //   * P0-5 vote gossip (commit 97dd23d) propagates TimeoutVotes
+                        //     in O(log N) hops, so 2f+1 reach happens within
+                        //     RTT × log_5(committee) — ~400 ms at committee=1000.
+                        //     Failover latency penalty vs adopted: bounded ~400 ms.
+                        //   * Worst-case stall: the leader at certified_round dies and
+                        //     no 2f+1 honest nodes have voted yet. Resolves on the next
+                        //     vote round (≤ 1 s of stall + propagation).
                         //
-                        // Security of the BFT-driven model:
-                        //   * VOTER_MAX_ROUND inserts only after Dilithium3 verification
-                        //     (see verify_timeout_vote_signature at the top of the
-                        //     handler). A Byzantine attacker with ≤ f keys cannot reach
-                        //     the f+1 threshold on HIGHEST_ADOPTED_ROUND alone.
-                        //   * HIGHEST_CERTIFIED_ROUND still requires 2f+1 signed votes
-                        //     at the same round — unforgeable supermajority.
-                        //   * Wall clock is only used for local_delay (stall detection /
-                        //     vote-broadcast timing), capped at 30 s under catch-up so a
-                        //     fresh node cannot broadcast inflated rounds.
-                        //
-                        // Scalability: two O(1) DashMap reads per tick regardless of
-                        // validator count. Works identically at 5 or 5000 validators.
+                        // Scalability: one O(1) DashMap read per tick (certified only).
+                        // adopted still computed for logging/metrics — same cost.
                         // ═══════════════════════════════════════════════════════════════
                         let (adopted_timeout_round, f_plus_1) = if let Some(p2p) = &unified_p2p {
                             let total_validators = p2p.get_active_validator_count();
@@ -16840,7 +16851,9 @@ impl BlockchainNode {
                             (0, 2)
                         };
 
-                        let timeout_round_for_rotation = certified_timeout_round.max(adopted_timeout_round);
+                        // v15.13: STRICTLY certified (2f+1). adopted retained for
+                        // observability only; producer selection ignores it.
+                        let timeout_round_for_rotation = certified_timeout_round;
 
                         // ═══════════════════════════════════════════════════════════════
                         // v14.8.10: LOCAL PROPOSED ROUND (vote content only)
