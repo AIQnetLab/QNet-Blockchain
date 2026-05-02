@@ -1167,7 +1167,12 @@ impl BlockPipeline {
                 }
                 // (b) MEDIAN-PAST rule. Silently skipped during the first ~11
                 // blocks after boot when the ring is undersized.
-                if let Some(median_past) = crate::node::median_past_timestamp() {
+                // v15.15: height-ordered (BIP-113 canonical) — median is taken
+                // over the parent-chain segment [mb.height - WINDOW, mb.height),
+                // not over the last WINDOW insertions. Fixes false positives
+                // during catch-up sync where blocks legitimately re-arrive in
+                // non-height order.
+                if let Some(median_past) = crate::node::median_past_timestamp_at_height(mb.height) {
                     if mb.timestamp <= median_past {
                         if is_warn() {
                             println!(

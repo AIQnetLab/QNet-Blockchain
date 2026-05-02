@@ -347,18 +347,82 @@ impl CommitRevealConsensus {
         
         let epoch = round_number / 90;
         
-        // v2.62: Check if round already exists in per-round storage
-        if let Some(existing) = self.rounds.get(&round_number) {
-            // Round exists - IDEMPOTENT! Don't reset, just return
-            println!("[INFO][CONS] round_exists round={} epoch={} commits={} reveals={} finalized={}", 
-                     round_number, epoch, existing.commits.len(), existing.reveals.len(), existing.is_finalized);
-            
+        // v2.62: Check if round already exists in per-round storage.
+        // v15.15: idempotent path now UPGRADES participants when the existing
+        //         round was auto-created from an early-arriving commit.
+        if self.rounds.contains_key(&round_number) {
+            // ═══════════════════════════════════════════════════════════════════
+            // v15.15: PARTICIPANTS UPGRADE on idempotent re-entry.
+            //
+            // Why this matters:
+            //   `process_commit` auto-creates a round entry when a commit
+            //   arrives BEFORE the local node has called start_round_at_height
+            //   for that round (race between P2P delivery and local consensus
+            //   tick). The auto-create path uses `vec![commit.node_id.clone()]`
+            //   as a stub participants list — i.e. participants.len() == 1.
+            //
+            //   When the producer-side macroblock loop later calls
+            //   start_round_at_height with the FULL committee
+            //   (genesis_node_count() = 5, or VRF committee up to MAX_VALIDATORS
+            //   = 1000), the previous version returned without updating the
+            //   stub. That stub then propagated into finalize_round_by_number,
+            //   which derives the canonical 2f+1 byzantine threshold from
+            //   `participants.len().max(commits.len())`. With participants=1
+            //   and commits=2 the threshold collapsed to 2 — far below the
+            //   real 2f+1 of 4 (genesis) or 668 (1000-validator committee).
+            //   Producer then finalized macroblocks with sub-quorum data which
+            //   the validator-side strict 2f+1 check rejected, halting the
+            //   chain.
+            //
+            // Fix:
+            //   When the new participants list is larger than the existing
+            //   stub, replace the participants vector. We only ever GROW the
+            //   list — never shrink — so a later attempt with an incomplete
+            //   peer view cannot weaken an already-validated committee.
+            //
+            // Correctness:
+            //   * Participants is metadata used to derive the 2f+1 threshold;
+            //     swapping it does not invalidate already-collected commits
+            //     or reveals (those are signature-bound to round_number,
+            //     not to the participants list).
+            //   * Authoritative committee_size for genesis epochs (mb_idx ≤ 2)
+            //     is `genesis_node_count()` baked into the binary. For mb_idx ≥ 3
+            //     it's the N-2 macroblock's eligible_producers snapshot.
+            //     Both sources are chain-anchored and identical across honest
+            //     nodes — the upgrade does not introduce non-determinism.
+            //
+            // Scalability:
+            //   At 1000-validator committees the participants vector is ~64KB
+            //   (1000 × ~64-byte node_ids). Swap is a Vec move — O(1).
+            //   Happens once per round at most. No locking beyond the existing
+            //   `&mut self` borrow on the consensus engine.
+            // ═══════════════════════════════════════════════════════════════════
+            if let Some(existing) = self.rounds.get_mut(&round_number) {
+                if existing.participants.len() < participants.len() {
+                    let prev = existing.participants.len();
+                    existing.participants = participants.clone();
+                    println!(
+                        "[INFO][CONS] round_participants_upgraded round={} epoch={} from={} to={} reason=stub_from_auto_create",
+                        round_number, epoch, prev, existing.participants.len()
+                    );
+                }
+                // Snapshot for log (release the &mut borrow before calling sync_legacy_round).
+                let cur_commits = existing.commits.len();
+                let cur_reveals = existing.reveals.len();
+                let cur_finalized = existing.is_finalized;
+                println!(
+                    "[INFO][CONS] round_exists round={} epoch={} commits={} reveals={} finalized={}",
+                    round_number, epoch, cur_commits, cur_reveals, cur_finalized
+                );
+            }
+
             // Update active round pointer
             self.active_round = Some(round_number);
-            
-            // Legacy compatibility: sync to current_round
+
+            // Legacy compatibility: sync to current_round (now reflects
+            // upgraded participants list).
             self.sync_legacy_round(round_number);
-            
+
             return Ok(round_number);
         }
         

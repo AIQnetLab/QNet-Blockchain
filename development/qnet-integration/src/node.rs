@@ -11,11 +11,129 @@ use crate::{
 pub const PROTOCOL_VERSION: u32 = 1;  // Increment when breaking changes are made
 pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 
+// ═════════════════════════════════════════════════════════════════════════════
+// v15.15: BFT SCALING ARCHITECTURE — single source of truth.
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The chain runs a two-tier BFT pipeline:
+//
+//   • MICROBLOCKS (1 s cadence) — single-producer authority. Each microblock
+//     carries the producer's own Dilithium3 signature; no per-block 2f+1
+//     quorum. Producer is rotated every ROTATION_INTERVAL_BLOCKS (= 30
+//     microblocks) deterministically from the previous macroblock's
+//     randomness beacon.
+//
+//   • MACROBLOCKS (every 90 microblocks) — full BFT 2f+1 commit-reveal.
+//     This is the consensus finality boundary; safety against long-range
+//     rewrites lives at this layer. Threshold formula `(N * 2 + 2) / 3`
+//     applied identically on the producer-side finalisation path AND on
+//     the validator-side macroblock validation path. Single source of
+//     truth for `N` per epoch (see SCALING below).
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// SCALING PIPELINE — how `N` (committee size) is derived as the network
+// grows from 5 to 1 000 000 + super-nodes:
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//                  ┌────────────────────────────────────┐
+//                  │  Full Super-node set (≤ millions)  │
+//                  │  Arbitrary size; not directly used │
+//                  │  for any consensus threshold.      │
+//                  └────────────────┬───────────────────┘
+//                                   ▼
+//          [VRF: deterministic seed = mb_(N-2).randomness_beacon]
+//                                   ▼
+//                  ┌────────────────────────────────────┐
+//                  │  Eligible producers per macroblock │
+//                  │  truncated to MAX_VALIDATORS=1000  │
+//                  │  (snapshot stored on-chain in mb)  │
+//                  └────────────────┬───────────────────┘
+//                                   ▼
+//          [VRF subsample if eligible.len() > COMMITTEE_THRESHOLD=120]
+//                                   ▼
+//                  ┌────────────────────────────────────┐
+//                  │  Consensus committee per round     │
+//                  │  size = CONSENSUS_COMMITTEE_SIZE   │
+//                  │  = 100 (when subsampled), or       │
+//                  │  = eligible.len() (≤ 120)          │
+//                  └────────────────┬───────────────────┘
+//                                   ▼
+//                       BFT 2f+1 = (N * 2 + 2) / 3
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THRESHOLDS at concrete network sizes:
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//   Bootstrap (genesis 5 nodes):
+//     eligible = 5,  committee = 5,  2f+1 = 4   (tolerate 1 byzantine)
+//
+//   Mid-size network (100 active super-nodes):
+//     eligible = 100, committee = 100, 2f+1 = 67   (tolerate 33 byzantine)
+//
+//   Large network (1 000 + active super-nodes):
+//     eligible = 1000, committee = 100, 2f+1 = 67  (tolerate 33 byzantine)
+//
+//   The committee subsample at scale keeps the per-round message complexity
+//   constant (100 commits + 100 reveals + signature aggregation) while
+//   randomly rotating committee membership across epochs so every
+//   super-node participates statistically over time.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// COMMITTEE SOURCE BY EPOCH (validator and producer agree per-epoch):
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//   • mb_idx ≤ 2 (genesis epochs 1, 2) →
+//       N = genesis_constants::genesis_node_count() (baked into binary).
+//       No chain dependency; identical on every honest node by construction.
+//
+//   • mb_idx ≥ 3 →
+//       N = eligible_producers.len() from macroblock (mb_idx - 2)
+//       (the "N-2 snapshot" rule). Strict — no fallback. If the local node
+//       is missing mb_(N-2), it triggers a sync and abstains from the
+//       current round; other honest nodes do the same.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// RELATED CONSTANTS (defined throughout this file):
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//   pub const MAX_VALIDATORS:                 1000  (≈line below)
+//   const ROTATION_INTERVAL_BLOCKS:           30
+//   const CONSENSUS_COMMITTEE_SIZE:           100   (impl block, ≈line 3917)
+//   const COMMITTEE_THRESHOLD:                120   (impl block, ≈line 3918)
+//   pub const MEDIAN_PAST_WINDOW:             11    (≈line 1408)
+//   pub const FINALITY_WINDOW:                10    (≈line 40)
+//   pub const TIMESTAMP_FUTURE_TOLERANCE:     7200 s (≈line 1403)
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// AGREEMENT POINTS (producer ↔ validator must use the same N):
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//   1. trigger_macroblock_consensus pre-round gate
+//      → checks  all_participants.len() ≥ ((N * 2 + 2) / 3)
+//
+//   2. commit_reveal::finalize_round_by_number
+//      → checks  reveals.len() ≥ ((participants.len() * 2 + 2) / 3)
+//        (participants is upgraded from any auto-create stub during
+//        start_round_at_height — see commit_reveal.rs::start_round_at_height
+//        v15.15 PARTICIPANTS UPGRADE block.)
+//
+//   3. validate_macroblock (validator on receive)
+//      → checks  commits.len() ≥ ((committee_size * 2 + 2) / 3)
+//        AND     reveals.len() ≥ ((committee_size * 2 + 2) / 3)
+//        (committee_size from genesis_node_count() OR mb_(N-2) snapshot.)
+//
+// All three paths derive `N` from the SAME chain-anchored source per epoch
+// and apply the SAME formula. By construction, an honest producer cannot
+// finalise a macroblock that an honest validator will reject.
+//
+// ═════════════════════════════════════════════════════════════════════════════
+
 // PRODUCTION CONSTANTS - No hardcoded magic numbers!
 /// Maximum eligible producers/validators per epoch AND per consensus round.
 /// Single source of truth — used in snapshot creation, candidate selection,
 /// emergency fallback, and CommitReveal consensus config.
 /// Scales BFT to millions of nodes: only 1000 participate in voting/production.
+/// See the BFT SCALING ARCHITECTURE block above for the full pipeline.
 pub const MAX_VALIDATORS: usize = 1000;
 const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
 const FORK_CHECK_INTERVAL: u64 = 5; // v10.0: Lightweight fork detection every 5 blocks (6× faster than rotation-only)
@@ -739,32 +857,102 @@ pub fn effective_now() -> u64 {
 // 10 000 validators.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Compute the Median-Past timestamp over the last `MEDIAN_PAST_WINDOW`
-/// on-chain samples. Returns `None` if the ring has fewer samples than the
-/// window, in which case callers should fall back to `parent+1` monotonicity.
-pub fn median_past_timestamp() -> Option<u64> {
-    let ring = NETWORK_TIME_RING.lock();
-    if ring.len < MEDIAN_PAST_WINDOW {
+/// Compute the Median-Past timestamp for a block being verified or produced
+/// at `target_height`. Median is taken over the canonical parent-chain
+/// segment `[target_height - MEDIAN_PAST_WINDOW, target_height)` —
+/// i.e. the WINDOW blocks immediately preceding `target_height` BY HEIGHT.
+///
+/// Returns `None` if the ring lacks enough samples within that height
+/// range, in which case the caller falls back to `parent+1` monotonicity
+/// alone.
+///
+/// ─────────────────────────────────────────────────────────────────────
+/// v15.15: Height-ordered median (canonical BIP-113 semantics).
+///
+/// The previous version walked the ring backwards from `head` (insertion
+/// order) and computed the median over the LAST WINDOW INSERTIONS,
+/// regardless of whether their heights formed a contiguous segment ending
+/// at `target_height - 1`.
+///
+/// On a healthy chain at steady-state, insertion order == height order
+/// (each new block height is inserted exactly once, monotonic), so the
+/// two definitions collapse to the same answer. Insertion order also
+/// rejects out-of-order observations via `NetworkTimeRing::insert`, which
+/// preserves the invariant.
+///
+/// HOWEVER — during catch-up sync after a force-resync rollback, blocks
+/// may legitimately re-arrive at the verify pipeline in non-height order:
+/// peer A serves [h=51..h=75], peer B serves [h=26..h=50], the verify
+/// queue may pull h=51 before h=26. With the insertion-order ring already
+/// containing recent heights from before the rollback, comparing an older
+/// re-delivered block against the insertion-order median produced false
+/// `median_past_violation` rejections — observed as 54+ verify failures
+/// per node during the bootstrap incident, blocking the pipeline.
+///
+/// This function consults the ring entries whose heights actually lie
+/// within `[target_height - WINDOW, target_height)` and computes the
+/// median strictly over those. Out-of-window samples (older or newer than
+/// the parent chain segment of interest) are ignored. The semantics now
+/// match Bitcoin BIP-113 — median of the canonical parent-chain block
+/// timestamps — and degrade gracefully (return None → skip) when the
+/// ring does not contain the full window.
+///
+/// Scalability: O(NETWORK_TIME_WINDOW) scan with a small BTreeMap dedupe.
+/// At fixed window=32 this is nanoseconds regardless of validator count.
+/// ─────────────────────────────────────────────────────────────────────
+pub fn median_past_timestamp_at_height(target_height: u64) -> Option<u64> {
+    // The rule cannot apply to the genesis-adjacent prefix where there
+    // are not yet WINDOW prior heights to take a median over.
+    if target_height < MEDIAN_PAST_WINDOW as u64 {
         return None;
     }
-    // Snapshot the most recent MEDIAN_PAST_WINDOW samples. `ring.samples`
-    // is a ring buffer of `NETWORK_TIME_WINDOW` slots (>= MEDIAN_PAST_WINDOW
-    // by construction). We walk backwards from `head` to collect the last
-    // `MEDIAN_PAST_WINDOW` entries in O(N).
-    let window_size = MEDIAN_PAST_WINDOW;
-    let total = ring.samples.len();
-    let mut collected: Vec<u64> = Vec::with_capacity(window_size);
-    for offset in 1..=window_size {
-        // head is the next write index; (head - offset) wraps into the
-        // slot of the most recent sample when offset == 1.
-        let idx = (ring.head + total - offset) % total;
-        let (_, ts) = ring.samples[idx];
-        collected.push(ts);
+
+    let lower: u64 = target_height - MEDIAN_PAST_WINDOW as u64;  // inclusive
+    let upper: u64 = target_height;                              // exclusive
+
+    let ring = NETWORK_TIME_RING.lock();
+
+    // Collect timestamps for heights in [lower, upper). Dedupe by height
+    // — the canonical chain produces exactly one timestamp per height; if
+    // duplicates exist (replay / rollback artifacts) we keep the FIRST
+    // sample observed (insertion-time entry) which corresponds to the
+    // accepted-into-ring chain version.
+    let mut by_height: std::collections::BTreeMap<u64, u64> =
+        std::collections::BTreeMap::new();
+    for (h, ts) in ring.samples[..ring.len.min(NETWORK_TIME_WINDOW)].iter() {
+        if *h >= lower && *h < upper {
+            by_height.entry(*h).or_insert(*ts);
+        }
     }
     drop(ring);
-    collected.sort_unstable();
+
+    // Need EXACTLY WINDOW samples in the canonical parent segment to
+    // compute the median. If the ring is missing some (e.g., the node has
+    // not yet observed all parents of `target_height` due to a recent
+    // rollback or rewind), fall back to None — caller relies on parent+1
+    // monotonicity instead, which is still a strict ordering rule.
+    if by_height.len() < MEDIAN_PAST_WINDOW {
+        return None;
+    }
+
+    // Take the WINDOW most recent heights below `target_height`. With
+    // BTreeMap ordering, that's the highest-key tail.
+    let mut window: Vec<u64> = by_height.values().rev().take(MEDIAN_PAST_WINDOW).copied().collect();
+    window.sort_unstable();
     // Median of an odd-size (11) slice: the middle element.
-    Some(collected[window_size / 2])
+    Some(window[MEDIAN_PAST_WINDOW / 2])
+}
+
+/// LEGACY wrapper for callers that do not yet pass a target height.
+/// Retained for source-level compatibility; new callers MUST use
+/// `median_past_timestamp_at_height(target_height)` for correct
+/// height-ordered semantics.
+///
+/// Without a target height we cannot compute a canonical parent-segment
+/// median — return None and let the caller fall back to parent+1.
+#[deprecated(note = "Use median_past_timestamp_at_height(target_height) for canonical BIP-113 semantics")]
+pub fn median_past_timestamp() -> Option<u64> {
+    None
 }
 
 /// Feed an observation into the drift monitor.
@@ -779,7 +967,7 @@ pub fn median_past_timestamp() -> Option<u64> {
 ///   * `effective_now()` — used in local stall detection
 ///   * Median-aware block timestamp generation (see block construction)
 ///   * Wide validation window (`TIMESTAMP_FUTURE_TOLERANCE`)
-///   * Median-Past rule (see `median_past_timestamp`)
+///   * Median-Past rule (see `median_past_timestamp_at_height`)
 ///
 /// The monitor never pauses production or blocks voting — a drifted node
 /// remains productive, its block timestamps are pulled back to the canonical
@@ -12456,7 +12644,7 @@ impl BlockchainNode {
                         ));
                     }
 
-                    // v14.8.11: MEDIAN-PAST rule
+                    // v14.8.11: MEDIAN-PAST rule.
                     // `block.timestamp` must be strictly greater than the median
                     // of the last MEDIAN_PAST_WINDOW (11) on-chain timestamps.
                     // Blocks the near-past-rewrite attempts that slip through the
@@ -12464,7 +12652,12 @@ impl BlockchainNode {
                     // Silently skipped during the first ~11 blocks after boot when
                     // the ring is undersized — parent monotonicity already
                     // guarantees ordering there.
-                    if let Some(median_past) = median_past_timestamp() {
+                    //
+                    // v15.15: height-ordered (BIP-113 canonical). Median is taken
+                    // over the parent-chain segment [microblock.height - WINDOW,
+                    // microblock.height), not over insertion-order — fixes false
+                    // positives during catch-up sync.
+                    if let Some(median_past) = median_past_timestamp_at_height(microblock.height) {
                         if microblock.timestamp <= median_past {
                             METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
                             eprintln!(
@@ -13297,44 +13490,62 @@ impl BlockchainNode {
             std::env::set_var("QNET_NODE_START_TIME", chrono::Utc::now().timestamp().to_string());
 
             // v14.8.5: STUCK-CHAIN WATCHDOG.
+            // v15.15: ALERT-ONLY (no process::exit) — see detailed rationale
+            //         at the alert site below.
             //
-            // Detects the cascade observed in production: one peer freezes
-            // (concurrent-map deadlock or similar), remaining peers cannot
-            // serve enough shards, a validator goes into sync mode, gets
-            // stranded forever because its own local round state diverges
-            // from the canonical chain. The chain then loses a validator
-            // indefinitely, which in a small-committee network (5 genesis
-            // nodes) is fatal for the 2f+1 liveness property.
+            // Original purpose: detect a stuck consensus engine on a single
+            // peer. Original action was process::exit, relying on the
+            // container supervisor to revive the runtime cleanly.
             //
-            // Policy: every WATCHDOG_TICK_SECS, sample LOCAL_BLOCKCHAIN_HEIGHT
-            // plus the cached network height. If our height has not advanced
-            // by WATCHDOG_MIN_PROGRESS blocks for WATCHDOG_STUCK_SECS AND
-            // the network is demonstrably ahead of us (network_height ≥ our
-            // height + WATCHDOG_BEHIND_THRESHOLD), we conclude the local
-            // runtime is jammed and exit the process. The container
-            // supervisor restarts us with a fresh runtime, which reconnects
-            // cleanly and catches up.
+            // Why we removed process::exit:
+            //   On genesis cold-start the watchdog interpreted the legitimate
+            //   bootstrap window (peer discovery + first-producer election +
+            //   initial macroblock formation) as a fault and killed every node
+            //   simultaneously. Each kill discarded in-progress consensus
+            //   state (active commit-reveal round, partial commits, pending
+            //   timeout votes). Containers were revived but consensus had to
+            //   restart from zero every cycle — a deterministic permanent
+            //   halt. The watchdog's "remedy" was the actual cause of the
+            //   halt at scale.
             //
-            // Safety: process::exit is only triggered when BOTH
-            //   (a) our height hasn't moved for 5 minutes AND
-            //   (b) the network is provably ahead.
+            //   Top-tier BFT chains never hard-kill the consensus process
+            //   on a stuck-chain heuristic — they alert and let the existing
+            //   sync / view-change machinery make progress while runtime
+            //   state remains intact. We now follow that pattern.
+            //
+            // Current policy: every WATCHDOG_TICK_SECS, sample
+            // LOCAL_BLOCKCHAIN_HEIGHT plus the cached network height. When
+            // local height has not advanced by WATCHDOG_MIN_PROGRESS blocks
+            // for WATCHDOG_STUCK_SECS AND the network is demonstrably ahead
+            // of us (network_height ≥ our height + WATCHDOG_BEHIND_THRESHOLD),
+            // emit a throttled [CRIT] alert. The alert is observability —
+            // operator monitoring decides when manual intervention is
+            // required. Consensus state is preserved.
+            //
             // A healthy node that idles because the whole network is idle
-            // (e.g. all peers offline) does NOT restart — network_height
-            // cache won't show us behind.
-            //
-            // A healthy catching-up node advances at hundreds of blocks/min
-            // and never trips this threshold.
+            // (e.g. all peers offline) does NOT alert — network_height cache
+            // won't show us behind. A healthy catching-up node advances at
+            // hundreds of blocks/min and never trips this threshold.
             //
             // Scalability: two atomic loads per tick, negligible cost even
             // at tens of thousands of Super-nodes (this is a per-node task).
+            // Alert log volume bounded by WATCHDOG_ALERT_REPEAT_SECS — at
+            // 1000 nodes, max ~12 alerts/hour/node during sustained stall,
+            // zero during normal operation.
             const WATCHDOG_TICK_SECS: u64 = 60;
             const WATCHDOG_STUCK_SECS: u64 = 300;       // 5 min
             const WATCHDOG_MIN_PROGRESS: u64 = 1;       // ≥ 1 block in 5 min = alive
             const WATCHDOG_BEHIND_THRESHOLD: u64 = 30;  // network must be ≥30 blocks ahead
+            // v15.15: alert log throttle — emit one [CRIT] per WATCHDOG_STUCK_SECS
+            // to avoid log-storm at 1000+ super-node scale (each runs its own
+            // watchdog independently). Operators monitoring [CRIT][WATCHDOG]
+            // see one alert per real stuck-window, not a flood per tick.
+            const WATCHDOG_ALERT_REPEAT_SECS: u64 = WATCHDOG_STUCK_SECS;
             tokio::spawn(async move {
                 let mut last_progress_at = std::time::Instant::now();
                 let mut last_height: u64 = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                     .load(std::sync::atomic::Ordering::Relaxed);
+                let mut last_alert_at: Option<std::time::Instant> = None;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_TICK_SECS)).await;
 
@@ -13343,6 +13554,7 @@ impl BlockchainNode {
                     if h.saturating_sub(last_height) >= WATCHDOG_MIN_PROGRESS {
                         last_height = h;
                         last_progress_at = std::time::Instant::now();
+                        last_alert_at = None;  // chain advanced — clear alert state
                         continue;
                     }
                     // No local progress — check whether the network is ahead.
@@ -13354,23 +13566,73 @@ impl BlockchainNode {
                         // Network is at our height (or we are ahead) — idle
                         // state is legitimate. Reset the timer and wait.
                         last_progress_at = std::time::Instant::now();
+                        last_alert_at = None;
                         continue;
                     }
 
                     let stuck_for = last_progress_at.elapsed().as_secs();
                     if stuck_for >= WATCHDOG_STUCK_SECS {
-                        eprintln!(
-                            "[CRIT][WATCHDOG] chain_stuck h={} net_h={} behind={} stuck_for={}s threshold={}s — restarting process for clean recovery",
-                            h, net_h, behind, stuck_for, WATCHDOG_STUCK_SECS
-                        );
-                        use std::io::Write;
-                        let _ = std::io::stdout().flush();
-                        let _ = std::io::stderr().flush();
-                        std::process::exit(2);
-                    }
-                    if crate::node::is_warn() {
+                        // ═══════════════════════════════════════════════════════════════
+                        // v15.15: NO process::exit on chain_stuck.
+                        //
+                        // Rationale:
+                        //   The previous policy hard-killed the process via
+                        //   std::process::exit(2) on every stuck-window. On a
+                        //   bootstrapping network (genesis cold-start) every
+                        //   node sits at h=0 until the first producer broadcasts
+                        //   microblocks — a window that legitimately exceeds
+                        //   WATCHDOG_STUCK_SECS while peer discovery, P2P
+                        //   handshake, NTP convergence, and committee election
+                        //   complete. The watchdog interpreted this normal
+                        //   bootstrap as a fault and killed the process. Docker's
+                        //   --restart=always then revived the container, but
+                        //   in-memory consensus state (active commit-reveal
+                        //   round, partial commits, pending TimeoutVotes) was
+                        //   lost on every cycle. This produced a deterministic
+                        //   permanent halt: no node ever survived long enough
+                        //   to gather 2f+1 commits for the first macroblock.
+                        //
+                        //   Top-tier BFT chains never hard-kill the consensus
+                        //   process on a stuck-chain heuristic. They alert,
+                        //   escalate via metrics, and let the operator (or the
+                        //   sync layer) take corrective action while consensus
+                        //   state remains intact. We follow that pattern here.
+                        //
+                        // Replacement policy:
+                        //   * Throttled [CRIT] alert (one per stuck-window)
+                        //   * Reset stuck-timer so the alert does not re-fire
+                        //     every tick after the threshold is crossed
+                        //   * Existing block_pipeline / sync coordinator already
+                        //     poll for catch-up — they make progress on their
+                        //     own; the watchdog's job is observability, not
+                        //     forced restart.
+                        //
+                        // Scalability: at 1000 super-nodes each watchdog runs
+                        // independently. With one [CRIT] per stuck-window the
+                        // log volume is bounded; alert-management tooling
+                        // operates per-node. No global state, no cross-node
+                        // coordination, no network traffic.
+                        // ═══════════════════════════════════════════════════════════════
+                        let should_alert = last_alert_at
+                            .map(|t| t.elapsed().as_secs() >= WATCHDOG_ALERT_REPEAT_SECS)
+                            .unwrap_or(true);
+
+                        if should_alert {
+                            eprintln!(
+                                "[CRIT][WATCHDOG] chain_stuck h={} net_h={} behind={} stuck_for={}s threshold={}s — alert_only_no_kill (operator action may be required)",
+                                h, net_h, behind, stuck_for, WATCHDOG_STUCK_SECS
+                            );
+                            last_alert_at = Some(std::time::Instant::now());
+                        }
+
+                        // Reset the stuck-timer so we do not re-evaluate the
+                        // same stuck-window every WATCHDOG_TICK_SECS. The
+                        // height-progress check at the top of the loop will
+                        // re-arm the timer on real progress.
+                        last_progress_at = std::time::Instant::now();
+                    } else if crate::node::is_warn() {
                         println!(
-                            "[WARN][WATCHDOG] no_progress h={} net_h={} behind={} stuck_for={}s (restart at {}s)",
+                            "[WARN][WATCHDOG] no_progress h={} net_h={} behind={} stuck_for={}s (alert at {}s)",
                             h, net_h, behind, stuck_for, WATCHDOG_STUCK_SECS
                         );
                     }
@@ -17790,87 +18052,54 @@ impl BlockchainNode {
                     println!("[DBG][NODE] active_node_count={}", active_node_count);
                 }
                 
-                // CRITICAL FIX: Coordinated network start for Genesis nodes
-                let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
-                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                    .unwrap_or(false);
-                
-                // CRITICAL FIX: Use the validated node_id passed as parameter, NOT regenerate it
-                // This ensures consistency throughout the node's lifecycle
-                let own_node_id = node_id.clone(); // Use the validated node_id from startup
-                let is_selected_producer = true; // Will be checked properly in production loop
-                
-                // ARCHITECTURE: No phases - always use unified logic
-                let network_phase = false; // Deprecated - always use registry
-                
-                let byzantine_safety_required = network_phase; // EXISTING: ONLY Genesis phase for microblock production
-                // EXISTING: Normal phase microblocks use producer signatures only (no Byzantine consensus)
-                // EXISTING: Macroblocks handled separately in macroblock consensus trigger (line ~1100)
-                
-                // PROGRESSIVE DEGRADATION: Allow reduced node count after initial blocks
-                // This prevents network deadlock in small networks or when nodes are unavailable
-                let network_size = active_node_count as usize;
-                let is_small_network = network_size <= 10; // Small network threshold
-                
-                let required_byzantine_nodes = if is_genesis_bootstrap || is_small_network {
-                    // Genesis phase OR small network: Progressive degradation
-                    if is_genesis_bootstrap {
-                        // Genesis: Height-based degradation
-                        match microblock_height {
-                            0..=30 => std::cmp::min(4, network_size as u64),  // Standard but capped by network size
-                            31..=90 => std::cmp::min(3, network_size as u64),  // Checkpoint mode
-                            91..=180 => std::cmp::min(2, network_size as u64), // Emergency mode
-                            _ => 1,  // Critical: single node allowed
-                        }
-                    } else {
-                        // Small production network: Size-based requirements
-                        match network_size {
-                            0..=1 => 1,   // Solo node
-                            2 => 2,       // Two nodes can proceed
-                            3 => 3,       // Three nodes can proceed
-                            _ => 4,       // Four or more: full safety
-                        }
-                    }
-                } else {
-                    4  // Large network: Always require full Byzantine safety
-                };
-                
-                if byzantine_safety_required && active_node_count < required_byzantine_nodes {
-                    if is_genesis_bootstrap {
-                        // Progressive safety enforcement for Genesis
-                        let degradation_mode = match microblock_height {
-                            0..=30 => "STANDARD",
-                            31..=90 => "CHECKPOINT", 
-                            91..=180 => "EMERGENCY",
-                            _ => "CRITICAL",
-                        };
-                        
-                        if is_warn() { println!("[WARN][MB] byzantine_wait mode={} nodes={} required={} h={}", 
-                                degradation_mode, active_node_count, required_byzantine_nodes, microblock_height); }
-                        
-                        if is_selected_producer {
-                            if is_info() { println!("[INFO][MB] producer_wait id={} reason=byzantine_safety", own_node_id); }
-                        } else {
-                            if is_debug() { println!("[DBG][MB] non_producer_wait reason=network_formation"); }
-                        }
-                        
-                        // Shorter wait time for degraded modes
-                        let wait_time = match microblock_height {
-                            0..=30 => 5,   // Standard: 5 seconds
-                            31..=90 => 3,  // Checkpoint: 3 seconds
-                            91..=180 => 2, // Emergency: 2 seconds
-                            _ => 1,        // Critical: 1 second
-                        };
-                        
-                        tokio::time::sleep(Duration::from_secs(wait_time)).await;
-                        continue;
-                    } else {
-                        if is_warn() { println!("[WARN][MB] full_node_wait nodes={} required={}", active_node_count, required_byzantine_nodes); }
-                        tokio::time::sleep(Duration::from_secs(2)).await; // EXISTING: 2-second timeout
-                        continue;
-                    }
-                }
-                
+                // ═══════════════════════════════════════════════════════════════════
+                // v15.15: DEAD-CODE REMOVAL.
+                //
+                // Removed in this revision: a microblock-layer "byzantine_safety_required"
+                // gate that performed progressive-degradation checks on
+                // `active_node_count` against a height/size-derived threshold
+                // (4 → 3 → 2 → 1 over genesis epochs, or 1..4 by network size
+                // at runtime).
+                //
+                // Why removed:
+                //   * The gate's controlling flag `byzantine_safety_required`
+                //     was bound to `network_phase` which was hard-coded to
+                //     `false` and labelled "Deprecated - always use registry".
+                //     The entire body — wait_time ladder, degradation_mode
+                //     logging, producer_wait branch — was therefore unreachable.
+                //   * Microblock production is NOT a BFT-quorum operation
+                //     in this design: each microblock carries the producer's
+                //     own Dilithium3 signature, and 2f+1 BFT consensus is
+                //     applied at the macroblock layer (every 90 microblocks)
+                //     via the commit-reveal engine. The "byzantine wait" at
+                //     the microblock layer was the wrong place to enforce
+                //     that property even when active.
+                //   * The progressive-degradation ladder (allowing 1-of-N
+                //     on critical heights) directly contradicted the
+                //     v15.15 "no degraded threshold" policy enforced at the
+                //     macroblock gate (trigger_macroblock_consensus) and
+                //     validator-side. Two different rules in two places is
+                //     a classic source of producer/validator mismatch.
+                //
+                // Net effect on operation:
+                //   None. The gate was dead — execution always fell through
+                //   to the synchronisation check below. Removal eliminates
+                //   ~75 lines of compiler-warning-prone unreachable code,
+                //   simplifies the audit surface, and removes a tempting
+                //   re-activation hook that could re-introduce the
+                //   producer/validator mismatch.
+                //
+                // BFT enforcement that REPLACES this gate:
+                //   * Macroblock production gate (trigger_macroblock_consensus,
+                //     v15.15 canonical 2f+1) — single arithmetic threshold
+                //     `((committee_size * 2) + 2) / 3`.
+                //   * Macroblock finalisation
+                //     (commit_reveal::finalize_round_by_number) — same formula.
+                //   * Macroblock validation (validate_macroblock) — same
+                //     formula, with committee_size from baked
+                //     genesis_node_count() (mb ≤ 2) or N-2 snapshot (mb ≥ 3).
+                // ═══════════════════════════════════════════════════════════════════
+
                 // CRITICAL: Synchronization check before participating in consensus
                 let local_stored_height = storage.get_chain_height().unwrap_or(0);
                 
@@ -20293,7 +20522,9 @@ impl BlockchainNode {
                         // is undersized for the very first blocks — in that case
                         // parent_ts+1 already provides the strict monotonicity we
                         // need and we skip this source.
-                        let median_past_plus_one = median_past_timestamp()
+                        // v15.15: height-ordered — median is over the parent
+                        // segment [next_block_height - WINDOW, next_block_height).
+                        let median_past_plus_one = median_past_timestamp_at_height(next_block_height)
                             .map(|m| m.saturating_add(1))
                             .unwrap_or(0);
 
@@ -24637,9 +24868,84 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     if macroblock_index > last_finalized_mb {
                         // Check if node is synchronized before participating
                         let is_synchronized = coordinator_is_synchronized();
-                        if !is_synchronized {
 
-                            println!("[WARN][MB] consensus_skip_unsynced mb={}", macroblock_index);
+                        // ═══════════════════════════════════════════════════════════════
+                        // v15.15: GENESIS-EPOCH BOOTSTRAP EXCEPTION
+                        //
+                        // Problem the exception solves:
+                        //   The unconditional "skip consensus while SYNCING" rule
+                        //   below is correct for steady-state operation, but it
+                        //   creates a chicken-and-egg deadlock on genesis cold-start.
+                        //
+                        //   Concretely: on a fresh 5-genesis network all nodes start
+                        //   simultaneously at height 0. Producer election fires the
+                        //   first microblock; peers consume it and ingest h=1, h=2,
+                        //   etc. Even nodes that are running the consensus listener
+                        //   see their own LOCAL_BLOCKCHAIN_HEIGHT lag the network
+                        //   median for the first few seconds (P2P propagation,
+                        //   rate-limit cool-downs, decode pipeline) — coordinator
+                        //   reports SYNCING. By the time a node reaches the first
+                        //   macroblock boundary (h=90) it has the full microblock
+                        //   chain locally, but coordinator may STILL report SYNCING
+                        //   because the cached network height moved on to h=91+.
+                        //   The previous guard refused to participate in MB1
+                        //   consensus on every node simultaneously — no commits
+                        //   collected, fallback-initiator finalised an empty
+                        //   macroblock with sub-quorum data, validator-side strict
+                        //   2f+1 rejected it everywhere, deadlock.
+                        //
+                        // Exception:
+                        //   A SYNCING node MAY participate in macroblock consensus
+                        //   if and only if:
+                        //     (1) it is a genesis-epoch macroblock (mb_idx ≤ 2),
+                        //         where the committee is the baked genesis set and
+                        //         the leader-selection beacon is the genesis seed —
+                        //         no chain-state dependency on a previous MB,
+                        //     (2) the node's local height has reached the
+                        //         macroblock-end boundary (it has the full
+                        //         microblock chain for THIS MB locally), and
+                        //     (3) it can compute its own commit/reveal from local
+                        //         state alone (PoH, VRF, randomness beacon are all
+                        //         genesis-derived for these epochs).
+                        //
+                        // Safety:
+                        //   * Each commit/reveal is cryptographically bound to the
+                        //     round_number and the node's Dilithium3 keypair —
+                        //     other nodes verify the signature regardless of the
+                        //     sender's sync state.
+                        //   * Threshold (2f+1) is enforced on the receiver side
+                        //     using the canonical baked committee_size for genesis
+                        //     epochs, not derived from any sender-controlled value.
+                        //   * The exception is hard-gated by `macroblock_index ≤ 2`
+                        //     so it cannot be exploited beyond the bootstrap
+                        //     window. Post-genesis epochs (mb_idx ≥ 3) require the
+                        //     N-2 macroblock snapshot which a SYNCING node may not
+                        //     yet have — the strict guard remains in effect.
+                        //
+                        // Scalability:
+                        //   * The exception fires at most twice per genesis cold
+                        //     start (mb=1 and mb=2). For all subsequent macroblocks
+                        //     in the lifetime of the network — including all
+                        //     macroblocks for the eventual 1000-validator-committee
+                        //     production load — the strict synchronisation gate
+                        //     remains in force.
+                        //   * Two atomic loads: LOCAL_BLOCKCHAIN_HEIGHT read and
+                        //     coordinator_is_synchronized read.
+                        // ═══════════════════════════════════════════════════════════════
+                        let local_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let mb_end_height = macroblock_index * 90;
+                        let bootstrap_eligible = !is_synchronized
+                            && macroblock_index <= 2
+                            && local_h >= mb_end_height;
+
+                        if !is_synchronized && !bootstrap_eligible {
+                            if is_warn() {
+                                println!(
+                                    "[WARN][MB] consensus_skip_unsynced mb={} local_h={} reason=not_synchronized_outside_bootstrap_window",
+                                    macroblock_index, local_h
+                                );
+                            }
                             
                             // CRITICAL FIX v2.31: Even unsynchronized nodes MUST receive macroblocks!
                             // Without macroblocks, node cannot do producer selection when it catches up
@@ -24717,7 +25023,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             // Just continue to avoid spam (sync task will update LAST_FINALIZED_CONSENSUS_ROUND)
                             continue;
                         }
-                        
+
+                        // v15.15: Log when bootstrap exception is exercised so
+                        // operators can see participation under the genesis-epoch
+                        // SYNCING relaxation. This log fires AT MOST twice per
+                        // network lifetime (mb=1 and mb=2 on cold-start).
+                        if bootstrap_eligible && is_info() {
+                            println!(
+                                "[INFO][MB] bootstrap_consensus_participation mb={} local_h={} mb_end={} synced=false reason=genesis_epoch_at_boundary",
+                                macroblock_index, local_h, mb_end_height
+                            );
+                        }
+
                         // Check if we're a validator for this round
                         if let Some(ref p2p_ref) = p2p {
                             // v3.16: Pass current_height for deterministic epoch calculation
@@ -27803,31 +28120,87 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         let network_size = all_participants.len();
-        
-        let required_byzantine_nodes = if network_size <= 10 {
-            match end_height {
-                0..=900 => {
-                    if network_size >= 4 { 4 }
-                    else if network_size >= 3 { 3 }
-                    else if network_size >= 2 { 2 }
-                    else { 1 }
-                },
-                _ => {
-                    std::cmp::min(4, network_size)
-                }
-            }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // v15.15: CANONICAL 2f+1 GATE (replaces hardcoded "4" / progressive
+        // degradation ladder).
+        //
+        // Purpose:
+        //   This gate runs BEFORE start_round_at_height. It rejects rounds
+        //   that lack enough committee members to even ATTEMPT a Byzantine-
+        //   safe finalisation. The actual finalisation threshold is enforced
+        //   in commit_reveal::finalize_round_by_number AND in the validator-
+        //   side macroblock validation — both use the same canonical
+        //   `(N * 2 + 2) / 3` formula. This gate must agree with them so
+        //   we don't start a round that finalisation will inevitably reject.
+        //
+        // Why the previous code was wrong:
+        //   * `network_size > 10` branch hardcoded `4`, which is correct for
+        //     a 5-node committee but undefined for a 1000-node committee
+        //     where the real 2f+1 is 668. The gate would let any size round
+        //     start with just 4 participants — finalise would then reject
+        //     it, wasting a full commit-reveal cycle.
+        //   * `0..=900 -> 4/3/2/1` ladder allowed rounds to start with 2 or
+        //     even 1 commit during genesis-bootstrap windows. The validator
+        //     demands canonical 4 from baked genesis_node_count and would
+        //     reject — exactly the producer/validator threshold mismatch
+        //     we observed in the v15.14 halt.
+        //
+        // New design:
+        //   Single canonical formula `((N * 2) + 2) / 3`. The committee
+        //   size N is taken from the SAME source the validator uses, so
+        //   producer and validator can never disagree on the threshold:
+        //     * Genesis epochs (mb_idx ≤ 2): `genesis_node_count()` baked
+        //       into the binary. Validator does the same in
+        //       node.rs::validate_macroblock.
+        //     * Normal epochs (mb_idx ≥ 3): `all_participants.len()` —
+        //       the committee derived from the N-2 snapshot via the same
+        //       deterministic VRF subsample every honest node computes.
+        //
+        //   For genesis bootstrap: N=5, threshold=4. If the live committee
+        //   shrinks below 4 (e.g., one genesis node temporarily offline),
+        //   the gate refuses and the consensus listener re-evaluates on
+        //   the next block event when the peer rejoins. BFT safety does
+        //   not relax just because we are early in the chain.
+        //
+        // Safety:
+        //   * No degraded threshold path. A round either has 2f+1 capacity
+        //     or does NOT start.
+        //   * Producer and validator share an identical formula and an
+        //     identical N source per epoch — by construction they cannot
+        //     disagree on whether a macroblock meets quorum.
+        //
+        // Scalability:
+        //   Single arithmetic operation, no branching by network size.
+        //   Identical cost at 5 or 100K nodes. Threshold scales linearly:
+        //     5 → 4, 100 → 67, 668 → 446, 1000 → 668.
+        // ═══════════════════════════════════════════════════════════════════
+        // Re-use the macroblock_index already computed at the top of this
+        // function (line where end_height/90 was first taken).
+        let canonical_committee_size = if macroblock_index <= 2 {
+            // Match validator-side genesis path. genesis_node_count() is
+            // baked-in and identical on every honest node by construction.
+            crate::genesis_constants::genesis_node_count()
         } else {
-            4
+            // Normal epochs: validator-side reads eligible_producers.len()
+            // from N-2 macroblock; our `network_size` is derived from the
+            // same N-2 snapshot via calculate_qualified_candidates +
+            // select_consensus_committee, so the values agree.
+            network_size
         };
-        
+
+        let required_byzantine_nodes = ((canonical_committee_size * 2) + 2) / 3;
+
         if all_participants.len() < required_byzantine_nodes {
-            if network_size <= 10 {
-                println!("[WARN][CONS] DEGRADED Byzantine consensus: {}/{} nodes (small/Genesis network)", 
-                         all_participants.len(), required_byzantine_nodes);
-                println!("[WARN][CONS] reduced_safety continuing");
-            } else {
-                return Err(format!("Insufficient nodes for Byzantine safety: {}/4", all_participants.len()));
-            }
+            // v15.15: hard refuse — no DEGRADED-mode bypass. The validator
+            // and the producer-finaliser will reject any output, so starting
+            // a round here is dead work. Caller (consensus listener) re-
+            // evaluates on the next block event.
+            let source = if macroblock_index <= 2 { "genesis_baked" } else { "n-2_snapshot" };
+            return Err(format!(
+                "Insufficient committee for canonical 2f+1: have {} need {} (committee_source={} committee_size={})",
+                all_participants.len(), required_byzantine_nodes, source, canonical_committee_size
+            ));
         }
         
         // STEP 2: Brief write lock for round setup only

@@ -17,10 +17,18 @@ use pqcrypto_traits::sign::{
 };
 use sha3::{Sha3_256, Digest};
 
-// Domain separation constants
-// v4: includes public key binding for formal VRF uniqueness guarantee
-const DOMAIN_EVAL: &[u8] = b"QNet_Dilithium3_VRF_Eval_v4";
-const DOMAIN_OUTPUT: &[u8] = b"QNet_Dilithium3_VRF_Output_v4";
+// Domain separation constants.
+//
+// v15.15: removed unused v4 VRF helpers (`DOMAIN_EVAL`, `DOMAIN_OUTPUT`,
+// `hash_input_keyed`, `derive_output`). The active VRF construction is v5,
+// implemented inline in `DilithiumVrf::evaluate` with `b"QNet_VRF_v5_OUTPUT"`
+// and `b"QNet_VRF_v5_PROOF"` literal domain tags. The v4 helpers were
+// orphaned during the v4→v5 refactor and never re-wired to a caller.
+//
+// `DOMAIN_SLOT` is still in use — it tags the seed input for
+// `compute_slot_seed`, the entry point for secret-leader-election and
+// macroblock-boundary VRF derivation. Format: `H(DOMAIN_SLOT || mb_hash ||
+// round_le_bytes)` — independent from the v4/v5 evaluate path.
 const DOMAIN_SLOT: &[u8] = b"QNet_VRF_SlotSeed_v4";
 
 // FIX R24-H4: Auto-zeroizing Vec wrapper for secret key material.
@@ -369,35 +377,11 @@ impl DilithiumVrf {
         Self::deterministic_leader(slot_seed, height, round, 0, num_candidates)
     }
 
-    // ── Internal helpers ─────────────────────────────────────────────────
-
-    /// v4.1: key-bound + chain-bound domain hash
-    /// H(domain || chain_id || pk_fingerprint || input)
-    /// FIX R24-M4: Include chain_id to prevent cross-network VRF output collisions.
-    /// pk_fingerprint = SHA3-256(pk)[..16] — 128 bits for domain binding.
-    fn hash_input_keyed(input: &[u8], pk: &[u8]) -> Vec<u8> {
-        let chain_id: u64 = std::env::var("QNET_CHAIN_ID")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1337); // default testnet
-        let pk_fp = Sha3_256::digest(pk);
-        let mut h = Sha3_256::new();
-        h.update(DOMAIN_EVAL);
-        h.update(&chain_id.to_le_bytes());
-        h.update(&pk_fp[..16]);
-        h.update(input);
-        h.finalize().to_vec()
-    }
-
-    fn derive_output(proof: &[u8]) -> [u8; 32] {
-        let mut h = Sha3_256::new();
-        h.update(DOMAIN_OUTPUT);
-        h.update(proof);
-        let r = h.finalize();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&r);
-        out
-    }
+    // v15.15: removed orphaned v4 helpers `hash_input_keyed` and
+    // `derive_output`. Active VRF (v5) inlines its hashing inside
+    // `evaluate` / `verify_static` with `b"QNet_VRF_v5_OUTPUT"` and
+    // `b"QNet_VRF_v5_PROOF"` literal domain tags — no shared helpers
+    // needed.
 }
 
 // =========================================================================
