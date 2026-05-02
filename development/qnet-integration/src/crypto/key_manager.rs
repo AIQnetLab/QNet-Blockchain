@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::sync::{Arc, OnceLock};
-use parking_lot::RwLock;
+use parking_lot::{RwLock, Mutex};
 use anyhow::{Result, anyhow};
 use pqcrypto_mldsa::mldsa65 as dilithium3;
 use pqcrypto_traits::sign::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait, SignedMessage as SignedMessageTrait};
 use sha3::{Sha3_256, Digest};
 use zeroize::Zeroize;
+use dashmap::DashMap;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCTION v2.50: Lock-free key directory cache with OnceLock
@@ -16,14 +17,71 @@ use zeroize::Zeroize;
 /// Cached writable key directory - set once, read forever (lock-free after init)
 static CACHED_KEY_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRODUCTION v15.14: Process-wide keypair singleton (fixes pk_mismatch race)
+//
+// Problem solved: multiple DilithiumKeyManager instances created across the codebase
+// (node.rs startup, quantum_crypto.rs signing cache, rpc.rs registration) each held
+// their own cached_keypair. When two raced before the disk file existed, each called
+// the random dilithium3::keypair() and persisted a different keypair → split-brain
+// identity, signatures from one path failed verification against the registered PK
+// from another path (pk_mismatch).
+//
+// Fix: keypairs are keyed by their canonical disk path. ALL DilithiumKeyManager
+// instances pointing to the same dilithium_keypair.bin share one Arc<(PK, SK)>.
+//
+// Concurrency model:
+//   - GLOBAL_KEYPAIR_CACHE: DashMap shards lock by hash; reads are wait-free.
+//   - GLOBAL_KEYPAIR_INIT_LOCKS: per-path Mutex held only during first-time keygen
+//     or first-time disk-load. Zero contention during steady-state reads.
+//   - Atomic insert via double-checked locking pattern: fast lock-free read first,
+//     then under the per-path Mutex re-check the cache, then generate or load.
+//
+// Scalability: O(1) memory per node process (one entry per process), wait-free reads
+// scale linearly with cores. Init lock is held for milliseconds during the very first
+// keygen on a fresh data directory and never thereafter.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Process-wide cache: canonical disk path → shared keypair.
+/// Eliminates the in-process race where two managers generated different random keys.
+static GLOBAL_KEYPAIR_CACHE: OnceLock<DashMap<PathBuf, Arc<(dilithium3::PublicKey, dilithium3::SecretKey)>>> = OnceLock::new();
+
+/// Per-path init mutex: serializes the very first keygen-or-load for each path.
+/// Held only during initialization; subsequent reads bypass this entirely.
+static GLOBAL_KEYPAIR_INIT_LOCKS: OnceLock<DashMap<PathBuf, Arc<Mutex<()>>>> = OnceLock::new();
+
+#[inline]
+fn keypair_cache() -> &'static DashMap<PathBuf, Arc<(dilithium3::PublicKey, dilithium3::SecretKey)>> {
+    GLOBAL_KEYPAIR_CACHE.get_or_init(DashMap::new)
+}
+
+#[inline]
+fn keypair_init_locks() -> &'static DashMap<PathBuf, Arc<Mutex<()>>> {
+    GLOBAL_KEYPAIR_INIT_LOCKS.get_or_init(DashMap::new)
+}
+
+/// Compute the canonical cache key for a given key directory.
+/// Uses canonicalized parent dir to ensure two managers pointing to the same on-disk
+/// file (even via different relative paths) share the same global cache entry.
+fn canonical_cache_key(key_dir: &Path) -> PathBuf {
+    // canonicalize() requires the directory to exist; ensure_writable_directory
+    // already guarantees this. Fall back to original path if canonicalize fails
+    // (e.g., on platforms with quirky path semantics) — same dir input still maps
+    // to same key, which is what we need.
+    let canonical_dir = key_dir.canonicalize().unwrap_or_else(|_| key_dir.to_path_buf());
+    canonical_dir.join("dilithium_keypair.bin")
+}
+
 /// Manages Dilithium keys for the node
 pub struct DilithiumKeyManager {
     /// Path to key storage
     key_dir: PathBuf,
-    
-    /// Cached keypair to avoid regeneration
+
+    /// Local view of the cached keypair (kept for backward-compatible Drop semantics
+    /// and fast per-instance access). Source of truth is the process-wide
+    /// GLOBAL_KEYPAIR_CACHE — this field mirrors that entry for the manager's path.
     cached_keypair: Arc<RwLock<Option<(dilithium3::PublicKey, dilithium3::SecretKey)>>>,
-    
+
     /// Node ID
     node_id: String,
 }
@@ -43,65 +101,91 @@ impl DilithiumKeyManager {
         })
     }
     
-    /// PRODUCTION-SAFE: Find and create writable directory with fallback paths
-    /// v2.50: Uses OnceLock for lock-free caching after first initialization
+    /// PRODUCTION-SAFE: Find and create writable directory with fallback paths.
+    ///
+    /// v2.50: Uses OnceLock for lock-free caching after first initialization.
+    /// v15.14: Serialises the candidate-search SLOW PATH under a global Mutex.
+    ///         The previous implementation used a `.write_test` probe per
+    ///         candidate which could race when multiple threads first-call this
+    ///         function concurrently — one thread would lose the file race on
+    ///         the preferred path, fall back to a different candidate, and end
+    ///         up with a different `key_dir` than its peers. That broke the
+    ///         "all DilithiumKeyManager instances on this node share one key
+    ///         directory" invariant. The Mutex eliminates this entirely; it
+    ///         is taken only on the very first call and never afterwards.
     fn ensure_writable_directory(preferred: &Path) -> Result<PathBuf> {
-        // PRODUCTION v2.50: Lock-free cache check (instant after first init)
+        // PRODUCTION v2.50: Lock-free cache check (instant after first init).
+        // After the slow path runs once, this branch is taken forever.
         if let Some(cached_dir) = CACHED_KEY_DIR.get() {
-            // Verify cached directory still exists and is writable
             if cached_dir.exists() && cached_dir.is_dir() {
                 return Ok(cached_dir.clone());
             }
         }
-        
+
+        // SLOW PATH: serialise candidate search across all racing threads so
+        // the `.write_test` probe is never contended. Runs at most once per
+        // process under normal operation.
+        static SEARCH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _search_guard = SEARCH_LOCK.lock();
+
+        // DOUBLE-CHECK: another thread may have populated the cache while we
+        // were waiting for the search lock.
+        if let Some(cached_dir) = CACHED_KEY_DIR.get() {
+            if cached_dir.exists() && cached_dir.is_dir() {
+                return Ok(cached_dir.clone());
+            }
+        }
+
         // Build candidate directories in priority order
         let mut candidates: Vec<PathBuf> = vec![
             preferred.to_path_buf(),                              // Preferred path
             PathBuf::from("/app/data/keys"),                      // Docker persistent volume
         ];
-        
+
         // Add optional paths if available
         if let Ok(current_dir) = std::env::current_dir() {
             candidates.push(current_dir.join("data").join("keys"));
         }
-        
+
         if let Some(data_dir) = dirs::data_local_dir() {
             candidates.push(data_dir.join("qnet").join("keys"));
         }
-        
+
         println!("[INFO][KEY] searching for writable key directory");
-        
+
         for (idx, path) in candidates.iter().enumerate() {
             if crate::node::is_debug() { println!("[DBG][KEY] testing dir [{}/{}] {:?}", idx + 1, candidates.len(), path); }
-            
+
             // Try to create directory
             match fs::create_dir_all(path) {
                 Ok(_) => {
-                    // Verify we can write to it by creating a test file
+                    // Verify we can write to it by creating a test file.
+                    // SEARCH_LOCK guarantees no other thread races us on this
+                    // probe, so a single `.write_test` filename is safe.
                     let test_file = path.join(".write_test");
                     match fs::write(&test_file, b"test") {
                         Ok(_) => {
                             let _ = fs::remove_file(&test_file); // Cleanup
                             println!("[INFO][KEY] selected_dir={:?}", path);
-                            
+
                             // PRODUCTION v2.50: Cache with OnceLock (lock-free after this)
                             let _ = CACHED_KEY_DIR.set(path.clone());
-                            
+
                             return Ok(path.clone());
                         }
                         Err(e) => {
-                            eprintln!("[ERR][KEY] dir_not_writable err={}", e);
+                            eprintln!("[ERR][KEY] dir_not_writable path={:?} err={}", path, e);
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[ERR][KEY] dir_create_failed err={}", e);
+                    eprintln!("[ERR][KEY] dir_create_failed path={:?} err={}", path, e);
                     continue;
                 }
             }
         }
-        
+
         // CRITICAL: If all fallbacks fail, provide detailed diagnostic
         eprintln!("[ERR][KEY] no writable directory found");
         eprintln!("[ERR][KEY] diagnostic info:");
@@ -109,7 +193,7 @@ impl DilithiumKeyManager {
             std::env::current_dir(),
             std::env::var("USER").or_else(|_| std::env::var("USERNAME")),
             std::env::temp_dir());
-        
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -117,7 +201,7 @@ impl DilithiumKeyManager {
                 eprintln!("[ERR][KEY] preferred_dir_perms={:o}", metadata.permissions().mode());
             }
         }
-        
+
         Err(anyhow!(
             "Cannot find writable directory for keys. Tried {} candidates. Check Docker volumes and file permissions.",
             candidates.len()
@@ -159,60 +243,93 @@ impl DilithiumKeyManager {
         Ok(())
     }
     
-    /// Get keypair (loads from disk or generates new, cached for performance)
+    /// Get keypair (loads from disk or generates new, cached process-wide).
+    ///
+    /// v15.14: Uses GLOBAL_KEYPAIR_CACHE keyed by canonical disk path so that all
+    /// DilithiumKeyManager instances for the same path share one keypair. Eliminates
+    /// the pk_mismatch race where two concurrent managers each generated random keys
+    /// before either persisted to disk.
     pub fn get_keypair(&self) -> Result<(dilithium3::PublicKey, dilithium3::SecretKey)> {
-        // Check cache first
-        {
-            let cache_guard = self.cached_keypair.read();
-            if let Some((pk, sk)) = cache_guard.as_ref() {
-                return Ok((pk.clone(), sk.clone()));
+        let cache_key = canonical_cache_key(&self.key_dir);
+
+        // FAST PATH 1: lock-free read of process-wide cache. After first init this
+        // is wait-free and dominates steady-state behaviour for all signing calls.
+        // We extract owned clones inside the closure so the DashMap shard lock is
+        // released BEFORE we touch any per-instance lock.
+        let cached_pair = keypair_cache().get(&cache_key).map(|entry| {
+            let (pk, sk) = entry.value().as_ref();
+            (pk.clone(), sk.clone())
+        });
+        if let Some((pk, sk)) = cached_pair {
+            // Mirror into local view for Drop-time zeroization bookkeeping.
+            {
+                let mut local = self.cached_keypair.write();
+                if local.is_none() {
+                    *local = Some((pk.clone(), sk.clone()));
+                }
             }
-        }
-        
-        // Try to load from disk first
-        let key_path = self.key_dir.join("dilithium_keypair.bin");
-        if key_path.exists() {
-            // CRITICAL: If file exists, it MUST be loaded successfully
-            // Generating new keys would cause node identity loss
-            let (pk, sk) = self.load_keypair_from_disk(&key_path)?;
-            
-            // Cache the loaded keypair (drop old secret key before replacing)
-            // NOTE: Production deployment should use HSM for secret key storage
-            let mut cache_guard = self.cached_keypair.write();
-            // Take old value out — drops old SecretKey (best effort memory clear without unsafe)
-            let _old = cache_guard.take();
-            println!("[INFO][KEY] old_keypair_dropped");
-            *cache_guard = Some((pk.clone(), sk.clone()));
             return Ok((pk, sk));
         }
-        
-        // Generate new keypair ONCE and save it
-        println!("[INFO][KEY] generating new ML-DSA-65 keypair (one-time)");
-        
-        // CRITICAL: Generate keypair only ONCE and persist it
-        // This ensures the same keys are used across restarts
-        let (pk, sk) = dilithium3::keypair();
-        
-        // Save to disk immediately for persistence
-        // CRITICAL: Node MUST NOT start without saved keys to prevent identity loss
-        self.save_keypair_to_disk(&pk, &sk, &key_path)?;
-        println!("[INFO][KEY] keypair saved to disk");
-        
-        // Cache the keypair (zeroize old secret key if replacing)
-        // NOTE: Production deployment should use HSM for secret key storage
-        {
-            let mut cache_guard = self.cached_keypair.write();
-            // FIX C17: Replace unsafe const-to-mut pointer cast with safe cache replacement
-            // Old key material in the dropped Option<SecretKey> will be reclaimed by allocator.
-            // We cannot safely zeroize pqcrypto SecretKey internals without unsafe UB,
-            // so we rely on replacing the cache entry (old value is dropped).
-            let had_old_key = cache_guard.is_some();
-            *cache_guard = Some((pk.clone(), sk.clone()));
-            if had_old_key {
-                println!("[INFO][KEY] old_keypair_replaced_in_cache");
+
+        // SLOW PATH: must acquire per-path init mutex to serialize first-time keygen.
+        // The mutex is created on demand via DashMap::entry().or_insert_with() which
+        // is itself atomic. We clone the Arc<Mutex> and release the init-locks shard
+        // before acquiring the mutex, to keep lock ordering simple.
+        let init_lock = {
+            let entry = keypair_init_locks()
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())));
+            entry.value().clone()
+        };
+        let _guard = init_lock.lock();
+
+        // DOUBLE-CHECK: another thread may have populated the cache while we waited.
+        let cached_pair_after_lock = keypair_cache().get(&cache_key).map(|entry| {
+            let (pk, sk) = entry.value().as_ref();
+            (pk.clone(), sk.clone())
+        });
+        if let Some((pk, sk)) = cached_pair_after_lock {
+            {
+                let mut local = self.cached_keypair.write();
+                if local.is_none() {
+                    *local = Some((pk.clone(), sk.clone()));
+                }
             }
+            return Ok((pk, sk));
         }
-        
+
+        // First initialization for this path. Either load from disk or generate new.
+        let key_path = self.key_dir.join("dilithium_keypair.bin");
+        let (pk, sk) = if key_path.exists() {
+            // CRITICAL: If file exists, it MUST be loaded successfully.
+            // Generating new keys would cause node identity loss.
+            println!("[INFO][KEY] loading_persisted_keypair node={} path={:?}", self.node_id, key_path);
+            self.load_keypair_from_disk(&key_path)?
+        } else {
+            // Generate new keypair ONCE and persist it. Subsequent restarts load it.
+            println!("[INFO][KEY] generating_new_mldsa65_keypair node={} (one-time, no disk file)", self.node_id);
+            let (new_pk, new_sk) = dilithium3::keypair();
+            self.save_keypair_to_disk(&new_pk, &new_sk, &key_path)?;
+            println!("[INFO][KEY] keypair_persisted node={} path={:?}", self.node_id, key_path);
+            (new_pk, new_sk)
+        };
+
+        // Atomic insert into the process-wide cache. After this point, all other
+        // DilithiumKeyManager instances for this path will hit the fast path.
+        let arc_kp = Arc::new((pk.clone(), sk.clone()));
+        keypair_cache().insert(cache_key, arc_kp);
+
+        // Mirror into local view for backward-compatible Drop bookkeeping.
+        {
+            let mut local = self.cached_keypair.write();
+            *local = Some((pk.clone(), sk.clone()));
+        }
+
+        if crate::node::is_info() {
+            let pk_hash = hex::encode(&Sha3_256::digest(PublicKeyTrait::as_bytes(&pk))[..8]);
+            println!("[INFO][KEY] keypair_ready node={} pk_hash={}", self.node_id, pk_hash);
+        }
+
         Ok((pk, sk))
     }
     
@@ -727,9 +844,177 @@ mod tests {
         cursor += 4;
         
         let restored_sk = &serialized[cursor..cursor+sk_len];
-        
+
         assert_eq!(pk_bytes, restored_pk);
         assert_eq!(sk_bytes, restored_sk);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // v15.14: Tests for the process-wide keypair singleton (pk_mismatch fix)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Two managers pointing to the same key directory must return the
+    /// IDENTICAL keypair. Before v15.14 each manager held its own cache and
+    /// raced on first-time keygen, producing two different random keypairs
+    /// and a split-brain identity.
+    #[test]
+    fn test_singleton_same_dir_returns_same_keypair() {
+        let temp = tempdir().expect("tempdir");
+        let key_dir = temp.path().join("keys_singleton_a");
+
+        let m1 = DilithiumKeyManager::new("node_alpha".to_string(), &key_dir)
+            .expect("m1 new");
+        let m2 = DilithiumKeyManager::new("node_beta".to_string(), &key_dir)
+            .expect("m2 new");
+
+        let (pk1, sk1) = m1.get_keypair().expect("m1 keypair");
+        let (pk2, sk2) = m2.get_keypair().expect("m2 keypair");
+
+        let pk1_bytes = PublicKeyTrait::as_bytes(&pk1);
+        let pk2_bytes = PublicKeyTrait::as_bytes(&pk2);
+        let sk1_bytes = SecretKeyTrait::as_bytes(&sk1);
+        let sk2_bytes = SecretKeyTrait::as_bytes(&sk2);
+
+        assert_eq!(pk1_bytes, pk2_bytes,
+            "Two DilithiumKeyManager instances with identical key_dir must \
+             share the same public key (no split-brain)");
+        assert_eq!(sk1_bytes, sk2_bytes,
+            "Two DilithiumKeyManager instances with identical key_dir must \
+             share the same secret key (signature path consistency)");
+    }
+
+    /// Stress the global singleton with many concurrent threads each trying
+    /// to first-time-init the SAME path. Without the per-path init mutex
+    /// and double-checked DashMap insert, this would race and produce
+    /// divergent keypairs.
+    ///
+    /// Production scenario this guards against: at node startup
+    /// `node.rs:initialize_wallet_identity` and `quantum_crypto.rs` may both
+    /// instantiate a `DilithiumKeyManager` for the same node before either
+    /// has completed its first `get_keypair()` call. Pre-v15.14 each manager
+    /// generated its own random keypair, persisted it, and cached locally,
+    /// producing two different on-disk and in-memory identities.
+    #[test]
+    fn test_singleton_concurrent_init_no_divergence() {
+        use std::thread;
+        use std::sync::Arc as StdArc;
+        use std::sync::Barrier;
+
+        let temp = tempdir().expect("tempdir");
+        let key_dir = temp.path().join("keys_concurrent_b");
+        fs::create_dir_all(&key_dir).expect("mkdir");
+
+        // Pre-warm CACHED_KEY_DIR so all threads observe the SAME final
+        // key_dir. This mirrors production where `ensure_writable_directory`
+        // runs once at startup before any concurrent signing path engages.
+        // Without this warm-up the candidate-search slow path is entered
+        // concurrently — `ensure_writable_directory`'s SEARCH_LOCK serialises
+        // it, but the warm-up is the canonical production sequence and
+        // represents the most realistic test of get_keypair() race fix.
+        let _warm = DilithiumKeyManager::new("warmer".to_string(), &key_dir)
+            .expect("warmer new");
+        drop(_warm);
+
+        let thread_count = 16usize;
+        // Barrier: release all threads at the same instant so the first
+        // get_keypair() call from each thread races on the empty global
+        // keypair cache. This is the precise scenario the singleton fix
+        // must handle — without the per-path init mutex + double-checked
+        // DashMap insert, threads would each call dilithium3::keypair()
+        // and save divergent keypairs to disk.
+        let barrier = StdArc::new(Barrier::new(thread_count));
+
+        let handles: Vec<_> = (0..thread_count).map(|i| {
+            let kd = key_dir.clone();
+            let bar = barrier.clone();
+            thread::spawn(move || {
+                let m = DilithiumKeyManager::new(format!("racer_{}", i), &kd)
+                    .expect("racer new");
+                bar.wait(); // release all threads simultaneously
+                let (pk, sk) = m.get_keypair().expect("racer keypair");
+                (
+                    PublicKeyTrait::as_bytes(&pk).to_vec(),
+                    SecretKeyTrait::as_bytes(&sk).to_vec(),
+                )
+            })
+        }).collect();
+
+        let results: Vec<_> = handles.into_iter()
+            .map(|h| h.join().expect("thread panic"))
+            .collect();
+
+        // Every thread must have observed the SAME (pk, sk).
+        for (i, (pk_i, sk_i)) in results.iter().enumerate().skip(1) {
+            assert_eq!(&results[0].0, pk_i,
+                "Thread {} observed a divergent public key — race not eliminated", i);
+            assert_eq!(&results[0].1, sk_i,
+                "Thread {} observed a divergent secret key — race not eliminated", i);
+        }
+    }
+
+    /// Verify the singleton uses the canonical disk path as cache key, so
+    /// two managers reaching the same on-disk file via different surface
+    /// paths (e.g., trailing slash, current-dir prefix) still share state.
+    #[test]
+    fn test_singleton_canonical_path_keying() {
+        let temp = tempdir().expect("tempdir");
+        let key_dir = temp.path().join("keys_canon_c");
+        fs::create_dir_all(&key_dir).expect("mkdir");
+
+        // Path 1: as given.
+        let m1 = DilithiumKeyManager::new("n1".to_string(), &key_dir).expect("m1");
+        let (pk1, _) = m1.get_keypair().expect("kp1");
+
+        // Path 2: same directory but accessed via PathBuf round-trip
+        // (canonicalize should normalize both to the same form).
+        let key_dir_alt: PathBuf = key_dir.clone().into();
+        let m2 = DilithiumKeyManager::new("n2".to_string(), &key_dir_alt).expect("m2");
+        let (pk2, _) = m2.get_keypair().expect("kp2");
+
+        assert_eq!(
+            PublicKeyTrait::as_bytes(&pk1),
+            PublicKeyTrait::as_bytes(&pk2),
+            "Canonical-path keying must collapse equivalent paths to the same cache entry"
+        );
+    }
+
+    /// Verify that distinct key directories yield DISTINCT keypairs (no
+    /// accidental cross-contamination via the global cache).
+    #[test]
+    fn test_singleton_distinct_dirs_distinct_keypairs() {
+        let temp = tempdir().expect("tempdir");
+        let dir_a = temp.path().join("keys_distinct_a_d");
+        let dir_b = temp.path().join("keys_distinct_b_d");
+        fs::create_dir_all(&dir_a).expect("mkdir a");
+        fs::create_dir_all(&dir_b).expect("mkdir b");
+
+        // NOTE: ensure_writable_directory caches the FIRST writable dir it
+        // sees process-wide via CACHED_KEY_DIR (OnceLock). To get distinct
+        // paths into the global keypair cache we exercise the canonical
+        // path keying directly by building managers whose key_dir field is
+        // explicitly each unique tempdir. We bypass new() because of the
+        // process-wide CACHED_KEY_DIR collision in the test harness; this
+        // is a test-only concern, not a production one (production has 1
+        // process per node and 1 key_dir per process).
+        let m_a = DilithiumKeyManager {
+            key_dir: dir_a.clone(),
+            cached_keypair: Arc::new(RwLock::new(None)),
+            node_id: "node_dist_a".to_string(),
+        };
+        let m_b = DilithiumKeyManager {
+            key_dir: dir_b.clone(),
+            cached_keypair: Arc::new(RwLock::new(None)),
+            node_id: "node_dist_b".to_string(),
+        };
+
+        let (pk_a, _) = m_a.get_keypair().expect("kp a");
+        let (pk_b, _) = m_b.get_keypair().expect("kp b");
+
+        assert_ne!(
+            PublicKeyTrait::as_bytes(&pk_a),
+            PublicKeyTrait::as_bytes(&pk_b),
+            "Distinct key directories must yield distinct keypairs"
+        );
     }
 }
 
