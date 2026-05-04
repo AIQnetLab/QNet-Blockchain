@@ -1560,6 +1560,63 @@ static METRIC_LAST_RESET: AtomicU64 = AtomicU64::new(0);          // Timestamp o
 static METRIC_TIMESTAMP_REJECTIONS: AtomicU64 = AtomicU64::new(0); // Blocks rejected due to invalid timestamp
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// COMMITTEE-ATTESTATION OBSERVABILITY METRICS
+// ═══════════════════════════════════════════════════════════════════════════════
+// These counters expose the per-microblock attestation layer to operators.
+// They are reset on the same 5-minute rolling window as the failover metrics
+// above. All updates are atomic relaxed-ordered (telemetry, not consensus).
+// ═══════════════════════════════════════════════════════════════════════════════
+static METRIC_ATTEST_BROADCAST_COUNT: AtomicU64 = AtomicU64::new(0);     // Block attestations this node broadcast
+static METRIC_EMPTY_SLOT_BROADCAST_COUNT: AtomicU64 = AtomicU64::new(0); // Empty-slot attestations this node broadcast
+static METRIC_EMPTY_SLOT_FAILOVERS: AtomicU64 = AtomicU64::new(0);       // Times empty-slot 2f+1 advanced rotation
+static METRIC_FORK_KEEP_LOCAL_LAYER1: AtomicU64 = AtomicU64::new(0);     // 2f+1 supermajority kept local block
+static METRIC_FORK_KEEP_LOCAL_LAYER2: AtomicU64 = AtomicU64::new(0);     // Chain weight density kept local
+static METRIC_FORK_RESYNC: AtomicU64 = AtomicU64::new(0);                // Local chain abandoned, resyncing
+static METRIC_LATEST_COMMITTEE_SIZE: AtomicU64 = AtomicU64::new(0);      // Last observed committee size
+
+/// Process startup wall-clock timestamp. Set ONCE at first call to
+/// `node_uptime_secs()` and never updated. Used by the LMD-GHOST layer to
+/// gate chain-weight-based fork decisions until the local attestation store
+/// has had time to populate from the gossip stream after a restart.
+static NODE_START_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+
+/// Minimum uptime (seconds) before a node trusts its local attestation store
+/// for cumulative chain-weight comparison. Below this, the node falls back to
+/// the conservative "2f+1 on disputed block" decision. Long enough to let the
+/// gossip layer rebuild attestation state after restart at any committee
+/// size up to the cap.
+pub const ATTESTATION_WARMUP_SECS: u64 = 30;
+
+/// Returns this node's uptime in seconds. Initialises the start timestamp on
+/// first call (idempotent — multiple calls return monotonically increasing values).
+#[inline]
+pub fn node_uptime_secs() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let start = NODE_START_TIMESTAMP.load(Ordering::Relaxed);
+    if start == 0 {
+        // First call: store now (CAS to win race with any concurrent caller).
+        let _ = NODE_START_TIMESTAMP.compare_exchange(
+            0, now, Ordering::Relaxed, Ordering::Relaxed,
+        );
+        return 0;
+    }
+    now.saturating_sub(start)
+}
+
+/// Returns true once the attestation store has had time to populate after
+/// startup. Below this the LMD-GHOST chain-weight layer should defer to the
+/// per-block 2f+1 rule alone, because the local attestation count for our
+/// chain is artificially low (we missed the attestations broadcast before
+/// our process started).
+#[inline]
+pub fn attestation_layer_warmed_up() -> bool {
+    node_uptime_secs() >= ATTESTATION_WARMUP_SECS
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // v14.8.11: TIMESTAMP VALIDATION CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 // These constants define acceptable timestamp ranges for incoming blocks.
@@ -1616,6 +1673,16 @@ pub struct FailoverMetrics {
     pub current_timeout_round: u64,
     pub genesis_timestamp: u64,
     pub current_time: u64,
+
+    // Committee-attestation observability (per-microblock layer)
+    pub attest_broadcast_count: u64,
+    pub empty_slot_broadcast_count: u64,
+    pub empty_slot_failovers: u64,
+    pub fork_keep_local_layer1: u64,
+    pub fork_keep_local_layer2: u64,
+    pub fork_resync_count: u64,
+    pub latest_committee_size: u64,
+    pub node_uptime_secs: u64,
 }
 
 /// v3.12: Get failover metrics for monitoring
@@ -1631,6 +1698,39 @@ pub fn get_extended_failover_metrics() -> FailoverMetrics {
         current_timeout_round: get_current_timeout_round(),
         genesis_timestamp: crate::GLOBAL_GENESIS_TIMESTAMP.load(Ordering::Relaxed),
         current_time: get_timestamp_safe(),
+
+        // Committee-attestation observability
+        attest_broadcast_count: METRIC_ATTEST_BROADCAST_COUNT.load(Ordering::Relaxed),
+        empty_slot_broadcast_count: METRIC_EMPTY_SLOT_BROADCAST_COUNT.load(Ordering::Relaxed),
+        empty_slot_failovers: METRIC_EMPTY_SLOT_FAILOVERS.load(Ordering::Relaxed),
+        fork_keep_local_layer1: METRIC_FORK_KEEP_LOCAL_LAYER1.load(Ordering::Relaxed),
+        fork_keep_local_layer2: METRIC_FORK_KEEP_LOCAL_LAYER2.load(Ordering::Relaxed),
+        fork_resync_count: METRIC_FORK_RESYNC.load(Ordering::Relaxed),
+        latest_committee_size: METRIC_LATEST_COMMITTEE_SIZE.load(Ordering::Relaxed),
+        node_uptime_secs: node_uptime_secs(),
+    }
+}
+
+/// Periodic emission of committee-attestation metrics. Called from the same
+/// path as `update_failover_metrics`'s 5-minute reset; logs the rolling
+/// window's counters at INFO when there is non-trivial activity.
+fn emit_attestation_metrics_window(window_secs: u64) {
+    let attests = METRIC_ATTEST_BROADCAST_COUNT.swap(0, Ordering::Relaxed);
+    let empty = METRIC_EMPTY_SLOT_BROADCAST_COUNT.swap(0, Ordering::Relaxed);
+    let empty_failovers = METRIC_EMPTY_SLOT_FAILOVERS.swap(0, Ordering::Relaxed);
+    let keep1 = METRIC_FORK_KEEP_LOCAL_LAYER1.swap(0, Ordering::Relaxed);
+    let keep2 = METRIC_FORK_KEEP_LOCAL_LAYER2.swap(0, Ordering::Relaxed);
+    let resync = METRIC_FORK_RESYNC.swap(0, Ordering::Relaxed);
+    let committee = METRIC_LATEST_COMMITTEE_SIZE.load(Ordering::Relaxed);
+
+    let any_activity = attests > 0 || empty > 0 || empty_failovers > 0
+        || keep1 > 0 || keep2 > 0 || resync > 0;
+
+    if any_activity {
+        println!(
+            "[METRICS][ATTEST] window={}s committee={} attests={} empty_atts={} empty_failovers={} keep_local_layer1={} keep_local_layer2={} resync={}",
+            window_secs, committee, attests, empty, empty_failovers, keep1, keep2, resync,
+        );
     }
 }
 
@@ -1663,9 +1763,12 @@ fn update_failover_metrics(slot_delay: u64, timeout_round: u64) {
         let max_round = METRIC_TIMEOUT_ROUND_MAX.swap(0, Ordering::Relaxed);
         let failovers = METRIC_FAILOVER_COUNT.swap(0, Ordering::Relaxed);
         METRIC_LAST_RESET.store(now, Ordering::Relaxed);
-        
+
+        // Committee-attestation metrics for the same rolling window
+        emit_attestation_metrics_window(300);
+
         if max_delay > 0 || failovers > 0 {
-            println!("[METRICS][FAILOVER] window=5min max_slot_delay={}s max_timeout_round={} failover_events={}", 
+            println!("[METRICS][FAILOVER] window=5min max_slot_delay={}s max_timeout_round={} failover_events={}",
                      max_delay, max_round, failovers);
         }
     }
@@ -10832,29 +10935,115 @@ impl BlockchainNode {
                                                                 });
 
                                                         let total_validators = p2p.get_active_validator_count();
-                                                        let attest_byz_threshold = (total_validators.saturating_mul(2).saturating_add(2)) / 3;
+                                                        let committee_size = crate::attestation_committee::get_attestation_committee_size(total_validators);
+                                                        let attest_byz_threshold = (committee_size.saturating_mul(2).saturating_add(2)) / 3;
                                                         let our_attest = our_local_hash
                                                             .map(|hash| crate::unified_p2p::get_attestation_count_for_hash(fork_height, &hash))
                                                             .unwrap_or(0);
+
+                                                        // ═══════════════════════════════════════════════════════════
+                                                        // FORK-CHOICE LAYER 1 — Per-block 2f+1 supermajority on the
+                                                        // disputed height. Same as before; if our block is locked in
+                                                        // by a Byzantine supermajority of committee attestations, we
+                                                        // KEEP local — no rollback.
+                                                        // ═══════════════════════════════════════════════════════════
                                                         let is_sufficient = our_local_hash
-                                                            .map(|hash| crate::unified_p2p::has_sufficient_attestations_for_hash(
-                                                                fork_height, &hash, total_validators,
-                                                            ))
+                                                            .map(|hash| crate::unified_p2p::get_attestation_count_for_hash(
+                                                                fork_height, &hash,
+                                                            ) >= attest_byz_threshold)
                                                             .unwrap_or(false);
 
                                                         if is_sufficient {
+                                                            METRIC_FORK_KEEP_LOCAL_LAYER1.fetch_add(1, Ordering::Relaxed);
+                                                            METRIC_LATEST_COMMITTEE_SIZE.store(committee_size as u64, Ordering::Relaxed);
                                                             if is_info() {
-                                                                println!("[INFO][REORG] attest_fork_choice h={} attestations_for_our_hash={}/{} threshold=2f+1={} keeping_local",
-                                                                         fork_height, our_attest, total_validators, attest_byz_threshold);
+                                                                println!("[INFO][REORG] supermajority_lock h={} attestations={}/{} threshold=2f+1={} action=keep_local",
+                                                                         fork_height, our_attest, committee_size, attest_byz_threshold);
                                                             }
                                                             // Our block has a Byzantine-supermajority of attestations —
                                                             // keep it, do NOT resync.
                                                             *reorg_flag.write().await = false;
                                                             return;
                                                         }
+
+                                                        // ═══════════════════════════════════════════════════════════
+                                                        // FORK-CHOICE LAYER 2 — Cumulative chain weight.
+                                                        // ───────────────────────────────────────────────────────────
+                                                        // No 2f+1 supermajority on the disputed block alone — but the
+                                                        // local chain may still be canonical if its CUMULATIVE weight
+                                                        // (sum of attestations along the chain history from the last
+                                                        // finalized macroblock to tip) is dominant. We compute our
+                                                        // local chain weight and a healthy-density threshold.
+                                                        //
+                                                        // Healthy density = ⌈ committee_size / 2 ⌉ × depth.
+                                                        // Rationale: under normal operation a majority of the
+                                                        // committee attests every block, so a depth-K chain
+                                                        // accumulates ~ committee_size × K weight. A chain at
+                                                        // ≥ 50% density is "well-supported" — a minority partition
+                                                        // would be far below this threshold because attestation
+                                                        // committee membership is deterministic and minority
+                                                        // attestations cannot accumulate without majority quorum.
+                                                        //
+                                                        // WARM-UP GATE:
+                                                        //   Skipped during the first ATTESTATION_WARMUP_SECS after
+                                                        //   process startup. The local attestation store is empty
+                                                        //   immediately after restart and rebuilds from the gossip
+                                                        //   stream over ~10–30 s. During that window, the
+                                                        //   cumulative-weight signal is artificially low and would
+                                                        //   force unnecessary rollbacks. Layer 1 (per-block 2f+1)
+                                                        //   continues to provide safety during warm-up.
+                                                        //
+                                                        // SAFETY:
+                                                        //   * Layer 1 already excluded blocks with 2f+1 — those
+                                                        //     keep without further evaluation.
+                                                        //   * Layer 2 is a strictly weaker keep-local condition;
+                                                        //     it never causes us to keep a block that 2f+1 of the
+                                                        //     committee actively dispute (otherwise we'd see a
+                                                        //     competing-block supermajority elsewhere).
+                                                        //   * If local weight is low (partition-isolated), we
+                                                        //     proceed to rollback path — same as before.
+                                                        // ═══════════════════════════════════════════════════════════
+                                                        if !crate::node::attestation_layer_warmed_up() {
+                                                            if is_info() {
+                                                                println!("[INFO][REORG] layer2_warmup_gate uptime={}s required={}s — skipping chain-weight evaluation",
+                                                                         crate::node::node_uptime_secs(),
+                                                                         crate::node::ATTESTATION_WARMUP_SECS);
+                                                            }
+                                                        } else {
+                                                            let finalized_height = crate::node::LAST_FINALIZED_HEIGHT
+                                                                .load(std::sync::atomic::Ordering::SeqCst);
+                                                            let local_weight = Self::compute_local_chain_weight(
+                                                                &storage_clone, finalized_height, local_height,
+                                                            ).await;
+
+                                                            if let Some(ref lw) = local_weight {
+                                                                let healthy_density: u64 = ((committee_size as u64 + 1) / 2)
+                                                                    .saturating_mul(lw.depth);
+
+                                                                if lw.total_weight >= healthy_density && lw.depth > 0 {
+                                                                    METRIC_FORK_KEEP_LOCAL_LAYER2.fetch_add(1, Ordering::Relaxed);
+                                                                    if is_info() {
+                                                                        println!("[INFO][REORG] chain_weight_dominant h={} total_weight={} depth={} avg={:.1} density={} action=keep_local",
+                                                                                 fork_height, lw.total_weight, lw.depth, lw.avg_per_block(), healthy_density);
+                                                                    }
+                                                                    *reorg_flag.write().await = false;
+                                                                    return;
+                                                                }
+
+                                                                if is_info() {
+                                                                    println!("[INFO][REORG] chain_weight_low h={} total_weight={} depth={} avg={:.1} density_required={} action=resync",
+                                                                             fork_height, lw.total_weight, lw.depth, lw.avg_per_block(), healthy_density);
+                                                                }
+                                                            } else if is_warn() {
+                                                                println!("[WARN][REORG] chain_weight_compute_failed h={} reason=missing_local_blocks fallback=resync",
+                                                                         fork_height);
+                                                            }
+                                                        }
+                                                        METRIC_FORK_RESYNC.fetch_add(1, Ordering::Relaxed);
+
                                                         if is_info() {
                                                             println!("[INFO][REORG] same_height={} fork=detected attestations_for_our_hash={}/{} below_2f+1={} resync=network",
-                                                                     local_height, our_attest, total_validators, attest_byz_threshold);
+                                                                     local_height, our_attest, committee_size, attest_byz_threshold);
                                                         }
 
                                                         // Get our hash at fork_height for logging (hex prefix)
@@ -11252,41 +11441,74 @@ impl BlockchainNode {
                                             }
                                         }
 
-                                        // v3.33: Broadcast block attestation with real Dilithium signature
-                                        // v9.7: SYNC GATE — only broadcast attestations when fully synced.
-                                        // A syncing node at h=100 broadcasting attestations for old blocks
-                                        // is useless noise that wastes bandwidth. With 30000 nodes, thousands
-                                        // syncing simultaneously would flood network with stale attestations.
-                                        let attest_synced = coordinator_is_production_ready();
-
-                                        if attest_synced {
+                                        // ═══════════════════════════════════════════════════════════════
+                                        // BLOCK ATTESTATION — committee-based per-microblock confirmation
+                                        // ═══════════════════════════════════════════════════════════════
+                                        // A node attests a block when:
+                                        //   (1) it has decoded, validated and applied the block locally
+                                        //       (we are inside the apply-success branch), AND
+                                        //   (2) it is in the deterministic attestation committee for this
+                                        //       height (committee is bandwidth-bounded — sample 32/64/128
+                                        //       depending on total validator count; ≤32 → all attest).
+                                        //
+                                        // Sync-state gating REMOVED: a node that successfully applied a block
+                                        // has produced a local fact ("I observed and accepted this block").
+                                        // Withholding attestations until production-ready creates a
+                                        // propagation-gap window where the canonical chain cannot accumulate
+                                        // supermajority attestations from briefly-desynced nodes — this was
+                                        // the architectural cause of split-brain forks in prior versions.
+                                        //
+                                        // Bandwidth bound: at committee_size=128 (cap), a single attestation
+                                        // is ≈3.4 KB, so the network-wide attestation gossip is bounded at
+                                        // ≈435 KB/sec independent of total validator count.
+                                        // ═══════════════════════════════════════════════════════════════
                                         if let Some(ref p2p) = unified_p2p {
-                                            // v12.0: Attestation hash = consensus hash from struct fields.
-                                            // Previously hashed raw decompressed bytes — depends on serialization format.
-                                            let attest_hash = microblock.hash();
+                                            let in_committee = Self::is_node_in_attestation_committee(
+                                                &node_id,
+                                                received_block.height,
+                                                p2p,
+                                                &storage,
+                                            ).await;
 
-                                            // Sign "QNET_ATTEST:{height}:{hash_hex}" with Dilithium3 (same key as block signing)
-                                            let attest_msg = format!("QNET_ATTEST:{}:{}", received_block.height, hex::encode(&attest_hash));
-                                            let attest_sig: Vec<u8> = {
-                                                use pqcrypto_mldsa::mldsa65 as dilithium3;
-                                                use pqcrypto_traits::sign::SecretKey as SkTrait;
-                                                use pqcrypto_traits::sign::DetachedSignature as SigTrait;
-                                                GLOBAL_VRF_INSTANCE.lock().clone()
-                                                    .and_then(|vrf| vrf.get_secret_key_bytes())
-                                                    .and_then(|sk_bytes| {
-                                                        dilithium3::SecretKey::from_bytes(&sk_bytes).ok()
-                                                            .map(|sk| dilithium3::detached_sign(attest_msg.as_bytes(), &sk))
-                                                            .map(|sig| SigTrait::as_bytes(&sig).to_vec())
-                                                    })
-                                                    .unwrap_or_default()
-                                            };
+                                            if in_committee {
+                                                // v12.0: Attestation hash = consensus hash from struct fields.
+                                                // Previously hashed raw decompressed bytes — depends on serialization format.
+                                                let attest_hash = microblock.hash();
 
-                                            if !attest_sig.is_empty() {
-                                                p2p.broadcast_block_attestation(received_block.height, attest_hash, attest_sig);
+                                                // Sign "QNET_ATTEST:{height}:{hash_hex}" with Dilithium3 (same key as block signing)
+                                                let attest_msg = format!("QNET_ATTEST:{}:{}", received_block.height, hex::encode(&attest_hash));
+                                                let attest_sig: Vec<u8> = {
+                                                    use pqcrypto_mldsa::mldsa65 as dilithium3;
+                                                    use pqcrypto_traits::sign::SecretKey as SkTrait;
+                                                    use pqcrypto_traits::sign::DetachedSignature as SigTrait;
+                                                    GLOBAL_VRF_INSTANCE.lock().clone()
+                                                        .and_then(|vrf| vrf.get_secret_key_bytes())
+                                                        .and_then(|sk_bytes| {
+                                                            dilithium3::SecretKey::from_bytes(&sk_bytes).ok()
+                                                                .map(|sk| dilithium3::detached_sign(attest_msg.as_bytes(), &sk))
+                                                                .map(|sig| SigTrait::as_bytes(&sig).to_vec())
+                                                        })
+                                                        .unwrap_or_default()
+                                                };
+
+                                                if !attest_sig.is_empty() {
+                                                    p2p.broadcast_block_attestation(received_block.height, attest_hash, attest_sig);
+                                                    METRIC_ATTEST_BROADCAST_COUNT.fetch_add(1, Ordering::Relaxed);
+                                                    if is_debug() {
+                                                        println!("[DBG][ATTEST] committee_member h={} producer={} attesting=true",
+                                                                 received_block.height, microblock.producer);
+                                                    }
+                                                } else if is_warn() {
+                                                    println!("[WARN][ATTEST] sign_failed h={} no_vrf_key", received_block.height);
+                                                }
+                                            } else if is_debug() {
+                                                println!("[DBG][ATTEST] not_in_committee h={} skipping_attestation",
+                                                         received_block.height);
                                             }
+
                                             crate::unified_p2p::cleanup_old_attestations(received_block.height);
+                                            crate::unified_p2p::cleanup_old_empty_slot_attestations(received_block.height);
                                         }
-                                        } // attest_synced
                                         
                                         Ok(())
                                     }
@@ -17137,6 +17359,150 @@ impl BlockchainNode {
                         // reset_timeout_round(); refreshed every stall iteration.
                         set_timeout_round(timeout_round_for_rotation, next_height);
                         update_failover_metrics(local_delay, timeout_round_for_rotation);
+
+                        // ═══════════════════════════════════════════════════════════════
+                        // EMPTY-SLOT ATTESTATION — DETERMINISTIC PRODUCER FAILOVER
+                        // ═══════════════════════════════════════════════════════════════
+                        // When the producer for `next_height` fails to broadcast within
+                        // the slot grace period, committee members sign an empty-slot
+                        // attestation: "I, attester, expected `producer_round_0` to
+                        // produce block `next_height`, but the slot grace elapsed
+                        // without a valid block. The slot should be treated as empty
+                        // and the network should advance to the next producer."
+                        //
+                        // Once 2f+1 distinct attestations accumulate for the same
+                        // (slot_height, expected_producer) pair, failover is
+                        // cryptographically certified — independent of, and faster
+                        // than, the legacy timeout-vote round. The check returns an
+                        // `empty_slot_failover_round` that the producer-selection
+                        // path consumes alongside the legacy `certified_timeout_round`.
+                        //
+                        // Deduplication: this node attests a given slot at most once
+                        // (checked via `get_empty_slot_attestations`); subsequent
+                        // ticks short-circuit.
+                        //
+                        // Bandwidth: bounded by committee size (32–128 attestations
+                        // per stalled slot, Dilithium3 sigs ≈ 3.4 KB each). Worst
+                        // case 435 KB extra during a single failover event.
+                        // ═══════════════════════════════════════════════════════════════
+                        let mut empty_slot_failover_round: u64 = 0;
+                        if local_delay > timeout_grace_period && microblock_height > 0 {
+                            if let Some(ref p2p) = unified_p2p {
+                                // Compute baseline (round-0) expected producer for next_height.
+                                // We use round 0 deliberately: failover is computed *relative*
+                                // to the round-0 producer, so all honest committee members
+                                // attest against the same baseline regardless of local
+                                // timeout-round state. This breaks the cycle where each
+                                // node would attest against its own perceived round.
+                                let producer_round_0 = Self::select_microblock_producer_with_round(
+                                    next_height, &unified_p2p, &node_id, node_type,
+                                    Some(&storage), &poh, 0,
+                                ).await;
+
+                                if !producer_round_0.is_empty() && producer_round_0 != node_id {
+                                    let in_committee = Self::is_node_in_attestation_committee(
+                                        &node_id, next_height, p2p, &storage,
+                                    ).await;
+
+                                    if in_committee {
+                                        // Dedup: skip if we already emitted for this (slot, producer).
+                                        let already_emitted = crate::unified_p2p::get_empty_slot_attestations(next_height)
+                                            .iter()
+                                            .any(|a| a.attester_id == node_id
+                                                && a.expected_producer == producer_round_0);
+
+                                        if !already_emitted {
+                                            // Sign "QNET_EMPTY_SLOT:{slot_height}:{expected_producer}"
+                                            let attest_msg = format!(
+                                                "QNET_EMPTY_SLOT:{}:{}",
+                                                next_height, producer_round_0
+                                            );
+                                            let sig: Vec<u8> = {
+                                                use pqcrypto_mldsa::mldsa65 as dilithium3;
+                                                use pqcrypto_traits::sign::SecretKey as SkTrait;
+                                                use pqcrypto_traits::sign::DetachedSignature as SigTrait;
+                                                GLOBAL_VRF_INSTANCE.lock().clone()
+                                                    .and_then(|vrf| vrf.get_secret_key_bytes())
+                                                    .and_then(|sk_bytes| {
+                                                        dilithium3::SecretKey::from_bytes(&sk_bytes).ok()
+                                                            .map(|sk| dilithium3::detached_sign(attest_msg.as_bytes(), &sk))
+                                                            .map(|sig| SigTrait::as_bytes(&sig).to_vec())
+                                                    })
+                                                    .unwrap_or_default()
+                                            };
+
+                                            if !sig.is_empty() {
+                                                p2p.broadcast_empty_slot_attestation(
+                                                    next_height, producer_round_0.clone(), sig,
+                                                );
+                                                METRIC_EMPTY_SLOT_BROADCAST_COUNT.fetch_add(1, Ordering::Relaxed);
+                                                if is_info() {
+                                                    println!("[INFO][EMPTY-SLOT] emitted h={} expected={} delay={}s",
+                                                             next_height, producer_round_0, local_delay);
+                                                }
+                                            } else if is_warn() {
+                                                println!("[WARN][EMPTY-SLOT] sign_failed h={} no_vrf_key", next_height);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check whether 2f+1 empty-slot attestations have accumulated
+                                // for the (next_height, producer_round_0) pair. If so, we are
+                                // committed to failover round 1+. Higher rounds are computed
+                                // by inspecting subsequent producers in rotation.
+                                if !producer_round_0.is_empty() {
+                                    // Use the same committee-size bound the threshold check expects.
+                                    let total_validators = p2p.get_active_validator_count();
+                                    let committee_size = crate::attestation_committee::get_attestation_committee_size(total_validators);
+
+                                    if crate::unified_p2p::has_sufficient_empty_slot_attestations(
+                                        next_height, &producer_round_0, committee_size,
+                                    ) {
+                                        empty_slot_failover_round = 1;
+                                        // Cascade: if round-1 producer also has 2f+1 empty attestations,
+                                        // advance further. Bounded scan up to total candidate count.
+                                        for r in 2..=8u64 {
+                                            // round-r producer = round-0 producer index + (r-1) mod N.
+                                            // Recompute via select_microblock_producer_with_round so
+                                            // candidate-set logic is centralized.
+                                            let producer_at_r = Self::select_microblock_producer_with_round(
+                                                next_height, &unified_p2p, &node_id, node_type,
+                                                Some(&storage), &poh, r - 1,
+                                            ).await;
+                                            if producer_at_r.is_empty() || producer_at_r == producer_round_0 {
+                                                break;
+                                            }
+                                            if crate::unified_p2p::has_sufficient_empty_slot_attestations(
+                                                next_height, &producer_at_r, committee_size,
+                                            ) {
+                                                empty_slot_failover_round = r;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        METRIC_EMPTY_SLOT_FAILOVERS.fetch_add(1, Ordering::Relaxed);
+                                        if is_info() {
+                                            println!("[INFO][EMPTY-SLOT] failover_certified h={} round={} via_2f+1_attestations",
+                                                     next_height, empty_slot_failover_round);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Combined effective rotation round: take the max of the legacy
+                        // 2f+1 certified timeout round and the new empty-slot certified
+                        // failover round. Either path independently certifies advancement
+                        // — both are 2f+1 Dilithium3-signed quora over the same committee.
+                        let timeout_round_for_rotation = std::cmp::max(
+                            timeout_round_for_rotation,
+                            empty_slot_failover_round,
+                        );
+
+                        // Re-store the (potentially-advanced) effective round so producer
+                        // selection downstream in this tick consumes the same value.
+                        set_timeout_round(timeout_round_for_rotation, next_height);
 
                         // v11.0: HARDENED vote gate — unsynced/restarting nodes MUST NOT vote
                         // Three conditions required:
@@ -23257,7 +23623,277 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             own_node_id.to_string()
         }
     }
-    
+
+    /// Compute the deterministic per-height entropy used by both producer
+    /// selection and attestation committee selection.
+    ///
+    /// Returns the same value for all honest nodes given identical local state:
+    ///   * Round 0 (genesis epoch, height ≤ 30): SHA3-256(genesis_block ‖ leadership_round)
+    ///   * Round N (height > 30): macroblock-N-2 deterministic-fields hash
+    ///
+    /// The deterministic-fields hash excludes `consensus_data.next_leader` (which
+    /// can differ across nodes mid-consensus); see `select_microblock_producer_with_round`
+    /// for the canonical format. Returns [0u8; 32] on storage error / desync.
+    pub fn compute_microblock_entropy_for_height(
+        height: u64,
+        storage: &Arc<Storage>,
+    ) -> [u8; 32] {
+        let leadership_round: u64 = if height == 0 {
+            0
+        } else if height <= ROTATION_INTERVAL_BLOCKS {
+            0
+        } else {
+            (height - 1) / ROTATION_INTERVAL_BLOCKS
+        };
+
+        if leadership_round == 0 {
+            match storage.load_microblock(0) {
+                Ok(Some(genesis_data)) => {
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(&genesis_data);
+                    hasher.update(&leadership_round.to_le_bytes());
+                    let result = hasher.finalize();
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&result);
+                    hash
+                }
+                _ => [0u8; 32],
+            }
+        } else {
+            let current_epoch = (height - 1) / 90 + 1;
+            let required_macroblock = current_epoch.saturating_sub(2);
+            if required_macroblock == 0 {
+                match storage.load_microblock(0) {
+                    Ok(Some(genesis_data)) => {
+                        let mut hasher = Sha3_256::new();
+                        hasher.update(&genesis_data);
+                        let result = hasher.finalize();
+                        let mut hash = [0u8; 32];
+                        hash.copy_from_slice(&result);
+                        hash
+                    }
+                    _ => [0u8; 32],
+                }
+            } else {
+                match storage.get_macroblock_by_height(required_macroblock) {
+                    Ok(Some(mb_data)) => {
+                        let mut hasher = Sha3_256::new();
+                        hasher.update(b"QNet_Deterministic_Entropy_v2.32");
+                        match bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
+                            Ok(mb) => {
+                                hasher.update(&mb.height.to_le_bytes());
+                                hasher.update(&mb.timestamp.to_le_bytes());
+                                for block_hash in &mb.micro_blocks {
+                                    hasher.update(block_hash);
+                                }
+                                hasher.update(&mb.state_root);
+                                hasher.update(&mb.previous_hash);
+                                hasher.update(&mb.poh_hash);
+                                hasher.update(&mb.poh_count.to_le_bytes());
+                            }
+                            Err(_) => {
+                                hasher.update(&[0u8; 32]);
+                            }
+                        }
+                        let result = hasher.finalize();
+                        let mut hash = [0u8; 32];
+                        hash.copy_from_slice(&result);
+                        hash
+                    }
+                    _ => [0u8; 32],
+                }
+            }
+        }
+    }
+
+    /// Determine whether `own_node_id` is in the attestation committee for `height`.
+    ///
+    /// Hot path — called by every node receiving a microblock to decide whether
+    /// to broadcast a block attestation. Uses the deterministic VRF-like
+    /// committee selection from `attestation_committee` module:
+    ///
+    ///   * Validators set: qualified producers from macroblock N-2 snapshot
+    ///     (same source as producer selection — guarantees identical view)
+    ///   * Entropy: `compute_microblock_entropy_for_height(height, storage)`
+    ///   * Committee size: adaptive based on total validators
+    ///     (≤32 → all attest, ≤256 → 32, ≤1024 → 64, > → 128 cap)
+    ///
+    /// Returns false on desync / missing data — node will not attest until
+    /// it has enough state to compute identical committee as the supermajority.
+    pub async fn is_node_in_attestation_committee(
+        own_node_id: &str,
+        height: u64,
+        unified_p2p: &Arc<SimplifiedP2P>,
+        storage: &Arc<Storage>,
+    ) -> bool {
+        // Genesis epoch (height ≤ 180): all genesis nodes are in committee
+        // because committee_size == genesis_node_count. Fast path avoids
+        // the entropy/snapshot dependency during bootstrap.
+        if height <= 180 {
+            let genesis_candidates = Self::get_genesis_candidates_with_real_reputation(unified_p2p);
+            if genesis_candidates.is_empty() {
+                return false;
+            }
+            return genesis_candidates.iter().any(|(id, _)| id == own_node_id);
+        }
+
+        // Production path: use the same eligible-producers snapshot as
+        // producer selection. Sorting by node_id ensures all nodes compute
+        // identical committee membership.
+        let candidates = Self::calculate_qualified_candidates(
+            unified_p2p, own_node_id, NodeType::Super, height,
+        ).await;
+
+        if candidates.is_empty() {
+            return false; // desync
+        }
+
+        let mut sorted_validators: Vec<String> = candidates.into_iter().map(|(id, _)| id).collect();
+        sorted_validators.sort();
+
+        let entropy = Self::compute_microblock_entropy_for_height(height, storage);
+        if entropy == [0u8; 32] {
+            return false; // entropy unavailable → cannot agree on committee
+        }
+
+        crate::attestation_committee::is_in_attestation_committee(
+            own_node_id,
+            &entropy,
+            height,
+            &sorted_validators,
+        )
+    }
+
+    /// Compute the full attestation committee list for a given height.
+    /// Used by callers that need the entire committee (e.g. for empty-slot
+    /// attestation initiation, where we need to know who else might attest).
+    pub async fn compute_attestation_committee_for_height(
+        height: u64,
+        own_node_id: &str,
+        unified_p2p: &Arc<SimplifiedP2P>,
+        storage: &Arc<Storage>,
+    ) -> Vec<String> {
+        if height <= 180 {
+            return Self::get_genesis_candidates_with_real_reputation(unified_p2p)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+        }
+
+        let candidates = Self::calculate_qualified_candidates(
+            unified_p2p, own_node_id, NodeType::Super, height,
+        ).await;
+
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let mut sorted_validators: Vec<String> = candidates.into_iter().map(|(id, _)| id).collect();
+        sorted_validators.sort();
+
+        let entropy = Self::compute_microblock_entropy_for_height(height, storage);
+        if entropy == [0u8; 32] {
+            return Vec::new();
+        }
+
+        crate::attestation_committee::select_attestation_committee(
+            &entropy,
+            height,
+            &sorted_validators,
+        )
+    }
+
+    /// Compute the cumulative attestation weight of the LOCAL chain from
+    /// `finalized_height + 1` to `head_height` inclusive.
+    ///
+    /// Used by the weighted fork-choice rule (LMD-GHOST analogue) when the
+    /// local chain disagrees with the network at some height: instead of
+    /// abandoning the local chain on the first witness mismatch, we compare
+    /// the cumulative attestation weights and only switch when the alternative
+    /// chain is provably heavier (i.e., supported by more committee members).
+    ///
+    /// Returns None if any block in `(finalized_height, head_height]` is
+    /// missing from local storage — caller should treat this as "cannot
+    /// evaluate, defer to peer-driven sync".
+    pub async fn compute_local_chain_weight(
+        storage: &Arc<Storage>,
+        finalized_height: u64,
+        head_height: u64,
+    ) -> Option<crate::chain_weight::ChainWeight> {
+        if head_height <= finalized_height {
+            return Some(crate::chain_weight::ChainWeight {
+                head_hash: [0u8; 32],
+                head_height,
+                total_weight: 0,
+                depth: 0,
+            });
+        }
+
+        let mut hashes: std::collections::HashMap<u64, [u8; 32]> =
+            std::collections::HashMap::with_capacity(
+                (head_height.saturating_sub(finalized_height)) as usize,
+            );
+
+        for h in (finalized_height + 1)..=head_height {
+            // Fast path: pre-computed hash index in storage.
+            match storage.load_microblock_hash(h) {
+                Ok(Some(hash)) => {
+                    hashes.insert(h, hash);
+                }
+                _ => {
+                    // Block missing locally — chain is incomplete.
+                    return None;
+                }
+            }
+        }
+
+        let head_hash = hashes.get(&head_height).copied()?;
+        let candidate = crate::chain_weight::ChainCandidate {
+            head_hash,
+            head_height,
+            hashes_by_height: hashes,
+        };
+
+        crate::chain_weight::compute_chain_weight(
+            &candidate,
+            finalized_height,
+            |h, hash| crate::unified_p2p::get_attestation_count_for_hash(h, hash) as u64,
+        )
+    }
+
+    /// Decide whether to switch from the local chain to a competing peer chain.
+    ///
+    /// Inputs:
+    ///   * `local_chain_weight` — weight of our current head (from `compute_local_chain_weight`)
+    ///   * `peer_head_height` — peer's tip height
+    ///   * `peer_head_hash` — peer's tip hash
+    ///   * `peer_attestations_at_head` — attestation count for peer's tip block
+    ///
+    /// Conservative decision: only switch when the peer's chain has *strictly*
+    /// greater cumulative weight than ours by a safety margin proportional to
+    /// the committee size. The margin prevents flapping on transient
+    /// attestation gossip races.
+    ///
+    /// At low depth (≤10 blocks) any concrete weight advantage is sufficient.
+    /// At higher depth, require margin ≥ committee_size / 4 — roughly one
+    /// round-trip's worth of attestations.
+    pub fn should_switch_to_peer_chain(
+        local_chain_weight: &crate::chain_weight::ChainWeight,
+        peer_head_height: u64,
+        peer_head_hash: [u8; 32],
+        peer_chain_weight_estimate: u64,
+        peer_chain_depth: u64,
+        committee_size: usize,
+    ) -> bool {
+        let peer_weight = crate::chain_weight::ChainWeight {
+            head_hash: peer_head_hash,
+            head_height: peer_head_height,
+            total_weight: peer_chain_weight_estimate,
+            depth: peer_chain_depth,
+        };
+        crate::chain_weight::should_switch_head(local_chain_weight, &peer_weight, committee_size)
+    }
+
     /// v4.0: Get VRF instance from global (for static context in select_producer)
     fn get_vrf_static() -> Option<Arc<crate::crypto::vrf::DilithiumVrf>> {
         // Access via global node reference if available
@@ -29751,6 +30387,44 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
         }
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // RPC-PATH TRANSACTION TYPE WHITELIST
+        // ═══════════════════════════════════════════════════════════════════════
+        // Mirrors the gossip-path whitelist in `validate_and_add_network_transaction`.
+        // Both ingress points reject the same internal-only types so that no
+        // user-submitted CreateAccount / BatchX transaction can ever reach
+        // the mempool. Genesis-time CreateAccount transactions never traverse
+        // this path — they are constructed directly by `genesis::create_genesis_block`
+        // and applied via the block-apply pipeline.
+        // ═══════════════════════════════════════════════════════════════════════
+        match &tx.tx_type {
+            qnet_state::TransactionType::CreateAccount { .. } => {
+                if is_warn() {
+                    println!("[WARN][TX-RPC] reject_rpc_create_account from={}... reason=internal_only_tx_type",
+                        &tx.from[..tx.from.len().min(20)]);
+                }
+                return Err(QNetError::ValidationError(
+                    "[REJECT][RPC] CreateAccount is genesis-only — not accepted via RPC".to_string()
+                ));
+            }
+            qnet_state::TransactionType::BatchRewardClaims { .. } => {
+                return Err(QNetError::ValidationError(
+                    "[REJECT][RPC] BatchRewardClaims is deprecated — not accepted via RPC".to_string()
+                ));
+            }
+            qnet_state::TransactionType::BatchNodeActivations { .. } => {
+                return Err(QNetError::ValidationError(
+                    "[REJECT][RPC] BatchNodeActivations is deprecated — not accepted via RPC".to_string()
+                ));
+            }
+            qnet_state::TransactionType::BatchTransfers { .. } => {
+                return Err(QNetError::ValidationError(
+                    "[REJECT][RPC] BatchTransfers is unused — not accepted via RPC".to_string()
+                ));
+            }
+            _ => {} // All other variants pass through to standard validation
+        }
+
         // FIX R23-M1: Chain ID validation — reject cross-chain replay attempts.
         // chain_id=0 is accepted for backward compat with pre-R23 TXs.
         // Non-zero chain_id MUST match this node's configured chain_id.
@@ -30220,7 +30894,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// │ NodeRegistration    │ (SKIPPED in batch verify — unsigned system TX)            │ System       │
     /// │ LightNodeBitmap     │ (SKIPPED in batch verify — unsigned system TX)            │ System       │
     /// └─────────────────────┴──────────────────────────────────────────────────────────┴──────────────┘
-    fn build_canonical_verify_message(tx: &qnet_state::Transaction) -> String {
+    pub fn build_canonical_verify_message(tx: &qnet_state::Transaction) -> String {
         let to_str = tx.to.as_ref().map(|s| s.as_str()).unwrap_or("");
         match &tx.tx_type {
             // === USER TRANSACTIONS (signed by mobile/dApp) ===
@@ -30392,6 +31066,77 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // PRODUCTION VALIDATION - same as submit_transaction
         if let Err(validation_error) = tx.validate() {
             return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // GOSSIP-PATH TRANSACTION TYPE WHITELIST
+        // ═══════════════════════════════════════════════════════════════════════
+        // Some transaction types are produced ONLY by block-construction code
+        // paths (locally on the producer) and MUST NEVER arrive via gossip.
+        // Allowing them through gossip would let a Byzantine peer inject
+        // forged genesis-style transactions (CreateAccount with mint),
+        // batch-claim multipliers, or batch-activation duplicates.
+        //
+        // Rejection here closes those vectors at the earliest point — before
+        // mempool admission, before block inclusion, before state apply. The
+        // block-pipeline TX-level signature stage provides a second-line
+        // defence for blocks containing such TXs (defense-in-depth).
+        //
+        // ALLOWED via gossip (user-originated or commitment-style):
+        //   * Transfer, ContractDeploy, ContractCall, Swap     (user TXs)
+        //   * NodeRegistration, NodeReactivation, NodeActivation (node lifecycle)
+        //   * KeyRotation                                       (PQ key hygiene)
+        //   * SetPQRequirement                                  (PQ wallet lock)
+        //   * RewardDistribution (claim, NOT system_emission)   (user reward claims)
+        //   * HeartbeatCommitment, PingCommitmentWithSampling   (node commitments)
+        //   * LightNodeEligibilityBitmap                        (Genesis ping aggregation)
+        //   * PingAttestation                                   (per-ping records)
+        //
+        // REJECTED via gossip (internal-only):
+        //   * CreateAccount       — produced ONLY by genesis_block construction.
+        //                            Any post-genesis CreateAccount is an attack.
+        //   * BatchRewardClaims   — DEPRECATED enum variant, never instantiated.
+        //   * BatchNodeActivations — DEPRECATED enum variant, never instantiated.
+        //   * BatchTransfers      — UNUSED handler-only enum variant.
+        //
+        // SCALABILITY: O(1) match per gossip TX. Identical cost at 5 or 5000
+        // validators — no cross-node coordination, purely local check.
+        // ═══════════════════════════════════════════════════════════════════════
+        match &tx.tx_type {
+            qnet_state::TransactionType::CreateAccount { .. } => {
+                if crate::node::is_warn() {
+                    println!("[WARN][TX-GOSSIP] reject_gossip_create_account from={}... reason=internal_only_tx_type",
+                        &tx.from[..tx.from.len().min(20)]);
+                }
+                return Err(QNetError::ValidationError(
+                    "[REJECT][GOSSIP] CreateAccount is genesis-only — must not arrive via gossip".to_string()
+                ));
+            }
+            qnet_state::TransactionType::BatchRewardClaims { .. } => {
+                if crate::node::is_warn() {
+                    println!("[WARN][TX-GOSSIP] reject_gossip_batch_reward_claims reason=deprecated_enum_variant");
+                }
+                return Err(QNetError::ValidationError(
+                    "[REJECT][GOSSIP] BatchRewardClaims is deprecated — must not arrive via gossip".to_string()
+                ));
+            }
+            qnet_state::TransactionType::BatchNodeActivations { .. } => {
+                if crate::node::is_warn() {
+                    println!("[WARN][TX-GOSSIP] reject_gossip_batch_node_activations reason=deprecated_enum_variant");
+                }
+                return Err(QNetError::ValidationError(
+                    "[REJECT][GOSSIP] BatchNodeActivations is deprecated — must not arrive via gossip".to_string()
+                ));
+            }
+            qnet_state::TransactionType::BatchTransfers { .. } => {
+                if crate::node::is_warn() {
+                    println!("[WARN][TX-GOSSIP] reject_gossip_batch_transfers reason=unused_enum_variant");
+                }
+                return Err(QNetError::ValidationError(
+                    "[REJECT][GOSSIP] BatchTransfers is unused — must not arrive via gossip".to_string()
+                ));
+            }
+            _ => {} // All other variants pass through to standard validation
         }
         
         // Signature validation with cryptographic verification

@@ -745,6 +745,109 @@ pub fn cleanup_old_attestations(current_height: u64) {
     BLOCK_ATTESTATIONS.retain(|h, _| *h > cutoff);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMPTY-SLOT ATTESTATION — DETERMINISTIC PRODUCER FAILOVER FOR MICROBLOCKS
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Purpose:
+//   When a microblock producer fails to broadcast within the slot grace period,
+//   the attestation committee signs an empty-slot attestation. Once 2f+1 distinct
+//   empty-slot attestations are observed for the same (slot_height, expected_producer)
+//   pair, the network deterministically advances to the next producer in rotation.
+//
+// Why this replaces reactive timeout_round for microblocks:
+//   * Reactive timeout_round depends on local wall-clock & gossip race ordering.
+//     Different nodes converge at slightly different rounds, producing
+//     timeout_divergence (different `our_round` vs `block_round`) under normal
+//     propagation gap.
+//   * Empty-slot attestations are signed locally but aggregated supermajority-style.
+//     Once 2f+1 honest validators agree the slot is empty, the failover is
+//     cryptographically certified — a 2f+1 supermajority is by definition outside
+//     the Byzantine bound.
+//   * Convergence is bounded by attestation gossip latency (~1 RTT), not by
+//     timeout grace period escalation (which scales with 1-second voting rounds).
+//
+// Signature format:
+//   message = "QNET_EMPTY_SLOT:{slot_height}:{expected_producer}"
+//   signed with the attester's Dilithium3 (ML-DSA-65) secret key
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Single empty-slot attestation from a committee member.
+///
+/// Attestation declares: "I, attester, was waiting for `expected_producer` to
+/// produce block at `slot_height`, but the slot grace period elapsed without
+/// receiving a valid block from that producer. The slot should be treated as
+/// empty and the network should advance to the next producer."
+#[derive(Debug, Clone)]
+pub struct EmptySlotAttestation {
+    pub slot_height: u64,
+    pub expected_producer: String,
+    pub attester_id: String,
+    pub signature: Vec<u8>,
+    pub timestamp: u64,
+}
+
+/// Empty-slot attestation store: keyed by (slot_height) → Vec<EmptySlotAttestation>.
+/// Multiple expected_producer values may coexist at the same slot if rotation
+/// state is itself contested; threshold checks always filter on a specific
+/// expected_producer to maintain BFT-safe quorum semantics.
+static EMPTY_SLOT_ATTESTATIONS: once_cell::sync::Lazy<AttestDashMap<u64, Vec<EmptySlotAttestation>>> =
+    once_cell::sync::Lazy::new(|| AttestDashMap::new());
+
+/// Submit an empty-slot attestation.
+/// Deduplication: one entry per (slot_height, attester_id, expected_producer).
+pub fn submit_empty_slot_attestation(attestation: EmptySlotAttestation) {
+    let h = attestation.slot_height;
+    let mut entry = EMPTY_SLOT_ATTESTATIONS
+        .entry(h)
+        .or_insert_with(Vec::new);
+    let already = entry.iter().any(|a|
+        a.attester_id == attestation.attester_id
+            && a.expected_producer == attestation.expected_producer
+    );
+    if !already {
+        entry.push(attestation);
+    }
+}
+
+/// Count empty-slot attestations for a given (slot_height, expected_producer).
+pub fn get_empty_slot_attestation_count(slot_height: u64, expected_producer: &str) -> usize {
+    EMPTY_SLOT_ATTESTATIONS
+        .get(&slot_height)
+        .map(|v| v.iter().filter(|a| a.expected_producer == expected_producer).count())
+        .unwrap_or(0)
+}
+
+/// Check whether 2f+1 empty-slot attestations have accumulated for a given
+/// (slot_height, expected_producer). Once true, the slot is deterministically
+/// considered empty and rotation should advance.
+pub fn has_sufficient_empty_slot_attestations(
+    slot_height: u64,
+    expected_producer: &str,
+    committee_size: usize,
+) -> bool {
+    let count = get_empty_slot_attestation_count(slot_height, expected_producer);
+    let threshold = (committee_size * 2 + 2) / 3; // Byzantine 2/3+
+    count >= threshold
+}
+
+/// All empty-slot attestations for a given slot height (any producer).
+pub fn get_empty_slot_attestations(slot_height: u64) -> Vec<EmptySlotAttestation> {
+    EMPTY_SLOT_ATTESTATIONS
+        .get(&slot_height)
+        .map(|v| v.clone())
+        .unwrap_or_default()
+}
+
+/// Cleanup empty-slot attestations older than 100 blocks behind current tip.
+/// Called from the same cleanup path as block attestations.
+pub fn cleanup_old_empty_slot_attestations(current_height: u64) {
+    if current_height <= 100 { return; }
+    let cutoff = current_height - 100;
+    EMPTY_SLOT_ATTESTATIONS.retain(|h, _| *h > cutoff);
+}
+
 /// v3.1: Cleanup stale entries from PENDING_SYNC_MACROBLOCKS
 pub fn cleanup_pending_sync_macroblocks() -> usize {
     let now = std::time::SystemTime::now()
@@ -12203,6 +12306,20 @@ pub enum NetworkMessage {
         timestamp: u64,
     },
 
+    /// Empty-slot attestation — committee member declares that the producer
+    /// for `slot_height` failed to broadcast a valid block within the slot
+    /// grace period, and the network should advance to the next producer
+    /// in rotation. Once 2f+1 distinct attestations accumulate for the
+    /// same (slot_height, expected_producer), failover is deterministic.
+    /// Replaces reactive timeout_round for microblock-level rotation.
+    EmptySlotAttestationMsg {
+        slot_height: u64,
+        expected_producer: String,
+        attester_id: String,
+        signature: Vec<u8>,        // Dilithium3 over "QNET_EMPTY_SLOT:{slot_height}:{expected_producer}"
+        timestamp: u64,
+    },
+
     /// v4.6: VRF Public Key Announcement — exchange Dilithium3 VRF keys between nodes.
     /// Broadcast on startup and at every macroblock boundary.
     /// Receiver verifies self-signature (proves ownership of secret key).
@@ -13119,8 +13236,64 @@ impl SimplifiedP2P {
                     timestamp,
                 });
                 if crate::node::is_debug() {
-                    println!("[DBG][ATTEST] verified h={} from={} total={}", 
+                    println!("[DBG][ATTEST] verified h={} from={} total={}",
                              block_height, attester_id, get_attestation_count(block_height));
+                }
+            }
+
+            // Empty-slot attestation — committee declares producer at slot_height failed
+            NetworkMessage::EmptySlotAttestationMsg { slot_height, expected_producer, attester_id, signature, timestamp } => {
+                self.update_peer_last_seen(from_peer);
+
+                // Drop stale empty-slot attestations from unsynced peers
+                // (same staleness gate as block attestations)
+                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                if local_h > 20 && slot_height.saturating_add(20) < local_h {
+                    return;
+                }
+
+                // Skip unsigned attestations (empty sig = invalid)
+                if signature.is_empty() {
+                    return;
+                }
+
+                // Verify Dilithium3 signature: "QNET_EMPTY_SLOT:{slot_height}:{expected_producer}"
+                let sig_ok = if let Some(pk_bytes) = crate::genesis_constants::get_vrf_public_key(&attester_id) {
+                    use pqcrypto_mldsa::mldsa65 as dilithium3;
+                    use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
+                    let attest_msg = format!("QNET_EMPTY_SLOT:{}:{}", slot_height, expected_producer);
+                    let pk_ok = dilithium3::PublicKey::from_bytes(&pk_bytes).ok();
+                    let sig_ok_decode = dilithium3::DetachedSignature::from_bytes(&signature).ok();
+                    match (pk_ok, sig_ok_decode) {
+                        (Some(pk), Some(sig)) => {
+                            dilithium3::verify_detached_signature(&sig, attest_msg.as_bytes(), &pk).is_ok()
+                        }
+                        _ => false,
+                    }
+                } else {
+                    // Attester not in key registry — accept during bootstrap/genesis phase
+                    slot_height < 100
+                };
+
+                if !sig_ok {
+                    if crate::node::is_warn() {
+                        println!("[WARN][EMPTY-SLOT] invalid_sig h={} expected={} from={}",
+                                 slot_height, expected_producer, attester_id);
+                    }
+                    return;
+                }
+
+                submit_empty_slot_attestation(EmptySlotAttestation {
+                    slot_height,
+                    expected_producer: expected_producer.clone(),
+                    attester_id: attester_id.clone(),
+                    signature,
+                    timestamp,
+                });
+                if crate::node::is_debug() {
+                    let total = get_empty_slot_attestation_count(slot_height, &expected_producer);
+                    println!("[DBG][EMPTY-SLOT] verified h={} expected={} from={} total={}",
+                             slot_height, expected_producer, attester_id, total);
                 }
             }
 
@@ -22978,8 +23151,72 @@ impl SimplifiedP2P {
         });
 
         if crate::node::is_debug() {
-            println!("[DBG][ATTEST] broadcast h={} hash={}", 
+            println!("[DBG][ATTEST] broadcast h={} hash={}",
                      block_height, hex::encode(&block_hash[..8]));
+        }
+    }
+
+    /// Broadcast an empty-slot attestation to all validators.
+    ///
+    /// Called by committee members when the producer for `slot_height` fails to
+    /// broadcast a valid block within the slot grace period. Once 2f+1 distinct
+    /// empty-slot attestations accumulate for the same (slot_height, expected_producer)
+    /// pair, the network deterministically advances to the next producer.
+    pub fn broadcast_empty_slot_attestation(
+        &self,
+        slot_height: u64,
+        expected_producer: String,
+        signature: Vec<u8>,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Store our own attestation locally
+        submit_empty_slot_attestation(EmptySlotAttestation {
+            slot_height,
+            expected_producer: expected_producer.clone(),
+            attester_id: self.node_id.clone(),
+            signature: signature.clone(),
+            timestamp: now,
+        });
+
+        let msg = NetworkMessage::EmptySlotAttestationMsg {
+            slot_height,
+            expected_producer: expected_producer.clone(),
+            attester_id: self.node_id.clone(),
+            signature,
+            timestamp: now,
+        };
+
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        let peers = self.get_all_validator_addresses();
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+
+        handle.spawn(async move {
+            if quic_enabled {
+                if let Some(ref qt_lock) = quic_transport {
+                    let qt = qt_lock.read().await;
+                    for peer_str in &peers {
+                        let ip = peer_str.split(':').next().unwrap_or(peer_str);
+                        let quic_addr_str = format!("{}:10876", ip);
+                        if let Ok(peer_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
+                            let _ = qt.broadcast_to(peer_addr, &msg).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        if crate::node::is_debug() {
+            println!("[DBG][EMPTY-SLOT] broadcast h={} expected={}",
+                     slot_height, expected_producer);
         }
     }
 

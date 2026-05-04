@@ -1073,7 +1073,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             // SECURITY: Rate limit ALL JSON-RPC methods (bypass with valid API key)
             let method = &request.method;
             let limit_category = match method.as_str() {
-                "tx_submit" | "tx_sendTransaction" | "mempool_submit" | "device_migration" => "write",
+                "tx_submit" | "tx_sendTransaction" | "mempool_submit" | "device_migration" | "account_setPQRequirement" => "write",
                 _ => "read_only",
             };
             if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, limit_category) {
@@ -1093,7 +1093,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             // SECURITY: Rate limit ALL JSON-RPC methods (bypass with valid API key)
             let method = &request.method;
             let limit_category = match method.as_str() {
-                "tx_submit" | "tx_sendTransaction" | "mempool_submit" | "device_migration" => "write",
+                "tx_submit" | "tx_sendTransaction" | "mempool_submit" | "device_migration" | "account_setPQRequirement" => "write",
                 _ => "read_only",
             };
             if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, limit_category) {
@@ -2645,6 +2645,8 @@ async fn handle_rpc(
         "tx_submit" => tx_submit(blockchain, request.params).await,
         "tx_sendTransaction" => tx_submit(blockchain, request.params).await, // Alias for compatibility
         "tx_get" => tx_get(blockchain, request.params).await,
+        // Post-quantum enforcement: per-wallet opt-in lock
+        "account_setPQRequirement" => account_set_pq_requirement(blockchain, request.params).await,
         
         // Mempool methods
         "mempool_getTransactions" => mempool_get_transactions(blockchain).await,
@@ -2921,6 +2923,149 @@ async fn tx_submit(
             Err(RpcError {
                 code: -32000,
                 message: "request failed".to_string(),
+            })
+        }
+    }
+}
+
+/// Post-quantum enforcement upgrade — submit a `SetPQRequirement` transaction.
+///
+/// Submitting this method permanently locks the sender account into mandatory
+/// Dilithium3 signing. Once accepted on-chain, every future TX from this account
+/// MUST carry a Dilithium3 signature whose public key matches the registered
+/// key on this transaction. One-way upgrade — cannot be reversed.
+///
+/// REQUEST PARAMS (all required):
+///   * `from`                  — sender EON wallet address
+///   * `nonce`                 — current account nonce + 1
+///   * `signature`             — Ed25519 signature (hex)
+///   * `public_key`            — Ed25519 public key (hex, 32 bytes / 64 chars)
+///   * `dilithium_signature`   — Dilithium3 signature (hex, 3309 bytes / 6618 chars)
+///   * `dilithium_public_key`  — Dilithium3 public key (hex, 1952 bytes / 3904 chars)
+///   * `gas_price` (optional, default 0) — system TX, no gas fee
+///   * `gas_limit` (optional, default 0)
+///
+/// CANONICAL SIGNED MESSAGE:
+///   The sender must sign `"set_pq_requirement:{from}:{nonce}"` with BOTH the
+///   Ed25519 wallet key AND the Dilithium3 key. The dual signature proves
+///   ownership of both keypairs at the moment of upgrade.
+///
+/// RESPONSE:
+///   * On success: `{ "hash": "<tx_hash>" }`
+///   * On failure: JSON-RPC error with descriptive message
+///
+/// SECURITY NOTES:
+///   * Dilithium3 public key on this TX becomes the REGISTERED key for the
+///     account. All future hybrid TXs must use the same Dilithium3 key.
+///   * Re-submission on a locked account with the SAME registered key is a
+///     no-op (idempotent, only nonce advances).
+///   * Re-submission with a DIFFERENT Dilithium3 key is rejected — use the
+///     `KeyRotation` TX path for legitimate key rotation.
+async fn account_set_pq_requirement(
+    blockchain: Arc<BlockchainNode>,
+    params: Option<Value>,
+) -> Result<Value, RpcError> {
+    let params = params.ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Invalid params".to_string(),
+    })?;
+
+    let from = params["from"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing from".to_string(),
+    })?;
+
+    if let Err(e) = validate_eon_address_with_error(from) {
+        return Err(RpcError {
+            code: -32602,
+            message: format!("Invalid 'from' address: {}", e),
+        });
+    }
+
+    let nonce = params["nonce"].as_u64().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing or invalid nonce (must be unsigned integer)".to_string(),
+    })?;
+
+    // Both signatures REQUIRED — dual-sig is the authorisation proof for
+    // permanent quantum-lock. We reject the upgrade if either is missing.
+    let signature = params["signature"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing signature (Ed25519) — required for PQ upgrade".to_string(),
+    })?;
+    let public_key = params["public_key"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing public_key (Ed25519) — required for PQ upgrade".to_string(),
+    })?;
+    let dilithium_signature = params["dilithium_signature"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing dilithium_signature — required for PQ upgrade (the whole point)".to_string(),
+    })?;
+    let dilithium_public_key = params["dilithium_public_key"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing dilithium_public_key — required for PQ upgrade".to_string(),
+    })?;
+
+    // Validate Dilithium3 public key format up-front: 1952 bytes = 3904 hex chars.
+    if dilithium_public_key.len() != 3904 {
+        return Err(RpcError {
+            code: -32602,
+            message: format!(
+                "Invalid dilithium_public_key length: expected 3904 hex chars (1952 bytes), got {}",
+                dilithium_public_key.len()
+            ),
+        });
+    }
+    if hex::decode(dilithium_public_key).is_err() {
+        return Err(RpcError {
+            code: -32602,
+            message: "Invalid dilithium_public_key: not valid hex".to_string(),
+        });
+    }
+
+    let gas_price = params["gas_price"].as_u64().unwrap_or(0); // system TX
+    let gas_limit = params["gas_limit"].as_u64().unwrap_or(0);
+
+    // Construct SetPQRequirement TX. The transaction-level signatures (Ed25519
+    // + Dilithium3) carry the dual-sig authorisation proof. The applied state
+    // change (account.require_pq_signature = true; account.dilithium_public_key
+    // = registered key) commits atomically.
+    let mut tx = qnet_state::Transaction {
+        hash: String::new(),
+        from: from.to_string(),
+        to: None, // SetPQRequirement is account-scoped — no recipient
+        amount: 0,
+        nonce,
+        gas_price,
+        gas_limit,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+        signature: Some(signature.to_string()),
+        public_key: Some(public_key.to_string()),
+        tx_type: qnet_state::TransactionType::SetPQRequirement {},
+        data: None,
+        dilithium_signature: Some(dilithium_signature.to_string()),
+        dilithium_public_key: Some(dilithium_public_key.to_string()),
+        chain_id: 0,
+    };
+
+    tx.hash = tx.calculate_hash();
+
+    match blockchain.submit_transaction(tx).await {
+        Ok(hash) => {
+            if crate::node::is_info() {
+                println!("[INFO][RPC] pq_upgrade_submitted account={}... hash={}",
+                    &from[..from.len().min(20)], &hash[..hash.len().min(16)]);
+            }
+            Ok(json!({
+                "hash": hash,
+                "info": "Post-quantum lock submitted. Once accepted on-chain, every future transaction from this account must carry a valid Dilithium3 signature under the registered public key."
+            }))
+        }
+        Err(e) => {
+            println!("[WARN][RPC] rpc_error method=account_setPQRequirement err={}", e);
+            Err(RpcError {
+                code: -32000,
+                message: format!("PQ upgrade rejected: {}", e),
             })
         }
     }

@@ -1380,6 +1380,240 @@ impl BlockPipeline {
             // A per-block QC is redundant with (4) and was also the source
             // of a production rate-limit collision. Removed.
 
+            // ═══════════════════════════════════════════════════════════════════════════
+            // 4b. INTERNAL-ONLY TRANSACTION TYPE GUARD (post-genesis)
+            // ═══════════════════════════════════════════════════════════════════════════
+            // Some transaction types are produced ONLY by genesis-block construction
+            // (CreateAccount with mint) or are deprecated enum variants that should
+            // never appear at all. A Byzantine producer could construct a block that
+            // bypasses mempool admission and directly contains such a TX — this
+            // backstop rejects the entire block at ingest time.
+            //
+            // ALLOWED in genesis (height == 0): CreateAccount (initial supply setup).
+            // ALLOWED ONLY in genesis: nothing else from the deprecated set.
+            //
+            // REJECTED post-genesis (height > 0):
+            //   * CreateAccount       — locked to genesis bootstrap
+            //   * BatchRewardClaims   — deprecated, never instantiated
+            //   * BatchNodeActivations — deprecated, never instantiated
+            //   * BatchTransfers      — unused enum variant
+            //
+            // SAFETY: this is a HARD REJECT of the whole block, not just the
+            // offending transaction. Including a forbidden TX is a sign of a
+            // malicious producer; the block is unsafe to apply, and the peer
+            // sending it accumulates negative reputation.
+            //
+            // SCALABILITY: O(tx_count) per block, single match per TX. Bounded
+            // identical at 5 or 5000 validators.
+            // ═══════════════════════════════════════════════════════════════════════════
+            if mb.height > 0 {
+                for tx in &decoded.microblock.transactions {
+                    let forbidden = matches!(tx.tx_type,
+                        qnet_state::TransactionType::CreateAccount { .. } |
+                        qnet_state::TransactionType::BatchRewardClaims { .. } |
+                        qnet_state::TransactionType::BatchNodeActivations { .. } |
+                        qnet_state::TransactionType::BatchTransfers { .. }
+                    );
+                    if forbidden {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] forbidden_tx_type_in_block h={} tx_type_discriminant={:?} producer={} from_peer={} action=reject_block",
+                                mb.height,
+                                std::mem::discriminant(&tx.tx_type),
+                                mb.producer,
+                                decoded.from_peer
+                            );
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        // Continue 'outer-style: drop this block entirely. We don't
+                        // strip the offending TX because that would mutate a block
+                        // already producer-signed; instead we discard the block and
+                        // sync_manager will refetch the canonical version from a
+                        // different peer.
+                        continue 'outer;
+                    }
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════════════════════
+            // 5. PER-TRANSACTION SIGNATURE VERIFICATION
+            // ═══════════════════════════════════════════════════════════════════════════
+            // SECURITY INVARIANT: every user-submitted transaction inside the block
+            // MUST carry a cryptographically valid Ed25519 signature (and Dilithium3
+            // when present). Without this check, a Byzantine producer could include
+            // forged transactions that drain arbitrary wallets — the producer's own
+            // block signature (step 3) authenticates the BLOCK envelope but says
+            // nothing about whether the transactions WITHIN the block were authorised
+            // by their senders.
+            //
+            // WHY THIS LIVES IN THE PIPELINE, NOT THE STATE LAYER:
+            //   * Mempool ingestion already verifies signatures before admission
+            //     (verify_ed25519_batch in node.rs). That covers the user-submitted
+            //     path: TX → RPC → mempool → producer.
+            //   * Block ingestion bypasses the local mempool entirely: a remote
+            //     producer's block contains TXs that THIS node never validated.
+            //     Without a verification step here, those TXs reach state-apply
+            //     unchecked. apply_transaction_lazy in state.rs intentionally does
+            //     NOT verify signatures (single-responsibility — it applies state
+            //     mutations on already-validated TXs, and re-checking inside the
+            //     state lock would serialise verification needlessly).
+            //   * Therefore signature verification of in-block TXs is the ingest
+            //     pipeline's responsibility. This step closes the gap.
+            //
+            // SCOPE — WHAT IS VERIFIED:
+            //   * Ed25519 batch verify for every TX with `tx.signature.is_some()`.
+            //   * Dilithium3 verify for every TX with `tx.dilithium_signature.is_some()`.
+            //   * SYSTEM TXs (RewardDistribution from system_emission, CreateAccount
+            //     bootstrap, BatchRewardClaims, BatchNodeActivations) are exempt —
+            //     they are signed at block-construction time by the producer and
+            //     validated against on-chain proofs (1DEV burn, 2f+1 macroblock
+            //     evidence, ping commitment chain) elsewhere in the apply path.
+            //     The same exemption set is mirrored from `verify_ed25519_batch`
+            //     in node.rs to keep the mempool and ingest paths consistent.
+            //
+            // SCOPE — WHAT IS NOT VERIFIED HERE:
+            //   * Nonce, balance, business-logic checks remain in apply stage where
+            //     account state is mutated atomically.
+            //   * Replay protection is enforced by per-account nonce monotonicity
+            //     in apply_to_state — a replayed signed TX still fails on nonce.
+            //
+            // PERFORMANCE:
+            //   * Ed25519 batch verify is ~5-10 ms per 100-TX block (negligible
+            //     against the 1-second slot budget). The batch path uses the same
+            //     `verify_ed25519_batch` helper as mempool admission so the cost
+            //     curve and CPU profile are identical to the well-understood
+            //     gossip-ingest path.
+            //   * Dilithium3 individual verify is ~3 ms per signature; only runs
+            //     for TXs that opted into post-quantum signing. At committee=128
+            //     and 100 TXs of which ~5 are hybrid, this adds ~15 ms — bounded.
+            //   * The check runs OFF the apply-stage state lock, so it never
+            //     blocks block application or state mutation paths.
+            //
+            // SCALABILITY (thousands of validators):
+            //   * Verification cost is per-block, not per-validator. Every node
+            //     verifies its own ingest stream independently — no cross-node
+            //     coordination, no extra gossip traffic. O(tx_count) per block,
+            //     identical at 5 or 5000 validators.
+            //   * Batch verification amortises elliptic-curve operations across
+                //     all signed TXs in a block, multiplying throughput vs naïve
+            //     per-TX verification.
+            //
+            // ═══════════════════════════════════════════════════════════════════════════
+            if !decoded.microblock.transactions.is_empty() {
+                metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_SIG);
+                let txsig_start = std::time::Instant::now();
+
+                // Ed25519 batch verification (shared helper with mempool path).
+                // Returns the indices of TXs whose Ed25519 sig verified OR which
+                // are in the system-TX exempt set. Any TX index NOT in the
+                // returned set has either a missing or invalid Ed25519 sig.
+                let valid_indices = crate::node::BlockchainNode::verify_ed25519_batch(
+                    &decoded.microblock.transactions,
+                );
+                let valid_set: std::collections::HashSet<usize> =
+                    valid_indices.into_iter().collect();
+
+                let total_txs = decoded.microblock.transactions.len();
+                if valid_set.len() != total_txs {
+                    let invalid_count = total_txs - valid_set.len();
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] tx_sig_invalid h={} invalid={}/{} producer={} from={} action=reject_block",
+                            mb.height, invalid_count, total_txs, mb.producer, decoded.from_peer
+                        );
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue; // HARD REJECT — Byzantine producer included forged TXs
+                }
+
+                // Dilithium3 verification for TXs that opted into PQ signing.
+                // Inline to avoid a second helper call: we only iterate over
+                // the small subset with `dilithium_signature.is_some()`.
+                let mut dilithium_invalid = 0usize;
+                for (idx, tx) in decoded.microblock.transactions.iter().enumerate() {
+                    if tx.dilithium_signature.is_none() {
+                        continue;
+                    }
+                    let dilithium_sig = match &tx.dilithium_signature {
+                        Some(s) if !s.is_empty() => s,
+                        _ => continue, // empty sig is treated as absent
+                    };
+                    let dilithium_pk = match &tx.dilithium_public_key {
+                        Some(p) if !p.is_empty() => p,
+                        _ => {
+                            // Has dilithium_signature but no dilithium_public_key —
+                            // malformed TX, reject the block.
+                            if is_warn() {
+                                println!(
+                                    "[WARN][PIPELINE] dilithium_pk_missing h={} tx_idx={} producer={} action=reject_block",
+                                    mb.height, idx, mb.producer
+                                );
+                            }
+                            dilithium_invalid += 1;
+                            continue;
+                        }
+                    };
+
+                    let sig_bytes = match hex::decode(dilithium_sig) {
+                        Ok(b) if b.len() == 3309 => b, // ML-DSA-65 detached sig
+                        _ => {
+                            dilithium_invalid += 1;
+                            continue;
+                        }
+                    };
+                    let pk_bytes = match hex::decode(dilithium_pk) {
+                        Ok(b) if b.len() == 1952 => b, // ML-DSA-65 public key
+                        _ => {
+                            dilithium_invalid += 1;
+                            continue;
+                        }
+                    };
+
+                    use pqcrypto_mldsa::mldsa65 as dilithium3;
+                    use pqcrypto_traits::sign::PublicKey as PkTrait;
+                    use pqcrypto_traits::sign::DetachedSignature as SigTrait;
+
+                    let pk = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
+                        Ok(p) => p,
+                        Err(_) => { dilithium_invalid += 1; continue; }
+                    };
+                    let sig = match dilithium3::DetachedSignature::from_bytes(&sig_bytes) {
+                        Ok(s) => s,
+                        Err(_) => { dilithium_invalid += 1; continue; }
+                    };
+
+                    // Canonical message — same builder used by RPC validation
+                    // path so the signed bytes are byte-identical across all
+                    // verification sites.
+                    let message = crate::node::BlockchainNode::build_canonical_verify_message(tx);
+
+                    if dilithium3::verify_detached_signature(&sig, message.as_bytes(), &pk).is_err() {
+                        dilithium_invalid += 1;
+                    }
+                }
+
+                if dilithium_invalid > 0 {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] dilithium_invalid h={} count={} producer={} from={} action=reject_block",
+                            mb.height, dilithium_invalid, mb.producer, decoded.from_peer
+                        );
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue; // HARD REJECT — Byzantine producer with bad PQ sigs
+                }
+
+                let txsig_elapsed = txsig_start.elapsed();
+                if txsig_elapsed > std::time::Duration::from_millis(100) {
+                    if is_info() {
+                        println!(
+                            "[INFO][PIPELINE] tx_sig_verify h={} txs={} elapsed_ms={}",
+                            mb.height, total_txs, txsig_elapsed.as_millis()
+                        );
+                    }
+                }
+            }
+
             // All checks passed — forward to apply stage
             let block_height = decoded.height; // Copy before move
             let verified = VerifiedBlock {
@@ -2474,14 +2708,22 @@ impl BlockPipeline {
                 producer: block.microblock.producer.clone(),
             });
 
-            // v14.7.2: per-microblock BlockCommitVote emission REMOVED.
-            // Canonical macroblock commit/reveal (2f+1 at 90-block boundary)
-            // is the sole BFT finality layer. Per-block QCs duplicated that
-            // path, inflated bandwidth, and shared the "commit" rate-limit
-            // key with macroblock ConsensusCommit, which starved the real
-            // macroblock consensus from peers. Producer-side pre-save
-            // yield_stale_round guard (v14.6) and TimeoutCertificate 2f+1
-            // provide live-path safety without a per-block attestation stream.
+            // Per-microblock BlockCommitVote (HotStuff-style blocking QC)
+            // remains DISABLED on this path. The previous quorum-certificate
+            // approach shared the "commit" rate-limit key with macroblock
+            // ConsensusCommit and starved real macroblock consensus from peers.
+            //
+            // Per-microblock confirmation is now provided by the COMMITTEE-
+            // ATTESTATION layer (see `attestation_committee.rs` and the
+            // BlockAttestationMsg / EmptySlotAttestationMsg handlers in
+            // `unified_p2p.rs`). That layer is non-blocking — attestations
+            // travel on a separate gossip channel, do not gate block
+            // production, and form the basis of the cumulative-weight fork
+            // choice rule (`chain_weight.rs`). It supplies per-block 2f+1
+            // safety AND deterministic empty-slot failover, without sharing
+            // the macroblock commit rate-limit bucket. Macroblock 2f+1
+            // commit/reveal at the 90-block boundary remains the canonical
+            // finality anchor.
 
             // ── Reputation update for block producer ──
             // Handled by deterministic reputation system via macroblock processing

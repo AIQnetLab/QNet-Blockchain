@@ -81,9 +81,11 @@ impl StateDB {
                     is_contract: false,
                     contract_code_hash: None,
                     contract_storage: std::collections::HashMap::new(),
+                    require_pq_signature: false,
+                    dilithium_public_key: None,
                 }
             });
-            
+
             // Check nonce for transaction ordering
             if tx.nonce != sender.nonce + 1 {
                 return Err(StateError::InvalidTransaction(format!(
@@ -134,9 +136,11 @@ impl StateDB {
                     is_contract: false,
                     contract_code_hash: None,
                     contract_storage: std::collections::HashMap::new(),
+                    require_pq_signature: false,
+                    dilithium_public_key: None,
                 }
             });
-            
+
             recipient.balance = recipient.balance.saturating_add(tx.amount);
             // Update recipient activity
             recipient.touch(timestamp);

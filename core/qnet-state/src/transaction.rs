@@ -31,6 +31,109 @@ static LOG_LEVEL: Lazy<AtomicU8> = Lazy::new(|| {
     AtomicU8::new(level)
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// SENDER ADDRESS FORMAT WHITELIST
+// ═══════════════════════════════════════════════════════════════════════════════
+// The set of identifier patterns that may legitimately appear in `tx.from`.
+// Any sender outside this set is rejected by `Transaction::validate()` —
+// closing the address-impersonation vector that allowed attackers to set
+// `tx.from = "system"` and pass apply-time string-match authority checks.
+//
+// Three legitimate formats:
+//
+//   1. EON wallet address — 45 chars, "eon" marker at position 19,
+//      SHA3-256 4-byte checksum (validated by `is_valid_eon_address`).
+//      This is the format produced by client wallets for human users.
+//
+//   2. Reserved protocol identifiers — produced by block-construction code
+//      paths only. They appear as `tx.from` for system-emitted transactions
+//      (RewardDistribution, ping commitments, genesis bootstrap). The
+//      `validate_and_add_network_transaction` path explicitly rejects
+//      these senders for transaction types that should not arrive via
+//      gossip — preventing forged "system" transactions from peers.
+//
+//   3. Node identifier pseudonyms — `genesis_node_NNN`, `super_*`, `light_*`.
+//      Used as `tx.from` for HeartbeatCommitment / NodeReactivation /
+//      similar node-bound system messages.
+//
+// Adding a new sender format MUST update this whitelist AND the corresponding
+// gossip-path tx_type whitelist to keep both invariants aligned.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Reserved protocol identifiers that produce transactions internally.
+/// Must NEVER appear as `tx.from` of a transaction received via gossip
+/// or RPC — only block-construction paths set these.
+const RESERVED_PROTOCOL_IDENTIFIERS: &[&str] = &[
+    "system",
+    "genesis",
+    "system_emission",
+    "system_rewards_pool",
+    "system_ping_commitment",
+];
+
+/// Validate whether the `tx.from` value matches one of the three accepted
+/// formats: EON wallet address, reserved protocol identifier, or node
+/// identifier pseudonym. Returns true on match, false otherwise.
+///
+/// SCALABILITY: O(1) — constant-bounded checks. Independent of network size.
+pub fn is_valid_sender_format(sender: &str) -> bool {
+    if sender.is_empty() {
+        return false;
+    }
+
+    // Format 1: EON wallet address (45 chars).
+    if is_valid_eon_address(sender) {
+        return true;
+    }
+
+    // Format 2: Reserved protocol identifier (exact match).
+    if RESERVED_PROTOCOL_IDENTIFIERS.contains(&sender) {
+        return true;
+    }
+
+    // Format 3: Node identifier pseudonyms.
+    if sender.starts_with("genesis_node_")
+        || sender.starts_with("super_")
+        || sender.starts_with("light_")
+    {
+        // Length sanity bound: pseudonyms are typically short. Reject overly
+        // long or empty-prefix variants to prevent storage-bloat attacks.
+        return sender.len() >= 8 && sender.len() <= 128;
+    }
+
+    false
+}
+
+/// Validate full EON wallet address format:
+///   * 45 chars total
+///   * lowercase hex chars 0-18 (part1, 19 chars)
+///   * "eon" literal at positions 19-21
+///   * lowercase hex chars 22-36 (part2, 15 chars)
+///   * SHA3-256(part1 + "eon" + part2)[..4] hex at positions 37-44
+///
+/// Returns true ONLY for fully valid checksummed addresses. Invalid format,
+/// wrong length, or bad checksum all return false.
+fn is_valid_eon_address(addr: &str) -> bool {
+    if addr.len() != 45 {
+        return false;
+    }
+    if &addr[19..22] != "eon" {
+        return false;
+    }
+    let part1 = &addr[0..19];
+    let part2 = &addr[22..37];
+    let checksum_claim = &addr[37..45];
+
+    let is_lower_hex = |s: &str| s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase());
+    if !is_lower_hex(part1) || !is_lower_hex(part2) || !is_lower_hex(checksum_claim) {
+        return false;
+    }
+
+    let address_without_checksum = format!("{}eon{}", part1, part2);
+    let computed = hex::encode(&Sha3_256::digest(address_without_checksum.as_bytes())[..4]);
+    checksum_claim == computed
+}
+
 fn is_info_log() -> bool {
     LOG_LEVEL.load(Ordering::Relaxed) >= 3
 }
@@ -330,6 +433,43 @@ pub enum TransactionType {
         /// Block height at which the new key becomes active (allows grace period)
         #[serde(default)]
         effective_height: u64,
+    },
+
+    /// Per-wallet post-quantum enforcement upgrade.
+    ///
+    /// Once accepted, the sender account's `require_pq_signature` flag is set
+    /// to `true` permanently. Every subsequent transaction from this account
+    /// MUST carry a valid Dilithium3 signature in addition to the standard
+    /// Ed25519 signature, or it is rejected at apply time.
+    ///
+    /// SECURITY REQUIREMENTS
+    ///   * The submitting `Transaction` MUST have BOTH `tx.signature` (Ed25519)
+    ///     AND `tx.dilithium_signature` (Dilithium3) populated and valid. This
+    ///     proves the sender owns BOTH keypairs at the moment of upgrade —
+    ///     prevents an attacker who only has one key from locking the wallet
+    ///     into an unusable state.
+    ///   * One-way upgrade: account.require_pq_signature transitions
+    ///     `false → true` and never the reverse. Even a SetPQRequirement TX
+    ///     issued from an account already locked is a no-op.
+    ///   * Nonce monotonicity is enforced by apply path (same as any other TX).
+    ///
+    /// USE CASES
+    ///   * Exchanges, treasuries, smart-contract escrow: lock high-value
+    ///     wallets into mandatory PQ-signing in advance of CRQC arrival.
+    ///   * Privacy-conscious users: opt into post-quantum protection without
+    ///     waiting for a network-wide policy change.
+    ///   * Smart contract owners: protect contract-controlling accounts that
+    ///     hold long-lived authority.
+    ///
+    /// SCALABILITY
+    ///   * Free system-side check: one bool comparison at apply time per TX
+    ///     from a flagged account. O(1) regardless of validator count.
+    ///   * Zero impact on accounts that don't opt in.
+    SetPQRequirement {
+        // No payload fields — the upgrade is account-scoped and the sender is
+        // identified by tx.from. The transaction-level signature pair (Ed25519
+        // + Dilithium3) carries the cryptographic proof that the holder owns
+        // both keypairs.
     },
 }
 
@@ -781,6 +921,11 @@ impl Transaction {
             }
             // FIX R23-K1: Key rotation is a system operation (free gas)
             TransactionType::KeyRotation { .. } => 0,
+            // PQ-enforcement upgrade is a per-account configuration change.
+            // No fee — it is a one-time security upgrade and we do not want
+            // gas costs to deter quantum-readiness adoption. Rate-limited via
+            // per-account nonce monotonicity (one upgrade per account, ever).
+            TransactionType::SetPQRequirement {} => 0,
         }
     }
 
@@ -842,7 +987,41 @@ impl Transaction {
         if self.from.is_empty() {
             return Err("[REJECT][TX] empty_sender_address".to_string());
         }
-        
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // SENDER ADDRESS FORMAT VALIDATION (defense against address impersonation)
+        // ═══════════════════════════════════════════════════════════════════════
+        // The sender field must match one of the following well-defined formats:
+        //
+        //   1. Standard user address — 45 chars, "eon" marker at position 19,
+        //      SHA3-256 4-byte checksum at position 37-45.
+        //
+        //   2. Reserved protocol identifiers — these are produced ONLY by the
+        //      block-construction path (locally by the producer) and MUST NEVER
+        //      arrive from external sources (mempool / P2P gossip / RPC). The
+        //      `validate_and_add_network_transaction` path enforces tx_type
+        //      whitelist that complements this check.
+        //
+        //   3. Node-binding identifiers — node_id pseudonyms used as sender
+        //      for system commitments (HeartbeatCommitment, PingCommitment).
+        //
+        // REJECTING UNKNOWN-FORMAT SENDERS prevents attacks where an adversary
+        // crafts a transaction with `from = "system"` to bypass apply-time
+        // string-match authority checks (e.g. C1 SECURITY in CreateAccount).
+        // The string-match logic remains for backward-compat with genesis TX
+        // serialisation, but it can no longer be triggered by user-submitted
+        // transactions because non-eon, non-reserved senders are rejected here.
+        //
+        // SCALABILITY: O(1) per TX (constant-set lookup + 45-char regex-free
+        // check). Identical cost at 5 or 5000 validators.
+        // ═══════════════════════════════════════════════════════════════════════
+        if !is_valid_sender_format(&self.from) {
+            return Err(format!(
+                "[REJECT][TX] invalid_sender_format from={} (must be eon address, reserved protocol id, or node identifier)",
+                &self.from[..self.from.len().min(40)]
+            ));
+        }
+
         // v2.101: Hash validation - STRICT for ALL transaction types
         // bincode serialization IS deterministic for our structures (no HashMap, no floats)
         // Previous "workaround" for system TXs was unnecessary - removed
@@ -1269,6 +1448,12 @@ impl Transaction {
                 }
                 let _ = effective_height; // effective_height=0 means immediate
             }
+            TransactionType::SetPQRequirement {} => {
+                // Sender must be present (the upgrade is account-scoped).
+                // Validation of dual-signature presence happens in apply_to_state
+                // because it inspects fields on the parent Transaction struct.
+                // Empty sender is already caught at the top of `validate()`.
+            }
         }
 
         Ok(())
@@ -1284,6 +1469,70 @@ impl Transaction {
                 return Err(StateError::InvalidTransaction(format!(
                     "[REJECT][TX] out_of_gas gas_used={} gas_limit={}", gas_used, self.gas_limit
                 )));
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // POST-QUANTUM ENFORCEMENT GATE (two-stage: presence + key binding)
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE 1: Presence check — if the sender account has opted into
+        //   mandatory post-quantum signing (account.require_pq_signature == true),
+        //   reject any non-system TX that lacks a Dilithium3 signature.
+        //
+        // STAGE 2: Key binding — if the sender account has a registered
+        //   Dilithium3 public key (account.dilithium_public_key.is_some()),
+        //   the TX's `dilithium_public_key` MUST byte-match the registered key.
+        //   This prevents the "any-Dilithium3-key" bypass: an attacker with a
+        //   forged Ed25519 signature cannot satisfy the gate by attaching their
+        //   own Dilithium3 keypair, because the TX would fail the registered-key
+        //   binding check. The attacker would need to compromise the holder's
+        //   specific Dilithium3 secret key — quantum-resistant by FIPS 204.
+        //
+        // System TXs (NodeRegistration, RewardDistribution, KeyRotation, etc.)
+        // are exempt — they are protocol-internal and authorised by other
+        // on-chain proofs (Solana burn, 2f+1 macroblock votes, ping commitment
+        // chain). Only user-originated TXs go through this gate.
+        //
+        // SCALABILITY: O(1) bool lookup + O(1) hex-string compare per TX. No
+        // marginal cost for accounts that haven't opted in. At thousands of
+        // validators, the only cost is one HashMap lookup per applied TX.
+        //
+        // The Dilithium3 signature itself is verified at ingest time (block
+        // pipeline TX-sig verification and mempool admission). This gate
+        // enforces presence + key binding only; signature validity is already
+        // proven before apply.
+        // ═══════════════════════════════════════════════════════════════════════
+        if !self.is_system_tx() {
+            if let Some(sender_account) = accounts.get(&self.from) {
+                if sender_account.require_pq_signature {
+                    // STAGE 1: presence
+                    let tx_dilithium_pk = match self.dilithium_public_key.as_ref() {
+                        Some(p) if !p.is_empty() => p,
+                        _ => {
+                            return Err(StateError::InvalidTransaction(format!(
+                                "[REJECT][PQ-LOCK] account={} require_pq_signature=true got_only_ed25519",
+                                &self.from[..self.from.len().min(20)]
+                            )));
+                        }
+                    };
+                    let has_dilithium_sig = self.dilithium_signature.as_ref().map_or(false, |s| !s.is_empty());
+                    if !has_dilithium_sig {
+                        return Err(StateError::InvalidTransaction(format!(
+                            "[REJECT][PQ-LOCK] account={} require_pq_signature=true missing_dilithium_signature",
+                            &self.from[..self.from.len().min(20)]
+                        )));
+                    }
+
+                    // STAGE 2: key binding (registered key must match)
+                    if let Some(registered_pk) = sender_account.registered_dilithium_pk() {
+                        if registered_pk != tx_dilithium_pk {
+                            return Err(StateError::InvalidTransaction(format!(
+                                "[REJECT][PQ-LOCK] account={} dilithium_pk_mismatch (TX uses unregistered key)",
+                                &self.from[..self.from.len().min(20)]
+                            )));
+                        }
+                    }
+                }
             }
         }
 
@@ -2171,6 +2420,119 @@ impl Transaction {
                 if is_info_log() {
                     println!("[INFO][KEY-ROTATE] node={} new_pk_prefix={}... effective_h={}",
                         node_id, &new_dilithium_pk[..16.min(new_dilithium_pk.len())], effective_height);
+                }
+            }
+
+            TransactionType::SetPQRequirement {} => {
+                // ═══════════════════════════════════════════════════════════════
+                // POST-QUANTUM ENFORCEMENT UPGRADE — APPLY (two-field commit)
+                // ═══════════════════════════════════════════════════════════════
+                // Permanently lock the sender account into mandatory Dilithium3
+                // signing AND register the Dilithium3 public key on the upgrade
+                // TX as the binding key for all future TXs from this account.
+                //
+                // Both fields commit atomically:
+                //   * `account.require_pq_signature = true`            (gate ON)
+                //   * `account.dilithium_public_key = Some(tx_pk_hex)` (key bound)
+                //
+                // Authorisation: this transaction MUST itself carry both Ed25519
+                // and Dilithium3 signatures (validated at ingest time). The
+                // dual-signature requirement proves the sender owns BOTH keypairs
+                // at the moment of upgrade — preventing an adversary with only
+                // one key from locking the wallet into an unusable state.
+                //
+                // The Dilithium3 public key on this TX is what gets REGISTERED.
+                // From this moment, every hybrid TX from this account must use
+                // a Dilithium3 signature verifiable under this exact key. An
+                // attacker with a forged Ed25519 sig cannot bypass the gate by
+                // attaching their own Dilithium3 keypair — the registered-key
+                // mismatch check would reject the TX.
+                // ═══════════════════════════════════════════════════════════════
+
+                // Authorisation gate: require BOTH signature components on the
+                // upgrading TX itself. Signature *validity* is verified at ingest;
+                // here we only check presence (cheap O(1) string-empty checks).
+                let has_ed25519 = self.signature.as_ref().map_or(false, |s| !s.is_empty())
+                    && self.public_key.as_ref().map_or(false, |p| !p.is_empty());
+                let dilithium_pk_hex = match (self.dilithium_signature.as_ref(), self.dilithium_public_key.as_ref()) {
+                    (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => p.clone(),
+                    _ => {
+                        return Err(StateError::InvalidTransaction(format!(
+                            "[REJECT][PQ-UPGRADE] account={} missing_dilithium_signature_or_pubkey",
+                            &self.from[..self.from.len().min(20)]
+                        )));
+                    }
+                };
+                if !has_ed25519 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "[REJECT][PQ-UPGRADE] account={} missing_ed25519_signature_or_pubkey",
+                        &self.from[..self.from.len().min(20)]
+                    )));
+                }
+
+                // Validate Dilithium3 public key format: hex-encoded 1952 bytes.
+                if dilithium_pk_hex.len() != 3904 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "[REJECT][PQ-UPGRADE] account={} invalid_dilithium_pk_size expected=3904_hex got={}",
+                        &self.from[..self.from.len().min(20)], dilithium_pk_hex.len()
+                    )));
+                }
+                if hex::decode(&dilithium_pk_hex).is_err() {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "[REJECT][PQ-UPGRADE] account={} invalid_dilithium_pk_hex",
+                        &self.from[..self.from.len().min(20)]
+                    )));
+                }
+
+                // Auto-create the account if it doesn't exist yet (e.g. first
+                // TX from a fresh wallet that wants to lock immediately).
+                if !accounts.contains_key(&self.from) {
+                    accounts.insert(self.from.clone(), Account::new(self.from.clone()));
+                }
+
+                let account = accounts.get_mut(&self.from)
+                    .expect("account just inserted");
+
+                // Nonce monotonicity (same as any user TX).
+                if self.nonce != account.nonce + 1 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "[REJECT][PQ-UPGRADE] invalid_nonce expected={} got={}",
+                        account.nonce + 1, self.nonce
+                    )));
+                }
+
+                // Re-locking: forbid changing the registered Dilithium3 key.
+                // If the account is already locked, the registered key must match
+                // the TX's key — this prevents an attacker who somehow forces a
+                // SetPQRequirement on a locked account from rotating the key
+                // out from under the legitimate holder.
+                let was_already_locked = account.require_pq_signature;
+                if was_already_locked {
+                    if let Some(existing_pk) = account.registered_dilithium_pk() {
+                        if existing_pk != dilithium_pk_hex {
+                            return Err(StateError::InvalidTransaction(format!(
+                                "[REJECT][PQ-UPGRADE] account={} already_locked_with_different_key — use KeyRotation TX",
+                                &self.from[..self.from.len().min(20)]
+                            )));
+                        }
+                    }
+                }
+
+                // Apply: monotonic flip false→true + register Dilithium3 key.
+                // `lock_pq_signature_required` is idempotent — if already locked,
+                // the registered key is preserved (no rebinding). The check above
+                // ensures we only reach here when the keys match.
+                account.lock_pq_signature_required(dilithium_pk_hex);
+                account.nonce = account.nonce.saturating_add(1);
+
+                if is_info_log() {
+                    if was_already_locked {
+                        println!("[INFO][PQ-UPGRADE] account={} already_locked nonce={}",
+                            &self.from[..self.from.len().min(20)], account.nonce);
+                    } else {
+                        println!("[INFO][PQ-UPGRADE] account={} pq_lock=acquired pk_registered=true one_way=true",
+                            &self.from[..self.from.len().min(20)]);
+                    }
                 }
             }
         }

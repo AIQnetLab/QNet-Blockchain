@@ -807,6 +807,14 @@ impl BlockValidator {
                 }
                 // System transaction - no gas fees
             }
+            TransactionType::SetPQRequirement {} => {
+                // No payload to validate at type level. Cryptographic enforcement
+                // (dual Ed25519 + Dilithium3 signatures present) is performed at
+                // apply time inside `transaction.rs::apply_to_state`. The TX-level
+                // signature batch verifier in block_pipeline already verifies
+                // the Ed25519 sig; the Dilithium3 sig is verified in the same
+                // pipeline stage before this validator is consulted.
+            }
         }
 
         Ok(())

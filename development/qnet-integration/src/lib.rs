@@ -24,6 +24,8 @@ pub mod genesis_constants;
 pub mod reward_sharding;
 pub mod consensus_state;   // L1 consensus state machine (single coordinator)
 pub mod block_pipeline;    // Staged block processing pipeline (ingest → decode → verify → apply)
+pub mod attestation_committee;  // Deterministic attestation committee selection (per-microblock BFT layer)
+pub mod chain_weight;            // Weighted fork choice (cumulative attestation weight, fork resolution)
 pub mod genesis_config;    // File-based genesis loader (not p2p)
 pub mod sync_manager;      // Block download coordinator (sequential waves, ordered buffer)
 pub mod p2p_extensions;

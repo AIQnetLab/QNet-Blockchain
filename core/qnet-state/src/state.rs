@@ -1293,6 +1293,8 @@ impl StateManager {
             is_contract: false,
             contract_code_hash: None,
             contract_storage: std::collections::HashMap::new(),
+            require_pq_signature: false,
+            dilithium_public_key: None,
         };
         
         StateMerkleTree::verify_proof(
