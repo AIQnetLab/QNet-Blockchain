@@ -1436,7 +1436,7 @@ impl BlockPipeline {
             }
 
             // ═══════════════════════════════════════════════════════════════════════════
-            // 5. PER-TRANSACTION SIGNATURE VERIFICATION
+            // 5. PER-TRANSACTION SIGNATURE VERIFICATION (post-genesis only)
             // ═══════════════════════════════════════════════════════════════════════════
             // SECURITY INVARIANT: every user-submitted transaction inside the block
             // MUST carry a cryptographically valid Ed25519 signature (and Dilithium3
@@ -1445,6 +1445,32 @@ impl BlockPipeline {
             // block signature (step 3) authenticates the BLOCK envelope but says
             // nothing about whether the transactions WITHIN the block were authorised
             // by their senders.
+            //
+            // GENESIS BYPASS (mb.height == 0):
+            //   The genesis block is a one-time deterministic bootstrap whose content
+            //   is fixed by network configuration (genesis distribution, system
+            //   account creation, genesis-node registration). Its in-block TXs use
+            //   literal-string authorisation tokens ("system", "genesis") that
+            //   pre-date the Ed25519 client-signing model — they are NOT real
+            //   Ed25519 signatures. Authority is enforced at apply time by string
+            //   match against the well-known reserved sender set.
+            //
+            //   Genesis safety is guaranteed by THREE independent invariants that
+            //   do NOT require per-TX signature verification:
+            //     1. Producer signature (step 3) — the genesis producer's
+            //        Dilithium3 signature on the BLOCK envelope is verified.
+            //     2. Genesis-hash determinism — every honest node computes the
+            //        identical genesis block from the identical config, so any
+            //        deviation (extra TX, modified amount, swapped recipient)
+            //        is rejected by hash-chain continuity at the next block.
+            //     3. One-time event — genesis runs exactly once at network
+            //        bootstrap, height==0; no reusable attack surface exists.
+            //
+            //   Skipping per-TX signature verification at height==0 therefore
+            //   loses no real security property while restoring the legitimate
+            //   bootstrap path. All blocks at height>0 receive full per-TX
+            //   verification, closing the byzantine-producer drain vector that
+            //   motivated this section.
             //
             // WHY THIS LIVES IN THE PIPELINE, NOT THE STATE LAYER:
             //   * Mempool ingestion already verifies signatures before admission
@@ -1499,7 +1525,15 @@ impl BlockPipeline {
             //     per-TX verification.
             //
             // ═══════════════════════════════════════════════════════════════════════════
-            if !decoded.microblock.transactions.is_empty() {
+            if mb.height == 0 {
+                if is_info() {
+                    println!(
+                        "[INFO][PIPELINE] genesis_block_skip_tx_sig h=0 txs={} producer={}",
+                        decoded.microblock.transactions.len(),
+                        mb.producer
+                    );
+                }
+            } else if !decoded.microblock.transactions.is_empty() {
                 metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_SIG);
                 let txsig_start = std::time::Instant::now();
 
