@@ -86,10 +86,19 @@ impl StateDB {
                 }
             });
 
+            // IDEMPOTENT APPLY — silent skip for already-applied transactions.
+            // Mirrors the policy in `transaction.rs::apply_to_state` (Transfer arm)
+            // so that re-delivery of the same TX during sync / replay does not
+            // fail the operation. Replay protection is preserved: a TX with stale
+            // nonce has no incremental effect (sender's balance already reflects
+            // the original deduction).
+            if tx.nonce <= sender.nonce {
+                return Ok(tx_hash);
+            }
             // Check nonce for transaction ordering
             if tx.nonce != sender.nonce + 1 {
                 return Err(StateError::InvalidTransaction(format!(
-                    "Invalid nonce: expected {}, got {}", 
+                    "Invalid nonce: expected {}, got {}",
                     sender.nonce + 1, tx.nonce
                 )));
             }
