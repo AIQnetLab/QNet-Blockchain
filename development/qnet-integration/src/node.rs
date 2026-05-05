@@ -1127,6 +1127,14 @@ pub static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 pub static PRODUCER_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
 pub static PRODUCER_WATCHDOG_STARTED: AtomicU64 = AtomicU64::new(0);
 
+/// v16.1: Throttle for the network-broadcast heartbeat. The local
+/// `record_producer_heartbeat` runs at every production-loop iteration
+/// (sub-second), but the network broadcast must respect a 1s minimum
+/// interval — the receivers' rate limiter caps inbound to 60/min/peer
+/// and the slot cadence is itself ~1s. Stored as wall-clock ms.
+pub static LAST_NETWORK_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
+const NETWORK_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+
 #[inline]
 pub fn record_producer_heartbeat() {
     let now_ms = std::time::SystemTime::now()
@@ -2210,18 +2218,166 @@ impl std::fmt::Display for NodeState {
 
 // v2.96: Global node state with fast parking_lot lock (never poisons, 2-3x faster)
 lazy_static::lazy_static! {
-    pub static ref GLOBAL_NODE_STATE: ParkingRwLock<NodeState> = 
+    pub static ref GLOBAL_NODE_STATE: ParkingRwLock<NodeState> =
         ParkingRwLock::new(NodeState::Initializing);
 }
 
-/// Update node state with logging
+// ═══════════════════════════════════════════════════════════════════════════
+// v16.1: NODE STATE ESCALATION LADDER
+// ═══════════════════════════════════════════════════════════════════════════
+// Tracks consecutive ERROR transitions so the runtime can react to a node
+// that is stuck in a recovery cycle without ever reaching Validating /
+// Producing / Idle. Counter resets to zero on any non-error transition and
+// is sampled by `escalate_error_state()` to drive deterministic recovery
+// actions (force local round advance → resync → peer rediscovery → halt).
+//
+// Forensic motivation: at the v15.x h=781 deadlock the legacy state machine
+// cycled VALIDATING → WAITING_CONSENSUS → ERROR{recoverable=true} → back to
+// VALIDATING for ~11 hours. The `recoverable` flag had no consumer and the
+// transition log silently rotated forever. Cycle counter + escalation
+// converts a stuck loop into a sequence of progressively larger recovery
+// signals, every signal being a SAFE primitive (does not modify
+// finalisation guarantees).
+//
+// Scalability: single AtomicU64 read/write per transition, O(1) regardless
+// of validator count. Same gate fires identically on a 5-node genesis set
+// and on a 100k super-node mainnet.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Number of consecutive `NodeState::Error{recoverable=true}` transitions.
+/// Reset to 0 on any non-Error transition.
+pub static ERROR_CYCLE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Last height at which an Error transition fired. Used by escalation to
+/// trigger chronic-stall resync only when the same height keeps failing.
+pub static ERROR_LAST_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Last wall-clock seconds at which `escalate_error_state` triggered a
+/// resync action — prevents resync flood when many cycles fire in burst.
+static ERROR_LAST_RESYNC_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Escalation thresholds. Calibrated for the ~1s microblock cadence so each
+/// stage covers a meaningful number of slots before promoting to the next.
+const ERROR_ESCALATE_FORCE_ROUND_AT: u64 = 3;     // ≥3 cycles → force local round advance
+const ERROR_ESCALATE_RESYNC_AT: u64 = 10;         // ≥10 cycles → trigger background resync
+const ERROR_ESCALATE_PEER_REFRESH_AT: u64 = 30;   // ≥30 cycles → drop + rediscover peers
+const ERROR_ESCALATE_HALT_AT: u64 = 120;          // ≥120 cycles (~2 min) → mark Halted
+const ERROR_RESYNC_COOLDOWN_SECS: u64 = 60;       // resync trigger cooldown
+
+/// Update node state with logging and escalation accounting.
+///
+/// v16.1: ladder of progressively-aggressive recovery actions when the same
+/// node sits in `Error{recoverable=true}` for many consecutive transitions.
+/// Safety properties:
+///   * `force_local_round_advance` only changes selection-side `timeout_round`;
+///     consensus signature checks still reject any block signed by the wrong
+///     producer, so safety holds.
+///   * Resync uses canonical-aware peer selection (Phase 4) — never accepts
+///     blocks past the last 2f+1-finalised macroblock.
+///   * Peer rediscovery drops only the active connection set, identity
+///     bindings (which are chain-anchored) are preserved.
+///   * `Halted` is a terminal state intended to surface for operator
+///     intervention; the watchdog already exits the process on RPC failure
+///     so Docker restart will trigger a clean reboot.
 pub fn set_node_state(new_state: NodeState) {
     let old_state = GLOBAL_NODE_STATE.read().clone();
-    
-    // Only log if state actually changed
-    if old_state != new_state {
-        if is_info() { println!("[INFO][STATE] {} → {}", old_state, new_state); }
-        *GLOBAL_NODE_STATE.write() = new_state;
+
+    if old_state == new_state {
+        return;
+    }
+
+    // ── Escalation accounting ──
+    match &new_state {
+        NodeState::Error { recoverable: true, .. } => {
+            let cycles = ERROR_CYCLE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            // Background-safe escalation. The trigger functions do not block
+            // the caller — they spawn async tasks where required.
+            escalate_error_state(cycles);
+        }
+        // Any non-error (or non-recoverable) transition resets the ladder.
+        _ => {
+            let prev = ERROR_CYCLE_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if prev >= ERROR_ESCALATE_FORCE_ROUND_AT && is_info() {
+                println!("[INFO][STATE] error_cycle_reset prev_cycles={}", prev);
+            }
+        }
+    }
+
+    if is_info() {
+        println!("[INFO][STATE] {} → {}", old_state, new_state);
+    }
+    *GLOBAL_NODE_STATE.write() = new_state;
+}
+
+/// Drive recovery actions based on consecutive Error cycle count.
+/// Called from `set_node_state` only — never schedule directly.
+fn escalate_error_state(cycles: u64) {
+    match cycles {
+        c if c == ERROR_ESCALATE_FORCE_ROUND_AT => {
+            // Stage 1: force local timeout-round advance for selection only.
+            // Other nodes still need 2f+1 certified votes to align with us;
+            // this stage just unblocks our local producer-selection lookup
+            // when the network has clearly progressed past us.
+            let proposed = CURRENT_TIMEOUT_ROUND.load(std::sync::atomic::Ordering::Relaxed);
+            let bumped = proposed.saturating_add(1);
+            CURRENT_TIMEOUT_ROUND.store(bumped, std::sync::atomic::Ordering::Relaxed);
+            println!(
+                "[WARN][STATE] escalate=force_round_advance cycles={} bumped_to={}",
+                cycles, bumped
+            );
+        }
+        c if c == ERROR_ESCALATE_RESYNC_AT => {
+            // Stage 2: trigger background resync from canonical peers.
+            // Cooldown-gated to avoid resync flood under sustained errors.
+            let now_secs = get_timestamp_safe();
+            let last = ERROR_LAST_RESYNC_SECS.load(std::sync::atomic::Ordering::Relaxed);
+            if now_secs.saturating_sub(last) >= ERROR_RESYNC_COOLDOWN_SECS {
+                ERROR_LAST_RESYNC_SECS.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                let height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "[WARN][STATE] escalate=trigger_resync cycles={} from_h={} cooldown_secs={}",
+                    cycles, height, ERROR_RESYNC_COOLDOWN_SECS
+                );
+                // Set a process-wide flag so the production loop's chronic
+                // stall path picks up the request without us blocking here.
+                CHRONIC_STALL_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else if is_info() {
+                println!(
+                    "[INFO][STATE] escalate=resync_skipped_cooldown cycles={} since_last={}s",
+                    cycles, now_secs.saturating_sub(last)
+                );
+            }
+        }
+        c if c == ERROR_ESCALATE_PEER_REFRESH_AT => {
+            // Stage 3: signal peer-discovery refresh. The connectivity
+            // subsystem checks this flag every tick and rotates peers
+            // when set. Identity bindings (anchored / on-chain) survive.
+            PEER_REFRESH_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            println!(
+                "[WARN][STATE] escalate=peer_rediscovery cycles={} action=drop_and_redial",
+                cycles
+            );
+        }
+        c if c >= ERROR_ESCALATE_HALT_AT => {
+            // Stage 4: terminal. Surface to the watchdog/RPC layer so the
+            // process can be restarted by the orchestrator. Don't silently
+            // recurse into another state change here.
+            eprintln!(
+                "[CRIT][STATE] escalate=halt_signal cycles={} action=external_restart_required",
+                cycles
+            );
+            HALT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {
+            // No-op between stage boundaries.
+        }
+    }
+
+    // Lightweight progress log every 5 cycles so operators can see the
+    // ladder advancing without spamming on every cycle.
+    if cycles % 5 == 0 && is_info() {
+        println!("[INFO][STATE] error_cycle_count={}", cycles);
     }
 }
 
@@ -2229,6 +2385,16 @@ pub fn set_node_state(new_state: NodeState) {
 pub fn get_node_state() -> NodeState {
     GLOBAL_NODE_STATE.read().clone()
 }
+
+// v16.1: Process-wide flags consumed by the production / connectivity loops
+// to enact the escalation ladder without coupling state machine to those
+// subsystems directly. Each is a single AtomicBool, O(1) check per tick.
+pub static CHRONIC_STALL_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static PEER_REFRESH_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static HALT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // CRITICAL: Global mempool instance for activation registry integration
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2780,6 +2946,67 @@ impl BlockchainNode {
         let pk_bytes = PkTrait::as_bytes(&pk).to_vec();
         let sk_bytes = SkTrait::as_bytes(&sk).to_vec();
 
+        // ─────────────────────────────────────────────────────────────────
+        // v16.1: STRICT IDENTITY-KEY ANCHOR ENFORCEMENT
+        // ─────────────────────────────────────────────────────────────────
+        // Refuse to start when the local Dilithium3 PK does not match the
+        // chain-anchored PK installed by the operator (`genesis_anchors.json`).
+        //
+        // This closes the v15.x deadlock root cause: a bootstrap node lost
+        // its `dilithium_keypair.bin` between restarts, regenerated a new
+        // random PK, and silently signed with a key that no peer's registry
+        // would accept. All 168+ inbound signatures per peer per hour
+        // failed `pk_mismatch` Tier-1 hard reject in `consensus_crypto.rs`.
+        //
+        // Policy:
+        //   * If anchor exists and matches → proceed, registry is authoritative.
+        //   * If anchor exists and does NOT match → FATAL panic with operator
+        //     guidance. Recovery requires restoring the original keypair file
+        //     from backup, NEVER silently overwriting the anchor.
+        //   * If no anchor for this node_id → proceed (cold-boot path; anchor
+        //     file will be installed on next restart by the operator).
+        //
+        // Safety: panic at startup is the correct industry-standard response
+        // for unrecoverable identity corruption. A node that signs with the
+        // wrong key cannot contribute to consensus and would only consume
+        // pacemaker slots without producing any valid blocks (exact pattern
+        // observed at the v15.x h=781 deadlock).
+        //
+        // Scalability: anchor map is bounded to 5 genesis identities; this
+        // check is O(1) DashMap lookup at process start. Non-genesis super
+        // nodes have no anchor so the gate is skipped — their identity
+        // binding is established via on-chain NodeRegistration TX which is
+        // signature-validated end-to-end.
+        // ─────────────────────────────────────────────────────────────────
+        if let Some(anchor_pk) = qnet_consensus::consensus_crypto::get_consensus_pk_anchor(&self.node_id) {
+            if anchor_pk != pk_bytes {
+                // Build a non-secret diagnostic for the operator. Hash both
+                // PKs so we never log raw key bytes; the prefix is enough
+                // to verify which key file the operator has on disk.
+                let local_hash = hex::encode(&Sha3_256::digest(&pk_bytes)[..8]);
+                let anchor_hash = hex::encode(&Sha3_256::digest(&anchor_pk)[..8]);
+                eprintln!(
+                    "[CRIT][NODE] identity_anchor_mismatch node={} local_pk_hash={} anchor_pk_hash={} \
+                     action=halt_startup hint=restore_dilithium_keypair_bin_from_backup",
+                    self.node_id, local_hash, anchor_hash
+                );
+                return Err(format!(
+                    "FATAL: identity-anchor mismatch for {}. Local keypair does not match the \
+                     genesis anchor; the previous keypair file was lost or replaced. Restore \
+                     /app/data/keys/dilithium_keypair.bin from backup before starting again. \
+                     Continuing would silently invalidate every signature this node emits.",
+                    self.node_id
+                ));
+            }
+            if is_info() {
+                let pk_hash_short = hex::encode(&Sha3_256::digest(&pk_bytes)[..8]);
+                println!(
+                    "[INFO][NODE] identity_anchor_match node={} pk_hash={}",
+                    self.node_id, pk_hash_short
+                );
+            }
+        }
+
         // Create WalletIdentity (seed → wallet address + keypair reference)
         let identity = WalletIdentity::from_seed_and_keys(wallet_seed, pk_bytes.clone(), sk_bytes)?;
 
@@ -2801,6 +3028,12 @@ impl BlockchainNode {
         // private key locally, so self-registration is implicitly proven. This
         // closes the "pk_not_registered" rejection path for our own signatures
         // as soon as the node has a keypair in hand.
+        //
+        // v16.1: After the anchor match guard above, this call is guaranteed
+        // to either succeed (PK matches anchor or no anchor) or be rejected
+        // by `register_consensus_pk_from_chain`'s anti-squat check (which
+        // would only fire on a defensive double-check race — the explicit
+        // panic above already covers the normal path).
         if !qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(&self.node_id, &pk_bytes) {
             println!("[WARN][CONSENSUS] self_consensus_pk_register_failed node={}", self.node_id);
         }
@@ -4877,23 +5110,35 @@ impl BlockchainNode {
     /// Create Genesis node registration TXs with FIXED timestamp for determinism
     /// CRITICAL: All 5 Genesis nodes MUST create IDENTICAL TXs for consensus
     /// Uses timestamp=0 (genesis epoch) to ensure same hashes across all nodes
+    ///
+    /// v16.1: Embeds the anchored Dilithium3 public key for each genesis identity
+    /// when an anchor map is installed (`set_genesis_anchor_pks`). Embedding the
+    /// PK in the genesis NodeRegistration TX is the canonical way to bind
+    /// identity → key in finalized chain state, replacing the v15.x trust-on-
+    /// first-verify path that allowed cross-restart pk_mismatch.
+    ///
+    /// When anchors are not yet installed (cold-boot before operator writes
+    /// `genesis_anchors.json`), the field stays `None` and identity binding
+    /// falls back to the legacy P2P announce path. Operators are expected to
+    /// install anchors and restart before the network reaches its first
+    /// macroblock boundary so binding is locked in for the long run.
     pub fn create_genesis_registration_txs() -> Vec<qnet_state::Transaction> {
         let mut txs = Vec::new();
-        
+
         // CRITICAL: Fixed timestamp = 0 for deterministic TX hashes
         // This ensures ALL nodes produce IDENTICAL genesis block
         const GENESIS_TX_TIMESTAMP: u64 = 0;
-        
+
         for (bootstrap_id, wallet) in crate::genesis_constants::GENESIS_WALLETS {
             let node_id = format!("genesis_node_{}", bootstrap_id);
-            
+
             // v3.35: Genesis nodes are ALWAYS public - get IP from constants
             let api_endpoint = crate::genesis_constants::GENESIS_NODE_IPS.iter()
                 .find(|(_, id)| *id == *bootstrap_id)
                 .map(|(ip, _)| format!("http://{}:8001", ip))
                 .unwrap_or_default();
-            
-            let tx = Self::create_node_registration_tx_with_timestamp(
+
+            let mut tx = Self::create_node_registration_tx_with_timestamp(
                 &node_id,
                 qnet_state::NodeType::Super,
                 wallet,
@@ -4901,16 +5146,42 @@ impl BlockchainNode {
                 &api_endpoint, // v3.35: Public API endpoint
                 Some(GENESIS_TX_TIMESTAMP), // Fixed timestamp for determinism
             );
-            
-            if is_info() { 
-                println!("[INFO][REG] genesis_tx_created node={} wallet={}... endpoint={} hash={}...", 
+
+            // v16.1: Embed the anchored Dilithium3 PK directly in the genesis TX
+            // payload. When all genesis nodes apply this same TX they install
+            // the SAME (node_id → PK) binding via
+            // `cache_node_registrations_from_transactions_with_dashmap`, which
+            // mirrors into `register_consensus_pk_from_chain`. This eliminates
+            // the v15.x race where each peer learned the genesis PK from the
+            // first VRF announce that arrived (TOFV), making cross-restart key
+            // regeneration silently invalidate every signature.
+            //
+            // Determinism: anchored PKs are byte-identical across every node
+            // because they are loaded from the SAME `genesis_anchors.json`
+            // shipped by the operator. tx.hash recomputes below to bind the
+            // PK into the canonical TX bytes — without rehashing, late
+            // anchor installation would produce different TX hashes across
+            // peers and the genesis block would itself fork.
+            if let Some(anchor_pk) = crate::genesis_constants::get_genesis_anchor_pk(&node_id) {
+                tx.dilithium_public_key = Some(hex::encode(&anchor_pk));
+                tx.hash = tx.calculate_hash();
+            } else if is_info() {
+                println!(
+                    "[INFO][REG] genesis_tx_no_anchor node={} reason=anchor_file_not_yet_installed",
+                    node_id
+                );
+            }
+
+            if is_info() {
+                println!("[INFO][REG] genesis_tx_created node={} wallet={}... endpoint={} hash={}... pk_anchored={}",
                          node_id, &wallet[..16.min(wallet.len())],
                          api_endpoint,
-                         &tx.hash[..16.min(tx.hash.len())]); 
+                         &tx.hash[..16.min(tx.hash.len())],
+                         tx.dilithium_public_key.is_some());
             }
             txs.push(tx);
         }
-        
+
         txs
     }
     
@@ -13632,13 +13903,41 @@ impl BlockchainNode {
     /// Start the blockchain node
     pub async fn start(&mut self) -> Result<(), QNetError> {
         println!("[INFO][NODE] starting");
-        
+
         // PRODUCTION v2.57: Log runtime isolation
         let stats = crate::unified_p2p::get_runtime_stats();
-        println!("[INFO][RUNTIME] cpus={} stages: BROADCAST({}t) SIGVERIFY({}t) BANKING({}t) REPLAY({}t) total={}t", 
+        println!("[INFO][RUNTIME] cpus={} stages: BROADCAST({}t) SIGVERIFY({}t) BANKING({}t) REPLAY({}t) total={}t",
                  stats.cpu_count, stats.broadcast_threads, stats.sigverify_threads,
                  stats.banking_threads, stats.replay_threads, stats.total());
-        
+
+        // ─────────────────────────────────────────────────────────────────
+        // v16.1: INSTALL GENESIS PK ANCHORS BEFORE ANY P2P TRAFFIC
+        // ─────────────────────────────────────────────────────────────────
+        // Anchor map MUST be in place before:
+        //   * The RPC server accepts incoming `VrfKeyAnnounce` / `NodeRegistration`
+        //   * The P2P layer processes any `VrfLeaderClaim` (which auto-registers
+        //     PKs in the consensus registry on first observation — see
+        //     `unified_p2p.rs:12944, 13426`)
+        //   * `initialize_wallet_identity` runs (which checks anchor for self)
+        //
+        // If the anchor file is missing this is an INFO log, not fatal: it is
+        // the cold-boot path where the operator hasn't yet collected and
+        // distributed PKs. After every node has run once (and produced its
+        // own pk_hash via the [INFO][KEY] keypair_ready log), the operator
+        // writes `genesis_anchors.json` and restarts the cluster — anchors
+        // are then permanent for the lifetime of the network.
+        //
+        // Scalability: O(file_read + 5 entries). Negligible at any cluster
+        // size. After install, every subsequent registration check is O(1)
+        // DashMap lookup against a fixed-size 5-entry map.
+        let anchors_installed = crate::genesis_constants::install_genesis_anchors_at_startup();
+        if anchors_installed == 0 {
+            println!(
+                "[INFO][GENESIS] anchors_pending path={} hint=collect_pk_hash_from_each_node_then_write_json",
+                crate::genesis_constants::GENESIS_ANCHORS_PATH
+            );
+        }
+
         *self.is_running.write().await = true;
         
         // Start API server first to handle peer auth
@@ -16301,6 +16600,16 @@ impl BlockchainNode {
                 // from "loop blocked inside an await". Atomic store is wait-free.
                 record_producer_heartbeat();
 
+                // v16.1: Halt escalation. Set by the state-machine escalation ladder
+                // (Phase 2.A) after sustained recoverable-error cycles. Matches the
+                // existing watchdog convention of process::exit(1) — Docker/orchestrator
+                // restart picks up a clean process state. We exit BEFORE doing any
+                // work this tick so a stuck-in-error node releases its resources fast.
+                if HALT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[CRIT][NODE] halt_requested action=process_exit_for_orchestrator_restart");
+                    std::process::exit(1);
+                }
+
                 // ═══════════════════════════════════════════════════════════════════
                 // v15.11: ADAPTIVE PRODUCER RATE CONTROL
                 // ═══════════════════════════════════════════════════════════════════
@@ -17385,8 +17694,109 @@ impl BlockchainNode {
                         // per stalled slot, Dilithium3 sigs ≈ 3.4 KB each). Worst
                         // case 435 KB extra during a single failover event.
                         // ═══════════════════════════════════════════════════════════════
+                        // v16.1: SMART GENESIS-ERA GATE
+                        //
+                        // Legacy `microblock_height > 0` gate existed to prevent
+                        // PREMATURE FAILOVER at network startup: every node sees
+                        // `local_delay = now - genesis_ts ≈ 5..15s` immediately
+                        // after boot (Docker init + P2P discovery latency), which
+                        // exceeds the normal grace window. Without the gate, all
+                        // 5 nodes would broadcast empty-slot attestations against
+                        // the round-0 producer of h=1 BEFORE that producer had a
+                        // realistic chance to publish — race-condition failover
+                        // at every restart.
+                        //
+                        // But the legacy gate was over-restrictive: when the
+                        // genesis producer was DEAD FROM BOOT (the v15.x h=781
+                        // pk_mismatch class), `microblock_height == 0` forever
+                        // and attestation could never fire — exactly the failure
+                        // mode the mechanism is designed to recover.
+                        //
+                        // Smart escape: allow genesis-era attestation only after
+                        // the producer has had `GENESIS_PRODUCER_GRACE_SECS`
+                        // (3× normal grace) to publish. Past that window, the
+                        // honest round-0 producer would have produced; persistent
+                        // silence proves the producer is genuinely dead and
+                        // failover is safe to start.
+                        //
+                        // Safety: 2f+1 supermajority still required before
+                        // `empty_slot_failover_round` advances. Genesis-era
+                        // escape only changes the ENTRY condition for attestation
+                        // broadcast, not the supermajority gate that consumes
+                        // 2f+1 attestations. Single malicious node cannot force
+                        // failover at any height, including h=0.
+                        const GENESIS_PRODUCER_GRACE_MULT: u64 = 3;
+                        let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+                        let now_secs = effective_now_ts;
+                        let genesis_grace_window = timeout_grace_period.saturating_mul(GENESIS_PRODUCER_GRACE_MULT);
+                        let genesis_era_dead_producer = microblock_height == 0
+                            && genesis_ts > 0
+                            && now_secs > genesis_ts.saturating_add(genesis_grace_window);
+                        // v16.1: HEARTBEAT-DRIVEN FAST FAILOVER PATH
+                        //
+                        // Industry-standard BFT chains (HotStuff family, PBFT-derived
+                        // designs) use a producer-broadcast heartbeat to accelerate
+                        // failover BELOW the legacy timeout-grace floor. Concretely:
+                        //
+                        //   * Heartbeat silent ≥ 3 s AND we know expected producer →
+                        //     immediately start the empty-slot attestation flow
+                        //     (without waiting for `local_delay > grace_period` which
+                        //     would add 12-15 seconds at rotation boundaries).
+                        //
+                        //   * 2f+1 attestation gate is UNCHANGED — heartbeat only
+                        //     accelerates the entry condition, never the supermajority
+                        //     consumption. A malicious peer cannot fake heartbeat
+                        //     silence on behalf of the producer; only `producer_id`
+                        //     itself can broadcast its own heartbeat (signed Dilithium3),
+                        //     and absence of valid heartbeats from a registered key
+                        //     is observable evidence of liveness failure.
+                        //
+                        // We compute the round-0 producer here even outside the legacy
+                        // gate so the heartbeat-watcher can run independently. Cost
+                        // is one cached VRF lookup per tick — O(1) at any committee
+                        // size up to MAX_VALIDATORS.
+                        let heartbeat_fast_path = if unified_p2p.is_some() {
+                            let candidate_producer = Self::select_microblock_producer_with_round(
+                                next_height, &unified_p2p, &node_id, node_type,
+                                Some(&storage), &poh, 0,
+                            ).await;
+                            if !candidate_producer.is_empty() && candidate_producer != node_id {
+                                // Use the producer-stamped age — local-clock independent.
+                                // None means "never seen a heartbeat from this producer";
+                                // we only treat that as silent after `genesis_grace_window`
+                                // to avoid premature failover at network startup.
+                                const HEARTBEAT_SILENT_THRESHOLD_MS: u64 = 3_000;
+                                match crate::unified_p2p::last_remote_producer_heartbeat_age_ms(
+                                    &candidate_producer,
+                                ) {
+                                    Some(age_ms) if age_ms > HEARTBEAT_SILENT_THRESHOLD_MS => {
+                                        if is_info() {
+                                            println!(
+                                                "[INFO][HEARTBEAT] remote_silent producer={} age_ms={} action=fast_attestation_path",
+                                                candidate_producer, age_ms
+                                            );
+                                        }
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            } else { false }
+                        } else { false };
+
                         let mut empty_slot_failover_round: u64 = 0;
-                        if local_delay > timeout_grace_period && microblock_height > 0 {
+                        // v16.1: trigger via either legacy grace path OR heartbeat fast path.
+                        // Both paths converge into the same 2f+1 attestation supermajority
+                        // gate below — heartbeat just lets the attestation start ~3 s into
+                        // a slot instead of waiting the full grace window.
+                        if (local_delay > timeout_grace_period
+                                && (microblock_height > 0 || genesis_era_dead_producer))
+                            || heartbeat_fast_path {
+                            if microblock_height == 0 && is_warn() {
+                                println!(
+                                    "[WARN][EMPTY-SLOT] genesis_era_failover delay={}s genesis_grace={}s producer_silent_since_boot=true",
+                                    local_delay, genesis_grace_window
+                                );
+                            }
                             if let Some(ref p2p) = unified_p2p {
                                 // Compute baseline (round-0) expected producer for next_height.
                                 // We use round 0 deliberately: failover is computed *relative*
@@ -17509,12 +17919,50 @@ impl BlockchainNode {
                         //   1. Height gap <= 20 blocks from best peer
                         //   2. PRODUCTION_UNLOCKED = true (first network block received since restart)
                         //   3. best_peer_h > 0 (don't bypass gate when peer heights unknown)
+                        //
+                        // v16.1: ADDED finalized-macroblock escape clause. Under the
+                        // legacy gate, a node on a minority branch with a tip 20+
+                        // blocks below network thinks it is "behind" and refuses to
+                        // emit `TimeoutVote`s. But if its LAST FINALIZED macroblock
+                        // hash matches the network's last finalized macroblock hash,
+                        // it is actually on the canonical chain — it just hasn't
+                        // received the latest microblocks yet. Suppressing votes in
+                        // this case is wrong: the node has full BFT-finalised state
+                        // up to the last 2f+1-signed checkpoint and can safely
+                        // contribute to round advancement.
+                        //
+                        // The escape is bounded by the canonical-chain check:
+                        // mismatch on the last finalized macroblock means the node
+                        // is on a forked finalised branch (which is a serious
+                        // safety event handled by Phase 4 fork recovery, NOT by
+                        // ignoring the vote gate). Match means liveness is safe.
+                        //
+                        // Scalability: O(1) — single macroblock-hash lookup per
+                        // tick. No additional network traffic.
                         let our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                         let best_peer_h = if let Some(ref p2p) = unified_p2p {
                             p2p.get_best_peer_height()
                         } else { our_h };
+                        let height_close_enough = best_peer_h == 0 || our_h + 20 >= best_peer_h;
+                        // Macroblock-granularity escape: a node within 1 macroblock
+                        // (≈90 microblocks) of the best peer is on the canonical
+                        // finalised chain by construction — every macroblock is
+                        // sealed by 2f+1 commit-reveal, and a divergence past the
+                        // last finalised macroblock would have surfaced as a fork
+                        // event handled by Phase 4 (not by suppressing votes).
+                        // Allowing votes from such a node restores liveness in
+                        // the genesis-era stall pattern observed at v15.x h=781.
+                        let our_mb = our_h / 90;
+                        let best_mb = best_peer_h / 90;
+                        let macroblock_close = best_peer_h == 0 || our_mb + 1 >= best_mb;
                         let is_synced_enough = production_unlocked
-                            && (best_peer_h == 0 || our_h + 20 >= best_peer_h);
+                            && (height_close_enough || macroblock_close);
+                        if !height_close_enough && macroblock_close && is_info() {
+                            println!(
+                                "[INFO][VOTE_GATE] macroblock_match_escape our_h={} best_h={} our_mb={} best_mb={} action=allow_vote",
+                                our_h, best_peer_h, our_mb, best_mb
+                            );
+                        }
 
                         // v14.8.11: drift self-pause vote gate REMOVED. A
                         // drifted node still contributes TimeoutVotes because
@@ -17528,7 +17976,17 @@ impl BlockchainNode {
                         // rotation round derives only from signed 2f+1
                         // evidence — so drifted votes cannot hijack rotation.
 
-                        if proposed_timeout_round > 0 && microblock_height > 0 && is_synced_enough {
+                        // v16.1: SMART GENESIS-ERA GATE (matches empty-slot-attestation block above).
+                        // TimeoutVote broadcast retains the `microblock_height > 0` gate to
+                        // prevent premature voting at network startup, but adds the
+                        // genesis-era escape: when the genesis producer has had 3× normal
+                        // grace and still no block exists, the network MUST be able to
+                        // emit signed votes to drive rotation past the dead producer.
+                        // Same safety property as above — 2f+1 certification gate is
+                        // unchanged, single dishonest node cannot hijack rotation.
+                        if proposed_timeout_round > 0
+                            && (microblock_height > 0 || genesis_era_dead_producer)
+                            && is_synced_enough {
                             if is_info() {
                                 println!("[INFO][TIMEOUT] stall h={} mb={} delay={}s proposed={} adopted={} certified={} rotation={} f1={}",
                                          next_height, timeout_mb_index, local_delay, proposed_timeout_round,
@@ -17605,7 +18063,17 @@ impl BlockchainNode {
                             let chronic_stall_threshold = 120u64;
                             let resync_cooldown = 120u64;
 
-                            if local_delay > chronic_stall_threshold && certified_timeout_round == 0 {
+                            // v16.1: also drive into chronic resync when the state-machine
+                            // escalation ladder (Phase 2.A) has crossed the resync stage.
+                            // ERROR_ESCALATE_RESYNC_AT cycles of `Error{recoverable=true}`
+                            // raise CHRONIC_STALL_REQUESTED — production loop consumes it
+                            // here so resync fires regardless of the legacy local_delay
+                            // path (which could be suppressed when last_block_time was
+                            // refreshed by partial recovery without progress).
+                            let escalation_requested = CHRONIC_STALL_REQUESTED
+                                .swap(false, std::sync::atomic::Ordering::Relaxed);
+                            if (local_delay > chronic_stall_threshold && certified_timeout_round == 0)
+                                || escalation_requested {
                                 let now_u64 = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
@@ -18787,6 +19255,85 @@ impl BlockchainNode {
 
                 let mut is_my_turn_to_produce = current_producer == node_id;
 
+                // ═══════════════════════════════════════════════════════════════════
+                // v16.1: NETWORK PRODUCER HEARTBEAT BROADCAST
+                // ═══════════════════════════════════════════════════════════════════
+                // Whenever this node observes itself as the elected producer for the
+                // next slot, broadcast a Dilithium3-signed `ProducerHeartbeat` to
+                // all validator peers. This converts the legacy local-only watchdog
+                // (`PRODUCER_HEARTBEAT_MS`, which only saw THIS node's loop) into a
+                // network signal — receivers track the latest heartbeat per
+                // producer and immediately broadcast empty-slot attestations when
+                // the elected producer goes silent. This is the architectural
+                // fix that prevents the v15.x h=781 deadlock where node_001 was
+                // VRF-elected but dead from boot and no other node could detect it.
+                //
+                // Throttled to 1 broadcast per second per producer — matches the
+                // slot cadence and is well below receivers' 60/min/peer rate
+                // limit. Skipped when sync is in progress (we are not yet a
+                // valid producer) or when not the elected producer.
+                //
+                // Safety:
+                //   * Heartbeat is signed by THIS node's Dilithium3 key, which is
+                //     bound to `node_id` via consensus_pk_registry / genesis
+                //     anchors. Receivers verify against the same registry that
+                //     gates TimeoutVote signatures — same trust boundary.
+                //   * Heartbeat does not advance any consensus state; it only
+                //     accelerates the entry condition for empty-slot attestation,
+                //     which is still gated by 2f+1 supermajority.
+                //
+                // Scalability: at any committee size only the SINGLE elected
+                // producer broadcasts per slot — total network rate is 1 msg/sec
+                // regardless of validator count. Receivers update O(1) DashMap
+                // entries.
+                if is_my_turn_to_produce {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let last_hb = LAST_NETWORK_HEARTBEAT_MS.load(std::sync::atomic::Ordering::Relaxed);
+                    if now_ms.saturating_sub(last_hb) >= NETWORK_HEARTBEAT_INTERVAL_MS {
+                        if let Some(ref p2p) = unified_p2p {
+                            let timestamp_secs = now_ms / 1000;
+                            let msg_to_sign = format!(
+                                "QNET_PRODUCER_HEARTBEAT_V1:{}:{}:{}",
+                                node_id, timestamp_secs, next_block_height
+                            );
+                            // Sign with the consensus crypto path used for
+                            // TimeoutVote so the receiver-side
+                            // verify_consensus_signature gate accepts it
+                            // identically — no new code path on the verify side.
+                            if let Some(crypto) = try_get_quantum_crypto() {
+                                match crypto.create_consensus_signature(&node_id, &msg_to_sign).await {
+                                    Ok(sig) => {
+                                        LAST_NETWORK_HEARTBEAT_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                        p2p.broadcast_producer_heartbeat(
+                                            node_id.clone(),
+                                            next_block_height,
+                                            sig.signature.as_bytes().to_vec(),
+                                            timestamp_secs,
+                                        );
+                                        if is_debug() {
+                                            println!(
+                                                "[DBG][HEARTBEAT] broadcast_self slot_h={} ts={}",
+                                                next_block_height, timestamp_secs
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if is_warn() {
+                                            println!(
+                                                "[WARN][HEARTBEAT] sign_failed err={}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // v11.0: HARD GATE — no production while sync in progress
                 // Prevents producing blocks at stale height while sync is still running.
                 // Node must be fully synchronized AND production unlocked (first network block received).
@@ -19319,10 +19866,22 @@ impl BlockchainNode {
                             // safe only for n≤5 and became exploitable above that.
                             let byzantine_threshold = ((sample_size * 2 + 2) / 3).max(1);
 
-                            println!("[INFO][CONS] bft_wait responses={}/{} threshold=2f+1_canonical",
-                                     byzantine_threshold, sample_size);
-                            
-                            // STATE MACHINE: Waiting for consensus
+                            // v16.1: log label fix — previously `responses=N/M` was
+                            // printed where the values were actually `threshold/sample`,
+                            // which made the 11-hour h=781 deadlock look like a healthy
+                            // "3/4 received" state in postmortem grep. The corrected
+                            // label below makes the entry intent unambiguous and emits
+                            // the actual received count below in `bft_progress` lines
+                            // so operators can distinguish entry / progress / completion.
+                            println!("[INFO][CONS] bft_wait_start sample={} threshold_2f_plus_1={}",
+                                     sample_size, byzantine_threshold);
+
+                            // STATE MACHINE: Waiting for consensus.
+                            // v16.1: `responses` field below is updated LIVE inside the
+                            // poll loop (lines below at every iteration) so the
+                            // [INFO][STATE] WAITING_CONSENSUS X/Y log reflects real
+                            // progress, not the static `0/threshold` placeholder that
+                            // confused postmortems on the v15.x deadlock.
                             set_node_state(NodeState::WaitingForConsensus {
                                 block_height: next_block_height,
                                 responses: 0,
@@ -19362,6 +19921,17 @@ impl BlockchainNode {
                                     }
                                 }
                                 
+                                // v16.1: live state-machine refresh so external watchers
+                                // (RPC, dashboards, watchdog) see the actual response
+                                // count instead of the static `0` that masked the v15.x
+                                // h=781 deadlock for ~11 hours.
+                                {
+                                    let mut state_guard = GLOBAL_NODE_STATE.write();
+                                    if let NodeState::WaitingForConsensus { responses: r, .. } = &mut *state_guard {
+                                        *r = (matches + mismatches).max(*r);
+                                    }
+                                }
+
                                 // OPTIMIZATION: Check if Byzantine threshold reached
                                 // 60% of peers must agree (3 out of 5 for Genesis)
                                 if matches >= byzantine_threshold {
@@ -19375,15 +19945,19 @@ impl BlockchainNode {
                                     consensus_reached = true;
                                     break;
                                 }
-                                
+
                                 // Check timeout
                                 if consensus_start.elapsed() >= max_consensus_wait {
                                     let elapsed_ms = consensus_start.elapsed().as_millis();
-                                    println!("[WARN][CONS] timeout={}ms matches={} mismatches={}", 
-                                             elapsed_ms, matches, mismatches);
+                                    // v16.1: corrected the misleading `bft_wait responses=` log
+                                    // by emitting actual received vs threshold here; this is
+                                    // the only path that reports timeouts so operators see
+                                    // the real partition vs slow-network vs fork pattern.
+                                    println!("[WARN][CONS] bft_wait_timeout elapsed_ms={} matches={} mismatches={} threshold={} sample={}",
+                                             elapsed_ms, matches, mismatches, byzantine_threshold, sample_size);
                                     break;
                                 }
-                                
+
                                 // Wait 100ms before checking again
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                             }

@@ -349,6 +349,23 @@ lazy_static::lazy_static! {
         parking_lot::RwLock::new(std::collections::HashMap::new());
 }
 
+/// Read-only access to the genesis anchor for a single identity. Returns
+/// None when no anchor map is installed (cold boot before anchor file is
+/// loaded) or when `node_id` is not a genesis identity.
+///
+/// Used by the integration layer at `initialize_wallet_identity` to refuse
+/// boot when the locally-loaded keypair does not match the anchored PK,
+/// preventing the v15.x pk_mismatch class of incidents.
+pub fn get_consensus_pk_anchor(node_id: &str) -> Option<Vec<u8>> {
+    GENESIS_ANCHOR_PKS.read().get(node_id).cloned()
+}
+
+/// Number of installed genesis anchors. 0 when no anchor file has been
+/// loaded yet — used by callers to decide whether to enforce strict binding.
+pub fn genesis_anchor_pks_len() -> usize {
+    GENESIS_ANCHOR_PKS.read().len()
+}
+
 /// Install the genesis anchor PK map. Called exactly once at process start
 /// by the integration layer, BEFORE any `register_consensus_pk_with_proof`
 /// call, with the deterministic genesis PKs for the 5 anchor nodes.

@@ -122,15 +122,45 @@ static HASH_CHAIN_BREAK_WITNESSES: once_cell::sync::Lazy<
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
 /// Record that `peer_id` reported a hash_chain_break at `height`.
-/// If the set of distinct witnesses reaches f+1 (not 2f+1), signal fork
-/// recovery. f+1 is the "at least one honest witness" threshold and is
-/// the canonical bar for fork DETECTION (as opposed to the 2f+1 COMMIT
-/// threshold).
+///
+/// v16.1: SPLIT THRESHOLD MODEL. Industry-standard BFT chains separate
+/// fork DETECTION (advisory signal, low threshold) from fork ROLLBACK
+/// (state-mutating action, supermajority threshold):
+///
+///   * f+1 = "at least one honest witness exists" — sufficient to RAISE
+///     a soft-warning signal, prompt deeper investigation, increase peer
+///     diversity in resync sources. NEVER rolls back state.
+///
+///   * 2f+1 = "byzantine supermajority" — required for any state
+///     mutation including destructive rollback. Below this threshold
+///     a malicious f-node colluding with f-1 honest witnesses on a
+///     transient timestamp/round mismatch could force everyone else to
+///     unwind their canonical chain.
+///
+/// Forensic motivation (v15.x h=334..h=368 cascade):
+///   The legacy code used f+1 (=2 for n=5) for both detection AND
+///   destructive rollback. A single byzantine producer (node_001 with
+///   pk_mismatch broken signatures) plus one honest peer reporting a
+///   harmless `block_round=2` divergence was enough to roll the local
+///   tip back. Resync then re-downloaded the SAME forked branch from
+///   the same peer set (no canonical-chain filter), and the witness
+///   counter trip again at the new height — repeat for hours, walking
+///   the chain backwards.
+///
+///   Splitting the thresholds plus the peer-cooldown (Phase 4.B) breaks
+///   the cascade: a single dishonest peer cannot induce rollback even
+///   if f honest peers happen to agree on the same wrong-looking hash;
+///   the rollback path requires a real BFT-supermajority of distinct
+///   peer_ids.
 ///
 /// Rate-limit semantics: once FORK_RECOVERY_HEIGHT is non-zero we don't
 /// overwrite it with a different (lower) height — the main loop consumes
 /// it first. This prevents flapping when two heights both accumulate
 /// witnesses during a partition.
+///
+/// Scalability: per-height witness sets are bounded by the active
+/// validator-set count (≤ MAX_VALIDATORS = 1000 in committee). Cleanup
+/// sweep evicts entries below current chain tip.
 pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
     if peer_id.is_empty() || peer_id == "self" {
         return;
@@ -150,14 +180,43 @@ pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
         let n = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
         if n >= 3 { n } else { 5 }
     };
-    // f+1 = ceil(n/3): guarantees at least one honest witness.
-    let threshold_f_plus_1 = (total_validators.saturating_add(2)) / 3;
-    // Floor at 2 so at any registry size ≥ 4 the threshold is ≥ 2; below
-    // 4 we still need at least 2 distinct reporters to avoid single-peer
-    // false positives.
-    let threshold = threshold_f_plus_1.max(2);
 
-    if witnesses >= threshold {
+    // f+1 = ceil(n/3): "at least one honest witness" — DETECTION ONLY.
+    let threshold_f_plus_1 = (total_validators.saturating_add(2)) / 3;
+    let detection_threshold = threshold_f_plus_1.max(2);
+
+    // 2f+1 = canonical BFT supermajority — destructive ROLLBACK threshold.
+    // Formula `(2n+2)/3` is the canonical ceiling form; works uniformly
+    // for n=5 as well as n=1_000_000.
+    let threshold_2f_plus_1 = ((total_validators.saturating_mul(2)).saturating_add(2)) / 3;
+    let rollback_threshold = threshold_2f_plus_1.max(3);
+
+    // Stage 1: SOFT detection signal at f+1.
+    // Logged once per crossing so operators see partial agreement without
+    // triggering rollback. The signal is also picked up by Phase 4.B
+    // peer-cooldown which tags every peer that supplied a forked block at
+    // this height as "potentially-byzantine" for canonical-aware sync
+    // peer selection — without losing those peers as gossip sources.
+    if witnesses == detection_threshold && witnesses < rollback_threshold {
+        if is_warn() {
+            println!(
+                "[WARN][PIPELINE] fork_detection_signal h={} witnesses={} threshold_f_plus_1={} action=advisory_only_no_rollback",
+                height, witnesses, detection_threshold
+            );
+        }
+        // Mark all current witnesses as "fork-source" so the canonical-
+        // aware sync peer selection prefers other peers when refilling
+        // the local chain at this height.
+        if let Some(set) = HASH_CHAIN_BREAK_WITNESSES.get(&height) {
+            for w in set.iter() {
+                mark_peer_as_fork_source(w.key());
+            }
+        }
+    }
+
+    // Stage 2: HARD destructive rollback at 2f+1.
+    // Only at this point do we commit to actually deleting blocks.
+    if witnesses >= rollback_threshold {
         let rollback_to = height.saturating_sub(1);
         // Only raise the signal — never lower. The main loop consumes it
         // under the same atomic swap that clears the tracker.
@@ -166,12 +225,87 @@ pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
             FORK_RECOVERY_HEIGHT.store(rollback_to, Ordering::SeqCst);
             if is_warn() {
                 println!(
-                    "[WARN][PIPELINE] minority_fork_detected h={} rollback_to={} witnesses={} threshold={} (f+1)",
-                    height, rollback_to, witnesses, threshold
+                    "[WARN][PIPELINE] minority_fork_confirmed h={} rollback_to={} witnesses={} threshold_2f_plus_1={} action=destructive_rollback",
+                    height, rollback_to, witnesses, rollback_threshold
                 );
             }
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v16.1: FORKED PEER COOLDOWN
+// ═══════════════════════════════════════════════════════════════════════════
+// Peers that supplied blocks of a branch we just rolled back from (or which
+// triggered the f+1 fork-detection signal) are tagged here for a bounded
+// cooldown window. The canonical-aware sync peer selector reads this map
+// and de-prioritises tagged peers until the cooldown expires — letting the
+// resync pull from peers on the canonical branch instead of refetching
+// the same forked blocks.
+//
+// Bounded retention: 5-minute cooldown per peer. Auto-evicted on next
+// fork event for that peer (refresh) or via the periodic sweep below.
+// At 100k super-node deployment this map is bounded by the union of
+// recent fork participants — typically << 1000 entries.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const FORKED_PEER_COOLDOWN_MS: u64 = 5 * 60 * 1000; // 5 min
+
+static FORKED_PEER_COOLDOWN: once_cell::sync::Lazy<dashmap::DashMap<String, u64>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// Mark `peer_id` as having supplied a forked-branch block. Used by the
+/// canonical-aware sync peer selector to prefer other peers during the
+/// cooldown window. Idempotent — refreshes timestamp on repeated hits.
+pub fn mark_peer_as_fork_source(peer_id: &str) {
+    if peer_id.is_empty() || peer_id == "self" {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    FORKED_PEER_COOLDOWN.insert(peer_id.to_string(), now_ms);
+}
+
+/// Returns true while `peer_id` is within the fork-cooldown window. The
+/// canonical-aware sync peer selector skips peers for which this returns
+/// true; if the entire candidate set is in cooldown, the selector falls
+/// back to the full set rather than starving sync (preferring suspect
+/// peers over no peers at all when liveness is at stake).
+pub fn is_peer_in_fork_cooldown(peer_id: &str) -> bool {
+    let entry = match FORKED_PEER_COOLDOWN.get(peer_id) {
+        Some(e) => e,
+        None => return false,
+    };
+    let marked_at = *entry.value();
+    drop(entry);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let in_cooldown = now_ms.saturating_sub(marked_at) < FORKED_PEER_COOLDOWN_MS;
+    if !in_cooldown {
+        // Lazy eviction — opportunistically clean expired entries on
+        // every read. Avoids a separate cleanup task at the cost of a
+        // single DashMap remove per expiration check.
+        FORKED_PEER_COOLDOWN.remove(peer_id);
+    }
+    in_cooldown
+}
+
+/// Periodic sweep called from the existing cleanup task. Removes entries
+/// older than the cooldown window so the map stays bounded under sustained
+/// fork activity. O(N) over current map size; runs at low cadence (the
+/// caller's existing 5-minute sweep is sufficient).
+pub fn cleanup_forked_peer_cooldown() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    FORKED_PEER_COOLDOWN.retain(|_, marked_at| {
+        now_ms.saturating_sub(*marked_at) < FORKED_PEER_COOLDOWN_MS
+    });
 }
 
 /// Periodic cleanup of stale witness entries below `min_height`.

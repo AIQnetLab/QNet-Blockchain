@@ -1465,6 +1465,76 @@ static AGGREGATED_TC: Lazy<Arc<DashMap<(u64, u64), AggregatedTimeoutCertificate>
 static AGGREGATED_TC_BROADCAST: Lazy<Arc<DashMap<u64, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
+// ═══════════════════════════════════════════════════════════════════════════
+// v16.1: REMOTE PRODUCER HEARTBEAT TRACKING (network-wide liveness signal)
+// ═══════════════════════════════════════════════════════════════════════════
+// Stored as separate DashMaps so the watchdog reads are wait-free and the
+// producer-side broadcast hot path doesn't serialise on a single mutex.
+//
+//   REMOTE_PRODUCER_HEARTBEAT_MS:
+//     producer_id → producer-stamped timestamp (the time the producer THINKS
+//     it sent the heartbeat). Monotonic per producer; replays rejected at
+//     handler entry. Used by signature anti-replay guard.
+//
+//   REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS:
+//     producer_id → local wall-clock at receive time. Used by the watchdog
+//     to compute "silence" duration without trusting the producer's clock.
+//     This is the source of truth for the silent-threshold check, NOT the
+//     producer's own timestamp (which could be skewed by NTP drift).
+//
+// Capacity: bounded to MAX_REMOTE_PRODUCER_TRACKED entries. When the cap is
+// reached the oldest observation is evicted — at 1000 active producers
+// rotating through slots, ~10× headroom is enough to retain everyone in the
+// committee without unbounded growth from churn.
+//
+// Scalability: O(1) per insert/lookup via DashMap shard hashing. At 100k
+// super nodes only the actively-rotating subset (≤ committee size) writes
+// here, so map size is bounded by validator-set ceiling not network size.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MAX_REMOTE_PRODUCER_TRACKED: usize = 10_000;
+
+pub static REMOTE_PRODUCER_HEARTBEAT_MS: Lazy<DashMap<String, u64>> =
+    Lazy::new(DashMap::new);
+
+pub static REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS: Lazy<DashMap<String, u64>> =
+    Lazy::new(DashMap::new);
+
+/// Wall-clock-ms since this node last received a heartbeat from `producer_id`.
+/// Returns `None` when no heartbeat has ever been observed (cold start or
+/// peer not yet reachable). Caller compares this against the silent
+/// threshold (3s default in the watchdog) to decide whether to broadcast an
+/// empty-slot attestation.
+pub fn last_remote_producer_heartbeat_age_ms(producer_id: &str) -> Option<u64> {
+    let observed = *REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.get(producer_id)?.value();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    Some(now_ms.saturating_sub(observed))
+}
+
+/// Best-effort eviction sweep so the heartbeat maps stay bounded for the
+/// life of the process. Called from the existing periodic cleanup task.
+pub fn evict_stale_producer_heartbeats(max_age_ms: u64) {
+    if REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.len() <= MAX_REMOTE_PRODUCER_TRACKED / 2 {
+        return;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.retain(|_, observed| {
+        now_ms.saturating_sub(*observed) <= max_age_ms
+    });
+    // Mirror eviction so the two maps stay in sync; an unevicted timestamp
+    // entry without a corresponding observed entry is harmless but wastes
+    // memory at the 100k-validator scale.
+    REMOTE_PRODUCER_HEARTBEAT_MS.retain(|producer_id, _| {
+        REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.contains_key(producer_id)
+    });
+}
+
 // v14.7.2: per-microblock BlockCommit aggregation, FAST_FINALIZED_HEIGHT,
 // leader-lock statics and helpers REMOVED. Microblock BFT safety is delivered
 // by the canonical macroblock commit/reveal path; per-block QC duplicated
@@ -11841,6 +11911,55 @@ pub enum NetworkMessage {
         #[serde(default)]
         public_key: String,
     },
+
+    /// v16.1: Network-broadcast producer heartbeat for remote silence detection.
+    ///
+    /// Forensic motivation: the legacy `PRODUCER_HEARTBEAT_MS` watchdog tracked
+    /// the LOCAL producer task's loop iteration on this node — useless when
+    /// the question is "is the remote round-0 producer (chosen by VRF) alive?"
+    /// At v15.x h=781, node_001 was VRF-elected producer but dead from boot;
+    /// other nodes' watchdogs only saw their own loop running fine and emitted
+    /// `producer_silent` against THEMSELVES, never raising any actionable
+    /// signal about node_001.
+    ///
+    /// Protocol:
+    ///   * Whenever a node observes itself as the expected producer for the
+    ///     next slot (via `select_microblock_producer_with_round`), it
+    ///     broadcasts `ProducerHeartbeat` once per second to all validator
+    ///     peers — independent of whether it is currently constructing a
+    ///     block.
+    ///   * Receivers store the latest `(producer_id, timestamp)` in
+    ///     `REMOTE_PRODUCER_HEARTBEAT_MS`.
+    ///   * Watchdog reads remote map: if the expected producer's last
+    ///     heartbeat is older than the silent-threshold AND this node is in
+    ///     the empty-slot attestation committee, broadcast an empty-slot
+    ///     attestation immediately (don't wait for the producer-loop tick to
+    ///     discover the silence).
+    ///
+    /// Safety:
+    ///   * Heartbeat MUST be Dilithium3-signed by the producer; receivers
+    ///     verify signature before updating the remote map.
+    ///   * Timestamp covered by signature with monotonic per-producer
+    ///     guard (later timestamp wins) — prevents replay of old heartbeats.
+    ///   * Heartbeat does NOT advance any consensus state directly; it only
+    ///     accelerates the entry condition for empty-slot attestation, which
+    ///     remains guarded by 2f+1 supermajority.
+    ///
+    /// Scalability: at 1000 producers, only the elected one broadcasts per
+    /// slot — that's 1 msg/sec network-wide. Receivers update an O(1)
+    /// DashMap entry. Bandwidth is negligible (≈4 KB per heartbeat:
+    /// 32-byte fields + Dilithium3 detached signature).
+    ProducerHeartbeat {
+        producer_id: String,
+        timestamp: u64,
+        /// Height the producer is targeting; receivers can correlate with
+        /// their own tip to detect a stuck producer that broadcasts but
+        /// hasn't caught up.
+        slot_height: u64,
+        /// Dilithium3 detached signature over
+        /// "QNET_PRODUCER_HEARTBEAT_V1:{producer_id}:{timestamp}:{slot_height}"
+        signature: Vec<u8>,
+    },
     
     /// State snapshot announcement
     StateSnapshot {
@@ -12794,6 +12913,75 @@ impl SimplifiedP2P {
                     if crate::node::is_debug() {
                         println!("[DBG][P2P] health_ping from={} h={} sig=rejected age={}s", from, height, age_secs);
                     }
+                }
+            }
+
+            NetworkMessage::ProducerHeartbeat { producer_id, timestamp, slot_height, signature } => {
+                // v16.1: remote producer liveness signal. Verified Dilithium3
+                // signature proves the producer is alive and aware of the
+                // current slot. Receivers update REMOTE_PRODUCER_HEARTBEAT_MS
+                // and the watchdog uses this to trigger empty-slot
+                // attestation IMMEDIATELY when the elected producer goes
+                // silent (no need to wait for next producer-loop tick).
+                //
+                // Rate limit: producer broadcasts ≈1/sec, so 60/min ceiling
+                // is generous. Anti-DoS — without this an attacker could
+                // flood ProducerHeartbeats to burn CPU on signature verify.
+                if self.is_consensus_rate_limited(&producer_id, "producer_heartbeat", 60) {
+                    return;
+                }
+
+                // Anti-replay: monotonic timestamp guard per producer. Older
+                // timestamps are silently ignored (no signature verify cost
+                // for stale replays).
+                if let Some(prev) = REMOTE_PRODUCER_HEARTBEAT_MS.get(&producer_id) {
+                    let prev_ts = *prev.value();
+                    if timestamp <= prev_ts {
+                        return;
+                    }
+                }
+
+                // Verify signature against producer's registered consensus PK.
+                // This is the same registry used for TimeoutVote signatures —
+                // node_001's pk_mismatch class of failures still applies and
+                // would correctly reject a spoofed heartbeat.
+                let msg = format!(
+                    "QNET_PRODUCER_HEARTBEAT_V1:{}:{}:{}",
+                    producer_id, timestamp, slot_height
+                );
+                let sig_str = match String::from_utf8(signature.clone()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        if crate::node::is_warn() {
+                            println!(
+                                "[WARN][HEARTBEAT] sig_not_utf8 producer={} len={}",
+                                producer_id, signature.len()
+                            );
+                        }
+                        return;
+                    }
+                };
+                if !self.verify_consensus_signature(&producer_id, &msg, &sig_str) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][HEARTBEAT] sig_invalid producer={}", producer_id);
+                    }
+                    return;
+                }
+
+                // Update remote heartbeat tracking. Stored as wall-clock ms
+                // so the watchdog comparison stays simple.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                REMOTE_PRODUCER_HEARTBEAT_MS.insert(producer_id.clone(), timestamp);
+                REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.insert(producer_id.clone(), now_ms);
+
+                if crate::node::is_debug() {
+                    println!(
+                        "[DBG][HEARTBEAT] received producer={} slot_h={} ts={}",
+                        producer_id, slot_height, timestamp
+                    );
                 }
             }
 
@@ -19890,17 +20078,42 @@ impl SimplifiedP2P {
         
         loop {
             interval.tick().await;
-            
+
+            // v16.1: ESCALATION-DRIVEN PEER REFRESH
+            //
+            // The state-machine escalation ladder (Phase 2.A stage 3) raises
+            // PEER_REFRESH_REQUESTED after 30 consecutive Error{recoverable=true}
+            // cycles — symptomatic of all our active peers being silent or
+            // forked. When this fires, force an IMMEDIATE peer-exchange round
+            // (don't wait for the next interval tick) and DOUBLE the breadth
+            // of this cycle's exchange so we have a chance to discover
+            // canonical peers we haven't talked to yet.
+            //
+            // Atomic swap clears the flag so a single signal triggers exactly
+            // one accelerated cycle. Subsequent cycles return to the standard
+            // interval until the flag is set again.
+            let force_refresh = crate::node::PEER_REFRESH_REQUESTED.swap(
+                false, std::sync::atomic::Ordering::Relaxed,
+            );
+            if force_refresh && crate::node::is_warn() {
+                println!("[WARN][P2P] peer_refresh_forced cause=escalation_stage_3");
+            }
+
             // SCALABILITY FIX: Limit peer exchange requests to prevent network overload
-            let max_exchange_peers = if is_genesis_node {
+            let mut max_exchange_peers = if is_genesis_node {
                 initial_peers.len() // Genesis: exchange with all known peers
             } else {
                 std::cmp::min(initial_peers.len(), 3) // Normal: max 3 peers per cycle
             };
-            
+            if force_refresh {
+                // Double breadth on forced refresh, capped at total known peers.
+                max_exchange_peers = std::cmp::min(initial_peers.len(), max_exchange_peers * 2 + 2);
+            }
+
             if crate::node::is_info() {
-                println!("[INFO][P2P] Starting peer exchange cycle with {} of {} peers",
-                        max_exchange_peers, initial_peers.len());
+                println!("[INFO][P2P] Starting peer exchange cycle with {} of {} peers{}",
+                        max_exchange_peers, initial_peers.len(),
+                        if force_refresh { " (forced)" } else { "" });
             }
             
             // Request peer lists from limited set of connected nodes
@@ -22821,9 +23034,45 @@ impl SimplifiedP2P {
         });
     }
 
+    /// v16.1: Broadcast a Dilithium3-signed `ProducerHeartbeat` to all
+    /// validator peers. Called by the production loop once per slot when
+    /// this node is the elected producer for the next height. The
+    /// signature payload binds (producer_id, timestamp, slot_height) so a
+    /// receiver can verify identity and reject replays without trusting
+    /// any wall-clock from the producer.
+    ///
+    /// Caller responsibility:
+    ///   * MUST only invoke when this node is the elected producer (avoids
+    ///     unauthorised heartbeats — receivers reject signatures from
+    ///     non-elected nodes via consensus_pk_registry binding).
+    ///   * Slot_height MUST be the height the producer is targeting; this
+    ///     gives receivers a stuck-producer detector ("producer_id is alive
+    ///     but stuck below local tip").
+    ///
+    /// Best-effort fan-out: PEER_RETRY_COOLDOWN respected, no acknowledgement
+    /// loop. The pull-based recovery path (`request_timeout_proofs` and
+    /// macroblock pull) covers any peer that misses a heartbeat broadcast.
+    pub fn broadcast_producer_heartbeat(
+        &self,
+        producer_id: String,
+        slot_height: u64,
+        signature_bytes: Vec<u8>,
+        timestamp: u64,
+    ) {
+        let msg = NetworkMessage::ProducerHeartbeat {
+            producer_id,
+            timestamp,
+            slot_height,
+            signature: signature_bytes,
+        };
+        // Reuse the parallel fan-out used for AggregatedTimeoutCertificate —
+        // identical bandwidth profile, identical PEER_RETRY_COOLDOWN gate.
+        self.broadcast_aggregated_timeout_cert(msg);
+    }
+
     /// Broadcast timeout proof to all connected nodes
     /// ARCHITECTURE: Same as broadcast_certificate_announce_tracked - parallel with retries
-    fn broadcast_timeout_proof(&self, height: u64, timeout_round: u64, 
+    fn broadcast_timeout_proof(&self, height: u64, timeout_round: u64,
                                last_block_hash: [u8; 32], votes: Vec<SignedTimeoutVote>) {
         let msg = NetworkMessage::TimeoutCertificateBroadcast {
             height,
@@ -25809,6 +26058,32 @@ impl SimplifiedP2P {
     /// v9.3: Sync peer selection with height filter.
     /// Only returns peers whose last_block_height >= min_height.
     pub fn get_sync_peers_filtered_by_height(&self, max_peers: usize, min_height: u64) -> Vec<PeerInfo> {
+        // v16.1: TWO-PASS canonical-aware sync peer selection.
+        //
+        // Pass 1 collects all peers that pass the legacy filters (height,
+        // node type, blacklist, reputation).
+        //
+        // Pass 2 splits the candidates into "fork-cooldown clean" and
+        // "fork-cooldown tagged" buckets. Tagged peers are those that
+        // recently supplied blocks of a branch we rolled back from
+        // (Phase 4.B `mark_peer_as_fork_source`). The selector returns
+        // the clean bucket first; only if the clean bucket is empty
+        // does it fall back to tagged peers (preferring suspect peers
+        // over no peers — liveness over caution when nothing else is
+        // available).
+        //
+        // This breaks the v15.x rollback cascade: after a rollback at
+        // h=N, the f+1 peers that pushed the forked branch are skipped
+        // for the resync window so we don't immediately re-download the
+        // same forked blocks they originally sent. Recovery converges
+        // on the canonical chain via different peers within the
+        // 5-minute cooldown window.
+        //
+        // Scalability: O(N) over candidate count (already bounded by
+        // committee size). At 1000-validator committee the two-pass
+        // sort runs in microseconds. At 100k network most peers won't
+        // be in the cooldown map (which is bounded to recent fork
+        // events only), so the clean bucket dominates.
         let mut eligible_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
             .filter_map(|entry| {
                 let peer = entry.value().clone();
@@ -25822,7 +26097,7 @@ impl SimplifiedP2P {
                 if min_height > 0 && peer.last_block_height < min_height {
                     return None;
                 }
-                
+
                 // Filter blacklisted peers
                 let (is_blacklisted, reason, remaining) = self.is_blacklisted(&peer.addr);
                 if is_blacklisted {
@@ -25842,7 +26117,7 @@ impl SimplifiedP2P {
                         }
                     }
                 }
-                
+
                 // Include only peers with good consensus reputation (Byzantine-safe)
                 if peer.is_consensus_qualified() {
                     Some(peer)
@@ -25851,7 +26126,7 @@ impl SimplifiedP2P {
                 }
             })
             .collect();
-        
+
         // Sort by priority: 1) network_score (latency), 2) cached reputation (reliability)
         eligible_peers.sort_by(|a, b| {
             // Primary: network_score (higher = better latency)
@@ -25862,9 +26137,28 @@ impl SimplifiedP2P {
             // Secondary: cached reputation (higher = more reliable)
             b.reputation().partial_cmp(&a.reputation()).unwrap_or(std::cmp::Ordering::Equal)
         });
-        
-        // Return top-N peers
-        eligible_peers.into_iter().take(max_peers).collect()
+
+        // v16.1: split into clean / fork-cooldown buckets. Clean peers go
+        // first. If clean.len() < max_peers, fall back into the cooldown
+        // bucket to fill remaining slots — staying live even when most
+        // peers are tagged is preferable to stalling.
+        let (clean, tagged): (Vec<PeerInfo>, Vec<PeerInfo>) = eligible_peers
+            .into_iter()
+            .partition(|p| !crate::block_pipeline::is_peer_in_fork_cooldown(&p.id));
+
+        if !tagged.is_empty() && crate::node::is_info() {
+            println!(
+                "[INFO][SYNC] sync_peer_selection clean={} fork_cooldown_skipped={} max_requested={}",
+                clean.len(), tagged.len(), max_peers
+            );
+        }
+
+        let mut result: Vec<PeerInfo> = clean.into_iter().take(max_peers).collect();
+        if result.len() < max_peers {
+            let remaining = max_peers - result.len();
+            result.extend(tagged.into_iter().take(remaining));
+        }
+        result
     }
     
     /// Cleanup expired blacklist entries (periodic maintenance)

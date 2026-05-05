@@ -159,3 +159,123 @@ pub fn get_all_vrf_keys() -> HashMap<String, Vec<u8>> {
     VRF_PK_REGISTRY.read().clone()
 }
 
+// =========================================================================
+// v16.1: GENESIS DILITHIUM ANCHOR LOADER (chain-anchored identity binding)
+// =========================================================================
+//
+// Identity-key binding for the 5 genesis bootstrap nodes is anchored at boot
+// time from a JSON file shipped with the deployment. Once installed via
+// `consensus_crypto::set_genesis_anchor_pks`, the anchor map is immutable and
+// guards every subsequent registration: any PK that does not match the anchor
+// is rejected as a squat attempt.
+//
+// File format (`/app/data/genesis_anchors.json`):
+//   { "genesis_node_001": "<hex_1952_bytes>", ... "genesis_node_005": "..." }
+//
+// Operator workflow:
+//   1. On a clean cluster, every bootstrap node generates its own keypair
+//      (lazy, on first start) under `/app/data/keys/dilithium_keypair.bin`.
+//   2. Operator collects each node's PK (hex from `pk_hash` log or RPC) and
+//      writes them all into ONE JSON file deployed to every node BEFORE the
+//      first restart that loads anchors.
+//   3. Subsequent restarts read the file and install anchors at startup,
+//      BEFORE P2P comes online — closes the trust-on-first-verify race that
+//      caused the v15.x pk_mismatch deadlock.
+//
+// Operational property: keypair files MUST be backed up. If a node's
+// `dilithium_keypair.bin` is lost while the anchor map still binds the old
+// PK, the node refuses to start (via `initialize_wallet_identity`'s strict
+// guard) — operator must restore from backup.
+//
+// Scalability: anchors are bounded to the 5 genesis identities. For
+// thousands of super-node operators, identity-key binding is established via
+// signed `NodeRegistration` transactions (already implemented at
+// `cache_node_registrations_from_transactions_with_dashmap`), which carry
+// `dilithium_public_key` in TX payload and feed `register_consensus_pk_from_chain`.
+// =========================================================================
+
+/// Default location of the genesis anchors JSON file inside the container.
+pub const GENESIS_ANCHORS_PATH: &str = "/app/data/genesis_anchors.json";
+
+/// Load genesis Dilithium3 anchor PKs from `path`. Returns empty map if file
+/// missing or malformed (logged as WARN, not fatal — boot proceeds without
+/// anchors so a fresh cluster can complete first-time keygen + anchor write).
+///
+/// Format: JSON object `{ node_id: pk_hex_1952_bytes }`. Each PK MUST decode
+/// to exactly 1952 bytes; invalid entries are skipped with WARN.
+pub fn load_genesis_anchor_pks_from_file(path: &str) -> HashMap<String, Vec<u8>> {
+    use std::fs;
+    let raw = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => {
+            // Not present is normal for first cluster boot — operator writes
+            // the file after collecting PKs. Don't WARN at this stage.
+            return HashMap::new();
+        }
+    };
+
+    let parsed: HashMap<String, String> = match serde_json::from_str(&raw) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[WARN][GENESIS] anchors_parse_fail path={} err={}", path, e);
+            return HashMap::new();
+        }
+    };
+
+    let mut out = HashMap::with_capacity(parsed.len());
+    for (node_id, pk_hex) in parsed {
+        match hex::decode(&pk_hex) {
+            Ok(bytes) if bytes.len() == 1952 => {
+                out.insert(node_id, bytes);
+            }
+            Ok(bytes) => {
+                eprintln!(
+                    "[WARN][GENESIS] anchor_invalid_size node={} got={} expected=1952",
+                    node_id, bytes.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("[WARN][GENESIS] anchor_hex_decode_fail node={} err={}", node_id, e);
+            }
+        }
+    }
+    out
+}
+
+/// One-shot startup hook: load anchors from default path and install into
+/// the consensus-layer registry. Idempotent — second call is a no-op once
+/// the consensus layer has installed a non-empty anchor map.
+///
+/// Returns the count of anchors installed (0 if file missing — caller may
+/// proceed without anchors during first-cluster keygen, then call again
+/// after the file is written by operator).
+///
+/// MUST be called BEFORE any P2P traffic is accepted (specifically, before
+/// the first `VrfLeaderClaim` or `VrfKeyAnnounce` could trigger
+/// `register_consensus_pk_from_chain` in a TOFV path).
+pub fn install_genesis_anchors_at_startup() -> usize {
+    let map = load_genesis_anchor_pks_from_file(GENESIS_ANCHORS_PATH);
+    if map.is_empty() {
+        // First-boot path: no anchor file yet. Caller logs the appropriate
+        // INFO; we return 0 so caller can decide whether to fail or proceed.
+        return 0;
+    }
+    let count = map.len();
+    let installed = qnet_consensus::consensus_crypto::set_genesis_anchor_pks(map);
+    if installed {
+        println!("[INFO][GENESIS] anchors_installed count={} src={}", count, GENESIS_ANCHORS_PATH);
+        count
+    } else {
+        // Already installed (immutable). Treat as success, but log so an
+        // operator restart with a different file is visible.
+        println!("[INFO][GENESIS] anchors_already_installed count={}", count);
+        count
+    }
+}
+
+/// Lookup the anchored PK for a given genesis node_id. Returns None if no
+/// anchor map is installed, or if the node_id is not a genesis identity.
+pub fn get_genesis_anchor_pk(node_id: &str) -> Option<Vec<u8>> {
+    qnet_consensus::consensus_crypto::get_consensus_pk_anchor(node_id)
+}
+
