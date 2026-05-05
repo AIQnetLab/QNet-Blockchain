@@ -213,7 +213,10 @@ mod producer_cache {
 }
 
 // PRODUCTION v4.0: Global VRF instance for static access in select_producer
-static GLOBAL_VRF_INSTANCE: parking_lot::Mutex<Option<Arc<crate::crypto::vrf::DilithiumVrf>>> =
+// v16.2: pub so unified_p2p::handle_message can access for sync ack signing
+// in the round-change ready handshake path (sync handler can't await async
+// `create_consensus_signature`, raw `detached_sign` from this Arc is fast).
+pub static GLOBAL_VRF_INSTANCE: parking_lot::Mutex<Option<Arc<crate::crypto::vrf::DilithiumVrf>>> =
     parking_lot::Mutex::new(None);
 
 use qnet_state::{State as StateManager, MicroBlock};
@@ -2258,27 +2261,33 @@ static ERROR_LAST_RESYNC_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 
 /// Escalation thresholds. Calibrated for the ~1s microblock cadence so each
 /// stage covers a meaningful number of slots before promoting to the next.
-const ERROR_ESCALATE_FORCE_ROUND_AT: u64 = 3;     // ≥3 cycles → force local round advance
+/// All stages are SIGNAL-based (set process-wide flags consumed by other
+/// loops). None mutate BFT consensus state directly — that property is
+/// what was violated by the v16.1 force_round_advance stage that has been
+/// removed in v16.2.
 const ERROR_ESCALATE_RESYNC_AT: u64 = 10;         // ≥10 cycles → trigger background resync
 const ERROR_ESCALATE_PEER_REFRESH_AT: u64 = 30;   // ≥30 cycles → drop + rediscover peers
 const ERROR_ESCALATE_HALT_AT: u64 = 120;          // ≥120 cycles (~2 min) → mark Halted
 const ERROR_RESYNC_COOLDOWN_SECS: u64 = 60;       // resync trigger cooldown
+/// Threshold above which the ladder reset event is worth logging — picks the
+/// first signal-based stage so operators see when a recovery cycle that
+/// reached actionable territory was cleared by progress.
+const ERROR_CYCLE_RESET_LOG_AT: u64 = ERROR_ESCALATE_RESYNC_AT;
 
 /// Update node state with logging and escalation accounting.
 ///
-/// v16.1: ladder of progressively-aggressive recovery actions when the same
-/// node sits in `Error{recoverable=true}` for many consecutive transitions.
-/// Safety properties:
-///   * `force_local_round_advance` only changes selection-side `timeout_round`;
-///     consensus signature checks still reject any block signed by the wrong
-///     producer, so safety holds.
-///   * Resync uses canonical-aware peer selection (Phase 4) — never accepts
-///     blocks past the last 2f+1-finalised macroblock.
-///   * Peer rediscovery drops only the active connection set, identity
-///     bindings (which are chain-anchored) are preserved.
-///   * `Halted` is a terminal state intended to surface for operator
-///     intervention; the watchdog already exits the process on RPC failure
-///     so Docker restart will trigger a clean reboot.
+/// v16.2: escalation ladder is strictly SIGNAL-based — no consensus-state
+/// mutation. Stages set AtomicBool flags that downstream loops consume:
+///   * Stage 2 (cycles=10): `CHRONIC_STALL_REQUESTED` → resync from peers
+///   * Stage 3 (cycles=30): `PEER_REFRESH_REQUESTED` → peer rediscovery
+///   * Stage 4 (cycles≥120): `HALT_REQUESTED` → process::exit(1)
+///
+/// Safety: every action either pulls verified evidence from peers (resync,
+/// rediscovery) or surfaces to the orchestrator (halt). None of them touches
+/// `CURRENT_TIMEOUT_ROUND`, `HIGHEST_CERTIFIED_ROUND`, or any other consensus
+/// state — which is why determinism of producer selection holds across the
+/// whole committee even when individual nodes hit the ladder at different
+/// moments.
 pub fn set_node_state(new_state: NodeState) {
     let old_state = GLOBAL_NODE_STATE.read().clone();
 
@@ -2297,7 +2306,7 @@ pub fn set_node_state(new_state: NodeState) {
         // Any non-error (or non-recoverable) transition resets the ladder.
         _ => {
             let prev = ERROR_CYCLE_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed);
-            if prev >= ERROR_ESCALATE_FORCE_ROUND_AT && is_info() {
+            if prev >= ERROR_CYCLE_RESET_LOG_AT && is_info() {
                 println!("[INFO][STATE] error_cycle_reset prev_cycles={}", prev);
             }
         }
@@ -2311,21 +2320,22 @@ pub fn set_node_state(new_state: NodeState) {
 
 /// Drive recovery actions based on consecutive Error cycle count.
 /// Called from `set_node_state` only — never schedule directly.
+///
+/// v16.2: REMOVED stage 1 force_round_advance. Local mutation of
+/// `CURRENT_TIMEOUT_ROUND` outside BFT consensus broke the determinism
+/// guarantee — different nodes hit `ERROR_ESCALATE_FORCE_ROUND_AT` at
+/// different moments and bumped the global selection input to different
+/// values, producing divergent producer selections and visible forks at
+/// the v16.1 deploy. The whole purpose of `set_timeout_round` is that the
+/// value is sourced ONLY from `HIGHEST_CERTIFIED_ROUND` — a 2f+1
+/// supermajority signed by Dilithium3-verified votes.
+///
+/// Recovery is now driven exclusively by signal-based stages 2..4 below,
+/// which never mutate consensus state — they only set process-wide flags
+/// that downstream loops consume to trigger network operations (resync,
+/// peer rediscovery, halt). All decisions remain BFT-consensus driven.
 fn escalate_error_state(cycles: u64) {
     match cycles {
-        c if c == ERROR_ESCALATE_FORCE_ROUND_AT => {
-            // Stage 1: force local timeout-round advance for selection only.
-            // Other nodes still need 2f+1 certified votes to align with us;
-            // this stage just unblocks our local producer-selection lookup
-            // when the network has clearly progressed past us.
-            let proposed = CURRENT_TIMEOUT_ROUND.load(std::sync::atomic::Ordering::Relaxed);
-            let bumped = proposed.saturating_add(1);
-            CURRENT_TIMEOUT_ROUND.store(bumped, std::sync::atomic::Ordering::Relaxed);
-            println!(
-                "[WARN][STATE] escalate=force_round_advance cycles={} bumped_to={}",
-                cycles, bumped
-            );
-        }
         c if c == ERROR_ESCALATE_RESYNC_AT => {
             // Stage 2: trigger background resync from canonical peers.
             // Cooldown-gated to avoid resync flood under sustained errors.
@@ -17725,13 +17735,61 @@ impl BlockchainNode {
                         // broadcast, not the supermajority gate that consumes
                         // 2f+1 attestations. Single malicious node cannot force
                         // failover at any height, including h=0.
-                        const GENESIS_PRODUCER_GRACE_MULT: u64 = 3;
+                        //
+                        // ─────────────────────────────────────────────────────
+                        // v16.2: EVENT-BASED COLD-BOOT GATE (replaces 60s timer)
+                        // ─────────────────────────────────────────────────────
+                        // The earlier `3 × grace` timer was an arbitrary magic
+                        // number — too short for slow Docker/P2P discovery,
+                        // potentially too long for healthy boots. A node now
+                        // exits the cold-boot gate when ALL of:
+                        //   * peer_count ≥ active_validator_count - 1 (we see
+                        //     every other committee member at the network layer)
+                        //   * registry_pk_count ≥ active_validator_count
+                        //     (every committee member's NodeRegistration TX has
+                        //     applied — embedded PK present in our registry)
+                        //   * MIN_SAFETY_FLOOR_SECS elapsed since `genesis_ts`
+                        //     (sanity floor against pathological races where
+                        //     all checks momentarily flap; small constant)
+                        //
+                        // This is a SIGNAL-based event, not a clock. It auto-
+                        // calibrates: fast networks exit the gate in seconds,
+                        // slow ones wait for actual readiness. No magic 60s.
+                        // The only constant is a 10s sanity floor — well below
+                        // any realistic Docker boot time, never the binding
+                        // limit in practice.
+                        //
+                        // Genesis-era stall path (microblock_height == 0):
+                        //   * If gate has CLEARED, treat slot as a normal stall
+                        //     (committee is up, producer truly silent).
+                        //   * If gate is OPEN, suppress empty-slot attestation
+                        //     to avoid premature failover during boot.
+                        //
+                        // Industry parallel: peer-discovery-quorum gate before
+                        // initial production (Cosmos `wait_for_peers`, similar
+                        // pattern in genesis-block-producing chains).
+                        const MIN_SAFETY_FLOOR_SECS: u64 = 10;
                         let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
                         let now_secs = effective_now_ts;
-                        let genesis_grace_window = timeout_grace_period.saturating_mul(GENESIS_PRODUCER_GRACE_MULT);
+                        let cold_boot_signal_ready = if let Some(ref p2p) = unified_p2p {
+                            let active_n = p2p.get_active_validator_count();
+                            let peer_n = p2p.get_validated_active_peers().len();
+                            let registry_n = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
+                            let safety_floor_passed = genesis_ts > 0
+                                && now_secs >= genesis_ts.saturating_add(MIN_SAFETY_FLOOR_SECS);
+                            // peer_n counts OTHER peers seen, not self; we are part
+                            // of the committee so peer_n + 1 ≈ active_n when fully
+                            // discovered.
+                            let peers_complete = active_n == 0 || peer_n + 1 >= active_n;
+                            let registry_complete = active_n == 0 || registry_n >= active_n;
+                            safety_floor_passed && peers_complete && registry_complete
+                        } else {
+                            // No P2P (replay path); cold-boot gate not applicable.
+                            true
+                        };
                         let genesis_era_dead_producer = microblock_height == 0
                             && genesis_ts > 0
-                            && now_secs > genesis_ts.saturating_add(genesis_grace_window);
+                            && cold_boot_signal_ready;
                         // v16.1: HEARTBEAT-DRIVEN FAST FAILOVER PATH
                         //
                         // Industry-standard BFT chains (HotStuff family, PBFT-derived
@@ -17793,8 +17851,8 @@ impl BlockchainNode {
                             || heartbeat_fast_path {
                             if microblock_height == 0 && is_warn() {
                                 println!(
-                                    "[WARN][EMPTY-SLOT] genesis_era_failover delay={}s genesis_grace={}s producer_silent_since_boot=true",
-                                    local_delay, genesis_grace_window
+                                    "[WARN][EMPTY-SLOT] genesis_era_failover delay={}s gate=peer_count_signal producer_silent_since_boot=true",
+                                    local_delay
                                 );
                             }
                             if let Some(ref p2p) = unified_p2p {
@@ -17944,23 +18002,41 @@ impl BlockchainNode {
                             p2p.get_best_peer_height()
                         } else { our_h };
                         let height_close_enough = best_peer_h == 0 || our_h + 20 >= best_peer_h;
-                        // Macroblock-granularity escape: a node within 1 macroblock
-                        // (≈90 microblocks) of the best peer is on the canonical
-                        // finalised chain by construction — every macroblock is
-                        // sealed by 2f+1 commit-reveal, and a divergence past the
-                        // last finalised macroblock would have surfaced as a fork
-                        // event handled by Phase 4 (not by suppressing votes).
-                        // Allowing votes from such a node restores liveness in
-                        // the genesis-era stall pattern observed at v15.x h=781.
+                        // ─────────────────────────────────────────────────
+                        // v16.2: FINALITY-LOCKED ESCAPE (replaces best_peer_h)
+                        // ─────────────────────────────────────────────────
+                        // The previous escape clause compared `our_mb` against
+                        // `best_mb` derived from `p2p.get_best_peer_height()`
+                        // — a gossip-derived value that races between peers.
+                        // Replaced here with `last_finalized_macroblock_index`
+                        // which is sourced from local storage and reflects the
+                        // last 2f+1 commit-reveal-finalised macroblock — a
+                        // canonical, race-free metric.
+                        //
+                        // Logic: a node whose local chain reaches the latest
+                        // finalised macroblock is by definition on the
+                        // canonical chain (any divergence past that boundary
+                        // is a fork event handled separately). If we are at
+                        // or above that finalised height, our votes are
+                        // safe to count even if the microblock tip lags.
+                        //
+                        // Safety: 2f+1 supermajority on votes is unchanged.
+                        // This only reopens the gate for nodes whose state
+                        // is finality-current; it never lets behind-finality
+                        // nodes contribute to round advancement.
+                        let last_finalized_mb_idx = match storage.get_latest_macroblock_index() {
+                            Ok(idx) => idx,
+                            Err(_) => 0,
+                        };
                         let our_mb = our_h / 90;
-                        let best_mb = best_peer_h / 90;
-                        let macroblock_close = best_peer_h == 0 || our_mb + 1 >= best_mb;
+                        let finality_match = last_finalized_mb_idx == 0
+                            || our_mb >= last_finalized_mb_idx;
                         let is_synced_enough = production_unlocked
-                            && (height_close_enough || macroblock_close);
-                        if !height_close_enough && macroblock_close && is_info() {
+                            && (height_close_enough || finality_match);
+                        if !height_close_enough && finality_match && is_info() {
                             println!(
-                                "[INFO][VOTE_GATE] macroblock_match_escape our_h={} best_h={} our_mb={} best_mb={} action=allow_vote",
-                                our_h, best_peer_h, our_mb, best_mb
+                                "[INFO][VOTE_GATE] finality_match_escape our_h={} our_mb={} last_finalized_mb={} action=allow_vote",
+                                our_h, our_mb, last_finalized_mb_idx
                             );
                         }
 
@@ -19348,6 +19424,76 @@ impl BlockchainNode {
                                      next_block_height, sync_active, prod_unlocked, node_synced);
                         }
                         is_my_turn_to_produce = false;
+                    }
+                }
+
+                // ═══════════════════════════════════════════════════════════════════════════
+                // v16.2: ROUND-CHANGE READY HANDSHAKE — eliminate cold-boot rotation race
+                // ═══════════════════════════════════════════════════════════════════════════
+                // When this node is the elected producer at `timeout_round > 0`, it has
+                // converged on the rotation round LOCALLY based on its view of the
+                // 2f+1 timeout votes. But other committee members may have observed
+                // those votes in different orders — so we cannot assume they agree
+                // on the same round at this exact moment. Without this barrier, two
+                // honest producers could each emit blocks at different rounds for
+                // the same height, creating the race that produced the v15.x h=154
+                // fork.
+                //
+                // The handshake makes the convergence explicit:
+                //   1. Producer broadcasts a Dilithium3-signed `ProducerReady` to
+                //      all validator peers (carrying mb_idx, round, height).
+                //   2. Each peer that ALSO has local certified ≥ round signs and
+                //      sends back a `ReadyAck` (point-to-point to the producer).
+                //   3. Producer waits for 2f+1 distinct acks before constructing
+                //      the block. Reaching 2f+1 acks proves at least f+1 honest
+                //      peers have converged on the same round — sufficient for
+                //      determinism.
+                //   4. If acks do not reach 2f+1 within `READY_HANDSHAKE_TIMEOUT_MS`,
+                //      producer YIELDS the slot. Pacemaker advances naturally on
+                //      the next stall cycle — same liveness path as a missing
+                //      block.
+                //
+                // Steady-state (round = 0): no handshake, zero overhead. The
+                // barrier only fires at rotation events — rare under healthy
+                // network conditions.
+                //
+                // Scalability: at committee size N the handshake exchanges
+                // O(N) messages (1 broadcast + up-to-N acks). For committee=1000
+                // this is well within the existing TimeoutVote bandwidth budget,
+                // and the cost is paid only on round-change events, not per
+                // microblock.
+                //
+                // Safety: handshake is signal-based, not state-mutating. It
+                // does not change `HIGHEST_CERTIFIED_ROUND` — only confirms
+                // peers have already converged on it. Bypassing the barrier
+                // (e.g., a Byzantine producer skipping it) would emit a block
+                // without 2f+1 ack evidence, but receivers' cert presence
+                // check (verify stage) still requires the AggregatedTimeoutCertificate
+                // for the round to be locally observed before applying. So the
+                // handshake is a LIVENESS HARDENING, not the safety boundary.
+                if is_my_turn_to_produce && timeout_round > 0 {
+                    if let Some(ref p2p) = unified_p2p {
+                        // Compute mb_idx from the height we are about to produce,
+                        // matching the keying convention used by the pacemaker
+                        // (`HIGHEST_CERTIFIED_ROUND[mb_idx]`) and the cert
+                        // presence check in the verify stage.
+                        let handshake_mb_idx = next_block_height / 90;
+                        let ready_ok = Self::wait_for_round_change_ready_quorum(
+                            p2p,
+                            &node_id,
+                            handshake_mb_idx,
+                            timeout_round,
+                            next_block_height,
+                        ).await;
+                        if !ready_ok {
+                            if is_warn() {
+                                println!(
+                                    "[WARN][READY] handshake_timeout h={} mb_idx={} round={} action=yield_slot",
+                                    next_block_height, handshake_mb_idx, timeout_round
+                                );
+                            }
+                            is_my_turn_to_produce = false;
+                        }
                     }
                 }
 
@@ -23698,6 +23844,114 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     ///   - ALL nodes compute SAME excluded list from SAME blockchain data
     ///   - NO BROADCAST NEEDED for failover!
     /// ═══════════════════════════════════════════════════════════════════════════
+    /// v16.2: Round-change ready handshake. Producer at `round > 0` invokes
+    /// this BEFORE constructing the block. Returns true iff 2f+1 distinct
+    /// `ReadyAck` signatures arrive within the configured timeout window.
+    ///
+    /// Implementation:
+    ///   1. Sign and broadcast `ProducerReady{mb_idx, round, height}` to
+    ///      all validator peers via `broadcast_producer_ready`.
+    ///   2. Self-record the producer's own ack contribution (handshake
+    ///      participation by definition).
+    ///   3. Poll `count_ready_acks()` every 50 ms until the running total
+    ///      reaches 2f+1 of the active validator count, or the timeout
+    ///      window elapses.
+    ///   4. Return true on quorum, false on timeout (caller yields slot).
+    ///
+    /// Timeout: 800 ms — empirically sized to cover one cross-region RTT
+    /// plus signature verification overhead at committee=1000. Larger
+    /// committees may tune via `QNET_READY_HANDSHAKE_TIMEOUT_MS` ENV.
+    /// Yielding the slot on timeout is a NO-OP for safety: pacemaker
+    /// advances naturally on the next stall cycle, exact same code path
+    /// as a missing-block timeout.
+    ///
+    /// Scalability: O(committee) network cost per round-change event,
+    /// fired only at rotation boundaries (rare). At steady-state
+    /// (round = 0) this function is never called — zero overhead.
+    async fn wait_for_round_change_ready_quorum(
+        p2p: &std::sync::Arc<crate::unified_p2p::SimplifiedP2P>,
+        node_id: &str,
+        mb_idx: u64,
+        round: u64,
+        height: u64,
+    ) -> bool {
+        // Round-0 has no handshake (no rotation event).
+        if round == 0 {
+            return true;
+        }
+
+        // Build canonical signed payload identical to the receiver-side
+        // verification format so peers can verify deterministically.
+        let msg_to_sign = format!(
+            "QNET_PRODUCER_READY_V1:{}:{}:{}:{}",
+            node_id, mb_idx, round, height
+        );
+        let sig_bytes = match try_get_quantum_crypto() {
+            Some(crypto) => match crypto.create_consensus_signature(node_id, &msg_to_sign).await {
+                Ok(sig) => sig.signature.as_bytes().to_vec(),
+                Err(e) => {
+                    if is_warn() {
+                        println!("[WARN][READY] producer_ready_sign_failed err={}", e);
+                    }
+                    return false;
+                }
+            },
+            None => return false,
+        };
+
+        // Self-record before broadcast — producer's own ack counts toward
+        // the 2f+1 quorum (the producer is part of the committee).
+        crate::unified_p2p::READY_ACKS
+            .entry((mb_idx, round, height, node_id.to_string()))
+            .or_insert_with(dashmap::DashSet::new)
+            .insert(node_id.to_string());
+
+        // Broadcast ProducerReady to all validator peers.
+        p2p.broadcast_producer_ready(
+            mb_idx,
+            round,
+            height,
+            node_id.to_string(),
+            sig_bytes,
+        );
+
+        // Poll for 2f+1 ack quorum. Compute target from current active
+        // validator count — same source the rest of consensus uses.
+        let total_validators = p2p.get_active_validator_count();
+        let two_f_plus_1 = ((2 * total_validators + 2) / 3).max(1);
+
+        let timeout_ms: u64 = std::env::var("QNET_READY_HANDSHAKE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(800);
+        let poll_interval_ms = 50u64;
+        let max_polls = (timeout_ms / poll_interval_ms).max(1);
+
+        for _ in 0..max_polls {
+            let count = crate::unified_p2p::count_ready_acks(mb_idx, round, height, node_id);
+            if count >= two_f_plus_1 {
+                if is_info() {
+                    println!(
+                        "[INFO][READY] handshake_quorum mb_idx={} round={} h={} acks={}/{}",
+                        mb_idx, round, height, count, two_f_plus_1
+                    );
+                }
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+        }
+
+        // Timeout — return false so caller yields the slot.
+        let final_count = crate::unified_p2p::count_ready_acks(mb_idx, round, height, node_id);
+        if is_info() {
+            println!(
+                "[INFO][READY] handshake_timeout mb_idx={} round={} h={} acks={}/{} timeout_ms={}",
+                mb_idx, round, height, final_count, two_f_plus_1, timeout_ms
+            );
+        }
+        false
+    }
+
     pub async fn select_microblock_producer(
         current_height: u64,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
@@ -24141,6 +24395,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // With N candidates: timeout 1→N-1 covers all others, then cycles.
                     // No exclusion sets, no collisions, no stalls.
                     // Dead node at any position is skipped within 6s (next timeout round).
+                    //
+                    // v16.2: NOTE on excluded producers — the candidate list passed
+                    // here has ALREADY been filtered through
+                    // `excluded_producers_for_next_epoch` from macroblock N-2 inside
+                    // `calculate_qualified_candidates`. That excluded set is on-
+                    // chain canonical state (2f+1 finalised), so the filtering is
+                    // deterministic across every honest node — they all start from
+                    // the same `candidates` ordering and compute the same
+                    // `(round0_idx + R) % N` index. Adding a runtime skip-forward
+                    // here over `EXCLUDED_PRODUCERS` (a per-node DashMap populated
+                    // by local detection events) would introduce non-determinism
+                    // — different nodes would have different runtime exclusion
+                    // states and select different producers from the same round.
+                    // The canonical filter is the only authoritative source.
                     let round0_idx = DilithiumVrf::deterministic_leader(
                         &slot_input, round_start_height, leadership_round, 0, candidates.len(),
                     );

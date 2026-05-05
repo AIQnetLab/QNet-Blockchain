@@ -1500,6 +1500,66 @@ pub static REMOTE_PRODUCER_HEARTBEAT_MS: Lazy<DashMap<String, u64>> =
 pub static REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS: Lazy<DashMap<String, u64>> =
     Lazy::new(DashMap::new);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// v16.2: OBSERVER-BASED BLOCK REJECTION AGGREGATOR
+// ═══════════════════════════════════════════════════════════════════════════
+// Maps (height, source_peer_id) → set of distinct observer_ids that
+// signed and verified a BlockRejection. When the set crosses 2f+1, fork
+// recovery fires. Keyed on (height, source) so two simultaneous Byzantine
+// producers at the same height can be tracked independently.
+//
+// Capacity: bounded by committee size; each tuple bounded by N observers.
+// Cleanup sweep evicts entries below current chain tip via the existing
+// timeout-state cleanup (extended below in cleanup_block_rejections).
+// ═══════════════════════════════════════════════════════════════════════════
+pub static BLOCK_REJECTION_OBSERVERS: Lazy<DashMap<(u64, String), DashSet<String>>> =
+    Lazy::new(DashMap::new);
+
+/// Count distinct observer signatures currently observed for the given
+/// (height, source_peer_id) tuple. Constant-time DashMap shard lookup.
+pub fn count_block_rejection_observers(height: u64, source_peer_id: &str) -> usize {
+    BLOCK_REJECTION_OBSERVERS
+        .get(&(height, source_peer_id.to_string()))
+        .map(|e| e.value().len())
+        .unwrap_or(0)
+}
+
+/// Periodic eviction of stale rejection tuples below the chain tip.
+/// Called by the existing timeout-state cleanup task.
+pub fn cleanup_block_rejections(min_height: u64) {
+    BLOCK_REJECTION_OBSERVERS.retain(|(h, _), _| *h >= min_height);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v16.2: ROUND-CHANGE READY HANDSHAKE — ack accumulator
+// ═══════════════════════════════════════════════════════════════════════════
+// Maps (mb_idx, round, height, producer_id) → set of distinct ack_ids that
+// have signed and verified. Producer reads this to determine when 2f+1
+// supermajority is met and it is safe to construct the block at round R.
+//
+// Capacity: bounded per-tuple by committee size (≤ MAX_VALIDATORS); the
+// outer DashMap is bounded by the active-rotation window via the existing
+// timeout-state cleanup sweep that prunes by mb_idx.
+// ═══════════════════════════════════════════════════════════════════════════
+pub static READY_ACKS: Lazy<DashMap<(u64, u64, u64, String), DashSet<String>>> =
+    Lazy::new(DashMap::new);
+
+/// Count distinct ack signers currently observed for the given handshake
+/// tuple. Constant-time DashMap shard lookup. Caller compares against
+/// the 2f+1 threshold computed locally from the active validator count.
+pub fn count_ready_acks(mb_idx: u64, round: u64, height: u64, producer_id: &str) -> usize {
+    READY_ACKS
+        .get(&(mb_idx, round, height, producer_id.to_string()))
+        .map(|e| e.value().len())
+        .unwrap_or(0)
+}
+
+/// Periodic eviction of stale ack tuples. Called by the existing timeout-
+/// state cleanup task that prunes other VOTER_* / TIMEOUT_* maps.
+pub fn cleanup_ready_acks(min_mb_idx: u64) {
+    READY_ACKS.retain(|(mb_idx, _, _, _), _| *mb_idx >= min_mb_idx);
+}
+
 /// Wall-clock-ms since this node last received a heartbeat from `producer_id`.
 /// Returns `None` when no heartbeat has ever been observed (cold start or
 /// peer not yet reachable). Caller compares this against the silent
@@ -11912,6 +11972,116 @@ pub enum NetworkMessage {
         public_key: String,
     },
 
+    /// v16.2: OBSERVER-BASED BLOCK REJECTION — supermajority fork detection.
+    ///
+    /// The legacy v16.1 fork detector counted DISTINCT PEER SOURCES that sent
+    /// a forked block at a given height. With ≤f Byzantine producers
+    /// (typically 1 in a 5-node committee) the source count tops out at 1,
+    /// so the 2f+1 supermajority threshold for destructive rollback was
+    /// mathematically unreachable — dead code that never fired in postmortem.
+    ///
+    /// The correct BFT model counts DISTINCT OBSERVERS (each honest node
+    /// that locally rejected the same forked block). When 2f+1 observers
+    /// independently reject the same `(height, source_peer_id)` tuple,
+    /// destructive rollback is justified by the supermajority — exactly
+    /// the property the BFT invariant promises.
+    ///
+    /// Protocol:
+    ///   1. On `verify_failed` for a block from peer S at height H, the
+    ///      detecting node broadcasts `BlockRejection{height=H, source=S,
+    ///      rejected_hash, observer=self, expected_prev_hash, signature}`.
+    ///   2. Receivers verify the observer's Dilithium3 signature against
+    ///      the consensus PK registry and aggregate distinct observers
+    ///      per `(height, source)` tuple.
+    ///   3. When 2f+1 distinct observers report the same `(height, source)`,
+    ///      the receiver raises `FORK_RECOVERY_HEIGHT = height - 1`. The
+    ///      same destructive-rollback path used by macroblock fork recovery
+    ///      then deletes the forked tip and resyncs from canonical peers.
+    ///
+    /// Safety: rollback fires only on cryptographic supermajority. A
+    /// Byzantine source that splits the network cannot trigger rollback
+    /// against an honest chain — the honest 2f+1 supermajority is on
+    /// the canonical chain and reports rejections against the BYZANTINE
+    /// source, not the canonical one.
+    ///
+    /// Scalability: bounded by committee size. At committee=1000, a fork
+    /// event produces O(committee) rejection broadcasts and O(committee)
+    /// signature verifications — same magnitude as a TimeoutVote round
+    /// and well within existing bandwidth budgets. Triggered only on
+    /// fork events (rare under healthy network conditions).
+    BlockRejection {
+        height: u64,
+        source_peer_id: String,
+        rejected_hash: [u8; 32],
+        observer_id: String,
+        expected_prev_hash: [u8; 32],
+        /// Dilithium3 detached signature over
+        /// "QNET_BLOCK_REJECTION_V1:{observer_id}:{height}:{source_peer_id}:{hex(rejected_hash)}:{hex(expected_prev_hash)}"
+        signature: Vec<u8>,
+    },
+
+    /// v16.2: ROUND-CHANGE READY HANDSHAKE — eliminates rotation race window.
+    ///
+    /// The v15.x cold-boot postmortem at h=154 traced a fork to two
+    /// producers concurrently emitting blocks at different rotation_rounds.
+    /// Each had advanced its own `HIGHEST_CERTIFIED_ROUND` independently as
+    /// peer gossip propagated at different rates — so each saw "I am the
+    /// elected producer for this slot" simultaneously based on its OWN
+    /// view of the round. Without an explicit per-round acknowledgement
+    /// step, the only safety net was post-hoc hash-chain detection, which
+    /// is too late to prevent the fork.
+    ///
+    /// The handshake closes that race:
+    ///   1. After local certified_round advances to R > 0, the elected
+    ///      producer broadcasts `ProducerReady{mb_idx, round=R, height}`
+    ///      signed with Dilithium3.
+    ///   2. Each committee member that ALSO has local certified_round ≥ R
+    ///      replies with `ReadyAck{mb_idx, round=R, height}` signed.
+    ///   3. The producer waits for 2f+1 distinct signed acks before
+    ///      constructing the block at round R. This proves at least one
+    ///      honest peer has already converged on the same round.
+    ///
+    /// Crucially this only fires when `round > 0` — the steady-state happy
+    /// path (round = 0 producer wins immediately) has zero handshake
+    /// overhead. At cold-boot rotation events the +1 round trip is the
+    /// price of determinism. Industry parallel: HotStuff "new-view" message
+    /// chain.
+    ///
+    /// Liveness: if 2f+1 acks do not arrive within the ack-wait timeout
+    /// (configurable, default 800 ms), the producer simply yields the
+    /// slot and the existing pacemaker advances to round R+1 — same
+    /// progress path as a missing block.
+    ///
+    /// Scalability: only the elected producer broadcasts at round-change
+    /// events (rare). Per round-change network cost is O(committee) for
+    /// the ready broadcast and O(committee) for acks — well within
+    /// existing TimeoutVote bandwidth at any committee size up to 1000.
+    ProducerReady {
+        mb_idx: u64,
+        round: u64,
+        height: u64,
+        producer_id: String,
+        /// Dilithium3 detached signature over
+        /// "QNET_PRODUCER_READY_V1:{producer_id}:{mb_idx}:{round}:{height}"
+        signature: Vec<u8>,
+    },
+
+    /// v16.2: Acknowledgement of `ProducerReady`. Each honest committee
+    /// member emits exactly one `ReadyAck` per (mb_idx, round, height,
+    /// producer_id) tuple, signed with its own Dilithium3 key. The
+    /// signature payload is the canonical ack string so receivers can
+    /// verify without holding the original ProducerReady message.
+    ReadyAck {
+        mb_idx: u64,
+        round: u64,
+        height: u64,
+        producer_id: String,
+        ack_id: String,
+        /// Dilithium3 detached signature over
+        /// "QNET_READY_ACK_V1:{ack_id}:{producer_id}:{mb_idx}:{round}:{height}"
+        signature: Vec<u8>,
+    },
+
     /// v16.1: Network-broadcast producer heartbeat for remote silence detection.
     ///
     /// Forensic motivation: the legacy `PRODUCER_HEARTBEAT_MS` watchdog tracked
@@ -12981,6 +13151,319 @@ impl SimplifiedP2P {
                     println!(
                         "[DBG][HEARTBEAT] received producer={} slot_h={} ts={}",
                         producer_id, slot_height, timestamp
+                    );
+                }
+            }
+
+            NetworkMessage::BlockRejection {
+                height,
+                source_peer_id,
+                rejected_hash,
+                observer_id,
+                expected_prev_hash,
+                signature,
+            } => {
+                // v16.2: observer-based fork detection. Each honest node
+                // that rejected a forked block from `source_peer_id` at
+                // `height` broadcasts this. Aggregating 2f+1 distinct
+                // observer signatures justifies destructive rollback.
+                if self.is_consensus_rate_limited(&observer_id, "block_rejection", 30) {
+                    return;
+                }
+
+                // Verify observer's signature.
+                let payload = format!(
+                    "QNET_BLOCK_REJECTION_V1:{}:{}:{}:{}:{}",
+                    observer_id,
+                    height,
+                    source_peer_id,
+                    hex::encode(&rejected_hash),
+                    hex::encode(&expected_prev_hash)
+                );
+                let sig_str = match String::from_utf8(signature.clone()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        if crate::node::is_warn() {
+                            println!(
+                                "[WARN][REJECT] sig_not_utf8 observer={} height={}",
+                                observer_id, height
+                            );
+                        }
+                        return;
+                    }
+                };
+                if !self.verify_consensus_signature(&observer_id, &payload, &sig_str) {
+                    if crate::node::is_warn() {
+                        println!(
+                            "[WARN][REJECT] sig_invalid observer={} height={} source={}",
+                            observer_id, height, source_peer_id
+                        );
+                    }
+                    return;
+                }
+
+                // Reject self-attestation: a peer cannot count itself toward
+                // its own destructive rollback evidence.
+                if observer_id == source_peer_id {
+                    return;
+                }
+
+                // Distinct-observer accumulation per (height, source) tuple.
+                let count_after = {
+                    let entry = BLOCK_REJECTION_OBSERVERS
+                        .entry((height, source_peer_id.clone()))
+                        .or_insert_with(DashSet::new);
+                    entry.insert(observer_id.clone());
+                    entry.len()
+                };
+
+                if crate::node::is_debug() {
+                    println!(
+                        "[DBG][REJECT] aggregated observer={} source={} h={} count={}",
+                        observer_id, source_peer_id, height, count_after
+                    );
+                }
+
+                // 2f+1 supermajority threshold check using the canonical
+                // active validator count from the consensus PK registry.
+                let total_validators = {
+                    let n = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
+                    if n >= 3 { n } else { 5 }
+                };
+                let two_f_plus_1 = ((2 * total_validators + 2) / 3).max(3);
+
+                if count_after >= two_f_plus_1 {
+                    // 2f+1 observers confirmed — destructive rollback is
+                    // safe because at least f+1 honest observers agree
+                    // the source's chain at this height is byzantine.
+                    let rollback_to = height.saturating_sub(1);
+                    let prev = crate::block_pipeline::FORK_RECOVERY_HEIGHT
+                        .load(std::sync::atomic::Ordering::SeqCst);
+                    if rollback_to > prev {
+                        crate::block_pipeline::FORK_RECOVERY_HEIGHT
+                            .store(rollback_to, std::sync::atomic::Ordering::SeqCst);
+                        if crate::node::is_warn() {
+                            println!(
+                                "[WARN][REJECT] minority_fork_confirmed h={} source={} observers={}/{} rollback_to={} action=destructive_rollback",
+                                height, source_peer_id, count_after, two_f_plus_1, rollback_to
+                            );
+                        }
+                    }
+                    // Mark source as fork-source so the canonical-aware
+                    // sync peer selector deprioritises it during resync.
+                    crate::block_pipeline::mark_peer_as_fork_source(&source_peer_id);
+                }
+            }
+
+            NetworkMessage::ProducerReady { mb_idx, round, height, producer_id, signature } => {
+                // v16.2: producer signals "I have local certified=R, ready to
+                // produce at this round". Receiver responds with ReadyAck IF
+                // local certified ≥ R (proves we have converged on the same
+                // rotation state). 2f+1 acks accumulated by producer give it
+                // cryptographic evidence that the network agrees on R before
+                // emitting the block — eliminates the cold-boot race window.
+                if self.is_consensus_rate_limited(&producer_id, "producer_ready", 30) {
+                    return;
+                }
+
+                // Reject malformed (round must be > 0; round 0 needs no handshake).
+                if round == 0 {
+                    return;
+                }
+
+                // Verify producer's signature against the consensus PK registry.
+                let msg = format!(
+                    "QNET_PRODUCER_READY_V1:{}:{}:{}:{}",
+                    producer_id, mb_idx, round, height
+                );
+                let sig_str = match String::from_utf8(signature.clone()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        if crate::node::is_warn() {
+                            println!("[WARN][READY] sig_not_utf8 producer={}", producer_id);
+                        }
+                        return;
+                    }
+                };
+                if !self.verify_consensus_signature(&producer_id, &msg, &sig_str) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][READY] producer_ready_sig_invalid producer={}", producer_id);
+                    }
+                    return;
+                }
+
+                // Convergence check: ack ONLY if our local certified_round
+                // EXACTLY matches the requested round.
+                //
+                // v16.2: tightened from `≥ round` to `== round` so the
+                // handshake quorum proves the network has converged on
+                // EXACTLY this round, not just "advanced past it". The
+                // looser semantics let two producers at different rounds
+                // both collect 2f+1 acks if certified was racing — both
+                // would still produce one canonical block each via VRF
+                // determinism, but the conceptual model becomes harder to
+                // reason about. Strict equality keeps the proof simple:
+                // 2f+1 acks ⇒ 2f+1 nodes are AT this round right now ⇒
+                // single producer per (height, round) pair, no ambiguity.
+                //
+                // Liveness preserved:
+                //   * If local_certified < round → not ack, producer's
+                //     handshake times out, pacemaker advances on next
+                //     stall cycle (existing path).
+                //   * If local_certified > round → producer's round is
+                //     stale; not ack-ing forces them to yield and re-enter
+                //     at the current canonical round. Exactly what we want.
+                let local_certified = HIGHEST_CERTIFIED_ROUND
+                    .get(&mb_idx)
+                    .map(|e| *e.value())
+                    .unwrap_or(0);
+                if local_certified != round {
+                    if crate::node::is_debug() {
+                        println!(
+                            "[DBG][READY] no_ack reason=round_mismatch local_certified={} ready_round={} producer={}",
+                            local_certified, round, producer_id
+                        );
+                    }
+                    return;
+                }
+
+                // Build canonical ack id (this node) and signature payload.
+                let ack_id = self.node_id.clone();
+                let ack_payload = format!(
+                    "QNET_READY_ACK_V1:{}:{}:{}:{}:{}",
+                    ack_id, producer_id, mb_idx, round, height
+                );
+
+                // Sign synchronously via the local VRF Dilithium3 keypair —
+                // the same sync path used by `broadcast_empty_slot_attestation`.
+                // We avoid the async `create_consensus_signature` here because
+                // `handle_message` is a synchronous dispatcher; spawning an
+                // async task to sign would require moving `&self` and is
+                // unnecessary when raw detached_sign is fast (~1 ms).
+                let ack_sig_bytes: Vec<u8> = {
+                    use pqcrypto_mldsa::mldsa65 as dilithium3;
+                    use pqcrypto_traits::sign::SecretKey as SkTrait;
+                    use pqcrypto_traits::sign::DetachedSignature as SigTrait;
+                    crate::node::GLOBAL_VRF_INSTANCE
+                        .lock()
+                        .clone()
+                        .and_then(|vrf| vrf.get_secret_key_bytes())
+                        .and_then(|sk_bytes| {
+                            dilithium3::SecretKey::from_bytes(&sk_bytes).ok().map(|sk| {
+                                let sig = dilithium3::detached_sign(ack_payload.as_bytes(), &sk);
+                                SigTrait::as_bytes(&sig).to_vec()
+                            })
+                        })
+                        .unwrap_or_default()
+                };
+                if ack_sig_bytes.is_empty() {
+                    if crate::node::is_warn() {
+                        println!(
+                            "[WARN][READY] ack_sign_failed mb_idx={} round={} no_vrf_key",
+                            mb_idx, round
+                        );
+                    }
+                    return;
+                }
+
+                // Self-record so the producer's own ack contribution is
+                // counted toward the 2f+1 quorum without round-tripping.
+                READY_ACKS
+                    .entry((mb_idx, round, height, producer_id.clone()))
+                    .or_insert_with(DashSet::new)
+                    .insert(ack_id.clone());
+
+                // Send ack point-to-point to the producer (no broadcast).
+                let producer_addr = self
+                    .get_peer_addr_by_id(&producer_id)
+                    .or_else(|| {
+                        self.connected_peers_lockfree
+                            .iter()
+                            .find(|e| e.value().id == producer_id)
+                            .map(|e| e.value().addr.clone())
+                    });
+
+                if let Some(addr) = producer_addr {
+                    let ack_msg = NetworkMessage::ReadyAck {
+                        mb_idx,
+                        round,
+                        height,
+                        producer_id: producer_id.clone(),
+                        ack_id: ack_id.clone(),
+                        signature: ack_sig_bytes,
+                    };
+                    self.send_network_message(&addr, ack_msg);
+                    if crate::node::is_debug() {
+                        println!(
+                            "[DBG][READY] ack_sent to_producer={} mb_idx={} round={} h={}",
+                            producer_id, mb_idx, round, height
+                        );
+                    }
+                }
+            }
+
+            NetworkMessage::ReadyAck { mb_idx, round, height, producer_id, ack_id, signature } => {
+                // v16.2: collected by the elected producer to prove 2f+1
+                // committee converged on round R before emitting block.
+                if self.is_consensus_rate_limited(&ack_id, "ready_ack", 60) {
+                    return;
+                }
+                if round == 0 {
+                    return;
+                }
+
+                // Verify ack signature against ack_id's PK in registry.
+                let payload = format!(
+                    "QNET_READY_ACK_V1:{}:{}:{}:{}:{}",
+                    ack_id, producer_id, mb_idx, round, height
+                );
+                // Verify raw detached Dilithium3 signature against ack_id's
+                // registered PK. Symmetric with the sender-side sync signing
+                // used in the ProducerReady handler (which used
+                // dilithium3::detached_sign on the ack payload). PK is
+                // sourced from the consensus registry — same trust boundary
+                // as TimeoutVote / heartbeat verification paths.
+                let ack_sig_valid: bool = {
+                    use pqcrypto_mldsa::mldsa65 as dilithium3;
+                    use pqcrypto_traits::sign::DetachedSignature as SigTrait;
+                    let pk_bytes_opt =
+                        qnet_consensus::consensus_crypto::get_consensus_pk(&ack_id)
+                            .or_else(|| crate::genesis_constants::get_vrf_public_key(&ack_id));
+                    match pk_bytes_opt {
+                        Some(pk_bytes) => {
+                            match (
+                                <dilithium3::PublicKey as pqcrypto_traits::sign::PublicKey>::from_bytes(&pk_bytes),
+                                <dilithium3::DetachedSignature as SigTrait>::from_bytes(&signature),
+                            ) {
+                                (Ok(pk), Ok(sig)) => dilithium3::verify_detached_signature(
+                                    &sig, payload.as_bytes(), &pk,
+                                )
+                                .is_ok(),
+                                _ => false,
+                            }
+                        }
+                        None => false,
+                    }
+                };
+                if !ack_sig_valid {
+                    if crate::node::is_warn() {
+                        println!("[WARN][READY] ack_sig_invalid ack_id={}", ack_id);
+                    }
+                    return;
+                }
+
+                // Distinct-ack accumulation; DashSet dedupes on ack_id.
+                let count_after = {
+                    let entry = READY_ACKS
+                        .entry((mb_idx, round, height, producer_id.clone()))
+                        .or_insert_with(DashSet::new);
+                    entry.insert(ack_id.clone());
+                    entry.len()
+                };
+                if crate::node::is_debug() {
+                    println!(
+                        "[DBG][READY] ack_collected from={} producer={} mb_idx={} round={} count={}",
+                        ack_id, producer_id, mb_idx, round, count_after
                     );
                 }
             }
@@ -22642,8 +23125,35 @@ impl SimplifiedP2P {
         // broadcasts for the same R are de-duped via AGGREGATED_TC_BROADCAST.
         // Committee-bounded (≤ MAX_VALIDATORS) per height, and pruned by the
         // same cleanup sweep that handles the rest of timeout state.
-        // ═══════════════════════════════════════════════════════════════════
-        {
+        //
+        // ─────────────────────────────────────────────────────────────────
+        // v16.2: COLD-BOOT SPECIALIZATION — same-round-only at mb_idx == 0
+        // ─────────────────────────────────────────────────────────────────
+        // Cross-round aggregation is correct under steady-state production
+        // (signed votes at staggered rounds collectively prove a 2f+1
+        // supermajority crossed any round R≤max). But during cold-boot,
+        // before the first macroblock is finalised, the same mechanism
+        // creates a pronounced timing race: pacemaker_certified can jump
+        // from 1 → 6 → 11 in seconds as votes from different nodes arrive
+        // at staggered moments, and each node observes the jump in its OWN
+        // order. Two nodes can each see "I am the elected producer" for
+        // the same height because they each saw a different intermediate
+        // certified value first — exactly the v15.x cold-boot fork
+        // signature observed at h=154.
+        //
+        // At mb_idx == 0 the network is small and homogeneous (5 genesis
+        // nodes, NTP-synced). Same-round 2f+1 is sufficient — they will
+        // converge on the same proposed_round naturally. Cross-round
+        // aggregation provides no liveness benefit in this regime because
+        // there is no propagation jitter to absorb. After the first
+        // macroblock is finalised, cross-round resumes.
+        //
+        // Safety preserved: same-round 2f+1 IS the canonical BFT threshold;
+        // this only DEFERS aggregation that v15.0 introduced for liveness,
+        // not weakens any 2f+1 invariant.
+        // ─────────────────────────────────────────────────────────────────
+        let cross_round_pacemaker_enabled = height > 0;
+        if cross_round_pacemaker_enabled {
             let two_f_plus_1 = (2 * total_validators + 2) / 3; // ceil(2n/3) = 2f+1
             if two_f_plus_1 > 0 && max_rounds.len() >= two_f_plus_1 {
                 let idx = two_f_plus_1 - 1;
@@ -22679,6 +23189,10 @@ impl SimplifiedP2P {
                     }
                 }
             }
+        } else if crate::node::is_debug() {
+            println!(
+                "[DBG][TIMEOUT] pacemaker_cross_round_disabled mb_idx=0 reason=cold_boot_strict_same_round"
+            );
         }
 
         // Signed 2f+1 same-round → TimeoutCertificate (strongest advancement).
@@ -23032,6 +23546,67 @@ impl SimplifiedP2P {
                 join_all(tasks),
             ).await;
         });
+    }
+
+    /// v16.2: Broadcast a Dilithium3-signed `BlockRejection` to all
+    /// validator peers. Caller is an honest observer that locally rejected
+    /// a block from `source_peer_id` at `height` due to a verifiable
+    /// inconsistency (hash-chain break, signature failure, etc.). The
+    /// observer self-records by inserting its own ID into the local
+    /// aggregator before broadcast — its rejection counts toward the
+    /// 2f+1 supermajority that triggers destructive rollback.
+    pub fn broadcast_block_rejection(
+        &self,
+        height: u64,
+        source_peer_id: String,
+        rejected_hash: [u8; 32],
+        expected_prev_hash: [u8; 32],
+        signature_bytes: Vec<u8>,
+    ) {
+        let observer_id = self.node_id.clone();
+
+        // Self-record so the producer's own observation participates in
+        // the 2f+1 supermajority count without round-tripping.
+        BLOCK_REJECTION_OBSERVERS
+            .entry((height, source_peer_id.clone()))
+            .or_insert_with(DashSet::new)
+            .insert(observer_id.clone());
+
+        let msg = NetworkMessage::BlockRejection {
+            height,
+            source_peer_id,
+            rejected_hash,
+            observer_id,
+            expected_prev_hash,
+            signature: signature_bytes,
+        };
+        // Reuse the parallel fan-out used for AggregatedTimeoutCertificate.
+        self.broadcast_aggregated_timeout_cert(msg);
+    }
+
+    /// v16.2: Broadcast `ProducerReady` to all validator peers. Caller is
+    /// the elected producer at (mb_idx, round, height) with round > 0,
+    /// invoked AFTER local certified_round has reached `round`. Receivers
+    /// reply with point-to-point `ReadyAck` once they too have local
+    /// certified ≥ round, accumulating into READY_ACKS for the producer
+    /// to consult before constructing the block.
+    pub fn broadcast_producer_ready(
+        &self,
+        mb_idx: u64,
+        round: u64,
+        height: u64,
+        producer_id: String,
+        signature_bytes: Vec<u8>,
+    ) {
+        let msg = NetworkMessage::ProducerReady {
+            mb_idx,
+            round,
+            height,
+            producer_id,
+            signature: signature_bytes,
+        };
+        // Reuse the parallel fan-out used for AggregatedTimeoutCertificate.
+        self.broadcast_aggregated_timeout_cert(msg);
     }
 
     /// v16.1: Broadcast a Dilithium3-signed `ProducerHeartbeat` to all
@@ -23902,6 +24477,22 @@ impl SimplifiedP2P {
             }
         }
         best
+    }
+
+    /// v16.2: Strict presence check for a SPECIFIC (mb_idx, round) pair.
+    ///
+    /// Used by the verify stage of the block pipeline to enforce that any
+    /// block claiming `timeout_round > 0` has a locally-observed 2f+1
+    /// AggregatedTimeoutCertificate for that exact round. Presence is
+    /// sufficient evidence — `handle_aggregated_timeout_cert` verified
+    /// every Dilithium3 signature in the cert at gossip ingest before
+    /// inserting into AGGREGATED_TC, so anything in the map is already
+    /// 2f+1 supermajority signed by the active committee.
+    ///
+    /// Constant-time DashMap shard lookup; safe to call on every block
+    /// verify pass at any committee size up to the MAX_VALIDATORS cap.
+    pub fn has_aggregated_timeout_cert(&self, mb_idx: u64, round: u64) -> bool {
+        AGGREGATED_TC.contains_key(&(mb_idx, round))
     }
 
     /// v15.9: Pure structural validation for an AggregatedTimeoutCertificate

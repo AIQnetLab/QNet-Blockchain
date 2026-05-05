@@ -61,9 +61,12 @@ use qnet_consensus::lazy_rewards::PhaseAwareRewardManager;
 // ============================================================================
 
 /// Global fork recovery signal: fork_height (0 = no signal).
-/// Set by the macroblock-divergence detector OR by the microblock
-/// distinct-peer-witness tracker (v14.8.5); consumed by the main consensus loop.
-static FORK_RECOVERY_HEIGHT: AtomicU64 = AtomicU64::new(0);
+/// Set by the macroblock-divergence detector OR by the v16.2 observer-based
+/// 2f+1 BlockRejection aggregator (`unified_p2p::handle BlockRejection`);
+/// consumed by the main consensus loop. Public so the cross-module rejection
+/// aggregator can raise the signal directly without going through a separate
+/// IPC channel.
+pub static FORK_RECOVERY_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 /// Check and consume fork recovery signal.
 /// Returns Some(fork_height) if recovery is needed.
@@ -123,44 +126,39 @@ static HASH_CHAIN_BREAK_WITNESSES: once_cell::sync::Lazy<
 
 /// Record that `peer_id` reported a hash_chain_break at `height`.
 ///
-/// v16.1: SPLIT THRESHOLD MODEL. Industry-standard BFT chains separate
-/// fork DETECTION (advisory signal, low threshold) from fork ROLLBACK
-/// (state-mutating action, supermajority threshold):
+/// v16.2: ADVISORY-ONLY MODEL. Witness count here measures how many
+/// DISTINCT peers SENT us a forked-looking block at the same height —
+/// not how many INDEPENDENT OBSERVERS detected the fork. With at most
+/// `f` Byzantine producers in a 3f+1 system, the maximum source count
+/// is `f` (typically 1 in practice), which means a 2f+1 source-based
+/// rollback threshold is mathematically unreachable in the common
+/// failure scenario. The v16.1 destructive-rollback path was therefore
+/// dead code — never triggered in any observed deploy.
 ///
-///   * f+1 = "at least one honest witness exists" — sufficient to RAISE
-///     a soft-warning signal, prompt deeper investigation, increase peer
-///     diversity in resync sources. NEVER rolls back state.
+/// Rather than carry dead consensus-mutating code, v16.2 collapses the
+/// behaviour to its useful subset:
+///   * Track distinct sources per height in `HASH_CHAIN_BREAK_WITNESSES`.
+///   * Once any source set crosses `f+1`, emit an advisory `[WARN]` so
+///     operators see partial-agreement evidence in postmortems.
+///   * Tag every source peer for the 5-minute fork cooldown so
+///     `get_sync_peers_filtered_by_height` deprioritises them when the
+///     local chain refills the disputed range. This breaks the v15.x
+///     rollback cascade WITHOUT touching consensus state — the local
+///     chain stays canonical, only sync source preference changes.
 ///
-///   * 2f+1 = "byzantine supermajority" — required for any state
-///     mutation including destructive rollback. Below this threshold
-///     a malicious f-node colluding with f-1 honest witnesses on a
-///     transient timestamp/round mismatch could force everyone else to
-///     unwind their canonical chain.
+/// A future extension (`v16.3+`) can introduce a true observer-based
+/// rollback by adding a `BlockRejection` gossip message: each honest
+/// node would broadcast a signed rejection on `verify_failed`, and 2f+1
+/// distinct OBSERVER signatures for the same `(height, source_peer_id)`
+/// tuple would justify destructive action. Until that protocol exists,
+/// no destructive rollback fires from this path — recovery happens via
+/// the existing 2f+1 macroblock commit-reveal which finalises the
+/// canonical branch every 90 microblocks regardless of microblock-level
+/// disagreement.
 ///
-/// Forensic motivation (v15.x h=334..h=368 cascade):
-///   The legacy code used f+1 (=2 for n=5) for both detection AND
-///   destructive rollback. A single byzantine producer (node_001 with
-///   pk_mismatch broken signatures) plus one honest peer reporting a
-///   harmless `block_round=2` divergence was enough to roll the local
-///   tip back. Resync then re-downloaded the SAME forked branch from
-///   the same peer set (no canonical-chain filter), and the witness
-///   counter trip again at the new height — repeat for hours, walking
-///   the chain backwards.
-///
-///   Splitting the thresholds plus the peer-cooldown (Phase 4.B) breaks
-///   the cascade: a single dishonest peer cannot induce rollback even
-///   if f honest peers happen to agree on the same wrong-looking hash;
-///   the rollback path requires a real BFT-supermajority of distinct
-///   peer_ids.
-///
-/// Rate-limit semantics: once FORK_RECOVERY_HEIGHT is non-zero we don't
-/// overwrite it with a different (lower) height — the main loop consumes
-/// it first. This prevents flapping when two heights both accumulate
-/// witnesses during a partition.
-///
-/// Scalability: per-height witness sets are bounded by the active
-/// validator-set count (≤ MAX_VALIDATORS = 1000 in committee). Cleanup
-/// sweep evicts entries below current chain tip.
+/// Scalability: per-height witness sets bounded by active validator
+/// count (≤ MAX_VALIDATORS = 1000 in committee). Cleanup sweep evicts
+/// entries below current chain tip.
 pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
     if peer_id.is_empty() || peer_id == "self" {
         return;
@@ -181,53 +179,25 @@ pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
         if n >= 3 { n } else { 5 }
     };
 
-    // f+1 = ceil(n/3): "at least one honest witness" — DETECTION ONLY.
+    // f+1 = ceil(n/3): "at least one honest witness" — ADVISORY ONLY.
     let threshold_f_plus_1 = (total_validators.saturating_add(2)) / 3;
     let detection_threshold = threshold_f_plus_1.max(2);
 
-    // 2f+1 = canonical BFT supermajority — destructive ROLLBACK threshold.
-    // Formula `(2n+2)/3` is the canonical ceiling form; works uniformly
-    // for n=5 as well as n=1_000_000.
-    let threshold_2f_plus_1 = ((total_validators.saturating_mul(2)).saturating_add(2)) / 3;
-    let rollback_threshold = threshold_2f_plus_1.max(3);
-
-    // Stage 1: SOFT detection signal at f+1.
-    // Logged once per crossing so operators see partial agreement without
-    // triggering rollback. The signal is also picked up by Phase 4.B
-    // peer-cooldown which tags every peer that supplied a forked block at
-    // this height as "potentially-byzantine" for canonical-aware sync
-    // peer selection — without losing those peers as gossip sources.
-    if witnesses == detection_threshold && witnesses < rollback_threshold {
+    // Advisory signal at f+1. Tags every reporter as a fork-source so the
+    // canonical-aware sync peer selector deprioritises them. No state
+    // mutation, no rollback — the local chain is preserved and the next
+    // 2f+1 macroblock commit-reveal naturally finalises the canonical
+    // branch every 90 microblocks.
+    if witnesses == detection_threshold {
         if is_warn() {
             println!(
-                "[WARN][PIPELINE] fork_detection_signal h={} witnesses={} threshold_f_plus_1={} action=advisory_only_no_rollback",
+                "[WARN][PIPELINE] fork_detection_signal h={} witnesses={} threshold_f_plus_1={} action=advisory_log_plus_peer_cooldown",
                 height, witnesses, detection_threshold
             );
         }
-        // Mark all current witnesses as "fork-source" so the canonical-
-        // aware sync peer selection prefers other peers when refilling
-        // the local chain at this height.
         if let Some(set) = HASH_CHAIN_BREAK_WITNESSES.get(&height) {
             for w in set.iter() {
                 mark_peer_as_fork_source(w.key());
-            }
-        }
-    }
-
-    // Stage 2: HARD destructive rollback at 2f+1.
-    // Only at this point do we commit to actually deleting blocks.
-    if witnesses >= rollback_threshold {
-        let rollback_to = height.saturating_sub(1);
-        // Only raise the signal — never lower. The main loop consumes it
-        // under the same atomic swap that clears the tracker.
-        let prev = FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst);
-        if rollback_to > prev {
-            FORK_RECOVERY_HEIGHT.store(rollback_to, Ordering::SeqCst);
-            if is_warn() {
-                println!(
-                    "[WARN][PIPELINE] minority_fork_confirmed h={} rollback_to={} witnesses={} threshold_2f_plus_1={} action=destructive_rollback",
-                    height, rollback_to, witnesses, rollback_threshold
-                );
             }
         }
     }
@@ -759,6 +729,7 @@ impl BlockPipeline {
         let metrics_verify = metrics.clone();
         let storage_verify = ctx.storage.clone();
         let coordinator_verify = ctx.coordinator.clone();
+        let p2p_verify = ctx.unified_p2p.clone();
         tokio::spawn(Self::verify_stage(
             decode_rx,
             verify_tx,
@@ -766,6 +737,7 @@ impl BlockPipeline {
             coordinator_verify,
             metrics_verify,
             ctx.node_id.clone(),
+            p2p_verify,
         ));
 
         // Stage 3: Verify → Apply (state transitions + storage write + ALL side effects)
@@ -1049,7 +1021,8 @@ impl BlockPipeline {
         storage: Arc<Storage>,
         coordinator: CoordinatorHandle,
         metrics: Arc<PipelineMetrics>,
-        _node_id: String,
+        node_id: String,
+        unified_p2p: Option<Arc<SimplifiedP2P>>,
     ) {
         // v13.1: Bounded deferred buffer for out-of-order blocks.
         // When blocks arrive before their parent (normal during sync),
@@ -1230,45 +1203,95 @@ impl BlockPipeline {
                     metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
 
                     // ═══════════════════════════════════════════════════════════════════════
-                    // v14.8.5: MINORITY-FORK DETECTION via BFT-safe distinct-peer quorum.
+                    // v16.2: OBSERVER-BASED BLOCK REJECTION + ADVISORY WITNESS
                     // ═══════════════════════════════════════════════════════════════════════
-                    // A single hash_chain_break is weak evidence — could be a single
-                    // malformed block. But if 2f+1 DISTINCT validated peers all send
-                    // blocks whose parent hash doesn't link into our local tip at the
-                    // same height, WE are on the minority fork by the Byzantine
-                    // supermajority rule: f+1 peers agreeing is already enough honest
-                    // witnesses to prove it; 2f+1 makes the evidence resistant to up to
-                    // f Byzantine peers all pushing the same wrong hash.
+                    // Two parallel paths fire on every locally-detected hash chain
+                    // break — each addresses a different recovery mechanism:
                     //
-                    // Implementation: per-height set of distinct peer_ids that reported
-                    // hash_chain_break. When the set size crosses 2f+1 of the current
-                    // validator committee, signal FORK_RECOVERY_HEIGHT = mb.height - 1
-                    // (everything at or below that height is still valid on our local
-                    // chain; we roll back to the last known-good point and resync).
+                    //   1. Source-witness counting (advisory): records `from_peer`
+                    //      in the per-height witness DashMap and tags the source
+                    //      for the fork-cooldown peer-selection helper. Useful for
+                    //      operator visibility and resync-source steering, but
+                    //      never destructive on its own (single-source ceiling).
                     //
-                    // Anti-Sybil: each entry is a verified peer_id from the decoded
-                    // block's signed envelope (not raw socket addresses). An attacker
-                    // cannot fake N distinct peer_ids without N distinct Dilithium3
-                    // keys, and those keys must be in the registered validator set
-                    // to count (see has_vrf_key check below).
+                    //   2. Observer-based rejection (destructive): broadcasts a
+                    //      Dilithium3-signed `BlockRejection` to all validator
+                    //      peers, declaring "I, observer X, locally rejected
+                    //      block_hash H from source S at height N because my
+                    //      local prev was P, not block.previous_hash". Receivers
+                    //      verify the observer signature, aggregate distinct
+                    //      observer_ids per (height, source), and trigger
+                    //      destructive rollback when the count crosses 2f+1.
                     //
-                    // Rate-limit: once a recovery signal is set for a given height,
-                    // we don't re-fire until the main loop consumes it via
-                    // `take_fork_recovery_signal()` — which also clears the tracker.
+                    // This is the BFT-canonical pattern — supermajority of
+                    // INDEPENDENT OBSERVERS justifies state mutation. A single
+                    // Byzantine source cannot trigger rollback against an honest
+                    // chain because ≤f Byzantine observers cannot reach 2f+1.
                     //
-                    // Scalability: DashSet per height, tiny (< 2f+1 entries). Cleaned
-                    // up at cleanup_break_tracker() during cache sweep. Safe at
-                    // thousands-of-nodes scale — committee sample is ≤ MAX_VALIDATORS
-                    // (1000), and threshold grows linearly with it.
-                    //
-                    // Orthogonal to the macroblock-level rollback trigger: macroblock
-                    // divergence catches PERSISTENT forks but only fires every 90 s;
-                    // this microblock-level detector catches ACUTE forks quickly.
+                    // Non-genesis-only: skip for h=0 (no prev to compare against).
                     if mb.height > 0 {
                         record_hash_chain_break_witness(
                             mb.height,
                             &decoded.from_peer,
                         );
+
+                        // Broadcast observer-side rejection if we have the P2P
+                        // handle and this isn't a self-emitted block (a producer
+                        // never rejects its own block — that path is the local
+                        // signing failure, handled elsewhere).
+                        if let Some(ref p2p) = unified_p2p {
+                            if !decoded.from_peer.is_empty() && decoded.from_peer != "self" {
+                                let rejected_hash = decoded.microblock.hash();
+                                // Best-effort load of our local view of the
+                                // parent for diagnostic purposes — receivers do
+                                // not act on this field, it's purely evidence.
+                                let local_prev_hash = match storage
+                                    .load_microblock_auto_format(mb.height.saturating_sub(1))
+                                {
+                                    Ok(Some(local_prev)) => local_prev.hash(),
+                                    _ => [0u8; 32],
+                                };
+                                let payload = format!(
+                                    "QNET_BLOCK_REJECTION_V1:{}:{}:{}:{}:{}",
+                                    node_id,
+                                    mb.height,
+                                    decoded.from_peer,
+                                    hex::encode(&rejected_hash),
+                                    hex::encode(&local_prev_hash)
+                                );
+                                let sig_bytes = if let Some(crypto) = crate::node::try_get_quantum_crypto() {
+                                    match crypto
+                                        .create_consensus_signature(
+                                            &node_id,
+                                            &payload,
+                                        )
+                                        .await
+                                    {
+                                        Ok(sig) => Some(sig.signature.as_bytes().to_vec()),
+                                        Err(e) => {
+                                            if is_warn() {
+                                                println!(
+                                                    "[WARN][REJECT] sign_failed h={} err={}",
+                                                    mb.height, e
+                                                );
+                                            }
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+                                if let Some(sig) = sig_bytes {
+                                    p2p.broadcast_block_rejection(
+                                        mb.height,
+                                        decoded.from_peer.clone(),
+                                        rejected_hash,
+                                        local_prev_hash,
+                                        sig,
+                                    );
+                                }
+                            }
+                        }
                     }
 
                     continue;
@@ -1321,27 +1344,90 @@ impl BlockPipeline {
             }
 
             // ═══════════════════════════════════════════════════════════════════════════
-            // 2b. v14.8.10: PACEMAKER-RANK CHECK REMOVED
+            // 2b. v16.2: CERT PRESENCE CHECK FOR ROUND>0 BLOCKS (BFT-evidence enforcement)
             // ═══════════════════════════════════════════════════════════════════════════
-            // Under the BFT-driven rotation model (v14.8.10), `block.timeout_round`
-            // is the network's certified/adopted round at construction time, NOT a
-            // wall-clock derivation. Ingest cannot recompute the expected value
-            // locally — doing so would cross back into the non-deterministic
-            // wall-clock pacemaker that caused the v14.8.7..9 fork regression.
+            // A block produced at `timeout_round = R > 0` claims that the network
+            // advanced rotation past round 0 via 2f+1 signed TimeoutVotes. The
+            // cryptographic evidence for that advancement is the
+            // AggregatedTimeoutCertificate stored at `AGGREGATED_TC[(mb_idx, R)]`.
             //
-            // Safety for this value is carried by:
-            //   * Dilithium3 signature over the block header (step 3) — a
-            //     Byzantine producer cannot forge a block claiming any round.
-            //   * Producer authority check (step 4) — same-round mismatch against
-            //     the locally derived `(expected_producer, expected_round)` cache
-            //     is a HARD reject, so a producer claiming a round they did not
-            //     earn cannot override the honest expected producer.
-            //   * Hash chain + parent monotonicity (steps 1 and 2) — timestamp
-            //     still has to progress monotonically within the future-tolerance
-            //     window, preventing arbitrary reordering.
+            // Cold-boot postmortem at h=154 showed two producers concurrently
+            // emitting blocks at different rotation_rounds because each had
+            // advanced its own `HIGHEST_CERTIFIED_ROUND` independently while
+            // peer gossip was still propagating votes. Without an evidence check
+            // here, ingest accepted any signed block that claimed any round —
+            // letting the network apply two divergent histories before the
+            // mismatch was observed at the next macroblock boundary.
             //
-            // Scalability / Liveness: one fewer storage read per block.
+            // The fix:
+            //   * `block.timeout_round == 0`  → no cert needed, accept (happy path).
+            //   * `block.timeout_round > 0`   → REQUIRE local
+            //     `AGGREGATED_TC.get((mb_idx, round)).is_some()`. If absent, defer
+            //     the block (pull request_timeout_proofs from peers, re-check on
+            //     next pass). The certificate carries 2f+1 Dilithium3 signatures
+            //     and is signature-verified at gossip ingest by
+            //     `handle_aggregated_timeout_cert`, so presence is sufficient
+            //     evidence — we don't re-verify here.
+            //
+            // Safety property: a block at round R is accepted iff this node has
+            // independently observed 2f+1 votes for round R. Two producers at
+            // different rounds at the same height become impossible — the late
+            // one's cert can only be present after 2f+1 votes for ITS round
+            // arrived, which means rotation advanced past the earlier producer's
+            // round and the earlier block is now stale (will be rejected by the
+            // producer authority check below or supplanted by canonical chain).
+            //
+            // Scalability: O(1) DashMap lookup. AGGREGATED_TC bounded by the
+            // active macroblock window (cleanup_old_timeout_data evicts stale
+            // entries). Works identically at 5-node genesis and 1000-node
+            // production committee — cert size doesn't matter, only presence.
+            //
+            // Post-quantum adaptation: Dilithium3 signatures cannot be
+            // aggregated to a constant-size bundle (no BLS equivalent), so we
+            // cannot embed the 2f+1-signed cert directly inside every block
+            // header — at committee=1000 that would be ~2.2 MB per block. The
+            // local-presence model achieves the same safety property without
+            // the bandwidth cost: cert is gossiped once via
+            // `broadcast_aggregated_timeout_cert`, stored at every honest peer,
+            // and consulted here.
             // ═══════════════════════════════════════════════════════════════════════════
+            if mb.height > 0 && mb.timeout_round > 0 {
+                let mb_idx_for_cert = mb.height / 90;
+                let cert_present = if let Some(ref p2p) = unified_p2p {
+                    p2p.has_aggregated_timeout_cert(mb_idx_for_cert, mb.timeout_round)
+                } else {
+                    // No P2P context (rare — replay path); accept block as
+                    // signature already validates producer identity. The
+                    // canonical safety net is at apply-time hash chain.
+                    true
+                };
+                if !cert_present {
+                    // Defer block: cert not yet propagated to us. Trigger
+                    // backfill request and put block in the deferred buffer to
+                    // be re-checked on the next pipeline pass.
+                    if let Some(ref p2p) = unified_p2p {
+                        p2p.request_timeout_proofs(mb_idx_for_cert, mb_idx_for_cert);
+                    }
+                    if deferred.len() < DEFERRED_MAX {
+                        if is_debug() {
+                            println!(
+                                "[DBG][PIPELINE] block_deferred_for_cert h={} round={} mb_idx={} buf={}",
+                                mb.height, mb.timeout_round, mb_idx_for_cert, deferred.len()
+                            );
+                        }
+                        deferred.insert(mb.height, decoded);
+                    } else {
+                        if is_info() {
+                            println!(
+                                "[INFO][PIPELINE] deferred_full h={} round={} dropped (buf={})",
+                                mb.height, mb.timeout_round, DEFERRED_MAX
+                            );
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+            }
 
             // 3. Signature verification
             // Genesis block (h=0) uses embedded self-signed keys — skip standard verification
