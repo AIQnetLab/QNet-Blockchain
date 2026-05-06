@@ -13094,13 +13094,16 @@ impl SimplifiedP2P {
                 // attestation IMMEDIATELY when the elected producer goes
                 // silent (no need to wait for next producer-loop tick).
                 //
-                // IDENTITY-IP ANCHORING: refuse heartbeats that claim a Genesis
-                // identity from a non-genesis IP. Cheap first line of defence —
-                // runs before rate limiting and Dilithium3 verification so a
-                // spoof flood costs the receiver effectively nothing.
-                if !self.check_genesis_ip_gate(&producer_id, from_peer, "HEARTBEAT") {
-                    return;
-                }
+                // v17.1: IP-anchor gate intentionally NOT applied here.
+                // ProducerHeartbeat is gossip-relayed; `from_peer` carries
+                // the relay's IP, not the originator's, so anchoring rejected
+                // legitimate gossip and broke 2f+1 quorum (macroblock #2
+                // stuck on testnet). Identity binding is enforced
+                // cryptographically by `verify_consensus_signature` below
+                // against the immutable consensus PK registry — paired with
+                // the Fix #2 removal of the legacy bootstrap fallback in
+                // quantum_crypto.rs, that path is the canonical security
+                // gate and is gossip-safe.
                 //
                 // Rate limit: producer broadcasts ≈1/sec, so 60/min ceiling
                 // is generous. Anti-DoS — without this an attacker could
@@ -13176,14 +13179,13 @@ impl SimplifiedP2P {
                 // `height` broadcasts this. Aggregating 2f+1 distinct
                 // observer signatures justifies destructive rollback.
                 //
-                // IDENTITY-IP ANCHORING: gate rejections that claim a Genesis
-                // observer identity. Without this, a non-genesis spoofer could
-                // forge BlockRejections in genesis names and contribute to a
-                // 2f+1 destructive-rollback quorum, weaponising a security
-                // mechanism into a liveness attack.
-                if !self.check_genesis_ip_gate(&observer_id, from_peer, "REJECT") {
-                    return;
-                }
+                // v17.1: IP-anchor gate intentionally NOT applied here. This
+                // message is gossip-relayed and `from_peer` is the relay,
+                // not the originator. The 2f+1 quorum is protected by the
+                // observer-signature verification below, which checks
+                // Dilithium3 against the immutable consensus PK registry
+                // (Fix #2/#3 close the legacy fallback). A non-genesis
+                // spoofer cannot mint a valid signature under a genesis PK.
 
                 if self.is_consensus_rate_limited(&observer_id, "block_rejection", 30) {
                     return;
@@ -13282,15 +13284,13 @@ impl SimplifiedP2P {
                 // cryptographic evidence that the network agrees on R before
                 // emitting the block — eliminates the cold-boot race window.
                 //
-                // IDENTITY-IP ANCHORING: gate ready-handshake messages claiming
-                // a Genesis producer identity. A spoofed ProducerReady would
-                // poll honest nodes for ReadyAcks and (in absence of registry
-                // binding) might collect 2f+1 acks the spoofer could later use
-                // to justify emitting a block. The signature path still
-                // rejects it post-fix, but this gate avoids the wasted CPU.
-                if !self.check_genesis_ip_gate(&producer_id, from_peer, "READY") {
-                    return;
-                }
+                // v17.1: IP-anchor gate intentionally NOT applied here. The
+                // ready-handshake propagates over gossip in some topologies,
+                // so `from_peer` is the relay's IP, not the originator's.
+                // The signature verification below (verify_consensus_signature
+                // against the immutable PK registry) is the canonical
+                // security boundary; a spoofer cannot mint a valid genesis
+                // signature post Fix #2/#3.
 
                 if self.is_consensus_rate_limited(&producer_id, "producer_ready", 30) {
                     return;
@@ -13436,13 +13436,12 @@ impl SimplifiedP2P {
                 // v16.2: collected by the elected producer to prove 2f+1
                 // committee converged on round R before emitting block.
                 //
-                // IDENTITY-IP ANCHORING: gate acks claiming a Genesis ack_id.
-                // A spoofed ack would inflate the producer's 2f+1 quorum count
-                // with phantom votes from a non-genesis IP — same class of
-                // attack as fake heartbeats, gated identically.
-                if !self.check_genesis_ip_gate(&ack_id, from_peer, "READYACK") {
-                    return;
-                }
+                // v17.1: IP-anchor gate intentionally NOT applied here. ReadyAck
+                // is point-to-point in the happy path but can also arrive via
+                // a relay during reconnection storms; in both cases the
+                // canonical security boundary is the Dilithium3 signature
+                // check below against the immutable PK registry. Phantom
+                // acks cannot be forged post Fix #2/#3.
 
                 if self.is_consensus_rate_limited(&ack_id, "ready_ack", 60) {
                     return;
@@ -13510,14 +13509,13 @@ impl SimplifiedP2P {
             NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, signature, timestamp } => {
                 self.update_peer_last_seen(&node_id);
 
-                // IDENTITY-IP ANCHORING: gate macroblock commits claiming a
-                // Genesis identity. The 2f+1 commit-reveal quorum is the most
-                // security-sensitive consensus boundary — a phantom commit
-                // signed in a genesis name and accepted into the aggregator
-                // would directly attack macroblock finality.
-                if !self.check_genesis_ip_gate(&node_id, from_peer, "COMMIT") {
-                    return;
-                }
+                // v17.1: IP-anchor gate intentionally NOT applied here.
+                // ConsensusCommit gossips through the network so `from_peer`
+                // is typically a relay; anchoring it broke 2f+1 macroblock
+                // quorum on testnet (mb=2 stuck). The aggregator
+                // (handle_remote_consensus_commit) verifies the Dilithium3
+                // signature against the immutable consensus PK registry —
+                // that path is the canonical, gossip-safe security gate.
 
                 // v9.0: Rate limit consensus messages (max 10/min per peer)
                 if self.is_consensus_rate_limited(&node_id, "commit", 10) { return; }
@@ -13543,13 +13541,12 @@ impl SimplifiedP2P {
             NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, nonce, timestamp, signature } => {
                 self.update_peer_last_seen(&node_id);
 
-                // IDENTITY-IP ANCHORING: gate macroblock reveals claiming a
-                // Genesis identity (paired with the matching ConsensusCommit
-                // gate above — both halves of the commit-reveal pair must be
-                // authenticated against the canonical genesis IP).
-                if !self.check_genesis_ip_gate(&node_id, from_peer, "REVEAL") {
-                    return;
-                }
+                // v17.1: IP-anchor gate intentionally NOT applied here. Same
+                // rationale as ConsensusCommit above — gossip-relayed
+                // `from_peer` is the relay, not the originator. The reveal's
+                // Dilithium3 signature is verified against the immutable PK
+                // registry inside handle_remote_consensus_reveal, which is
+                // the canonical, gossip-safe security gate.
 
                 // v9.0: Rate limit consensus messages (max 10/min per peer)
                 if self.is_consensus_rate_limited(&node_id, "reveal", 10) { return; }
@@ -13630,17 +13627,20 @@ impl SimplifiedP2P {
                         // above (vrf::verify) is itself proof-of-ownership, so we can also
                         // install the key in the consensus-layer registry.
                         //
-                        // GENESIS IDENTITY ANTI-SQUAT: if the claim names a
-                        // genesis slot, the source IP must match the anchored
-                        // IP for that slot. Prevents a non-genesis peer with
-                        // their own valid Dilithium3 keypair from squatting
-                        // `genesis_node_N` via a well-formed VRF claim.
-                        // Centralised in `check_genesis_ip_gate` so format
-                        // normalisation (`genesis_node_001` ↔ `genesis_node_1`)
-                        // and the rejection log live in one place.
-                        if !self.check_genesis_ip_gate(&node_id, from_peer, "VRF") {
-                            return;
-                        }
+                        // v17.1: IP-anchor gate REMOVED for VRF claims. Reasons:
+                        // (a) VrfLeaderClaim is gossip-relayed (TTL up to 4),
+                        //     so `from_peer` is a relay's IP, not the
+                        //     originator's — anchoring rejected legitimate
+                        //     claims and broke leader rotation.
+                        // (b) Anti-squat is now enforced by the consensus PK
+                        //     registry: `register_consensus_pk_from_chain`
+                        //     refuses to overwrite an already-registered key
+                        //     for a genesis identity. The genesis anchors
+                        //     file (loaded at startup via
+                        //     `install_genesis_anchors_at_startup`) pre-pins
+                        //     the canonical PK for every genesis slot, so a
+                        //     squatter's `register_consensus_pk_from_chain`
+                        //     call is rejected as a mismatch (Fix #2/#3).
 
                         if !crate::genesis_constants::has_vrf_key(&node_id) {
                             if let Some(ref pk_bytes) = pk_for_verify {
@@ -13741,14 +13741,14 @@ impl SimplifiedP2P {
             NetworkMessage::TimeoutVote { height, timeout_round, voter_id, last_block_hash, signature } => {
                 self.update_peer_last_seen(&voter_id);
 
-                // IDENTITY-IP ANCHORING: gate timeout votes claiming a Genesis
-                // voter identity. A spoofer flooding fake genesis-voter timeout
-                // votes could trigger a fast-path round-change with phantom
-                // 2f+1 evidence — gated here before the height filter and
-                // rate limit so spoofed packets cost ~0 CPU.
-                if !self.check_genesis_ip_gate(&voter_id, from_peer, "TIMEOUT") {
-                    return;
-                }
+                // v17.1: IP-anchor gate intentionally NOT applied here.
+                // TimeoutVote is gossip-relayed and `from_peer` is the
+                // relay's IP, not the voter's — anchoring it broke timeout
+                // certificate aggregation in production (mb=2 stuck on
+                // testnet). The voter's Dilithium3 signature is verified
+                // against the immutable consensus PK registry inside
+                // `handle_timeout_vote`; that path is the canonical,
+                // gossip-safe security gate (Fix #2/#3).
 
                 // v9.5/v9.8: Early height filter — discard obviously stale/future votes before signature check.
                 // saturating_add prevents overflow from malicious u64::MAX height values.
@@ -13930,12 +13930,13 @@ impl SimplifiedP2P {
                     return;
                 }
 
-                // GENESIS IDENTITY-IP GATE: a non-genesis IP cannot stand in
-                // for a Genesis attester. (Pure-super attesters skip the gate
-                // since they are not anchored.)
-                if !self.check_genesis_ip_gate(&attester_id, from_peer, "ATTEST") {
-                    return;
-                }
+                // v17.1: IP-anchor gate intentionally NOT applied here.
+                // BlockAttestation is broadcast/gossiped, so `from_peer` is
+                // a relay rather than the attester. Identity binding is
+                // enforced by the Dilithium3 verification below against the
+                // attester's registered PK — a non-genesis spoofer cannot
+                // mint a signature under a genesis PK once Fix #2/#3
+                // closed the legacy bootstrap fallback.
 
                 // Verify Dilithium3 signature: "QNET_ATTEST:{height}:{hash_hex}"
                 //
@@ -14011,11 +14012,11 @@ impl SimplifiedP2P {
                     return;
                 }
 
-                // GENESIS IDENTITY-IP GATE for empty-slot attesters claiming
-                // a Genesis identity. Same threat model as block attestation.
-                if !self.check_genesis_ip_gate(&attester_id, from_peer, "EMPTY_SLOT") {
-                    return;
-                }
+                // v17.1: IP-anchor gate intentionally NOT applied here.
+                // Same rationale as BlockAttestation above — gossip-relayed
+                // `from_peer` is the relay; the Dilithium3 verification
+                // below against the attester's registered PK is the
+                // canonical, gossip-safe security gate.
 
                 // Verify Dilithium3 signature: "QNET_EMPTY_SLOT:{slot_height}:{expected_producer}"
                 //
@@ -14119,31 +14120,36 @@ impl SimplifiedP2P {
                     return;
                 }
 
-                // v14.8.1: GENESIS IDENTITY ANTI-SQUAT.
+                // v17.1: GENESIS IDENTITY ANTI-SQUAT — registry-pinning model.
                 //
-                // A self-signed VRF announce proves only that the sender owns the
-                // private key matching `vrf_public_key`. It does NOT prove they
-                // are the real owner of a genesis identity. An attacker could
-                // generate a fresh keypair, sign `QNET_VRF_KEY_v1:genesis_node_1`,
-                // and lock genesis_node_1's identity to their key before the real
-                // Genesis node comes online. Because the consensus-layer registry
-                // is immutable, the real Genesis node could never register its
-                // real key — it would be permanently locked out.
+                // The original v14.8.1 design used an IP-anchor gate here to
+                // refuse genesis announces that did not arrive from the
+                // canonical genesis IP. That gate broke gossip propagation
+                // because VrfKeyAnnounce is broadcast through the network
+                // and `from_peer` is the relay, not the originator —
+                // legitimate cross-registration was rejected (visible in
+                // testnet logs as `genesis_ip_mismatch ... REJECTED` warns).
                 //
-                // Protection: if the claimed identity matches a genesis pattern,
-                // the source peer IP MUST match the baked-in genesis IP for that
-                // identity. Only Genesis operators controlling the canonical IPs
-                // (GENESIS_NODE_IPS) can register genesis PKs. Regular Super-node
-                // joiners use their wallet/activation-code identity, which is
-                // outside the genesis namespace and not gated here.
-                // GENESIS IDENTITY ANTI-SQUAT: if the announce names a
-                // genesis slot, the source IP must match the anchored IP
-                // for that slot. Centralised in `check_genesis_ip_gate`
-                // so format normalisation and rejection logging live in
-                // one place — see the helper for the threat model.
-                if !self.check_genesis_ip_gate(&node_id, from_peer, "VRF-KEY") {
-                    return;
-                }
+                // Replacement defence (already in place — see Fix #2/#3 +
+                // `install_genesis_anchors_at_startup` in node.rs):
+                //
+                //   1. At boot every genesis node loads
+                //      `genesis_anchors.json` and pre-pins the canonical
+                //      Dilithium3 PK for each genesis_node_N into both the
+                //      consensus PK registry and the VRF key registry.
+                //   2. `register_consensus_pk_from_chain` is now strict:
+                //      it refuses to overwrite an existing entry, so a
+                //      squatter's fresh keypair targeting a genesis slot
+                //      is hard-rejected as a mismatch.
+                //   3. `verify_consensus_signature` (Fix #2) no longer
+                //      falls back to the legacy bootstrap path, so a
+                //      squatter cannot ride past signature checks even
+                //      if their announce slips through.
+                //
+                // The early `has_vrf_key` short-circuit below means an
+                // already-pinned genesis slot ignores re-announces from
+                // any source — the squatter never gets to the registration
+                // path. Non-genesis (Super-node) joiners are unaffected.
 
                 if crate::genesis_constants::has_vrf_key(&node_id) {
                     return;
@@ -15261,16 +15267,15 @@ impl SimplifiedP2P {
             } => {
                 self.update_peer_last_seen(from_peer);
 
-                // IDENTITY-IP ANCHORING: refuse to even consider a Genesis-identity
-                // announcement that did not arrive from the canonical genesis IP.
-                // This is the cheap first line of defence — runs before any
-                // Dilithium3 work (~35ms each) so a spoof flood costs the receiver
-                // ~0 CPU. Non-genesis (Super-node) identities pass through with
-                // no IP check; their identity binding is via signed
-                // NodeRegistration TX.
-                if !self.check_genesis_ip_gate(&node_id, from_peer, "ACTIVE") {
-                    return;
-                }
+                // v17.1: IP-anchor gate intentionally NOT applied here.
+                // ActiveNodeAnnouncement is gossip-relayed (gossip_hop up to
+                // 3); `from_peer` carries the relay's IP, not the
+                // originator's — anchoring it rejected legitimate
+                // announcements from peers that learned about a genesis
+                // node via gossip. Identity binding for genesis is provided
+                // by the consensus PK registry (pre-pinned at boot from
+                // `genesis_anchors.json`); non-genesis identities are
+                // bound via signed NodeRegistration TX.
 
                 // v9.2: Adaptive rate limit BEFORE Dilithium3 verification (~35ms CPU each).
                 // Scales with network size: more peers → each peer relays more unique announces.
@@ -16412,49 +16417,35 @@ impl SimplifiedP2P {
         self.verify_dilithium_heartbeat_signature(message, signature, node_id)
     }
 
-    /// IDENTITY-IP ANCHORING: gate inbound messages that claim a Genesis
-    /// identity by the canonical Genesis IP for that identity.
+    /// IDENTITY-IP ANCHORING — preserved for direct-only message types.
     ///
-    /// Returns `true` when the gate ALLOWS the message (either the claimed
-    /// `node_id` is not a Genesis identity, or it is Genesis AND the sender
-    /// IP matches the anchored IP from `GENESIS_NODE_IPS`).
-    /// Returns `false` (with a single WARN log per offence) when the gate
-    /// REJECTS the message — caller must drop it without further processing.
+    /// **v17.1 status: NOT called from any current handler.** The original
+    /// design used this gate on every genesis-bearing inbound message, but
+    /// every such message in v17 is gossip-relayed: `from_peer` is the
+    /// IP of the relay that forwarded the packet, NOT of the originator
+    /// who signed it. Anchoring the relay's IP to the originator's
+    /// genesis slot rejected legitimate gossip and broke 2f+1 quorum on
+    /// testnet (visible as `genesis_ip_mismatch ... REJECTED` warns and a
+    /// stuck macroblock #2). Identity binding for genesis nodes is now
+    /// enforced exclusively at the cryptographic layer:
     ///
-    /// Why this gate exists
-    /// ────────────────────
-    /// Genesis bootstrap nodes have hard-coded IPs (`GENESIS_NODE_IPS`) baked
-    /// into every binary. Any peer holding a valid Dilithium3 keypair could
-    /// otherwise forge a P2P message claiming a Genesis `node_id` and:
-    ///   * Get their PK installed in remote registries via a TOFV path
-    ///     (closed for genesis at consensus_crypto level — see
-    ///     `genesis_pk_first_seen_rejected` — but this gate is the cheap
-    ///     first line of defence that avoids a Dilithium verification
-    ///     CPU hit per spoofed packet);
-    ///   * Inject spoofed liveness data (heartbeats, active-node
-    ///     announcements, producer signals) that pollutes chain state.
+    ///   * `genesis_anchors.json` pre-pins the canonical Dilithium3 PK for
+    ///     every `genesis_node_N` at startup
+    ///     (see `install_genesis_anchors_at_startup`).
+    ///   * `register_consensus_pk_from_chain` is strict — any later
+    ///     attempt to register a different PK for the same genesis slot
+    ///     is hard-rejected (`genesis_pk_first_seen_rejected`).
+    ///   * `verify_consensus_signature` (Fix #2 in quantum_crypto.rs)
+    ///     no longer falls back to the legacy bootstrap path, so a
+    ///     squatter cannot ride past the signature check.
     ///
-    /// Coverage matrix
-    /// ───────────────
-    /// Every inbound P2P message type that carries a claimed genesis
-    /// `node_id` MUST consult this gate. Currently applied to:
-    ///   * VrfLeaderClaim
-    ///   * VrfKeyAnnounce
-    ///   * ActiveNodeAnnouncement
-    ///   * ProducerHeartbeat
-    ///   * ProducerReady
-    ///   * BlockRejection
-    /// New genesis-bearing message types must add a call here.
+    /// The helper is retained for any future message type that is
+    /// guaranteed point-to-point (no relays) — for those, IP anchoring
+    /// is a free additional defence-in-depth layer.
     ///
-    /// Scalability
-    /// ───────────
-    /// O(N) over `GENESIS_NODE_IPS` where N == 5. Independent of total network
-    /// size. Super-node messages (non-genesis identities) pass through with no
-    /// IP check — their identity binding is established via signed
-    /// `NodeRegistration` TX, not by IP.
-    ///
-    /// `msg_tag` is the short subsystem tag used in the WARN log (`VRF`,
-    /// `ACTIVE`, `HEARTBEAT`, `READY`, `REJECT`, …).
+    /// Returns `true` when the gate ALLOWS (non-genesis identity OR
+    /// matching IP), `false` (with WARN log) when it REJECTS.
+    #[allow(dead_code)]
     fn check_genesis_ip_gate(&self, node_id: &str, from_peer: &str, msg_tag: &str) -> bool {
         if !crate::genesis_constants::is_legacy_genesis_node(node_id) {
             // Not a genesis identity — gate doesn't apply.

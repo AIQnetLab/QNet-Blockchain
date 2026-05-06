@@ -374,6 +374,50 @@ pub fn get_all_vrf_keys() -> HashMap<String, Vec<u8>> {
 /// Default location of the genesis anchors JSON file inside the container.
 pub const GENESIS_ANCHORS_PATH: &str = "/app/data/genesis_anchors.json";
 
+/// Outcome of the bootstrap-race guard in `install_genesis_anchors_at_startup`
+/// when the anchors file is absent. Exposed (and computed by the pure helper
+/// `anchors_missing_boot_decision`) so the policy can be unit-tested without
+/// touching process env or invoking `std::process::exit`.
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub(crate) enum BootDecision {
+    /// Not a genesis node — anchors are irrelevant. Proceed.
+    Allowed,
+    /// Genesis node, no anchors, operator explicitly opted in via
+    /// `QNET_BOOTSTRAP_FRESH=1`. Proceed but emit a CRIT warning every boot
+    /// so the dangerous mode is impossible to miss in operational logs.
+    AllowedFreshOptIn,
+    /// Genesis node, no anchors, no opt-in. Caller must abort startup —
+    /// silently continuing would open the squat-on-bootstrap race window.
+    Refused,
+}
+
+/// Pure-logic decision for whether `install_genesis_anchors_at_startup` may
+/// proceed when the anchors file is absent. Inputs are taken explicitly so
+/// this function is fully testable without reading env vars or panicking.
+///
+/// Policy:
+///   * Super-node (no `QNET_BOOTSTRAP_ID`): always allowed — they bind
+///     identity via signed `NodeRegistration` TX, not via anchors.
+///   * Genesis node + opt-in via `QNET_BOOTSTRAP_FRESH=1`: allowed with a
+///     CRIT warning. The operator has accepted the race risk.
+///   * Genesis node, no opt-in: refused. Caller must terminate the process.
+///
+/// The opt-in is intentionally a single discrete env var rather than a
+/// timeout / heuristic — silent continuation in dangerous mode is exactly
+/// what we are defending against, so the gate must be operator-explicit.
+pub(crate) fn anchors_missing_boot_decision(
+    is_genesis_node: bool,
+    fresh_opt_in: bool,
+) -> BootDecision {
+    if !is_genesis_node {
+        BootDecision::Allowed
+    } else if fresh_opt_in {
+        BootDecision::AllowedFreshOptIn
+    } else {
+        BootDecision::Refused
+    }
+}
+
 /// Load genesis Dilithium3 anchor PKs from `path`. Returns empty map if file
 /// missing or malformed (logged as WARN, not fatal — boot proceeds without
 /// anchors so a fresh cluster can complete first-time keygen + anchor write).
@@ -453,8 +497,76 @@ pub fn load_genesis_anchor_pks_from_file(path: &str) -> HashMap<String, Vec<u8>>
 pub fn install_genesis_anchors_at_startup() -> usize {
     let map = load_genesis_anchor_pks_from_file(GENESIS_ANCHORS_PATH);
     if map.is_empty() {
-        // First-boot path: no anchor file yet. Caller logs the appropriate
-        // INFO; we return 0 so caller can decide whether to fail or proceed.
+        // ─────────────────────────────────────────────────────────────────
+        // v17.1: GENESIS BOOTSTRAP RACE GUARD
+        // ─────────────────────────────────────────────────────────────────
+        // A genesis node started without anchors is in the dangerous "fresh
+        // bootstrap" path: cross-registration via `VrfKeyAnnounce` uses
+        // trust-on-first-verify (the announce handler verifies a self-
+        // signature against the SUPPLIED public key, not against the
+        // registry — see unified_p2p.rs::NetworkMessage::VrfKeyAnnounce).
+        // Whichever peer announces a genesis identity FIRST locks that
+        // identity to its PK in the local consensus PK registry. If a
+        // non-genesis peer (e.g. a whitelisted but otherwise hostile IP)
+        // is online and faster than the legitimate genesis bootstrap, it
+        // can squat the slot.
+        //
+        // Refuse to start unless the operator has explicitly acknowledged
+        // the race by setting `QNET_BOOTSTRAP_FRESH=1`. Two situations are
+        // legitimate uses of that opt-in:
+        //   * Truly first-ever cluster boot before any anchors have ever
+        //     been auto-written.
+        //   * Operator-driven full state cleanup where the
+        //     `dilithium_keypair.bin` files were also wiped (so a new
+        //     round of cross-registration is required).
+        //
+        // Any other situation — anchors lost between restarts, deploy
+        // script forgot to copy the file, host filesystem corruption —
+        // should fail loudly so the operator can restore from backup
+        // BEFORE the race window opens. Silent continuation in fresh-boot
+        // mode after operator-unaware anchor loss is exactly how an
+        // attacker squat succeeds on the next restart.
+        //
+        // Super-node identities (no `QNET_BOOTSTRAP_ID` env var) do NOT
+        // need anchors — their identity binding is established via signed
+        // `NodeRegistration` TX, which carries the Dilithium3 PK in the
+        // payload and is verified end-to-end. The guard skips them.
+        //
+        // Scalability: O(1) — two env-var lookups and a string compare.
+        // Independent of cluster size or network state.
+        let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+        let fresh_opt_in = std::env::var("QNET_BOOTSTRAP_FRESH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        match anchors_missing_boot_decision(is_genesis_node, fresh_opt_in) {
+            BootDecision::Allowed => { /* proceed below */ }
+            BootDecision::AllowedFreshOptIn => {
+                let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+                eprintln!(
+                    "[CRIT][GENESIS] fresh_bootstrap_mode_active bootstrap_id={} path={} \
+                     risk=identity_squat_window_open \
+                     hint=ensure_QNET_WHITELIST_IPS_contains_only_genesis_or_trusted_peers",
+                    bootstrap_id, GENESIS_ANCHORS_PATH
+                );
+            }
+            BootDecision::Refused => {
+                let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+                eprintln!(
+                    "[CRIT][GENESIS] genesis_node_started_without_anchors \
+                     bootstrap_id={} path={} action=halt_startup",
+                    bootstrap_id, GENESIS_ANCHORS_PATH
+                );
+                eprintln!(
+                    "[CRIT][GENESIS] hint=restore_genesis_anchors_json_from_backup \
+                     OR set_QNET_BOOTSTRAP_FRESH=1_to_acknowledge_race_risk"
+                );
+                eprintln!(
+                    "[CRIT][GENESIS] race_summary=a_non-genesis_peer_with_valid_dilithium3_keypair \
+                     can_announce_first_and_lock_genesis_identity_to_its_PK_squat_attack"
+                );
+                std::process::exit(2);
+            }
+        }
         return 0;
     }
     let count = map.len();
@@ -623,6 +735,60 @@ mod tests_v17_security {
     #[test]
     fn genesis_node_count_matches_ip_table() {
         assert_eq!(genesis_node_count(), GENESIS_NODE_IPS.len());
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // v17.1: BOOTSTRAP-RACE GUARD (anchors_missing_boot_decision)
+    // ────────────────────────────────────────────────────────────────────────
+    // The four cases below exhaustively cover the truth table of the policy
+    // documented above the function. A regression on ANY of these means the
+    // refuse-to-start guard has been broken — either we'd start dangerously
+    // (squat window open) or we'd crash super-nodes that have no business
+    // touching anchors. Both are loud production failures.
+
+    /// Super-node (no `QNET_BOOTSTRAP_ID`) MUST always boot regardless of
+    /// the `QNET_BOOTSTRAP_FRESH` flag — they have no anchor relationship.
+    #[test]
+    fn boot_decision_super_node_no_opt_in_allowed() {
+        assert_eq!(
+            anchors_missing_boot_decision(false, false),
+            BootDecision::Allowed
+        );
+    }
+
+    /// Super-node + opt-in: still allowed. Opt-in is irrelevant for a node
+    /// type that doesn't consult anchors. We don't error on irrelevant flags.
+    #[test]
+    fn boot_decision_super_node_with_opt_in_allowed() {
+        assert_eq!(
+            anchors_missing_boot_decision(false, true),
+            BootDecision::Allowed
+        );
+    }
+
+    /// Genesis node + no opt-in is the SECURITY-CRITICAL case. Booting here
+    /// would let any whitelisted hostile peer with a fresh Dilithium3 keypair
+    /// announce a genesis identity first and pin its PK in the local
+    /// registry — squat-on-bootstrap. The guard MUST refuse.
+    #[test]
+    fn boot_decision_genesis_no_anchors_no_opt_in_refused() {
+        assert_eq!(
+            anchors_missing_boot_decision(true, false),
+            BootDecision::Refused
+        );
+    }
+
+    /// Genesis node + explicit opt-in: allowed but flagged. This is the
+    /// legitimate first-cluster-boot path; it must succeed so a brand-new
+    /// network can complete cross-registration and auto-write its anchors.
+    /// The CRIT log emitted alongside this decision is the operator's
+    /// evidence that they are running in dangerous mode for this boot.
+    #[test]
+    fn boot_decision_genesis_no_anchors_with_opt_in_allowed_with_warning() {
+        assert_eq!(
+            anchors_missing_boot_decision(true, true),
+            BootDecision::AllowedFreshOptIn
+        );
     }
 }
 
