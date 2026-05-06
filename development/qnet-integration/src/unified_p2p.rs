@@ -13094,6 +13094,14 @@ impl SimplifiedP2P {
                 // attestation IMMEDIATELY when the elected producer goes
                 // silent (no need to wait for next producer-loop tick).
                 //
+                // IDENTITY-IP ANCHORING: refuse heartbeats that claim a Genesis
+                // identity from a non-genesis IP. Cheap first line of defence —
+                // runs before rate limiting and Dilithium3 verification so a
+                // spoof flood costs the receiver effectively nothing.
+                if !self.check_genesis_ip_gate(&producer_id, from_peer, "HEARTBEAT") {
+                    return;
+                }
+                //
                 // Rate limit: producer broadcasts ≈1/sec, so 60/min ceiling
                 // is generous. Anti-DoS — without this an attacker could
                 // flood ProducerHeartbeats to burn CPU on signature verify.
@@ -13167,6 +13175,16 @@ impl SimplifiedP2P {
                 // that rejected a forked block from `source_peer_id` at
                 // `height` broadcasts this. Aggregating 2f+1 distinct
                 // observer signatures justifies destructive rollback.
+                //
+                // IDENTITY-IP ANCHORING: gate rejections that claim a Genesis
+                // observer identity. Without this, a non-genesis spoofer could
+                // forge BlockRejections in genesis names and contribute to a
+                // 2f+1 destructive-rollback quorum, weaponising a security
+                // mechanism into a liveness attack.
+                if !self.check_genesis_ip_gate(&observer_id, from_peer, "REJECT") {
+                    return;
+                }
+
                 if self.is_consensus_rate_limited(&observer_id, "block_rejection", 30) {
                     return;
                 }
@@ -13259,9 +13277,21 @@ impl SimplifiedP2P {
                 // v16.2: producer signals "I have local certified=R, ready to
                 // produce at this round". Receiver responds with ReadyAck IF
                 // local certified ≥ R (proves we have converged on the same
+                //
                 // rotation state). 2f+1 acks accumulated by producer give it
                 // cryptographic evidence that the network agrees on R before
                 // emitting the block — eliminates the cold-boot race window.
+                //
+                // IDENTITY-IP ANCHORING: gate ready-handshake messages claiming
+                // a Genesis producer identity. A spoofed ProducerReady would
+                // poll honest nodes for ReadyAcks and (in absence of registry
+                // binding) might collect 2f+1 acks the spoofer could later use
+                // to justify emitting a block. The signature path still
+                // rejects it post-fix, but this gate avoids the wasted CPU.
+                if !self.check_genesis_ip_gate(&producer_id, from_peer, "READY") {
+                    return;
+                }
+
                 if self.is_consensus_rate_limited(&producer_id, "producer_ready", 30) {
                     return;
                 }
@@ -13405,6 +13435,15 @@ impl SimplifiedP2P {
             NetworkMessage::ReadyAck { mb_idx, round, height, producer_id, ack_id, signature } => {
                 // v16.2: collected by the elected producer to prove 2f+1
                 // committee converged on round R before emitting block.
+                //
+                // IDENTITY-IP ANCHORING: gate acks claiming a Genesis ack_id.
+                // A spoofed ack would inflate the producer's 2f+1 quorum count
+                // with phantom votes from a non-genesis IP — same class of
+                // attack as fake heartbeats, gated identically.
+                if !self.check_genesis_ip_gate(&ack_id, from_peer, "READYACK") {
+                    return;
+                }
+
                 if self.is_consensus_rate_limited(&ack_id, "ready_ack", 60) {
                     return;
                 }
@@ -13471,6 +13510,15 @@ impl SimplifiedP2P {
             NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, signature, timestamp } => {
                 self.update_peer_last_seen(&node_id);
 
+                // IDENTITY-IP ANCHORING: gate macroblock commits claiming a
+                // Genesis identity. The 2f+1 commit-reveal quorum is the most
+                // security-sensitive consensus boundary — a phantom commit
+                // signed in a genesis name and accepted into the aggregator
+                // would directly attack macroblock finality.
+                if !self.check_genesis_ip_gate(&node_id, from_peer, "COMMIT") {
+                    return;
+                }
+
                 // v9.0: Rate limit consensus messages (max 10/min per peer)
                 if self.is_consensus_rate_limited(&node_id, "commit", 10) { return; }
 
@@ -13494,6 +13542,14 @@ impl SimplifiedP2P {
 
             NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, nonce, timestamp, signature } => {
                 self.update_peer_last_seen(&node_id);
+
+                // IDENTITY-IP ANCHORING: gate macroblock reveals claiming a
+                // Genesis identity (paired with the matching ConsensusCommit
+                // gate above — both halves of the commit-reveal pair must be
+                // authenticated against the canonical genesis IP).
+                if !self.check_genesis_ip_gate(&node_id, from_peer, "REVEAL") {
+                    return;
+                }
 
                 // v9.0: Rate limit consensus messages (max 10/min per peer)
                 if self.is_consensus_rate_limited(&node_id, "reveal", 10) { return; }
@@ -13574,39 +13630,16 @@ impl SimplifiedP2P {
                         // above (vrf::verify) is itself proof-of-ownership, so we can also
                         // install the key in the consensus-layer registry.
                         //
-                        // v14.8.1: GENESIS IDENTITY ANTI-SQUAT — same rule as the
-                        // VrfKeyAnnounce path. If the claimed identity is a genesis
-                        // slot, the source peer IP must match the anchored IP for
-                        // that slot. Prevents an attacker with their own valid
-                        // Dilithium3 keypair from squatting `genesis_node_N`
-                        // by producing a well-formed VRF claim.
-                        if crate::genesis_constants::is_legacy_genesis_node(&node_id) {
-                            let sender_ip = from_peer.split(':').next().unwrap_or("");
-                            let genesis_slot = node_id.strip_prefix("genesis_node_").unwrap_or("");
-                            let padded_slot = if genesis_slot.len() == 1 {
-                                format!("00{}", genesis_slot)
-                            } else if genesis_slot.len() == 2 {
-                                format!("0{}", genesis_slot)
-                            } else {
-                                genesis_slot.to_string()
-                            };
-                            let expected_ip = crate::genesis_constants::get_genesis_ip_by_id(&padded_slot);
-                            match expected_ip {
-                                Some(exp) if exp == sender_ip => { /* allowed */ }
-                                Some(exp) => {
-                                    if crate::node::is_warn() {
-                                        println!("[WARN][VRF] genesis_ip_mismatch_claim node={} sender_ip={} expected_ip={} REJECTED",
-                                                 node_id, sender_ip, exp);
-                                    }
-                                    return;
-                                }
-                                None => {
-                                    if crate::node::is_warn() {
-                                        println!("[WARN][VRF] genesis_unknown_slot_claim node={} REJECTED", node_id);
-                                    }
-                                    return;
-                                }
-                            }
+                        // GENESIS IDENTITY ANTI-SQUAT: if the claim names a
+                        // genesis slot, the source IP must match the anchored
+                        // IP for that slot. Prevents a non-genesis peer with
+                        // their own valid Dilithium3 keypair from squatting
+                        // `genesis_node_N` via a well-formed VRF claim.
+                        // Centralised in `check_genesis_ip_gate` so format
+                        // normalisation (`genesis_node_001` ↔ `genesis_node_1`)
+                        // and the rejection log live in one place.
+                        if !self.check_genesis_ip_gate(&node_id, from_peer, "VRF") {
+                            return;
                         }
 
                         if !crate::genesis_constants::has_vrf_key(&node_id) {
@@ -13708,6 +13741,15 @@ impl SimplifiedP2P {
             NetworkMessage::TimeoutVote { height, timeout_round, voter_id, last_block_hash, signature } => {
                 self.update_peer_last_seen(&voter_id);
 
+                // IDENTITY-IP ANCHORING: gate timeout votes claiming a Genesis
+                // voter identity. A spoofer flooding fake genesis-voter timeout
+                // votes could trigger a fast-path round-change with phantom
+                // 2f+1 evidence — gated here before the height filter and
+                // rate limit so spoofed packets cost ~0 CPU.
+                if !self.check_genesis_ip_gate(&voter_id, from_peer, "TIMEOUT") {
+                    return;
+                }
+
                 // v9.5/v9.8: Early height filter — discard obviously stale/future votes before signature check.
                 // saturating_add prevents overflow from malicious u64::MAX height values.
                 // FIX: `height` is macroblock INDEX (microblock_height / 90), so compare against
@@ -13786,16 +13828,36 @@ impl SimplifiedP2P {
             // PRODUCTION v2.37: Handle dedicated MacroBlock broadcast (NOT ShredProtocol!)
             NetworkMessage::MacroBlockBroadcast { index, data, sender_id, epoch } => {
                 if crate::node::is_info() {
-                    println!("[INFO][MB-RX] ← received idx={} epoch={} sender={} bytes={}", 
+                    println!("[INFO][MB-RX] ← received idx={} epoch={} sender={} bytes={}",
                              index, epoch, get_privacy_id_for_addr(&sender_id), data.len());
                 }
-                
-                // Decompress macroblock data
-                let macroblock_data = match zstd::decode_all(&data[..]) {
+
+                // BOUNDED DECOMPRESSION (anti-DoS).
+                //
+                // `zstd::decode_all` accepts the input and produces a single
+                // buffer with no built-in output ceiling. A hostile peer could
+                // ship a 10 MB compressed payload (the QUIC `MAX_MESSAGE_SIZE`
+                // ceiling) that decompresses to multiple GB — every receiver
+                // would OOM or thrash. We cap output at MAX_MACROBLOCK_DECOMPRESSED
+                // and stream-decode through a take-bounded reader so the
+                // process exits early before allocating beyond the cap.
+                //
+                // Sizing: macroblocks aggregate at most one epoch (90 microblocks)
+                // of state, signed commits, and reveals. A 64 MB ceiling is ~10×
+                // the largest legitimate macroblock observed in practice and ~6×
+                // the QUIC packet ceiling — generous head-room without allowing
+                // a packet-sized bomb to cost gigabytes of RAM. The constant
+                // is named so it can be tuned in one place if epoch density
+                // changes.
+                const MAX_MACROBLOCK_DECOMPRESSED: usize = 64 * 1024 * 1024;
+                let macroblock_data = match decompress_zstd_bounded(&data[..], MAX_MACROBLOCK_DECOMPRESSED) {
                     Ok(decompressed) => decompressed,
                     Err(e) => {
                         if crate::node::is_warn() {
-                            println!("[ERR][MB-RX] decompress failed idx={}: {}", index, e);
+                            println!(
+                                "[ERR][MB-RX] decompress_failed idx={} input_bytes={} err={} action=drop",
+                                index, data.len(), e
+                            );
                         }
                         return;
                     }
@@ -13868,7 +13930,24 @@ impl SimplifiedP2P {
                     return;
                 }
 
+                // GENESIS IDENTITY-IP GATE: a non-genesis IP cannot stand in
+                // for a Genesis attester. (Pure-super attesters skip the gate
+                // since they are not anchored.)
+                if !self.check_genesis_ip_gate(&attester_id, from_peer, "ATTEST") {
+                    return;
+                }
+
                 // Verify Dilithium3 signature: "QNET_ATTEST:{height}:{hash_hex}"
+                //
+                // No "bootstrap grace" branch. The historical bypass accepted
+                // unsigned attestations from un-registered identities during
+                // the first 100 blocks, which let a peer flood phantom block
+                // attestations early in chain life. There is no legitimate
+                // reason to skip math verification for an attestation —
+                // honest nodes always have a registered PK before they can
+                // attest a block (self-register at boot + VrfKeyAnnounce
+                // cross-register peers within seconds). Reject anything
+                // signed by an identity we cannot cryptographically bind.
                 let sig_ok = if let Some(pk_bytes) = crate::genesis_constants::get_vrf_public_key(&attester_id) {
                     use pqcrypto_mldsa::mldsa65 as dilithium3;
                     use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
@@ -13880,9 +13959,13 @@ impl SimplifiedP2P {
                         _ => false,
                     }
                 } else {
-                    // Attester not in key registry — accept during bootstrap/genesis phase
-                    // (same grace as VRF claim handler: first N blocks no pk required)
-                    block_height < 100
+                    if crate::node::is_warn() {
+                        println!(
+                            "[WARN][ATTEST] attester_pk_unknown attester={} h={} action=reject",
+                            attester_id, block_height
+                        );
+                    }
+                    false
                 };
 
                 if !sig_ok {
@@ -13928,7 +14011,18 @@ impl SimplifiedP2P {
                     return;
                 }
 
+                // GENESIS IDENTITY-IP GATE for empty-slot attesters claiming
+                // a Genesis identity. Same threat model as block attestation.
+                if !self.check_genesis_ip_gate(&attester_id, from_peer, "EMPTY_SLOT") {
+                    return;
+                }
+
                 // Verify Dilithium3 signature: "QNET_EMPTY_SLOT:{slot_height}:{expected_producer}"
+                //
+                // No "bootstrap grace" branch — see block attestation handler
+                // above. Empty-slot attestations are aggregated by producers
+                // to skip silent leaders; phantom signatures from unbound
+                // identities would let an attacker force-skip an honest leader.
                 let sig_ok = if let Some(pk_bytes) = crate::genesis_constants::get_vrf_public_key(&attester_id) {
                     use pqcrypto_mldsa::mldsa65 as dilithium3;
                     use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
@@ -13942,8 +14036,13 @@ impl SimplifiedP2P {
                         _ => false,
                     }
                 } else {
-                    // Attester not in key registry — accept during bootstrap/genesis phase
-                    slot_height < 100
+                    if crate::node::is_warn() {
+                        println!(
+                            "[WARN][EMPTY_SLOT] attester_pk_unknown attester={} slot_h={} action=reject",
+                            attester_id, slot_height
+                        );
+                    }
+                    false
                 };
 
                 if !sig_ok {
@@ -14037,44 +14136,13 @@ impl SimplifiedP2P {
                 // (GENESIS_NODE_IPS) can register genesis PKs. Regular Super-node
                 // joiners use their wallet/activation-code identity, which is
                 // outside the genesis namespace and not gated here.
-                if crate::genesis_constants::is_legacy_genesis_node(&node_id) {
-                    // Extract sender IP from `from_peer` (format: "ip:port" or just "id").
-                    // We compare against the hard-coded genesis IP table; the network
-                    // layer gives us the remote address for every inbound message.
-                    let sender_ip = from_peer.split(':').next().unwrap_or("");
-
-                    // Resolve expected IP for this genesis identity.
-                    // LEGACY_GENESIS_NODES = ["genesis_node_1", ..., "genesis_node_5"]
-                    // GENESIS_NODE_IPS     = [(ip, "001"), ..., (ip, "005")]
-                    // Map "genesis_node_N" -> "00N" for lookup.
-                    let genesis_slot = node_id.strip_prefix("genesis_node_").unwrap_or("");
-                    let padded_slot = if genesis_slot.len() == 1 {
-                        format!("00{}", genesis_slot)
-                    } else if genesis_slot.len() == 2 {
-                        format!("0{}", genesis_slot)
-                    } else {
-                        genesis_slot.to_string()
-                    };
-                    let expected_ip = crate::genesis_constants::get_genesis_ip_by_id(&padded_slot);
-
-                    match expected_ip {
-                        Some(exp) if exp == sender_ip => {
-                            // IP matches the anchored genesis IP — allow through.
-                        }
-                        Some(exp) => {
-                            if crate::node::is_warn() {
-                                println!("[WARN][VRF-KEY] genesis_ip_mismatch node={} sender_ip={} expected_ip={} REJECTED",
-                                         node_id, sender_ip, exp);
-                            }
-                            return;
-                        }
-                        None => {
-                            if crate::node::is_warn() {
-                                println!("[WARN][VRF-KEY] genesis_unknown_slot node={} REJECTED", node_id);
-                            }
-                            return;
-                        }
-                    }
+                // GENESIS IDENTITY ANTI-SQUAT: if the announce names a
+                // genesis slot, the source IP must match the anchored IP
+                // for that slot. Centralised in `check_genesis_ip_gate`
+                // so format normalisation and rejection logging live in
+                // one place — see the helper for the threat model.
+                if !self.check_genesis_ip_gate(&node_id, from_peer, "VRF-KEY") {
+                    return;
                 }
 
                 if crate::genesis_constants::has_vrf_key(&node_id) {
@@ -15004,12 +15072,56 @@ impl SimplifiedP2P {
             // PRODUCTION: Light Node registry sync response
             NetworkMessage::LightNodeRegistryResponse { sender_id, registrations, total_count } => {
                 self.update_peer_last_seen(from_peer);
+
+                // ─────────────────────────────────────────────────────────────
+                // SENDER AUTHENTICATION — only consensus-tier peers may sync.
+                //
+                // The Light-node registry feeds pinger selection and reward
+                // window aggregation. Without this gate any peer could push
+                // an unbounded list of `LightNodeRegistrationData` into the
+                // local registry — there is NO cryptographic check on the
+                // payload entries themselves, so the attacker controls the
+                // whole record (node_id, wallet, FCM token, quantum_pubkey).
+                // Pollution is bounded by `MAX_LIGHT_NODE_REGISTRY` so the
+                // attack does not OOM, but it does:
+                //   * inflate pinger selection candidates (resource burn);
+                //   * occupy capacity that legitimate registrations cannot
+                //     reclaim until eviction fires;
+                //   * mix attacker-controlled FCM tokens into the local
+                //     dedup keyspace (operationally noisy).
+                //
+                // Honest registry sync exclusively flows between consensus-
+                // tier peers (Genesis + active Super). Restricting the
+                // accepted senders to those identities closes the pollution
+                // path without changing the on-the-wire format. New Super
+                // nodes pick up the constraint automatically: as soon as
+                // their NodeRegistration TX is applied to chain state and
+                // mirrored into `active_full_super_nodes`, peers will accept
+                // their sync responses.
+                //
+                // Scalability: at thousands of Super-nodes the active map is
+                // O(1) DashMap lookup; gating cost is negligible.
+                let sender_authenticated = sender_id.starts_with("genesis_node_")
+                    || self.active_full_super_nodes.contains_key(&sender_id);
+                if !sender_authenticated {
+                    if crate::node::is_warn() {
+                        println!(
+                            "[WARN][SYNC] light_registry_response_unauthenticated sender={} count={} action=drop",
+                            sender_id, registrations.len()
+                        );
+                    }
+                    return;
+                }
+
                 if crate::node::is_info() {
                     println!("[INFO][SYNC] Light node registry response from {} ({} nodes, {} total)",
                              sender_id, registrations.len(), total_count);
                 }
-                
-                // Merge into local registry
+
+                // Merge into local registry. The pre-existing dedup-by-
+                // `node_id` plus the upstream `MAX_LIGHT_NODE_REGISTRY` cap
+                // jointly bound memory and prevent overwrite of an entry
+                // already known to this node.
                 let mut added = 0;
                 {
                     let mut registry = self.light_node_registry.write();
@@ -15020,7 +15132,7 @@ impl SimplifiedP2P {
                         }
                     }
                 }
-                
+
                 if crate::node::is_info() {
                     println!("[INFO][SYNC] Added {} new Light nodes to registry", added);
                 }
@@ -15148,6 +15260,17 @@ impl SimplifiedP2P {
                 node_id, node_type, shard_id, reputation, timestamp, signature, gossip_hop
             } => {
                 self.update_peer_last_seen(from_peer);
+
+                // IDENTITY-IP ANCHORING: refuse to even consider a Genesis-identity
+                // announcement that did not arrive from the canonical genesis IP.
+                // This is the cheap first line of defence — runs before any
+                // Dilithium3 work (~35ms each) so a spoof flood costs the receiver
+                // ~0 CPU. Non-genesis (Super-node) identities pass through with
+                // no IP check; their identity binding is via signed
+                // NodeRegistration TX.
+                if !self.check_genesis_ip_gate(&node_id, from_peer, "ACTIVE") {
+                    return;
+                }
 
                 // v9.2: Adaptive rate limit BEFORE Dilithium3 verification (~35ms CPU each).
                 // Scales with network size: more peers → each peer relays more unique announces.
@@ -16287,6 +16410,78 @@ impl SimplifiedP2P {
     fn verify_consensus_signature(&self, node_id: &str, message: &str, signature: &str) -> bool {
         // Use the same verification logic as heartbeat (supports all formats)
         self.verify_dilithium_heartbeat_signature(message, signature, node_id)
+    }
+
+    /// IDENTITY-IP ANCHORING: gate inbound messages that claim a Genesis
+    /// identity by the canonical Genesis IP for that identity.
+    ///
+    /// Returns `true` when the gate ALLOWS the message (either the claimed
+    /// `node_id` is not a Genesis identity, or it is Genesis AND the sender
+    /// IP matches the anchored IP from `GENESIS_NODE_IPS`).
+    /// Returns `false` (with a single WARN log per offence) when the gate
+    /// REJECTS the message — caller must drop it without further processing.
+    ///
+    /// Why this gate exists
+    /// ────────────────────
+    /// Genesis bootstrap nodes have hard-coded IPs (`GENESIS_NODE_IPS`) baked
+    /// into every binary. Any peer holding a valid Dilithium3 keypair could
+    /// otherwise forge a P2P message claiming a Genesis `node_id` and:
+    ///   * Get their PK installed in remote registries via a TOFV path
+    ///     (closed for genesis at consensus_crypto level — see
+    ///     `genesis_pk_first_seen_rejected` — but this gate is the cheap
+    ///     first line of defence that avoids a Dilithium verification
+    ///     CPU hit per spoofed packet);
+    ///   * Inject spoofed liveness data (heartbeats, active-node
+    ///     announcements, producer signals) that pollutes chain state.
+    ///
+    /// Coverage matrix
+    /// ───────────────
+    /// Every inbound P2P message type that carries a claimed genesis
+    /// `node_id` MUST consult this gate. Currently applied to:
+    ///   * VrfLeaderClaim
+    ///   * VrfKeyAnnounce
+    ///   * ActiveNodeAnnouncement
+    ///   * ProducerHeartbeat
+    ///   * ProducerReady
+    ///   * BlockRejection
+    /// New genesis-bearing message types must add a call here.
+    ///
+    /// Scalability
+    /// ───────────
+    /// O(N) over `GENESIS_NODE_IPS` where N == 5. Independent of total network
+    /// size. Super-node messages (non-genesis identities) pass through with no
+    /// IP check — their identity binding is established via signed
+    /// `NodeRegistration` TX, not by IP.
+    ///
+    /// `msg_tag` is the short subsystem tag used in the WARN log (`VRF`,
+    /// `ACTIVE`, `HEARTBEAT`, `READY`, `REJECT`, …).
+    fn check_genesis_ip_gate(&self, node_id: &str, from_peer: &str, msg_tag: &str) -> bool {
+        if !crate::genesis_constants::is_legacy_genesis_node(node_id) {
+            // Not a genesis identity — gate doesn't apply.
+            return true;
+        }
+        let sender_ip = from_peer.split(':').next().unwrap_or("");
+        match crate::genesis_constants::genesis_ip_for_node_id(node_id) {
+            Some(expected) if expected == sender_ip => true,
+            Some(expected) => {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][{}] genesis_ip_mismatch node={} sender_ip={} expected_ip={} REJECTED",
+                        msg_tag, node_id, sender_ip, expected
+                    );
+                }
+                false
+            }
+            None => {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][{}] genesis_unknown_slot node={} REJECTED",
+                        msg_tag, node_id
+                    );
+                }
+                false
+            }
+        }
     }
     
     /// OPTIMIZED v2.24: Verify HYBRID P2P BINARY signature (SYNC version)
@@ -20445,6 +20640,62 @@ fn is_genesis_node_ip(ip: &str) -> bool {
     get_genesis_id_by_ip(ip).is_some()
 }
 
+/// Decompress zstd-compressed bytes with a HARD output ceiling.
+///
+/// `zstd::decode_all` reads the input to completion and allocates whatever
+/// the stream asks for. Adversarial inputs can be ~1000× their on-the-wire
+/// size, so an attacker who slips a 10 MB packet past the QUIC
+/// `MAX_MESSAGE_SIZE` gate could decompress into several GB of RAM. We
+/// stream the decoder into a buffer wrapped by `std::io::Read::take` so
+/// the very first byte beyond `max_output_bytes` short-circuits with
+/// `Err(InvalidInput)` — the partially-decoded buffer is dropped and the
+/// caller drops the message. No additional RAM beyond `max_output_bytes`
+/// is ever observed.
+///
+/// Threat addressed
+/// ────────────────
+/// DoS via decompression bomb: a bounded packet (≤ MAX_MESSAGE_SIZE) that
+/// expands to gigabytes during decoding. With this cap the worst-case RAM
+/// allocation per malicious packet is `max_output_bytes`, and the rate of
+/// such packets is bounded by the upstream P2P rate limiter.
+///
+/// Scalability
+/// ───────────
+/// O(N) in `output_size` (typical zstd decode). Independent of network
+/// peer count. The 4 KiB streaming buffer is constant per call. Used on
+/// hot paths (incoming P2P decompression) so we deliberately avoid
+/// allocation churn — the resulting `Vec<u8>` is built once with a
+/// pre-sized capacity hint of 1 MiB or `max_output_bytes`, whichever is
+/// smaller.
+///
+/// Returns the decoded bytes on success. On overflow the error message
+/// names the cap that was breached so operators can correlate the WARN
+/// log to the configured ceiling.
+fn decompress_zstd_bounded(input: &[u8], max_output_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = zstd::Decoder::new(input)?;
+    // Pre-size to a small constant; the bounded reader caps the upper end.
+    let initial_cap = max_output_bytes.min(1 * 1024 * 1024);
+    let mut output: Vec<u8> = Vec::with_capacity(initial_cap);
+    // `Read::take` prevents any read past the cap from succeeding without
+    // having to peek-and-drop bytes ourselves. We give it `max + 1` so a
+    // payload that decodes to EXACTLY `max` succeeds, but `max + 1` trips
+    // the limit and returns 0 (EOF) before the inner buffer can grow.
+    let cap_plus_one = max_output_bytes.saturating_add(1) as u64;
+    let mut bounded = decoder.by_ref().take(cap_plus_one);
+    let _ = bounded.read_to_end(&mut output)?;
+    if output.len() > max_output_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "decompressed_size_exceeds_cap output_bytes={} cap_bytes={}",
+                output.len(), max_output_bytes
+            ),
+        ));
+    }
+    Ok(output)
+}
+
 /// Helper function to get Genesis region by index (0-4)
 #[allow(dead_code)]
 fn get_genesis_region_by_index(index: usize) -> Region {
@@ -22814,23 +23065,39 @@ impl SimplifiedP2P {
         }
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // SECURITY v2.48: Dilithium signature verification (quantum-resistant)
-        // Format: SHA3-256(node_id:reveal_data:nonce:timestamp) → verify signature
+        // MANDATORY SIGNATURE — no legacy bypass.
+        //
+        // Historically this branch had a "legacy mode" that accepted reveals
+        // with an empty signature and only logged a WARN. That was a hole:
+        // any peer (subject to Tier-3 + IP-gate at the receive path, but
+        // NOT at the consensus aggregator) could submit phantom reveals
+        // with no signature and contribute to the 2f+1 macroblock quorum.
+        //
+        // The matched commit handler (`handle_remote_consensus_commit`)
+        // already rejects empty/short signatures unconditionally — this
+        // path now matches it for symmetry and to close the asymmetry hole.
+        // Top-L1 BFT designs never accept unsigned consensus messages.
         // ═══════════════════════════════════════════════════════════════════════════
-        if signature.is_empty() {
-            // Legacy mode - accept without signature but log warning
+        if signature.is_empty() || signature.len() < 100 {
             if crate::node::is_warn() {
-                println!("[WARN][CONS] reveal_no_signature node={} accepting_legacy", node_id);
+                println!(
+                    "[WARN][CONS] reveal_sig_missing_or_short node={} len={} round={} action=reject",
+                    node_id, signature.len(), round_id
+                );
             }
-        } else {
-            // v2.48: Verify Dilithium signature
-            // CRITICAL: Must use SAME format as signing: SHA3-256(message) 
+            self.report_invalid_block(&node_id, round_id, [0u8; 32], "Reveal without signature");
+            return;
+        }
+
+        // v2.48: Verify Dilithium signature
+        // CRITICAL: Must use SAME format as signing: SHA3-256(message)
+        {
             use sha3::{Sha3_256, Digest};
             let message_to_hash = format!("{}:{}:{}:{}", node_id, reveal_data, nonce, timestamp);
             let mut hasher = Sha3_256::new();
             hasher.update(message_to_hash.as_bytes());
             let message_hash = hex::encode(hasher.finalize());
-            
+
             if !self.verify_consensus_signature(&node_id, &message_hash, &signature) {
                 if crate::node::is_warn() {
                     println!("[WARN][CONS] reveal_sig_invalid node={} round={} rejecting", node_id, round_id);
@@ -22838,7 +23105,7 @@ impl SimplifiedP2P {
                 self.report_invalid_block(&node_id, round_id, [0u8; 32], "Invalid reveal signature");
                 return;
             }
-            
+
             if crate::node::is_debug() {
                 println!("[DBG][CONS] reveal_sig_verified node={}", node_id);
             }
@@ -27382,5 +27649,88 @@ mod tests {
         let a16 = extract_subnet_prefix("203.0.113.1", 2);
         let b16 = extract_subnet_prefix("203.0.114.1", 2);
         assert_eq!(a16, b16, "/16 must collapse 113 and 114 into 203.0");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // FIX #20 REGRESSION TESTS — bounded zstd decompression (DoS defence)
+    // ════════════════════════════════════════════════════════════════════
+    // Locks in the invariant that `decompress_zstd_bounded` rejects payloads
+    // whose decompressed size exceeds the caller-supplied cap. A regression
+    // here re-opens the decompression-bomb DoS class on every incoming P2P
+    // path that uses it (MacroBlockBroadcast, sync paths).
+
+    /// Helper: zstd-compress raw bytes for a test fixture.
+    fn zstd_compress_for_test(input: &[u8]) -> Vec<u8> {
+        zstd::encode_all(input, 1).expect("zstd encode must succeed for test input")
+    }
+
+    #[test]
+    fn decompress_zstd_bounded_accepts_payload_below_cap() {
+        // Payload well under the cap: must decode cleanly.
+        let original = b"hello qnet decompression test payload".to_vec();
+        let compressed = zstd_compress_for_test(&original);
+        let decoded = decompress_zstd_bounded(&compressed, 1024).expect("must decode below cap");
+        assert_eq!(decoded, original, "decoded bytes must match original");
+    }
+
+    #[test]
+    fn decompress_zstd_bounded_accepts_payload_at_exact_cap() {
+        // Boundary case: decompressed size equals the cap exactly.
+        // The implementation's `cap_plus_one` reader allows this and the
+        // post-read length check stays `<= cap`. A regression that uses
+        // `< cap` instead would break this test.
+        let original = vec![0xABu8; 8 * 1024];
+        let compressed = zstd_compress_for_test(&original);
+        let decoded = decompress_zstd_bounded(&compressed, original.len())
+            .expect("must accept exact-size payload");
+        assert_eq!(decoded.len(), original.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn decompress_zstd_bounded_rejects_payload_above_cap() {
+        // Bomb-style input: decompressed size exceeds the cap by a single
+        // byte. The cap is the security boundary; +1 must reject.
+        let original = vec![0u8; 4096]; // highly compressible
+        let compressed = zstd_compress_for_test(&original);
+        let result = decompress_zstd_bounded(&compressed, original.len() - 1);
+        assert!(result.is_err(), "must reject when decoded > cap");
+        let err_str = result.err().unwrap().to_string();
+        assert!(
+            err_str.contains("decompressed_size_exceeds_cap"),
+            "error message must name the breached cap, got: {}", err_str
+        );
+    }
+
+    #[test]
+    fn decompress_zstd_bounded_rejects_high_ratio_bomb() {
+        // Realistic decompression-bomb shape: a small input that expands
+        // dramatically. We give the cap headroom for the small input but
+        // not for the expanded output.
+        // 1 MB of repeated zeroes typically compresses to a few KB.
+        let original = vec![0u8; 1 * 1024 * 1024];
+        let compressed = zstd_compress_for_test(&original);
+        // Cap is 4 KB — well above input size, well below decompressed.
+        // This proves the cap operates on OUTPUT, not INPUT.
+        let result = decompress_zstd_bounded(&compressed, 4 * 1024);
+        assert!(result.is_err(), "1 MB-output bomb must be rejected at 4 KB output cap");
+    }
+
+    #[test]
+    fn decompress_zstd_bounded_rejects_malformed_zstd() {
+        // Random bytes that are not a valid zstd stream. The function
+        // must return Err (not panic, not silently produce empty output).
+        let garbage: Vec<u8> = (0..512).map(|i| (i * 7 + 13) as u8).collect();
+        let result = decompress_zstd_bounded(&garbage, 1024);
+        assert!(result.is_err(), "malformed zstd must error, not panic");
+    }
+
+    #[test]
+    fn decompress_zstd_bounded_handles_empty_payload() {
+        // Empty original input compresses to a small valid zstd frame
+        // (header + EOF). Decoding must succeed and yield an empty Vec.
+        let compressed = zstd_compress_for_test(&[]);
+        let decoded = decompress_zstd_bounded(&compressed, 1024).expect("empty input must decode");
+        assert!(decoded.is_empty(), "empty input decodes to empty output");
     }
 }

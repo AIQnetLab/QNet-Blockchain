@@ -1430,48 +1430,64 @@ impl BlockPipeline {
             }
 
             // 3. Signature verification
-            // Genesis block (h=0) uses embedded self-signed keys — skip standard verification
+            // Genesis block (h=0) uses embedded self-signed keys — skip standard verification.
+            // Every other height MUST carry a producer signature; empty sig is a hard reject.
             if mb.height > 0 {
-                // Dilithium/hybrid signature verification via BlockchainNode
-                if !mb.signature.is_empty() {
-                    // v15.4 DIAG: mark op as signature verify. Dilithium3
-                    // verify is a sync C-binding called via an async
-                    // wrapper; if it ever blocks the runtime worker
-                    // thread under load, the watchdog will surface this
-                    // op as the stuck point.
-                    metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_SIG);
-                    let sig_start = std::time::Instant::now();
-                    let verify_ok = match BlockchainNode::verify_microblock_signature(
-                        &decoded.microblock,
-                        &decoded.microblock.producer,
-                        None, // No P2P needed for sync verification
-                    ).await {
-                        Ok(valid) => valid,
-                        Err(e) => {
-                            if is_warn() {
-                                println!("[WARN][PIPELINE] sig_verify_err h={} err={}", mb.height, e);
-                            }
-                            false
-                        }
-                    };
+                // MANDATORY signature: previously empty `mb.signature` slipped past
+                // verification entirely (the surrounding `if !mb.signature.is_empty()`
+                // wrapped the verify call but had no else branch — empty was implicit
+                // accept). Honest producers always emit
+                // "dilithium3_v4:<hex>" via `sign_microblock_with_dilithium`,
+                // so an empty signature on a non-genesis block can only come from
+                // a malformed or hostile sender. Reject hard.
+                if mb.signature.is_empty() {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] sig_missing h={} prod={} from={} action=reject",
+                            mb.height, mb.producer, decoded.from_peer
+                        );
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
 
-                    let sig_elapsed = sig_start.elapsed();
-                    if sig_elapsed > std::time::Duration::from_millis(500) {
+                // v15.4 DIAG: mark op as signature verify. Dilithium3
+                // verify is a sync C-binding called via an async
+                // wrapper; if it ever blocks the runtime worker
+                // thread under load, the watchdog will surface this
+                // op as the stuck point.
+                metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_SIG);
+                let sig_start = std::time::Instant::now();
+                let verify_ok = match BlockchainNode::verify_microblock_signature(
+                    &decoded.microblock,
+                    &decoded.microblock.producer,
+                    None, // No P2P needed for sync verification
+                ).await {
+                    Ok(valid) => valid,
+                    Err(e) => {
                         if is_warn() {
-                            println!(
-                                "[WARN][PIPELINE] slow_signature_verify h={} elapsed_ms={}",
-                                mb.height, sig_elapsed.as_millis()
-                            );
+                            println!("[WARN][PIPELINE] sig_verify_err h={} err={}", mb.height, e);
                         }
+                        false
                     }
-                    if !verify_ok {
-                        if is_warn() {
-                            println!("[WARN][PIPELINE] sig_invalid h={} prod={} from={}",
-                                     mb.height, mb.producer, decoded.from_peer);
-                        }
-                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                        continue;
+                };
+
+                let sig_elapsed = sig_start.elapsed();
+                if sig_elapsed > std::time::Duration::from_millis(500) {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] slow_signature_verify h={} elapsed_ms={}",
+                            mb.height, sig_elapsed.as_millis()
+                        );
                     }
+                }
+                if !verify_ok {
+                    if is_warn() {
+                        println!("[WARN][PIPELINE] sig_invalid h={} prod={} from={}",
+                                 mb.height, mb.producer, decoded.from_peer);
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
             }
 

@@ -453,11 +453,23 @@ async fn verify_compact_binary_signature(
         }
     };
     
-    // Decompress zstd
-    let decompressed = match zstd::decode_all(binary_data.as_slice()) {
+    // Decompress zstd with a HARD output ceiling.
+    //
+    // `zstd::decode_all` allocates whatever the stream demands; an adversarial
+    // input ~1000× its on-the-wire size could OOM every receiver. Honest
+    // compact_bin signatures are ~2.6 KB; the largest plausible variant
+    // (`hybrid_bin` with embedded certificate) is ~5 KB. A 256 KB ceiling
+    // is ~50× the largest legitimate payload — generous head-room for future
+    // protocol additions while making decompression-bomb DoS impossible
+    // in this code path.
+    const MAX_COMPACT_BIN_DECOMPRESSED: usize = 256 * 1024;
+    let decompressed = match decode_zstd_bounded(binary_data.as_slice(), MAX_COMPACT_BIN_DECOMPRESSED) {
         Ok(data) => data,
         Err(e) => {
-            println!("[ERR][CONSENSUS_CRYPTO] compact_bin_decompress_failed err={}", e);
+            println!(
+                "[ERR][CONSENSUS_CRYPTO] compact_bin_decompress_failed input_bytes={} err={}",
+                binary_data.len(), e
+            );
             return false;
         }
     };
@@ -1192,30 +1204,63 @@ async fn verify_with_real_dilithium(
     let signed_message_bytes = &signature_bytes[4..4 + signed_len];
     let public_key_bytes = &signature_bytes[pk_start..pk_start + pk_len];
 
-    // v14.8: Two-tier PK binding.
-    //   Tier 1 (HARD): if node_id is registered, extracted PK must match. A
-    //     mismatch is a hostile self-attested PK — reject hard. This is the
-    //     only check that can prevent a compromised peer from pretending to
-    //     be a different node_id (whose real PK is in the registry).
-    //   Tier 2 (SOFT): if node_id is not yet registered, accept but do NOT
-    //     auto-register from here. Auto-registering from the verify path
-    //     would re-open the race window that register_consensus_pk_from_chain
-    //     exists to close (binding must come from finalised chain state,
-    //     not from the first inbound signature we happen to see). The
-    //     integration layer installs bindings either via genesis anchors or
-    //     during NodeRegistration/NodeReactivation TX application.
+    // ─────────────────────────────────────────────────────────────────────
+    // Identity → public-key binding policy (three tiers)
+    // ─────────────────────────────────────────────────────────────────────
     //
-    // NOTE: the Dilithium3 signature itself is cryptographically verified
-    // further down under `dilithium3::open` regardless of which tier fired —
-    // this block only governs the identity → key binding policy, not the
-    // mathematical validity of the signature.
+    // Tier 1 (HARD MATCH): registry has a binding for `node_id` and the
+    //   extracted PK matches it. The signature is identity-bound.
+    //
+    // Tier 2 (HARD REJECT — non-match): registry has a binding for `node_id`
+    //   and the extracted PK does NOT match. This is a hostile identity
+    //   claim — a peer holding their own valid Dilithium3 keypair attempting
+    //   to spoof an already-bound identity. Reject. There is NO legitimate
+    //   reason to accept a different PK for an identity once the registry
+    //   has locked one in (registry entries are immutable for the process
+    //   lifetime; see register_consensus_pk_from_chain immutability check).
+    //
+    // Tier 3 (POLICY-DEPENDENT — no binding):
+    //   * If `node_id` matches a Genesis pattern (`"genesis_node_*"`):
+    //     HARD REJECT. Genesis identities MUST be in the registry before any
+    //     inbound signature is accepted. They are populated either by
+    //       (1) self-registration at boot (initialize_wallet_identity calls
+    //           register_consensus_pk_from_chain with the local keypair
+    //           BEFORE P2P comes up); or
+    //       (2) the genesis anchor file shipped by the operator
+    //           (install_genesis_anchors_at_startup, then anchored PKs are
+    //           embedded into the genesis NodeRegistration TX which feeds
+    //           cache_node_registrations_from_transactions_with_dashmap →
+    //           register_consensus_pk_from_chain).
+    //     Accepting a first-seen Genesis PK here would lock the identity to
+    //     whatever PK the network sees first, opening the squat-on-bootstrap
+    //     window that the anchor system exists to close.
+    //   * Otherwise (Super-node, Light-node, generic identity):
+    //     Accept (TOFV) and continue to math verification. Super-node
+    //     identities reach steady-state binding via signed
+    //     `NodeRegistration` TX (proof-of-ownership in the TX payload),
+    //     which is applied to chain state and mirrored into this registry
+    //     before any cross-restart binding is needed. The TOFV path lets
+    //     a freshly-joined Super-node's first announcement be accepted in
+    //     the small window between its TX broadcast and chain finality.
+    //
+    // NOTE on math: regardless of tier, the Dilithium3 signature is
+    // cryptographically verified under `dilithium3::open` further down. This
+    // tier block only governs the identity → key binding decision, not the
+    // mathematical validity of the signature itself.
+    //
+    // SCALABILITY: registry uses parking_lot::RwLock + HashMap with capacity
+    // 50K — supports tens of thousands of Super-nodes. Read path is
+    // wait-free; the write path runs exactly once per identity registration
+    // (one-shot per node lifetime). The genesis prefix check is a fixed-cost
+    // string comparison — O(1) regardless of network size.
     {
         let registry = CONSENSUS_PK_REGISTRY.read();
         match registry.get(node_id) {
             Some(registered_pk) if registered_pk == public_key_bytes => {
-                // ok, bound and matches
+                // Tier 1: bound and matches — proceed to math verification.
             }
             Some(registered_pk) => {
+                // Tier 2: bound, mismatch — hostile identity claim. Hard reject.
                 eprintln!("[ERR][CONSENSUS] pk_mismatch node={} registered={}.. extracted={}..",
                          node_id,
                          hex::encode(&registered_pk[..8]),
@@ -1223,8 +1268,35 @@ async fn verify_with_real_dilithium(
                 return false;
             }
             None => {
-                // First-seen — allowed, but logged so integration can audit
-                // which identities slipped past chain-state binding.
+                // Tier 3: policy depends on identity class.
+                if node_id.starts_with("genesis_node_") {
+                    // Genesis identity with no registry binding. The boot
+                    // sequence of every honest node guarantees a binding is
+                    // installed BEFORE P2P traffic is processed, so an
+                    // unbound genesis claim arriving here is either:
+                    //   (a) a race against a not-yet-completed self-register
+                    //       (transient, will resolve on retry/regossip), or
+                    //   (b) a squat attempt from a non-genesis peer.
+                    // Both cases are handled identically by hard-rejecting:
+                    // case (a) self-heals because the legitimate sender's
+                    // gossip continues; case (b) is the attack we exist to
+                    // block.
+                    let extracted_prefix = if public_key_bytes.len() >= 8 {
+                        hex::encode(&public_key_bytes[..8])
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "[CRIT][CONSENSUS] genesis_pk_first_seen_rejected node={} extracted={}.. \
+                         action=hard_reject hint=anchor_or_self_register_must_run_before_p2p",
+                        node_id, extracted_prefix
+                    );
+                    return false;
+                }
+                // Non-genesis identity (Super-node, Light-node, etc.). TOFV
+                // is acceptable; chain-state will lock the canonical binding
+                // shortly via NodeRegistration TX application, after which
+                // any future mismatch is caught by Tier 2 above.
                 if public_key_bytes.len() >= 8 {
                     println!("[WARN][CONSENSUS] pk_first_seen node={} extracted={}..",
                              node_id, hex::encode(&public_key_bytes[..8]));
@@ -1296,4 +1368,116 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     }
     // Use black_box to prevent compiler from optimising the loop away
     std::hint::black_box(diff) == 0
+}
+
+/// Decompress zstd bytes with a hard output ceiling.
+///
+/// Used by every signature-format verifier on the inbound P2P path so a
+/// hostile peer cannot weaponise zstd's typical-thousand-fold expansion
+/// ratio into an OOM. The streaming `Read::take` adapter caps the total
+/// bytes read from the decoder; a payload that decodes to more than
+/// `max_output_bytes` short-circuits with `Err(InvalidData)` before the
+/// inner buffer is allowed to grow further.
+///
+/// Scalability: O(N) in `output_size`. The pre-sized `Vec` capacity is
+/// 1 MiB or `max_output_bytes` (whichever is smaller), so small-but-
+/// frequent verifications do not pay a full max-size allocation each call.
+pub(crate) fn decode_zstd_bounded(input: &[u8], max_output_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = zstd::Decoder::new(input)?;
+    let initial_cap = max_output_bytes.min(1 * 1024 * 1024);
+    let mut output: Vec<u8> = Vec::with_capacity(initial_cap);
+    let cap_plus_one = max_output_bytes.saturating_add(1) as u64;
+    let mut bounded = decoder.by_ref().take(cap_plus_one);
+    let _ = bounded.read_to_end(&mut output)?;
+    if output.len() > max_output_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "decompressed_size_exceeds_cap output_bytes={} cap_bytes={}",
+                output.len(), max_output_bytes
+            ),
+        ));
+    }
+    Ok(output)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// REGRESSION TESTS — Fix #20 (bounded zstd) + Tier-3 binding policy
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests_v17_security {
+    use super::*;
+
+    fn zstd_compress_for_test(input: &[u8]) -> Vec<u8> {
+        zstd::encode_all(input, 1).expect("zstd encode for test must succeed")
+    }
+
+    /// Fix #20: decoded bytes equal input on a payload below the cap.
+    #[test]
+    fn decode_zstd_bounded_accepts_payload_below_cap() {
+        let original = b"compact_bin signature test payload".to_vec();
+        let compressed = zstd_compress_for_test(&original);
+        let decoded = decode_zstd_bounded(&compressed, 1024).expect("below cap must decode");
+        assert_eq!(decoded, original);
+    }
+
+    /// Fix #20: an exact-cap payload is accepted; the implementation's
+    /// `cap_plus_one` reader plus `<= cap` post-check allow equality.
+    #[test]
+    fn decode_zstd_bounded_accepts_payload_at_exact_cap() {
+        let original = vec![0x55u8; 5 * 1024];
+        let compressed = zstd_compress_for_test(&original);
+        let decoded = decode_zstd_bounded(&compressed, original.len())
+            .expect("exact-size must decode");
+        assert_eq!(decoded.len(), original.len());
+    }
+
+    /// Fix #20: decoded bytes one over the cap MUST yield InvalidData.
+    /// Regression here re-opens the bomb class on the consensus layer.
+    #[test]
+    fn decode_zstd_bounded_rejects_payload_above_cap() {
+        let original = vec![0xAAu8; 2048];
+        let compressed = zstd_compress_for_test(&original);
+        let result = decode_zstd_bounded(&compressed, original.len() - 1);
+        assert!(result.is_err(), "must reject above-cap output");
+        let err = result.err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("decompressed_size_exceeds_cap"));
+    }
+
+    /// Fix #20: classic decompression bomb — small input, huge output.
+    /// The cap is on OUTPUT bytes, not input bytes; a small input that
+    /// expands far past the cap MUST be rejected even though the input
+    /// alone is well within any reasonable network packet size.
+    #[test]
+    fn decode_zstd_bounded_rejects_high_ratio_bomb() {
+        // 512 KB of zeros compresses to a few KB — but exceeds an 8 KB
+        // output cap by ~64×. Real-world bombs hit 1000× ratios.
+        let original = vec![0u8; 512 * 1024];
+        let compressed = zstd_compress_for_test(&original);
+        assert!(compressed.len() < 8 * 1024,
+            "fixture sanity: compressed payload must be small relative to original");
+        let result = decode_zstd_bounded(&compressed, 8 * 1024);
+        assert!(result.is_err(), "decompression bomb must be rejected on output cap");
+    }
+
+    /// Fix #20: malformed zstd input MUST return Err (and not panic) so a
+    /// hostile peer cannot crash the verifier with a bogus stream.
+    #[test]
+    fn decode_zstd_bounded_rejects_malformed_input() {
+        let garbage: Vec<u8> = (0..256).map(|i| (i * 31 + 17) as u8).collect();
+        let result = decode_zstd_bounded(&garbage, 4096);
+        assert!(result.is_err(), "malformed zstd must error gracefully");
+    }
+
+    /// Fix #20: empty payload decodes to empty output without error.
+    /// Edge case ensures the bounded reader does not regress to a
+    /// "minimum 1 byte" requirement.
+    #[test]
+    fn decode_zstd_bounded_empty_payload_round_trip() {
+        let compressed = zstd_compress_for_test(&[]);
+        let decoded = decode_zstd_bounded(&compressed, 4096).expect("empty must decode");
+        assert!(decoded.is_empty());
+    }
 }

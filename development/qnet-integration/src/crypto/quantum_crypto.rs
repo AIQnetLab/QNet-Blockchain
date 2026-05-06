@@ -15,14 +15,11 @@ use dashmap::DashMap;
 
 
 
-/// Constant-time byte-slice equality to prevent timing side-channel attacks
-#[inline(never)]
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) { diff |= x ^ y; }
-    std::hint::black_box(diff) == 0
-}
+// `ct_eq` was used by the old STEP-4 fallback in `verify_dilithium_signature`
+// that was removed as part of the v17 identity-binding hardening. The
+// canonical-message comparison now lives entirely inside
+// `qnet_consensus::consensus_crypto::verify_with_real_dilithium`, which has
+// its own constant-time helper. This module no longer needs a local copy.
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCTION v2.51: Lock-free caches with DashMap
@@ -595,113 +592,64 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Invalid signature length: {}", signature_bytes.len()));
         }
 
-        // 3. Try consensus verification (hybrid compact/binary format)
+        // 3. Verify through the consensus-layer canonical path.
+        //
+        //    `verify_consensus_signature` is the ONE function authorised to
+        //    accept or reject a Dilithium3 signature for an identity-bearing
+        //    wire message. It performs the FULL chain of checks:
+        //      a) Decodes the on-the-wire format ("dilithium_sig_<id>_<b64>",
+        //         "compact_bin:<b64>", "hybrid_bin:<b64>", etc.);
+        //      b) Parses the combined `[sig_len][SignedMessage][pk_len][pk]`
+        //         payload and validates structural invariants;
+        //      c) ENFORCES THE (node_id → public_key) BINDING via the
+        //         `CONSENSUS_PK_REGISTRY` — a registered identity whose
+        //         extracted PK does not match yields a hard `pk_mismatch`
+        //         rejection, and an unbound genesis identity yields a hard
+        //         `genesis_pk_first_seen_rejected` (see consensus_crypto.rs);
+        //      d) Verifies the ML-DSA-65 signature math via `dilithium3::open`.
+        //
+        //    HISTORICAL INCIDENT (v15.x / v16.x identity-squat class):
+        //    A previous version of this function carried a "fallback" branch
+        //    that — when the consensus-layer call returned `false` — re-parsed
+        //    the same combined format locally and ran ONLY the math check,
+        //    skipping the registry binding from step (c). That branch let any
+        //    peer with their own valid Dilithium3 keypair forge messages
+        //    claiming any node identity (most damagingly genesis identities
+        //    operated from non-genesis IPs). The math passed because the
+        //    signature WAS valid for the embedded PK; the spoof succeeded
+        //    because the registry binding was never consulted on the second
+        //    pass. We saw the fallout as `pk_mismatch` log spam from the
+        //    consensus-layer detector, paired with `mldsa65_verified` from the
+        //    bypass — the system was correctly detecting the attack, then
+        //    correctly accepting it.
+        //
+        //    DO NOT REINTRODUCE A FALLBACK HERE.
+        //
+        //    A `false` return from `verify_consensus_signature` is FINAL.
+        //    It already covers every legitimate branch including the
+        //    bootstrap (None / TOFV) case for non-genesis identities.
         let is_valid = qnet_consensus::consensus_crypto::verify_consensus_signature(
             wallet_address,
             data,
             &signature.signature
         ).await;
-        
+
         if is_valid {
             println!("[INFO][QUANTUM_CRYPTO] dilithium_verified");
-            return Ok(true);
-        }
-        
-        // 4. Parse combined Dilithium3 format and verify directly
-        // Format: [sig_len(4)] + [SignedMessage] + [pk_len(4)] + [public_key(1952)]
-        if signature_bytes.len() < 8 {
-            return Err(anyhow!("Signature too short: {} bytes", signature_bytes.len()));
-        }
-        
-        let mut cursor = 0;
-        
-        // Read signed message length (signature + message combined)
-        let signed_len = u32::from_le_bytes([
-            signature_bytes[cursor],
-            signature_bytes[cursor + 1],
-            signature_bytes[cursor + 2],
-            signature_bytes[cursor + 3],
-        ]) as usize;
-        cursor += 4;
-        
-        if cursor + signed_len > signature_bytes.len() {
-            return Err(anyhow!("Invalid signature format: signed message truncated"));
-        }
-        
-        // Extract signed message bytes (signature + message)
-        let signed_bytes = &signature_bytes[cursor..cursor + signed_len];
-        cursor += signed_len;
-        
-        // Read public key length
-        if cursor + 4 > signature_bytes.len() {
-            return Err(anyhow!("Invalid signature format: missing public key length"));
-        }
-        
-        let pk_len = u32::from_le_bytes([
-            signature_bytes[cursor],
-            signature_bytes[cursor + 1],
-            signature_bytes[cursor + 2],
-            signature_bytes[cursor + 3],
-        ]) as usize;
-        cursor += 4;
-        
-        // NIST FIPS 204: Dilithium3 public key MUST be exactly 1952 bytes
-        if pk_len != 1952 {
-            return Err(anyhow!("Invalid public key size: {} (expected 1952)", pk_len));
-        }
-        
-        if cursor + pk_len != signature_bytes.len() {
-            return Err(anyhow!("Invalid signature format: public key size mismatch"));
-        }
-        
-        // Extract public key bytes
-        let pk_bytes = &signature_bytes[cursor..cursor + pk_len];
-        
-        println!("[INFO][QUANTUM_CRYPTO] dilithium3_verify_nist_fips204");
-        println!("[DEBUG][QUANTUM_CRYPTO] signed_msg_len={}", signed_len);
-        println!("[DEBUG][QUANTUM_CRYPTO] pk_len={}", pk_len);
-        
-        // PRODUCTION: Use REAL Dilithium3 verification from pqcrypto
-        use pqcrypto_mldsa::mldsa65 as dilithium3;
-        use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SignedMessage as PQSignedMessage};
-        
-        // Parse Dilithium3 public key
-        let public_key = match dilithium3::PublicKey::from_bytes(pk_bytes) {
-            Ok(pk) => pk,
-            Err(_) => {
-                println!("[ERR][QUANTUM_CRYPTO] dilithium3_pk_invalid");
-                return Err(anyhow!("Invalid Dilithium3 public key"));
-            }
-        };
-        
-        // Parse signed message (signature + message concatenated)
-        let signed_message = match dilithium3::SignedMessage::from_bytes(signed_bytes) {
-            Ok(sm) => sm,
-            Err(_) => {
-                println!("[ERR][QUANTUM_CRYPTO] dilithium3_signed_msg_invalid");
-                return Err(anyhow!("Invalid Dilithium3 signed message"));
-            }
-        };
-        
-        // REAL cryptographic verification using dilithium3::open()
-        match dilithium3::open(&signed_message, &public_key) {
-            Ok(recovered_message) => {
-                // Verify recovered message matches expected data
-                let expected_bytes = data.as_bytes();
-                
-                if ct_eq(recovered_message.as_slice(), expected_bytes) {
-                    println!("[INFO][QUANTUM_CRYPTO] mldsa65_verified fips=204");
-                    Ok(true)
+            Ok(true)
+        } else {
+            // Consensus-layer rejection is final — registry mismatch, malformed
+            // payload, or math failure. Caller decides how to react (drop the
+            // message, score the peer, etc.); we just propagate the verdict.
+            if crate::node::is_warn() {
+                let display = if wallet_address.len() > 16 {
+                    &wallet_address[..16]
                 } else {
-                    println!("[ERR][QUANTUM_CRYPTO] dilithium3_msg_mismatch");
-                    println!("[DEBUG][QUANTUM_CRYPTO] expected_len={} recovered_len={}", expected_bytes.len(), recovered_message.len());
-                    Ok(false)
-                }
+                    wallet_address
+                };
+                println!("[WARN][QUANTUM_CRYPTO] consensus_verify_rejected id={}", display);
             }
-            Err(_) => {
-                println!("[ERR][QUANTUM_CRYPTO] dilithium3_sig_invalid");
-                Ok(false)
-            }
+            Ok(false)
         }
     }
 

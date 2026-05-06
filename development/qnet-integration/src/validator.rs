@@ -67,19 +67,58 @@ impl BlockValidator {
         if tx.hash.is_empty() {
             return Err(IntegrationError::ValidationError("Transaction hash cannot be empty".to_string()));
         }
-        
+
         if tx.from.is_empty() {
             return Err(IntegrationError::ValidationError("Transaction sender cannot be empty".to_string()));
         }
-        
+
         // CRITICAL: NodeActivation has special amount rules based on phase
         // Skip general amount check for NodeActivation (validated in validate_transaction_type)
         let is_node_activation = matches!(tx.tx_type, TransactionType::NodeActivation { .. });
-        
+
         if tx.amount == 0 && !is_node_activation {
             return Err(IntegrationError::ValidationError("Transaction amount cannot be zero".to_string()));
         }
-        
+
+        // ════════════════════════════════════════════════════════════════════
+        // SENDER-IDENTITY ENFORCEMENT (wallet-impersonation defence)
+        // ════════════════════════════════════════════════════════════════════
+        // For TX types that carry a payload `from` field, the canonical signing
+        // message binds `tx.from`, while `apply_to_state` reads the payload
+        // `from`. A mismatch lets a peer drain an arbitrary victim wallet:
+        // attacker signs over their own `tx.from` (signature verifies against
+        // attacker's PK), the apply path then mutates the victim account named
+        // by the unsigned payload field. Reject mismatched pairs at the
+        // mempool boundary so the spoofed TX never reaches block construction.
+        //
+        // The same gate fires again at `qnet_state::Transaction::validate` and
+        // `apply_to_state` for defence in depth — see the matching comments
+        // there. Honest clients always emit matching pairs; mismatch is
+        // unambiguously hostile.
+        //
+        // Applies to Transfer (payload-`from` arm) and Swap (payload-`from`
+        // arm). Other TX types either bind via `tx.from` directly or have
+        // payload `from` constrained to be the chain-validated TX sender.
+        match &tx.tx_type {
+            TransactionType::Transfer { from, .. } if from != &tx.from => {
+                return Err(IntegrationError::ValidationError(format!(
+                    "Transfer payload `from` ({}) does not match TX sender ({}). \
+                     Wallet-impersonation rejected.",
+                    &from[..from.len().min(20)],
+                    &tx.from[..tx.from.len().min(20)]
+                )));
+            }
+            TransactionType::Swap { from, .. } if from != &tx.from => {
+                return Err(IntegrationError::ValidationError(format!(
+                    "Swap payload `from` ({}) does not match TX sender ({}). \
+                     Wallet-impersonation rejected.",
+                    &from[..from.len().min(20)],
+                    &tx.from[..tx.from.len().min(20)]
+                )));
+            }
+            _ => {}
+        }
+
         // Validate transaction type
         self.validate_transaction_type(&tx.tx_type)?;
         
@@ -753,8 +792,17 @@ impl BlockValidator {
                 if pool_address.is_empty() {
                     return Err(IntegrationError::ValidationError("DEX pool address cannot be empty".to_string()));
                 }
+                // SENDER-IDENTITY ENFORCEMENT for Swap is enforced one layer up
+                // in `validate_transaction` where the parent `&Transaction` (and
+                // therefore `tx.from`) is in scope. This function takes only
+                // `&TransactionType`, so the binding check cannot live here
+                // without a signature change. The state-layer
+                // `qnet_state::Transaction::validate` is the canonical gate;
+                // see also the apply-time defence-in-depth in
+                // `transaction.rs::apply_to_state` Swap arm.
+                let _ = from;
                 // amount_out_min can be 0 (no slippage protection - risky but allowed)
-                let _ = amount_out_min; // Explicitly mark as intentionally unused here
+                let _ = amount_out_min;
                 // v3.18: Gas fee goes directly to block producer (Pool 2 removed)
             }
             TransactionType::NodeRegistration { node_id, wallet_address, .. } => {

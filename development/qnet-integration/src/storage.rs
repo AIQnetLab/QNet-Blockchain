@@ -8742,18 +8742,25 @@ impl Storage {
     //   3. reads `consensus_data.snapshot_root` from that macroblock,
     //   4. compares — accepts on match, ROLLS BACK on mismatch.
     //
-    // Graceful degradation: when the macroblock is unreachable (network
-    // partition, very early bootstrap before any macroblock has propagated)
-    // OR when `snapshot_root = None` (legacy macroblocks created before this
-    // revision), verification is skipped with a WARN log instead of
-    // returning an error. This preserves operational liveness while still
-    // logging the unverified state for operator review.
+    // BYZANTINE-SAFE BINDING: snapshot acceptance requires a consensus-
+    // finalised `snapshot_root` from the binding macroblock. The previous
+    // implementation had three "graceful degradation" exits that accepted
+    // snapshots without verification:
+    //
+    //   * `verifier_macroblock_fetch_failed` — peer returned no macroblock
+    //   * `verifier_macroblock_unavailable`  — local cache miss after fetch
+    //   * `verifier_no_binding`              — macroblock had `snapshot_root = None`
+    //
+    // Each of those let an attacker peer feed an arbitrary snapshot whenever
+    // the local node could not retrieve the matching macroblock — and with
+    // a controlled peer that's trivially arrangeable. Now every failure
+    // returns Err so the caller falls through to byzantine-safe
+    // block-by-block sync. Liveness cost is one extra sync round-trip;
+    // safety gain is no attacker-controlled state contamination.
     //
     // Rollback: on digest mismatch the snapshot keys
     // (`full_snap_{height}` / `state_snap_{height}`) are deleted to prevent
-    // the bad data from being read by subsequent state-recovery passes. The
-    // function returns Err so the caller falls through to block-by-block
-    // sync — slower but byzantine-safe.
+    // the bad data from being read by subsequent state-recovery passes.
     //
     // Scalability: O(1) per bootstrap (one SHA3 over the snapshot, one
     // macroblock fetch). Independent of validator committee size. The
@@ -8789,11 +8796,14 @@ impl Storage {
                 if let Err(e) = p2p.sync_macroblocks(mb_idx, mb_idx).await {
                     if crate::node::is_warn() {
                         println!(
-                            "[WARN][SYNC] verifier_macroblock_fetch_failed mb={} err={} mode=unverified_accept",
+                            "[WARN][SYNC] verifier_macroblock_fetch_failed mb={} err={} action=reject_snapshot",
                             mb_idx, e,
                         );
                     }
-                    return Ok(()); // graceful degradation
+                    return Err(IntegrationError::Other(format!(
+                        "snapshot_binding_unavailable mb={} reason=mb_fetch_failed",
+                        mb_idx
+                    )));
                 }
                 match self.get_macroblock_by_height(mb_idx)
                     .map_err(|e| IntegrationError::Other(format!("mb_reload_err mb={} err={:?}", mb_idx, e)))?
@@ -8802,11 +8812,14 @@ impl Storage {
                     None => {
                         if crate::node::is_warn() {
                             println!(
-                                "[WARN][SYNC] verifier_macroblock_unavailable mb={} mode=unverified_accept",
+                                "[WARN][SYNC] verifier_macroblock_unavailable mb={} action=reject_snapshot",
                                 mb_idx,
                             );
                         }
-                        return Ok(()); // graceful degradation
+                        return Err(IntegrationError::Other(format!(
+                            "snapshot_binding_unavailable mb={} reason=mb_post_fetch_miss",
+                            mb_idx
+                        )));
                     }
                 }
             }
@@ -8817,11 +8830,14 @@ impl Storage {
             Err(e) => {
                 if crate::node::is_warn() {
                     println!(
-                        "[WARN][SYNC] verifier_macroblock_decode_failed mb={} err={} mode=unverified_accept",
+                        "[WARN][SYNC] verifier_macroblock_decode_failed mb={} err={} action=reject_snapshot",
                         mb_idx, e,
                     );
                 }
-                return Ok(());
+                return Err(IntegrationError::Other(format!(
+                    "snapshot_binding_unavailable mb={} reason=mb_decode_failed err={}",
+                    mb_idx, e
+                )));
             }
         };
 
@@ -8829,18 +8845,22 @@ impl Storage {
         let expected_root = match macroblock.consensus_data.snapshot_root {
             Some(r) => r,
             None => {
-                // Pre-binding macroblocks from earlier protocol revisions —
-                // accept the snapshot via the legacy chunked-manifest path
-                // alone. New deployments will produce bound macroblocks at
-                // the next boundary height and verification will activate
-                // automatically.
-                if crate::node::is_info() {
+                // No snapshot_root in the binding macroblock — cannot verify.
+                // Reject and let the caller fall through to block-by-block
+                // sync. Pre-binding (legacy) macroblocks should not appear
+                // in a freshly-deployed network; if seen during a protocol
+                // upgrade, operator must produce a fresh macroblock at the
+                // next boundary before snapshot-based sync resumes.
+                if crate::node::is_warn() {
                     println!(
-                        "[INFO][SYNC] verifier_no_binding mb={} snapshot_h={} mode=legacy_accept",
+                        "[WARN][SYNC] verifier_no_binding mb={} snapshot_h={} action=reject_snapshot",
                         mb_idx, snapshot_height,
                     );
                 }
-                return Ok(());
+                return Err(IntegrationError::Other(format!(
+                    "snapshot_binding_missing mb={} reason=mb_has_no_snapshot_root",
+                    mb_idx
+                )));
             }
         };
 

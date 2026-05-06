@@ -10799,14 +10799,52 @@ async fn handle_register_node(
     // v4.5: PURE STATELESS VERIFICATION — code is self-contained!
     // Code = XOR(wallet_prefix, SHA3(burn_tx_hash:node_type:burn_amount))
     // Decrypt code → compare wallet → verify burn on Solana. NO node state needed.
-    // Genesis codes: bypass (QNET-BOOT-*-STRAP format, IP-based auth).
+    //
+    // Genesis bootstrap codes (`QNET-BOOT-XXXX-STRAP`) bypass the burn check
+    // because the 5 anchored bootstrap identities are funded by network policy,
+    // not on-chain burn. The bootstrap codes are PUBLIC (baked into every
+    // binary in `GENESIS_BOOTSTRAP_CODES`), so without an IP gate any peer
+    // could submit a registration with a bootstrap code and skip the
+    // economic gate entirely. We require the request to arrive from one of
+    // the canonical Genesis IPs (`GENESIS_NODE_IPS`) — same defence-in-depth
+    // pattern used at the P2P layer for genesis-bearing messages.
+    //
+    // Note on identity: even when the bypass is allowed, the resulting
+    // `node_id` is `super_QNET-BOOT-NNNN-STRAP` (not `genesis_node_NNN`),
+    // so this gate prevents free-burn squatting, not genesis identity
+    // squatting (the latter is closed by the registry binding + IP gate
+    // covered elsewhere).
     // ═══════════════════════════════════════════════════════════════════════════════
     {
-        let is_genesis_code = activation_code.starts_with("QNET-BOOT-") 
+        let is_genesis_code = activation_code.starts_with("QNET-BOOT-")
             && activation_code.ends_with("-STRAP");
-        
+
         if is_genesis_code {
-            println!("[INFO][REGISTER] genesis_code_bypass code={}...", &activation_code[..16.min(activation_code.len())]);
+            // IP-based authentication for genesis bootstrap codes.
+            let sender_ip = remote_addr
+                .map(|a| a.ip().to_string())
+                .unwrap_or_default();
+            let from_genesis_ip = !sender_ip.is_empty()
+                && crate::genesis_constants::GENESIS_NODE_IPS
+                    .iter()
+                    .any(|(ip, _)| *ip == sender_ip);
+            if !from_genesis_ip {
+                println!(
+                    "[WARN][REGISTER] genesis_code_from_non_genesis_ip code={}... sender_ip={} action=reject",
+                    &activation_code[..16.min(activation_code.len())],
+                    sender_ip
+                );
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Genesis bootstrap codes are restricted to anchored Genesis IPs",
+                    "hint": "Use a code derived from your burn_tx_hash for non-genesis registration"
+                })));
+            }
+            println!(
+                "[INFO][REGISTER] genesis_code_bypass code={}... ip={}",
+                &activation_code[..16.min(activation_code.len())],
+                sender_ip
+            );
         } else {
             let registry = &*GLOBAL_ACTIVATION_REGISTRY;
             

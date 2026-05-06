@@ -1037,14 +1037,33 @@ impl Transaction {
         
         // Type-specific validation
         match &self.tx_type {
-            TransactionType::Transfer { amount, .. } => {
-                // v3.0: Self-transfers are ALLOWED (like Bitcoin, Ethereum, Solana)
-                // Use cases: testing, nonce increment, consolidation
+            TransactionType::Transfer { from, amount, .. } => {
+                // v3.0: Self-transfers are ALLOWED (testing, nonce increment, consolidation).
                 if *amount == 0 {
                     return Err("[REJECT][TX] zero_transfer_amount".to_string());
                 }
                 if self.to.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
                     return Err("[REJECT][TX] empty_recipient_address".to_string());
+                }
+                // SENDER-IDENTITY ENFORCEMENT
+                // ────────────────────────────
+                // The TX-level sender (`self.from`) is the wallet whose Dilithium3
+                // keypair signed the canonical bytes; it is also the wallet whose
+                // registered PK is checked against `self.dilithium_public_key` at
+                // apply time. The payload `from` field inside `Transfer` MUST equal
+                // `self.from` — without this check, a peer could craft a TX whose
+                // signed canonical message names ATTACKER as sender (sig verifies
+                // against attacker's PK) while the apply path mutates VICTIM's
+                // account because `apply_to_state` reads `accounts[Transfer.from]`.
+                // Every honest wallet client emits matching pairs; mismatch is
+                // unambiguously hostile.
+                if from != &self.from {
+                    return Err(format!(
+                        "[REJECT][TX] transfer_sender_mismatch tx_from={} payload_from={} \
+                         action=reject hint=payload_from_must_equal_tx_from",
+                        &self.from[..self.from.len().min(20)],
+                        &from[..from.len().min(20)]
+                    ));
                 }
             }
             TransactionType::NodeActivation { amount, phase, .. } => {
@@ -1087,8 +1106,26 @@ impl Transaction {
                 if pool_address.is_empty() {
                     return Err("[REJECT][SWAP] empty_pool_address".to_string());
                 }
+                // SENDER-IDENTITY ENFORCEMENT
+                // ────────────────────────────
+                // Same threat model as Transfer above: `apply_to_state` mutates
+                // `accounts[Swap.from]` which carries the QNC debit and the
+                // pool deposit. The signing canonical message names `self.from`,
+                // not `Swap.from`, so without this gate any peer can submit a
+                // Swap whose payload `from` is an arbitrary victim wallet —
+                // signature still verifies against the attacker's registered
+                // PK, but the apply path drains the victim's balance. Every
+                // honest DEX client emits matching pairs; mismatch is hostile.
+                if from != &self.from {
+                    return Err(format!(
+                        "[REJECT][SWAP] sender_mismatch tx_from={} payload_from={} \
+                         action=reject hint=payload_from_must_equal_tx_from",
+                        &self.from[..self.from.len().min(20)],
+                        &from[..from.len().min(20)]
+                    ));
+                }
                 // amount_out_min can be 0 (no slippage protection, risky but allowed)
-                let _ = amount_out_min; // Explicitly mark as intentionally unused here
+                let _ = amount_out_min;
             }
             TransactionType::RewardDistribution => {
                 // No additional validation needed for RewardDistribution
@@ -1538,6 +1575,21 @@ impl Transaction {
 
         match &self.tx_type {
             TransactionType::Transfer { from, to, amount } => {
+                // DEFENCE-IN-DEPTH: payload `from` MUST equal TX-level `self.from`.
+                // The same check fires at `validate()` so this branch is
+                // unreachable on a well-formed TX, but a state-apply layer
+                // that trusts `validate()` exclusively breaks defence-in-depth:
+                // if a future code path enters `apply_to_state` without a
+                // prior validate (block replay, snapshot recovery, internal
+                // construction), the wallet-impersonation route would re-open.
+                // This guard makes the invariant locally provable.
+                if from != &self.from {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "[REJECT][TX] transfer_sender_mismatch_at_apply tx_from={} payload_from={}",
+                        &self.from[..self.from.len().min(20)],
+                        &from[..from.len().min(20)]
+                    )));
+                }
                 // Get sender account
                 let sender = accounts.get_mut(from)
                     .ok_or_else(|| StateError::AccountNotFound(from.clone()))?;
@@ -2111,6 +2163,20 @@ impl Transaction {
             TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, amount_out, pool_address } => {
                 // Token swap via DEX
                 // v3.18: Gas fee goes directly to block producer (Pool 2 removed)
+                // DEFENCE-IN-DEPTH: see Transfer arm above for full rationale.
+                // Payload `from` MUST equal TX-level `self.from` — the canonical
+                // signing message binds `self.from`, not `Swap.from`, so a
+                // mismatch is an attempted wallet-impersonation drain. The
+                // matching `validate()` check is the primary gate; this is
+                // the locally-provable invariant for future apply-only paths
+                // (snapshot recovery, internal construction).
+                if from != &self.from {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "[REJECT][SWAP] sender_mismatch_at_apply tx_from={} payload_from={}",
+                        &self.from[..self.from.len().min(20)],
+                        &from[..from.len().min(20)]
+                    )));
+                }
                 let sender = accounts.get_mut(from)
                     .ok_or_else(|| StateError::AccountNotFound(from.clone()))?;
 
@@ -3068,6 +3134,215 @@ pub fn update_dynamic_gas_pricing(new_pricing: DynamicGasPricing) {
     match DYNAMIC_GAS_PRICING.write() {
         Ok(mut guard) => *guard = Some(new_pricing),
         Err(poisoned) => *poisoned.into_inner() = Some(new_pricing),
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// REGRESSION TESTS — Fix #19 (Transfer/Swap wallet impersonation)
+// ════════════════════════════════════════════════════════════════════════════
+// These tests pin the security invariant that the payload `from` field on
+// Transfer / Swap transactions MUST equal the TX-level sender (`tx.from`).
+// The original bug: the canonical signing message bound `tx.from`, but
+// `apply_to_state` mutated `accounts[payload.from]`. Without this gate any
+// peer could submit a TX whose signature verified against THEIR registered
+// PK while debiting an arbitrary VICTIM wallet.
+//
+// Tests cover BOTH `validate()` (mempool / RPC ingest gate) and
+// `apply_to_state()` (defence-in-depth at state mutation time).
+#[cfg(test)]
+mod tests_v17_swap_sender {
+    use super::*;
+    use crate::account::Account;
+
+    // The two genesis wallets below are real production EON addresses used
+    // by `genesis_node_001` and `genesis_node_002`. They satisfy
+    // `is_valid_eon_address` (45 chars, embedded "eon" marker, valid SHA3
+    // checksum). Hard-coding them here keeps the tests independent of
+    // runtime checksum computation while exercising real-shaped data.
+    const ATTACKER: &str = "f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab";
+    const VICTIM:   &str = "0bac6225a082de1f659eond0c96f1706cf19cc7abf70a";
+
+    fn make_transfer_tx(tx_from: &str, payload_from: &str, to: &str, amount: u64) -> Transaction {
+        // Construct via direct struct init so we can set `payload_from`
+        // independently of `tx_from` — the very mismatch the fix forbids.
+        let mut tx = Transaction {
+            hash: String::new(),
+            from: tx_from.to_string(),
+            to: Some(to.to_string()),
+            amount,
+            nonce: 1,
+            gas_price: 100_000,
+            gas_limit: gas_limits::TRANSFER,
+            timestamp: 1_700_000_000,
+            signature: None,
+            public_key: None,
+            tx_type: TransactionType::Transfer {
+                from: payload_from.to_string(),
+                to: to.to_string(),
+                amount,
+            },
+            data: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    fn make_swap_tx(tx_from: &str, payload_from: &str) -> Transaction {
+        let pool = "1234567890123456789eonabcdef0123456789ab12345678";
+        let mut tx = Transaction {
+            hash: String::new(),
+            from: tx_from.to_string(),
+            to: Some(pool.to_string()),
+            amount: 0,
+            nonce: 1,
+            gas_price: 100_000,
+            gas_limit: gas_limits::CONTRACT_CALL,
+            timestamp: 1_700_000_000,
+            signature: None,
+            public_key: None,
+            tx_type: TransactionType::Swap {
+                from: payload_from.to_string(),
+                token_in: "QNC".to_string(),
+                token_out: "TOK".to_string(),
+                amount_in: 1_000,
+                amount_out_min: 0,
+                amount_out: 0,
+                pool_address: pool.to_string(),
+            },
+            data: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    /// Fix #19 (validate, Transfer): matching `tx.from` and payload `from`
+    /// MUST pass. This proves the gate does not over-fire on legitimate TXs.
+    #[test]
+    fn transfer_validate_accepts_matching_from() {
+        let tx = make_transfer_tx(ATTACKER, ATTACKER, VICTIM, 1_000);
+        // Validate may reject for unrelated reasons (signature absent), but
+        // it must NOT reject with a sender_mismatch reason. We assert the
+        // specific error we care about does not appear.
+        match tx.validate() {
+            Ok(()) => {} // acceptable — fully valid
+            Err(msg) => {
+                assert!(
+                    !msg.contains("transfer_sender_mismatch"),
+                    "matching from must not trigger sender_mismatch, got: {}", msg
+                );
+            }
+        }
+    }
+
+    /// Fix #19 (validate, Transfer): MISMATCHED payload `from` MUST be
+    /// rejected. This is the primary security invariant — a regression
+    /// here directly re-opens the wallet-drain attack.
+    #[test]
+    fn transfer_validate_rejects_mismatched_from() {
+        let tx = make_transfer_tx(ATTACKER, VICTIM, VICTIM, 1_000);
+        let result = tx.validate();
+        assert!(result.is_err(), "mismatched Transfer.from must be rejected");
+        let msg = result.err().unwrap();
+        assert!(
+            msg.contains("transfer_sender_mismatch"),
+            "rejection must name the specific gate, got: {}", msg
+        );
+    }
+
+    /// Fix #19 (validate, Swap): matching `tx.from` and payload `from`
+    /// passes the sender gate.
+    #[test]
+    fn swap_validate_accepts_matching_from() {
+        let tx = make_swap_tx(ATTACKER, ATTACKER);
+        match tx.validate() {
+            Ok(()) => {}
+            Err(msg) => {
+                assert!(
+                    !msg.contains("[REJECT][SWAP] sender_mismatch"),
+                    "matching from must not trigger SWAP sender_mismatch, got: {}", msg
+                );
+            }
+        }
+    }
+
+    /// Fix #19 (validate, Swap): mismatched `Swap.from` MUST be rejected.
+    /// Same security invariant as Transfer — this is the gate against
+    /// the DEX wallet-drain variant.
+    #[test]
+    fn swap_validate_rejects_mismatched_from() {
+        let tx = make_swap_tx(ATTACKER, VICTIM);
+        let result = tx.validate();
+        assert!(result.is_err(), "mismatched Swap.from must be rejected");
+        let msg = result.err().unwrap();
+        assert!(
+            msg.contains("[REJECT][SWAP] sender_mismatch"),
+            "rejection must name the specific gate, got: {}", msg
+        );
+    }
+
+    /// Fix #19 (apply, Transfer): defence-in-depth — even if a Transaction
+    /// somehow reaches `apply_to_state` with a mismatched payload `from`
+    /// (e.g. via a code path that skipped `validate()`), the apply layer
+    /// MUST still reject. Locks in the second-line gate.
+    #[test]
+    fn transfer_apply_rejects_mismatched_from() {
+        let tx = make_transfer_tx(ATTACKER, VICTIM, VICTIM, 1_000);
+        let mut accounts: HashMap<String, Account> = HashMap::new();
+        // Seed the victim account with balance so the only failure mode
+        // we can hit is the mismatch gate, not "AccountNotFound".
+        let mut victim_acct = Account::default();
+        victim_acct.balance = 1_000_000;
+        accounts.insert(VICTIM.to_string(), victim_acct);
+        let mut attacker_acct = Account::default();
+        attacker_acct.balance = 1_000_000;
+        accounts.insert(ATTACKER.to_string(), attacker_acct);
+
+        let result = tx.apply_to_state(&mut accounts);
+        assert!(result.is_err(), "apply must reject mismatched Transfer.from");
+        let err_str = format!("{:?}", result.err().unwrap());
+        assert!(
+            err_str.contains("transfer_sender_mismatch_at_apply"),
+            "apply-layer rejection must name the at_apply gate, got: {}", err_str
+        );
+
+        // Critical post-condition: VICTIM's balance MUST NOT have changed.
+        assert_eq!(
+            accounts.get(VICTIM).map(|a| a.balance), Some(1_000_000),
+            "victim balance must be untouched after rejection"
+        );
+    }
+
+    /// Fix #19 (apply, Swap): same defence-in-depth invariant for Swap.
+    #[test]
+    fn swap_apply_rejects_mismatched_from() {
+        let tx = make_swap_tx(ATTACKER, VICTIM);
+        let mut accounts: HashMap<String, Account> = HashMap::new();
+        let mut victim_acct = Account::default();
+        victim_acct.balance = 1_000_000;
+        accounts.insert(VICTIM.to_string(), victim_acct);
+        let mut attacker_acct = Account::default();
+        attacker_acct.balance = 1_000_000;
+        accounts.insert(ATTACKER.to_string(), attacker_acct);
+
+        let result = tx.apply_to_state(&mut accounts);
+        assert!(result.is_err(), "apply must reject mismatched Swap.from");
+        let err_str = format!("{:?}", result.err().unwrap());
+        assert!(
+            err_str.contains("sender_mismatch_at_apply"),
+            "apply-layer rejection must name the at_apply gate, got: {}", err_str
+        );
+
+        // Victim balance untouched.
+        assert_eq!(
+            accounts.get(VICTIM).map(|a| a.balance), Some(1_000_000),
+            "victim balance must be untouched after Swap apply rejection"
+        );
     }
 }
 

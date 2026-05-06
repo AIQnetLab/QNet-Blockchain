@@ -2947,6 +2947,24 @@ impl BlockchainNode {
         use crate::crypto::vrf::WalletIdentity;
         use pqcrypto_traits::sign::{PublicKey as PkTrait, SecretKey as SkTrait};
 
+        // ─────────────────────────────────────────────────────────────────
+        // ANCHOR INSTALL MUST PRECEDE THE STRICT GUARD
+        // ─────────────────────────────────────────────────────────────────
+        // The strict guard below consults `get_consensus_pk_anchor`, which
+        // reads the anchor map populated by `install_genesis_anchors_at_startup`.
+        // Historically the anchor install ran inside `start()` AFTER node
+        // construction (which is what runs `initialize_wallet_identity`),
+        // so the anchor map was empty at strict-guard time and the guard
+        // silently no-op'd. Calling the installer here as the first action
+        // of `initialize_wallet_identity` puts the file load BEFORE the
+        // strict guard so the guard can actually do its job.
+        //
+        // Idempotency: `install_genesis_anchors_at_startup` is a no-op once
+        // the consensus-layer anchor map is populated (immutable singleton).
+        // Calling it twice (here + in `start()`) costs at most one extra
+        // file-existence check and one log line.
+        let _ = crate::genesis_constants::install_genesis_anchors_at_startup();
+
         // Load or generate persistent Dilithium3 keypair
         let key_dir = std::path::PathBuf::from("/app/data/keys");
         let km = DilithiumKeyManager::new(self.node_id.clone(), &key_dir)
@@ -3082,16 +3100,41 @@ impl BlockchainNode {
         self.wallet_identity.clone()
     }
 
-    /// v4.0: Verify VRF proof in received microblock
-    /// Uses producer's registered Dilithium3 public key from VRF_PK_REGISTRY
+    /// v4.0: Verify VRF proof in received microblock.
+    /// Uses producer's registered Dilithium3 public key from VRF_PK_REGISTRY.
+    ///
+    /// Genesis block (h=0) has no VRF fields and is bypassed by the caller
+    /// at `verify_microblock_signature` before reaching here. Every other
+    /// height MUST carry both `vrf_output` and `vrf_proof` — these are the
+    /// cryptographic witness that the producer was the leader elected for
+    /// `(previous_hash, height)`. Missing VRF fields previously got a free
+    /// pass under a "legacy block" comment, which let a forged or
+    /// non-elected producer's block in if accompanied by a valid producer
+    /// signature. We now reject hard.
     pub fn verify_block_vrf_proof(
         microblock: &qnet_state::MicroBlock,
     ) -> Result<bool, String> {
         use crate::crypto::vrf::DilithiumVrf;
 
+        // Genesis (h=0) is the only height for which no VRF election ran.
+        // Genuine height>0 microblocks always have both VRF fields populated
+        // by `sign_microblock_with_dilithium`'s producer path. Anything else
+        // is malformed or hostile.
+        if microblock.height == 0 {
+            return Ok(true);
+        }
+
         let (vrf_output, vrf_proof) = match (&microblock.vrf_output, &microblock.vrf_proof) {
             (Some(out), Some(proof)) => (*out, proof.clone()),
-            _ => return Ok(true), // No VRF fields = legacy block, skip
+            _ => {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][VRF] missing_vrf_fields h={} producer={} action=reject",
+                        microblock.height, microblock.producer
+                    );
+                }
+                return Ok(false);
+            }
         };
 
         // Lookup producer's registered VRF public key
@@ -9108,12 +9151,71 @@ impl BlockchainNode {
             p2p.set_wallet_identity(identity.clone());
         }
 
-        // v4.6: Delayed VRF key announce — wait for QUIC connections to establish
+        // BOOTSTRAP-WINDOW MINIMISATION: aggressive VrfKeyAnnounce schedule.
+        //
+        // Why so aggressive
+        // ─────────────────
+        // Each genesis identity self-registers in its OWN registry at boot
+        // (initialize_wallet_identity → register_consensus_pk_from_chain).
+        // Cross-registration happens ONLY after peers receive a verified
+        // `VrfKeyAnnounce`. Until cross-registration completes, the Tier-3
+        // hard-reject for unbound genesis identities (consensus_crypto.rs)
+        // drops every inter-genesis non-Vrf message.
+        //
+        // The historical one-shot 15s timer left a 15-20s blackout window
+        // during which producer/heartbeat/active-announce traffic was
+        // discarded — visible on a fresh cluster as missed early blocks
+        // and pacemaker timeouts. We now broadcast on a tightening schedule:
+        //
+        //   * t = 1s  : first broadcast (P2P binding is typically done
+        //               within <1s of process start; if a peer is not yet
+        //               connected the send is a silent no-op, retried next).
+        //   * t = 1s..30s : every 2s — catches every peer that finishes
+        //                   QUIC handshake during the boot phase.
+        //   * t = 30s..600s : every 60s — covers late-joiners (operator
+        //                     starting nodes in sequence rather than
+        //                     parallel).
+        //   * t > 600s : the per-90-block schedule (already implemented at
+        //                node.rs ~19273) takes over as steady-state
+        //                maintenance.
+        //
+        // Auto-anchor knock-on
+        // ────────────────────
+        // `register_vrf_public_key` in genesis_constants.rs triggers an
+        // atomic anchor-file write when all 5 genesis PKs are present. The
+        // tightened schedule means that file lands on disk within ~2-4s of
+        // process start instead of 15-20s, so even Boot 1 has near-zero
+        // window when the operator subsequently restarts.
+        //
+        // Cost
+        // ────
+        // 15 × Dilithium3 sign + ~75 small UDP sends in the first 30s. At
+        // ~3KB per signed announce that's < 250KB/30s ≈ 8KB/s — utterly
+        // negligible vs. block traffic. Bounded to genesis identities (5).
         if let Some(ref p2p) = blockchain.unified_p2p {
             let p2p_clone = p2p.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                p2p_clone.broadcast_vrf_key_announce();
+                use tokio::time::{sleep, Duration, Instant};
+                // Phase 1: brief settle for the QUIC binder + first peer
+                // handshakes. 1s is more than enough on healthy networks
+                // and reduces Boot-1 window dramatically vs. the previous
+                // 15s wait.
+                sleep(Duration::from_secs(1)).await;
+                let start = Instant::now();
+
+                // Phase 2: tight cadence during the bootstrap phase.
+                while start.elapsed() < Duration::from_secs(30) {
+                    p2p_clone.broadcast_vrf_key_announce();
+                    sleep(Duration::from_secs(2)).await;
+                }
+
+                // Phase 3: maintenance cadence for late-joiners.
+                while start.elapsed() < Duration::from_secs(600) {
+                    p2p_clone.broadcast_vrf_key_announce();
+                    sleep(Duration::from_secs(60)).await;
+                }
+                // After 10 min the steady-state per-90-block schedule
+                // continues to handle any remaining propagation needs.
             });
         }
 
@@ -27784,17 +27886,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         }
         
-        // SECURITY: Legacy genesis nodes with exact matching (backward compatibility)
-        use crate::genesis_constants::LEGACY_GENESIS_NODES;
-        
-        for legacy_id in LEGACY_GENESIS_NODES {
-            if node_id == *legacy_id {
-                if verify_genesis_node_certificate(node_id) {
-                    return 0.70; // PRODUCTION: Equal starting reputation for all nodes
-                } else {
-                    println!("[WARN][NODE] legacy_genesis_verify_failed node={}", node_id);
-                    return 0.1; // Low reputation for failed verification
-                }
+        // SECURITY: Legacy genesis nodes — accept BOTH the canonical 3-digit
+        // form (`genesis_node_001`) AND the historical 1-digit form
+        // (`genesis_node_1`). `is_legacy_genesis_node` normalises both.
+        // Without this normalisation the production form falls through to
+        // the BLOCKCHAIN-BASED path below and gets default reputation, which
+        // is incorrect for the 5 anchored bootstrap identities.
+        if crate::genesis_constants::is_legacy_genesis_node(node_id) {
+            if verify_genesis_node_certificate(node_id) {
+                return 0.70; // PRODUCTION: Equal starting reputation for all nodes
+            } else {
+                println!("[WARN][NODE] legacy_genesis_verify_failed node={}", node_id);
+                return 0.1; // Low reputation for failed verification
             }
         }
         
