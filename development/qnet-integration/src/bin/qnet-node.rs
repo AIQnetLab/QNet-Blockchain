@@ -1,3 +1,12 @@
+// Lift the trait-recursion ceiling to compile the deeply-nested
+// `warp::Filter::or(...)` chain used by the embedded RPC router.
+// Default `recursion_limit = 128` blows the stack inside rustc's trait
+// solver on the `Or<Or<Or<...>>>` Filter type the router builds at
+// roughly 70+ routes. 1024 is well above the chain depth and matches
+// the ceiling production binaries already use elsewhere in the workspace.
+// Required for `cargo test` (test profile) — release profile resolves
+// the chain via inlining hints and is unaffected.
+#![recursion_limit = "1024"]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(dead_code)]

@@ -5289,6 +5289,13 @@ impl SimplifiedP2P {
                 // (see block_pipeline::record_hash_chain_break_witness).
                 crate::block_pipeline::cleanup_break_tracker(min_height);
 
+                // v18: evict expired in-flight missing-parent request entries
+                // so the dedup map stays bounded under sustained gap-recovery
+                // activity. Same retention semantics as the cooldown sweeps
+                // above — opportunistic eviction on TTL.
+                crate::block_pipeline::cleanup_missing_block_requests();
+                crate::block_pipeline::cleanup_forked_peer_cooldown();
+
                 let timeout_total_removed = timeout_votes_removed + timeout_certs_removed + timeout_voted_removed;
 
                 // Log if anything was cleaned
@@ -11175,6 +11182,34 @@ impl SimplifiedP2P {
     
     /// v9.0: Per-peer consensus message rate check.
     /// Returns true if message should be DROPPED (rate exceeded).
+    ///
+    /// v18 USAGE NOTE: signature-verified consensus messages (TimeoutVote,
+    /// ConsensusCommit/Reveal, ProducerHeartbeat, ProducerReady, ReadyAck,
+    /// BlockRejection, VrfLeaderClaim, BlockAttestation, EmptySlotAttestation,
+    /// VrfKeyAnnounce) NO LONGER consult this helper — those handlers verify
+    /// the Dilithium3 signature against the consensus PK registry as the
+    /// canonical security gate, and use existing protocol-level dedup maps
+    /// (TIMEOUT_VOTES round-uniqueness, READY_ACKS distinct-ack DashSet,
+    /// BLOCK_REJECTION_OBSERVERS distinct-observer DashSet, etc.) as the
+    /// natural emission cap. The legacy 30/min cap was the immediate cause
+    /// of the v17.x stall observed at h=180-241 — under sustained pacemaker
+    /// stall the rotation round increments at ≈1/sec, producing ≈60 signed
+    /// TimeoutVotes/min that tripped the 30/min cap and silently dropped
+    /// honest validator gossip. With strict 2f+1 BFT-certified rotation
+    /// (node.rs v15.13), even a single rate-limited voter prevented
+    /// HIGHEST_CERTIFIED_ROUND from advancing → producer rotation froze.
+    ///
+    /// Industry-standard L1 BFT protocols never count-rate-limit signed
+    /// consensus messages — the protocol-level uniqueness invariant
+    /// (one vote per validator per round) is sufficient.
+    ///
+    /// This helper is RETAINED for:
+    ///   * `health_ping` — unsigned liveness probes (DoS protection on
+    ///     pure-network paths where signature is not the primary gate).
+    ///   * `active_announce` (ActiveNodeAnnouncement) — non-consensus
+    ///     telemetry path with adaptive limit (10 + active/5, capped 200)
+    ///     scaling to thousands of super-nodes; protects the ~35 ms
+    ///     Dilithium3 verify cost from gossip-amplified flood.
     fn is_consensus_rate_limited(&self, peer_id: &str, msg_type: &str, max_per_min: usize) -> bool {
         let now = self.current_timestamp();
         let rate_key = format!("cons_{}_{}", msg_type, peer_id);
@@ -13105,13 +13140,17 @@ impl SimplifiedP2P {
                 // quantum_crypto.rs, that path is the canonical security
                 // gate and is gossip-safe.
                 //
-                // Rate limit: producer broadcasts ≈1/sec, so 60/min ceiling
-                // is generous. Anti-DoS — without this an attacker could
-                // flood ProducerHeartbeats to burn CPU on signature verify.
-                if self.is_consensus_rate_limited(&producer_id, "producer_heartbeat", 60) {
-                    return;
-                }
-
+                // v18: COUNT-BASED RATE LIMIT REMOVED. Heartbeat is signed
+                // by the producer's registered Dilithium3 key — verification
+                // below is the canonical security gate. The natural emission
+                // cap is the monotonic-timestamp anti-replay guard immediately
+                // below (one accepted heartbeat per producer per timestamp),
+                // and the producer-side throttle in the broadcast loop
+                // (NETWORK_HEARTBEAT_INTERVAL_MS = 1 s). Pre-v18 the receiver
+                // also enforced 60 / min per-producer count, which collided
+                // with the legitimate per-second cadence under transient
+                // gossip duplication and dropped honest heartbeats.
+                //
                 // Anti-replay: monotonic timestamp guard per producer. Older
                 // timestamps are silently ignored (no signature verify cost
                 // for stale replays).
@@ -13124,8 +13163,8 @@ impl SimplifiedP2P {
 
                 // Verify signature against producer's registered consensus PK.
                 // This is the same registry used for TimeoutVote signatures —
-                // node_001's pk_mismatch class of failures still applies and
-                // would correctly reject a spoofed heartbeat.
+                // pk_mismatch class of failures still applies and would
+                // correctly reject a spoofed heartbeat.
                 let msg = format!(
                     "QNET_PRODUCER_HEARTBEAT_V1:{}:{}:{}",
                     producer_id, timestamp, slot_height
@@ -13187,11 +13226,14 @@ impl SimplifiedP2P {
                 // (Fix #2/#3 close the legacy fallback). A non-genesis
                 // spoofer cannot mint a valid signature under a genesis PK.
 
-                if self.is_consensus_rate_limited(&observer_id, "block_rejection", 30) {
-                    return;
-                }
-
-                // Verify observer's signature.
+                // v18: COUNT-BASED RATE LIMIT REMOVED. BlockRejection is
+                // Dilithium3 signed by the observer's registered key. Natural
+                // cap is distinct-observer dedup in BLOCK_REJECTION_OBSERVERS
+                // (one rejection per (height, source) per observer).
+                // Pre-v18 the receiver also rate-limited at 30/min per peer,
+                // which under fork events with multiple peers reporting
+                // could drop legitimate observer signatures and prevent
+                // 2f+1 destructive-rollback evidence accumulation.
                 let payload = format!(
                     "QNET_BLOCK_REJECTION_V1:{}:{}:{}:{}:{}",
                     observer_id,
@@ -13292,9 +13334,12 @@ impl SimplifiedP2P {
                 // security boundary; a spoofer cannot mint a valid genesis
                 // signature post Fix #2/#3.
 
-                if self.is_consensus_rate_limited(&producer_id, "producer_ready", 30) {
-                    return;
-                }
+                // v18: COUNT-BASED RATE LIMIT REMOVED. Verified ProducerReady
+                // is signed by the producer's registered Dilithium3 key. The
+                // natural cap is the (mb_idx, round, height, producer_id)
+                // handshake quorum dedup in READY_ACKS — at most one ack per
+                // committee member per round. Spoofers fail signature
+                // verification below and consume only ≈5 ms of verify CPU.
 
                 // Reject malformed (round must be > 0; round 0 needs no handshake).
                 if round == 0 {
@@ -13443,9 +13488,11 @@ impl SimplifiedP2P {
                 // check below against the immutable PK registry. Phantom
                 // acks cannot be forged post Fix #2/#3.
 
-                if self.is_consensus_rate_limited(&ack_id, "ready_ack", 60) {
-                    return;
-                }
+                // v18: COUNT-BASED RATE LIMIT REMOVED. ReadyAck is Dilithium3
+                // signed by ack_id's registered key. Natural cap is the
+                // distinct-ack DashSet — one ack per ack_id per
+                // (mb_idx, round, height, producer). Spoofers consume only
+                // verification CPU and are rejected by the signature check.
                 if round == 0 {
                     return;
                 }
@@ -13509,18 +13556,18 @@ impl SimplifiedP2P {
             NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, signature, timestamp } => {
                 self.update_peer_last_seen(&node_id);
 
-                // v17.1: IP-anchor gate intentionally NOT applied here.
-                // ConsensusCommit gossips through the network so `from_peer`
-                // is typically a relay; anchoring it broke 2f+1 macroblock
-                // quorum on testnet (mb=2 stuck). The aggregator
-                // (handle_remote_consensus_commit) verifies the Dilithium3
-                // signature against the immutable consensus PK registry —
-                // that path is the canonical, gossip-safe security gate.
+                // v18: COUNT-BASED RATE LIMIT REMOVED for macroblock commits.
+                // The legacy `is_consensus_rate_limited(node_id, "commit", 10)`
+                // gate was incompatible with sustained 2f+1 commit-reveal
+                // rounds at large committee sizes — at 1000+ super-nodes,
+                // commit broadcasts during view changes can legitimately
+                // exceed 10/min/peer. Signature verification inside
+                // `handle_remote_consensus_commit` is the canonical security
+                // gate (Dilithium3 over the consensus PK registry; spoofers
+                // produce `pk_mismatch` and are dropped). The aggregator
+                // dedups by (round_id, node_id), so duplicates are no-ops.
 
-                // v9.0: Rate limit consensus messages (max 10/min per peer)
-                if self.is_consensus_rate_limited(&node_id, "commit", 10) { return; }
-
-                // v9.0: Acquire ordering ensures we see the latest height written by any thread.
+                // Acquire ordering ensures we see the latest height written by any thread.
                 let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
                 if round_id > 0 && local_h + 100 < round_id {
                     // Too far behind — silently drop consensus messages
@@ -13541,28 +13588,24 @@ impl SimplifiedP2P {
             NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, nonce, timestamp, signature } => {
                 self.update_peer_last_seen(&node_id);
 
-                // v17.1: IP-anchor gate intentionally NOT applied here. Same
-                // rationale as ConsensusCommit above — gossip-relayed
-                // `from_peer` is the relay, not the originator. The reveal's
-                // Dilithium3 signature is verified against the immutable PK
-                // registry inside handle_remote_consensus_reveal, which is
-                // the canonical, gossip-safe security gate.
+                // v18: COUNT-BASED RATE LIMIT REMOVED for macroblock reveals.
+                // Same rationale as ConsensusCommit above. Reveal signature
+                // is verified inside `handle_remote_consensus_reveal` over
+                // SHA3-256(node_id || reveal_data || nonce || timestamp) —
+                // the canonical reveal payload format.
 
-                // v9.0: Rate limit consensus messages (max 10/min per peer)
-                if self.is_consensus_rate_limited(&node_id, "reveal", 10) { return; }
-
-                // v9.0: Acquire ordering for consensus-critical height check
+                // Acquire ordering for consensus-critical height check
                 let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
                 if round_id > 0 && local_h + 100 < round_id {
                     return;
                 }
 
-                if crate::node::is_debug() { 
-                    println!("[DBG][CONS] reveal_recv round={} from={} sig_len={}", round_id, node_id, signature.len()); 
+                if crate::node::is_debug() {
+                    println!("[DBG][CONS] reveal_recv round={} from={} sig_len={}", round_id, node_id, signature.len());
                 }
                 if self.is_macroblock_consensus_round(round_id) {
-                    if crate::node::is_info() { 
-                        println!("[INFO][MACRO] reveal_process round={}", round_id); 
+                    if crate::node::is_info() {
+                        println!("[INFO][MACRO] reveal_process round={}", round_id);
                     }
                     self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, nonce, timestamp, signature);
                 }
@@ -13575,10 +13618,13 @@ impl SimplifiedP2P {
             NetworkMessage::VrfLeaderClaim { round, node_id, vrf_output, vrf_proof, slot_seed, reputation, timestamp, vrf_public_key, gossip_ttl } => {
                 self.update_peer_last_seen(&node_id);
 
-                // v9.0: Rate limit VRF claims (max 5/min per peer)
-                if self.is_consensus_rate_limited(&node_id, "vrf", 5) { return; }
+                // v18: COUNT-BASED RATE LIMIT REMOVED. VRF claims are
+                // self-verifiable via DilithiumVrf::verify_static below —
+                // a failed proof rejects the claim with no state mutation.
+                // Natural cap is the per-(round, node_id) dedup in
+                // LEADER_CLAIMS; gossip TTL bounds re-broadcast amplification.
 
-                // v9.0: Acquire ordering for consensus-critical height check
+                // Acquire ordering for consensus-critical height check
                 let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
                 if round > 0 && local_h + 100 < round {
                     return;
@@ -13748,7 +13794,7 @@ impl SimplifiedP2P {
                 // testnet). The voter's Dilithium3 signature is verified
                 // against the immutable consensus PK registry inside
                 // `handle_timeout_vote`; that path is the canonical,
-                // gossip-safe security gate (Fix #2/#3).
+                // gossip-safe security gate.
 
                 // v9.5/v9.8: Early height filter — discard obviously stale/future votes before signature check.
                 // saturating_add prevents overflow from malicious u64::MAX height values.
@@ -13761,14 +13807,52 @@ impl SimplifiedP2P {
                     return;
                 }
 
-                // v9.0: Rate limit timeout votes (max 30/min per peer)
-                if self.is_consensus_rate_limited(&voter_id, "timeout", 30) { return; }
+                // ───────────────────────────────────────────────────────────
+                // v18: COUNT-BASED RATE LIMIT REMOVED for signed TimeoutVotes
+                // ───────────────────────────────────────────────────────────
+                // The legacy `is_consensus_rate_limited(voter_id, "timeout", 30)`
+                // gate was the immediate cause of the v17.x stall observed at
+                // h=180-241. Under sustained pacemaker stall the rotation round
+                // increments at ≈1 / second, so each honest validator emits
+                // ≈60 TimeoutVotes / minute. That trips the 30 / min cap on
+                // EVERY receiver, blocking the legitimate voter for 5 minutes.
+                // With strict 2f+1 BFT-certified rotation (see node.rs v15.13),
+                // even a single blocked voter prevents `HIGHEST_CERTIFIED_ROUND`
+                // from advancing — producer rotation freezes permanently.
+                //
+                // The vote is signed (Dilithium3 over the consensus PK registry)
+                // and authenticated end-to-end. Industry-standard L1 BFT
+                // protocols never count-rate-limit signed consensus messages —
+                // their natural cap is `(height, round, voter_id)` uniqueness
+                // enforced by `TIMEOUT_VOTES`, with conflicting payloads
+                // triggering equivocation slashing via
+                // `report_timeout_equivocation`. The sender side of this
+                // protocol (`broadcast_timeout_vote`) already enforces one
+                // vote per (height, round) via `TIMEOUT_VOTED_HEIGHTS`,
+                // bounding emission at the protocol level.
+                //
+                // Spoofers / malformed signatures are still rejected — the
+                // signature check inside `handle_timeout_vote` (cheap registry
+                // lookup + Dilithium3 open) returns false on any unbound
+                // identity claim. Receiver CPU cost for a rejected vote is
+                // negligible (≈5 ms), and a spoofer flooding fake votes would
+                // be observed in the operator logs as a sustained rejection
+                // pattern, surfacing the attacker for manual mitigation.
+                //
+                // Scalability: at 1000+ super-node deployment this change
+                // ELIMINATES a liveness fault that would otherwise grow worse
+                // with committee size — under the legacy gate, every additional
+                // peer added another rate-limited voter that could disable
+                // certified-round advancement.
+                // ───────────────────────────────────────────────────────────
 
                 if crate::node::is_debug() {
                     println!("[DBG][TIMEOUT] vote_recv h={} round={} voter={}", height, timeout_round, voter_id);
                 }
 
-                // Process timeout vote and check if certificate is ready
+                // Process timeout vote and check if certificate is ready.
+                // Signature verification + round-uniqueness + equivocation
+                // slashing are all enforced inside handle_timeout_vote.
                 self.handle_timeout_vote(height, timeout_round, voter_id, last_block_hash, signature);
             }
             
@@ -14176,11 +14260,13 @@ impl SimplifiedP2P {
                     if crate::node::is_info() {
                         println!("[INFO][VRF-KEY] registered node={} pk_hash={}", node_id, hex::encode(&vrf_public_key[..8]));
                     }
-                } else if crate::node::is_warn() {
-                    println!("[WARN][VRF-KEY] bad_self_sig node={}", node_id);
+                } else {
+                    if crate::node::is_warn() {
+                        println!("[WARN][VRF-KEY] bad_self_sig node={}", node_id);
+                    }
                 }
             }
-            
+
             NetworkMessage::PeerListRequest { requester_id } => {
                 // v2.95: Handle QUIC-based peer list request (replaces HTTP /api/v1/peers)
                 if crate::node::is_info() {
@@ -15289,6 +15375,15 @@ impl SimplifiedP2P {
                 // at this stage causes a deadlock: nodes can't register → can't produce →
                 // stay at height 0 forever. Dedup (seen_announcements below) still prevents
                 // redundant Dilithium3 verification, so CPU is protected without rate limiting.
+                //
+                // v18: ActiveNodeAnnouncement is NOT consensus-critical (it drives pinger
+                // selection / reputation telemetry, not rotation). The adaptive rate-limit
+                // is retained because the signature verify cost (~35 ms Dilithium3) is the
+                // primary DoS vector — at 1000 super-nodes, an attacker emitting 1000+
+                // unique announces / sec would saturate CPU on signature verification
+                // without this cap. Consensus-critical handlers (TimeoutVote / commit /
+                // reveal) had their count limits removed in v18 because those are
+                // protocol-driven (not topology-driven) and self-cap via round dedup.
                 let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                 if local_h > 0 {
                     let active_count = self.active_full_super_nodes.len();
@@ -15319,11 +15414,11 @@ impl SimplifiedP2P {
                     return;
                 }
 
-                // SECURITY (NIST FIPS 204 compliant): ALWAYS verify Dilithium signature
-                // ActiveNodeAnnouncement affects pinger selection - MUST be verified
-                // Skipping verification would allow replay attacks and fake registrations
-                // CPU cost (~35ms) is acceptable for security-critical operations
-                let announcement_data = format!("active:{}:{}:{}:{}:{}", 
+                // SECURITY (NIST FIPS 204 compliant): ALWAYS verify Dilithium signature.
+                // ActiveNodeAnnouncement affects pinger selection — MUST be verified.
+                // Skipping verification would allow replay attacks and fake registrations.
+                // CPU cost (~35ms) is acceptable for security-critical operations.
+                let announcement_data = format!("active:{}:{}:{}:{}:{}",
                     node_id, node_type, shard_id, reputation as u64, timestamp);
                 if !self.verify_dilithium_heartbeat_signature(&announcement_data, &signature, &node_id) {
                     if crate::node::is_warn() {

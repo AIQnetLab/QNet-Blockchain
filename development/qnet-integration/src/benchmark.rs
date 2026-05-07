@@ -1021,9 +1021,25 @@ mod tests {
 
     // =========================================================================
     // VARIANT A: Ed25519-only
+    //
+    // These are HARDWARE-DEPENDENT performance benchmarks, not correctness
+    // regression tests. They assert minimum throughput thresholds that hold
+    // on any modern CPU running a single benchmark in isolation, but become
+    // flaky when `cargo test` runs the full suite in parallel — every test
+    // worker competes for cores, and per-core TPS measured under contention
+    // can fall below the ≥10K signs/s assertion.
+    //
+    // v18: marked `#[ignore]` so they are excluded from the default
+    // regression run. Invoke explicitly for benchmark sweeps:
+    //
+    //   cargo test --release -p qnet-integration --lib bench_ed25519 -- --ignored --nocapture
+    //
+    // This matches the standard convention used elsewhere for performance-
+    // sensitive tests that should not gate CI on hardware noise.
     // =========================================================================
 
     #[test]
+    #[ignore = "hardware-dependent benchmark; run with --ignored"]
     fn bench_ed25519_small() {
         let n = 10_000;
         let (s, v) = run_ed25519_bench(n);
@@ -1033,6 +1049,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hardware-dependent benchmark; run with --ignored"]
     fn bench_ed25519_medium() {
         let n = 100_000;
         let (s, v) = run_ed25519_bench(n);
@@ -1042,6 +1059,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hardware-dependent benchmark; run with --ignored"]
     fn bench_ed25519_high() {
         let n = 500_000;
         let (s, v) = run_ed25519_bench(n);
@@ -1053,6 +1071,7 @@ mod tests {
     /// Custom preset: 1 M TX, target 100K TPS
     /// This is the honest upper bound for mempool-only throughput (no P2P, no finality).
     #[test]
+    #[ignore = "hardware-dependent benchmark; run with --ignored"]
     fn bench_ed25519_custom() {
         let n = 1_000_000;
         let (s, v) = run_ed25519_bench(n);
@@ -1072,6 +1091,7 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[ignore = "hardware-dependent benchmark; run with --ignored"]
     fn bench_hybrid_small() {
         let n = 1_000; // 10× less than Ed25519 small (10K)
         let (s, v) = run_hybrid_bench(n);
@@ -1081,6 +1101,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hardware-dependent benchmark; run with --ignored"]
     fn bench_hybrid_medium() {
         let n = 10_000; // 10× less than Ed25519 medium (100K)
         let (s, v) = run_hybrid_bench(n);
@@ -1090,6 +1111,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hardware-dependent benchmark; run with --ignored"]
     fn bench_hybrid_high() {
         let n = 50_000; // 10× less than Ed25519 high (500K)
         let (s, v) = run_hybrid_bench(n);

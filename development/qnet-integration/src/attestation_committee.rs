@@ -363,11 +363,19 @@ mod tests {
 
     #[test]
     fn byzantine_threshold_canonical() {
-        assert_eq!(byzantine_threshold(5), 4);
-        assert_eq!(byzantine_threshold(10), 7);
-        assert_eq!(byzantine_threshold(32), 22);
-        assert_eq!(byzantine_threshold(64), 43);
-        assert_eq!(byzantine_threshold(128), 86);
-        assert_eq!(byzantine_threshold(1000), 668);
+        // Canonical 2/3+ supermajority thresholds. The function implements
+        // `ceil(2N/3)` via the integer-arithmetic identity `(2N + 2) / 3`,
+        // which equals the smallest integer K such that K > 2N/3 — i.e.
+        // the BFT 2f+1 threshold under f = floor((N-1)/3) Byzantine nodes.
+        assert_eq!(byzantine_threshold(5), 4);     // ceil(10/3) = 4
+        assert_eq!(byzantine_threshold(10), 7);    // ceil(20/3) = 7
+        assert_eq!(byzantine_threshold(32), 22);   // ceil(64/3) = 22
+        assert_eq!(byzantine_threshold(64), 43);   // ceil(128/3) = 43
+        assert_eq!(byzantine_threshold(128), 86);  // ceil(256/3) = 86
+        // N=1000: 2N/3 = 666.67, ceil = 667. Equivalent to 2f+1 where
+        // f = floor(999/3) = 333 → 2*333+1 = 667. Pre-fix test asserted
+        // 668 which would correspond to `2f+2` — strictly greater than
+        // the canonical BFT supermajority and therefore non-canonical.
+        assert_eq!(byzantine_threshold(1000), 667);
     }
 }

@@ -285,6 +285,151 @@ pub fn cleanup_break_tracker(min_height: u64) {
 }
 
 // ============================================================================
+// v18: MISSING-PARENT ACTIVE SYNC TRIGGER (storage gap recovery)
+// ============================================================================
+//
+// When the verify stage attempts `load_microblock_auto_format(parent_h)` and
+// the parent is absent from local storage (Ok(None)), the legacy behaviour
+// was to defer the child block and wait for the parent to arrive on its own
+// via gossip. Under partial propagation that wait can be unbounded — the
+// deferred buffer fills up, the child is evicted, and the gap stays open
+// indefinitely. This is the storage-side root cause of the v17.x stall
+// observed at h=180-241 where individual nodes had block subsets like
+// {1, 2, 211, 213, 214, 216, ...} with permanent holes.
+//
+// v18: when a parent miss is detected, the verify stage proactively triggers
+// `request_block_repair(parent_h)` on the global P2P instance, which fans
+// out a `RequestBlocks{from=parent_h, to=parent_h}` to the top peers by
+// reputation in parallel. The first response that arrives is decoded by
+// the existing `handle_blocks_batch` path and re-enters the pipeline as
+// a normal incoming block, where it is verified, applied, and triggers
+// retry of the deferred child via the existing deferred-drain loop.
+//
+// Design properties
+// ─────────────────
+//   * Single-flight per height: a height already in the request map is
+//     not re-requested while the previous request is in-flight (within
+//     the cooldown window). Eliminates thundering-herd amplification when
+//     many child blocks arrive for the same missing parent.
+//   * TTL retention: stale entries (older than the cooldown) are evicted
+//     opportunistically on read. Memory bounded by the active request
+//     fan, which equals the gap size in the worst case (≪ chain height).
+//   * Detached spawn: the request is fired from a `tokio::spawn` task so
+//     the verify stage never blocks on network I/O. Failure to enqueue
+//     leaves the deferred entry in place — the legacy passive-wait path
+//     remains as the last-resort fallback, so this code only ever ADDS
+//     a recovery vector, never removes one.
+//   * Idempotent across pipeline workers: the dedup map is process-wide
+//     so multiple verify tasks (e.g. parallel verify pool) never race on
+//     duplicate sends.
+//
+// Scalability
+// ───────────
+//   * O(1) DashMap operation per missing-parent encounter (insert-and-check).
+//   * `request_block_repair` itself sends to top-3 peers in parallel,
+//     bounded send fan-out regardless of network size.
+//   * Cooldown evicts stale entries lazily; periodic sweep below caps
+//     long-tail growth at any committee size.
+//
+// Security
+// ────────
+//   * Returned blocks pass the full pipeline (signature + hash chain +
+//     state apply) before being committed — no trust in the responding
+//     peer beyond the canonical verify stages.
+//   * No new attack surface: an attacker who sends bogus blocks to
+//     `RequestBlocks` is rejected at verify just like any other malformed
+//     gossip block. Attacker cannot exhaust this map because TTL eviction
+//     drops stale entries; sustained DoS would also fail the existing
+//     `is_consensus_rate_limited` check on the request handler side.
+// ============================================================================
+
+/// How long a single (height) request stays in the dedup map before another
+/// retry is allowed. Long enough to cover RTT + decode + apply on slow links
+/// (1000+ super-node deployment, WAN), short enough that a real persistent
+/// missing block triggers fresh requests without the operator restarting.
+const MISSING_BLOCK_REQUEST_TTL_MS: u64 = 30_000; // 30 seconds
+
+/// Per-height in-flight request tracker. Key = parent height that is missing
+/// locally; value = unix-ms timestamp of the most recent request attempt.
+/// Lock-free DashMap keeps the verify stage non-blocking under load.
+static MISSING_BLOCK_REQUESTED: once_cell::sync::Lazy<dashmap::DashMap<u64, u64>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// Trigger an active sync request for a missing parent block, with single-flight
+/// dedup. Returns true when this call dispatched a request, false when an
+/// in-flight request is still within the cooldown window.
+///
+/// The actual network send is performed on a detached tokio task so the verify
+/// stage thread never blocks on peer I/O. If the global P2P instance is not
+/// yet initialized (very early boot), the call is a silent no-op — verify
+/// stage falls back to the legacy passive-wait deferral path.
+pub fn request_missing_parent(parent_h: u64) -> bool {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // Single-flight: refuse to re-trigger while a request is in-flight.
+    // The DashMap entry is updated atomically — no two threads can both
+    // observe "no recent request" and double-fire.
+    let should_dispatch = match MISSING_BLOCK_REQUESTED.entry(parent_h) {
+        dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+            let last = *occupied.get();
+            if now_ms.saturating_sub(last) < MISSING_BLOCK_REQUEST_TTL_MS {
+                false // still in cooldown
+            } else {
+                *occupied.get_mut() = now_ms;
+                true // cooldown expired — refresh and dispatch
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            vacant.insert(now_ms);
+            true
+        }
+    };
+
+    if !should_dispatch {
+        return false;
+    }
+
+    // Detached dispatch — never block the caller (verify stage) on network.
+    if let Some(p2p_arc) = crate::node::try_get_p2p() {
+        let p2p_clone = p2p_arc.clone();
+        tokio::spawn(async move {
+            if let Err(e) = p2p_clone.request_block_repair(parent_h).await {
+                if is_debug() {
+                    println!("[DBG][PIPELINE] missing_parent_request_failed h={} err={}",
+                             parent_h, e);
+                }
+            } else if is_info() {
+                println!("[INFO][PIPELINE] missing_parent_requested h={} action=fanout_to_top_peers",
+                         parent_h);
+            }
+        });
+        true
+    } else {
+        if is_debug() {
+            println!("[DBG][PIPELINE] missing_parent_request_skipped h={} reason=p2p_not_ready",
+                     parent_h);
+        }
+        false
+    }
+}
+
+/// Periodic cleanup of expired request entries. Called from the existing
+/// cleanup task on the same cadence as `cleanup_forked_peer_cooldown` to
+/// keep the map bounded regardless of chain length or stall duration.
+pub fn cleanup_missing_block_requests() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    MISSING_BLOCK_REQUESTED.retain(|_, last| {
+        now_ms.saturating_sub(*last) < MISSING_BLOCK_REQUEST_TTL_MS
+    });
+}
+
+// ============================================================================
 // PIPELINE TYPES
 // ============================================================================
 
@@ -1168,22 +1313,59 @@ impl BlockPipeline {
                         mb.previous_hash == prev_hash
                     }
                     Ok(None) => {
+                        // Capture height fields BEFORE moving `decoded` into
+                        // the deferred map — `mb` is borrowed from `decoded`
+                        // and would be invalidated by the move otherwise.
+                        let child_h = mb.height;
+                        let parent_h = mb.height - 1;
                         // Previous block not yet available — defer for retry.
                         // When parent arrives, this block will be re-checked.
                         if deferred.len() < DEFERRED_MAX {
                             if is_debug() {
                                 println!("[DBG][PIPELINE] block_deferred h={} need_h={} buf={}",
-                                         mb.height, mb.height - 1, deferred.len());
+                                         child_h, parent_h, deferred.len());
                             }
-                            deferred.insert(mb.height, decoded);
+                            deferred.insert(child_h, decoded);
                         } else {
                             // Buffer full — drop oldest to make room
                             if is_info() {
                                 println!("[INFO][PIPELINE] deferred_full h={} dropped (buf={})",
-                                         mb.height, DEFERRED_MAX);
+                                         child_h, DEFERRED_MAX);
                             }
                             metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                         }
+
+                        // ───────────────────────────────────────────────────
+                        // v18: ACTIVE SYNC TRIGGER (storage gap recovery)
+                        // ───────────────────────────────────────────────────
+                        // Passive defer alone is insufficient under partial
+                        // gossip propagation: if the parent never arrives via
+                        // broadcast (peer offline, network partition healed
+                        // mid-window, dropped shred), the deferred buffer
+                        // fills with orphaned children and the gap stays
+                        // open indefinitely — observed at h=180-241 with
+                        // permanent block subsets like {1, 2, 211, 213,
+                        // 214, ...}. Proactively request the missing parent
+                        // from peers in parallel; the request is single-
+                        // flighted per height and runs on a detached task,
+                        // so the verify stage never blocks on network I/O.
+                        // ───────────────────────────────────────────────────
+                        let _ = request_missing_parent(parent_h);
+
+                        // ───────────────────────────────────────────────────
+                        // v18: WATCHDOG DIAGNOSTIC FIX
+                        // ───────────────────────────────────────────────────
+                        // Mark verify stage as IDLE on the deferral path so
+                        // the watchdog does not report `verify_stuck` with
+                        // a stale `op_age_ms` value (counter measured against
+                        // the last `mark_verify_op` even though the operation
+                        // logically completed via the deferral branch). Pre-
+                        // v18 the verify_op timestamp stayed pinned to the
+                        // first deferred block until a non-deferred block
+                        // arrived, producing misleading multi-hour
+                        // op_age_ms values in stalled-network logs.
+                        // ───────────────────────────────────────────────────
+                        metrics.mark_verify_idle();
                         continue;
                     }
                     Err(e) => {
@@ -3012,5 +3194,157 @@ impl BlockPipeline {
             // upstream is never mis-attributed to apply.
             metrics.mark_apply_idle();
         }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// v18: REGRESSION TESTS — active sync trigger + dedup semantics
+// ════════════════════════════════════════════════════════════════════════════
+// These tests lock in the security and liveness invariants enforced by the
+// new MISSING_BLOCK_REQUESTED dedup map and request_missing_parent helper.
+// A regression on ANY of these means either:
+//   * The thundering-herd protection (single-flight per height within TTL)
+//     was broken — risk of bandwidth amplification when many child blocks
+//     arrive for the same missing parent.
+//   * The TTL retention was broken — risk of unbounded map growth or
+//     legitimate retry of a genuinely-missing parent being silently
+//     suppressed forever.
+// Each test asserts a SECURITY or LIVENESS property, never a styling choice.
+#[cfg(test)]
+mod tests_v18_active_sync {
+    use super::*;
+
+    // The dedup map (`MISSING_BLOCK_REQUESTED`) is process-wide and shared
+    // across cargo's parallel test workers. To avoid cross-test interference
+    // each test below uses a UNIQUE height (>= 1_000_000_000) so its key
+    // space cannot collide with production heights or other tests' keys.
+    // No shared `reset_request_map` helper is used — every test scopes its
+    // assertions to its own height key, and `cleanup_missing_block_requests`
+    // tests check height-specific presence, not whole-map state.
+
+    const H_FIRST_CALL: u64 = 1_000_000_001;
+    const H_DUPLICATE: u64 = 1_000_000_002;
+    const H_CLEANUP_EVICT: u64 = 1_000_000_003;
+    const H_CLEANUP_KEEP: u64 = 1_000_000_004;
+    const H_TTL_EXPIRY: u64 = 1_000_000_005;
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// First call for an unseen height MUST insert the dedup entry.
+    /// Without this, the very first orphaned-parent observation in a
+    /// fresh boot would silently no-op and the legacy passive-wait
+    /// remains the only recovery vector — defeating the purpose of v18.
+    ///
+    /// Note: the actual network send is gated on `try_get_p2p()` — in a
+    /// unit-test context the global is None, so dispatch returns false
+    /// from the network branch but the dedup-map insert MUST still
+    /// happen. The test verifies the insert by reading the height key.
+    #[test]
+    fn first_call_inserts_into_dedup_map() {
+        // Make sure we start from a clean state for THIS specific height key.
+        // Avoid clearing the whole map — other parallel tests use other keys.
+        MISSING_BLOCK_REQUESTED.remove(&H_FIRST_CALL);
+        let _ = request_missing_parent(H_FIRST_CALL);
+        assert!(
+            MISSING_BLOCK_REQUESTED.contains_key(&H_FIRST_CALL),
+            "first call must insert the height into the request map"
+        );
+    }
+
+    /// A second call for the SAME height within the TTL window MUST NOT
+    /// refresh the timestamp. This is the single-flight guarantee —
+    /// without it, a flood of child blocks for the same missing parent
+    /// would amplify into the same number of outbound `RequestBlocks`
+    /// messages, wasting peer bandwidth at 1000+ super-node scale.
+    #[test]
+    fn duplicate_within_ttl_is_rejected() {
+        MISSING_BLOCK_REQUESTED.remove(&H_DUPLICATE);
+        let _ = request_missing_parent(H_DUPLICATE);
+        let first_ts = *MISSING_BLOCK_REQUESTED
+            .get(&H_DUPLICATE)
+            .expect("first insert must succeed")
+            .value();
+        // Second call within the same millisecond MUST NOT advance the
+        // timestamp — verifies the cooldown branch was taken.
+        let _ = request_missing_parent(H_DUPLICATE);
+        let second_ts = *MISSING_BLOCK_REQUESTED
+            .get(&H_DUPLICATE)
+            .expect("entry must still be present")
+            .value();
+        assert_eq!(
+            first_ts, second_ts,
+            "second call within TTL must NOT refresh the timestamp"
+        );
+    }
+
+    /// Cleanup MUST evict entries older than the TTL. Without this the
+    /// map grows unboundedly under sustained gap-recovery activity at
+    /// thousand-node deployment scale.
+    ///
+    /// Cargo runs tests in parallel, so any other test that calls
+    /// `cleanup_missing_block_requests()` may evict our stale-TS entry
+    /// before this test asserts on it. To make the test deterministic
+    /// under parallelism we directly compute the post-cleanup expectation:
+    /// after `cleanup_missing_block_requests()`, an entry that was inserted
+    /// with a stale timestamp MUST be absent regardless of the order in
+    /// which other tests' cleanups interleaved with this one. The function
+    /// is idempotent — multiple cleanups don't change the post-condition.
+    #[test]
+    fn cleanup_evicts_stale_entries() {
+        let stale_ts = now_ms().saturating_sub(MISSING_BLOCK_REQUEST_TTL_MS + 1000);
+        MISSING_BLOCK_REQUESTED.insert(H_CLEANUP_EVICT, stale_ts);
+
+        // Run cleanup explicitly. Any parallel test's cleanup that ran
+        // between our insert and this call would also evict our stale
+        // entry — which is the post-condition we are asserting. Either
+        // way, the entry MUST be gone after this point.
+        cleanup_missing_block_requests();
+        assert!(
+            !MISSING_BLOCK_REQUESTED.contains_key(&H_CLEANUP_EVICT),
+            "cleanup must evict entries older than the TTL (key={})",
+            H_CLEANUP_EVICT
+        );
+    }
+
+    /// Cleanup MUST NOT evict entries within the TTL window. False
+    /// positives here would cause re-dispatch of in-flight requests,
+    /// re-introducing the thundering-herd we are trying to prevent.
+    #[test]
+    fn cleanup_preserves_fresh_entries() {
+        MISSING_BLOCK_REQUESTED.insert(H_CLEANUP_KEEP, now_ms());
+
+        cleanup_missing_block_requests();
+        assert!(
+            MISSING_BLOCK_REQUESTED.contains_key(&H_CLEANUP_KEEP),
+            "cleanup must keep entries inserted within the TTL"
+        );
+    }
+
+    /// After TTL expiry, a follow-up call MUST refresh the timestamp
+    /// (the previous request is presumed lost — peer offline, packet
+    /// drop — and a new attempt is warranted). Without this, a
+    /// genuinely-missing parent that the network failed to deliver
+    /// once would be silently abandoned forever — exactly the v17.x
+    /// stall failure mode.
+    #[test]
+    fn ttl_expiry_allows_retry() {
+        let stale_ts = now_ms().saturating_sub(MISSING_BLOCK_REQUEST_TTL_MS + 1000);
+        MISSING_BLOCK_REQUESTED.insert(H_TTL_EXPIRY, stale_ts);
+
+        let _ = request_missing_parent(H_TTL_EXPIRY);
+        let new_ts = *MISSING_BLOCK_REQUESTED
+            .get(&H_TTL_EXPIRY)
+            .expect("entry must still exist")
+            .value();
+        assert!(
+            new_ts > stale_ts,
+            "expired-TTL retry must refresh the timestamp (was {} now {})",
+            stale_ts, new_ts
+        );
     }
 }
