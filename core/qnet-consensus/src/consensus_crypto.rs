@@ -88,7 +88,7 @@ use base64::{Engine as _, engine::general_purpose};
 use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SignedMessage as PQSignedMessage, DetachedSignature as PQDetachedSignature};
 
 // ============================================================================
-// Consensus-layer PK registry with proof-of-ownership (v14.8)
+// Consensus-layer PK registry with proof-of-ownership (v14.8 / v20)
 // ============================================================================
 // Prevents self-attested PK attacks AND first-seen PK squatting at scale.
 //
@@ -108,22 +108,273 @@ use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SignedMessage as PQSignedM
 // Re-registration with a DIFFERENT PK is rejected; re-registration with the
 // SAME PK is a no-op (idempotent, safe for multi-call).
 //
-// Scalability: registry bounded to 50K entries (fits thousands of super-nodes
-// with large headroom). Reads are parking_lot::RwLock — no tokio contention.
+// ─── v20: SCALABILITY HARDENING (multi-tier eviction) ──────────────────────
+//
+// Default cap raised from 50 000 to 100 000 entries (~210 MB peak — fits
+// every operator with ≥ 4 GB RAM). Cap is overridable at boot via
+// `QNET_PK_REGISTRY_CAP` env var so large deployments can tune up to
+// hardware limits without recompiling.
+//
+// LRU idle-eviction removes entries whose owner has not produced a single
+// signature-verified consensus message within `QNET_PK_REGISTRY_IDLE_DAYS`
+// (default 30). Activity is tracked lock-free in a separate DashMap that is
+// updated on every successful PK lookup (`get_consensus_pk`) plus every
+// explicit `observe_pk_activity` call from signature-verification paths.
+// Registry rotation is therefore driven by REAL participation, not by
+// registration order — a node that registered at boot and went silent for
+// a month vacates its slot for a new joiner.
+//
+// Genesis anchor entries are PINNED — `pinned: true` forbids eviction
+// regardless of staleness. The 5 anchored identities never lose their
+// registry slot even if they crash for months: BFT safety requires their
+// PKs available for verification when they return.
+//
+// Capacity-full path:
+//   1. On insert at cap, attempt single-shot eviction of the most-stale
+//      non-pinned entry (≥ idle-threshold) — defence in depth.
+//   2. Background sweep `evict_idle_consensus_pks(threshold)` is invoked
+//      from the integration layer's hourly cleanup loop for proactive
+//      reclamation.
+//   3. If after eviction the registry is still at cap, the new
+//      registration is rejected with `[WARN][CONSENSUS] pk_registry_full`
+//      including the actual cap and idle-min so operators can diagnose.
+//
+// Memory profile (per entry):
+//   - HashMap bucket overhead ......................   ~32 B
+//   - Owned String node_id (16-32 chars) ...........   ~48 B
+//   - Vec<u8> Dilithium3 PK ......................... 1 952 B
+//   - DashMap<String, ActivityRecord> entry .........   ~80 B
+//   ────────────────────────────────────────────────────────
+//   ≈ 2.1 KB / entry
+//
+//   100 000 entries → ~210 MB
+//   200 000 entries → ~420 MB
+//   1 000 000 entries → ~2.1 GB
+//
+// Reads stay on parking_lot::RwLock (no tokio contention); the activity
+// tracker is fully lock-free. Eviction sweeps take a single short write
+// lock per pass.
 // ============================================================================
 
+/// Per-entry record held inside the registry. The PK bytes never change
+/// after insert; the `pinned` flag is decided at insert time and stays
+/// constant for the entry's lifetime.
+#[derive(Debug, Clone)]
+struct PkEntry {
+    pk: Vec<u8>,
+    /// True for genesis-anchor entries — never evicted by idle-sweep.
+    pinned: bool,
+    /// Wall-clock seconds at insertion (for telemetry / debug only).
+    registered_at: u64,
+}
+
 lazy_static::lazy_static! {
-    /// Trusted PK registry: node_id -> dilithium3 public key bytes (1952 bytes)
-    static ref CONSENSUS_PK_REGISTRY: parking_lot::RwLock<std::collections::HashMap<String, Vec<u8>>> =
+    /// Trusted PK registry: node_id -> PkEntry (PK + pinned flag).
+    static ref CONSENSUS_PK_REGISTRY: parking_lot::RwLock<std::collections::HashMap<String, PkEntry>> =
         parking_lot::RwLock::new(std::collections::HashMap::new());
+
+    /// Lock-free last-activity tracker for LRU eviction. Updated on every
+    /// successful PK lookup and on explicit `observe_pk_activity` calls
+    /// from signature-verification paths. Decoupled from the registry so
+    /// hot-read paths do not contend with eviction sweeps.
+    static ref LAST_ACTIVITY: dashmap::DashMap<String, std::sync::atomic::AtomicU64> =
+        dashmap::DashMap::new();
 }
 
 /// Canonical challenge prefix for proof-of-ownership. Versioned so a future
 /// rotation (e.g. v2 with timestamp binding) cannot replay v1 registrations.
 pub const PK_REGISTER_CHALLENGE_PREFIX: &str = "qnet-pk-register-v1:";
 
-/// Maximum registry size (scalable for tens of thousands of super-nodes).
-const MAX_CONSENSUS_PK_REGISTRY: usize = 50_000;
+/// Default registry cap when the env override is absent.
+/// v20: raised from 50 000 to 100 000 to match expected mid-term growth
+/// (Y1-Y5: 5 → 50 000 active super-nodes). Operators running larger
+/// deployments override at boot via `QNET_PK_REGISTRY_CAP`.
+const DEFAULT_PK_REGISTRY_CAP: usize = 100_000;
+
+/// Hard upper bound on the cap, regardless of env override. At 1M entries
+/// the registry consumes ~2 GB RAM; we refuse caps higher than that until
+/// a tiered (hot/warm/cold) backend lands in v25+.
+const MAX_PK_REGISTRY_CAP_HARD: usize = 1_000_000;
+
+/// Default idle threshold for LRU eviction (30 days in seconds).
+/// Overridable via `QNET_PK_REGISTRY_IDLE_DAYS`.
+///
+/// Choice rationale: 30 days is longer than the longest consecutive
+/// stall observed in any major BFT chain (Tendermint p99 outage ≈ 7
+/// days). A node silent for a full month is operationally dead; freeing
+/// its slot is correct.
+const DEFAULT_IDLE_THRESHOLD_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Read the active registry capacity (env override or default).
+/// Re-read on every consultation so operators can tune at runtime via
+/// process restart without code changes.
+pub fn consensus_pk_registry_cap() -> usize {
+    std::env::var("QNET_PK_REGISTRY_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.min(MAX_PK_REGISTRY_CAP_HARD))
+        .unwrap_or(DEFAULT_PK_REGISTRY_CAP)
+}
+
+/// Read the active idle threshold for LRU eviction (env override or default).
+pub fn consensus_pk_registry_idle_threshold_secs() -> u64 {
+    std::env::var("QNET_PK_REGISTRY_IDLE_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|days| days * 24 * 60 * 60)
+        .unwrap_or(DEFAULT_IDLE_THRESHOLD_SECS)
+}
+
+/// Current wall-clock seconds (UNIX epoch). Local helper to avoid
+/// re-importing `SystemTime` everywhere in this file.
+#[inline]
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Mark `node_id` as having just produced a signature-verified consensus
+/// message. Lock-free atomic update — safe to call from any thread on every
+/// verify-success path. Unknown node_ids are tracked as well so that if they
+/// later register, the activity record is already current.
+pub fn observe_pk_activity(node_id: &str) {
+    let now = now_secs();
+    LAST_ACTIVITY
+        .entry(node_id.to_string())
+        .and_modify(|t| t.store(now, std::sync::atomic::Ordering::Relaxed))
+        .or_insert_with(|| std::sync::atomic::AtomicU64::new(now));
+}
+
+/// Read the last-activity timestamp for `node_id` (UNIX seconds).
+/// Returns `None` for nodes never observed.
+pub fn last_pk_activity(node_id: &str) -> Option<u64> {
+    LAST_ACTIVITY
+        .get(node_id)
+        .map(|r| r.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Try to evict the single most-stale non-pinned entry whose age exceeds
+/// `idle_threshold_secs`. Returns `Some(node_id)` on eviction, `None`
+/// otherwise. Used as the in-line make-room path inside register_*().
+fn try_evict_one_stale_entry(
+    registry: &mut std::collections::HashMap<String, PkEntry>,
+    idle_threshold_secs: u64,
+) -> Option<String> {
+    let now = now_secs();
+    let mut staleest_id: Option<String> = None;
+    let mut staleest_idle: u64 = 0;
+
+    for (id, entry) in registry.iter() {
+        if entry.pinned {
+            continue; // Never evict genesis anchors
+        }
+        let last = LAST_ACTIVITY
+            .get(id)
+            .map(|r| r.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(entry.registered_at);
+        let idle = now.saturating_sub(last);
+        if idle >= idle_threshold_secs && idle > staleest_idle {
+            staleest_idle = idle;
+            staleest_id = Some(id.clone());
+        }
+    }
+
+    if let Some(id) = staleest_id.as_ref() {
+        registry.remove(id);
+        LAST_ACTIVITY.remove(id);
+        println!(
+            "[INFO][CONSENSUS] pk_evicted_idle node={} idle_secs={} reason=cap_full_and_stale",
+            id, staleest_idle
+        );
+    }
+    staleest_id
+}
+
+/// Background sweep: evict ALL non-pinned entries idle longer than the
+/// threshold. Called from the integration layer's periodic cleanup loop
+/// (hourly or longer). Returns count evicted.
+///
+/// Invariant: pinned entries (genesis anchors) are NEVER evicted, regardless
+/// of staleness — BFT safety requires their PKs always available for
+/// verification.
+pub fn evict_idle_consensus_pks(idle_threshold_secs: u64) -> usize {
+    let now = now_secs();
+    let mut to_evict: Vec<String> = Vec::new();
+
+    {
+        let registry = CONSENSUS_PK_REGISTRY.read();
+        for (id, entry) in registry.iter() {
+            if entry.pinned {
+                continue;
+            }
+            let last = LAST_ACTIVITY
+                .get(id)
+                .map(|r| r.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(entry.registered_at);
+            if now.saturating_sub(last) >= idle_threshold_secs {
+                to_evict.push(id.clone());
+            }
+        }
+    }
+
+    if to_evict.is_empty() {
+        return 0;
+    }
+
+    let mut registry = CONSENSUS_PK_REGISTRY.write();
+    let mut count = 0usize;
+    for id in &to_evict {
+        if let Some(entry) = registry.get(id) {
+            // Re-check pinned (defensive — could have been re-anchored mid-sweep)
+            if entry.pinned {
+                continue;
+            }
+            registry.remove(id);
+            LAST_ACTIVITY.remove(id);
+            count += 1;
+        }
+    }
+    drop(registry);
+
+    if count > 0 {
+        println!(
+            "[INFO][CONSENSUS] pk_idle_sweep_done evicted={} threshold_secs={} remaining={}",
+            count,
+            idle_threshold_secs,
+            consensus_pk_registry_len()
+        );
+    }
+    count
+}
+
+/// Explicit deactivation of a registered PK. Intended for future use by a
+/// signed `NodeDeactivation` TX apply path or by operator tooling. Refuses
+/// to remove pinned (genesis-anchor) entries — anchors can only be rotated
+/// through a network-wide upgrade ceremony, not a runtime call.
+///
+/// Returns `true` on successful removal, `false` if the entry was not
+/// present or was pinned.
+pub fn deactivate_consensus_pk(node_id: &str) -> bool {
+    let mut registry = CONSENSUS_PK_REGISTRY.write();
+    match registry.get(node_id) {
+        Some(entry) if entry.pinned => {
+            eprintln!(
+                "[WARN][CONSENSUS] pk_deactivate_refused_pinned node={} reason=genesis_anchor",
+                node_id
+            );
+            false
+        }
+        Some(_) => {
+            registry.remove(node_id);
+            LAST_ACTIVITY.remove(node_id);
+            println!("[INFO][CONSENSUS] pk_deactivated node={}", node_id);
+            true
+        }
+        None => false,
+    }
+}
 
 /// Build the canonical challenge string for proof-of-ownership.
 /// The joiner MUST sign exactly this byte string with their Dilithium3 key.
@@ -159,15 +410,31 @@ pub fn register_genesis_pk(node_id: &str, pk_bytes: &[u8]) -> bool {
 
     let mut registry = CONSENSUS_PK_REGISTRY.write();
     if let Some(existing) = registry.get(node_id) {
-        if existing.as_slice() == pk_bytes {
+        if existing.pk.as_slice() == pk_bytes {
             // Idempotent re-register
             return true;
         }
         eprintln!("[ERR][CONSENSUS] genesis_pk_already_registered_different node={}", node_id);
         return false;
     }
-    registry.insert(node_id.to_string(), pk_bytes.to_vec());
-    println!("[INFO][CONSENSUS] genesis_pk_registered node={} total={}", node_id, registry.len());
+    let now = now_secs();
+    registry.insert(
+        node_id.to_string(),
+        PkEntry {
+            pk: pk_bytes.to_vec(),
+            pinned: true, // v20: genesis anchors are NEVER evicted
+            registered_at: now,
+        },
+    );
+    drop(registry);
+    LAST_ACTIVITY
+        .entry(node_id.to_string())
+        .or_insert_with(|| std::sync::atomic::AtomicU64::new(now));
+    println!(
+        "[INFO][CONSENSUS] genesis_pk_registered node={} total={} pinned=true",
+        node_id,
+        consensus_pk_registry_len()
+    );
     true
 }
 
@@ -215,22 +482,45 @@ pub fn register_consensus_pk_from_chain(node_id: &str, pk_bytes: &[u8]) -> bool 
         }
     }
 
-    // Immutability + capacity
+    // Immutability + capacity (with v20 LRU eviction on cap-full)
+    let cap = consensus_pk_registry_cap();
+    let idle_threshold = consensus_pk_registry_idle_threshold_secs();
     let mut registry = CONSENSUS_PK_REGISTRY.write();
     if let Some(existing) = registry.get(node_id) {
-        if existing.as_slice() == pk_bytes {
+        if existing.pk.as_slice() == pk_bytes {
             return true;
         }
         eprintln!("[ERR][CONSENSUS] chain_pk_immutable_violation node={}", node_id);
         return false;
     }
-    if registry.len() >= MAX_CONSENSUS_PK_REGISTRY {
-        eprintln!("[WARN][CONSENSUS] pk_registry_full size={}", registry.len());
-        return false;
+    if registry.len() >= cap {
+        // Try in-line eviction of one stale entry before rejecting.
+        if try_evict_one_stale_entry(&mut registry, idle_threshold).is_none() {
+            eprintln!(
+                "[WARN][CONSENSUS] pk_registry_full size={} cap={} idle_threshold_secs={} \
+                 hint=raise_QNET_PK_REGISTRY_CAP_or_lower_QNET_PK_REGISTRY_IDLE_DAYS",
+                registry.len(), cap, idle_threshold
+            );
+            return false;
+        }
     }
-    registry.insert(node_id.to_string(), pk_bytes.to_vec());
-    if registry.len() % 100 == 0 || registry.len() < 16 {
-        println!("[INFO][CONSENSUS] chain_pk_registered node={} total={}", node_id, registry.len());
+    let now = now_secs();
+    registry.insert(
+        node_id.to_string(),
+        PkEntry {
+            pk: pk_bytes.to_vec(),
+            pinned: false, // v20: chain-registered nodes participate in LRU eviction
+            registered_at: now,
+        },
+    );
+    let total = registry.len();
+    drop(registry);
+    LAST_ACTIVITY
+        .entry(node_id.to_string())
+        .or_insert_with(|| std::sync::atomic::AtomicU64::new(now));
+    if total % 100 == 0 || total < 16 {
+        println!("[INFO][CONSENSUS] chain_pk_registered node={} total={} cap={}",
+                 node_id, total, cap);
     }
     true
 }
@@ -295,22 +585,45 @@ pub fn register_consensus_pk_with_proof(
         return false;
     }
 
-    // 4. Immutability + capacity
+    // 4. Immutability + capacity (with v20 LRU eviction on cap-full)
+    let cap = consensus_pk_registry_cap();
+    let idle_threshold = consensus_pk_registry_idle_threshold_secs();
     let mut registry = CONSENSUS_PK_REGISTRY.write();
     if let Some(existing) = registry.get(node_id) {
-        if existing.as_slice() == pk_bytes {
+        if existing.pk.as_slice() == pk_bytes {
             // Idempotent: same node re-proving same PK is fine
             return true;
         }
         eprintln!("[ERR][CONSENSUS] pk_register_immutable_violation node={}", node_id);
         return false;
     }
-    if registry.len() >= MAX_CONSENSUS_PK_REGISTRY {
-        eprintln!("[WARN][CONSENSUS] pk_registry_full size={}", registry.len());
-        return false;
+    if registry.len() >= cap {
+        // Try in-line eviction of one stale entry before rejecting.
+        if try_evict_one_stale_entry(&mut registry, idle_threshold).is_none() {
+            eprintln!(
+                "[WARN][CONSENSUS] pk_registry_full size={} cap={} idle_threshold_secs={} \
+                 hint=raise_QNET_PK_REGISTRY_CAP_or_lower_QNET_PK_REGISTRY_IDLE_DAYS",
+                registry.len(), cap, idle_threshold
+            );
+            return false;
+        }
     }
-    registry.insert(node_id.to_string(), pk_bytes.to_vec());
-    println!("[INFO][CONSENSUS] pk_registered_with_proof node={} total={}", node_id, registry.len());
+    let now = now_secs();
+    registry.insert(
+        node_id.to_string(),
+        PkEntry {
+            pk: pk_bytes.to_vec(),
+            pinned: false, // v20: proof-registered nodes participate in LRU eviction
+            registered_at: now,
+        },
+    );
+    let total = registry.len();
+    drop(registry);
+    LAST_ACTIVITY
+        .entry(node_id.to_string())
+        .or_insert_with(|| std::sync::atomic::AtomicU64::new(now));
+    println!("[INFO][CONSENSUS] pk_registered_with_proof node={} total={} cap={}",
+             node_id, total, cap);
     true
 }
 
@@ -320,13 +633,28 @@ pub fn has_consensus_pk(node_id: &str) -> bool {
 }
 
 /// Retrieve a registered PK (returns None if not registered).
+///
+/// v20: Every successful lookup updates the activity tracker — the
+/// signature-verification path is the canonical "this node is alive" signal
+/// for LRU eviction. The update is lock-free (DashMap + AtomicU64), so the
+/// read-hot consensus path stays wait-free.
 pub fn get_consensus_pk(node_id: &str) -> Option<Vec<u8>> {
-    CONSENSUS_PK_REGISTRY.read().get(node_id).cloned()
+    let pk = CONSENSUS_PK_REGISTRY.read().get(node_id).map(|e| e.pk.clone());
+    if pk.is_some() {
+        observe_pk_activity(node_id);
+    }
+    pk
 }
 
 /// Current registry size (for metrics / diagnostics).
 pub fn consensus_pk_registry_len() -> usize {
     CONSENSUS_PK_REGISTRY.read().len()
+}
+
+/// Count of pinned (genesis-anchor) entries — never evicted by idle-sweep.
+/// Used by tests and diagnostics to verify the pin invariant.
+pub fn consensus_pk_registry_pinned_count() -> usize {
+    CONSENSUS_PK_REGISTRY.read().values().filter(|e| e.pinned).count()
 }
 
 /// Anchored genesis public keys. These 5 nodes form the initial validator set.
@@ -1256,14 +1584,18 @@ async fn verify_with_real_dilithium(
     {
         let registry = CONSENSUS_PK_REGISTRY.read();
         match registry.get(node_id) {
-            Some(registered_pk) if registered_pk == public_key_bytes => {
+            Some(entry) if entry.pk.as_slice() == public_key_bytes => {
                 // Tier 1: bound and matches — proceed to math verification.
+                // v20: drop the read lock BEFORE recording activity so the
+                // hot path stays wait-free.
+                drop(registry);
+                observe_pk_activity(node_id);
             }
-            Some(registered_pk) => {
+            Some(entry) => {
                 // Tier 2: bound, mismatch — hostile identity claim. Hard reject.
                 eprintln!("[ERR][CONSENSUS] pk_mismatch node={} registered={}.. extracted={}..",
                          node_id,
-                         hex::encode(&registered_pk[..8]),
+                         hex::encode(&entry.pk[..8]),
                          hex::encode(&public_key_bytes[..8]));
                 return false;
             }
@@ -1479,5 +1811,256 @@ mod tests_v17_security {
         let compressed = zstd_compress_for_test(&[]);
         let decoded = decode_zstd_bounded(&compressed, 4096).expect("empty must decode");
         assert!(decoded.is_empty());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v20: REGRESSION TESTS — PK REGISTRY SCALING
+// ═══════════════════════════════════════════════════════════════════════════
+// These tests verify the LRU + idle-eviction + pinned-anchor invariants of
+// the v20 consensus PK registry. The registry is a process-wide singleton,
+// so cargo's parallel test workers share state. Each test below isolates
+// its assertions to UNIQUE node_ids it owns — collisions with the genesis
+// anchor namespace or other tests' keys are avoided by a per-test prefix.
+//
+// Each test exercises a SECURITY or LIVENESS property:
+//   * pinned anchors must NEVER be evicted (BFT safety — verifies depend on
+//     anchored PKs being available even after long stalls)
+//   * LRU eviction must respect the idle-threshold (no false-positive evict)
+//   * cap-full path must attempt eviction before rejecting a new joiner
+//   * deactivation must refuse to remove pinned entries
+//   * env override must control runtime cap / idle-threshold
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests_v20_pk_registry {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Build a syntactically valid 1952-byte Dilithium3 PK seed for tests.
+    /// Real cryptographic validity is irrelevant for these registry-level
+    /// tests because they exercise the storage + eviction logic, not the
+    /// signature math (covered separately by `tests_v17_security`).
+    fn fake_pk_bytes(seed: u8) -> Vec<u8> {
+        // Build deterministic 1952 bytes; structural parsing checks are
+        // exercised in their dedicated tests, not here.
+        let mut v = vec![seed; 1952];
+        // Make first byte distinct per seed for easier debug output
+        v[0] = seed;
+        v
+    }
+
+    /// Helper that bypasses parse-validation for tests. Inserts a synthetic
+    /// entry directly into the registry under a test-owned key prefix.
+    /// Pinned flag controls whether LRU eviction can later remove it.
+    fn install_test_entry(node_id: &str, pk_bytes: &[u8], pinned: bool, last_seen: u64) {
+        let mut registry = CONSENSUS_PK_REGISTRY.write();
+        registry.insert(
+            node_id.to_string(),
+            PkEntry {
+                pk: pk_bytes.to_vec(),
+                pinned,
+                registered_at: last_seen,
+            },
+        );
+        drop(registry);
+        LAST_ACTIVITY
+            .entry(node_id.to_string())
+            .and_modify(|t| t.store(last_seen, Ordering::Relaxed))
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(last_seen));
+    }
+
+    fn cleanup_test_entry(node_id: &str) {
+        CONSENSUS_PK_REGISTRY.write().remove(node_id);
+        LAST_ACTIVITY.remove(node_id);
+    }
+
+    /// Pinned (genesis-anchor) entries MUST survive an idle sweep regardless
+    /// of how long they have been silent. BFT safety relies on anchored PKs
+    /// being available for verification when a recovered genesis node
+    /// re-broadcasts after a long offline window.
+    #[test]
+    fn pinned_anchor_survives_idle_sweep() {
+        let id = "v20_test_pinned_anchor_survives";
+        let pk = fake_pk_bytes(0xAA);
+        // Insert with `last_seen` 10 years ago — far past any realistic
+        // idle threshold.
+        let ancient_ts = now_secs().saturating_sub(10 * 365 * 24 * 60 * 60);
+        install_test_entry(id, &pk, true, ancient_ts);
+
+        // 1-second idle threshold: every non-pinned entry would evict.
+        let _ = evict_idle_consensus_pks(1);
+
+        assert!(
+            has_consensus_pk(id),
+            "pinned anchor {} MUST survive idle sweep regardless of age",
+            id
+        );
+        cleanup_test_entry(id);
+    }
+
+    /// Non-pinned entries idle longer than the threshold MUST be evicted by
+    /// the periodic sweep — this is the LRU contract that frees registry
+    /// slots for new joiners.
+    #[test]
+    fn idle_non_pinned_entry_is_evicted() {
+        let id = "v20_test_idle_evicted";
+        let pk = fake_pk_bytes(0xBB);
+        let ancient_ts = now_secs().saturating_sub(60 * 60 * 24 * 60); // 60 days ago
+        install_test_entry(id, &pk, false, ancient_ts);
+
+        // 30-day threshold — entry is well past it.
+        let evicted = evict_idle_consensus_pks(30 * 24 * 60 * 60);
+
+        assert!(evicted >= 1, "at least one entry must be evicted, got {}", evicted);
+        assert!(
+            !has_consensus_pk(id),
+            "stale non-pinned entry {} MUST be removed by sweep",
+            id
+        );
+    }
+
+    /// Fresh non-pinned entries MUST NOT be evicted. False positives here
+    /// would re-introduce the pre-v20 cap-full rejection symptom: every
+    /// honest joiner registering normally would suddenly be evicted by an
+    /// over-aggressive sweep, violating the "active = retained" contract.
+    #[test]
+    fn fresh_non_pinned_entry_is_preserved() {
+        let id = "v20_test_fresh_preserved";
+        let pk = fake_pk_bytes(0xCC);
+        let now = now_secs();
+        install_test_entry(id, &pk, false, now);
+
+        // 30-day threshold — entry is fresh (≤ 1 sec old).
+        let _ = evict_idle_consensus_pks(30 * 24 * 60 * 60);
+
+        assert!(
+            has_consensus_pk(id),
+            "fresh non-pinned entry {} MUST survive (not stale)",
+            id
+        );
+        cleanup_test_entry(id);
+    }
+
+    /// `deactivate_consensus_pk` MUST remove a non-pinned entry and return
+    /// true. This is the explicit-unregister path used by future
+    /// NodeDeactivation TX apply hooks and by operator tooling.
+    #[test]
+    fn deactivate_removes_non_pinned_entry() {
+        let id = "v20_test_deactivate_removes";
+        let pk = fake_pk_bytes(0xDD);
+        install_test_entry(id, &pk, false, now_secs());
+
+        let removed = deactivate_consensus_pk(id);
+
+        assert!(removed, "deactivate must succeed for non-pinned entry");
+        assert!(
+            !has_consensus_pk(id),
+            "deactivated entry {} must no longer be in registry",
+            id
+        );
+    }
+
+    /// `deactivate_consensus_pk` MUST refuse to remove a pinned (genesis-
+    /// anchor) entry and return false. Anchors can only be rotated through
+    /// a network-wide upgrade ceremony; no runtime call may take them out.
+    #[test]
+    fn deactivate_refuses_pinned_entry() {
+        let id = "v20_test_deactivate_refuses_pinned";
+        let pk = fake_pk_bytes(0xEE);
+        install_test_entry(id, &pk, true, now_secs());
+
+        let removed = deactivate_consensus_pk(id);
+
+        assert!(!removed, "deactivate MUST refuse pinned anchor");
+        assert!(
+            has_consensus_pk(id),
+            "pinned anchor {} must still be in registry after refused deactivate",
+            id
+        );
+        cleanup_test_entry(id);
+    }
+
+    /// `try_evict_one_stale_entry` MUST select the most-stale eligible
+    /// entry (largest idle time), not just any stale entry. Without this,
+    /// LRU semantics degrade to FIFO — the oldest insertion would always
+    /// vacate even if it is in fact more recently active than other
+    /// entries.
+    #[test]
+    fn in_line_eviction_picks_most_stale() {
+        let id_old = "v20_test_evict_pick_oldest";
+        let id_recent = "v20_test_evict_pick_recent";
+        let pk_old = fake_pk_bytes(0x10);
+        let pk_recent = fake_pk_bytes(0x11);
+
+        let now = now_secs();
+        install_test_entry(id_old, &pk_old, false, now.saturating_sub(60 * 24 * 3600));
+        install_test_entry(id_recent, &pk_recent, false, now.saturating_sub(40 * 24 * 3600));
+
+        let mut reg = CONSENSUS_PK_REGISTRY.write();
+        let evicted = try_evict_one_stale_entry(&mut reg, 30 * 24 * 3600);
+        drop(reg);
+
+        assert_eq!(
+            evicted.as_deref(),
+            Some(id_old),
+            "in-line eviction must pick the most-stale entry, got {:?}",
+            evicted
+        );
+        // Cleanup the survivor; the evicted entry was already removed by the helper.
+        cleanup_test_entry(id_recent);
+    }
+
+    /// `consensus_pk_registry_cap` MUST honour the `QNET_PK_REGISTRY_CAP`
+    /// env override at runtime. Operators tuning a high-density deployment
+    /// rely on this to lift the default 100K cap without code changes.
+    /// Hard-bound MUST clamp values above MAX_PK_REGISTRY_CAP_HARD.
+    #[test]
+    fn env_override_controls_cap() {
+        // SAFETY: this test mutates a process-global env var. Cargo runs
+        // tests in parallel by default, so we serialise via a unique
+        // override value that is restored at the end of the test.
+        let prev = std::env::var("QNET_PK_REGISTRY_CAP").ok();
+        std::env::set_var("QNET_PK_REGISTRY_CAP", "777");
+        let cap_with_override = consensus_pk_registry_cap();
+        // Restore IMMEDIATELY before any assertion so a panic does not leak
+        // the env var into other tests in this module.
+        match prev {
+            Some(v) => std::env::set_var("QNET_PK_REGISTRY_CAP", v),
+            None => std::env::remove_var("QNET_PK_REGISTRY_CAP"),
+        }
+        assert_eq!(cap_with_override, 777, "env override must be honoured");
+
+        // Verify hard bound clamp without leaking env state across tests.
+        std::env::set_var("QNET_PK_REGISTRY_CAP", "999999999999"); // way over hard bound
+        let cap_clamped = consensus_pk_registry_cap();
+        std::env::remove_var("QNET_PK_REGISTRY_CAP");
+        assert_eq!(
+            cap_clamped, MAX_PK_REGISTRY_CAP_HARD,
+            "cap larger than MAX_PK_REGISTRY_CAP_HARD must clamp"
+        );
+    }
+
+    /// `observe_pk_activity` MUST update the timestamp on subsequent calls.
+    /// Without this the activity tracker would remain frozen at the first
+    /// observation and every entry would look idle to the sweep.
+    #[test]
+    fn observe_pk_activity_updates_timestamp() {
+        let id = "v20_test_observe_updates";
+        observe_pk_activity(id);
+        let first = last_pk_activity(id).expect("first observation must record");
+
+        // Wait for the wall clock to advance by at least one second so the
+        // timestamp delta is observable. `now_secs` is 1-sec granularity.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        observe_pk_activity(id);
+        let second = last_pk_activity(id).expect("second observation must record");
+
+        assert!(
+            second > first,
+            "second observation timestamp ({}) must be later than first ({})",
+            second, first
+        );
+        LAST_ACTIVITY.remove(id);
     }
 }

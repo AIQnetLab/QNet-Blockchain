@@ -9025,9 +9025,41 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                     // RAM cleanup
                     p2p.cleanup_old_attestations();
                     p2p.cleanup_old_heartbeats();
-                    
+
                     // PRODUCTION v2.78: RocksDB cleanup (persistent storage)
                     blockchain_for_pings.cleanup_old_storage_data().await;
+
+                    // ─────────────────────────────────────────────────────────
+                    // v20: CONSENSUS PK REGISTRY — IDLE LRU SWEEP
+                    // ─────────────────────────────────────────────────────────
+                    // Reclaims registry slots held by super-nodes that have not
+                    // produced a single signature-verified consensus message
+                    // within `QNET_PK_REGISTRY_IDLE_DAYS` (default 30). Pinned
+                    // genesis-anchor entries are never evicted regardless of
+                    // staleness — BFT safety requires their PKs always
+                    // available for verification.
+                    //
+                    // The sweep is the proactive counterpart to the in-line
+                    // single-shot eviction performed by register_*() when the
+                    // cap is hit. Running once an hour keeps the registry
+                    // responsive to operator churn at thousand-node scale
+                    // without amplifying the lock-contention surface.
+                    //
+                    // Cost: O(N) read pass + bounded write pass over the
+                    // PK registry. At 100K entries with ~5% idle, expected
+                    // wall-clock ~10 ms per sweep — negligible at hourly
+                    // cadence.
+                    // ─────────────────────────────────────────────────────────
+                    let idle_threshold =
+                        qnet_consensus::consensus_crypto::consensus_pk_registry_idle_threshold_secs();
+                    let evicted =
+                        qnet_consensus::consensus_crypto::evict_idle_consensus_pks(idle_threshold);
+                    if evicted > 0 && crate::node::is_info() {
+                        println!(
+                            "[INFO][CLEANUP] consensus_pk_idle_sweep evicted={} threshold_secs={}",
+                            evicted, idle_threshold
+                        );
+                    }
                 }
             }
             

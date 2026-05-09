@@ -25391,15 +25391,70 @@ impl SimplifiedP2P {
         const BFT_LIVENESS_WINDOW_SECS: u64 = 300; // 5 minutes
         const GENESIS_MIN_VALIDATORS: usize = 5;
 
-        // v6.6: Genesis epoch (blocks 0-180) — bootstrap mode
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v19: AUTHENTICATED VALIDATOR-SET SOURCE (anti-spoof hardening)
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Pre-v19 the genesis-epoch path counted unique-by-node_id LIVE peers from
+        // `connected_peers_lockfree`. That set is admitted by the QUIC-handshake
+        // layer (X.509 SAN + TOFU) which does not cryptographically bind the
+        // claimed identity to a registered Dilithium3 key. A peer holding any
+        // self-signed cert with `qnet-{claimed_node_id}` in its SAN is admitted
+        // and its `node_id` (or its privacy-hash variant) becomes a +1 to the
+        // counted validator set — an unauthenticated entry inflates `2f+1`,
+        // making consensus thresholds harder to reach for honest validators.
+        //
+        // Authoritative source for genesis epoch is the consensus PK registry
+        // (`CONSENSUS_PK_REGISTRY`), which is populated in three audited paths:
+        //   1. `install_genesis_anchors_at_startup` — pre-pinned canonical PKs
+        //      from the deploy-shipped `genesis_anchors.json`. Locked at boot
+        //      BEFORE the P2P layer accepts a single packet.
+        //   2. `register_consensus_pk_from_chain` — invoked from the chain
+        //      apply path on a finalized `NodeRegistration` TX (super-node
+        //      activation via burn). Anti-squat enforced against anchors.
+        //   3. `register_consensus_pk_with_proof` — explicit challenge-signature
+        //      path; signature must verify under the supplied PK. Admits
+        //      proven-ownership entries only.
+        //
+        // Every entry in this registry has cryptographic proof of ownership;
+        // a spoofer that did not solve the challenge for `genesis_node_001`
+        // does not appear here regardless of how many TLS connections it
+        // opens. Substituting the registry size for the genesis-epoch
+        // counter eliminates the inflation vector in O(1) without changing
+        // any existing security path.
+        //
+        // Scalability: the registry is a `parking_lot::RwLock<HashMap>` capped
+        // at MAX_CONSENSUS_PK_REGISTRY (50K). Read path is wait-free at any
+        // committee size; write path runs once per identity registration.
+        //
+        // Compatibility: when the registry is unexpectedly empty (e.g. very
+        // early boot before anchor install completes — should not happen in
+        // production because `install_genesis_anchors_at_startup` runs before
+        // P2P, but defended here in depth), the helper falls back to the
+        // legacy live-peer count. The fallback emits a `[WARN][BFT]` so the
+        // anomaly is visible in operational logs.
+        // ═══════════════════════════════════════════════════════════════════════════
+
         if local_h <= 180 {
+            let registry_size = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
+            if registry_size >= GENESIS_MIN_VALIDATORS {
+                let total = registry_size.min(crate::node::MAX_VALIDATORS);
+                if crate::node::is_info() {
+                    println!("[INFO][BFT] validator_count={} source=consensus_pk_registry h={}",
+                             total, local_h);
+                }
+                return total;
+            }
+            // Defence-in-depth fallback: registry not yet populated. Emit WARN
+            // so the operator can investigate why anchors did not install.
             let unique_live = self.count_unique_live_peers(BFT_LIVENESS_WINDOW_SECS);
-            // +1 for self; min 5 (genesis constants); cap at MAX_VALIDATORS
             let total = std::cmp::max(GENESIS_MIN_VALIDATORS, unique_live + 1)
                 .min(crate::node::MAX_VALIDATORS);
-            if crate::node::is_info() {
-                println!("[INFO][BFT] validator_count={} source=genesis unique_peers={} h={}",
-                         total, unique_live, local_h);
+            if crate::node::is_warn() {
+                println!(
+                    "[WARN][BFT] validator_count={} source=p2p_fallback_unauthenticated registry_size={} unique_peers={} h={} \
+                     hint=anchor_install_incomplete_or_pre_consensus_boot",
+                    total, registry_size, unique_live, local_h
+                );
             }
             return total;
         }

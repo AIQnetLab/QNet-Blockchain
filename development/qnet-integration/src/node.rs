@@ -590,8 +590,15 @@ pub static LAST_SYNC_PROGRESS_TIME: AtomicU64 = AtomicU64::new(0);
 // slot starts fresh.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Current rotation round (certified.max(adopted) from the latest stall
-/// evaluation). Read by producer selection and block construction.
+/// v19: TELEMETRY-ONLY snapshot of the rotation round most recently observed
+/// by the stall-detection loop. Once read by producer selection / block
+/// construction; that consensus path now reads `get_highest_certified_round`
+/// directly to avoid the per-tip-advance reset race that briefly returned 0
+/// while the network was still at a non-zero BFT-certified round.
+///
+/// Kept for: status RPC (`current_timeout_round`), debug logs, telemetry
+/// metrics. Setting / resetting it is side-effect-free with respect to
+/// consensus correctness.
 static CURRENT_TIMEOUT_ROUND: AtomicU64 = AtomicU64::new(0);
 
 /// Height for which `CURRENT_TIMEOUT_ROUND` was last set. Informational;
@@ -599,22 +606,27 @@ static CURRENT_TIMEOUT_ROUND: AtomicU64 = AtomicU64::new(0);
 #[allow(dead_code)]
 static TIMEOUT_ROUND_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
-/// Read the current BFT rotation round (certified.max(adopted)) for producer
-/// selection and block construction.
+/// Read the most recently observed BFT rotation round.
+/// v19: TELEMETRY-ONLY. Consensus paths (producer selection, block
+/// construction) read `get_highest_certified_round(mb_index)` directly
+/// from `SimplifiedP2P` instead — that is the same DashMap the stall
+/// detector itself reads, with no oscillation under tip-advance races.
 pub fn get_current_timeout_round() -> u64 {
     CURRENT_TIMEOUT_ROUND.load(Ordering::SeqCst)
 }
 
-/// Set the current rotation round. Called by the stall-detection loop after
-/// re-reading `certified_timeout_round` and `adopted_timeout_round` from
-/// `unified_p2p`. The value is what producer selection will use this tick.
+/// Update the telemetry snapshot of the current rotation round. Called by
+/// the stall-detection loop after re-reading `certified_timeout_round`.
+/// v19: stored value is no longer authoritative for producer selection.
 pub fn set_timeout_round(round: u64, height: u64) {
     CURRENT_TIMEOUT_ROUND.store(round, Ordering::SeqCst);
     TIMEOUT_ROUND_HEIGHT.store(height, Ordering::SeqCst);
 }
 
-/// Reset rotation round to 0. Called on tip advance — a fresh block
-/// arrived, so the previous slot's failover round no longer applies.
+/// Clear the telemetry snapshot on tip advance.
+/// v19: this no longer affects consensus — producer selection reads the
+/// 2f+1 BFT-certified round directly. The reset is preserved so that
+/// status / debug logs do not stale-display a previous slot's round.
 pub fn reset_timeout_round() {
     CURRENT_TIMEOUT_ROUND.store(0, Ordering::SeqCst);
 }
@@ -19403,17 +19415,47 @@ impl BlockchainNode {
                     }
                 }
 
-                // v14.8.10: Get timeout_round for deterministic failover from the
-                // stored BFT-agreed value. `set_timeout_round()` is called in the
-                // stall-detection path above every tick with
-                // `certified.max(adopted)` — both operands aggregate only
-                // Dilithium3-verified signed votes, so every validator reads the
-                // same value once gossip has reached them. On tip advance the
-                // value is cleared via `reset_timeout_round()` so a fresh block
-                // starts at round 0. Under steady-state (no stall) this is just
-                // a cheap atomic load that returns 0 → the primary producer
-                // stays selected.
-                let timeout_round: u64 = get_current_timeout_round();
+                // ═══════════════════════════════════════════════════════════════
+                // v19: BFT-CERTIFIED ROTATION ROUND — DIRECT READ
+                // ═══════════════════════════════════════════════════════════════
+                // Producer selection reads the rotation round DIRECTLY from the
+                // 2f+1 BFT-certified state for this height's macroblock index
+                // instead of via the globally mutable `CURRENT_TIMEOUT_ROUND`
+                // atomic.
+                //
+                // Why: the legacy atomic was set by the stall-detection loop
+                // every tick AND reset to 0 on every tip-advance. Under load,
+                // these two writes interleaved with the producer-selection
+                // read in this loop, occasionally yielding 0 when the actual
+                // BFT-agreed round was non-zero (or vice versa). When local
+                // and remote nodes computed different rounds for the same
+                // height, they selected different producers — the validator
+                // produced an empty-slot attestation while the producer
+                // signed a microblock, and the network stalled until gossip
+                // reconciled (~30 s × N blocks).
+                //
+                // The new path queries `get_highest_certified_round(mb_index)`,
+                // which is:
+                //   * a lock-free DashMap read keyed by macroblock index
+                //   * monotonic (advances only on 2f+1 Dilithium3-verified
+                //     TimeoutVote certificates) — never resets per-block
+                //   * deterministic across honest validators once vote
+                //     gossip propagates (≤ 1 s in steady state)
+                //
+                // The legacy `CURRENT_TIMEOUT_ROUND` atomic stays in place
+                // for telemetry / debug logging and is still updated by the
+                // stall-detection loop, but is no longer on the consensus
+                // path.
+                //
+                // Scalability: O(1) DashMap lookup per slot. Identical cost
+                // at 5 or 5000 super-nodes.
+                // ═══════════════════════════════════════════════════════════════
+                let timeout_round: u64 = if let Some(ref p2p) = unified_p2p {
+                    let mb_index = next_block_height / 90;
+                    p2p.get_highest_certified_round(mb_index)
+                } else {
+                    0
+                };
 
                 // v3.8: Use select_microblock_producer_with_round for deterministic failover.
                 // Value is read-only after this point (validated via is_my_turn_to_produce,
@@ -19428,7 +19470,13 @@ impl BlockchainNode {
                     timeout_round  // CRITICAL: Pass timeout_round for deterministic failover!
                 ).await;
                 
-                // v4.3: Cache expected producer for incoming block validation
+                // v4.3 / v19: Cache expected producer for incoming block validation.
+                // The cached round is the 2f+1 BFT-certified value (read above as
+                // `timeout_round`), so all honest validators populate identical
+                // entries once vote gossip has propagated. Block-pipeline ingest
+                // compares the cached pair against the incoming block's
+                // `(producer, timeout_round)` to detect Category B authority
+                // violations (same round, wrong signer → HARD reject).
                 cache_expected_producer(next_block_height, &current_producer, timeout_round);
 
                 let mut is_my_turn_to_produce = current_producer == node_id;

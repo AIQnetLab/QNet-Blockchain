@@ -655,20 +655,44 @@ impl GracefulDegradation {
 }
 
 // ============================================================================
-// LIGHT NODE ROTATION (Auto-cleanup old headers)
+// v19: LightNodeRotation — DEPRECATED LEGACY (kept for backward compatibility)
 // ============================================================================
-// Light nodes automatically delete old block headers to maintain ~100MB size
-// This is a FIFO queue - oldest headers are deleted first
+// Status: NOT used in production light-node deployments.
+//
+// Rationale
+// ─────────
+// Production light-node design (per `StorageTierConfig::light()` below) is
+// `Pure API client — NO local storage. max_storage_bytes = 0.`. A light
+// node is the mobile-wallet tier: it signs transactions, queries balances
+// via API endpoints, and receives uptime rewards via the ping-response
+// challenge protocol (`handle_light_node_ping_response` in rpc.rs). It
+// does NOT maintain a local block-header chain on disk.
+//
+// `LightNodeRotation` was an earlier design where light clients persisted
+// macroblock headers locally and rotated them in a FIFO buffer when the
+// retention cap was hit. That scheme was retired when the storage tier
+// config flipped `max_storage_bytes` to zero — the rotation code path now
+// runs against an empty buffer and is effectively a no-op. The struct is
+// retained so the existing `Storage::light_rotation` field continues to
+// compile without ripple-effect refactors across the codebase.
+//
+// Future cleanup (post-mainnet): remove this struct and the corresponding
+// `Storage::light_rotation` field once all in-tree references are migrated.
+// Until then, `#[allow(dead_code)]` annotations document the deprecation.
 // ============================================================================
 
-/// Light node header rotation configuration
+/// DEPRECATED — header rotation buffer for the historical "headers-persisted"
+/// light-node tier. Production light nodes are pure API clients with no
+/// local storage; this struct is no-op in that configuration.
+#[allow(dead_code)]
 pub struct LightNodeRotation {
-    /// Maximum number of headers to keep
+    /// Maximum number of headers to keep (legacy; production = 0).
     max_headers: u64,
-    /// Current header count
+    /// Current header count (legacy; production = 0).
     current_count: u64,
 }
 
+#[allow(dead_code)]
 impl LightNodeRotation {
     pub fn new(max_headers: u64) -> Self {
         Self {
@@ -676,13 +700,15 @@ impl LightNodeRotation {
             current_count: 0,
         }
     }
-    
-    /// Check if we need to rotate (delete old headers)
+
+    /// Check if we need to rotate (delete old headers).
+    /// DEPRECATED: returns false in production (max_headers = 0).
     pub fn needs_rotation(&self) -> bool {
         self.current_count >= self.max_headers
     }
-    
-    /// Get number of headers to delete
+
+    /// Get number of headers to delete.
+    /// DEPRECATED: returns 0 in production (no-op).
     pub fn headers_to_delete(&self) -> u64 {
         if self.current_count > self.max_headers {
             self.current_count - self.max_headers
@@ -690,13 +716,15 @@ impl LightNodeRotation {
             0
         }
     }
-    
-    /// Update count after adding a header
+
+    /// Update count after adding a header.
+    /// DEPRECATED: does not affect production light tier (no storage).
     pub fn increment(&mut self) {
         self.current_count += 1;
     }
-    
-    /// Update count after deleting headers
+
+    /// Update count after deleting headers.
+    /// DEPRECATED: does not affect production light tier (no storage).
     pub fn decrement(&mut self, count: u64) {
         self.current_count = self.current_count.saturating_sub(count);
     }

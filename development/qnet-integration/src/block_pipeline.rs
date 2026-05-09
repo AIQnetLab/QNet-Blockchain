@@ -416,6 +416,155 @@ pub fn request_missing_parent(parent_h: u64) -> bool {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// v19: RANGE-SYNC TRIGGER for large storage gaps
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Problem the v18 single-flight path leaves open
+// ──────────────────────────────────────────────
+// `request_missing_parent` issues one request per missing height with a 30 s
+// dedup TTL. When the local pipeline finds itself N blocks behind the network
+// tip (observed at h=90 vs network tip h=121, gap=31), the cascade of
+// individual single-height requests recovers at most one block per TTL window
+// per missing height, which produces a worst-case recovery time of
+// `gap × TTL ≈ 15 minutes` on a 31-block gap — orders of magnitude slower
+// than the underlying network can deliver. While the cascade is in flight
+// the producer's downstream blocks keep arriving and queue up in the
+// deferred buffer, never converting into applied state.
+//
+// What the network actually has
+// ─────────────────────────────
+// `unified_p2p::sync_blocks(from, to)` is the canonical block-range sync
+// primitive used elsewhere in the codebase: parallel fan-out to the
+// top-reputation validators with `MAX_BATCH_BLOCKS = 500` per request and
+// timeout-aligned peer rotation. A single call retrieves every block in the
+// requested range from authenticated peers in one round-trip; the responses
+// arrive as `BlocksBatch` envelopes that re-enter the same pipeline through
+// `handle_blocks_batch → block_tx → ingest`.
+//
+// The v19 fix simply wires that primitive into the verify-stage gap-detection
+// path: when the missing parent is more than `RANGE_SYNC_GAP_THRESHOLD`
+// blocks below the just-arrived child, dispatch a single range request
+// instead of N single-flights.
+//
+// Single-flight per RANGE
+// ───────────────────────
+// The legacy per-height dedup map (`MISSING_BLOCK_REQUESTED`) is preserved
+// for the small-gap path. Range sync uses a separate, time-windowed dedup
+// (`MISSING_BLOCK_RANGE_REQUESTED`) keyed by `(local_tip, target_height)`
+// pair — multiple gap detections within the cooldown window collapse to
+// one outbound request, so a hot stream of deferred children does not
+// amplify into a request storm.
+//
+// Scalability
+// ───────────
+//   * O(1) dedup-map ops per gap detection. Bounded by the active gap set,
+//     typically << 100 entries even on a 100K-super-node deployment.
+//   * Range request itself caps at MAX_BATCH_BLOCKS = 500 blocks per peer.
+//     Top-3 peers parallel send ⇒ ~1500 blocks delivered per round-trip
+//     under contention, ~500 under healthy single-peer fan-out.
+//   * Detached `tokio::spawn` keeps the verify stage non-blocking.
+//
+// Security
+// ────────
+//   * Range responses re-enter the canonical pipeline (signature + hash
+//     chain + state apply). Attacker cannot inject blocks bypassing
+//     `verify_consensus_signature`, equivalence with the v18 single-flight
+//     security boundary.
+//   * Dedup map is per-target-height keyed; an attacker cannot exhaust
+//     it because TTL eviction releases slots, and `cleanup_missing_block_requests`
+//     evicts in periodic sweeps regardless of activity.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Threshold (in blocks) above which the verify stage prefers a single
+/// range-sync over the cascade of single-height requests. Picked to keep
+/// the small-gap regime (1–5 blocks, normal gossip jitter) on the
+/// lighter-weight per-height path while ensuring any genuine catch-up gap
+/// converts to a batched range request.
+const RANGE_SYNC_GAP_THRESHOLD: u64 = 5;
+
+/// TTL for in-flight range-sync request dedup. Slightly longer than the
+/// per-height TTL so a cascade of children does not generate overlapping
+/// batched requests for substantially the same range.
+const MISSING_BLOCK_RANGE_TTL_MS: u64 = 60_000; // 60 seconds
+
+/// Range-sync dedup map. Key = `(from_height, to_height)`; value =
+/// dispatch timestamp in unix-ms. Lock-free DashMap, evicted on TTL
+/// by `cleanup_missing_block_requests`.
+static MISSING_BLOCK_RANGE_REQUESTED: once_cell::sync::Lazy<
+    dashmap::DashMap<(u64, u64), u64>
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// Trigger a range sync covering `from..=to`. Returns true on dispatch,
+/// false if a recent request for the same range is still in cooldown or
+/// the global P2P instance is not yet initialized.
+///
+/// The actual network call (`unified_p2p::sync_blocks`) runs on a detached
+/// task so the verify stage thread is never blocked on I/O.
+pub fn request_missing_range(from: u64, to: u64) -> bool {
+    if to < from {
+        return false;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // Single-flight per (from, to) tuple within the cooldown window.
+    let should_dispatch = match MISSING_BLOCK_RANGE_REQUESTED.entry((from, to)) {
+        dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+            let last = *occupied.get();
+            if now_ms.saturating_sub(last) < MISSING_BLOCK_RANGE_TTL_MS {
+                false
+            } else {
+                *occupied.get_mut() = now_ms;
+                true
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            vacant.insert(now_ms);
+            true
+        }
+    };
+
+    if !should_dispatch {
+        return false;
+    }
+
+    if let Some(p2p_arc) = crate::node::try_get_p2p() {
+        let p2p_clone = p2p_arc.clone();
+        tokio::spawn(async move {
+            match p2p_clone.sync_blocks(from, to).await {
+                Ok(_) => {
+                    if is_info() {
+                        println!(
+                            "[INFO][PIPELINE] missing_range_requested from={} to={} blocks={} action=batched_top_peers",
+                            from, to, to.saturating_sub(from).saturating_add(1)
+                        );
+                    }
+                }
+                Err(e) => {
+                    if is_debug() {
+                        println!(
+                            "[DBG][PIPELINE] missing_range_request_failed from={} to={} err={}",
+                            from, to, e
+                        );
+                    }
+                }
+            }
+        });
+        true
+    } else {
+        if is_debug() {
+            println!(
+                "[DBG][PIPELINE] missing_range_request_skipped from={} to={} reason=p2p_not_ready",
+                from, to
+            );
+        }
+        false
+    }
+}
+
 /// Periodic cleanup of expired request entries. Called from the existing
 /// cleanup task on the same cadence as `cleanup_forked_peer_cooldown` to
 /// keep the map bounded regardless of chain length or stall duration.
@@ -426,6 +575,12 @@ pub fn cleanup_missing_block_requests() {
         .unwrap_or(0);
     MISSING_BLOCK_REQUESTED.retain(|_, last| {
         now_ms.saturating_sub(*last) < MISSING_BLOCK_REQUEST_TTL_MS
+    });
+    // v19: range-sync dedup map shares the same retention sweep so it
+    // stays bounded under sustained gap-recovery activity without a
+    // separate cleanup task.
+    MISSING_BLOCK_RANGE_REQUESTED.retain(|_, last| {
+        now_ms.saturating_sub(*last) < MISSING_BLOCK_RANGE_TTL_MS
     });
 }
 
@@ -1349,8 +1504,38 @@ impl BlockPipeline {
                         // from peers in parallel; the request is single-
                         // flighted per height and runs on a detached task,
                         // so the verify stage never blocks on network I/O.
+                        //
+                        // v19: SIZE-ADAPTIVE RECOVERY
                         // ───────────────────────────────────────────────────
-                        let _ = request_missing_parent(parent_h);
+                        // The v18 single-flight path is well-tuned for the
+                        // small-gap regime (1–5 blocks of normal gossip
+                        // jitter) but recovers a 30-block gap in about
+                        // `gap × 30 s = 15 min`. For real catch-up windows
+                        // we now switch to a single batched range request
+                        // covering `local_tip+1 ..= child_h`, served by
+                        // `unified_p2p::sync_blocks` in a single round-trip.
+                        //
+                        // The two paths are complementary, not redundant:
+                        // - Small gap (≤ RANGE_SYNC_GAP_THRESHOLD): per-
+                        //   height single-flight remains the cheapest
+                        //   recovery and avoids range-fanout amplification
+                        //   for transient gossip jitter.
+                        // - Large gap (> threshold): batched range avoids
+                        //   the multi-minute cascade. Single-flight per
+                        //   range tuple prevents request storms when many
+                        //   children for the same parent arrive at once.
+                        // ───────────────────────────────────────────────────
+                        let local_tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                            .load(Ordering::Relaxed);
+                        let gap = child_h.saturating_sub(local_tip);
+                        if gap > RANGE_SYNC_GAP_THRESHOLD {
+                            // Large gap — fetch the entire missing range in one batch.
+                            let from = local_tip.saturating_add(1);
+                            let _ = request_missing_range(from, child_h);
+                        } else {
+                            // Small gap — keep the lighter per-height path.
+                            let _ = request_missing_parent(parent_h);
+                        }
 
                         // ───────────────────────────────────────────────────
                         // v18: WATCHDOG DIAGNOSTIC FIX
@@ -3345,6 +3530,160 @@ mod tests_v18_active_sync {
             new_ts > stale_ts,
             "expired-TTL retry must refresh the timestamp (was {} now {})",
             stale_ts, new_ts
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v19: REGRESSION TESTS — RANGE-SYNC DEDUP
+// ═══════════════════════════════════════════════════════════════════════════
+// Mirror of `tests_v18_active_sync` for the range-sync path added in v19.
+// The single-flight semantics here protect against thundering-herd at thousand-
+// node scale: when a long stall ends and many peers simultaneously surface
+// their tip-advance, every local pipeline observation of an out-of-order child
+// would otherwise emit one `sync_blocks(local_tip+1, child_h)` request per
+// missing block — flooding the top-3 peers with duplicate batched fetches.
+// Each test asserts a SECURITY or LIVENESS property, never a styling choice.
+#[cfg(test)]
+mod tests_v19_range_sync {
+    use super::*;
+
+    // Use a disjoint key space from the v18 tests above so cargo's parallel
+    // workers cannot interfere across modules.
+    const FROM_FIRST_CALL: u64 = 1_000_001_001;
+    const TO_FIRST_CALL: u64 = 1_000_001_500;
+
+    const FROM_DUPLICATE: u64 = 1_000_002_001;
+    const TO_DUPLICATE: u64 = 1_000_002_500;
+
+    const FROM_CLEANUP_EVICT: u64 = 1_000_003_001;
+    const TO_CLEANUP_EVICT: u64 = 1_000_003_500;
+
+    const FROM_CLEANUP_KEEP: u64 = 1_000_004_001;
+    const TO_CLEANUP_KEEP: u64 = 1_000_004_500;
+
+    const FROM_TTL_EXPIRY: u64 = 1_000_005_001;
+    const TO_TTL_EXPIRY: u64 = 1_000_005_500;
+
+    const FROM_INVALID: u64 = 1_000_006_500;
+    const TO_INVALID: u64 = 1_000_006_001;
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// First call for a fresh `(from, to)` pair MUST insert the dedup entry.
+    /// The actual network dispatch is gated on `try_get_p2p()` — in unit-test
+    /// context the global is None, so the function returns false; the dedup
+    /// insert MUST still happen so a follow-up call within the TTL window
+    /// is suppressed even if p2p comes online in between (the only honest
+    /// way to differentiate "first call" from "duplicate" is the map state).
+    #[test]
+    fn range_first_call_inserts_into_dedup_map() {
+        MISSING_BLOCK_RANGE_REQUESTED.remove(&(FROM_FIRST_CALL, TO_FIRST_CALL));
+        let _ = request_missing_range(FROM_FIRST_CALL, TO_FIRST_CALL);
+        assert!(
+            MISSING_BLOCK_RANGE_REQUESTED.contains_key(&(FROM_FIRST_CALL, TO_FIRST_CALL)),
+            "first range call must insert (from, to) into the dedup map"
+        );
+    }
+
+    /// A second call for the SAME `(from, to)` pair within the TTL window
+    /// MUST NOT refresh the timestamp. Without this guarantee, every child
+    /// block landing during a long stall would amplify into another batched
+    /// fetch covering substantially the same range — at 1000-peer scale a
+    /// 500-block gap with 50 in-flight children = 25 000 redundant requests.
+    #[test]
+    fn range_duplicate_within_ttl_is_rejected() {
+        MISSING_BLOCK_RANGE_REQUESTED.remove(&(FROM_DUPLICATE, TO_DUPLICATE));
+        let _ = request_missing_range(FROM_DUPLICATE, TO_DUPLICATE);
+        let first_ts = *MISSING_BLOCK_RANGE_REQUESTED
+            .get(&(FROM_DUPLICATE, TO_DUPLICATE))
+            .expect("first insert must succeed")
+            .value();
+        let _ = request_missing_range(FROM_DUPLICATE, TO_DUPLICATE);
+        let second_ts = *MISSING_BLOCK_RANGE_REQUESTED
+            .get(&(FROM_DUPLICATE, TO_DUPLICATE))
+            .expect("entry must still be present")
+            .value();
+        assert_eq!(
+            first_ts, second_ts,
+            "second range call within TTL must NOT refresh the timestamp"
+        );
+    }
+
+    /// `cleanup_missing_block_requests` MUST evict range entries older than
+    /// `MISSING_BLOCK_RANGE_TTL_MS`. Without this the range dedup map grows
+    /// unboundedly under sustained gap-recovery activity at thousand-node
+    /// deployment scale (every long stall adds one entry per `(from, to)`
+    /// pair seen).
+    #[test]
+    fn range_cleanup_evicts_stale_entries() {
+        let stale_ts = now_ms().saturating_sub(MISSING_BLOCK_RANGE_TTL_MS + 1000);
+        MISSING_BLOCK_RANGE_REQUESTED.insert((FROM_CLEANUP_EVICT, TO_CLEANUP_EVICT), stale_ts);
+
+        cleanup_missing_block_requests();
+        assert!(
+            !MISSING_BLOCK_RANGE_REQUESTED.contains_key(&(FROM_CLEANUP_EVICT, TO_CLEANUP_EVICT)),
+            "cleanup must evict range entries older than the TTL"
+        );
+    }
+
+    /// Cleanup MUST NOT evict range entries within the TTL window. False
+    /// positives here would re-dispatch in-flight `sync_blocks` against
+    /// peers and re-introduce the thundering-herd we are trying to prevent.
+    #[test]
+    fn range_cleanup_preserves_fresh_entries() {
+        MISSING_BLOCK_RANGE_REQUESTED.insert((FROM_CLEANUP_KEEP, TO_CLEANUP_KEEP), now_ms());
+        cleanup_missing_block_requests();
+        assert!(
+            MISSING_BLOCK_RANGE_REQUESTED.contains_key(&(FROM_CLEANUP_KEEP, TO_CLEANUP_KEEP)),
+            "cleanup must keep range entries inserted within the TTL"
+        );
+    }
+
+    /// After TTL expiry, a follow-up range request MUST refresh the
+    /// timestamp. Mirror of the per-height TTL-expiry contract: if the
+    /// previous request was lost (peer offline, packet drop), the network
+    /// MUST be allowed to retry — otherwise a genuinely-missing range that
+    /// the network failed to deliver once would be silently abandoned
+    /// forever.
+    #[test]
+    fn range_ttl_expiry_allows_retry() {
+        let stale_ts = now_ms().saturating_sub(MISSING_BLOCK_RANGE_TTL_MS + 1000);
+        MISSING_BLOCK_RANGE_REQUESTED.insert((FROM_TTL_EXPIRY, TO_TTL_EXPIRY), stale_ts);
+
+        let _ = request_missing_range(FROM_TTL_EXPIRY, TO_TTL_EXPIRY);
+        let new_ts = *MISSING_BLOCK_RANGE_REQUESTED
+            .get(&(FROM_TTL_EXPIRY, TO_TTL_EXPIRY))
+            .expect("entry must still exist")
+            .value();
+        assert!(
+            new_ts > stale_ts,
+            "expired-TTL range retry must refresh the timestamp (was {} now {})",
+            stale_ts, new_ts
+        );
+    }
+
+    /// An inverted range (`to < from`) MUST be rejected without inserting
+    /// into the dedup map. Without this guard a faulty caller could pin
+    /// arbitrary `(from, to)` keys that never legitimately appear in
+    /// dispatch, slowly leaking memory and obscuring real stall patterns
+    /// in operator dashboards.
+    #[test]
+    fn range_inverted_input_is_rejected() {
+        MISSING_BLOCK_RANGE_REQUESTED.remove(&(FROM_INVALID, TO_INVALID));
+        let dispatched = request_missing_range(FROM_INVALID, TO_INVALID);
+        assert!(
+            !dispatched,
+            "inverted range (to < from) must be rejected"
+        );
+        assert!(
+            !MISSING_BLOCK_RANGE_REQUESTED.contains_key(&(FROM_INVALID, TO_INVALID)),
+            "inverted range MUST NOT insert into the dedup map"
         );
     }
 }
