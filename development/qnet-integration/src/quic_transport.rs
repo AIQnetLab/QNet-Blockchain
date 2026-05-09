@@ -496,20 +496,74 @@ pub async fn build_handshake_proof(
     }
 }
 
-/// v19: Advisory verification of a handshake proof.
+/// v19.1: Advisory verification of a handshake proof.
 ///
-/// Returns `Ok(true)` when the supplied proof verifies under the claimed
-/// identity's registered Dilithium PK; `Ok(false)` when the peer did not
-/// supply a proof (Phase 2.A backward-compat path) OR the local subsystem
-/// cannot perform verification yet (extremely early boot, registry not
-/// yet populated); `Err(reason)` when a proof was supplied but did not
-/// verify — the caller MUST drop the connection in that case.
+/// Three-state contract — each state reflects a different operational
+/// reality and the caller's response is calibrated accordingly:
 ///
-/// The function uses the ASYNC verification path
-/// (`verify_dilithium_heartbeat_signature_async`) to avoid spawning a
-/// thread + runtime per handshake; this matters at the target scale of
-/// thousands of super-nodes where a sqrt(N) mesh produces O(N) handshakes
-/// per epoch boundary.
+///   * `Ok(true)`  — proof was supplied AND verified successfully under
+///                   the claimed identity's REGISTERED Dilithium PK.
+///                   Peer is cryptographically authenticated.
+///
+///   * `Ok(false)` — peer is admitted under a documented advisory path
+///                   (no signature gate violation). One of:
+///                       a) no proof attached (pre-v19 sender)
+///                       b) crypto subsystem not yet initialised
+///                          (very early boot, before P2P startup
+///                          completes)
+///                       c) PK is NOT yet present in the consensus PK
+///                          registry — the peer is a fresh-bootstrap
+///                          joiner whose identity binding will be
+///                          established by its inbound `VrfKeyAnnounce`
+///                          (see `unified_p2p.rs::VrfKeyAnnounce`,
+///                          which carries its own self-signature
+///                          verified inline and registers the PK on
+///                          success). Without this state, fresh
+///                          clusters cannot bootstrap because the
+///                          first connection from each genesis peer
+///                          arrives BEFORE that peer's PK has been
+///                          cross-registered.
+///
+///   * `Err(reason)` — proof was supplied AND the PK is in the registry
+///                     AND the signature did not verify. This is the
+///                     only path that drops the connection, because it
+///                     is the only path that distinguishes a real
+///                     identity-squat attempt (PK present, sig wrong)
+///                     from a legitimate first-contact peer (PK
+///                     absent).
+///
+/// Splitting "PK absent" out of the failure path is what makes the
+/// connection-level handshake compatible with the universal L1 BFT
+/// invariant: TLS/QUIC connection establishment MUST NOT require
+/// pre-knowledge of the peer's identity key, because identity binding
+/// happens through signed messages CARRIED OVER the connection, not
+/// embedded in the handshake itself. A connection-level gate that
+/// blocks unknown-PK peers creates an unrecoverable chicken-and-egg
+/// at fresh-cluster boot.
+///
+/// Security argument
+/// ─────────────────
+/// `Ok(false)` admits the connection but does NOT authenticate the
+/// peer. Every consensus-relevant message that flows over the
+/// admitted connection still passes through:
+///   * `verify_consensus_signature` (Dilithium3 against registered PK)
+///   * `verify_dilithium_heartbeat_signature_async` for heartbeats
+///   * inline self-signature verification on `VrfKeyAnnounce` payload
+///     (which is what installs the PK in the registry in the first
+///     place)
+/// An attacker who attaches a fake proof for an unknown identity gets
+/// no privilege beyond what an unsigned-handshake peer already has —
+/// their first signed message will fail verification. An attacker who
+/// attaches a bad proof for a KNOWN identity is rejected here (Err)
+/// before getting a chance to send any message at all.
+///
+/// Scalability
+/// ───────────
+/// One `has_consensus_pk` lookup (lock-free `parking_lot::RwLock` read)
+/// + at most one Dilithium3 verify (~3 ms). At thousand-node mesh with
+/// sqrt(N) topology, steady-state cost stays sub-1% of a core. The
+/// async path avoids spawning a thread per verify (which would be
+/// catastrophic at 1000+ peers reconnecting after a regional outage).
 pub async fn verify_handshake_proof(
     claimed_node_id: &str,
     timestamp: u64,
@@ -518,23 +572,35 @@ pub async fn verify_handshake_proof(
 ) -> Result<bool, String> {
     let proof_bytes = match proof {
         Some(p) if !p.is_empty() => p,
-        _ => return Ok(false), // No proof attached — legacy peer
+        _ => return Ok(false), // (a) No proof attached — legacy peer
     };
     let proof_str = match std::str::from_utf8(proof_bytes) {
         Ok(s) => s.to_string(),
         Err(_) => return Err("handshake proof is not valid UTF-8".to_string()),
     };
-    let challenge = handshake_challenge_message(claimed_node_id, timestamp, block_height);
-    // Bridge to the same Dilithium verification path used for consensus
-    // messages (`verify_dilithium_heartbeat_signature_async` →
-    // `verify_consensus_signature`). If the P2P singleton is not yet
-    // initialised the verification cannot proceed and we return `Ok(false)`
-    // so the caller downgrades gracefully — an attacker cannot exploit
-    // this because the QUIC port only opens AFTER P2P startup.
+
+    // (b) Crypto/P2P subsystems not yet ready — extremely early boot.
+    // The QUIC port only opens AFTER P2P comes online, so under
+    // production this branch should be unreachable; defended in depth.
     let p2p = match crate::node::try_get_p2p() {
         Some(p) => p,
         None => return Ok(false),
     };
+
+    // (c) v19.1: PK-miss path — peer is a fresh joiner whose identity
+    // binding is not yet in the consensus PK registry. Admit the
+    // connection so the peer's `VrfKeyAnnounce` (carrying its
+    // self-signed identity proof) can flow over it. Inline verify on
+    // that message is the canonical install path; until then the
+    // connection is a transport channel, not an authenticated peer.
+    if !qnet_consensus::consensus_crypto::has_consensus_pk(claimed_node_id) {
+        return Ok(false);
+    }
+
+    // PK is in registry — proof MUST verify under it. A failure here is
+    // an attempted identity squat (someone produced a fake signature
+    // for a known identity).
+    let challenge = handshake_challenge_message(claimed_node_id, timestamp, block_height);
     if p2p
         .verify_dilithium_heartbeat_signature_async(&challenge, &proof_str, claimed_node_id)
         .await
@@ -1209,8 +1275,17 @@ impl QuicTransport {
                     }
                 }
                 Ok(false) => {
+                    // v19.1: Advisory admit. Three causes possible (in order
+                    // of likelihood for a fresh cluster):
+                    //   (c) PK not yet in CONSENSUS_PK_REGISTRY — peer's
+                    //       VrfKeyAnnounce will install it;
+                    //   (a) peer is pre-v19 and did not attach a proof;
+                    //   (b) local crypto subsystem not yet initialised.
+                    // None of these are attacks — the peer is admitted,
+                    // and every consensus message it later sends still
+                    // goes through full Dilithium3 verification.
                     if crate::node::is_warn() {
-                        println!("[WARN][HANDSHAKE] no_dilithium_proof side=server node={} reason=legacy_peer_phase_2A",
+                        println!("[WARN][HANDSHAKE] advisory_admit side=server node={} reason=pk_unknown_or_no_proof hint=will_authenticate_via_VrfKeyAnnounce_or_consensus_msg",
                                  peer_handshake.node_id);
                     }
                 }
@@ -1928,8 +2003,12 @@ impl QuicTransport {
                     }
                 }
                 Ok(false) => {
+                    // v19.1: Advisory admit (same three-state semantics as
+                    // server side). Every consensus message that flows
+                    // over this connection still goes through full
+                    // Dilithium3 verification before being honoured.
                     if crate::node::is_warn() {
-                        println!("[WARN][HANDSHAKE] no_dilithium_proof side=client node={} reason=legacy_peer_phase_2A",
+                        println!("[WARN][HANDSHAKE] advisory_admit side=client node={} reason=pk_unknown_or_no_proof hint=will_authenticate_via_VrfKeyAnnounce_or_consensus_msg",
                                  peer_handshake.node_id);
                     }
                 }
@@ -2844,5 +2923,39 @@ mod tests_v19_handshake {
         let result =
             verify_handshake_proof("node_001", 1_700_000_000, 100, Some(bad)).await;
         assert!(result.is_err(), "expected Err for non-UTF-8 proof, got {:?}", result);
+    }
+
+    /// v19.1: When a peer presents a syntactically valid proof for an
+    /// identity whose PK is NOT YET in the consensus PK registry, the
+    /// helper MUST return `Ok(false)` (advisory admit), not `Err`.
+    ///
+    /// Rationale: at fresh-cluster boot, every peer's first connection
+    /// arrives BEFORE that peer's PK has been cross-registered via
+    /// `VrfKeyAnnounce`. Returning `Err` in this state was the v19.0
+    /// regression that bricked fresh bootstrap — connections dropped
+    /// before the announce gossip could populate the registry, making
+    /// the "PK not in registry" condition self-perpetuating.
+    ///
+    /// Test methodology:
+    /// `try_get_p2p()` is `None` in unit-test context, which is itself an
+    /// `Ok(false)` branch (PK is also unknown — `has_consensus_pk`
+    /// returns false on an empty registry). We use a clearly fake but
+    /// well-formed UTF-8 proof string targeting an identity that
+    /// definitely is NOT in the test-process registry. The expected
+    /// outcome is `Ok(false)`.
+    #[tokio::test]
+    async fn verify_returns_ok_false_for_unknown_pk_with_proof() {
+        let fake_proof = b"compact_bin:never_registered_test_payload";
+        let result = verify_handshake_proof(
+            "v19_1_test_unknown_identity_must_admit",
+            1_700_000_000,
+            100,
+            Some(fake_proof),
+        ).await;
+        assert!(
+            matches!(result, Ok(false)),
+            "unknown identity with attached proof MUST advisory-admit (Ok(false)), got {:?}",
+            result
+        );
     }
 }

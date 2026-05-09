@@ -1602,36 +1602,91 @@ async fn verify_with_real_dilithium(
             None => {
                 // Tier 3: policy depends on identity class.
                 if node_id.starts_with("genesis_node_") {
-                    // Genesis identity with no registry binding. The boot
-                    // sequence of every honest node guarantees a binding is
-                    // installed BEFORE P2P traffic is processed, so an
-                    // unbound genesis claim arriving here is either:
+                    // Genesis identity with no registry binding. Three causes:
                     //   (a) a race against a not-yet-completed self-register
-                    //       (transient, will resolve on retry/regossip), or
-                    //   (b) a squat attempt from a non-genesis peer.
-                    // Both cases are handled identically by hard-rejecting:
-                    // case (a) self-heals because the legitimate sender's
-                    // gossip continues; case (b) is the attack we exist to
-                    // block.
+                    //       — transient, resolves once the legitimate sender's
+                    //       VrfKeyAnnounce or self-register completes;
+                    //   (b) a squat attempt from a non-genesis peer
+                    //       presenting their own keypair under a genesis
+                    //       node_id; or
+                    //   (c) the FIRST sync of a fresh-bootstrap cluster: the
+                    //       anchor file does not yet exist and the
+                    //       cross-registration round-trip via VrfKeyAnnounce
+                    //       has not completed for this peer yet.
+                    //
+                    // v19.1: The previous policy was a blanket hard-reject.
+                    // That broke case (c) end-to-end — fresh genesis clusters
+                    // could not bootstrap because the very first cross-peer
+                    // consensus message was rejected before the registry
+                    // could be populated, leaving every genesis node
+                    // permanently isolated.
+                    //
+                    // Aligned policy:
+                    //   * If anchors are loaded (`genesis_anchor_pks_len() > 0`),
+                    //     the registry MUST already contain every genesis PK
+                    //     (anchors are mirrored into the registry at install
+                    //     time). A Tier-3 hit on a genesis identity in that
+                    //     state is an actual squat attempt → hard reject.
+                    //   * If anchors are absent AND `QNET_BOOTSTRAP_FRESH=1`
+                    //     is set (operator opted into the fresh-bootstrap
+                    //     race window — same gate that allows the process
+                    //     to start in `anchors_missing_boot_decision`), this
+                    //     is case (c). Admit (TOFV) and let signature math
+                    //     below decide the outcome. An attacker without the
+                    //     SK for the claimed PK cannot produce a valid
+                    //     signature, so the cryptographic floor is
+                    //     preserved; the only state we relax is the
+                    //     anchor-binding precheck — which by definition does
+                    //     not exist yet during fresh bootstrap.
+                    //   * Otherwise (no anchors AND no opt-in) it is a
+                    //     misconfigured deploy. Hard reject so the operator
+                    //     sees the failure and either deploys anchors or
+                    //     opts into fresh mode explicitly.
+                    //
+                    // Security note: the TOFV admit DOES NOT register the
+                    // PK. Registration happens through:
+                    //   (1) `VrfKeyAnnounce` handler (inline self-signature
+                    //       verify + register_consensus_pk_from_chain), or
+                    //   (2) signed `NodeRegistration` TX application.
+                    // Both are themselves cryptographic proofs of ownership.
+                    // Tier-3 here only widens the message-acceptance gate
+                    // during the documented fresh window so those
+                    // registration flows can complete.
                     let extracted_prefix = if public_key_bytes.len() >= 8 {
                         hex::encode(&public_key_bytes[..8])
                     } else {
                         String::new()
                     };
-                    eprintln!(
-                        "[CRIT][CONSENSUS] genesis_pk_first_seen_rejected node={} extracted={}.. \
-                         action=hard_reject hint=anchor_or_self_register_must_run_before_p2p",
-                        node_id, extracted_prefix
-                    );
-                    return false;
-                }
-                // Non-genesis identity (Super-node, Light-node, etc.). TOFV
-                // is acceptable; chain-state will lock the canonical binding
-                // shortly via NodeRegistration TX application, after which
-                // any future mismatch is caught by Tier 2 above.
-                if public_key_bytes.len() >= 8 {
-                    println!("[WARN][CONSENSUS] pk_first_seen node={} extracted={}..",
-                             node_id, hex::encode(&public_key_bytes[..8]));
+                    let anchors_loaded = genesis_anchor_pks_len() > 0;
+                    let fresh_opt_in =
+                        std::env::var("QNET_BOOTSTRAP_FRESH").as_deref() == Ok("1");
+                    if tier3_genesis_first_seen_admit(anchors_loaded, fresh_opt_in) {
+                        // Case (c): admit TOFV, signature math below is the gate.
+                        println!(
+                            "[WARN][CONSENSUS] genesis_pk_first_seen_admit_fresh_window \
+                             node={} extracted={}.. anchors_loaded=false bootstrap_fresh=true \
+                             hint=signature_math_will_decide",
+                            node_id, extracted_prefix
+                        );
+                        // fall through to math verification
+                    } else {
+                        eprintln!(
+                            "[CRIT][CONSENSUS] genesis_pk_first_seen_rejected node={} extracted={}.. \
+                             anchors_loaded={} bootstrap_fresh={} action=hard_reject \
+                             hint=deploy_anchors_or_set_QNET_BOOTSTRAP_FRESH",
+                            node_id, extracted_prefix, anchors_loaded, fresh_opt_in
+                        );
+                        return false;
+                    }
+                } else {
+                    // Non-genesis identity (Super-node, Light-node, etc.). TOFV
+                    // is acceptable; chain-state will lock the canonical binding
+                    // shortly via NodeRegistration TX application, after which
+                    // any future mismatch is caught by Tier 2 above.
+                    if public_key_bytes.len() >= 8 {
+                        println!("[WARN][CONSENSUS] pk_first_seen node={} extracted={}..",
+                                 node_id, hex::encode(&public_key_bytes[..8]));
+                    }
                 }
             }
         }
@@ -2062,5 +2117,94 @@ mod tests_v20_pk_registry {
             second, first
         );
         LAST_ACTIVITY.remove(id);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v19.1: REGRESSION TESTS — TIER 3 FRESH-BOOTSTRAP WINDOW
+// ═══════════════════════════════════════════════════════════════════════════
+// The Tier 3 path of `verify_consensus_signature` makes a policy decision
+// for first-seen identities. v19.1 widens the policy for genesis identities
+// during the documented fresh-bootstrap window; these tests pin the new
+// contract:
+//
+//   * anchors loaded → strict reject for first-seen genesis (anchor squat)
+//   * anchors absent + QNET_BOOTSTRAP_FRESH=1 → admit TOFV (signature math
+//     is the cryptographic gate; an attacker without the SK cannot pass it)
+//   * anchors absent + no opt-in → strict reject (misconfigured deploy
+//     surfaces explicitly to the operator)
+//
+// The tests assert the POLICY decision via a dedicated pure helper rather
+// than going through the full `verify_consensus_signature` path — that path
+// also performs Dilithium3 math which would require keypair generation +
+// real signatures and is covered by upper-layer integration tests. The
+// policy helper isolates exactly the v19.1 logic added here.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Pure-logic helper for the Tier 3 first-seen genesis policy.
+///
+/// Returns `true` when the connection should ADMIT the first-seen claim
+/// (TOFV — signature math will gate further), `false` when it MUST be
+/// hard-rejected as an identity squat or misconfigured deploy.
+///
+/// Single source of truth for the v19.1 policy: the inline verify-path
+/// uses this helper too (see `verify_dilithium_signature` Tier 3
+/// branch), keeping production behaviour and unit-test assertions in
+/// lockstep.
+pub(crate) fn tier3_genesis_first_seen_admit(
+    anchors_loaded: bool,
+    fresh_opt_in: bool,
+) -> bool {
+    !anchors_loaded && fresh_opt_in
+}
+
+#[cfg(test)]
+mod tests_v19_1_tier3_fresh_window {
+    use super::*;
+
+    /// Anchors loaded means every legitimate genesis PK is already in the
+    /// registry. A first-seen claim for a genesis identity in that state
+    /// is an actual squat attempt → MUST hard reject regardless of any
+    /// fresh-bootstrap opt-in flag. This is the steady-state security
+    /// invariant for genesis identity-key binding.
+    #[test]
+    fn tier3_strict_when_anchors_loaded() {
+        // Even with QNET_BOOTSTRAP_FRESH=1 set: anchors are authoritative.
+        assert!(
+            !tier3_genesis_first_seen_admit(/*anchors_loaded=*/ true, /*fresh_opt_in=*/ true),
+            "anchors loaded + fresh opt-in MUST reject (squat attempt under loaded anchors)"
+        );
+        assert!(
+            !tier3_genesis_first_seen_admit(/*anchors_loaded=*/ true, /*fresh_opt_in=*/ false),
+            "anchors loaded + no opt-in MUST reject"
+        );
+    }
+
+    /// The fresh-bootstrap path: no anchors yet AND operator opted in via
+    /// QNET_BOOTSTRAP_FRESH=1. This is the only state in which a first-seen
+    /// genesis claim is admitted — the signature math below the policy
+    /// gate is what actually verifies the message. Without this admit,
+    /// fresh genesis clusters cannot bootstrap (the v19.0 regression).
+    #[test]
+    fn tier3_admit_when_fresh_window_open() {
+        assert!(
+            tier3_genesis_first_seen_admit(/*anchors_loaded=*/ false, /*fresh_opt_in=*/ true),
+            "anchors absent + fresh opt-in MUST admit (case (c) bootstrap)"
+        );
+    }
+
+    /// Misconfigured deploy: anchors absent AND no opt-in. The operator
+    /// did not deploy `genesis_anchors.json` and did not set
+    /// `QNET_BOOTSTRAP_FRESH=1`. Hard reject so the failure is visible
+    /// in operational logs (`anchors_loaded=false bootstrap_fresh=false`)
+    /// and the operator has to make an explicit choice. Silent admit
+    /// here would hide a deploy bug AND open the squat-on-bootstrap
+    /// race that the anchor file exists to close.
+    #[test]
+    fn tier3_strict_when_no_anchors_no_opt_in() {
+        assert!(
+            !tier3_genesis_first_seen_admit(/*anchors_loaded=*/ false, /*fresh_opt_in=*/ false),
+            "anchors absent + no opt-in MUST reject (misconfigured deploy)"
+        );
     }
 }
