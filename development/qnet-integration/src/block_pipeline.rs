@@ -1769,30 +1769,106 @@ impl BlockPipeline {
                     true
                 };
                 if !cert_present {
-                    // Defer block: cert not yet propagated to us. Trigger
-                    // backfill request and put block in the deferred buffer to
-                    // be re-checked on the next pipeline pass.
-                    if let Some(ref p2p) = unified_p2p {
-                        p2p.request_timeout_proofs(mb_idx_for_cert, mb_idx_for_cert);
-                    }
-                    if deferred.len() < DEFERRED_MAX {
-                        if is_debug() {
-                            println!(
-                                "[DBG][PIPELINE] block_deferred_for_cert h={} round={} mb_idx={} buf={}",
-                                mb.height, mb.timeout_round, mb_idx_for_cert, deferred.len()
-                            );
-                        }
-                        deferred.insert(mb.height, decoded);
+                    // ═══════════════════════════════════════════════════════════
+                    // v21 (A2): VOTE-POOL FALLBACK — boundary grace
+                    // ═══════════════════════════════════════════════════════════
+                    // The aggregated cert may not have been generated or
+                    // gossipped yet, but the underlying TimeoutVotes — each
+                    // Dilithium3-verified at ingest by `handle_timeout_vote`
+                    // — may already be in the local pool. The cert is just an
+                    // aggregated view of those votes; if 2f+1 are present in
+                    // the pool, we have equivalent cryptographic evidence.
+                    //
+                    // Why this is needed
+                    // ──────────────────
+                    // Forensic case h=360 on the 5-node testnet showed the
+                    // failure mode:
+                    //   * h=360 first block of new macroblock; primary
+                    //     timed out → failover producer emitted block with
+                    //     timeout_round=R>0;
+                    //   * receivers required AggregatedTimeoutCert for
+                    //     (mb_idx=4, R) before applying;
+                    //   * cert generation requires 2f+1 votes for
+                    //     (mb_idx=4, R) gossipped to at least one node
+                    //     which then aggregates and re-broadcasts;
+                    //   * during the race window between last vote arriving
+                    //     and cert re-gossip, every receiver's pipeline
+                    //     deferred the block — even though the underlying
+                    //     votes WERE locally present.
+                    //
+                    // Treating the pool as equivalent evidence closes that
+                    // race. No new attack surface: the votes counted are
+                    // the same Dilithium3-signed messages that feed cert
+                    // generation; threshold (2f+1) is the same.
+                    //
+                    // Pattern
+                    // ───────
+                    // "cert is a view, not a gate" — same data, two access
+                    // paths. Aligns with production-grade BFT semantics
+                    // where vote pool is the canonical source of truth and
+                    // the aggregated form is a transport optimisation.
+                    //
+                    // Scalability
+                    // ───────────
+                    // One DashMap shard read + one HashMap len() — O(1)
+                    // hot-path cost. At 1M super-nodes the inner HashMap
+                    // is bounded by `MAX_VALIDATORS = 1000` per slot, so
+                    // the count operation is a constant.
+                    // ═══════════════════════════════════════════════════════════
+                    let pool_has_quorum = if let Some(ref p2p) = unified_p2p {
+                        let total = p2p.get_active_validator_count();
+                        // Same threshold formula used everywhere in the
+                        // codebase: `(N * 2 + 2) / 3` = ceil(2N/3) = 2f+1.
+                        let two_f_plus_1 = (total * 2 + 2) / 3;
+                        p2p.has_two_f_plus_one_timeout_votes(
+                            mb_idx_for_cert,
+                            mb.timeout_round,
+                            two_f_plus_1,
+                        )
                     } else {
+                        false
+                    };
+
+                    if pool_has_quorum {
+                        // Pool evidence equivalent to cert. Fall through to
+                        // subsequent verify steps. Boundary flag in the log
+                        // helps operators distinguish the legitimate macroblock-
+                        // boundary race window from steady-state mid-macroblock
+                        // catches (the latter is unusual and worth noting).
+                        let at_boundary = mb.height % 90 == 0;
                         if is_info() {
                             println!(
-                                "[INFO][PIPELINE] deferred_full h={} round={} dropped (buf={})",
-                                mb.height, mb.timeout_round, DEFERRED_MAX
+                                "[INFO][PIPELINE] cert_pool_grace_admit h={} mb_idx={} round={} boundary={} \
+                                 reason=2fplus1_votes_in_local_pool hint=cert_aggregation_race_bypassed",
+                                mb.height, mb_idx_for_cert, mb.timeout_round, at_boundary
                             );
                         }
-                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        // Defer block: neither cert nor enough pool votes yet.
+                        // Trigger backfill request and put block in the
+                        // deferred buffer to be re-checked on the next pass.
+                        if let Some(ref p2p) = unified_p2p {
+                            p2p.request_timeout_proofs(mb_idx_for_cert, mb_idx_for_cert);
+                        }
+                        if deferred.len() < DEFERRED_MAX {
+                            if is_debug() {
+                                println!(
+                                    "[DBG][PIPELINE] block_deferred_for_cert h={} round={} mb_idx={} buf={}",
+                                    mb.height, mb.timeout_round, mb_idx_for_cert, deferred.len()
+                                );
+                            }
+                            deferred.insert(mb.height, decoded);
+                        } else {
+                            if is_info() {
+                                println!(
+                                    "[INFO][PIPELINE] deferred_full h={} round={} dropped (buf={})",
+                                    mb.height, mb.timeout_round, DEFERRED_MAX
+                                );
+                            }
+                            metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
 
