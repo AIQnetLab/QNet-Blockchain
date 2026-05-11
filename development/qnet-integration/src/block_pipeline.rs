@@ -1890,16 +1890,23 @@ impl BlockPipeline {
             //                                        boundary; any split-brain
             //                                        branch cannot collect 2f+1.
             //
-            // The producer-side pre-save guard (node.rs:yield_stale_round) still
-            // prevents THIS node from emitting its own stale block — that is a
-            // self-check on the same node and does not cross domains.
+            // v22 update: the legacy producer-side pre-save `yield_stale_round`
+            // guard (v15.11) was deleted alongside the round-based microblock
+            // failover model. v22 microblock production is pure VRF + time-
+            // derived skip-slot offset; there is exactly ONE valid producer
+            // per height, so the cross-domain comparison the guard relied on
+            // is no longer meaningful. Safety on the producer's own path is
+            // preserved by deterministic VRF expectation (`get_expected_producer`)
+            // + Dilithium3 self-signature + hash-chain continuity.
             // ═══════════════════════════════════════════════════════════════════════════
 
             // v14.7.2: per-microblock pipelined-QC verify REMOVED.
             // BFT safety for microblocks is delivered by the combination of:
             //   1. Dilithium3 producer signature (identity binding);
             //   2. hash-chain continuity (parent_hash check above);
-            //   3. Producer-side pre-save yield_stale_round guard (self-check);
+            //   3. Deterministic VRF-derived `expected_producer` (Category B
+            //      ingest reject; v22 collapse left a single valid signer per
+            //      slot, so any second candidate is invalid by construction);
             //   4. 2f+1 macroblock commit/reveal at the 90-block boundary
             //      that hard-finalises and, by implication, retroactively
             //      ratifies every microblock below it.

@@ -22214,108 +22214,46 @@ impl BlockchainNode {
                     let rotation_tracker_clone = rotation_tracker.clone();
 
                     // ═══════════════════════════════════════════════════════════════════════════
-                    // v14.6: STALE-ROUND GUARD (pre-save re-check of consensus view)
+                    // v22: pre-save STALE-ROUND GUARD removed
                     // ═══════════════════════════════════════════════════════════════════════════
-                    // Problem root-caused from testnet h=4711 split-brain:
+                    // The pre-broadcast `effective_round_now > microblock.timeout_round`
+                    // check (legacy v14.6 / v15.11) was a self-yield mechanism designed
+                    // for the round-based microblock failover model. v22 collapsed that
+                    // model to pure VRF + time-derived skip-slot (see
+                    // `v22_compute_empty_slot_offset` and the producer loop), so:
                     //
-                    //   * Block production takes 8-15 s (entropy bft_wait → PoH mixing →
-                    //     state_root → Dilithium sign → serialize). The producer is busy
-                    //     for that entire window.
-                    //   * During the window, validators may cast signed timeout votes.
-                    //     Enough of them reach f+1 / 2f+1 → adopted / certified round
-                    //     advances past 0. Other nodes switch to the failover producer.
-                    //   * The slow primary returns from its pipeline with a block signed
-                    //     for the OLD round (e.g. timeout_round=0). The failover producer
-                    //     meanwhile has already produced its own block for the NEW round
-                    //     (e.g. timeout_round=16). Both blocks are valid-looking at height
-                    //     h; different peers accept different ones first → split-brain.
+                    //   * `microblock.timeout_round` is hard-coded to 0 at construction;
+                    //   * the comparison `effective_round_now > 0` becomes structurally
+                    //     true whenever the macroblock-level view-change (a SEPARATE,
+                    //     preserved subsystem) bumps `HIGHEST_CERTIFIED_ROUND` — which
+                    //     happens on every legitimate commit-reveal-phase timeout —
+                    //     making the guard fire on every honest producer attempt.
                     //
-                    // v14.4 removed the local `fallback_selected_self` short-cut that
-                    // allowed a node to self-promote without 2f+1 votes, but this path is
-                    // different — it's the legitimate primary producer failing to notice
-                    // that consensus has already rotated away from it.
+                    // Forensic case (clean v22 deploy, all 5 nodes synchronised at h=89,
+                    // first macroblock commit-reveal triggers view-change → certified
+                    // bumps to 3 → next microblock production at h=90 emits
+                    // `[WARN][PROD] yield_stale_round h=90 produced_for_round=0
+                    // effective_round_now=3 action=skip_save` and never broadcasts,
+                    // resulting in a permanent stall observed 1.8 hours after deploy
+                    // despite zero fork, zero pk_mismatch on the production path, and
+                    // a fully-synchronised microblock chain).
                     //
-                    // Top-tier BFT design:
-                    //   Leader commitment is valid only if "I am still leader at commit
-                    //   time". Before broadcasting the final block, re-read the certified
-                    //   / adopted round from shared state. If it advanced past the round
-                    //   we locked in at production start, our block is stale — yield
-                    //   silently. The failover producer's block (at the new round) wins.
+                    // Safety after removal
+                    // ────────────────────
+                    // The original guard's job was to prevent two valid producers at
+                    // different rotation rounds from emitting blocks at the same height.
+                    // In v22 there is exactly ONE producer per height — VRF-deterministic
+                    // primary at offset 0, deterministically-derived fallback at
+                    // offset ≥ 1 — so there is no "second valid candidate" to suppress.
+                    // The peer-side producer-authority check at
+                    // `block_pipeline.rs` still rejects any signed block whose producer
+                    // does not match the cached VRF expectation.
                     //
-                    // Safety:
-                    //   * Hash chain + Dilithium sig + state_root still validate both
-                    //     candidate blocks — we never accept garbage. This guard only
-                    //     PREVENTS us from emitting a second valid candidate.
-                    //   * Peer-side ingest does NOT reject on round comparison
-                    //     (v14.8.6): microblock-round and macroblock-consensus-round
-                    //     are independent domains; cross-domain comparison caused
-                    //     livelock. Safety at the peer side is carried by hash chain,
-                    //     Dilithium3 signature, VRF-deterministic producer, and
-                    //     retroactive 2f+1 macroblock ratification.
-                    //
-                    // Scalability:
-                    //   * One atomic read (HIGHEST_CERTIFIED_ROUND DashMap lookup).
-                    //     Microseconds. Unaffected by validator count.
-                    //
-                    // Liveness:
-                    //   * If the primary yields, the failover leader's block stands.
-                    //   * If nobody else has a block ready, the next iteration of the
-                    //     production loop picks up the new round deterministically and
-                    //     produces cleanly.
-                    //
-                    // v15.11: stale-round self-check uses the EFFECTIVE rotation
-                    // round (live - baseline) for the current macroblock. The
-                    // baseline is the round at which the previous block in this
-                    // mb was finalized, which auto-resets to 0 for each new
-                    // height after a successful save. This eliminates the
-                    // post-stall producer mute that v14.8.10 suffered (forensic
-                    // case h=15886 → h=15899: 14 consecutive yields after a
-                    // single rotation event because the round counter persisted
-                    // across heights within the macroblock).
-                    //
-                    // Safety:
-                    //   * HIGHEST_ADOPTED_ROUND is populated only after
-                    //     Dilithium3 verification of f+1 signed TimeoutVotes —
-                    //     unforgeable by ≤ f Byzantine validators.
-                    //   * HIGHEST_CERTIFIED_ROUND still requires 2f+1 signed
-                    //     votes at the same round.
-                    //   * Baseline is monotonic and synced across nodes through
-                    //     block application (every honest validator records the
-                    //     same baseline when applying a finalized block).
-                    //
-                    // Scalability: O(1) DashMap reads per block save, independent
-                    // of validator count. Suitable for 1000+ super-node committees.
+                    // Macroblock-level view-change is unchanged and continues to
+                    // advance `HIGHEST_CERTIFIED_ROUND` on commit-reveal-phase failure;
+                    // that state stays internal to the macroblock-finality subsystem
+                    // and never gates microblock production after v22.
                     // ═══════════════════════════════════════════════════════════════════════════
-                    {
-                        // v15.11: re-read effective rotation round (live - baseline)
-                        // right before broadcast. Any advance past the value baked
-                        // into the block at production start means rotation has
-                        // moved on for THIS height and our candidate is stale.
-                        // The baseline correctly excludes prior-height rotation
-                        // that has already been finalized.
-                        let effective_round_now: u64 = if unified_p2p.is_some() {
-                            crate::unified_p2p::get_effective_rotation_round(height_for_storage / 90)
-                        } else {
-                            0
-                        };
-                        if effective_round_now > microblock.timeout_round {
-                            println!(
-                                "[WARN][PROD] yield_stale_round h={} produced_for_round={} effective_round_now={} action=skip_save",
-                                height_for_storage, microblock.timeout_round, effective_round_now
-                            );
-                            // Clear broadcast lock so the next iteration can proceed
-                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
-                            // Return TX to mempool so the failover producer can include them
-                            if !included_tx_hashes.is_empty() && is_debug() {
-                                println!(
-                                    "[DBG][MEMPOOL] yield_stale_round tx_count={} left_in_mempool",
-                                    included_tx_hashes.len()
-                                );
-                            }
-                            continue;
-                        }
-                    }
 
                     // Save synchronously to ensure block exists before height increment
                     // This is FAST (just RocksDB write, ~10-50ms) and prevents race conditions
