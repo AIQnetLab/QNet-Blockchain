@@ -1397,16 +1397,62 @@ pub fn get_baseline_round(mb_index: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// Returns the effective rotation round for `mb_index` — the delta between
-/// the live consensus round (max of certified and adopted) and the baseline
-/// finalized round in this macroblock.
+/// Returns the BFT-CERTIFIED rotation round for `mb_index`, relative to the
+/// last finalized baseline in this macroblock.
 ///
-/// Returns 0 if no rotation advance has occurred since the last finalized
-/// block in this macroblock. Returns N > 0 only if rotation has advanced N
-/// rounds beyond the baseline since the last successful finalization.
+/// ═══════════════════════════════════════════════════════════════════════════
+/// v23.1: STRICT 2f+1 CERTIFIED-ONLY (h=556 split-brain class fix)
+/// ═══════════════════════════════════════════════════════════════════════════
+/// `HIGHEST_ADOPTED_ROUND` (f+1 plurality) is REMOVED from this calculation.
+/// Why: f+1 voters' max-round can DIVERGE across nodes under partial gossip
+/// propagation — two nodes can see different f+1 subsets, compute different
+/// `adopted` values, and therefore elect DIFFERENT leaders for the same
+/// height. Result: split-brain microblock fork at one height, observed in
+/// the h=556 forensic incident (commit b0c39aa, "strict 2f+1 BFT-certified
+/// producer rotation").
 ///
-/// This is the value that should be embedded in `microblock.timeout_round`
-/// at production start, and re-checked at pre-save guard.
+/// Only the 2f+1 SUPERMAJORITY-certified round is safe to drive producer
+/// selection. The certified round is cryptographically unforgeable
+/// (Dilithium3-signed votes verified at handle_timeout_vote ingestion),
+/// monotonic per macroblock index, and identical on every honest node
+/// within one gossip RTT of the supermajority being reached.
+///
+/// `HIGHEST_ADOPTED_ROUND` remains computed elsewhere (handle_timeout_vote
+/// pacemaker path) for vote-collection acceleration and observability —
+/// but it MUST NOT enter the producer-selection path. Re-introducing it
+/// here re-introduces the h=556 split-brain class.
+///
+/// Returns 0 if no rotation advance has been BFT-certified since the last
+/// finalized block in this macroblock. Returns N > 0 only if 2f+1 signed
+/// timeout votes have aggregated for round (baseline + N).
+///
+/// This is the value that MUST be embedded in `microblock.timeout_round`
+/// at production start, used for ingest-side Category B authority check,
+/// and is the SOLE rotation input to `select_microblock_producer_with_round`.
+///
+/// Scalability: O(1) DashMap reads. Identical cost from 5 to 10 000 super-
+/// nodes.
+/// ═══════════════════════════════════════════════════════════════════════════
+pub fn get_certified_rotation_round(mb_index: u64) -> u64 {
+    let baseline = get_baseline_round(mb_index);
+    let certified = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
+    certified.saturating_sub(baseline)
+}
+
+/// DEPRECATED in v23.1 — kept only for backward compatibility with
+/// observability/telemetry callers that explicitly want the
+/// max(certified, adopted) view. Producer selection and ingest-side
+/// authority validation MUST use `get_certified_rotation_round` instead.
+///
+/// Removing the wrong helper outright would silently change behavior for
+/// any latent caller; keeping it as a documented deprecation lets us
+/// detect future misuse via grep and migrate explicitly. New code MUST
+/// NOT call this function.
+#[deprecated(
+    note = "Use get_certified_rotation_round for producer selection. \
+            max(certified, adopted) is unsafe under partial gossip propagation \
+            (h=556 forensic). This helper is retained ONLY for observability."
+)]
 pub fn get_effective_rotation_round(mb_index: u64) -> u64 {
     let baseline = get_baseline_round(mb_index);
     let certified = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
@@ -25570,7 +25616,7 @@ impl SimplifiedP2P {
     pub fn cleanup_old_timeout_data(&self, current_height: u64) {
         let current_mb_index = current_height / 90;
         let min_mb = current_mb_index.saturating_sub(20);
-        
+
         TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_mb);
         TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_mb);
         HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_mb);
@@ -25585,6 +25631,28 @@ impl SimplifiedP2P {
         VOTER_MAX_SIGNED_VOTE.retain(|(h, _), _| *h >= min_mb);
         AGGREGATED_TC.retain(|(h, _), _| *h >= min_mb);
         AGGREGATED_TC_BROADCAST.retain(|h, _| *h >= min_mb);
+
+        // ═══════════════════════════════════════════════════════════════════
+        // v23 / v23.1: prune microblock-rotation-related DashMaps under the
+        // same retention contract so memory stays flat for thousands of
+        // super-nodes running for unbounded periods.
+        //
+        //   * LAST_TIMEOUT_EMIT_PER_MB — keyed by mb_idx. Same retention
+        //     window as the rest of the per-mb state above.
+        //   * STICKY_LEADER_PER_VIEW — keyed by `leadership_round`
+        //     (= (height-1) / ROTATION_INTERVAL_BLOCKS). One leadership
+        //     round covers 30 blocks; one macroblock covers 90 blocks =
+        //     3 leadership rounds. Min retention = `(min_mb * 90) / 30
+        //     - 3` (with an extra 3-round safety margin for views that
+        //     started during the boundary transition between mbs).
+        // ═══════════════════════════════════════════════════════════════════
+        crate::node::LAST_TIMEOUT_EMIT_PER_MB.retain(|h, _| *h >= min_mb);
+        let min_leadership_round = min_mb
+            .saturating_mul(90)
+            .saturating_div(crate::node::ROTATION_INTERVAL_BLOCKS)
+            .saturating_sub(3);
+        crate::node::STICKY_LEADER_PER_VIEW
+            .retain(|lr, _| *lr >= min_leadership_round);
     }
     
     /// Handle emergency producer change notifications with sender tracking

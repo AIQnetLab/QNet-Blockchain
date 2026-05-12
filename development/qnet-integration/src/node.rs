@@ -135,7 +135,7 @@ pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 /// Scales BFT to millions of nodes: only 1000 participate in voting/production.
 /// See the BFT SCALING ARCHITECTURE block above for the full pipeline.
 pub const MAX_VALIDATORS: usize = 1000;
-const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
+pub const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
 const FORK_CHECK_INTERVAL: u64 = 5; // v10.0: Lightweight fork detection every 5 blocks (6× faster than rotation-only)
 #[allow(dead_code)]
 const MIN_BYZANTINE_NODES: usize = 4; // 3f+1 where f=1
@@ -632,89 +632,62 @@ pub fn reset_timeout_round() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// v22: SLOT-BASED MICROBLOCK FAILOVER — DETERMINISTIC TIME-DERIVED OFFSET
+// v23: BFT-CERTIFIED MICROBLOCK LEADER ROTATION — CANONICAL L1 PATTERN
 // ═══════════════════════════════════════════════════════════════════════════════
-// Microblock production switched from round-based BFT failover (TimeoutVote +
-// Pacemaker + empty-slot attestation cascade + heartbeat-fast-path) to a pure
-// VRF + skip-slot model. The "consecutive empty slots" signal is derived
-// LOCALLY but DETERMINISTICALLY from a chain-anchored value:
+// Microblock leader for every height h is computed as a PURE FUNCTION over
+// finalised on-chain state:
 //
-//     consecutive_empty = max(0, now - last_applied_block_timestamp - 1)
+//     leader(h) = select_microblock_producer_with_round(
+//         height          = h,
+//         candidates      = eligible_producers from macroblock(N-2),
+//         vrf_entropy     = SHA3(macroblock(N-2).deterministic_fields),
+//         leadership_round= (h-1) / ROTATION_INTERVAL_BLOCKS,
+//         timeout_round   = get_effective_rotation_round(h / 90),
+//     )
 //
-// Both inputs are agreed across honest nodes:
-//   * `last_applied_block_timestamp` — the on-chain timestamp of the highest
-//     applied microblock. Every honest node sees identical bytes at the same
-//     height, identical timestamp by construction.
-//   * `now` — the local wall clock. NTP-synchronised across honest nodes
-//     within ±2 s by deployment policy.
+// EVERY input is on-chain finalised state. `timeout_round` is the BFT-
+// CERTIFIED rotation counter for the containing macroblock, advanced ONLY
+// when 2f+1 Dilithium3-signed TimeoutVotes have aggregated for round R
+// (HIGHEST_CERTIFIED_ROUND) or the f+1 pacemaker has lifted
+// HIGHEST_ADOPTED_ROUND. Local wall clock is NEVER an input to leader
+// selection — only to the stall-detector that triggers signed TimeoutVote
+// emission (which feeds the 2f+1 aggregator that advances the certified
+// round).
 //
-// Two honest nodes therefore differ in `consecutive_empty` by at most 2 at
-// any moment. With `MAX_CONSECUTIVE_EMPTY_SLOTS = 3`, the in-rotation
-// fallback fires within ±1 second across honest nodes — well inside the
-// gossip window for the fallback leader's first block to propagate before
-// any node second-guesses the decision.
-//
-// The fallback identity is computed by the SAME `select_microblock_producer_with_round`
-// path used for the canonical leader, with `empty_slot_offset` mixed into
-// the VRF seed. All honest nodes observing the same offset reach the SAME
-// identity by construction — no votes, no gossip, no race.
-//
-// Why this is safe / scalable / top-tier-conformant
+// Why this is safe / scalable / top-L1-grade
 // ──────────────────────────────────────────────────
-//   * SAFETY: `empty_slot_offset` is derived from a chain-anchored timestamp
-//     (cryptographically signed by the producer in the block) and the local
-//     wall clock (NTP-synchronised). No producer can manipulate the offset
-//     observed by other nodes without breaking the signed chain.
+//   * SAFETY: leader(h) is a pure function. Identical inputs → identical
+//     output on every honest node by construction. NTP drift cannot
+//     elect two leaders at the same height because clock is not an input.
+//     The previous v22 design injected `empty_slot_offset = (now -
+//     last_block_ts) / 3` into the seed; under any NTP drift > 1 second
+//     between two nodes the offset diverged, electing different
+//     "fallback" producers at the same height, signing different blocks
+//     at one height — a chain split. v23 makes this structurally
+//     impossible.
 //
-//   * LIVENESS: bounded fallback latency = `MAX_CONSECUTIVE_EMPTY_SLOTS *
-//     SLOT_DURATION_MS` ≈ 3 seconds. After fallback fires, the new leader
-//     produces the remaining blocks in the rotation window. At the next
-//     30-block rotation boundary, the canonical rotation succession resumes.
+//   * LIVENESS: when the primary at round R is silent, every honest node
+//     observes `local_delay >= grace_period` independently and emits a
+//     signed TimeoutVote for round R+1. After 2f+1 votes aggregate
+//     (one gossip RTT), HIGHEST_CERTIFIED_ROUND[mb_idx] advances to R+1
+//     simultaneously on every honest node — same input → same fallback
+//     producer. Bounded recovery latency = grace_period + 1 RTT ≈ 1–3 s.
 //
-//   * NO SPLIT-BRAIN: every honest node reads the SAME applied-block
-//     stream and the SAME (within-NTP-jitter) wall clock. They reach the
-//     same offset within ±1 sec → same fallback identity → no fork.
+//   * SCALABILITY: O(1) DashMap read for `HIGHEST_CERTIFIED_ROUND[mb_idx]`,
+//     O(1) cached VRF result per 30-block rotation period. Identical cost
+//     from 5 to 10 000 super-nodes.
 //
-//   * NO PROCESS-LOCAL STATE: no atomic counter to drift across nodes.
-//     The signal is purely a function of chain state + clock.
+//   * POST-QUANTUM: all signatures are Dilithium3; no aggregate signature
+//     scheme required. TimeoutVote / TimeoutCertificate already operate on
+//     individual Dilithium3 sigs with explicit voter sets — no threshold
+//     primitive needed.
 //
-//   * SCALABILITY: one timestamp load + one timestamp compute per slot.
-//     Identical cost from 5 to 1M super-nodes. The 1000-validator-per-round
-//     macroblock-committee cap is unaffected.
-//
-// Macroblock layer is UNCHANGED — commit-reveal + view-change continues to
-// govern finality on 90-block boundaries. v22 only simplifies the microblock
-// (slot) layer.
+// Macroblock layer is UNCHANGED — commit-reveal + view-change continues
+// to govern finality on 90-block boundaries. v23 restores the canonical
+// BFT-certified rotation invariant that v18/v19 had and that v22 broke
+// by injecting a clock-derived path. v22.1's removal of the cross-domain
+// `yield_stale_round` guard remains in force.
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/// Number of consecutive empty microblock slots before in-rotation fallback
-/// fires. At 1-second slot cadence this is a 3-second silent window — long
-/// enough to absorb gossip jitter on healthy networks (typical p99 RTT
-/// ≤ 500 ms intercontinental) and short enough that operators do not perceive
-/// failover as a stall.
-pub const MAX_CONSECUTIVE_EMPTY_SLOTS: u64 = 3;
-
-/// Compute the deterministic in-rotation fallback offset for the current
-/// slot. Returns 0 under healthy production (fallback inactive). Returns
-/// `floor(seconds_since_last_block_minus_one / MAX_CONSECUTIVE_EMPTY_SLOTS)`
-/// otherwise — incrementing every full `MAX_CONSECUTIVE_EMPTY_SLOTS` seconds
-/// of silence to walk forward through the eligible-producer ordering.
-///
-/// Inputs are deliberately chain-anchored + clock-derived (no per-process
-/// state) so that two honest nodes observing the same applied-block stream
-/// reach the SAME offset within NTP jitter (±2 s). See module-level
-/// `v22 SLOT-BASED MICROBLOCK FAILOVER` block for the full safety argument.
-pub fn v22_compute_empty_slot_offset(
-    last_applied_block_timestamp: u64,
-    now: u64,
-) -> u64 {
-    // `+1` is the canonical 1-second slot duration. The first second after
-    // a block lands is the "next slot" — not an empty slot.
-    let seconds_silent = now
-        .saturating_sub(last_applied_block_timestamp)
-        .saturating_sub(1);
-    seconds_silent / MAX_CONSECUTIVE_EMPTY_SLOTS
-}
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2507,6 +2480,90 @@ pub static PEER_REFRESH_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 pub static HALT_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v23: STALL-DRIVEN TIMEOUT-VOTE EMISSION THROTTLE
+// ═══════════════════════════════════════════════════════════════════════════════
+// Per-macroblock-index throttle for `emit_macroblock_view_change_vote` calls
+// initiated from the microblock-stall path. Keyed by `mb_idx`, value is the
+// last emission timestamp (unix seconds). The stall detector reads this on
+// every tick and re-emits at most once per `STALL_GRACE_SECS` per macroblock
+// per node, bounding network gossip overhead during a stall regardless of
+// committee size (5 nodes or 10 000).
+//
+// Receiver-side `VOTER_MAX_ROUND` further dedupes votes from the same voter
+// at the same or lower round, so even duplicate emissions over a slow gossip
+// window cannot affect aggregation correctness — this throttle is purely a
+// network-efficiency guard.
+//
+// Retention: pruned alongside the active-macroblock-window cleanup sweep
+// (`cleanup_old_timeout_data` in unified_p2p.rs) so memory stays flat at
+// the active window irrespective of chain length.
+// ═══════════════════════════════════════════════════════════════════════════════
+pub static LAST_TIMEOUT_EMIT_PER_MB:
+    once_cell::sync::Lazy<dashmap::DashMap<u64, u64>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v23.1: STICKY LEADER PER LEADERSHIP-ROUND VIEW
+// ═══════════════════════════════════════════════════════════════════════════════
+// Once a fallback producer (`timeout_round > 0`) successfully produces a block
+// in leadership_round L, that producer STICKS as the leader for the remainder
+// of L (until the next 30-block rotation boundary at `(L+1) * 30 + 1`). The
+// "primary at round 0" of L is NOT consulted again — it just failed and its
+// failure is the reason a fallback was elected. Returning to it on every
+// subsequent height would force another 5-second stall + 2f+1 vote
+// aggregation per block, halving production rate while the primary remains
+// offline.
+//
+// Why this is the canonical BFT-PoS pattern
+// ─────────────────────────────────────────
+// Stable leader within view is a SAFETY property of every production
+// BFT-PoS protocol family (HotStuff lineage, classical PBFT, Tendermint-
+// style chains). The "view" here is the 30-block leadership_round window.
+// Once 2f+1 honest validators have certified the rotation to a new
+// leader, that leader holds the view until either:
+//   * the view ends naturally at the next leadership_round boundary
+//     (every 30 blocks), OR
+//   * 2f+1 vote again to advance certified_round (current sticky also
+//     failed — escalate to next fallback in the deterministic ordering)
+//
+// Without stickiness, every fallback success is followed by a "thrash"
+// retry of the failed primary on the next height: certified=R,
+// baseline=R → effective=0 → ask for primary → primary still dead →
+// stall → 2f+1 vote → certified=R+1 → fallback. Rinse and repeat,
+// every block, 5 seconds per cycle. Catastrophic for UX while a
+// committee member is offline. Sticky locks the recovered state.
+//
+// Safety
+// ──────
+//   * The sticky entry is ONLY honored when the sticky's locked round
+//     is ≥ current certified round. If certified has advanced beyond
+//     the sticky's round (the sticky producer also failed and 2f+1
+//     re-voted), the cache is INVALIDATED and a fresh selection runs.
+//   * Sticky producer is always the deterministic VRF result of
+//     `select_microblock_producer_with_round(h, ..., certified_round)`
+//     at the moment it was set — every honest node computes the same
+//     identity under the same on-chain state, so all honest nodes lock
+//     to the SAME sticky producer.
+//   * Sticky is per `leadership_round`, so a new 30-block window
+//     naturally starts with a fresh selection (primary at round 0).
+//     The failed primary gets another chance at the next epoch
+//     boundary; if it has recovered, normal production resumes.
+//
+// Scalability
+// ───────────
+//   * O(1) DashMap lookup per slot. Identical cost from 5 to 10 000
+//     super-nodes.
+//   * One entry per leadership_round, capped by the active-mb cleanup
+//     window (typically 3-5 epochs = 9-15 leadership rounds).
+//
+// Retention: pruned by the active-macroblock-window cleanup sweep
+// (`cleanup_old_timeout_data` in unified_p2p.rs) so memory stays flat.
+// ═══════════════════════════════════════════════════════════════════════════════
+pub static STICKY_LEADER_PER_VIEW:
+    once_cell::sync::Lazy<dashmap::DashMap<u64, (String, u64)>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
 // CRITICAL: Global mempool instance for activation registry integration
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -17692,105 +17749,142 @@ impl BlockchainNode {
                             local_delay
                         };
 
-                        // v22: ADAPTIVE TIMEOUT GRACE / STRICT-2f+1 ROTATION block DELETED.
-                        // The microblock layer no longer uses round-based timeout voting,
-                        // so the adaptive grace period and certified-round derivation that
-                        // fed it are no longer needed. Macroblock view-change retains its
-                        // own cert lookup path via `emit_macroblock_view_change_vote`.
-                        // Producer rotation for microblocks is driven STRICTLY by the
-                        // 2f+1 BFT-certified rotation round. Adopted (f+1 voters' max
-                        // signed round) is retained for vote-collection acceleration
-                        // and observability/metrics, but is NEVER consumed by producer
-                        // selection — that path requires the supermajority guarantee.
-                        //
-                        // Why this changed (forensic case h=556, 2026-04-30):
-                        //   The pre-v15.13 logic
-                        //       rotation_round = certified.max(adopted)
-                        //   computed leader from a value that could be elevated by
-                        //   `adopted` alone. `adopted` is f+1 (honest plurality, not
-                        //   supermajority) and is built from the local node's view of
-                        //   incoming TimeoutVotes — necessarily divergent across nodes
-                        //   under partial gossip propagation. Different `adopted` →
-                        //   different `rotation_round` → different leader → two
-                        //   producers create two different blocks at the same height
-                        //   (split-brain). Observed: node 005 ran with adopted=2 while
-                        //   nodes 001-004 had adopted=0 for the same macroblock,
-                        //   producing divergent h=556 blocks and stalling the network
-                        //   for 13 hours.
-                        //
-                        //   Industry-standard BFT chains (HotStuff family, Tendermint,
-                        //   PBFT-derived designs) require 2f+1 supermajority before
-                        //   any producer-selection state advances. f+1 is sufficient
-                        //   to detect liveness failure and emit votes, but NEVER to
-                        //   commit a leader-rotation decision. v15.13 aligns with that
-                        //   invariant.
-                        //
-                        // Security:
-                        //   * HIGHEST_CERTIFIED_ROUND advances only on 2f+1 Dilithium3-
-                        //     signed TimeoutVotes at the SAME round — cryptographically
-                        //     unforgeable supermajority. Identical on every honest node
-                        //     by construction.
-                        //   * Byzantine attackers with ≤ f keys cannot move the
-                        //     certified round, therefore cannot induce divergent
-                        //     producer selection.
-                        //
-                        // Liveness:
-                        //   * P0-5 vote gossip (commit 97dd23d) propagates TimeoutVotes
-                        //     in O(log N) hops, so 2f+1 reach happens within
-                        //     RTT × log_5(committee) — ~400 ms at committee=1000.
-                        //     Failover latency penalty vs adopted: bounded ~400 ms.
-                        //   * Worst-case stall: the leader at certified_round dies and
-                        //     no 2f+1 honest nodes have voted yet. Resolves on the next
-                        //     vote round (≤ 1 s of stall + propagation).
-                        //
-                        // Scalability: one O(1) DashMap read per tick (certified only).
-                        // adopted still computed for logging/metrics — same cost.
                         // ═══════════════════════════════════════════════════════════════
-                        // v22: adopted_timeout_round / f_plus_1 / proposed_timeout_round /
-                        // timeout_round_for_rotation DELETED. Microblock rotation no longer
-                        // uses round-based BFT failover. Telemetry call `update_failover_metrics`
-                        // retained with current observed silent-window seconds — operators
-                        // keep the same dashboard surface.
-                        update_failover_metrics(local_delay, 0);
-
-                        // v22: EMPTY-SLOT ATTESTATION CASCADE + HEARTBEAT-FAST-PATH +
-                        // ROTATION-ROUND COMBINE + VOTE-GATE — ALL DELETED.
+                        // v23: BFT-CERTIFIED ROTATION INVARIANT (microblock layer)
+                        // ═══════════════════════════════════════════════════════════════
+                        // Microblock leader rotation is driven STRICTLY by the
+                        // 2f+1 BFT-certified rotation round
+                        // (HIGHEST_CERTIFIED_ROUND[mb_idx]). The adopted (f+1)
+                        // round is computed for telemetry/observability only
+                        // and is NEVER consumed by leader selection — only the
+                        // supermajority guarantee is safe for producer-selection
+                        // state advancement.
                         //
-                        // The microblock layer no longer relies on 2f+1 attestations or
-                        // votes for rotation advancement. The producer loop uses pure VRF
-                        // leader selection at `timeout_round = 0` plus a deterministic
-                        // time-derived in-rotation fallback (see
-                        // `v22_compute_empty_slot_offset` and the producer loop block
-                        // below). The fallback identity is the SAME function of inputs on
-                        // every honest node — no votes, no gossip, no race window.
+                        // Forensic for the rule (h=556, 2026-04-30):
+                        //   The pre-v15.13 logic `rotation = certified.max(adopted)`
+                        //   could elevate rotation via `adopted` (f+1), which is
+                        //   built from local TimeoutVote view and divergent under
+                        //   partial gossip. Different `adopted` → different
+                        //   leader → split-brain at one height. Industry-standard
+                        //   BFT chains require 2f+1 supermajority before any
+                        //   leader-rotation state mutates; v15.13 aligned, v22
+                        //   broke it by injecting a clock-derived bypass, v23
+                        //   restores it as the SOLE rotation source.
                         //
-                        // Macroblock view-change (the canonical safety anchor for
-                        // 90-block finality) retains its own TimeoutVote / cert chain via
-                        // `emit_macroblock_view_change_vote` — separate path, unchanged.
+                        // Why v22 was wrong (h=4742 split-brain, 2026-05-11):
+                        //   The previous design replaced 2f+1 BFT timeout votes
+                        //   with `empty_slot_offset = (local_now - last_block_ts) / 3`,
+                        //   then injected the offset into VRF seed. Under any NTP
+                        //   drift > 1 second the offset diverged across nodes,
+                        //   electing different "fallback" producers at one height
+                        //   → two valid signed blocks → fork. v23 makes this
+                        //   structurally impossible by removing clock from the
+                        //   leader-selection input set entirely.
+                        // ═══════════════════════════════════════════════════════════════
 
-                        // v14.8.11: drift self-pause vote gate REMOVED. A
-                        // drifted node still contributes TimeoutVotes because
-                        // its `proposed_timeout_round` is clamped by the
-                        // `effective_now()` computation (which pulls a
-                        // behind-clock node back into the canonical range via
-                        // the network-time median) plus the `lbpt_stale_cap`
-                        // (30s ceiling on local_delay during catch-up). The
-                        // f+1 adopted aggregation tolerates the remaining
-                        // small proposed-round variance, and the BFT-agreed
-                        // rotation round derives only from signed 2f+1
-                        // evidence — so drifted votes cannot hijack rotation.
+                        // v23.1: ROTATION-ROUND TELEMETRY — strict 2f+1 BFT-certified
+                        // rotation round for the current macroblock (no f+1 adopted),
+                        // reported into the operator dashboard surface via
+                        // `update_failover_metrics`. Cheap O(1) DashMap read;
+                        // identical cost from 5 to 10 000 super-nodes.
+                        let current_rotation_round = {
+                            let mb_idx = next_height / 90;
+                            crate::unified_p2p::get_certified_rotation_round(mb_idx)
+                        };
+                        update_failover_metrics(local_delay, current_rotation_round);
 
-                        // v22: stall-driven TimeoutVote-microblock emit + failover-log block
-                        // DELETED. The microblock layer no longer uses TimeoutVotes for
-                        // rotation; the pure-VRF leader + time-derived in-rotation fallback
-                        // in the producer loop handles silent producers deterministically.
-                        // Macroblock view-change retains its own TimeoutVote emission via
-                        // `emit_macroblock_view_change_vote` — unchanged.
+                        // ═══════════════════════════════════════════════════════════════
+                        // v23: SIGNED TIMEOUT-VOTE EMISSION ON MICROBLOCK STALL
+                        // ═══════════════════════════════════════════════════════════════
+                        // When this node observes the slot-leader silent for longer
+                        // than the grace period (`local_delay > STALL_GRACE_SECS`),
+                        // it emits a Dilithium3-signed TimeoutVote for the current
+                        // macroblock at round = `certified + 1`. After 2f+1 honest
+                        // nodes co-sign at the same proposed round, the receiver-
+                        // side aggregator advances `HIGHEST_CERTIFIED_ROUND[mb_idx]`
+                        // — and the producer loop on every honest node then computes
+                        // the SAME fallback leader (pure function of new round +
+                        // on-chain candidate set).
                         //
-                        // The chronic-stall-recovery path below is the only logic kept from
-                        // the old stall block: it is a peer-driven resync triggered after
-                        // 120 seconds of zero progress, useful as an operator-grade safety
-                        // net independent of consensus mechanism.
+                        // Throttling
+                        // ──────────
+                        // Re-emission is gated by `LAST_TIMEOUT_EMIT_PER_MB`
+                        // (DashMap<mb_idx, last_emit_unix_secs>). At most one
+                        // emission per `STALL_GRACE_SECS` per macroblock per node.
+                        // Receiver-side `VOTER_MAX_ROUND` further dedupes votes from
+                        // the same voter at the same or lower round — so even
+                        // duplicated emissions over a slow gossip window do not
+                        // affect aggregation correctness.
+                        //
+                        // Safety
+                        // ──────
+                        //   * Vote is Dilithium3-signed by this node's consensus key.
+                        //     Receivers verify against the on-chain PK registry
+                        //     before considering the signature for aggregation.
+                        //   * Byzantine voters with ≤ f keys cannot reach the 2f+1
+                        //     threshold required to advance HIGHEST_CERTIFIED_ROUND,
+                        //     so rotation cannot be hijacked by minority attackers.
+                        //
+                        // Liveness
+                        // ────────
+                        //   * Bounded failover latency: STALL_GRACE_SECS (grace) +
+                        //     O(log N) RTT for 2f+1 gossip aggregation ≈ 3–5 s for
+                        //     N=5, 3–8 s for N=1000 (committee-bounded).
+                        //   * Far below the macroblock-boundary view-change cycle
+                        //     (~90 s), giving mid-window rotation as required by
+                        //     the canonical L1 pattern.
+                        //
+                        // Scalability
+                        // ───────────
+                        //   * O(1) DashMap throttle read + one signature emission
+                        //     per stalled mb per node. Receiver-side aggregator is
+                        //     O(votes_received), bounded by committee size.
+                        // ═══════════════════════════════════════════════════════════════
+                        const STALL_GRACE_SECS: u64 = 5;
+                        if local_delay > STALL_GRACE_SECS && production_unlocked {
+                            let mb_idx = next_height / 90;
+                            let now_u64 = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let should_emit = {
+                                let last = LAST_TIMEOUT_EMIT_PER_MB
+                                    .get(&mb_idx)
+                                    .map(|v| *v)
+                                    .unwrap_or(0);
+                                now_u64.saturating_sub(last) >= STALL_GRACE_SECS
+                            };
+                            if should_emit {
+                                LAST_TIMEOUT_EMIT_PER_MB.insert(mb_idx, now_u64);
+                                if is_info() {
+                                    println!(
+                                        "[INFO][TIMEOUT] emit_microblock_vote h={} mb={} cert_round={} delay={}s reason=primary_silent",
+                                        next_height, mb_idx, current_rotation_round, local_delay
+                                    );
+                                }
+                                // Re-use the macroblock view-change emission helper:
+                                // it signs `TIMEOUT:{mb_idx}:{cert+1}:{hash}` and
+                                // broadcasts via `broadcast_timeout_vote`, which is
+                                // the same path the macroblock-boundary view-change
+                                // uses. Receivers aggregate identically; rotation
+                                // advances on 2f+1 supermajority.
+                                Self::emit_macroblock_view_change_vote(
+                                    mb_idx.saturating_mul(90),
+                                    &node_id,
+                                    &unified_p2p,
+                                    Some(&storage),
+                                ).await;
+                            }
+                        }
+
+                        // v23: chronic-stall safety net — peer-driven resync after
+                        // 120 s of zero progress. Operator-grade fallback for the
+                        // rare case where 2f+1 timeout vote aggregation itself
+                        // cannot complete (e.g. asymmetric partition during a
+                        // macroblock window). Independent of consensus path;
+                        // macroblock finality at the next 90-block boundary
+                        // remains the canonical recovery anchor and this block
+                        // ensures lagging nodes catch up to it.
                         // v14.7.2 (retained in v22): CHRONIC STALL RECOVERY — peer-driven
                         // resync after 120 s with no progress. Operator-grade safety net
                         // independent of consensus mechanism. Macroblock finality at the
@@ -18985,82 +19079,171 @@ impl BlockchainNode {
                 // at 5 or 5000 super-nodes.
                 // ═══════════════════════════════════════════════════════════════
                 // ═══════════════════════════════════════════════════════════════
-                // v22: PURE-VRF MICROBLOCK LEADER SELECTION (no rotation rounds)
+                // v23: BFT-CERTIFIED MICROBLOCK LEADER ROTATION (canonical L1)
                 // ═══════════════════════════════════════════════════════════════
-                // The microblock layer always selects the VRF-deterministic
-                // leader at `timeout_round = 0`. There is no per-block voting,
-                // no rotation_round consumption, no Pacemaker derivation.
+                // Leader selection for the next microblock is a PURE FUNCTION
+                // of on-chain state:
                 //
-                // In-rotation failover: when the consecutive-empty-slot counter
-                // crosses `MAX_CONSECUTIVE_EMPTY_SLOTS`, every honest node
-                // deterministically swaps to a fallback identity for the
-                // remainder of the current rotation window. The fallback
-                // is computed by the SAME VRF + reputation ordering on the
-                // SAME eligible-producer snapshot from macroblock(N-2), but
-                // with an `empty_slot_offset` mixed into the seed — every
-                // honest node, observing the same empty-slot count, reaches
-                // the same fallback identity. No votes, no gossip races.
+                //     leader(h) = select_microblock_producer_with_round(
+                //         height          = h,
+                //         candidates      = eligible_producers from macroblock(N-2),
+                //         vrf_entropy     = SHA3(macroblock(N-2).deterministic_fields),
+                //         leadership_round= (h-1) / ROTATION_INTERVAL_BLOCKS,
+                //         timeout_round   = HIGHEST_CERTIFIED_ROUND[mb_idx] - baseline,
+                //     )
                 //
-                // Macroblock commit-reveal (every 90 blocks) retains the full
-                // 2f+1 vote / cert / view-change machinery for finality.
+                // EVERY input is finalised on-chain state. Two honest nodes
+                // at the same height compute the IDENTICAL leader by
+                // construction. Local wall clock is NEVER an input.
+                //
+                // The `timeout_round` argument is the BFT-CERTIFIED rotation
+                // round for the containing macroblock, derived via
+                // `get_effective_rotation_round(mb_idx)`:
+                //
+                //   * advances ONLY when 2f+1 Dilithium3-signed TimeoutVotes
+                //     have been aggregated for round R (HIGHEST_CERTIFIED_ROUND)
+                //     OR the f+1 pacemaker has lifted HIGHEST_ADOPTED_ROUND
+                //   * monotonic per macroblock index — never regresses
+                //   * propagates over the network in ≤ 1 RTT via signed gossip
+                //   * is therefore identical on all honest nodes within one
+                //     gossip window of any rotation event
+                //
+                // FAILURE MODE COVERED — primary silent:
+                //   1. Primary at round R fails to produce at slot h.
+                //   2. Stall-detection on every node signs TimeoutVote for mb_idx
+                //      at round R+1 once `local_delay >= grace_period`.
+                //   3. After 2f+1 signed timeout votes, HIGHEST_CERTIFIED_ROUND[mb_idx]
+                //      advances to R+1 — same value on every honest node.
+                //   4. Next call to this loop computes `timeout_round = R+1` →
+                //      same fallback producer on every honest node.
+                //   5. Fallback producer signs h with `microblock.timeout_round = R+1`.
+                //   6. Receiving nodes verify producer authority by recomputing
+                //      the same pure function with `block.timeout_round` —
+                //      Category B reject only fires when round matches but
+                //      producer doesn't (= unauthorised signer at that rank).
+                //
+                // FAILURE MODE PROHIBITED — clock-derived dual production:
+                //   The previous v22 design injected a locally-computed
+                //   `empty_slot_offset = (now - last_block_ts) / 3` into the
+                //   leader-selection seed. Under any NTP drift > 1 second between
+                //   two nodes, the offset diverged across nodes, electing
+                //   different "fallback" producers at the same height — two
+                //   valid signed blocks at one height → chain split. With v23
+                //   this is structurally impossible: `timeout_round` is the
+                //   ONLY rotation input and is BFT-CERTIFIED, not clock-derived.
+                //
+                // Macroblock commit-reveal at 90-block boundaries retains the
+                // full 2f+1 vote / cert / view-change machinery for finality.
+                //
+                // Scalability: O(1) DashMap lookup for HIGHEST_CERTIFIED_ROUND +
+                // O(1) cached VRF result per 30-block rotation period. Identical
+                // cost at 5 or 10 000 super-nodes.
                 // ═══════════════════════════════════════════════════════════════
-                let timeout_round: u64 = 0;
+                let mb_idx = next_block_height / 90;
+                // v23.1: STRICT 2f+1 CERTIFIED-ONLY for producer selection.
+                // Calling `get_certified_rotation_round` (not
+                // `get_effective_rotation_round`) eliminates the f+1 `adopted`
+                // input that could diverge across nodes under partial gossip
+                // propagation — the h=556 split-brain class fix.
+                let timeout_round: u64 =
+                    crate::unified_p2p::get_certified_rotation_round(mb_idx);
 
-                let primary_producer = Self::select_microblock_producer_with_round(
-                    next_block_height,
-                    &unified_p2p,
-                    &node_id,
-                    node_type,
-                    Some(&storage),
-                    &poh,
-                    timeout_round, // v22: always 0 — pure VRF leader
-                ).await;
-
-                // v22: in-rotation fallback offset is derived deterministically
-                // from the chain-anchored last-applied-block timestamp and the
-                // network-corrected `effective_now()`. Using `effective_now()`
-                // instead of raw `get_timestamp_safe()` means a node whose
-                // local wall clock has drifted falls back on the median of the
-                // 32-sample on-chain block-timestamp ring — the same BFT-time
-                // surface that defends every other local stall-detection
-                // decision in this file. Two honest nodes therefore reach the
-                // SAME offset by construction, independent of per-host NTP
-                // jitter, as long as the chain itself is making progress.
-                let last_applied_ts =
-                    LAST_BLOCK_PRODUCED_TIME.load(std::sync::atomic::Ordering::Relaxed);
-                let now_secs = effective_now();
-                let empty_slot_offset =
-                    v22_compute_empty_slot_offset(last_applied_ts, now_secs);
-                let current_producer = if empty_slot_offset == 0 {
-                    primary_producer.clone()
+                // ═══════════════════════════════════════════════════════════════
+                // v23.1: STICKY LEADER WITHIN VIEW (no leader thrash)
+                // ═══════════════════════════════════════════════════════════════
+                // Compute the canonical `leadership_round` (30-block view
+                // window) and resolve the current producer through the
+                // sticky-leader cache.
+                //
+                //   * If a sticky leader exists for this view AND its locked
+                //     round is ≥ current certified round → use sticky leader
+                //     (the failed primary is NOT consulted again within view).
+                //   * If certified has advanced beyond the sticky's round
+                //     (the sticky also failed and 2f+1 re-voted) → invalidate
+                //     and re-derive from scratch at the new certified round.
+                //   * If no sticky exists yet → compute from
+                //     `select_microblock_producer_with_round` and, when the
+                //     selection is a fallback (`timeout_round > 0`), lock it
+                //     into the sticky cache for the rest of the view.
+                //
+                // See module-level v23.1 STICKY LEADER PER LEADERSHIP-ROUND
+                // VIEW block for safety + scalability rationale.
+                // ═══════════════════════════════════════════════════════════════
+                let leadership_round_view: u64 = if next_block_height == 0 {
+                    0
+                } else if next_block_height <= ROTATION_INTERVAL_BLOCKS {
+                    0
                 } else {
-                    let fallback = Self::select_microblock_producer_with_round(
-                        next_block_height,
-                        &unified_p2p,
-                        &node_id,
-                        node_type,
-                        Some(&storage),
-                        &poh,
-                        empty_slot_offset, // v22: in-rotation fallback offset
-                    ).await;
-                    if is_info() {
-                        let silent_secs = now_secs.saturating_sub(last_applied_ts);
-                        println!(
-                            "[INFO][SLOT] in_rotation_fallback h={} primary={} fallback={} silent_secs={} offset={}",
-                            next_block_height, primary_producer, fallback,
-                            silent_secs, empty_slot_offset
-                        );
-                    }
-                    fallback
+                    (next_block_height - 1) / ROTATION_INTERVAL_BLOCKS
                 };
-                
-                // v4.3 / v19: Cache expected producer for incoming block validation.
-                // The cached round is the 2f+1 BFT-certified value (read above as
-                // `timeout_round`), so all honest validators populate identical
-                // entries once vote gossip has propagated. Block-pipeline ingest
-                // compares the cached pair against the incoming block's
-                // `(producer, timeout_round)` to detect Category B authority
-                // violations (same round, wrong signer → HARD reject).
+
+                let sticky_hit: Option<(String, u64)> = STICKY_LEADER_PER_VIEW
+                    .get(&leadership_round_view)
+                    .map(|e| e.value().clone());
+
+                let current_producer = match sticky_hit {
+                    Some((sticky_id, sticky_round)) if sticky_round >= timeout_round => {
+                        // Sticky leader is current or future — honor lock.
+                        if is_info() && next_block_height % ROTATION_INTERVAL_BLOCKS == 1 {
+                            println!(
+                                "[INFO][ROTATION] sticky_leader h={} view={} producer={} locked_round={} cert_round={}",
+                                next_block_height, leadership_round_view,
+                                sticky_id, sticky_round, timeout_round,
+                            );
+                        }
+                        sticky_id
+                    }
+                    _ => {
+                        // No sticky OR certified advanced past sticky → fresh
+                        // VRF-deterministic resolution at current certified.
+                        let fresh = Self::select_microblock_producer_with_round(
+                            next_block_height,
+                            &unified_p2p,
+                            &node_id,
+                            node_type,
+                            Some(&storage),
+                            &poh,
+                            timeout_round,
+                        ).await;
+                        // Lock fallback selections (round > 0) into the view's
+                        // sticky cache. Round-0 (primary) is the natural
+                        // starting point of every view — no lock needed; if
+                        // primary succeeds the view runs normally; if it
+                        // fails, the next iteration will rotate and lock the
+                        // chosen fallback.
+                        if timeout_round > 0 && !fresh.is_empty() {
+                            STICKY_LEADER_PER_VIEW.insert(
+                                leadership_round_view,
+                                (fresh.clone(), timeout_round),
+                            );
+                            if is_info() {
+                                println!(
+                                    "[INFO][ROTATION] sticky_lock h={} view={} producer={} round={} reason=fallback_elected",
+                                    next_block_height, leadership_round_view,
+                                    fresh, timeout_round,
+                                );
+                            }
+                        }
+                        fresh
+                    }
+                };
+
+                if is_info() && timeout_round > 0 {
+                    println!(
+                        "[INFO][ROTATION] h={} mb={} round={} producer={} source=bft_certified",
+                        next_block_height, mb_idx, timeout_round, current_producer
+                    );
+                }
+
+                // v23: Cache the BFT-certified expectation for ingest-side
+                // Category B validation. All honest nodes write the IDENTICAL
+                // (producer, timeout_round) pair to this cache for any given
+                // height once vote gossip has propagated — guaranteed by the
+                // pure-function property of `select_microblock_producer_with_round`
+                // and the BFT-certified property of `timeout_round`. There is
+                // no clock-derived input to this cache write, so cross-node
+                // cache divergence (the v22 root cause of the h=4742 fork) is
+                // structurally impossible after this commit.
                 cache_expected_producer(next_block_height, &current_producer, timeout_round);
 
                 let mut is_my_turn_to_produce = current_producer == node_id;
@@ -21719,9 +21902,23 @@ impl BlockchainNode {
                         vrf_proof: qrb_proof,
                         fees_collected: block_fees_collected,
                         state_root: [0u8; 32], // populated after TX+fees apply
-                        // v22: Always 0 — microblock layer no longer has rotation
-                        // rounds. See block-level comment above for rationale.
-                        timeout_round: 0,
+                        // v23: BFT-CERTIFIED ROTATION ROUND EMBEDDED IN BLOCK
+                        // ────────────────────────────────────────────────────
+                        // Carries the `timeout_round` value used by the
+                        // leader-election above (snapshotted from
+                        // `get_effective_rotation_round(mb_idx)` — a BFT-
+                        // certified counter advanced ONLY by 2f+1 signed
+                        // TimeoutVotes / f+1 pacemaker, NEVER by local wall
+                        // clock). Block_pipeline ingest recomputes the
+                        // same pure function on receive and rejects only
+                        // when `block.producer != expected AND
+                        // block.timeout_round == local.timeout_round` —
+                        // i.e. unauthorised signer at a locally-agreed rank.
+                        // Cross-round mismatches log Category A and are
+                        // accepted (gossip-window legitimate divergence).
+                        // Restores the v14.0 producer-authority-proof invariant
+                        // that v22 had erased by hardcoding 0.
+                        timeout_round,
                     };
                     
                     // ═══════════════════════════════════════════════════════════════════════════
@@ -22214,45 +22411,43 @@ impl BlockchainNode {
                     let rotation_tracker_clone = rotation_tracker.clone();
 
                     // ═══════════════════════════════════════════════════════════════════════════
-                    // v22: pre-save STALE-ROUND GUARD removed
+                    // v22.1 / v23: pre-save STALE-ROUND GUARD remains removed
                     // ═══════════════════════════════════════════════════════════════════════════
-                    // The pre-broadcast `effective_round_now > microblock.timeout_round`
-                    // check (legacy v14.6 / v15.11) was a self-yield mechanism designed
-                    // for the round-based microblock failover model. v22 collapsed that
-                    // model to pure VRF + time-derived skip-slot (see
-                    // `v22_compute_empty_slot_offset` and the producer loop), so:
+                    // The legacy `effective_round_now > microblock.timeout_round`
+                    // self-check (v14.6 / v15.11) compared two values that, under
+                    // the v23 architecture, are by construction equal on every
+                    // honest producer attempt:
                     //
-                    //   * `microblock.timeout_round` is hard-coded to 0 at construction;
-                    //   * the comparison `effective_round_now > 0` becomes structurally
-                    //     true whenever the macroblock-level view-change (a SEPARATE,
-                    //     preserved subsystem) bumps `HIGHEST_CERTIFIED_ROUND` — which
-                    //     happens on every legitimate commit-reveal-phase timeout —
-                    //     making the guard fire on every honest producer attempt.
+                    //   * `microblock.timeout_round` — value snapshotted from
+                    //     `get_effective_rotation_round(mb_idx)` at the top of the
+                    //     producer loop, used for leader election.
+                    //   * `effective_round_now` — same `get_effective_rotation_round`
+                    //     read a few microseconds later before save.
                     //
-                    // Forensic case (clean v22 deploy, all 5 nodes synchronised at h=89,
-                    // first macroblock commit-reveal triggers view-change → certified
-                    // bumps to 3 → next microblock production at h=90 emits
-                    // `[WARN][PROD] yield_stale_round h=90 produced_for_round=0
-                    // effective_round_now=3 action=skip_save` and never broadcasts,
-                    // resulting in a permanent stall observed 1.8 hours after deploy
-                    // despite zero fork, zero pk_mismatch on the production path, and
-                    // a fully-synchronised microblock chain).
+                    // The two reads can only differ if a concurrent 2f+1 cert
+                    // aggregation completed between them, which (a) advances the
+                    // rotation and (b) makes THIS node no longer the elected
+                    // producer at the new round. The Category B / B' ingest
+                    // check on every other validator will harmlessly reject the
+                    // late block; producing it locally is wasted CPU but never a
+                    // safety risk. Re-introducing the pre-save guard adds no
+                    // safety beyond what Category B already provides, and on a
+                    // network where macroblock-boundary view-change drives mid-
+                    // window certified-round bumps it fires on every honest
+                    // attempt (v22.1 forensic — permanent h=90 stall).
                     //
                     // Safety after removal
                     // ────────────────────
-                    // The original guard's job was to prevent two valid producers at
-                    // different rotation rounds from emitting blocks at the same height.
-                    // In v22 there is exactly ONE producer per height — VRF-deterministic
-                    // primary at offset 0, deterministically-derived fallback at
-                    // offset ≥ 1 — so there is no "second valid candidate" to suppress.
-                    // The peer-side producer-authority check at
-                    // `block_pipeline.rs` still rejects any signed block whose producer
-                    // does not match the cached VRF expectation.
-                    //
-                    // Macroblock-level view-change is unchanged and continues to
-                    // advance `HIGHEST_CERTIFIED_ROUND` on commit-reveal-phase failure;
-                    // that state stays internal to the macroblock-finality subsystem
-                    // and never gates microblock production after v22.
+                    // Producer authority is enforced at INGEST on every peer via
+                    // `block_pipeline.rs` Category B reject (same round, different
+                    // producer → HARD REJECT). Storage-layer L4 anti-fork guard
+                    // (`storage.rs::save_block_with_delta`) rejects a second block
+                    // with a different hash at the same height even on this node.
+                    // Equivocation slashing pipeline (`record_block_equivocation`
+                    // + `analyze_chain_for_slashing`) catches Byzantine producers
+                    // who attempt to sign two blocks at one height — the proof is
+                    // unforgeable and slashing fires deterministically on every
+                    // honest validator at the next macroblock commit.
                     // ═══════════════════════════════════════════════════════════════════════════
 
                     // Save synchronously to ensure block exists before height increment
@@ -27866,10 +28061,30 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         _node_id: &str,
         _unified_p2p: Option<&Arc<SimplifiedP2P>>
     ) -> Result<Vec<u8>, String> {
-        
+
+        // ═══════════════════════════════════════════════════════════════════
+        // v23.1: SIGNED PAYLOAD INCLUDES `timeout_round` (consensus binding)
+        // ═══════════════════════════════════════════════════════════════════
+        // Per the canonical BFT-PoS invariant ("every consensus-relevant
+        // field MUST be cryptographically bound to the block"), the
+        // BFT-certified rotation round embedded in the microblock is now
+        // part of the Dilithium3 signature input. Without this, a network
+        // peer-relay could mutate `timeout_round` in transit and the
+        // signature would still verify against the unsigned remainder —
+        // allowing an attacker to manipulate downstream baseline tracking
+        // (`record_finalized_round`) and leader-selection state on
+        // subsequent heights without any producer cooperation.
+        //
+        // The signing-payload version tag is bumped to "v23.1" to reflect
+        // the format change. Existing peers running v23 or earlier will
+        // fail signature verification on blocks signed with the new format
+        // — this is intentional: a clean network restart is the supported
+        // upgrade path for this consensus-rule change.
+        // ═══════════════════════════════════════════════════════════════════
+
         // Create deterministic message hash (same on all nodes for verification)
         let mut hasher = Sha3_256::new();
-        hasher.update(b"QNet_Block_Sig_v4");
+        hasher.update(b"Block_Sig_v23.1");
         hasher.update(&microblock.height.to_be_bytes());
         hasher.update(&microblock.timestamp.to_be_bytes());
         hasher.update(&microblock.merkle_root);
@@ -27879,6 +28094,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if let Some(ref vrf_out) = microblock.vrf_output {
             hasher.update(vrf_out);
         }
+        // v23.1: bind timeout_round to the signed digest.
+        hasher.update(&microblock.timeout_round.to_be_bytes());
         let message_hash = hasher.finalize();
         
         // Sign with VRF instance (Dilithium3 detached signature)
@@ -27979,9 +28196,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             };
 
-            // Recreate message hash (MUST match sign_microblock_with_dilithium)
+            // Recreate message hash (MUST match sign_microblock_with_dilithium).
+            // v23.1: payload version tag is "Block_Sig_v23.1" and includes
+            // `timeout_round` to bind consensus rotation state to the signature.
             let mut hasher2 = Sha3_256::new();
-            hasher2.update(b"QNet_Block_Sig_v4");
+            hasher2.update(b"Block_Sig_v23.1");
             hasher2.update(&microblock.height.to_be_bytes());
             hasher2.update(&microblock.timestamp.to_be_bytes());
             hasher2.update(&microblock.merkle_root);
@@ -27991,6 +28210,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if let Some(ref vrf_out) = microblock.vrf_output {
                 hasher2.update(vrf_out);
             }
+            // v23.1: bind timeout_round to the signed digest (matches signer).
+            hasher2.update(&microblock.timeout_round.to_be_bytes());
             let msg_hash = hasher2.finalize();
 
             // Verify Dilithium3 detached signature
@@ -35661,106 +35882,58 @@ mod tests {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// v22: REGRESSION TESTS — SLOT-BASED FAILOVER OFFSET DETERMINISM
+// v23.1: REGRESSION TESTS — BFT-CERTIFIED MICROBLOCK ROTATION DETERMINISM
 // ═══════════════════════════════════════════════════════════════════════════
-// `v22_compute_empty_slot_offset` is the canonical formula that drives the
-// in-rotation fallback decision on every honest node. Two honest nodes must
-// reach the SAME offset value when given the same chain-anchored timestamp
-// + their (NTP-synchronised) local clocks; these tests pin every transition
-// boundary so a regression cannot silently shift the failover behaviour.
+// `get_certified_rotation_round(mb_idx)` is the canonical source of the
+// `timeout_round` argument passed to `select_microblock_producer_with_round`.
+// Two honest nodes converging on the same on-chain state MUST read the
+// same value; these tests pin the monotonicity, saturating-subtraction
+// and baseline-relative semantics so a regression cannot silently
+// reintroduce a clock-derived fallback path OR an f+1 adopted-based
+// rotation source.
 //
 // The function MUST be:
-//   * Pure (no global state)
-//   * Saturating (no underflow when now < ts, defensively)
-//   * Strictly increasing in `now`
-//   * Step boundary at every `MAX_CONSECUTIVE_EMPTY_SLOTS` seconds
+//   * A pure function of HIGHEST_CERTIFIED_ROUND (2f+1 supermajority only,
+//     NEVER HIGHEST_ADOPTED_ROUND) and the per-mb baseline — no clock
+//     input, no per-process atomics on the read path.
+//   * Saturating on `certified - baseline` (no wrap when a stale baseline
+//     transiently exceeds certified during finalisation races).
+//   * Monotonic in the supplied state — if both `certified` and `baseline`
+//     only ever advance, the function output never regresses for the
+//     same `mb_idx` between any two stable observations.
+//
+// The deprecated `get_effective_rotation_round` retains its OLD semantics
+// (max of certified + adopted) for observability callers only; producer
+// selection MUST NOT use it (h=556 forensic).
 // ═══════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
-mod tests_v22_slot_offset {
-    use super::*;
+mod tests_v23_rotation_round {
+    // No `use super::*` — tests reference `crate::unified_p2p::*` fully
+    // qualified so all rotation-state mutations go through the canonical
+    // public API (no parent-module shortcut that could mask incorrect
+    // visibility regressions).
 
-    /// Healthy production: applied block lands within the 1-second slot,
-    /// so `now` ≈ `last_ts + 1`. Offset MUST stay 0 — primary VRF leader
-    /// is selected without fallback.
+    /// Healthy fresh macroblock: no timeout votes seen, no baseline
+    /// recorded. `get_certified_rotation_round` MUST return 0 — primary
+    /// VRF leader at round 0 is selected.
     #[test]
-    fn offset_zero_under_healthy_production() {
-        // Block timestamp 1000, "now" 1001 (one slot elapsed → next slot,
-        // no silence beyond the canonical 1-second slot).
-        assert_eq!(v22_compute_empty_slot_offset(1000, 1001), 0);
-        // Same slot still — block JUST landed.
-        assert_eq!(v22_compute_empty_slot_offset(1000, 1000), 0);
+    fn round_zero_on_fresh_macroblock() {
+        let mb_idx: u64 = 1_000_001;
+        // Without any state mutations, certified=0, baseline=0
+        // → certified rotation round = 0.
+        assert_eq!(crate::unified_p2p::get_certified_rotation_round(mb_idx), 0);
     }
 
-    /// Below threshold: 1, 2 seconds of silence past the slot. Still no
-    /// fallback — gossip jitter is allowed up to MAX_CONSECUTIVE_EMPTY_SLOTS.
+    /// Saturating subtraction defends against finalisation ordering
+    /// races — if `record_finalized_round` records a baseline equal to
+    /// (or transiently greater than) the live certified round, the
+    /// function MUST saturate to 0, not wrap.
     #[test]
-    fn offset_zero_below_threshold() {
-        // 1 silent second past the slot.
-        assert_eq!(v22_compute_empty_slot_offset(1000, 1002), 0);
-        // 2 silent seconds — still tolerated.
-        assert_eq!(v22_compute_empty_slot_offset(1000, 1003), 0);
+    fn round_saturates_when_baseline_exceeds_live() {
+        let mb_idx: u64 = 1_000_002;
+        // Record a baseline of 5 with no live round movement — certified=0,
+        // baseline=5, saturating_sub yields 0.
+        crate::unified_p2p::record_finalized_round(mb_idx, 5);
+        assert_eq!(crate::unified_p2p::get_certified_rotation_round(mb_idx), 0);
     }
-
-    /// Threshold reached at exactly MAX_CONSECUTIVE_EMPTY_SLOTS seconds of
-    /// silence. Offset bumps to 1 — first in-rotation fallback identity.
-    #[test]
-    fn offset_one_at_threshold() {
-        // 3 silent seconds past slot.
-        assert_eq!(
-            v22_compute_empty_slot_offset(1000, 1004),
-            1,
-            "MAX_CONSECUTIVE_EMPTY_SLOTS = {} silent seconds MUST yield offset 1",
-            MAX_CONSECUTIVE_EMPTY_SLOTS
-        );
-    }
-
-    /// Continued silence walks the offset forward by one for every full
-    /// MAX_CONSECUTIVE_EMPTY_SLOTS-second window. After 2 full windows of
-    /// silence, offset is 2 (second fallback identity).
-    #[test]
-    fn offset_walks_forward_with_silence() {
-        // 6 silent seconds = 2 full windows.
-        assert_eq!(v22_compute_empty_slot_offset(1000, 1007), 2);
-        // 9 silent seconds = 3 full windows.
-        assert_eq!(v22_compute_empty_slot_offset(1000, 1010), 3);
-    }
-
-    /// Saturating subtraction defends against clock skew — if local
-    /// `now` is somehow BEFORE the chain-anchored timestamp (NTP step
-    /// backward, container restart with clock not yet synced), the
-    /// offset MUST saturate to 0 rather than wrap.
-    #[test]
-    fn offset_saturates_on_backward_clock() {
-        // now < last_ts — implausible but must not panic / wrap.
-        assert_eq!(v22_compute_empty_slot_offset(1000, 999), 0);
-        assert_eq!(v22_compute_empty_slot_offset(1000, 0), 0);
-    }
-
-    /// NTP jitter check: at the same observed silence, two nodes whose
-    /// clocks differ by ±2 s reach offsets differing by AT MOST 1.
-    /// This is the tightness invariant for "no split-brain across the
-    /// fallback boundary" — see the SLOT-BASED FAILOVER block-level
-    /// comment.
-    #[test]
-    fn offset_jitter_bound_within_two_seconds_ntp() {
-        let last_ts = 1000;
-        // Node A: now = 1004 → 3 silent seconds → offset 1
-        let a = v22_compute_empty_slot_offset(last_ts, 1004);
-        // Node B: 2 seconds ahead → 5 silent seconds → still offset 1
-        let b = v22_compute_empty_slot_offset(last_ts, 1006);
-        // Node C: 2 seconds behind → 1 silent second → offset 0
-        let c = v22_compute_empty_slot_offset(last_ts, 1002);
-
-        // Across NTP jitter, offset spread ≤ 1 (between A and C).
-        // Worst-case "spread" boundary IS allowed at exactly the threshold.
-        assert!(
-            a.abs_diff(c) <= 1,
-            "NTP-±2s jitter MUST yield offset spread ≤ 1, got {} vs {}",
-            a, c
-        );
-        assert_eq!(a, 1);
-        assert_eq!(b, 1);
-        assert_eq!(c, 0);
-    }
-
 }

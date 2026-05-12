@@ -957,6 +957,35 @@ impl MicroBlock {
     }
 
     /// Calculate microblock hash
+    ///
+    /// ═══════════════════════════════════════════════════════════════════════
+    /// v23.1: TIMEOUT_ROUND INCLUDED IN HASH (consensus-relevant binding)
+    /// ═══════════════════════════════════════════════════════════════════════
+    /// The `timeout_round` field is consensus-relevant state — it determines
+    /// which producer is legitimately elected at this height via the pure
+    /// function `select_microblock_producer_with_round(h, candidates, round)`.
+    /// It also drives `record_finalized_round` → `LAST_FINALIZED_ROUND_PER_MB`
+    /// → `get_certified_rotation_round` for all subsequent heights in the
+    /// macroblock window. Any field that influences consensus decisions
+    /// MUST be cryptographically bound to the block.
+    ///
+    /// Pre-v23.1 the field was omitted from the hash because v22 hardcoded
+    /// it to 0 (single value, omission harmless). v23 restored real values
+    /// (0, 1, 2, ...) for BFT-certified rotation; the omission then became
+    /// a real attack surface: a peer-relay or man-in-the-middle could mutate
+    /// `timeout_round` without breaking the hash → storage L4 anti-fork
+    /// guard would silently treat the mutated block as idempotent re-save
+    /// → divergent baseline tracking across nodes → potential leader-
+    /// selection divergence on subsequent heights.
+    ///
+    /// Including `timeout_round` in the hash closes that surface: any
+    /// mutation produces a different hash → storage L4 detects it as
+    /// equivocation (different content at same height) → reject + record
+    /// evidence for slashing.
+    ///
+    /// Scalability: one extra `to_le_bytes` + `hasher.update` per block.
+    /// Negligible cost at any committee size.
+    /// ═══════════════════════════════════════════════════════════════════════
     pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha3_256::new();
         hasher.update(&self.height.to_le_bytes());
@@ -964,7 +993,9 @@ impl MicroBlock {
         hasher.update(&self.previous_hash);
         hasher.update(&self.merkle_root);
         hasher.update(self.producer.as_bytes());
-        
+        // v23.1: bind timeout_round to block identity (see header above).
+        hasher.update(&self.timeout_round.to_le_bytes());
+
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
@@ -1123,6 +1154,15 @@ impl EfficientMicroBlock {
     }
     
     /// Calculate efficient microblock hash
+    ///
+    /// v23.1: Mirror of `MicroBlock::hash` — includes `timeout_round` in the
+    /// digest so that storage-layer hash identity matches between the full
+    /// `MicroBlock` and its `EfficientMicroBlock` representation. Without
+    /// this mirror, a block loaded as `MicroBlock` and a block loaded as
+    /// `EfficientMicroBlock` would produce different hashes for the same
+    /// on-disk bytes — breaking the storage-L4 anti-fork guard's identity
+    /// comparison across read paths. See `MicroBlock::hash` header for the
+    /// full consensus-binding rationale.
     pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha3_256::new();
         hasher.update(&self.height.to_le_bytes());
@@ -1130,7 +1170,9 @@ impl EfficientMicroBlock {
         hasher.update(&self.previous_hash);
         hasher.update(&self.merkle_root);
         hasher.update(self.producer.as_bytes());
-        
+        // v23.1: bind timeout_round to block identity (see MicroBlock::hash header).
+        hasher.update(&self.timeout_round.to_le_bytes());
+
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);

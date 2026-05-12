@@ -1822,15 +1822,78 @@ impl BlockPipeline {
             //
             // Scalability: O(1) cache lookup. Identical cost at 5 or 5000 validators.
             if !snap.is_syncing() && mb.height > 0 {
+                // ═══════════════════════════════════════════════════════════════
+                // v23.1: BFT-CERTIFIED ROUND AUTHENTICITY GATE
+                // ═══════════════════════════════════════════════════════════════
+                // A block claims to have been produced at rotation round
+                // `mb.timeout_round`. Verify the claim is plausible against
+                // this node's local view of supermajority-certified rounds
+                // for the containing macroblock.
+                //
+                // Allow a small forward drift (TIMEOUT_ROUND_DRIFT_WINDOW)
+                // to absorb honest gossip propagation latency — a producer
+                // can legitimately see 2f+1 votes for round R before this
+                // node's local DashMap has been updated by the same gossip
+                // stream. After the drift window, the claim is implausibly
+                // far ahead of any cert this node could ever have seen,
+                // so it must come from a Byzantine signer (authentic
+                // producer with valid Dilithium3 key but signing an
+                // unsupportable claim).
+                //
+                // Why this matters
+                // ────────────────
+                // After v23.1's timeout_round binding in hash+signature
+                // (block.rs:hash, sign_microblock_with_dilithium), the
+                // producer's claim is CRYPTOGRAPHICALLY ATTESTED — it
+                // cannot be mutated in transit. But a Byzantine producer
+                // can still SIGN an arbitrary round claim. Without this
+                // gate, downstream code (notably `record_finalized_round`
+                // called at apply) would advance `LAST_FINALIZED_ROUND_PER_MB`
+                // to the Byzantine value, locking out future rotation
+                // until 2f+1 honest evidence catches up to the inflated
+                // baseline. This is a DoS class — bounded here.
+                //
+                // The v15.0 `rotation_backfill_request` path below still
+                // fires as a soft signal: if the producer's claim is
+                // legitimate (cert exists somewhere), peer-side retrieval
+                // catches our local certified up to match.
+                //
+                // Drift window = 3: covers ~3 gossip RTTs at the
+                // 1000-validator committee cap (log_5 propagation depth
+                // ≈ 4 hops × ~50ms each = 200ms; cross-region asymmetry
+                // could extend this to ~1s; 3 rounds × 5s emit grace
+                // covers the worst-case propagation race).
+                //
+                // Scalability: one O(1) DashMap read per block ingest.
+                // Identical cost at 5 or 10 000 super-nodes.
+                // ═══════════════════════════════════════════════════════════════
+                const TIMEOUT_ROUND_DRIFT_WINDOW: u64 = 3;
+                let mb_idx = mb.height / 90;
+                let local_certified =
+                    crate::unified_p2p::highest_certified_round_for(mb_idx);
+                if mb.timeout_round > local_certified.saturating_add(TIMEOUT_ROUND_DRIFT_WINDOW) {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] timeout_round_implausible h={} mb={} claimed={} local_certified={} drift_window={} action=hard_reject from={}",
+                            mb.height, mb_idx, mb.timeout_round,
+                            local_certified, TIMEOUT_ROUND_DRIFT_WINDOW,
+                            decoded.from_peer,
+                        );
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
                 if let Some((expected, expected_round)) = crate::node::get_expected_producer(mb.height) {
                     if mb.producer != expected {
                         if mb.timeout_round != expected_round {
                             // Category A: Timeout divergence — different round claimed.
-                            // Without an ingest-side VRF re-derivation we cannot
-                            // declare this invalid; signature + hash chain + 2f+1
-                            // macroblock commit still enforce correctness, and
-                            // the BFT-driven rotation converges once all nodes
-                            // have gossiped their signed TimeoutVotes.
+                            // Bounded above by the v23.1 authenticity gate; this branch
+                            // covers honest gossip-window divergence (within drift) where
+                            // the claim is plausible but doesn't match our cached view.
+                            // Signature + hash chain + macroblock 2f+1 commit still enforce
+                            // correctness; the BFT-driven rotation converges once vote
+                            // gossip propagates.
                             if is_info() {
                                 println!("[INFO][PIPELINE] timeout_divergence h={} our_round={} block_round={} our_prod={} block_prod={}",
                                          mb.height, expected_round, mb.timeout_round, expected, mb.producer);
