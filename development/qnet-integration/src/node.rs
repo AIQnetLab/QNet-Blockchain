@@ -17841,39 +17841,188 @@ impl BlockchainNode {
                         //     O(votes_received), bounded by committee size.
                         // ═══════════════════════════════════════════════════════════════
                         const STALL_GRACE_SECS: u64 = 5;
+
+                        // ═══════════════════════════════════════════════════════════════
+                        // v23.2: HEARTBEAT-GATED TIMEOUT-VOTE EMISSION
+                        // ═══════════════════════════════════════════════════════════════
+                        // The pre-v23.2 emit-gate triggered SOLELY on `local_delay`
+                        // (wall-clock elapsed since last block). That created a
+                        // self-perpetuating rotation cascade at macroblock boundaries:
+                        //
+                        //   1. block h=H+1 not produced within STALL_GRACE_SECS
+                        //   2. local_delay > 5s on every node → all 5 emit
+                        //   3. 2f+1 votes propagate → HIGHEST_CERTIFIED_ROUND advances
+                        //   4. producer-loop re-derives expected leader at new round
+                        //   5. gossip lag means each node sees a slightly different cert
+                        //      → each node computes a DIFFERENT expected leader at the
+                        //      same wall clock instant
+                        //   6. no node thinks it is its own turn → no production
+                        //   7. 5 s later local_delay still grows → emit again → loop
+                        //
+                        // Observed live at h=2791 (mb=31 boundary) with HIGHEST_CERTIFIED_
+                        // ROUND[31] reaching 783 in ~2 hours of stall, while the
+                        // expected producer was actually broadcasting valid signed
+                        // heartbeats every second.
+                        //
+                        // Architecture
+                        // ────────────
+                        // Producer broadcasts a Dilithium3-signed `ProducerHeartbeat`
+                        // once per second while it is the elected leader. Peers
+                        // verify the signature against the on-chain PK registry and
+                        // record the local wall-clock receive time in
+                        // `REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS`. The helper
+                        // `last_remote_producer_heartbeat_age_ms(producer_id)`
+                        // returns the elapsed ms since the most recent signed
+                        // heartbeat from `producer_id`.
+                        //
+                        // The new pre-emit gate: read the expected producer for the
+                        // stalled height from the local cache (populated each
+                        // iteration of the producer loop). If that producer's most
+                        // recent heartbeat is FRESH (age ≤ HEARTBEAT_SILENT_MS),
+                        // skip the timeout-vote emission entirely — the leader is
+                        // cryptographically proven alive, just slow this slot.
+                        // Rotation should NOT churn merely because one block
+                        // landed a few seconds late.
+                        //
+                        // Edge cases:
+                        //   * Expected producer == this node (self):
+                        //     never vote against self. Other nodes' stall detectors
+                        //     will rotate us out if we are actually broken; voting
+                        //     against ourselves is semantically meaningless and
+                        //     wastes bandwidth.
+                        //   * No expected producer cached yet:
+                        //     defensive — proceed to emit. This only happens during
+                        //     bootstrap before the producer loop has populated its
+                        //     cache for the first time.
+                        //   * Heartbeat never observed for that producer:
+                        //     treat as silent → emit. Either the producer never came
+                        //     online or we have not yet received its first heartbeat.
+                        //
+                        // Safety
+                        // ──────
+                        //   * Heartbeat is Dilithium3-signed by the registered
+                        //     consensus key for `producer_id`. Receivers verify
+                        //     signature before storing the receive time, so a
+                        //     Byzantine peer cannot forge a fresh heartbeat for
+                        //     another identity.
+                        //   * A Byzantine producer can sign heartbeats while
+                        //     refusing to produce blocks. In that case the gate
+                        //     SUPPRESSES emission and the chain stalls — but only
+                        //     until the macroblock-boundary view-change fires
+                        //     (≤ 90 s), at which point 2f+1 macroblock-finalize
+                        //     timeout votes route around the Byzantine producer.
+                        //     This is an acceptable trade — bounded liveness loss
+                        //     vs unbounded runaway rotation under partial sync.
+                        //   * Heartbeat freshness is per-receiver wall clock,
+                        //     unforgeable by gossip lag. NTP drift between
+                        //     receivers affects timing within ±2s but does not
+                        //     create cross-node divergence in the gate decision
+                        //     (each receiver judges independently).
+                        //
+                        // Scalability
+                        // ───────────
+                        //   * Heartbeat broadcast: 1 msg/sec from current elected
+                        //     leader only — independent of validator count.
+                        //   * Receive path: one DashMap insert + Dilithium3
+                        //     signature verify (≈ 35 µs) per heartbeat per receiver.
+                        //   * Gate decision: one O(1) DashMap read.
+                        //   * Identical cost from 5 to 100 000 super-nodes.
+                        // ═══════════════════════════════════════════════════════════════
+                        const HEARTBEAT_SILENT_MS: u64 = 3_000;
+
                         if local_delay > STALL_GRACE_SECS && production_unlocked {
                             let mb_idx = next_height / 90;
                             let now_u64 = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            let should_emit = {
-                                let last = LAST_TIMEOUT_EMIT_PER_MB
-                                    .get(&mb_idx)
-                                    .map(|v| *v)
-                                    .unwrap_or(0);
-                                now_u64.saturating_sub(last) >= STALL_GRACE_SECS
-                            };
-                            if should_emit {
-                                LAST_TIMEOUT_EMIT_PER_MB.insert(mb_idx, now_u64);
+
+                            // v23.2: pre-emit gate — consult signed producer
+                            // heartbeat before voting for rotation. Decision tree:
+                            //
+                            //   expected_producer cached?
+                            //       └ self → skip (never vote against self)
+                            //       └ other → heartbeat age ≤ threshold?
+                            //               └ yes → skip (leader proven alive)
+                            //               └ no  → proceed to emit
+                            //       └ not cached → proceed to emit (defensive)
+                            let expected_producer =
+                                crate::node::get_expected_producer(next_height)
+                                    .map(|(producer, _round)| producer);
+                            let suppression_reason: Option<&'static str> =
+                                match expected_producer.as_deref() {
+                                    Some(p) if p == node_id.as_str() => {
+                                        Some("self_expected")
+                                    }
+                                    Some(p) => {
+                                        match crate::unified_p2p::last_remote_producer_heartbeat_age_ms(p) {
+                                            Some(age_ms) if age_ms <= HEARTBEAT_SILENT_MS => {
+                                                Some("heartbeat_fresh")
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                    None => None,
+                                };
+
+                            if let Some(reason) = suppression_reason {
+                                // Suppress emission. Log at INFO with structured
+                                // fields so operator dashboards can correlate
+                                // suppression rate vs production rate.
                                 if is_info() {
+                                    let hb_age = expected_producer
+                                        .as_deref()
+                                        .and_then(crate::unified_p2p::last_remote_producer_heartbeat_age_ms)
+                                        .map(|m| m as i64)
+                                        .unwrap_or(-1);
                                     println!(
-                                        "[INFO][TIMEOUT] emit_microblock_vote h={} mb={} cert_round={} delay={}s reason=primary_silent",
-                                        next_height, mb_idx, current_rotation_round, local_delay
+                                        "[INFO][TIMEOUT] emit_suppressed h={} mb={} expected={} hb_age_ms={} delay={}s reason={}",
+                                        next_height, mb_idx,
+                                        expected_producer.as_deref().unwrap_or("-"),
+                                        hb_age, local_delay, reason
                                     );
                                 }
-                                // Re-use the macroblock view-change emission helper:
-                                // it signs `TIMEOUT:{mb_idx}:{cert+1}:{hash}` and
-                                // broadcasts via `broadcast_timeout_vote`, which is
-                                // the same path the macroblock-boundary view-change
-                                // uses. Receivers aggregate identically; rotation
-                                // advances on 2f+1 supermajority.
-                                Self::emit_macroblock_view_change_vote(
-                                    mb_idx.saturating_mul(90),
-                                    &node_id,
-                                    &unified_p2p,
-                                    Some(&storage),
-                                ).await;
+                            } else {
+                                // Heartbeat stale OR no cache: proceed with the
+                                // existing per-mb throttle to bound network spam
+                                // (one signed broadcast per STALL_GRACE_SECS per
+                                // node per macroblock).
+                                let should_emit = {
+                                    let last = LAST_TIMEOUT_EMIT_PER_MB
+                                        .get(&mb_idx)
+                                        .map(|v| *v)
+                                        .unwrap_or(0);
+                                    now_u64.saturating_sub(last) >= STALL_GRACE_SECS
+                                };
+                                if should_emit {
+                                    LAST_TIMEOUT_EMIT_PER_MB.insert(mb_idx, now_u64);
+                                    if is_info() {
+                                        let hb_age = expected_producer
+                                            .as_deref()
+                                            .and_then(crate::unified_p2p::last_remote_producer_heartbeat_age_ms)
+                                            .map(|m| m as i64)
+                                            .unwrap_or(-1);
+                                        println!(
+                                            "[INFO][TIMEOUT] emit_microblock_vote h={} mb={} cert_round={} delay={}s expected={} hb_age_ms={} reason=primary_silent",
+                                            next_height, mb_idx, current_rotation_round,
+                                            local_delay,
+                                            expected_producer.as_deref().unwrap_or("-"),
+                                            hb_age
+                                        );
+                                    }
+                                    // Re-use the macroblock view-change emission helper:
+                                    // it signs `TIMEOUT:{mb_idx}:{cert+1}:{hash}` and
+                                    // broadcasts via `broadcast_timeout_vote`, which is
+                                    // the same path the macroblock-boundary view-change
+                                    // uses. Receivers aggregate identically; rotation
+                                    // advances on 2f+1 supermajority.
+                                    Self::emit_macroblock_view_change_vote(
+                                        mb_idx.saturating_mul(90),
+                                        &node_id,
+                                        &unified_p2p,
+                                        Some(&storage),
+                                    ).await;
+                                }
                             }
                         }
 
