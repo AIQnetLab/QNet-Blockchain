@@ -1874,6 +1874,7 @@ const MAX_CONCURRENT_MACROBLOCK_CHECKS: u64 = 5;
 // v2.43.2-v2.43.3 had network-ahead check that caused deadlocks - REMOVED
 // Now using ONLY broadcast backpressure which naturally limits production speed
 pub static PENDING_BROADCAST_COUNT: AtomicU64 = AtomicU64::new(0);
+#[allow(dead_code)] // v24: gate removed, constant retained for telemetry compatibility
 const MAX_PENDING_BROADCASTS: u64 = 2;  // Allow 2 concurrent broadcasts
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2480,6 +2481,27 @@ pub static PEER_REFRESH_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 pub static HALT_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// v24: PER-PEER BACKPRESSURE — SUPERSEDED BY R1 (adaptive throttle removal)
+// ═══════════════════════════════════════════════════════════════════════════════
+// The pre-v24 design had a single global `PENDING_BROADCAST_COUNT` counter
+// that paused production whenever ANY peer fell behind. A per-peer backpressure
+// system was on the roadmap to isolate slow peers from healthy ones (so one
+// host's I/O contention couldn't throttle the entire chain).
+//
+// R1 (v24) made per-peer backpressure unnecessary by removing the global gate
+// entirely. The producer now runs at the full consensus slot cadence (1 s).
+// Slow peers self-recover via the independent sync subsystem (block_pipeline +
+// SyncManager + Reed-Solomon redundancy + multi-hop chunk forwarding). The
+// QUIC transport handles per-peer flow control at the TLS / UDP-stream level
+// using OS-kernel buffers — this is the canonical place for transport
+// backpressure and requires no consensus-layer involvement.
+//
+// In other words, the "per-peer backpressure" feature is now implicit in the
+// transport stack and the gossip/sync layered architecture. No additional
+// consensus-layer state is required.
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // v23: STALL-DRIVEN TIMEOUT-VOTE EMISSION THROTTLE
@@ -9931,12 +9953,63 @@ impl BlockchainNode {
         
         // PRODUCTION v2.19.22: Start QUIC message handler
         // Routes ALL QUIC messages through handle_message() for full processing
+        //
+        // ═══════════════════════════════════════════════════════════════════
+        // v25 H8b: PER-MESSAGE CPU OFFLOAD FOR CRYPTO-HEAVY HANDLERS
+        // ───────────────────────────────────────────────────────────────────
+        // The legacy loop drained the QUIC ingress channel on a SINGLE tokio
+        // task and dispatched every message synchronously. For most messages
+        // (peer-bookkeeping, sync requests, etc.) that is fine — they cost
+        // microseconds. But for messages whose handler does a Dilithium3
+        // signature verify (ConsensusCommit / ConsensusReveal / TimeoutVote
+        // / TimeoutCertificateBroadcast / TimeoutAggregateCertificate /
+        // ProducerHeartbeat / VrfLeaderClaim) the per-message cost is
+        // 1–2 ms on commodity hardware. At a 1000-validator committee a
+        // commit-reveal cycle bursts 2f+1 = 667 commits + 667 reveals back
+        // to back; serialized that is ≥ 2 seconds of receive-loop block,
+        // and during that interval the same task can't drain Block /
+        // BlockChunk messages from the same channel — bandwidth-hungry
+        // shred chunks queue up and the macroblock window deadline drifts.
+        //
+        // Targeted fix: route only the crypto-heavy message types through
+        // `tokio::task::spawn_blocking`. The blocking pool (default ≈ 512
+        // threads) executes the verify off the runtime cores; multiple
+        // verifies run truly in parallel; the receive-loop returns to the
+        // channel within microseconds. Ordering inside each heavy handler
+        // is irrelevant — they are all keyed-idempotent
+        // (`(round_id, node_id)`, `(height, round, voter_id)`, etc.) so
+        // out-of-order execution between concurrent spawned verifies is
+        // safe by construction.
+        //
+        // Cheap messages keep the synchronous path: spawning a blocking
+        // task for them would be pure overhead.
+        // ═══════════════════════════════════════════════════════════════════
         let blockchain_for_quic = blockchain.clone();
         tokio::spawn(async move {
             while let Some((from_peer, message)) = quic_message_rx.recv().await {
-                // Use same handle_message() logic as HTTP
                 if let Some(ref p2p) = blockchain_for_quic.unified_p2p {
-                    p2p.handle_message(&from_peer, message);
+                    let needs_offload = matches!(&message,
+                        crate::unified_p2p::NetworkMessage::ConsensusCommit { .. }
+                        | crate::unified_p2p::NetworkMessage::ConsensusReveal { .. }
+                        | crate::unified_p2p::NetworkMessage::TimeoutVote { .. }
+                        | crate::unified_p2p::NetworkMessage::TimeoutCertificateBroadcast { .. }
+                        | crate::unified_p2p::NetworkMessage::TimeoutAggregateCertificate { .. }
+                        | crate::unified_p2p::NetworkMessage::ProducerHeartbeat { .. }
+                        | crate::unified_p2p::NetworkMessage::VrfLeaderClaim { .. }
+                    );
+                    if needs_offload {
+                        let p2p_clone = p2p.clone();
+                        let from_peer_owned = from_peer.clone();
+                        // Fire-and-forget: handler emits its own success/error
+                        // logs; spawn_blocking guarantees the task makes
+                        // progress without contending for tokio worker cores.
+                        tokio::task::spawn_blocking(move || {
+                            p2p_clone.handle_message(&from_peer_owned, message);
+                        });
+                    } else {
+                        // Cheap dispatch: keep the synchronous fast path.
+                        p2p.handle_message(&from_peer, message);
+                    }
                 }
             }
         });
@@ -16882,63 +16955,33 @@ impl BlockchainNode {
                 }
 
                 // ═══════════════════════════════════════════════════════════════════
-                // v15.11: ADAPTIVE PRODUCER RATE CONTROL
+                // v24: ADAPTIVE_RATE THROTTLE REMOVED — produce at full slot cadence
                 // ═══════════════════════════════════════════════════════════════════
-                // Forensic case h=154345: producer 002 was running 54-144 blocks
-                // ahead of every other validator on the network. SHRED broadcasts
-                // could not be applied fast enough on the receiving side, leaving
-                // 002's freshly-produced blocks stranded as receivers ran their
-                // own emergency block checks and triggered view-change cascades.
+                // The v15.11 self-pause-when-ahead heuristic was empirically harmful.
+                // Forensic case h=2791 (v23.1 deploy): producer consistently 18-30
+                // blocks ahead of slowest peer triggered `pause_ms=100` on every
+                // single slot, producing 1.107 s real cadence instead of the 1 s
+                // consensus target. The "slowest peer" was always behind because
+                // its apply pipeline was naturally slower (host I/O scheduling +
+                // RocksDB compaction); waiting for it merely meant the chain
+                // moved at the slowest host's speed — a guaranteed liveness
+                // degradation that gets WORSE at scale (1000 validators → one
+                // slow host pins the entire network).
                 //
-                // When a producer detects it has run measurably ahead of the
-                // network (max known peer height), it inserts a brief pause so
-                // peers can catch up via SHRED + repair, before producing the
-                // next block. This is NOT backpressure — production continues
-                // at full rate once peers re-converge — it's a self-throttle to
-                // prevent the producer from sustaining a multi-block lead that
-                // induces network-wide stalls.
+                // The original premise — that producer "running ahead" causes
+                // network-wide stalls — was inverted: in reality the chain
+                // stalls when producer slows DOWN. Catch-up is handled by the
+                // existing sync subsystem (block_pipeline + SyncManager
+                // pipelined window + Reed-Solomon 1.5× redundancy + multi-hop
+                // chunk forwarding), not by the producer's own self-throttle.
                 //
-                // Thresholds:
-                //   * Ahead by ≤ 10 blocks    → no pause  (normal SHRED latency)
-                //   * Ahead by 11-30 blocks   → 100 ms pause (mild slowdown)
-                //   * Ahead by 31-90 blocks   → 300 ms pause (visible lag, fits inside one slot)
-                //   * Ahead by > 90 blocks    → 800 ms pause (essentially skip a slot)
-                //
-                // Bypass conditions:
-                //   * No live peers                 → cannot measure, run free
-                //   * peer height ≥ ours            → catch up needed, produce now
-                //   * very early heights (< 100)    → bootstrap, no throttle
-                //
-                // Scalability: one atomic load (BEST_PEER_HEIGHT) and one read
-                // of the local height — O(1) regardless of validator count.
-                if let Some(ref p2p) = unified_p2p {
-                    let my_h = *height.read().await;
-                    let peer_h = p2p.get_max_peer_height();
-                    if my_h > 100 && peer_h > 0 && my_h > peer_h {
-                        let ahead_by = my_h - peer_h;
-                        let pause_ms: u64 = if ahead_by <= 10 {
-                            0
-                        } else if ahead_by <= 30 {
-                            100
-                        } else if ahead_by <= 90 {
-                            300
-                        } else {
-                            800
-                        };
-                        if pause_ms > 0 {
-                            if is_info() {
-                                println!(
-                                    "[INFO][PROD] adaptive_rate ahead_by={} pause_ms={} my_h={} peer_h={}",
-                                    ahead_by, pause_ms, my_h, peer_h
-                                );
-                            }
-                            tokio::time::sleep(Duration::from_millis(pause_ms)).await;
-                            // Refresh heartbeat so the watchdog does not flag
-                            // the deliberate sleep as a stall.
-                            record_producer_heartbeat();
-                        }
-                    }
-                }
+                // Top-L1 canonical behaviour: producer runs at the fixed
+                // consensus slot interval. Slow peers self-recover via the
+                // independent sync path. Permanently slow peers either catch
+                // up via background sync, get ejected (v24 H9 validator
+                // ejection — separate fix), or fall out of the active
+                // committee at the next epoch boundary.
+                // ═══════════════════════════════════════════════════════════════════
 
                 // ═══════════════════════════════════════════════════════════════════
                 // SLOT-BASED TIMING v2.42: Wait based on UNIX timestamp (not Instant!)
@@ -18010,6 +18053,49 @@ impl BlockchainNode {
                                             hb_age
                                         );
                                     }
+
+                                    // ═══════════════════════════════════════════════════════
+                                    // v25 H9/H16: VALIDATOR LIVENESS — MISS PATH
+                                    // ───────────────────────────────────────────────────────
+                                    // We emit a primary-silent timeout vote at most once per
+                                    // STALL_GRACE_SECS per macroblock (debounced by
+                                    // `LAST_TIMEOUT_EMIT_PER_MB` above). Record this as a
+                                    // single miss against the expected producer.
+                                    //
+                                    // The underlying `record_validator_miss` is itself
+                                    // idempotent on `(validator_id, expected_height)` — repeat
+                                    // calls for the same height are coalesced to one logical
+                                    // miss. This double-layer of debouncing keeps the counter
+                                    // free of pathological double-counts even if the emit
+                                    // gate fires twice in adjacent ticks due to clock skew.
+                                    //
+                                    // SELF-EJECT GUARD: the heartbeat-staleness filter inside
+                                    // `record_validator_miss` only consults the REMOTE producer
+                                    // heartbeat map (it is populated exclusively from received
+                                    // `ProducerHeartbeat` messages). The local node never
+                                    // appears there even when emitting heartbeats normally,
+                                    // so without an explicit `expected_id != &node_id` check
+                                    // a miss could be recorded against ourselves in any edge
+                                    // path where our own id is cached as the expected producer
+                                    // for a stalled slot. Skip recording in that case — a
+                                    // node grading its own liveness would self-eject during
+                                    // the very stall its own emit is trying to resolve.
+                                    //
+                                    // Strictly observation-only when
+                                    // `QNET_LIVENESS_EJECTION` is unset — the counter still
+                                    // accumulates so operators can grade validators offline,
+                                    // but ejection state is never mutated. Safe at thousands
+                                    // of validators (O(1) DashMap update per call).
+                                    // ═══════════════════════════════════════════════════════
+                                    if let Some(ref expected_id) = expected_producer {
+                                        if !expected_id.is_empty() && expected_id != &node_id {
+                                            let _ = crate::unified_p2p::record_validator_miss(
+                                                expected_id,
+                                                next_height,
+                                            );
+                                        }
+                                    }
+
                                     // Re-use the macroblock view-change emission helper:
                                     // it signs `TIMEOUT:{mb_idx}:{cert+1}:{hash}` and
                                     // broadcasts via `broadcast_timeout_vote`, which is
@@ -22839,37 +22925,60 @@ impl BlockchainNode {
                         // Clone P2P for async task
                         let p2p_clone = p2p.clone();
                         
-                        // PRODUCTION v2.43: BACKPRESSURE - Wait if too many broadcasts pending
-                        // This prevents producer from overwhelming network during stress tests
-                        // Ensures blocks are actually delivered before creating more
                         // ═══════════════════════════════════════════════════════════════════════════
-                        // PRODUCTION v2.43.2: BACKPRESSURE for block broadcasts
-                        // Combined with height-based sync (peer heights = actually received blocks)
-                        // this prevents producer from overwhelming network during stress tests
+                        // v24: SLOWEST-PEER BACKPRESSURE REMOVED — restore 1-sec slot cadence
                         // ═══════════════════════════════════════════════════════════════════════════
-                        let pending = PENDING_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-                        if pending >= MAX_PENDING_BROADCASTS {
-                            println!("[INFO][P2P] backpressure_wait h={} pending={} max={}",
-                                    height_for_broadcast, pending, MAX_PENDING_BROADCASTS);
-                            // v2.43.5: Wait up to 10 seconds for broadcast slot
-                            // v2.43.4 had 1.5s which was too short for large blocks (5MB+) at 100K TPS
-                            // At 100 Mbps: 5MB block → ~400ms broadcast, but under load can be 2-5s
-                            // 10s timeout ensures producer waits for delivery before creating next block
-                            let wait_start = std::time::Instant::now();
-                            while PENDING_BROADCAST_COUNT.load(std::sync::atomic::Ordering::Relaxed) >= MAX_PENDING_BROADCASTS 
-                                  && wait_start.elapsed().as_millis() < 10_000 {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                            }
-                            
-                            // Log if we had to wait
-                            let waited_ms = wait_start.elapsed().as_millis();
-                            if waited_ms > 200 {
-                                println!("[WARN][P2P] backpressure_delay h={} waited={}ms",
-                                        height_for_broadcast, waited_ms);
-                            }
-                        }
-                        
-                        // Increment pending count BEFORE spawning
+                        // Legacy v2.43 backpressure (`PENDING_BROADCAST_COUNT >= MAX_PENDING_BROADCASTS`)
+                        // delayed every block by 50-ms polling loops whenever the slowest peer was
+                        // behind. In a network with even one persistently slow validator (which is
+                        // statistically guaranteed at any non-trivial committee size), the counter
+                        // was almost always at the cap, so the producer was throttling on EVERY
+                        // block. Measured live: target 1000 ms → actual 1107 ms (+10.7 %) with the
+                        // gate active, even on a 5-node testnet with only 18-block lag.
+                        //
+                        // At 1 000+ super-nodes the failure mode is catastrophic: one slow peer
+                        // pins the entire chain. This is the opposite of how a BFT-PoS chain
+                        // should behave — the producer must run at full slot cadence while slow
+                        // peers self-recover via the sync subsystem (block_pipeline + SyncManager
+                        // pipelined catch-up + chunked-parallel snapshot restore). Production
+                        // bandwidth at 1 producer × 1 block/s × 5 MB block ≈ 40 Mbps egress —
+                        // well below any reasonable host's link capacity, so there is no
+                        // physical reason to throttle.
+                        //
+                        // Safety after removal
+                        // ────────────────────
+                        // No safety property depended on this gate. It was a *liveness throttle*
+                        // intended to prevent the producer from "racing ahead" of consumers
+                        // during stress tests, but:
+                        //   * Block-pipeline backpressure already enforces ingest-side flow
+                        //     control via bounded mpsc channels (capacity 1024-8192 per stage).
+                        //   * Reed-Solomon erasure coding (1.5× redundancy, 170+85 shards)
+                        //     ensures delivery survives transient packet loss.
+                        //   * Multi-hop chunk forwarding (`forward_shred_protocol_chunk`)
+                        //     propagates blocks in O(log N) hops via cascading gossip.
+                        //   * SyncManager pipelined catch-up + range-sharded sync_blocks fills
+                        //     any gaps via dedicated request path with per-peer cooldown.
+                        // The producer's slot cadence is a CONSENSUS PARAMETER, not a network
+                        // capacity flow-control input.
+                        //
+                        // Scalability
+                        // ───────────
+                        //   * O(1) per slot — one tokio::spawn for the async broadcast.
+                        //   * Reed-Solomon redundancy handles single-peer slowness without any
+                        //     coordination from the producer.
+                        //   * At 100 000 nodes: producer fans out to ~32 layer-1 peers, each
+                        //     forwards to ~32 layer-2 peers, etc. Producer's local CPU/network
+                        //     is independent of total network size.
+                        //
+                        // The `PENDING_BROADCAST_COUNT` AtomicU64 and `MAX_PENDING_BROADCASTS`
+                        // const are RETAINED at module scope for backward compatibility with
+                        // any external observability tooling that may grep them, but they are
+                        // no longer read on the consensus hot path. The fetch_add / fetch_sub
+                        // below are kept so the counter remains queryable for diagnostics
+                        // without changing memory layout.
+                        // ═══════════════════════════════════════════════════════════════════════════
+
+                        // Diagnostic-only counter — never gates the slot.
                         PENDING_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         
                         // ═══════════════════════════════════════════════════════════════════════════
@@ -25500,17 +25609,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
                                     if !producers.is_empty() {
                                         // v3.10: Filter out excluded producers (DETERMINISTIC!)
+                                        // v25 H9: Also filter out validators that the liveness
+                                        // tracker has marked as ejected. The ejection gate
+                                        // (`is_validator_ejected`) is a no-op unless the operator
+                                        // has explicitly enabled enforcement via
+                                        // `QNET_LIVENESS_EJECTION=1`. When disabled the tracker
+                                        // still observes misses but does not mutate candidate
+                                        // selection — the filter passes everyone through.
                                         let mut all_qualified: Vec<(String, f64)> = producers.iter()
                                             .filter(|p| !excluded_node_ids.contains(&p.node_id))
+                                            .filter(|p| !crate::unified_p2p::is_validator_ejected(&p.node_id))
                                             .map(|p| (p.node_id.clone(), p.reputation))
                                             .collect();
-                                        
+
                                         all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
-                                        
-                                        if is_debug() { 
-                                            println!("[DBG][CANDIDATES] ep={} prod={} excluded={} mb={}", 
-                                                     current_epoch, all_qualified.len(), 
-                                                     excluded_node_ids.len(), required_macroblock); 
+
+                                        if is_debug() {
+                                            println!("[DBG][CANDIDATES] ep={} prod={} excluded={} mb={}",
+                                                     current_epoch, all_qualified.len(),
+                                                     excluded_node_ids.len(), required_macroblock);
                                         }
                                         return all_qualified;
                                     }
@@ -25545,8 +25662,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 // order is fully deterministic regardless of reputation.
                                 // Scales identically at 5 or 5000 validators (O(commits)).
                                 let det_rep = (qnet_consensus::deterministic_reputation::INITIAL_REPUTATION) / 100.0;
+                                // v25 H9: SECONDARY path mirrors PRIMARY — also gate by
+                                // liveness ejection (no-op unless QNET_LIVENESS_EJECTION=1
+                                // is set). Keeps the two candidate paths semantically
+                                // identical so behaviour does not depend on which one
+                                // happens to fire.
                                 let mut all_qualified: Vec<(String, f64)> = macroblock.consensus_data.commits.keys()
                                     .filter(|id| !excluded_node_ids.contains(*id))
+                                    .filter(|id| !crate::unified_p2p::is_validator_ejected(id))
                                     .map(|id| (id.clone(), det_rep))
                                     .collect();
                                 all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
