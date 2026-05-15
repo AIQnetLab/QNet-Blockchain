@@ -40,12 +40,12 @@ const MAX_ATTESTATIONS_SIZE: usize = 100_000;
 #[allow(dead_code)]
 const MAX_HEARTBEATS_SIZE: usize = 100_000;
 
-/// Max active Full/Super nodes tracked
+/// Max active Super nodes tracked
 /// 10K nodes × ~150 bytes = ~1.5MB RAM
 #[allow(dead_code)]
 const MAX_ACTIVE_NODES_SIZE: usize = 10_000;
 
-/// Max connected peers (Full/Super nodes) to prevent phantom peer accumulation
+/// Max connected peers (Super nodes) to prevent phantom peer accumulation
 /// SCALABILITY: 1000 peers × ~200 bytes = ~200KB RAM
 /// LRU eviction when limit reached
 const MAX_CONNECTED_PEERS: usize = 1000;
@@ -2022,19 +2022,31 @@ const PEER_COOLDOWN_MAX_SECS: u64 = 30;    // Max cooldown: 30 seconds
 #[allow(dead_code)]
 const PEER_COOLDOWN_RESET_SECS: u64 = 60;  // Reset retry count after 60s of success
 
-/// SYNC: Blacklist reason categories (Soft vs Hard)
+/// SYNC: Blacklist reason categories (Soft vs Hard vs Identity-Hard)
 /// Soft: Temporary network issues (timeouts, latency) - affects network_score only
-/// Hard: Byzantine attacks (invalid blocks, malicious behavior) - affects consensus_score
+/// Hard: Byzantine attacks (invalid blocks, malicious behavior) - permanent until reputation recovered
+/// Identity-Hard: Cryptographic impersonation (PK mismatch under bound identity) -
+///   permanent for the LIFETIME of the attacker keypair; not subject to
+///   reputation recovery because the underlying evidence is mathematical
+///   (registered Dilithium3 PK does not match presented signature key).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BlacklistReason {
     // SOFT BLACKLIST (Network performance issues - temporary)
     SyncTimeout,        // Failed to respond to sync request (30s soft ban)
     ConnectionFailure,  // Connection refused/reset (60s soft ban)
     SlowResponse,       // Response took too long (15s soft ban)
-    
+
     // HARD BLACKLIST (Byzantine attacks - permanent until reputation recovered)
     InvalidBlocks,      // Sent invalid/corrupted blocks (permanent until consensus_score >= 70%)
     MaliciousBehavior,  // Detected Byzantine attack (permanent until consensus_score >= 70%)
+
+    // IDENTITY-HARD BLACKLIST (Cryptographic impersonation - permanent by PK)
+    // Tracked at the PK-fingerprint layer in `qnet_consensus::consensus_crypto`
+    // (canonical source of truth). The peer_addr entry here is a secondary
+    // hint used by sync-peer selection — the authoritative gate runs at the
+    // QUIC handshake on the presented Dilithium3 PK, so even an attacker
+    // who rotates source IPs is still rejected.
+    PkImpersonation,    // Presented PK ≠ registered PK for a bound identity (permanent)
 }
 
 /// SYNC: Blacklist entry with expiration and reason tracking
@@ -2098,7 +2110,11 @@ pub struct PeerMetrics {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// v3.18: Full node type REMOVED - only Light and Super remain
 pub enum NodeType {
-    Light,   // Mobile nodes - receives macroblock headers
+    Light,   // Mobile-only pure API client (phone/tablet, Android/iOS, F-Droid).
+             // Stores ZERO blockchain data on-device (max_storage_bytes=0).
+             // Queries balance/TX history via REST API on Super nodes.
+             // Responds to Genesis-driven pings → earns PoP rewards.
+             // Disqualified from consensus (`is_consensus_qualified() = false`).
     Super,   // Server nodes - validates and produces blocks
 }
 
@@ -2427,7 +2443,7 @@ pub struct SimplifiedP2P {
     pub certificate_manager: Arc<RwLock<CertificateManager>>,
     
     /// PRODUCTION: Light Node registry synchronized via gossip
-    /// All Full/Super nodes maintain identical registry for deterministic ping assignment
+    /// All Super nodes maintain identical registry for deterministic ping assignment
     light_node_registry: Arc<RwLock<HashMap<String, LightNodeRegistrationData>>>,
     
     /// PRODUCTION: Heartbeat history for reward eligibility calculation
@@ -2452,7 +2468,7 @@ pub struct SimplifiedP2P {
     /// Dedupe ensures only one attestation per Light node per slot
     light_node_attestations: Arc<RwLock<HashMap<String, LightNodeAttestation>>>,
     
-    /// PRODUCTION: Active Full/Super nodes for pinger selection
+    /// PRODUCTION: Active Super nodes for pinger selection
     /// Updated via gossip, used for deterministic pinger assignment
     /// Key: node_id, Value: ActiveNodeInfo
     /// PRODUCTION v2.51: Lock-free DashMap for 10x faster producer selection
@@ -4883,7 +4899,7 @@ impl SimplifiedP2P {
                         if node_id.starts_with("genesis_node_") {
                             node_id.clone()
                         } else {
-                            // Full/Super: Privacy display name
+                            // Super: Privacy display name (v3.18: "Full" tier removed)
                             let display_hash = blake3::hash(format!("P2P_DISPLAY_{}_{}", 
                                                                     node_id, 
                                                                     format!("{:?}", node_type)).as_bytes());
@@ -5186,7 +5202,9 @@ impl SimplifiedP2P {
                 // Genesis Super nodes: 7s (was 1s) - 8.5 requests/min (safe margin)
                 // Regular nodes: Keep original timing (already safe)
                 let sync_interval = match &node_type {
-                    NodeType::Light => 30,  // Light nodes: 30s (mobile, stores only 1000 blocks)
+                    NodeType::Light => 30,  // Light nodes: 30s — mobile-only, no local chain
+                                            // storage (pure API client). Long interval bounds
+                                            // mobile battery / data-plan cost on the device.
                     NodeType::Super => {
                         if is_genesis_node { 7 } else { 2 }  // Super nodes: 7s genesis, 2s normal
                     }
@@ -6214,13 +6232,24 @@ impl SimplifiedP2P {
             if let Some(ref quic_transport) = self.quic_transport {
                 let transport = quic_transport.read().await;
                 
-                // Filter peers by node type
+                // Filter peers by node type.
+                //
+                // Light nodes are PURE API clients — they do not store
+                // blockchain data and never appear in `connected_peers`
+                // (they sit in the separate `light_node_registry` and
+                // interact only via direct ping/attestation). The two
+                // `NodeType::Light` arms below are therefore defensive
+                // no-ops under the current architecture; kept so the
+                // match stays total and future regressions (e.g., a
+                // stale Light entry leaking into connected_peers) cannot
+                // result in unintended block broadcasts to a device that
+                // has no storage for them.
                 let filtered_peers: Vec<PeerInfo> = validated_peers.iter()
                     .filter(|peer| {
                         match (&self.node_type, &peer.node_type) {
-                            (NodeType::Light, _) => false,  // Light nodes don't broadcast
-                            (_, NodeType::Light) => height % 90 == 0,  // Send only macroblocks to light
-                            _ => true,  // Full/Super nodes get everything
+                            (NodeType::Light, _) => false,  // never reached: Light has no P2P broadcast path
+                            (_, NodeType::Light) => false,  // never reached: Light not in connected_peers
+                            _ => true,                       // Super → Super block propagation
                         }
                     })
                     .cloned()
@@ -9848,7 +9877,7 @@ impl SimplifiedP2P {
             return;
         }
         
-        // Broadcast to all Full and Super nodes
+        // Broadcast to all Super nodes
         let target_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
             .filter(|e| matches!(e.value().node_type, NodeType::Super))
             .map(|e| e.value().clone())
@@ -10554,7 +10583,7 @@ impl SimplifiedP2P {
     /// PRODUCTION: Get validated active peers for consensus participation (NODE TYPE AWARE)
     pub fn get_validated_active_peers(&self) -> Vec<PeerInfo> {
         // CRITICAL FIX: Light nodes DO NOT participate in consensus - return empty list
-        // Only Full and Super nodes need validated peers for consensus/emergency producer selection
+        // Only Super nodes need validated peers for consensus/emergency producer selection
         match self.node_type {
             NodeType::Light => {
                 if crate::node::is_info() {
@@ -10562,7 +10591,7 @@ impl SimplifiedP2P {
                 }
                 return Vec::new(); // Light nodes don't participate in consensus
             },
-            _ => {} // Continue with Full/Super node logic
+            _ => {} // Continue with Super node logic
         }
         
         // CRITICAL FIX: For Genesis bootstrap, return ALL configured peers WITHOUT TCP checks
@@ -12411,7 +12440,7 @@ impl Default for PushType {
 }
 
 /// PRODUCTION: Light Node registration data for gossip sync
-/// Compact struct for efficient batch transfers between Full/Super nodes
+/// Compact struct for efficient batch transfers between Super nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightNodeRegistrationData {
     pub node_id: String,              // Privacy-preserving pseudonym
@@ -12467,7 +12496,7 @@ pub struct HeartbeatRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightNodeAttestation {
     pub light_node_id: String,        // Light node that was pinged
-    pub pinger_id: String,            // Full/Super node that pinged
+    pub pinger_id: String,            // Super node that pinged
     pub slot: u64,                    // Time slot (4h window / 240 = 1 min slots)
     pub timestamp: u64,               // When attestation was created
     pub light_node_signature: String, // HYBRID compact_bin (Ed25519+Dilithium, ~2.6KB)
@@ -12985,7 +13014,7 @@ pub enum NetworkMessage {
     },
     
     /// PRODUCTION: Light Node registration gossip for decentralized registry sync
-    /// All Full/Super nodes maintain synchronized Light Node registry via gossip
+    /// All Super nodes maintain synchronized Light Node registry via gossip
     /// HYBRID SIGNATURE v2.90: Ed25519 + Dilithium3 for double authentication
     LightNodeRegistration {
         node_id: String,              // Privacy-preserving pseudonym (hash-based)
@@ -13017,7 +13046,7 @@ pub enum NetworkMessage {
         ping_delegation_cert: String, // Dilithium cert authorizing ping_pubkey
     },
     
-    /// PRODUCTION: Full/Super node heartbeat for self-attestation
+    /// PRODUCTION: Super node heartbeat for self-attestation
     /// Nodes prove liveness by broadcasting signed heartbeats at deterministic times
     NodeHeartbeat {
         node_id: String,              // Node identifier
@@ -13046,7 +13075,7 @@ pub enum NetworkMessage {
     /// Gossiped after pinger receives signed response from Light node
     LightNodeAttestation {
         light_node_id: String,        // Light node that was pinged
-        pinger_id: String,            // Full/Super node that pinged
+        pinger_id: String,            // Super node that pinged
         slot: u64,                    // Time slot for deduplication
         timestamp: u64,               // When attestation was created
         light_node_signature: String, // Light node's signature on challenge
@@ -13056,7 +13085,7 @@ pub enum NetworkMessage {
         block_height: u64,            // v2.59: Block height for epoch-based filtering
     },
     
-    /// PRODUCTION: Active Full/Super node announcement for pinger selection sync
+    /// PRODUCTION: Active Super node announcement for pinger selection sync
     /// Gossiped when node starts and periodically (every 10 min) to maintain active list
     ActiveNodeAnnouncement {
         node_id: String,              // Node identifier
@@ -13073,7 +13102,7 @@ pub enum NetworkMessage {
         requester_id: String,
     },
     
-    /// PRODUCTION: Response with active Full/Super nodes list
+    /// PRODUCTION: Response with active Super nodes list
     ActiveNodesResponse {
         sender_id: String,
         active_nodes: Vec<ActiveNodeInfo>,  // List of active nodes
@@ -15847,7 +15876,7 @@ impl SimplifiedP2P {
                     return;
                 }
                 
-                // VERIFY: Pinger must be in active Full/Super nodes list
+                // VERIFY: Pinger must be in active Super nodes list
                 // v2.51: Lock-free check
                 if !self.active_full_super_nodes.contains_key(&pinger_id) && !pinger_id.starts_with("genesis_node_") {
                     if crate::node::is_info() {
@@ -15929,7 +15958,7 @@ impl SimplifiedP2P {
                 self.gossip_to_random_peers(forward_msg, 3);
             }
             
-            // PRODUCTION: Active Full/Super node announcement for pinger selection
+            // PRODUCTION: Active Super node announcement for pinger selection
             NetworkMessage::ActiveNodeAnnouncement {
                 node_id, node_type, shard_id, reputation, timestamp, signature, gossip_hop
             } => {
@@ -17643,7 +17672,7 @@ impl SimplifiedP2P {
     }
     
     /// PASSIVE RECOVERY: +1% for nodes in recovery zone (10-69%)
-    /// - Only applies to Full/Super nodes with reputation 10 <= rep < 70
+    /// - Only applies to Super nodes with reputation 10 <= rep < 70
     /// - Caps at 70 (consensus threshold) - nodes must earn higher through consensus participation
     /// - Light nodes: EXCLUDED (fixed at 70)
     /// - Banned nodes (<10): EXCLUDED (no passive recovery)
@@ -17672,7 +17701,7 @@ impl SimplifiedP2P {
         self.peer_id_to_addr.get(node_id).map(|r| r.value().clone())
     }
     
-    /// PRODUCTION: Start heartbeat service for Full/Super nodes (TIME-based, not block-based)
+    /// PRODUCTION: Start heartbeat service for Super nodes (TIME-based, not block-based)
     /// This is called by the node on startup
     /// v2.42.2: FIXED - Now uses tokio::spawn instead of std::thread for proper gossip!
     /// Returns Arc<Self> for thread safety
@@ -18312,7 +18341,7 @@ impl SimplifiedP2P {
         
         // ═══════════════════════════════════════════════════════════════════════════
         // v2.59: LIGHT NODES - Collect from attestations (separate storage)
-        // Light nodes don't send heartbeats themselves; Full/Super nodes ping them
+        // Light nodes don't send heartbeats themselves; Super nodes ping them
         // and create attestations. Attestations are stored in light_node_attestations.
         // Light nodes need only 1 attestation per epoch to be eligible for rewards.
         // ═══════════════════════════════════════════════════════════════════════════
@@ -18761,7 +18790,7 @@ impl SimplifiedP2P {
     // ========================================================================
     
     /// Calculate assigned node index for Light node (DYNAMIC distribution)
-    /// Returns which active Full/Super node should ping this Light node (0 to N-1)
+    /// Returns which active Super node should ping this Light node (0 to N-1)
     /// Uses consistent hashing to evenly distribute Light nodes across active pingers
     pub fn calculate_assigned_node_index(light_node_id: &str, active_node_count: usize) -> usize {
         if active_node_count == 0 { return 0; }
@@ -18888,7 +18917,7 @@ impl SimplifiedP2P {
         
         let current_slot = Self::get_current_slot();
         
-        // Get sorted active Full/Super node IDs (v2.51: lock-free)
+        // Get sorted active Super node IDs (v2.51: lock-free)
         let active_node_ids: Vec<String> = {
             let mut sorted: Vec<_> = self.active_full_super_nodes.iter()
                 .filter(|entry| entry.value().reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION)
@@ -18956,11 +18985,11 @@ impl SimplifiedP2P {
             })
     }
     
-    /// Get Light nodes assigned to THIS Full/Super node (DYNAMIC distribution)
+    /// Get Light nodes assigned to THIS Super node (DYNAMIC distribution)
     pub fn get_light_nodes_in_shard(&self) -> Vec<LightNodeRegistrationData> {
         let our_node_id = &self.node_id;
         
-        // DYNAMIC DISTRIBUTION: Get active Full/Super nodes
+        // DYNAMIC DISTRIBUTION: Get active Super nodes
         let active_nodes = self.get_active_full_super_nodes();
         let active_count = active_nodes.len().max(1);
         
@@ -18985,7 +19014,7 @@ impl SimplifiedP2P {
     ///   - Non-Genesis nodes return empty list
     /// 
     /// RELIABILITY: Genesis nodes are stable infrastructure under our control
-    /// If ANY Full/Super node could ping, node failures = lost pings = lost rewards
+    /// If ANY Super node could ping, node failures = lost pings = lost rewards
     /// With Genesis-only pinging: 100% reliability, 100% coverage
     /// 
     /// SCALABILITY: 2M pings per Genesis per epoch = 139 pings/sec = easily handled
@@ -19125,7 +19154,7 @@ impl SimplifiedP2P {
         let our_node_id = &self.node_id;
         let current_window = Self::get_current_window_number();
         
-        // DYNAMIC DISTRIBUTION: Get active Full/Super nodes
+        // DYNAMIC DISTRIBUTION: Get active Super nodes
         let active_nodes = self.get_active_full_super_nodes();
         let active_count = active_nodes.len().max(1);
         
@@ -19206,7 +19235,7 @@ impl SimplifiedP2P {
         ids
     }
     
-    /// Register this node as active Full/Super node and broadcast announcement (ASYNC)
+    /// Register this node as active Super node and broadcast announcement (ASYNC)
     /// PRODUCTION: Use this in async contexts (warp handlers, tokio tasks)
     /// Called on startup and periodically (every 10 min)
     pub async fn register_as_active_node_async(&self) {
@@ -19296,7 +19325,7 @@ impl SimplifiedP2P {
         self.gossip_to_random_peers(msg, adaptive_fanout);
     }
 
-    /// Register this node as active Full/Super node (SYNC version for std::thread::spawn)
+    /// Register this node as active Super node (SYNC version for std::thread::spawn)
     /// WARNING: Only use in pure sync contexts where NO tokio runtime exists!
     pub fn register_as_active_node(&self) {
         let now = std::time::SystemTime::now()
@@ -19477,12 +19506,12 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Get count of active Full/Super nodes (v2.51: lock-free)
+    /// Get count of active Super nodes (v2.51: lock-free)
     pub fn get_active_node_count(&self) -> usize {
         self.active_full_super_nodes.len()
     }
     
-    /// Get list of active Full/Super nodes with their status (v2.51: lock-free)
+    /// Get list of active Super nodes with their status (v2.51: lock-free)
     /// Returns Vec<(node_id, node_type, last_seen)>
     pub fn get_active_full_super_nodes(&self) -> Vec<(String, String, u64)> {
         self.active_full_super_nodes.iter()
@@ -19629,7 +19658,7 @@ impl SimplifiedP2P {
     }
     
     /// v2.78: Record Light node attestation (for pinging)
-    /// Used by Full/Super nodes to record successful pings
+    /// Used by Super nodes to record successful pings
     pub fn record_light_node_attestation(
         &self,
         light_node_id: String,
@@ -19657,7 +19686,7 @@ impl SimplifiedP2P {
         });
     }
     
-    /// Get all Full/Super node heartbeats for a 4h window (for Merkle commitment)
+    /// Get all Super node heartbeats for a 4h window (for Merkle commitment)
     /// Returns Vec<(node_id, heartbeat_index, timestamp)>
     /// DEPRECATED: Use get_heartbeats_for_block_range for deterministic emission
     pub fn get_heartbeats_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u8, u64)> {
@@ -19689,7 +19718,7 @@ impl SimplifiedP2P {
         result
     }
     
-    /// v2.64: Get eligible Full/Super nodes filtered by BLOCK HEIGHT
+    /// v2.64: Get eligible Super nodes filtered by BLOCK HEIGHT
     /// Returns Vec<(node_id, node_type, heartbeat_count)>
     pub fn get_eligible_full_super_nodes_by_height(&self, start_height: u64, end_height: u64) -> Vec<(String, String, u8)> {
         let heartbeats = self.get_heartbeats_for_block_range(start_height, end_height);
@@ -19794,7 +19823,7 @@ impl SimplifiedP2P {
         eligible
     }
     
-    /// Get eligible Full/Super nodes for rewards in current window
+    /// Get eligible Super nodes for rewards in current window
     /// Returns Vec<(node_id, node_type, heartbeat_count)>
     /// CRITICAL: Only nodes with reputation >= 70% are eligible for QNC rewards!
     /// DEPRECATED: Use get_eligible_full_super_nodes_by_height for deterministic emission
@@ -20243,7 +20272,9 @@ impl SimplifiedP2P {
     // - Index 1 = blocks 1-90, Index 2 = blocks 91-180, etc.
     // - Max 10 macroblocks per batch (~1MB)
     // - Rate limiting: 5 requests/minute (macroblocks are large)
-    // - Light nodes can request macroblock headers only
+    // - Only Super nodes participate in this sync path. Light nodes are
+    //   pure mobile API clients (no on-device chain storage) and use the
+    //   REST API instead of macroblock peer-to-peer sync.
     // =========================================================================
     
     /// Handle macroblock request from peer for sync
@@ -22178,7 +22209,7 @@ impl SimplifiedP2P {
                 return;
             },
             NodeType::Super => {
-                // Both Full and Super nodes store ALL reputation
+                // Both Super nodes store ALL reputation
                 // Full nodes: Can participate in consensus, need full data
                 // Super nodes: Produce blocks, need full data for leader selection
                 // Storage overhead is minimal (~300MB) compared to blockchain size
@@ -22517,7 +22548,7 @@ impl SimplifiedP2P {
                 return None;
             },
             NodeType::Super => {
-                // Both Full and Super nodes have complete reputation storage
+                // Both Super nodes have complete reputation storage
                 // Continue with loading from local files
             }
         }
@@ -23196,13 +23227,13 @@ impl SimplifiedP2P {
                     return self.node_id.clone();
                 }
                 
-                // Full/Super nodes: Generate privacy-preserving display name
+                // Super nodes: Generate privacy-preserving display name
                 self.generate_p2p_display_name()
             }
         }
     }
     
-    /// PRIVACY: Generate display name for P2P announcements (Full/Super nodes)
+    /// PRIVACY: Generate display name for P2P announcements (Super nodes)
     fn generate_p2p_display_name(&self) -> String {
         // EXISTING PATTERN: Use same pattern as other display name functions
         // SECURITY: Use node_id as source for consistency (not wallet for P2P layer)
@@ -27765,9 +27796,17 @@ impl SimplifiedP2P {
             BlacklistReason::SlowResponse => (15, 15),   // 15s base, +15s per violation
             BlacklistReason::SyncTimeout => (30, 30),    // 30s base, +30s per violation
             BlacklistReason::ConnectionFailure => (60, 60), // 60s base, +60s per violation
-            
+
             // HARD BLACKLIST: Permanent until reputation recovered (Byzantine)
             BlacklistReason::InvalidBlocks | BlacklistReason::MaliciousBehavior => (0, 0),
+
+            // IDENTITY-HARD BLACKLIST: Permanent for the lifetime of the
+            // attacker keypair. duration_secs=0 → permanent in the
+            // existing `BlacklistEntry::is_active` semantics; the
+            // sync-peer filter never auto-recovers a PkImpersonation
+            // peer because its `consensus_qualified` cannot recover
+            // (every consensus message it sends fails Tier-2 verify).
+            BlacklistReason::PkImpersonation => (0, 0),
         };
         
         // Check if already blacklisted (escalation logic)
@@ -27833,12 +27872,106 @@ impl SimplifiedP2P {
             }
         }
     }
+
+    // ========================================================================
+    // PERMANENT PK BLACKLIST (cryptographic identity impersonation)
+    // ========================================================================
+    // SECURITY: This surface is keyed by the SHA3-256 fingerprint of the
+    // attacker's Dilithium3 public key — NOT by peer_addr (which the
+    // attacker controls) or node_id (which the attacker spoofs).
+    // Canonical state lives in `qnet_consensus::consensus_crypto`; these
+    // wrappers expose it through the SimplifiedP2P facade so call sites
+    // do not need to take a direct dependency on the lower-level crate.
+    //
+    // The PEER_BLACKLIST entry keyed by peer_addr is a SECONDARY hint
+    // populated alongside the canonical PK entry: it lets the existing
+    // sync-peer selector strip the attacker's last-known address
+    // without an extra crypto check. The authoritative gate still runs
+    // at the QUIC handshake / dispatcher layer on the presented PK.
+
+    /// O(1) check: is the supplied extracted Dilithium3 public key on
+    /// the permanent attacker blacklist? Safe to call from any thread.
+    pub fn is_pk_blacklisted(&self, extracted_pk: &[u8]) -> bool {
+        qnet_consensus::consensus_crypto::is_pk_blacklisted(extracted_pk)
+    }
+
+    /// Telemetry counter — number of distinct attacker PKs retained
+    /// in-memory. Exposed for the operator dashboard.
+    pub fn attacker_pk_blacklist_len(&self) -> usize {
+        qnet_consensus::consensus_crypto::attacker_pk_blacklist_len()
+    }
+
+    /// Report a cryptographic impersonation event. Called from the
+    /// upstream defence layers (consensus_crypto's Tier-2 reject site
+    /// is the canonical install point — this wrapper exists for
+    /// integration-side detectors such as the QUIC handshake when it
+    /// gains structural PK extraction).
+    ///
+    /// Side effects:
+    ///   * Adds the PK fingerprint to the permanent blacklist
+    ///     (persisted via the registered callback if any).
+    ///   * Adds `peer_addr` (when supplied) to the peer-addr layer with
+    ///     `BlacklistReason::PkImpersonation` so the sync-peer
+    ///     selector picks up the deny immediately.
+    pub fn report_pk_impersonation(
+        &self,
+        extracted_pk: &[u8],
+        claimed_node_id: &str,
+        peer_addr: Option<&str>,
+    ) {
+        let (_record, was_first) =
+            qnet_consensus::consensus_crypto::record_attacker_pk(extracted_pk, claimed_node_id);
+        if let Some(addr) = peer_addr {
+            self.add_to_blacklist(addr, BlacklistReason::PkImpersonation);
+        }
+        if was_first {
+            if crate::node::is_warn() {
+                println!(
+                    "[CRIT][SECURITY] pk_impersonation_recorded node={} pk_total={} action=permanent_ban",
+                    claimed_node_id,
+                    self.attacker_pk_blacklist_len(),
+                );
+            }
+        }
+    }
+
+    /// Operator override: remove a single attacker PK fingerprint
+    /// (e.g. confirmed false positive caused by an off-chain
+    /// key-rotation flow that has since reconciled). Returns `true`
+    /// when an entry was actually present.
+    pub fn clear_attacker_pk(&self, fingerprint: &[u8; 32]) -> bool {
+        let removed = qnet_consensus::consensus_crypto::clear_attacker_pk(fingerprint);
+        if removed && crate::node::is_info() {
+            println!(
+                "[INFO][SECURITY] attacker_pk_cleared fp={}.. by=operator",
+                hex::encode(&fingerprint[..8]),
+            );
+        }
+        removed
+    }
+
+    /// Operator override: clear the entire in-memory PK blacklist.
+    /// Returns the number of entries removed. Intended for dev-resets
+    /// and post-incident reconciliation; production operators are
+    /// expected to clear single entries.
+    pub fn clear_attacker_pk_blacklist_all(&self) -> usize {
+        let n = qnet_consensus::consensus_crypto::clear_attacker_pk_blacklist_all();
+        if n > 0 && crate::node::is_info() {
+            println!(
+                "[WARN][SECURITY] attacker_pk_blacklist_cleared_all entries={} by=operator",
+                n,
+            );
+        }
+        n
+    }
     
     /// Get peers for sync with blacklist filtering and prioritization
     /// ARCHITECTURE: Filter by blacklist, node type (Light excluded), and reputation
     /// SCALABILITY: Returns top-N peers sorted by latency and reputation
-    /// CRITICAL: Light nodes NEVER included as sync SOURCE (they only RECEIVE macroblock headers)
-    /// NOTE: Light nodes DO receive blocks via broadcast, but don't serve blocks to others
+    /// CRITICAL: Light nodes NEVER included as sync SOURCE — they are pure
+    /// mobile API clients with zero on-device chain storage; they have no
+    /// blocks to serve. This filter is mandatory for correctness, not just
+    /// an optimization.
     /// v9.3: Added `min_height` parameter — only return peers whose `last_block_height >= min_height`.
     /// This prevents requesting blocks from peers that don't have them (empty_range responses).
     pub fn get_sync_peers_filtered(&self, max_peers: usize) -> Vec<PeerInfo> {
@@ -27878,7 +28011,8 @@ impl SimplifiedP2P {
             .filter_map(|entry| {
                 let peer = entry.value().clone();
 
-                // CRITICAL: Light nodes are NOT sync sources (don't store full blocks)
+                // CRITICAL: Light nodes are NOT sync sources — they store
+                // zero blockchain data on-device (pure mobile API clients).
                 if peer.node_type == NodeType::Light {
                     return None;
                 }
@@ -27891,19 +28025,25 @@ impl SimplifiedP2P {
                 // Filter blacklisted peers
                 let (is_blacklisted, reason, remaining) = self.is_blacklisted(&peer.addr);
                 if is_blacklisted {
-                    // SOFT blacklist: Can be overridden if no other peers available
-                    // HARD blacklist: Check reputation instead
-                    if let Some(BlacklistReason::InvalidBlocks | BlacklistReason::MaliciousBehavior) = reason {
-                        // Hard blacklist: check if reputation recovered
-                        if !peer.is_consensus_qualified() {
-                            return None; // Still below Byzantine threshold
+                    match reason {
+                        // IDENTITY-HARD: never recoverable via reputation. The
+                        // attacker's keypair fails Tier-2 verify on every
+                        // consensus message, so `is_consensus_qualified` is
+                        // structurally false. Drop unconditionally.
+                        Some(BlacklistReason::PkImpersonation) => return None,
+                        // HARD: recoverable via reputation gate.
+                        Some(BlacklistReason::InvalidBlocks)
+                        | Some(BlacklistReason::MaliciousBehavior) => {
+                            if !peer.is_consensus_qualified() {
+                                return None;
+                            }
+                            self.remove_from_blacklist(&peer.addr);
                         }
-                        // Reputation recovered - auto-remove from blacklist
-                        self.remove_from_blacklist(&peer.addr);
-                    } else {
-                        // Soft blacklist: skip if still active
-                        if remaining > 0 {
-                            return None;
+                        // SOFT: skip while window is active.
+                        _ => {
+                            if remaining > 0 {
+                                return None;
+                            }
                         }
                     }
                 }

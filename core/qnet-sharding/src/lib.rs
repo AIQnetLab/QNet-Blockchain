@@ -110,7 +110,9 @@ use tokio::sync::RwLock;
 use blake3;
 use rayon::prelude::*;
 
-// OPTIMIZED: Dynamic shard configuration based on active Full/Super nodes
+// OPTIMIZED: Dynamic shard configuration based on the active Super-node
+// population (v3.18: "Full" tier was removed; only Super nodes participate
+// in P2P sharding and consensus).
 // PRODUCTION: Start with minimal shards, scale up automatically
 // v2.64: Increased to 100K TPS per shard (was 50K)
 pub const DEFAULT_SHARDS: u32 = 1;
@@ -119,7 +121,9 @@ pub const MAX_SHARDS: u32 = 256;     // Maximum for 25.6M TPS capacity (100K × 
 pub const MAX_CROSS_SHARD_TXS: usize = 1000;
 pub const REBALANCE_THRESHOLD: f64 = 1.5; // 50% load difference triggers rebalance
 
-/// Get optimal shard count based on network size (Full/Super nodes only, NOT Light)
+/// Get optimal shard count based on network size (Super nodes only —
+/// Light is a mobile API-client role and does NOT participate in
+/// sharding; the legacy "Full" tier was removed in v3.18).
 /// PRODUCTION: Gradual scaling based on active consensus-participating nodes
 /// - 1 shard handles ~100K TPS (100K TX/block × 1 block/sec)
 /// - Scale up automatically when network grows

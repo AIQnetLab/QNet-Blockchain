@@ -179,6 +179,239 @@ lazy_static::lazy_static! {
     /// hot-read paths do not contend with eviction sweeps.
     static ref LAST_ACTIVITY: dashmap::DashMap<String, std::sync::atomic::AtomicU64> =
         dashmap::DashMap::new();
+
+    /// Permanent attacker PK blacklist (canonical SECURITY surface).
+    ///
+    /// Keyed by the 32-byte SHA3-256 fingerprint of the EXTRACTED
+    /// (attacker-supplied) Dilithium3 public key — NOT by node_id,
+    /// because a single attacker key can be replayed under many spoofed
+    /// identities and a single node_id can be squatted by many
+    /// attacker keys. The fingerprint is post-quantum collision-
+    /// resistant and stable across restarts.
+    ///
+    /// SEMANTICS: This is a HARD, process-lifetime ban. Any PK in this
+    /// set has been observed presenting itself as a registered identity
+    /// whose canonical PK does not match. In a permissionless registry
+    /// where each node controls exactly one keypair (CONSENSUS_PK_REGISTRY
+    /// is immutable once bound — see `register_consensus_pk_with_origin`),
+    /// a single Tier-2 mismatch is conclusive proof of an impersonation
+    /// attempt — there is no legitimate cause. We therefore admit a key
+    /// to the blacklist on the FIRST observed mismatch.
+    ///
+    /// PERSISTENCE: When an integrator (qnet-integration) installs a
+    /// `ATTACKER_PK_PERSIST_CALLBACK` at boot, every insertion is
+    /// mirrored to durable storage. On restart the integrator replays
+    /// the persisted set via `seed_attacker_pk_blacklist` BEFORE the
+    /// QUIC listener opens, so a known attacker cannot regain a
+    /// transient verification budget across reboots.
+    ///
+    /// BOUNDED MEMORY: Map size is soft-capped at `ATTACKER_PK_BLACKLIST_CAP`.
+    /// At the cap we evict the oldest 25% by `last_seen_unix_s` so a
+    /// key-rotating attacker (each spoofed connection presents a fresh
+    /// Dilithium3 keypair) cannot grow the table unboundedly. At cap
+    /// (≤ 1 MB resident) this still retains 12 000 distinct attacker
+    /// keys — well above any realistic adversary's churn budget.
+    static ref ATTACKER_PK_BLACKLIST: dashmap::DashMap<[u8; 32], AttackerRecord> =
+        dashmap::DashMap::new();
+
+    /// Optional persistence callback. When `Some`, every
+    /// `record_attacker_pk` mirrors the (fingerprint, record) pair to
+    /// the integrator's storage layer (RocksDB metadata CF in the
+    /// canonical wiring). Registered exactly once at boot via
+    /// `set_attacker_pk_persist_callback`; never replaced.
+    static ref ATTACKER_PK_PERSIST_CALLBACK:
+        parking_lot::RwLock<Option<std::sync::Arc<dyn Fn(&[u8; 32], &AttackerRecord) + Send + Sync>>> =
+        parking_lot::RwLock::new(None);
+}
+
+/// Durable record for a single blacklisted attacker public key.
+///
+/// Kept compact (≤ 64 bytes resident excluding the `last_node_id` short
+/// string) so the in-memory set scales to the soft cap without bloat.
+#[derive(Debug, Clone)]
+pub struct AttackerRecord {
+    /// Wall-clock UNIX seconds at first observed mismatch.
+    pub first_seen_unix_s: u64,
+    /// Wall-clock UNIX seconds at most recent mismatch.
+    pub last_seen_unix_s: u64,
+    /// Running mismatch count across the process lifetime (post-restart
+    /// the value resumes from the persisted record).
+    pub offense_count: u32,
+    /// `node_id` that the attacker most recently CLAIMED to be. Helpful
+    /// for forensic correlation against the registry; never used for
+    /// authorisation decisions.
+    pub last_claimed_node_id: String,
+}
+
+/// Soft cap on `ATTACKER_PK_BLACKLIST`. At 12K entries × ~96 bytes
+/// (`AttackerRecord` + DashMap shard overhead) the resident footprint
+/// is ≤ 1 MB, comfortable on every super-node. Eviction is lazy (only
+/// checked on insert) so the hot read path is unaffected.
+const ATTACKER_PK_BLACKLIST_CAP: usize = 12_288;
+
+/// Eviction batch fraction (25 % oldest by `last_seen_unix_s`) applied
+/// when the cap is hit. Drops the least-recently-seen attackers; an
+/// active attacker still in the wild will be re-inserted on its next
+/// connection attempt because the Tier-2 check is always evaluated.
+const ATTACKER_PK_EVICT_FRACTION: usize = 4;
+
+/// Compute the 32-byte SHA3-256 fingerprint of an extracted public key.
+/// Collision-resistant and post-quantum safe; fits as a DashMap key
+/// with no allocations on the lookup path.
+pub fn pk_fingerprint(pk: &[u8]) -> [u8; 32] {
+    use sha3::{Sha3_256, Digest};
+    let mut h = Sha3_256::new();
+    h.update(pk);
+    let out = h.finalize();
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&out);
+    buf
+}
+
+/// Install the persistence callback. Idempotent — re-registration is a
+/// no-op so a botched re-init cannot strip an already-installed sink.
+///
+/// Called exactly once during integrator boot, AFTER the storage handle
+/// is open and BEFORE the QUIC listener accepts inbound traffic. The
+/// callback runs synchronously on the rejection hot path, so the
+/// integrator implementation MUST be cheap (≤ µs) — the canonical
+/// implementation is a single `db.put_cf(metadata, key, value)`.
+pub fn set_attacker_pk_persist_callback<F>(cb: F)
+where
+    F: Fn(&[u8; 32], &AttackerRecord) + Send + Sync + 'static,
+{
+    let mut slot = ATTACKER_PK_PERSIST_CALLBACK.write();
+    if slot.is_some() {
+        return; // idempotent
+    }
+    *slot = Some(std::sync::Arc::new(cb));
+}
+
+/// Seed the in-memory blacklist from durable storage. Called once at
+/// boot by the integrator AFTER `set_attacker_pk_persist_callback` and
+/// BEFORE the network listener opens. Existing entries are preserved
+/// (additive) so a second boot-time replay cannot silently shrink the
+/// set.
+pub fn seed_attacker_pk_blacklist(entries: Vec<([u8; 32], AttackerRecord)>) {
+    for (fp, rec) in entries {
+        ATTACKER_PK_BLACKLIST.entry(fp).or_insert(rec);
+    }
+}
+
+/// O(1) hot-path check. Returns true iff `extracted_pk`'s SHA3-256
+/// fingerprint is in the permanent blacklist. Safe to call from any
+/// thread; lock-free DashMap read.
+pub fn is_pk_blacklisted(extracted_pk: &[u8]) -> bool {
+    let fp = pk_fingerprint(extracted_pk);
+    ATTACKER_PK_BLACKLIST.contains_key(&fp)
+}
+
+/// Variant used by callers that already hold a precomputed fingerprint
+/// (e.g. boot-time replay or operator tooling).
+pub fn is_pk_fp_blacklisted(fp: &[u8; 32]) -> bool {
+    ATTACKER_PK_BLACKLIST.contains_key(fp)
+}
+
+/// Telemetry: number of distinct attacker keys currently retained.
+pub fn attacker_pk_blacklist_len() -> usize {
+    ATTACKER_PK_BLACKLIST.len()
+}
+
+/// Operator override: remove a single attacker fingerprint from the
+/// blacklist (e.g. after forensic confirmation of a false positive
+/// caused by an off-chain key-rotation flow). Returns true if an entry
+/// was actually removed. Does NOT touch persistent storage — the
+/// integrator clears the durable row from its own admin surface.
+pub fn clear_attacker_pk(fp: &[u8; 32]) -> bool {
+    ATTACKER_PK_BLACKLIST.remove(fp).is_some()
+}
+
+/// Operator override: clear the entire in-memory blacklist. Intended
+/// for development resets and post-incident reconciliation; production
+/// operators are expected to clear individual entries.
+pub fn clear_attacker_pk_blacklist_all() -> usize {
+    let n = ATTACKER_PK_BLACKLIST.len();
+    ATTACKER_PK_BLACKLIST.clear();
+    n
+}
+
+/// Record one pk-mismatch offense from `extracted_pk` (the attacker-
+/// supplied key) under the registered identity `claimed_node_id`.
+///
+/// Behaviour:
+///   * First sighting → insert a fresh `AttackerRecord`. Persistence
+///     callback runs. Returns `(record_after, was_first)` with
+///     `was_first = true` — the caller emits one `[CRIT][SECURITY]`
+///     discovery line.
+///   * Subsequent sightings → bump `offense_count`, refresh
+///     `last_seen_unix_s` and `last_claimed_node_id`. Persistence
+///     callback runs (idempotent overwrite of the same row).
+///     Returns `was_first = false` — the caller stays silent.
+///
+/// Lazy soft-eviction: at cap we drop the oldest 25 % by
+/// `last_seen_unix_s` before insertion so a key-rotating attacker
+/// cannot grow the table without bound.
+pub fn record_attacker_pk(extracted_pk: &[u8], claimed_node_id: &str) -> (AttackerRecord, bool) {
+    let fp = pk_fingerprint(extracted_pk);
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Lazy soft-eviction (only when over cap and NEW key incoming).
+    if !ATTACKER_PK_BLACKLIST.contains_key(&fp)
+        && ATTACKER_PK_BLACKLIST.len() >= ATTACKER_PK_BLACKLIST_CAP
+    {
+        // Collect into a Vec first so we don't hold any DashMap shard
+        // locks across the sort + remove loop.
+        let mut entries: Vec<([u8; 32], u64)> = ATTACKER_PK_BLACKLIST
+            .iter()
+            .map(|e| (*e.key(), e.value().last_seen_unix_s))
+            .collect();
+        entries.sort_by_key(|(_, last)| *last);
+        let to_drop = entries.len() / ATTACKER_PK_EVICT_FRACTION;
+        for (k, _) in entries.into_iter().take(to_drop) {
+            ATTACKER_PK_BLACKLIST.remove(&k);
+        }
+    }
+
+    let mut was_first = false;
+    let record = ATTACKER_PK_BLACKLIST
+        .entry(fp)
+        .and_modify(|r| {
+            r.offense_count = r.offense_count.saturating_add(1);
+            r.last_seen_unix_s = now_s;
+            // Track the most recently claimed identity for forensic
+            // correlation; truncate to a sane length to bound storage.
+            r.last_claimed_node_id = claimed_node_id
+                .chars()
+                .take(96)
+                .collect::<String>();
+        })
+        .or_insert_with(|| {
+            was_first = true;
+            AttackerRecord {
+                first_seen_unix_s: now_s,
+                last_seen_unix_s: now_s,
+                offense_count: 1,
+                last_claimed_node_id: claimed_node_id
+                    .chars()
+                    .take(96)
+                    .collect::<String>(),
+            }
+        })
+        .clone();
+
+    // Mirror to durable storage if the integrator wired one up. We
+    // clone the Arc out of the lock so the callback runs without
+    // holding the RwLock — eliminates contention with `set_*` (which
+    // is also one-shot at boot, but the discipline matters).
+    let cb_arc = ATTACKER_PK_PERSIST_CALLBACK.read().clone();
+    if let Some(cb) = cb_arc {
+        cb(&fp, &record);
+    }
+
+    (record, was_first)
 }
 
 /// Canonical challenge prefix for proof-of-ownership. Versioned so a future
@@ -1533,6 +1766,23 @@ async fn verify_with_real_dilithium(
     let public_key_bytes = &signature_bytes[pk_start..pk_start + pk_len];
 
     // ─────────────────────────────────────────────────────────────────────
+    // Permanent attacker-PK fast path (defence-in-depth).
+    // ─────────────────────────────────────────────────────────────────────
+    // O(1) DashMap lookup. If this PK has been recorded as an impersonator
+    // in a prior verification (current run or replayed from durable
+    // storage on boot via `seed_attacker_pk_blacklist`), drop the message
+    // here — before the registry-lock dance and the ~3.3 KB Dilithium3
+    // open call. We bump the offense counter so telemetry stays correct
+    // and persistence reflects renewed activity, but emit no log line:
+    // the original `[CRIT][SECURITY] attacker_pk_blacklisted` discovery
+    // event is the canonical record; subsequent silent drops are the
+    // expected steady state.
+    if is_pk_blacklisted(public_key_bytes) {
+        let _ = record_attacker_pk(public_key_bytes, node_id);
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // Identity → public-key binding policy (three tiers)
     // ─────────────────────────────────────────────────────────────────────
     //
@@ -1593,10 +1843,43 @@ async fn verify_with_real_dilithium(
             }
             Some(entry) => {
                 // Tier 2: bound, mismatch — hostile identity claim. Hard reject.
-                eprintln!("[ERR][CONSENSUS] pk_mismatch node={} registered={}.. extracted={}..",
-                         node_id,
-                         hex::encode(&entry.pk[..8]),
-                         hex::encode(&public_key_bytes[..8]));
+                //
+                // SECURITY ESCALATION (v25.1): CONSENSUS_PK_REGISTRY is
+                // immutable once bound — every node controls exactly one
+                // identity keypair. A mismatch is therefore conclusive
+                // evidence of an impersonation attempt: there is NO
+                // legitimate cause. We:
+                //
+                //   1. Hard-reject the math step (always — correctness
+                //      boundary).
+                //   2. Permanently blacklist the attacker's extracted PK
+                //      by SHA3-256 fingerprint, mirrored to durable
+                //      storage when the integrator has installed a
+                //      persistence callback.
+                //   3. Emit exactly ONE `[CRIT][SECURITY]` discovery log
+                //      line on first sighting of this attacker key; all
+                //      subsequent rejections from the same PK are silent
+                //      (the entry counts up but produces no log noise).
+                //
+                // Upstream layers (QUIC handshake, consensus dispatcher)
+                // consult `is_pk_blacklisted` BEFORE reaching this code
+                // path, so a recidivist attacker is dropped at the
+                // transport boundary and never causes a verification
+                // attempt. This site is the install path for new
+                // attacker keys and the last-line backstop.
+                let pk_for_log = hex::encode(&public_key_bytes[..8.min(public_key_bytes.len())]);
+                let registered_for_log = hex::encode(&entry.pk[..8.min(entry.pk.len())]);
+                drop(registry);
+                let (record, was_first) = record_attacker_pk(public_key_bytes, node_id);
+                if was_first {
+                    eprintln!(
+                        "[CRIT][SECURITY] attacker_pk_blacklisted node={} registered={}.. extracted={}.. first_seen={} action=permanent_ban",
+                        node_id,
+                        registered_for_log,
+                        pk_for_log,
+                        record.first_seen_unix_s,
+                    );
+                }
                 return false;
             }
             None => {

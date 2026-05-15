@@ -201,8 +201,11 @@ pub struct ConsensusData {
     
     // ═══════════════════════════════════════════════════════════════════════════
     // REWARD HEARTBEATS (v2.41.0)
-    // Deterministic heartbeat recording for Full/Super node rewards
-    // Replaces gossip-based heartbeats which were non-deterministic and lossy
+    // Deterministic heartbeat recording for Super node rewards.
+    // Replaces gossip-based heartbeats which were non-deterministic and lossy.
+    // (v3.18: the "Full" tier was removed from the protocol; only Super
+    // nodes self-attest via heartbeats. Light nodes use the separate
+    // ping-response attestation path.)
     // ═══════════════════════════════════════════════════════════════════════════
     
     /// Aggregated heartbeat summaries for all nodes in this epoch
@@ -218,12 +221,15 @@ pub struct ConsensusData {
     pub heartbeats_merkle_root: Option<[u8; 32]>,
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // v2.78: LIGHT NODE ATTESTATIONS - Collected from PingCommitment TXs
-    // Each Full/Super node submits PingCommitment TX with Light nodes it pinged
-    // MacroBlock aggregates all to count unique Light nodes for Pool 3 rewards
+    // v2.78: LIGHT NODE ATTESTATIONS - Collected from PingCommitment TXs.
+    // Each Super node submits a PingCommitment TX listing the Light nodes
+    // it pinged. The MacroBlock aggregates all of them to count unique
+    // Light nodes for Pool 3 rewards.
+    // (v3.18: only Super nodes ping Light nodes — the "Full" tier was
+    // removed.)
     // ═══════════════════════════════════════════════════════════════════════════
-    
-    /// Aggregated Light node attestations from all Full/Super PingCommitment TXs
+
+    /// Aggregated Light node attestations from all Super-node PingCommitment TXs
     /// Format: bincode serialized HashMap<light_node_id: String, ping_count: u32>
     /// Deterministic: all nodes see same Light node data from blockchain
     /// Used for reward calculation at emission blocks (every 4 hours)
@@ -441,13 +447,15 @@ pub struct ExcludedProducerEntry {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // REWARD HEARTBEAT DATA (v2.41.0)
-// Deterministic heartbeat recording for Full/Super node rewards
-// Stored in MacroBlock for verifiable, deterministic reward calculation
+// Deterministic heartbeat recording for Super-node rewards.
+// Stored in MacroBlock for verifiable, deterministic reward calculation.
+// (v3.18: the "Full" tier was removed from the protocol.)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Reward heartbeat entry for blockchain storage
-/// Each Full/Super node must send 10 heartbeats per 4-hour window
-/// Super nodes need 9/10 (90%), Full nodes need 8/10 (80%) for rewards
+/// Each Super node must send 10 heartbeats per 4-hour window
+/// Super nodes need 9/10 (90%) for rewards.
+/// (v3.18: legacy "Full" tier removed.)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RewardHeartbeat {
     /// Node identifier (pseudonym, not IP)
@@ -468,9 +476,12 @@ pub struct RewardHeartbeat {
 pub struct HeartbeatSummary {
     /// Node identifier
     pub node_id: String,
-    /// Node type: 0=Light, 1=Full, 2=Super
+    /// Node type tag: 0=Light, 2=Super. The value 1 ("Full") is a
+    /// historical reserved code from before v3.18 and is no longer
+    /// produced by any current node; readers map any legacy 1 to
+    /// Super for backward compatibility.
     pub node_type: u8,
-    /// Number of successful heartbeats in this epoch (0-10 for Full/Super)
+    /// Number of successful heartbeats in this epoch (0-10 for Super)
     pub heartbeat_count: u8,
     /// First heartbeat timestamp in epoch
     pub first_heartbeat: u64,
@@ -572,7 +583,12 @@ pub mod storage_version {
     pub const V1_FULL_MICROBLOCK: u8 = 0x01;
     /// EfficientMicroBlock with transaction hashes only (v2.19.8+)
     pub const V2_EFFICIENT_MICROBLOCK: u8 = 0x02;
-    /// LightMicroBlock headers only for Light nodes (v2.19.8+)
+    /// DEPRECATED — `LightMicroBlock` (headers-only) wire/storage form.
+    /// Designed for the historical Light tier that persisted block
+    /// headers locally. In v3.18+, the Light tier is a pure mobile API
+    /// client with zero on-device chain storage, so this format is no
+    /// longer produced or stored by Light nodes. Tag retained for
+    /// backward compatibility with any legacy records or peers.
     pub const V3_LIGHT_MICROBLOCK: u8 = 0x03;
     /// Future: Compressed format with dictionary
     pub const V4_COMPRESSED: u8 = 0x04;
@@ -586,7 +602,11 @@ pub enum StoredMicroBlock {
     V1Full(MicroBlock),
     /// Version 2: Efficient format - transaction hashes only, TX stored separately
     V2Efficient(EfficientMicroBlock),
-    /// Version 3: Light format - headers only, no transactions or signatures
+    /// Version 3: DEPRECATED — `LightMicroBlock` headers-only format from the
+    /// historical Light tier that persisted block headers on-device. The
+    /// current Light tier (v3.18+) is a pure mobile API client with zero
+    /// on-device chain storage and never emits or consumes this variant.
+    /// Kept for backward compatibility with any legacy stored records.
     V3Light(LightMicroBlock),
 }
 

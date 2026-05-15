@@ -1070,20 +1070,38 @@ impl BlockPipeline {
         //
         // Scalability
         // ───────────
-        // At the 1000-validator-per-round committee cap, macroblock commit/
-        // reveal collects up to 2f+1 ≈ 667 attestation signatures. Serial
-        // Dilithium3 verify cost ≈ 667 × 3 ms = 2 s — fully consuming the
-        // 1-sec slot and starving micro-block production. With verify_workers
-        // = 4 the wall-clock drops to ≈ 500 ms, leaving headroom. At
-        // verify_workers = number_of_cpu_cores the speedup saturates at the
-        // host's core count.
+        // This pipeline is a SUPER-node code path. Mobile Light nodes
+        // never reach it — they are a wholly separate role (Proof-of-
+        // Presence via Genesis-driven ping/attest, macroblock-headers-
+        // only sync, ~1000-block local cache, consensus-disqualified by
+        // `is_consensus_qualified()`). Pool sizing here is therefore
+        // exclusively about Super-node behaviour.
         //
-        // For 100 000-node networks where only 1000 are in the active
-        // round, observers (Light nodes and inactive Super-nodes) do NOT
-        // verify attestations — they verify only producer signatures from
-        // gossip-relayed blocks (1 per block). The pool sizing therefore
-        // depends on validator role: producers use the full pool, observers
-        // can run verify_workers=1 with no cost.
+        // Per-block cost on every Super node, regardless of whether the
+        // node sits in the current 1000-validator macroblock committee:
+        //   * One Dilithium3 producer-signature verify per microblock.
+        //     ~3 ms serialised; the 1-block-per-second cadence means
+        //     a single worker keeps up at steady state. The worker
+        //     pool exists for CATCH-UP and BURST regimes where a
+        //     backlog must be drained as fast as host CPU allows
+        //     (joining the network, recovering from a view-change
+        //     stall, applying a long resync window).
+        //
+        // Extra signature-verify cost incurred ONLY by the 1000-node
+        // committee elected for the current macroblock:
+        //   * 2f+1 ≈ 667 attestation/commit/reveal signatures per
+        //     macroblock boundary. Verified via rayon-parallel batches
+        //     inside `handle_aggregated_timeout_cert` and
+        //     `handle_timeout_proof_broadcast` — completely separate
+        //     from this worker pool, so macroblock attestation bursts
+        //     do not contend with microblock apply throughput.
+        //
+        // Sizing guideline:
+        //   * Catch-up / burst: verify_workers = number_of_cpu_cores —
+        //     saturates available cores to drain backlog quickly.
+        //   * Steady state (committee or not): verify_workers = 2
+        //     suffices; one verify per 1-sec slot with comfortable
+        //     headroom.
         //
         // Safety
         // ──────
@@ -2451,68 +2469,105 @@ impl BlockPipeline {
                 }
 
                 // Dilithium3 verification for TXs that opted into PQ signing.
-                // Inline to avoid a second helper call: we only iterate over
-                // the small subset with `dilithium_signature.is_some()`.
+                //
+                // v25.2 — UNIFIED VERIFIER ENTRY POINT
+                // ─────────────────────────────────────────────────────────────
+                // Pre-v25.2 this stage decoded `tx.dilithium_signature` and
+                // `tx.dilithium_public_key` as fixed-length hex strings:
+                //   * sig = hex(3309 raw ML-DSA-65 detached bytes)
+                //   * pk  = hex(1952 raw ML-DSA-65 public key bytes)
+                // That layout matches MOBILE-WALLET TXs (Transfer, ContractCall
+                // and similar user-originated traffic) where the wallet ships
+                // raw key material inline.
+                //
+                // Node-signed SYSTEM TXs use a DIFFERENT on-the-wire layout
+                // because the signing path runs through `create_consensus_signature`:
+                //   * sig = ASCII wrapper `"dilithium_sig_<node_id>_<b64>"`
+                //   * pk  = `Some(node_id)` — a node-identity STRING; the
+                //           authoritative public key is the one bound to that
+                //           `node_id` in `CONSENSUS_PK_REGISTRY` (immutable
+                //           per identity once registered).
+                //
+                // The inline decoder rejected the system-TX format by
+                // construction (`hex::decode("dilithium_sig_...")` fails,
+                // `hex::decode("genesis_node_004")` fails). The receiver-side
+                // result was a HARD block reject every time the producer
+                // included a HeartbeatCommitment, PingCommitment,
+                // PingCommitmentWithSampling, or LightNodeEligibilityBitmap.
+                // First such inclusion lands at the commitment window
+                // (last 50 blocks of every epoch) — and that is exactly where
+                // the testnet froze at h=14350 (first epoch boundary on
+                // post-v25 code).
+                //
+                // Fix: delegate to the canonical helper used by the gossip
+                // and RPC admission paths. The helper:
+                //   1. Selects `signer_id` per signer-class semantics
+                //      (`node_id` for system TXs, `dilithium_public_key` for
+                //      user TXs — see `verify_dilithium_tx_signature_async`).
+                //   2. Forwards into `consensus_crypto::verify_consensus_signature`,
+                //      which knows every wrapper format
+                //      (`dilithium_sig_*`, `compact_bin:*`, `compact:*`,
+                //      `hybrid_bin:*`, …) AND enforces the
+                //      identity→PK registry binding (Tier 1/2/3, blacklist).
+                //   3. Runs the cryptographic verify on the canonical
+                //      message produced by `build_canonical_verify_message`.
+                //
+                // After this change apply-path verdicts are byte-identical to
+                // gossip-path verdicts for every TX class. Future signature
+                // format additions need to be wired in ONLY at the helper —
+                // both paths pick the change up automatically, eliminating
+                // the format-divergence class of bugs entirely.
+                //
+                // PARALLEL BATCH VERIFY (v25.2).
+                //
+                // The helper internally hands every signature off to the
+                // dedicated `SIGVERIFY_RUNTIME` (multi-threaded tokio runtime
+                // sized to ~num_cpus, see `unified_p2p::SIGVERIFY_RUNTIME`),
+                // so simultaneously-pending Dilithium verifies execute on
+                // distinct worker threads. Sequential `await` in a `for`
+                // loop would serialise the dispatch — every future would
+                // not even *start* its math until the previous one
+                // returned. Building a `Vec<Future>` and feeding it to
+                // `join_all` is the canonical parallel-batch pattern used
+                // elsewhere in the integration crate (see
+                // `unified_p2p.rs:8059` and `unified_p2p.rs:10543`).
+                //
+                // Performance characteristics:
+                //   * 5-node testnet, ≤ 1 HBC per block in commitment
+                //     window: 1 verify, parallelism irrelevant.
+                //   * 1000-validator committee in mature mainnet, ~20 HBC
+                //     per block at commitment-window peak: 20 verifies
+                //     parallel across ~num_cpus threads → ~ceil(20/cores) *
+                //     5 ms ≈ 10 ms wall-clock on a 16-core super-node,
+                //     well under the 1-second slot budget.
+                //   * Stage runtime is not blocked: each future awaits a
+                //     `JoinHandle` from a separate runtime, so the verify
+                //     stage thread continues to drive other I/O between
+                //     dispatch and join.
+                //
+                // Memory: futures hold immutable borrows on `&tx`. The
+                // borrow set lives until `join_all().await` returns, which
+                // is before we move on from `decoded`. Multiple concurrent
+                // immutable borrows are safe.
                 let mut dilithium_invalid = 0usize;
-                for (idx, tx) in decoded.microblock.transactions.iter().enumerate() {
-                    if tx.dilithium_signature.is_none() {
-                        continue;
-                    }
-                    let dilithium_sig = match &tx.dilithium_signature {
-                        Some(s) if !s.is_empty() => s,
-                        _ => continue, // empty sig is treated as absent
-                    };
-                    let dilithium_pk = match &tx.dilithium_public_key {
-                        Some(p) if !p.is_empty() => p,
-                        _ => {
-                            // Has dilithium_signature but no dilithium_public_key —
-                            // malformed TX, reject the block.
-                            if is_warn() {
-                                println!(
-                                    "[WARN][PIPELINE] dilithium_pk_missing h={} tx_idx={} producer={} action=reject_block",
-                                    mb.height, idx, mb.producer
-                                );
+                {
+                    use futures::future::join_all;
+                    let verify_futures: Vec<_> = decoded.microblock.transactions
+                        .iter()
+                        .filter(|tx| match &tx.dilithium_signature {
+                            Some(s) => !s.is_empty(),
+                            None => false,
+                        })
+                        .map(|tx| crate::node::BlockchainNode::verify_dilithium_tx_signature_async(tx))
+                        .collect();
+                    if !verify_futures.is_empty() {
+                        let results = join_all(verify_futures).await;
+                        for r in results {
+                            match r {
+                                Ok(true) => {} // valid — wrapper format + registry + math all OK
+                                Ok(false) | Err(_) => dilithium_invalid += 1,
                             }
-                            dilithium_invalid += 1;
-                            continue;
                         }
-                    };
-
-                    let sig_bytes = match hex::decode(dilithium_sig) {
-                        Ok(b) if b.len() == 3309 => b, // ML-DSA-65 detached sig
-                        _ => {
-                            dilithium_invalid += 1;
-                            continue;
-                        }
-                    };
-                    let pk_bytes = match hex::decode(dilithium_pk) {
-                        Ok(b) if b.len() == 1952 => b, // ML-DSA-65 public key
-                        _ => {
-                            dilithium_invalid += 1;
-                            continue;
-                        }
-                    };
-
-                    use pqcrypto_mldsa::mldsa65 as dilithium3;
-                    use pqcrypto_traits::sign::PublicKey as PkTrait;
-                    use pqcrypto_traits::sign::DetachedSignature as SigTrait;
-
-                    let pk = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
-                        Ok(p) => p,
-                        Err(_) => { dilithium_invalid += 1; continue; }
-                    };
-                    let sig = match dilithium3::DetachedSignature::from_bytes(&sig_bytes) {
-                        Ok(s) => s,
-                        Err(_) => { dilithium_invalid += 1; continue; }
-                    };
-
-                    // Canonical message — same builder used by RPC validation
-                    // path so the signed bytes are byte-identical across all
-                    // verification sites.
-                    let message = crate::node::BlockchainNode::build_canonical_verify_message(tx);
-
-                    if dilithium3::verify_detached_signature(&sig, message.as_bytes(), &pk).is_err() {
-                        dilithium_invalid += 1;
                     }
                 }
 

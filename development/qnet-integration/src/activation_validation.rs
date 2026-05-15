@@ -892,7 +892,8 @@ impl BlockchainActivationRegistry {
         Ok(())
     }
 
-    /// Simplified device migration for Light nodes, rate-limited for Full/Super nodes
+    /// Simplified device migration for Light nodes, rate-limited for Super nodes.
+    /// (v3.18: the "Full" tier was removed from the protocol.)
     pub async fn migrate_device_on_blockchain(&self, code: &str, wallet_address: &str, new_device_signature: &str) -> Result<(), IntegrationError> {
         println!("🔄 Processing device migration for activation code: {}", code);
         

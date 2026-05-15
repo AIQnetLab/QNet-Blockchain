@@ -453,19 +453,29 @@ class _MyAppState extends State<MyApp> {
 ## Performance Guidelines
 
 ### Memory Usage
-- Light Node: 50-100 MB
-- Full Node: 200-500 MB
-- Super Node: 1-2 GB
+- Light Node (mobile-only, pure API client): **~10-30 MB** for the app
+  itself (SDK + wallet UI + minimal caches). The Light role stores
+  **zero blockchain data** on-device — no blocks, no headers, no
+  certificates. Balance and TX history come from the Super-node REST
+  API; the wallet keeps user TX list in AsyncStorage / localStorage,
+  not in a chain database.
+- Super Node (server only — Light is mobile only): 1–2 GB resident
+  working set (full RocksDB chain + state + caches).
+- *(v3.18+ has only two node roles: Light and Super.)*
 
-### Battery Impact
-- Active Mining: 2-3% per hour
-- Passive Sync: 0.5-1% per hour
+### Battery Impact (Light node only — Super is server-class)
+- Ping response (per ping, ~once every 4-hour window): negligible
+  (single Dilithium3 signature ≈ 30–50 ms of CPU)
 - Idle: < 0.1% per hour
+- (Light nodes do NOT mine and do NOT continuously sync; no "active
+  mining" or "passive sync" battery profile applies.)
 
-### Data Usage
-- Initial Sync: 100-500 MB
-- Daily Usage: 5-50 MB
-- Monthly Average: 500 MB - 2 GB
+### Data Usage (Light node)
+- Per ping cycle: a few KB (challenge + Hybrid Ed25519+Dilithium3
+  attestation, ~2.6 KB compact_bin)
+- Per balance / TX-history query: REST API roundtrip (~1–5 KB)
+- No initial chain sync, no continuous block download. Typical
+  monthly data usage: < 50 MB even for heavily-active wallets.
 
 ## Security Best Practices
 

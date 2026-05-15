@@ -2032,7 +2032,145 @@ impl PersistentStorage {
         println!("[INFO][STORAGE] burn_tx_saved tx={}...", &burn_tx[..8.min(burn_tx.len())]);
         Ok(())
     }
-    
+
+    // ========================================================================
+    // PERMANENT ATTACKER PK BLACKLIST (durable mirror)
+    // ========================================================================
+    // Canonical in-memory state lives in `qnet_consensus::consensus_crypto`.
+    // The methods below mirror that state into the `metadata` column family
+    // so a known attacker keypair cannot regain a transient verification
+    // budget by racing the boot window after a restart.
+    //
+    // Layout (one key per attacker PK fingerprint):
+    //   key = b"attacker_pk_bl/" || sha3_256(attacker_pk)        (47 bytes)
+    //   val = first_seen_unix_s(8 LE) || last_seen_unix_s(8 LE)
+    //       || offense_count(4 LE) || last_node_id_len(2 LE)
+    //       || last_node_id(utf8)                                (≤ 122 bytes)
+    //
+    // Fixed-prefix scan recovers the full set with one iterator pass at
+    // boot. No external schema dependency — values are self-describing
+    // length-prefixed records.
+
+    const ATTACKER_PK_KEY_PREFIX: &'static [u8] = b"attacker_pk_bl/";
+
+    fn encode_attacker_pk_value(rec: &qnet_consensus::consensus_crypto::AttackerRecord) -> Vec<u8> {
+        let node_id_bytes = rec.last_claimed_node_id.as_bytes();
+        let node_id_len = node_id_bytes.len().min(u16::MAX as usize) as u16;
+        let mut buf = Vec::with_capacity(8 + 8 + 4 + 2 + node_id_len as usize);
+        buf.extend_from_slice(&rec.first_seen_unix_s.to_le_bytes());
+        buf.extend_from_slice(&rec.last_seen_unix_s.to_le_bytes());
+        buf.extend_from_slice(&rec.offense_count.to_le_bytes());
+        buf.extend_from_slice(&node_id_len.to_le_bytes());
+        buf.extend_from_slice(&node_id_bytes[..node_id_len as usize]);
+        buf
+    }
+
+    fn decode_attacker_pk_value(
+        data: &[u8],
+    ) -> Option<qnet_consensus::consensus_crypto::AttackerRecord> {
+        if data.len() < 8 + 8 + 4 + 2 {
+            return None;
+        }
+        let mut o = 0;
+        let mut u8x8 = [0u8; 8];
+        u8x8.copy_from_slice(&data[o..o + 8]);
+        let first_seen_unix_s = u64::from_le_bytes(u8x8);
+        o += 8;
+        u8x8.copy_from_slice(&data[o..o + 8]);
+        let last_seen_unix_s = u64::from_le_bytes(u8x8);
+        o += 8;
+        let mut u8x4 = [0u8; 4];
+        u8x4.copy_from_slice(&data[o..o + 4]);
+        let offense_count = u32::from_le_bytes(u8x4);
+        o += 4;
+        let mut u8x2 = [0u8; 2];
+        u8x2.copy_from_slice(&data[o..o + 2]);
+        let node_id_len = u16::from_le_bytes(u8x2) as usize;
+        o += 2;
+        if data.len() < o + node_id_len {
+            return None;
+        }
+        let last_claimed_node_id = String::from_utf8_lossy(&data[o..o + node_id_len]).to_string();
+        Some(qnet_consensus::consensus_crypto::AttackerRecord {
+            first_seen_unix_s,
+            last_seen_unix_s,
+            offense_count,
+            last_claimed_node_id,
+        })
+    }
+
+    /// Persist one attacker-PK blacklist entry. Idempotent overwrite —
+    /// the canonical layer guarantees that on re-insert the record is
+    /// the post-update state, so writing it unconditionally keeps the
+    /// durable row in sync with the in-memory truth.
+    pub fn save_attacker_pk_entry(
+        &self,
+        fingerprint: &[u8; 32],
+        record: &qnet_consensus::consensus_crypto::AttackerRecord,
+    ) -> IntegrationResult<()> {
+        let metadata_cf = self
+            .db
+            .cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let mut key = Vec::with_capacity(Self::ATTACKER_PK_KEY_PREFIX.len() + 32);
+        key.extend_from_slice(Self::ATTACKER_PK_KEY_PREFIX);
+        key.extend_from_slice(fingerprint);
+        let value = Self::encode_attacker_pk_value(record);
+        self.db.put_cf(&metadata_cf, &key, &value)?;
+        Ok(())
+    }
+
+    /// Load every persisted attacker-PK blacklist entry. One iterator
+    /// pass over the fixed-prefix range — called exactly once at boot.
+    /// Malformed rows (e.g. legacy schema, truncated value) are skipped
+    /// with a `[WARN][SECURITY]` log so they don't break the seed
+    /// replay; the in-memory layer simply forgets them, which is safe
+    /// because the Tier-2 verifier will re-record any still-active
+    /// attacker on its next connection attempt.
+    pub fn load_all_attacker_pk_entries(
+        &self,
+    ) -> IntegrationResult<Vec<([u8; 32], qnet_consensus::consensus_crypto::AttackerRecord)>>
+    {
+        use rocksdb::{IteratorMode, Direction};
+        let metadata_cf = self
+            .db
+            .cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let mut out: Vec<([u8; 32], qnet_consensus::consensus_crypto::AttackerRecord)> = Vec::new();
+        let prefix = Self::ATTACKER_PK_KEY_PREFIX;
+        let iter = self
+            .db
+            .iterator_cf(&metadata_cf, IteratorMode::From(prefix, Direction::Forward));
+        let mut malformed: u64 = 0;
+        for item in iter {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(_) => continue,
+            };
+            if !k.starts_with(prefix) {
+                break; // left the prefix range
+            }
+            if k.len() != prefix.len() + 32 {
+                malformed += 1;
+                continue;
+            }
+            let mut fp = [0u8; 32];
+            fp.copy_from_slice(&k[prefix.len()..]);
+            match Self::decode_attacker_pk_value(&v) {
+                Some(rec) => out.push((fp, rec)),
+                None => malformed += 1,
+            }
+        }
+        if malformed > 0 {
+            println!(
+                "[WARN][SECURITY] attacker_pk_blacklist_load malformed={} loaded={} action=skip_malformed",
+                malformed,
+                out.len(),
+            );
+        }
+        Ok(out)
+    }
+
     /// Update activation code for device migration (preserves activation, updates device)
     pub fn update_activation_for_migration(&self, code: &str, node_type: u8, timestamp: u64, new_device_signature: &str) -> IntegrationResult<()> {
         let metadata_cf = self.db.cf_handle("metadata")
@@ -3059,7 +3197,12 @@ impl PersistentStorage {
 /// Storage modes for different node types
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StorageMode {
-    /// Light node - headers only, no full blocks (mobile/IoT)
+    /// Light node — mobile-only pure API client. Stores ZERO blockchain
+    /// data on-device (no blocks, no headers, no certificates). All
+    /// chain reads route through the Super-node REST API; the wallet
+    /// app keeps the user's own TX history in AsyncStorage /
+    /// localStorage, not in this RocksDB. The on-disk footprint for a
+    /// Light role is limited to CF metadata (a few MB at most).
     Light,
     /// Super node - keeps complete blockchain history + sharding support (servers)
     /// v3.18: Full node type removed - only Light and Super remain
@@ -3140,21 +3283,30 @@ pub struct Storage {
     sliding_window_size: u64,
     /// Pattern recognizer for transaction compression
     pattern_recognizer: Arc<RwLock<PatternRecognizer>>,
-    /// Tiered storage configuration (Light/Full/Super)
+    /// Tiered storage configuration (v3.18+ has only two roles: Light
+    /// and Super).
     tier_config: StorageTierConfig,
     /// Graceful degradation manager
     graceful_degradation: Arc<RwLock<GracefulDegradation>>,
-    /// Light node header rotation (for Light mode only)
+    /// DEPRECATED — legacy header-rotation buffer from the historical
+    /// "headers-persisted" Light tier. Current Light nodes are pure
+    /// mobile API clients with zero on-device chain storage, so this
+    /// buffer is a no-op in production. Field retained so the struct
+    /// shape stays stable until all in-tree references migrate.
     light_rotation: Arc<RwLock<LightNodeRotation>>,
 }
 
 // ============================================================================
 // TIERED STORAGE IMPLEMENTATION
 // ============================================================================
-// ALL nodes receive ALL blocks. Storage differs by:
-// - Light: Headers only (~100MB)
-// - Full: Full blocks + pruning (~500GB, 30 days)
-// - Super/Bootstrap: Full blocks, NO pruning (~2TB, full history)
+// Storage tier by node role (v3.18+ — only two roles exist: Light and Super).
+// - Light: ZERO on-device chain storage. Pure mobile API client (phones,
+//   tablets, F-Droid). Reads balance / TX history through REST API on
+//   Super nodes. Wallet app keeps user's own TX list in its native
+//   storage (AsyncStorage / localStorage), NOT in RocksDB.
+// - Super/Bootstrap: Full blocks, NO pruning (~2TB, full history). Only
+//   role that participates in consensus, serves sync requests, and
+//   stores on-chain state.
 // ============================================================================
 
 /// Statistics for tiered storage
@@ -3323,7 +3475,7 @@ impl Storage {
     pub fn get_tiered_storage_stats(&self) -> TieredStorageStats {
         // v3.18: Only Light and Super modes
         let mode_str = match self.storage_mode {
-            StorageMode::Light => "Light (headers only, ~100MB)",
+            StorageMode::Light => "Light (mobile API client, no on-device chain storage)",
             StorageMode::Super => "Super/Bootstrap (full history, ~2TB)",
         };
         
@@ -3383,20 +3535,29 @@ impl Storage {
             optimal_shards
         };
         
-        // TIERED STORAGE CONFIGURATION
+        // TIERED STORAGE CONFIGURATION (v3.18+ — only two roles).
         // ============================================================================
-        // ALL nodes receive ALL blocks from network (via P2P broadcast)
-        // Storage differs by WHAT is kept and for HOW LONG:
-        // - Light: Headers only (~100MB, last 1000 blocks)
-        // - Full: Full blocks + pruning (~500GB, last 30 days)
-        // - Super/Bootstrap: Full blocks, NO pruning (~2TB, complete history)
+        // - Light: ZERO on-device chain storage. Mobile-only pure API client.
+        //          No blocks, no headers, no certs in RocksDB. All chain data
+        //          accessed via REST API on Super nodes; wallet app stores
+        //          user TX history in AsyncStorage / localStorage. The
+        //          `max_storage_gb` and `base_window` values below are
+        //          legacy parameters retained for the tuple shape and a
+        //          minimal RocksDB footprint (CF metadata, no chain data);
+        //          actual chain-data writes are no-ops — see
+        //          `StorageTierConfig::light()` and the `StorageMode::Light`
+        //          branch in `save_microblock` further down this file.
+        // - Super/Bootstrap: Full blocks, NO pruning (~2TB, complete history).
         // ============================================================================
-        
+
         let (storage_mode, max_storage_gb, base_window, tier_config) = match node_type.to_lowercase().as_str() {
             "light" => (
-                StorageMode::Light, 
-                1,  // ~100 MB
-                1_000, // Keep last 1000 block headers
+                StorageMode::Light,
+                1,      // legacy field — chain storage is disabled; this only sizes
+                        // the RocksDB CF metadata footprint on mobile (≈ few MB).
+                1_000,  // legacy field — Light never persists chain blocks; this
+                        // value is unused at runtime (StorageMode::Light branch
+                        // in save_microblock is a no-op).
                 StorageTierConfig::light()
             ),
             // v3.18: "full" maps to Super for backward compatibility
@@ -3419,14 +3580,15 @@ impl Storage {
         
         // Log tiered storage configuration (v3.18: only Light and Super)
         let (mode_name, storage_desc) = match storage_mode {
-            StorageMode::Light => ("light", "headers_only ~100MB"),
+            StorageMode::Light => ("light", "mobile_api_client_no_chain_storage"),
             StorageMode::Super => ("super", "full_history_archival ~2TB"),
         };
-        println!("[INFO][STORAGE] config mode={} storage={} pruning_window={}", 
+        println!("[INFO][STORAGE] config mode={} storage={} pruning_window={}",
                  mode_name, storage_desc, tier_config.pruning_window_blocks);
-        
-        // v3.18: Only Light and Super modes - no sliding window scaling needed
-        // Super nodes keep everything, Light nodes keep minimal headers
+
+        // v3.18: Only Light and Super modes — no sliding-window scaling needed.
+        // Super nodes keep everything; Light nodes store no chain data at all,
+        // so the `sliding_window` value below is unused on Light at runtime.
         let sliding_window = base_window;
         
         // Allow override via environment
@@ -3484,7 +3646,11 @@ impl Storage {
         // Initialize graceful degradation manager
         let graceful_degradation = GracefulDegradation::new(storage_mode);
         
-        // Initialize light node rotation (1000 headers = ~100MB)
+        // Initialize the deprecated light-node header-rotation buffer.
+        // Light tier is now a pure-API-client role (zero on-device chain
+        // storage), so this buffer is a no-op in production — kept only
+        // for backward-compat field presence. See `LightNodeRotation`
+        // docstring above for the deprecation note.
         let light_rotation = LightNodeRotation::new(tier_config.pruning_window_blocks);
             
         Ok(Self { 
@@ -3680,8 +3846,10 @@ impl Storage {
         // =====================================================================
         // This method now includes:
         // 1. Storage health check with graceful degradation
-        // 2. Tiered storage based on node type (Light/Full/Super)
-        // 3. Light node auto-rotation to maintain ~100MB
+        // 2. Tiered storage based on node type (Light / Super)
+        // 3. Light-node short-circuit: writes are no-ops (pure API client,
+        //    no on-device chain storage). All chain-data persistence below
+        //    runs only on Super nodes.
         // =====================================================================
         
         // Step 1: Check for graceful degradation (every 100 blocks to reduce overhead)
@@ -4455,7 +4623,28 @@ impl Storage {
     pub fn save_activation_burn_tx(&self, burn_tx: &str) -> IntegrationResult<()> {
         self.persistent.save_activation_burn_tx(burn_tx)
     }
-    
+
+    /// SECURITY: Persist one attacker-PK blacklist entry (delegates to
+    /// the inner `PersistentStorage`). Used by the persistence callback
+    /// installed in `node.rs` boot path.
+    pub fn save_attacker_pk_entry(
+        &self,
+        fingerprint: &[u8; 32],
+        record: &qnet_consensus::consensus_crypto::AttackerRecord,
+    ) -> IntegrationResult<()> {
+        self.persistent.save_attacker_pk_entry(fingerprint, record)
+    }
+
+    /// SECURITY: Replay every persisted attacker-PK blacklist entry at
+    /// boot. Delegates to the inner `PersistentStorage`. Empty result
+    /// is normal on a fresh data directory.
+    pub fn load_all_attacker_pk_entries(
+        &self,
+    ) -> IntegrationResult<Vec<([u8; 32], qnet_consensus::consensus_crypto::AttackerRecord)>>
+    {
+        self.persistent.load_all_attacker_pk_entries()
+    }
+
     /// Find transaction by hash
     pub async fn find_transaction_by_hash(&self, tx_hash: &str) -> IntegrationResult<Option<qnet_state::Transaction>> {
         self.persistent.find_transaction_by_hash(tx_hash).await
@@ -5406,7 +5595,7 @@ impl Storage {
     /// Save block with optimal compression (delegates to unified save_microblock)
     /// 
     /// UNIFIED STORAGE: All block saving goes through save_microblock() which handles:
-    /// - Tiered storage (Light/Full/Super)
+    /// - Tiered storage (v3.18+ — Light and Super only)
     /// - Pattern Recognition compression (89% for simple transfers)
     /// - EfficientMicroBlock format (hashes only + separate TX storage)
     /// - Adaptive Zstd compression (levels 3-22 based on age)
@@ -6809,10 +6998,10 @@ impl Storage {
     }
     
     // ============================================
-    // PRODUCTION: HEARTBEAT STORAGE (Full/Super nodes)
+    // PRODUCTION: HEARTBEAT STORAGE (Super nodes)
     // ============================================
     
-    /// Save Full/Super node heartbeat (persistent for reward calculation)
+    /// Save Super node heartbeat (persistent for reward calculation)
     /// PRODUCTION v2.78: Now includes Dilithium signature for HeartbeatCommitment TX
     pub fn save_heartbeat(&self, node_id: &str, heartbeat_index: u8, timestamp: u64, block_height: u64, dilithium_signature: &str) -> IntegrationResult<()> {
         let hb_cf = self.persistent.db.cf_handle("heartbeats")
@@ -8510,9 +8699,16 @@ impl Storage {
         Ok(pruned_count)
     }
     
-    /// Light node pruning - keep only block headers and recent state
+    /// DEPRECATED — legacy "headers-only" Light pruning pass.
+    ///
+    /// Current Light tier (v3.18+) is a pure mobile API client with
+    /// zero on-device chain storage; the `save_microblock` path is a
+    /// no-op for `StorageMode::Light`, so this pruning function should
+    /// never observe any rows to convert. Retained for backward
+    /// compatibility with the historical header-rotation tier and to
+    /// keep call sites compiling. Will be removed in a future cleanup.
     fn prune_for_light_node(&self) -> IntegrationResult<()> {
-        println!("[INFO][STORAGE] light_node_prune_start mode=headers_only");
+        println!("[INFO][STORAGE] light_node_prune_start mode=legacy_no_op");
         
         let microblocks_cf = self.persistent.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
@@ -9154,9 +9350,12 @@ impl Storage {
     pub async fn fast_sync_with_snapshot(&self, p2p: &crate::unified_p2p::SimplifiedP2P, target_height: u64) -> IntegrationResult<()> {
         println!("[INFO][STORAGE] fast_sync_start target_height={}", target_height);
         
-        // For Light nodes, only sync recent state
+        // Light nodes do not perform fast-sync at all — they are pure
+        // mobile API clients with zero on-device chain storage. All
+        // chain reads happen via the Super-node REST API at request
+        // time, so there is nothing to download here.
         if self.storage_mode == StorageMode::Light {
-            println!("[INFO][STORAGE] fast_sync_light_node mode=recent_headers_only");
+            println!("[INFO][STORAGE] fast_sync_skipped role=light_api_client");
             return Ok(());
         }
         

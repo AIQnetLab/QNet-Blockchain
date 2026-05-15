@@ -153,13 +153,12 @@ curl http://localhost:8545/api/v1/metrics
 
 ### Node Types & Capabilities
 
-| Type | Access Cost | Capabilities | Storage | Performance |
-|------|-------------|--------------|---------|-------------|
-| **Light** | 1,500-300 $1DEV | Basic validation, mobile-optimized | ~100MB (headers only) | 8,859 TPS mobile |
-| ~~**Full**~~ | ~~1,500-300 $1DEV~~ | ~~v3.18: REMOVED~~ | ~~~500GB (pruned)~~ | ~~424,411 TPS blockchain~~ |
-| **Super** | 1,500-300 $1DEV | Priority validation, full archive | ~2TB (no pruning) | 424,411 TPS blockchain |
+| Type | Access Cost | Role | On-device Storage | Performance |
+|------|-------------|------|-------------------|-------------|
+| **Light** | 1,500-300 $1DEV | Mobile-only PoP participant (phone/tablet, Android/iOS, F-Droid). Earns rewards by responding to Genesis-driven pings. NOT part of consensus, NOT a P2P block relay. | 0 bytes of chain data — pure REST API client | N/A (does not validate or produce blocks) |
+| **Super** | 1,500-300 $1DEV | Server-class validator. Produces and validates blocks, runs P2P sharding, serves Light-node API queries, archives full history. | ~2 TB (full history, no pruning) | 424,411 TPS blockchain |
 
-> **Note (v2.19.10)**: Sharding is for parallel TX processing, NOT storage partitioning. All nodes receive all blocks; storage differs by tier.
+> **Two roles, v3.18+**: Only Light and Super exist. The legacy "Full" tier was removed and is no longer a valid node type. Only Super nodes participate in P2P block sync and consensus; Light nodes are mobile clients that read chain state through the Super-node REST API and respond to pings to earn QNC. All on-chain validation is performed by Super nodes; Light nodes do not validate blocks.
 
 ### Performance Metrics
 - ✅ **424,411 TPS** achieved (verified June 2025) ⚡

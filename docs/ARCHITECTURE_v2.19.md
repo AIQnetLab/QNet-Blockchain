@@ -1383,7 +1383,8 @@ MaliciousBehavior:  Permanent (until reputation ≥ 70%)
 
 ```rust
 pub fn get_sync_peers_filtered(&self, max_peers: usize) -> Vec<PeerInfo> {
-    // 1. Exclude Light nodes (don't store full blocks)
+    // 1. Exclude Light nodes (mobile API clients — store ZERO chain
+    //    data on-device, so they cannot serve sync requests).
     // 2. Filter blacklisted peers (soft: temporary, hard: until reputation recovered)
     // 3. Check Byzantine threshold (consensus_score ≥ 70%)
     // 4. Sort by network_score (latency) + consensus_score (reliability)
@@ -1450,9 +1451,11 @@ pub fn is_consensus_qualified(&self) -> bool {
 
 **Universal 70% Threshold**: Applies to ALL node types (Genesis, Super, Full)
 
-**Node Type Matrix**:
-- **Light**: ❌ Never in consensus (only receive macroblock headers)
-- **Full**: ✅ If `consensus_score` ≥ 70%
+**Node Type Matrix (v3.18+ — only Light and Super exist):**
+- **Light**: ❌ Never in consensus. Mobile-only API client — does NOT
+  store chain data, does NOT receive block broadcasts, does NOT relay
+  blocks. Reads chain state via REST API and earns rewards purely
+  through Genesis-driven PoP pings.
 - **Super**: ✅ If `consensus_score` ≥ 70%
 
 ### Light Node Reputation (Fixed)

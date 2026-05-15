@@ -2078,17 +2078,16 @@ All persistent data in QNet uses cryptographic integrity verification:
 | **Reputation** | SHA3-256 | Tamper detection |
 | **Jail Status** | SHA3-256 | Batched file integrity |
 
-### 8.2 Storage Architecture by Node Type (v2.19.10)
+### 8.2 Storage Architecture by Node Type (v3.18+ — only Light and Super exist)
 
-| Node Type | Storage | What is Stored | Pruning |
-|-----------|---------|----------------|---------|
-| **Light** | **~100 MB** | Headers only (FIFO rotation) | Auto-rotate oldest |
-| **Full** | **~500 GB** | Full blocks + transactions | 30-day window |
-| **Super** | **~2 TB** | Complete history | No pruning (archival) |
+| Node Type | On-device chain data | What is Stored | Pruning |
+|-----------|----------------------|----------------|---------|
+| **Light** | **0 bytes** | Nothing — pure mobile API client. Wallet app keeps user TX list in AsyncStorage / localStorage. | N/A |
+| **Super** | **~2 TB** | Complete history (blocks, transactions, state, certificates) | No pruning (archival) |
 
-**Compression**: Zstd-3 for all transactions (~50% reduction, lossless)
+**Compression**: Zstd-3 for all transactions (~50% reduction, lossless), applied on Super nodes only.
 
-**Note (v2.19.10)**: Sharding is for parallel TX processing, NOT storage partitioning. All nodes receive all blocks via P2P broadcast.
+**Note**: Sharding is for parallel TX processing, NOT storage partitioning. Only Super nodes participate in P2P block sync; Light nodes never receive block broadcasts and read chain state exclusively through the REST API on Super nodes.
 
 ### 8.3 Transaction Pruning (v2.19.7)
 
@@ -2144,10 +2143,9 @@ All nodes receive ALL blocks via P2P broadcast. Shards determine which transacti
 | 100K-500K nodes | 128 | ~512K TPS |
 | 500K+ nodes | 256 | ~1M+ TPS |
 
-**Storage is determined by NODE TYPE, not shards:**
-- Light: ~100 MB (headers only)
-- Full: ~500 GB (30-day pruning)
-- Super: ~2 TB (full history)
+**Storage is determined by NODE TYPE, not shards (v3.18+ — only two roles):**
+- Light: 0 bytes of chain data (mobile API client; no on-device blocks/headers)
+- Super: ~2 TB (full history, archival)
 
 **Implementation:**
 ```rust

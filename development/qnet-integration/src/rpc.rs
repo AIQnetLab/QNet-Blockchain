@@ -1733,7 +1733,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_status);
 
-    // Server node status endpoint (Full/Super/Genesis node monitoring)
+    // Server node status endpoint (Super-node monitoring, including Genesis bootstrap nodes)
     let server_node_status = api_v1
         .and(warp::path("node"))
         .and(warp::path("status"))
@@ -2599,7 +2599,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     println!("🏛️ Macroblock Consensus: Commit-Reveal, Byzantine Fault Tolerance");
     println!("📜 Smart Contract API: Deploy, Call, Query");
     
-    // Start Light node ping service for Full/Super nodes  
+    // Start Light node ping service for Super nodes  
     let blockchain_for_ping = blockchain.clone();
     let node_type = blockchain_for_ping.get_node_type();
     if !matches!(node_type, crate::node::NodeType::Light) {
@@ -6173,7 +6173,7 @@ async fn verify_dilithium_signature(node_id: &str, message: &str, signature: &st
 
 /// PRODUCTION v2.78: Verify Light node signature (HYBRID - Ed25519+Dilithium)
 /// ARCHITECTURE: Light nodes use compact_bin HYBRID signature format
-/// Same format as Full/Super nodes for consistency and quantum resistance
+/// Same format as Super nodes for consistency and quantum resistance
 async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: &str, blockchain: &Arc<BlockchainNode>) -> bool {
     // Basic validation
     if node_id.is_empty() || challenge.is_empty() || signature.is_empty() {
@@ -6187,7 +6187,7 @@ async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: 
     // Format: "compact_bin:<base64_bincode_zstd>" - same as pinger attestations
     // This provides quantum resistance for Light node attestations
     if signature.starts_with("compact_bin:") {
-        // Use unified P2P verification (same as Full/Super nodes)
+        // Use unified P2P verification (same as Super nodes)
         if let Some(p2p) = blockchain.get_unified_p2p() {
             // verify_dilithium_heartbeat_signature supports compact_bin format
             let is_valid = p2p.verify_dilithium_heartbeat_signature(challenge, signature, node_id);
@@ -7427,7 +7427,7 @@ async fn handle_light_node_register(
     WALLET_REG_FAIL_TIMESTAMPS.remove(&register_request.wallet_address);
 
     // CRITICAL: Gossip Light node registration to P2P network for decentralized sync
-    // This ensures ALL Full/Super nodes have the same Light node registry
+    // This ensures ALL Super nodes have the same Light node registry
     if let Some(p2p) = blockchain.get_unified_p2p() {
         use crate::unified_p2p::LightNodeRegistrationData;
         
@@ -8388,7 +8388,7 @@ async fn handle_light_node_status(
     })))
 }
 
-/// Handle Server node (Full/Super/Genesis) status check
+/// Handle Server node (Super, including Genesis) status check
 /// Returns online status, heartbeat count, and activity info
 async fn handle_server_node_status(
     params: HashMap<String, String>,
@@ -8411,7 +8411,7 @@ async fn handle_server_node_status(
     let current_window = now - (now % (4 * 60 * 60)); // Current 4h window
     
     if let Some(p2p) = blockchain.get_unified_p2p() {
-        // Get active Full/Super nodes
+        // Get active Super nodes
         let active_nodes = p2p.get_active_full_super_nodes();
         
         // Find node by activation_code or node_id
@@ -8891,7 +8891,7 @@ fn calculate_next_ping_time(node_id: &str) -> u64 {
     }
 }
 
-// Calculate all ping times for Full/Super nodes (10 pings per 4h window)
+// Calculate all ping times for Super nodes (10 pings per 4h window)
 #[allow(dead_code)]
 fn calculate_full_super_ping_times(node_id: &str) -> Vec<u64> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -8925,7 +8925,7 @@ fn calculate_full_super_ping_times(node_id: &str) -> Vec<u64> {
 // ============================================================================
 // PRODUCTION: Sharded Light Node Ping System
 // ============================================================================
-// SCALABLE: Each Full/Super node only pings Light nodes in its shard (1/256)
+// SCALABLE: Each Super node only pings Light nodes in its shard (1/256)
 // NO DUPLICATES: Deterministic pinger selection (primary + 2 backups)
 // DECENTRALIZED: Attestations gossiped to all nodes for reward eligibility
 // ============================================================================
@@ -9357,7 +9357,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             // ================================================================
             // FULL/SUPER NODE HEARTBEAT (Self-Attestation)
             // ================================================================
-            // Note: Full/Super nodes use self-attestation (heartbeats) not network pings
+            // Note: Super nodes use self-attestation (heartbeats) not network pings
             // The heartbeat service is started separately in unified_p2p.rs
             // Here we just verify heartbeats from other nodes
             

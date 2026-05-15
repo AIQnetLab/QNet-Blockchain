@@ -375,9 +375,11 @@ impl ShardedRewardManager {
                         _ => false,
                     };
                     
-                    // Reputation requirements by node type:
+                    // Reputation requirements by node type (v3.18+ — Light and Super only):
                     // Light: ANY reputation (mobile devices, don't participate in consensus)
-                    // Full/Super: >= MIN_CONSENSUS_REPUTATION (must maintain network quality)
+                    // Super: >= MIN_CONSENSUS_REPUTATION (must maintain network quality).
+                    // The legacy "full" string below is silently mapped to Super for backward
+                    // compatibility with pre-v3.18 stored activation codes.
                     let eligible_for_new_rewards = match node_type.to_lowercase().as_str() {
                         "light" => true, // Light nodes: no reputation requirement
                         "full" | "super" => reputation >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION,

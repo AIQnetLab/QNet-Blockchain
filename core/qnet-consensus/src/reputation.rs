@@ -258,8 +258,9 @@ impl NodeReputation {
         for node_id in nodes_to_decay {
             let current = self.get_reputation(&node_id);
             
-            // CRITICAL: Check if node was active recently
-            // Full/Super nodes ping 10 times per 4 hours = every 24 minutes
+            // CRITICAL: Check if node was active recently.
+            // Super nodes ping 10 times per 4 hours = every 24 minutes
+            // (v3.18: the "Full" tier was removed; only Super nodes ping).
             // We check 1 hour window which should contain ~2.5 pings
             // This aligns with decay_interval (1 hour) from config
             let was_active = last_activity.get(&node_id)

@@ -602,9 +602,10 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
   - Auto-cleanup: Keeps only last 5 snapshots
   - Zstd-15 compression for snapshot data
   - SHA3-256 integrity verification
-- **Tiered Storage** (v2.19.10 - corrected estimates with Zstd-3 only):
-  - Light nodes: **~100 MB** (headers only, FIFO auto-rotation)
-  - Full nodes: **~500 GB** (30-day pruning window)
+- **Tiered Storage** (v3.18+ — Light/Super only; "Full" merged into Super):
+  - Light nodes: **0 bytes of on-device chain data** — pure mobile API
+    client. Balance / TX history fetched via REST API on Super nodes;
+    wallet app stores user TX list in AsyncStorage / localStorage.
   - Super nodes (archival): **~2 TB** (full history, no pruning)
   - Storage with Zstd-3 (~50% reduction):
     - 100 TPS: ~220 GB/year (Super), ~18 GB (Full 30d)

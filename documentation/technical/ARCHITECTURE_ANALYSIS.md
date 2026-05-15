@@ -25,10 +25,14 @@
    - Easy to upgrade individual components
    - Good for parallel development
 
-4. **Mobile Support**
-   - Light nodes with 2-4GB RAM
-   - Battery optimization
-   - Progressive sync
+4. **Mobile Support (Light role)**
+   - Mobile-only pure API client (phones/tablets, Android/iOS, F-Droid)
+   - Zero on-device blockchain storage — chain state read via REST API
+     on Super nodes; wallet TX list kept in AsyncStorage / localStorage
+   - Battery-optimised push protocol (FCM / UnifiedPush / Polling)
+   - Earns QNC rewards by responding to Genesis-driven Proof-of-Presence
+     pings; does NOT participate in consensus or block production
+   - No "progressive sync" — no blocks are downloaded at all
 
 ### Weaknesses ⚠️
 

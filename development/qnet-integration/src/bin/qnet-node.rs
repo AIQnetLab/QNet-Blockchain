@@ -1354,8 +1354,9 @@ fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
         }
     }
     
-    // PRODUCTION FIX: Provide appropriate bootstrap nodes based on context
-    // Light nodes connect to Full/Super nodes, servers connect to Genesis nodes
+    // PRODUCTION FIX: Provide appropriate bootstrap nodes based on context.
+    // Light nodes connect to Super nodes; servers connect to Genesis nodes.
+    // (v3.18: the "Full" tier was removed from the protocol.)
     let is_light_node = std::env::var("QNET_NODE_TYPE")
         .map(|t| t.to_lowercase() == "light")
         .unwrap_or(false);
@@ -3198,13 +3199,18 @@ fn configure_production_mode() {
 }
 
 fn parse_node_type(type_str: &str) -> Result<NodeType, String> {
+    // v3.18+: only Light (mobile-only) and Super (server) exist. The
+    // string "full" is silently accepted and mapped to Super so that
+    // legacy operator scripts and stored configs from before v3.18 do
+    // not break, but new deployments should use "super" — the only
+    // server role advertised in the help text below.
     match type_str.to_lowercase().as_str() {
         "light" => {
-            Err("❌ Light nodes are not supported on servers! Light nodes are restricted to mobile devices only. Use 'full' or 'super' for server deployment.".to_string())
+            Err("❌ Light nodes are not supported on servers! Light nodes are restricted to mobile devices only. Use 'super' for server deployment.".to_string())
         },
-        "full" => Ok(NodeType::Super),
+        "full" => Ok(NodeType::Super),     // legacy alias kept for backward compat
         "super" => Ok(NodeType::Super),
-        _ => Err(format!("❌ Invalid node type: '{}' for server deployment.\n🖥️  Servers support: full, super\n📱 Mobile devices support: light", type_str)),
+        _ => Err(format!("❌ Invalid node type: '{}' for server deployment.\n🖥️  Servers support: super\n📱 Mobile devices support: light", type_str)),
     }
 }
 

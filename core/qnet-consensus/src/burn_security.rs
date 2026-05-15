@@ -80,7 +80,7 @@ pub struct NodeActivationInfo {
     /// When they activated
     pub activated_at: u64,
     
-    /// Node type (Light/Full/Super)
+    /// Node type (v3.18+: Light or Super; "Full" tier removed from the protocol)
     pub node_type: NodeType,
     
     /// Current reputation

@@ -937,13 +937,18 @@ Response requirements:
 └── Super Nodes: 90% (9+ out of 10 heartbeats in current window)
 (v3.18: Full Nodes removed)
 
-Architecture (v2.23):
-├── Light: Full/Super nodes ping via FCM V1 API → Light signs challenge → attestation
-├── Full/Super: Self-attest via heartbeats (10 per 4h window, HYBRID signature - quantum-resistant)
-├── 256-shard ping system: Light nodes assigned to pingers based on SHA3-256(node_id)[0]
+Architecture (v3.18+):
+├── Light: 5 Genesis nodes ping mobile Light nodes (FCM V1 / UnifiedPush / Polling)
+│           → Light signs challenge with Dilithium3 ping-delegation key
+│           → pinger creates HYBRID Ed25519+Dilithium3 attestation
+├── Super: Self-attest via heartbeats (10 per 4h window, HYBRID signature, quantum-resistant)
+├── Linear sharding: each of 5 Genesis pings 20% of Light registry (sorted by node_id)
 ├── Light node reputation: Fixed at 70 (immutable, not affected by events)
-├── Storage: Tiered (Light ~10MB thin client, Full ~500GB pruned, Super ~2TB full)
-└── Mobile monitoring: viewing only, no attestations
+├── Storage tiers (v3.18+ — only two roles exist):
+│     * Light → 0 bytes of on-device chain data (mobile pure API client;
+│       balance/TX history read via REST API on Super nodes)
+│     * Super → ~2 TB (full history, archival, no pruning)
+└── Mobile role: ping-response only — no block download, no broadcast, no relay
 
 Deterministic On-Chain Heartbeats (v2.41):
 ├── Heartbeats collected via gossip → stored in heartbeat_history (RAM)
@@ -963,8 +968,10 @@ Deterministic On-Chain Heartbeats (v2.41):
 
 **NEW Rewards eligibility (unified for ALL node types):**
 - **ALL Nodes (Light/Full/Super)**: Reputation ≥70 required for network to ping you → NEW rewards
-- **Light Nodes**: Do NOT participate in consensus (viewing only)
-- **Full/Super Nodes**: Participate in consensus (reputation ≥70 required)
+- **Light Nodes**: Mobile-only, do NOT participate in consensus. No on-device chain storage; do not download or relay blocks. Earn rewards purely by responding to Genesis-driven PoP pings.
+- **Super Nodes**: Participate in consensus (reputation ≥70 required). Produce and validate blocks; archive full history; serve Light-node REST API queries.
+
+*(v3.18: the "Full" tier was removed from the protocol. Only Light and Super exist.)*
 
 **Claiming rewards logic:**
 - **NEW rewards**: Network pings you ONLY if reputation ≥70 (applies to ALL node types)
@@ -1096,7 +1103,8 @@ Recovery: If no issues for 5 minutes → reset counter
 
 ```
 get_sync_peers_filtered(max: 20):
-  1. Filter: Exclude Light nodes (don't store full blocks)
+  1. Filter: Exclude Light nodes (mobile API clients — store ZERO chain
+              data on-device, cannot serve sync requests).
   2. Filter: Exclude blacklisted peers
   3. Filter: Check consensus_score ≥ 70% (Byzantine-safe)
   4. Sort by:
@@ -1863,11 +1871,12 @@ pub struct QNetSignature {
 
 **Node-Specific Storage Requirements:**
 
-| Node Type | Storage | Data Stored |
-|-----------|---------|-------------|
-| **Light** | **~10 MB** | Nothing (thin client - all data via RPC) |
-| **Full** | ~50 GB | Sliding window (100K blocks) + snapshots |
-| **Super** | 400+ GB | Full history with archival |
+| Node Type | On-device chain data | Notes |
+|-----------|----------------------|-------|
+| **Light** | **0 bytes** | Pure mobile API client — all chain data fetched via REST API on Super nodes. Wallet keeps user's own TX list in AsyncStorage / localStorage. |
+| **Super** | ~2 TB (full archival) | Complete chain history, no pruning. Only role that stores and serves blocks. |
+
+*(v3.18+ has only two node roles: Light and Super. The historical "Full" tier has been removed from the protocol.)*
 
 **Pruning System (v2.19.7):**
 
@@ -2415,10 +2424,14 @@ Security Thresholds:
 ├── 10-69: Limited network access (no NEW rewards, no network pings, no consensus)
 └── <10: Network ban enforced (can still claim OLD rewards)
 
-NEW Rewards Distribution (unified for ALL node types):
+NEW Rewards Distribution (v3.18+ — only two node roles: Light and Super):
 ├── ALL Nodes: reputation ≥70 required (network pings you → NEW rewards)
-├── Light Nodes: Do NOT participate in consensus (viewing only)
-└── Full/Super Nodes: Participate in consensus (reputation ≥70 required)
+├── Light Nodes: Mobile-only PoP — do NOT participate in consensus. No
+│                on-device chain storage; do not download or relay
+│                blocks. Earn rewards purely by responding to
+│                Genesis-driven pings.
+└── Super Nodes: Server-class validators (reputation ≥70 required).
+                 Produce/validate blocks, archive full history.
 
 OLD Rewards Claiming:
 ├── No reputation requirement (only wallet ownership)

@@ -1,12 +1,13 @@
 //! Archive Replication Manager - Production system for distributed blockchain archival
-//! 
-//! This module implements a distributed archival system where:
-//! - Full nodes archive 3 chunks as network obligation
+//!
+//! This module implements a distributed archival system where (v3.18+ — only
+//! Light and Super exist; the legacy "Full" tier was removed from the protocol):
 //! - Super nodes archive 8 chunks as network obligation
 //! - Genesis nodes archive 20+ chunks for critical network infrastructure
 //! - Automatic replication ensures 3+ copies of each chunk exist
 //! - Compliance enforcement maintains network fault tolerance
 //! - Background monitoring ensures archival obligations are met
+//! - Light nodes have no archival obligation (mobile API clients, no chain storage)
 
 use std::collections::HashMap;
 use std::sync::Arc;

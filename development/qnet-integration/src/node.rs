@@ -2666,7 +2666,7 @@ fn generate_eon_address_from_id(id: &str) -> String {
 
 // DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
-/// v3.18: Removed Full node type - only Light and Super remain
+/// v3.18: Removed Super node type - only Light and Super remain
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum NodeType {
     Light,
@@ -5199,7 +5199,7 @@ impl BlockchainNode {
     /// Cache node registration for fast lookups
     async fn cache_node_registration(&self, node_id: &str, node_type: qnet_state::NodeType, wallet: String) {
         // Use storage for persistence
-        // v3.18: Full node type removed
+        // v3.18: Super node type removed
         let type_str = match node_type {
             qnet_state::NodeType::Light => "light",
             qnet_state::NodeType::Super => "super",
@@ -5592,7 +5592,9 @@ impl BlockchainNode {
             }
         }
         
-        // STEP 1B: Collect Full/Super node heartbeats from gossip-synced registry
+        // STEP 1B: Collect Super-node heartbeats from gossip-synced registry
+        //          (v3.18: the "Full" tier was removed; only Super nodes
+        //          self-attest via heartbeats.)
         // v2.64: Use BLOCK HEIGHT filtering for deterministic emission (not UTC timestamp!)
         // This ensures all nodes see the same heartbeats regardless of network start time
         let heartbeats = p2p.get_heartbeats_for_block_range(window_start_height, window_end_height);
@@ -5617,7 +5619,7 @@ impl BlockchainNode {
             });
         }
         
-        // Register eligible Full/Super nodes
+        // Register eligible Super nodes
         // v2.64: Use block height filtering for deterministic eligibility
         let eligible_full_super = p2p.get_eligible_full_super_nodes_by_height(window_start_height, window_end_height);
         let eligible_count = eligible_full_super.len();
@@ -6051,27 +6053,29 @@ impl BlockchainNode {
         Ok(())
     }
     
-    /// PRODUCTION v2.78: Ping ALL Light nodes and collect attestations
-    /// ARCHITECTURE: Each Full/Super node pings 100% of registered Light nodes
+    /// PRODUCTION v2.78: Ping ALL Light nodes and collect attestations.
+    /// ARCHITECTURE: Each Super node pings 100% of registered Light nodes.
+    /// (v3.18: the "Full" tier was removed; only Super nodes ping Light.)
     /// - Deterministic: Uses node_id hash to determine pinging schedule
     /// - Parallel: Pings multiple Light nodes simultaneously
     /// - Resilient: Retries failed pings with exponential backoff
-    /// 
-    /// GUARANTEE: 100% coverage regardless of Full/Super node count
-    /// - 1 Full node + 1000 Light nodes = 1 node pings all 1000
-    /// - 100 Full nodes + 1M Light nodes = each pings all 1M (dedupe on-chain)
-    /// 
+    ///
+    /// GUARANTEE: 100% coverage regardless of Super-node count.
+    /// - 1 Super node + 1000 Light nodes = 1 node pings all 1000
+    /// - 100 Super nodes + 1M Light nodes = each pings all 1M (dedupe on-chain)
+    ///
     /// SCALABILITY: Light nodes deduplicated in MacroBlock (HashMap)
     /// Returns: Number of successful pings
     #[allow(dead_code)]
     async fn ping_all_light_nodes_for_epoch(&self) -> Result<u32, QNetError> {
         // PRODUCTION v2.78: Verify continuous pinging system created attestations for ALL Light nodes
-        // 
+        //
         // ARCHITECTURE:
-        //   - Continuous system (rpc.rs): Each Full/Super node pings 1/N of ALL Light nodes every minute
-        //     * 5 Full nodes → each pings 20% Light nodes → 100% coverage ✅
-        //     * 100 Full nodes → each pings 1% Light nodes → 100% coverage ✅
-        //     * 1 Full node → pings 100% Light nodes → 100% coverage ✅
+        //   - Continuous system (rpc.rs): Each Super node pings 1/N of ALL Light
+        //     nodes every minute.
+        //     * 5 Super nodes → each pings 20% of Light nodes → 100% coverage ✅
+        //     * 100 Super nodes → each pings 1% Light nodes → 100% coverage ✅
+        //     * 1 Super node → pings 100% Light nodes → 100% coverage ✅
         //   - This function: Verify coverage and report
         
         let p2p = match &self.unified_p2p {
@@ -6118,7 +6122,7 @@ impl BlockchainNode {
         if coverage_pct < 80 {
             println!("[WARN][PING-VERIFY] Low Light node coverage ({}%)! node={} epoch={}", 
                      coverage_pct, self.node_id, current_epoch);
-            println!("[WARN][PING-VERIFY] Active Full/Super nodes: {}", 
+            println!("[WARN][PING-VERIFY] Active Super nodes: {}",
                      p2p.get_active_full_super_nodes().len());
             
             // List some missing nodes for debugging
@@ -6501,15 +6505,16 @@ impl BlockchainNode {
         Ok(commitment_tx)
     }
     
-    /// PRODUCTION v2.78: Create PingCommitment TX for Light nodes pinged by this Full/Super node
-    /// Each Full/Super node submits ONE commitment TX per epoch containing:
+    /// PRODUCTION v2.78: Create PingCommitment TX for Light nodes pinged by this Super node.
+    /// (v3.18: the "Full" tier was removed; only Super nodes ping Light.)
+    /// Each Super node submits ONE commitment TX per epoch containing:
     /// - Merkle root of all pings to Light nodes
     /// - Deterministic samples (10 or 1%) with Merkle proofs
     /// - Shard-based aggregation for scalability (1000+ Light nodes)
-    /// 
-    /// ARCHITECTURE: Similar to HeartbeatCommitment but for Light node attestations
-    /// - Full/Super nodes ping Light nodes throughout the epoch
-    /// - At commitment window (50 blocks before epoch end), create PingCommitment TX
+    ///
+    /// ARCHITECTURE: Similar to HeartbeatCommitment but for Light node attestations.
+    /// - Super nodes ping Light nodes throughout the epoch.
+    /// - At commitment window (50 blocks before epoch end), create PingCommitment TX.
     /// - MacroBlock aggregates all PingCommitment TXs for reward calculation
     /// 
     /// Arguments:
@@ -6962,7 +6967,7 @@ impl BlockchainNode {
                 last_heartbeat_time,
                 ..
             } = tx_type {
-                // v3.18: Full nodes removed
+                // v3.18: Super nodes removed
                 let node_type = if node_id.starts_with("light_") {
                     0
                 } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
@@ -7023,7 +7028,7 @@ impl BlockchainNode {
                 last_heartbeat_time,
                 ..
             } = &tx_type {
-                // v3.18: Full nodes removed
+                // v3.18: Super nodes removed
                 let node_type = if node_id.starts_with("light_") {
                     0
                 } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
@@ -7080,13 +7085,13 @@ impl BlockchainNode {
                 } = tx_type {
                     total_nodes += 1;
                     
-                    // v3.18: Full nodes removed
+                    // v3.18: Super nodes removed
                     let node_type = if node_id.starts_with("light_") {
                         0  // Mobile node (Light)
                     } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
                         2  // Server node (Super)
                     } else if node_id.starts_with("full_") {
-                        // v3.18: Reject old Full node format
+                        // v3.18: Reject old Super node format
                         continue;
                     } else {
                         continue;
@@ -7125,12 +7130,12 @@ impl BlockchainNode {
                 }
                 let commitments_root = hex::encode(hasher.finalize());
                 
-                // v3.18: eligible_full always 0 (Full nodes removed)
+                // v3.18: eligible_full always 0 (Super nodes removed)
                 shard_summaries.push(qnet_state::ShardHeartbeatSummary {
                     shard_id,
                     total_nodes,
                     eligible_light,
-                    eligible_full: 0, // v3.18: Full nodes removed, always 0
+                    eligible_full: 0, // v3.18: Super nodes removed, always 0
                     eligible_super,
                     total_eligible,
                     commitments_merkle_root: commitments_root,
@@ -7705,9 +7710,10 @@ impl BlockchainNode {
         
         // =========================================================================
         // PHASE 0.2: SYSTEM REQUIREMENTS CHECK (v3.1)
-        // CRITICAL: Verify minimum RAM before proceeding
-        // Full/Super server nodes require 4GB RAM minimum
-        // (Light nodes are mobile apps - they don't use this server code)
+        // CRITICAL: Verify minimum RAM before proceeding.
+        // Super server nodes require 4 GB RAM minimum.
+        // (Light nodes are mobile apps and do not run this server code path;
+        // v3.18: the "Full" tier was removed from the protocol.)
         // =========================================================================
         {
             const MIN_RAM_SERVER_MB: u64 = 4_000;  // 4GB minimum for server nodes
@@ -7727,7 +7733,7 @@ impl BlockchainNode {
                 })
                 .unwrap_or(8_000); // Assume 8GB if can't detect (non-Linux)
             
-            // v3.18: Full node type removed
+            // v3.18: Super node type removed
             if total_ram_mb < MIN_RAM_SERVER_MB {
                 let node_type_str = match node_type {
                     NodeType::Super => "Super",
@@ -7741,7 +7747,7 @@ impl BlockchainNode {
                 println!("║  Detected RAM:  {:>5} MB                                         ║", total_ram_mb);
                 println!("║  Required RAM:  {:>5} MB                                         ║", MIN_RAM_SERVER_MB);
                 println!("╠══════════════════════════════════════════════════════════════════╣");
-                println!("║  QNet server nodes (Full/Super) require minimum 4 GB RAM         ║");
+                println!("║  QNet Super server nodes require minimum 4 GB RAM                ║");
                 println!("║  to operate reliably without constant OOM crashes.               ║");
                 println!("║                                                                  ║");
                 println!("║  Options:                                                        ║");
@@ -7855,10 +7861,68 @@ impl BlockchainNode {
                 if is_debug() { println!("[DBG][NODE] storage_init_ok"); }
                 
                 let storage_arc = Arc::new(storage);
-                
+
                 // PRODUCTION v2.50: Set global storage using OnceCell (lock-free)
                 init_global_storage(storage_arc.clone());
-                
+
+                // ─────────────────────────────────────────────────────────
+                // SECURITY: Restore the permanent attacker-PK blacklist
+                // ─────────────────────────────────────────────────────────
+                // The blacklist is the cryptographic boundary against
+                // identity impersonation: any Dilithium3 public key that
+                // has been observed presenting itself under a bound
+                // registry identity it does not own is permanently
+                // rejected. Without a durable mirror, a restart would
+                // reset the set and grant every known attacker a fresh
+                // window of free verification attempts.
+                //
+                // Order matters: the seed call MUST complete BEFORE
+                // anything that could trigger a `verify_with_real_dilithium`
+                // path (P2P listener, RPC, consensus reactor). All of
+                // those come up downstream of this point in the boot
+                // sequence, so the seed-then-callback ordering here is
+                // sufficient.
+                //
+                // The persistence callback is the only place the lower
+                // crate gets write access to durable storage; we resolve
+                // the storage handle through `try_get_storage` at every
+                // call so the callback never captures a stale clone.
+                match storage_arc.as_ref().load_all_attacker_pk_entries() {
+                    Ok(seeds) => {
+                        let n = seeds.len();
+                        qnet_consensus::consensus_crypto::seed_attacker_pk_blacklist(seeds);
+                        if n > 0 && is_info() {
+                            println!(
+                                "[INFO][SECURITY] attacker_pk_blacklist_restored entries={} source=metadata_cf",
+                                n,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "[WARN][SECURITY] attacker_pk_blacklist_load_failed err={} action=continue_empty",
+                            e,
+                        );
+                    }
+                }
+                qnet_consensus::consensus_crypto::set_attacker_pk_persist_callback(
+                    |fp, rec| {
+                        if let Some(storage) = try_get_storage() {
+                            if let Err(e) = storage.save_attacker_pk_entry(fp, rec) {
+                                // Single warn line; the in-memory entry
+                                // already exists, so a transient write
+                                // failure costs durability but not
+                                // correctness.
+                                eprintln!(
+                                    "[WARN][SECURITY] attacker_pk_persist_failed fp={}.. err={}",
+                                    hex::encode(&fp[..8]),
+                                    e,
+                                );
+                            }
+                        }
+                    },
+                );
+
                 // v3.36: Initialize dynamic gas pricing (EIP-1559 style)
                 qnet_state::init_dynamic_gas_pricing();
                 
@@ -8647,7 +8711,7 @@ impl BlockchainNode {
         // Create unified P2P with regional clustering
         if is_debug() { println!("[DBG][P2P] unified_p2p_init"); }
         
-        // v3.18: Full node type removed
+        // v3.18: Super node type removed
         let unified_node_type = match node_type {
             NodeType::Light => UnifiedNodeType::Light,
             NodeType::Super => UnifiedNodeType::Super,
@@ -8711,7 +8775,8 @@ impl BlockchainNode {
         
         // ═══════════════════════════════════════════════════════════════════════════
         // PRODUCTION FIX v2.30: Load certificate history from disk
-        // ONLY for Full/Super nodes - Light nodes don't participate in consensus!
+        // ONLY for Super nodes — Light nodes don't participate in consensus!
+        // (v3.18: the "Full" tier was removed from the protocol.)
         // ═══════════════════════════════════════════════════════════════════════════
         if node_type != NodeType::Light {
             // Use QNET_STORAGE_PATH (set during init) with fallback to "data"
@@ -8818,7 +8883,8 @@ impl BlockchainNode {
                 return true;
             }
             
-            // AUTO-DETECTION based on GLOBAL active Full/Super nodes (NOT local peers!)
+            // AUTO-DETECTION based on the GLOBAL active Super-node population
+            // (NOT local peers!). v3.18: "Full" tier removed.
             // Light nodes are NOT counted - only consensus-participating nodes
             let active_nodes = unified_p2p.get_active_full_super_nodes();
             let network_size = active_nodes.len();
@@ -9031,7 +9097,7 @@ impl BlockchainNode {
         if let Err(e) = archive_manager.register_archive_node(&node_id, node_type, &node_ip).await {
             if is_warn() { println!("[WARN][NODE] archive_reg_fail err={}", e); }
         } else {
-            // v3.18: Full node type removed
+            // v3.18: Super node type removed
             let quota = match node_type {
                 NodeType::Light => 0,
                 NodeType::Super => 8,
@@ -9043,10 +9109,11 @@ impl BlockchainNode {
         
         // =========================================================================
         // QUANTUM VTS INITIALIZATION
-        // CRITICAL: VTS only runs on Full and Super nodes (block producers)
+        // CRITICAL: VTS only runs on Super nodes (block producers).
+        // (v3.18: the "Full" tier was removed from the protocol.)
         // Light nodes do NOT run PoH - they are mobile devices with limited resources
         // =========================================================================
-        // v3.18: Full node type removed
+        // v3.18: Super node type removed
         let (poh, poh_receiver): (Option<Arc<crate::poh::PoH>>, Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::poh::PoHEntry>>>>) =
             if matches!(node_type, NodeType::Super) {
                 if is_info() { println!("[INFO][POH] init type={:?}", node_type); }
@@ -9290,7 +9357,7 @@ impl BlockchainNode {
             // v2.96: DashMap for confirmation tracking + retry
             heartbeat_commitment_tracker: Arc::new(DashMap::new()),
             bitmap_commitment_tracker: Arc::new(DashMap::new()),
-            poh,  // Already Option - None for Light nodes, Some for Full/Super
+            poh,  // Option — None for Light nodes (no consensus), Some for Super
             poh_receiver: poh_receiver,  // Already Option
             parallel_executor,
             adaptive_bft,
@@ -10407,7 +10474,8 @@ impl BlockchainNode {
                                 progress_percent: progress,
                             });
                             
-                            // v3.0: TRY SNAPSHOT SYNC FIRST for new/empty nodes (Full/Super only)
+                            // v3.0: TRY SNAPSHOT SYNC FIRST for new/empty nodes (Super only —
+                            // Light nodes are mobile API clients and do not sync chain data).
                             // SNAPSHOT INTERVALS from constants:
                             // - SNAPSHOT_INCREMENTAL_INTERVAL = 3600 (1 hour)
                             // - SNAPSHOT_FULL_INTERVAL = 43200 (12 hours)
@@ -10805,14 +10873,21 @@ impl BlockchainNode {
         const REQUEST_COOLDOWN_FAST: u64 = 1;    // Fast sync: 1 second for catching up
         const FAST_SYNC_THRESHOLD: u64 = 10;     // Switch to fast sync if >10 blocks behind
         
-        // MEMORY PROTECTION v2.19.20: Adaptive buffer size by node type
-        // Full/Super nodes: 500 blocks (~50MB) - covers 8+ minutes of network issues
-        // Light nodes: 100 blocks (~10MB) - minimal memory footprint
-        // Protects against malicious peers sending out-of-order blocks
-        // v3.18: Full node type removed
+        // MEMORY PROTECTION v2.19.20: Adaptive in-RAM dedup buffer size
+        // by node role. This sizes a per-process RAM table that tracks
+        // recently received block heights to defend against malicious
+        // peers sending out-of-order blocks. It is NOT on-disk storage.
+        //
+        //   * Super: 500 entries (~50 MB) — covers ~8 minutes of churn
+        //   * Light: 100 entries (~10 MB) — defensive cap only. Light is
+        //     a mobile pure-API-client role and does NOT receive block
+        //     broadcasts in normal operation, so this arm is effectively
+        //     unreachable in production. The small bound prevents an
+        //     unbounded buffer from ever growing on a Light role even if
+        //     a legacy code path leaks a block reception into the table.
         let max_pending_blocks: usize = match node_type {
-            NodeType::Light => 100,  // Light nodes: minimal memory (~10MB)
-            NodeType::Super => 500,  // Super: larger buffer (~50MB)
+            NodeType::Light => 100,  // defensive RAM cap; Light never syncs blocks
+            NodeType::Super => 500,  // Super: ~50 MB in-RAM dedup buffer
         };
         
         // CRITICAL: REORG PROTECTION - Prevent concurrent reorgs and DoS attacks
@@ -11214,7 +11289,7 @@ impl BlockchainNode {
                                     // CRITICAL v2.19.20: PSEUDO-INFINITE retries for block reliability
                                     // Blocks are critical data - NEVER discard them!
                                     // Protection layers:
-                                    // 1. max_pending_blocks = 500 Full/Super, 100 Light (memory protection)
+                                    // 1. max_pending_blocks = 500 (Super) / 100 (Light defensive cap; Light never syncs)
                                     // 2. Exponential backoff after 10 retries (network protection)
                                     // 3. Rate limiting on requests (CPU protection)
                                     // 4. Background sync every 30s (persistent recovery)
@@ -14537,14 +14612,14 @@ impl BlockchainNode {
             // ========================================================================
             // NETWORK STARTUP SYNCHRONIZATION (v2.19.13)
             // ========================================================================
-            // ALL producer nodes (Full/Super) must:
+            // ALL producer nodes (Super only — v3.18: "Full" tier removed) must:
             // 1. Wait for minimum peers for Byzantine consensus (4 nodes)
             // 2. Ensure Genesis block exists before starting production
             // 3. Use REAL TCP connectivity checks, not deterministic lists
             //
             // This applies to:
             // - Bootstrap nodes (genesis_node_001-005) on first start
-            // - Regular Full/Super nodes joining the network
+            // - Regular Super nodes joining the network
             // - Nodes restarting after crash
             // ========================================================================
             
@@ -14992,7 +15067,7 @@ impl BlockchainNode {
         }
         
         // PRODUCTION: Start archive compliance enforcement (mandatory for Super nodes)
-        // v3.18: Full node type removed
+        // v3.18: Super node type removed
         if matches!(self.node_type, NodeType::Super) {
             println!("[INFO][ARCHIVE] compliance_monitoring_start");
             self.start_archive_compliance_monitoring().await;
@@ -17133,7 +17208,8 @@ impl BlockchainNode {
                             println!("[INFO][CERT] cache_cleaned");
 
                             // PRODUCTION FIX v2.30: Persist certificate history every 5 minutes
-                            // ONLY for Full/Super nodes - Light nodes don't participate in consensus!
+                            // ONLY for Super nodes — Light nodes don't participate in consensus!
+        // (v3.18: the "Full" tier was removed from the protocol.)
                             if node_type != NodeType::Light {
                                 let storage_path = std::env::var("QNET_STORAGE_PATH").unwrap_or_else(|_| "data".to_string());
                                 let data_dir = std::path::Path::new(&storage_path);
@@ -20973,7 +21049,7 @@ impl BlockchainNode {
                             // Load PREVIOUS MacroBlock (always ready - no waiting!)
                             if let Ok(Some(mb_bytes)) = storage.get_macroblock_by_height(prev_macroblock_index) {
                                 if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
-                            // Extract reward_heartbeats from MacroBlock (Full/Super nodes)
+                            // Extract reward_heartbeats from MacroBlock (Super-node self-attestations)
                             if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
                                 if !heartbeats_data.is_empty() {
                                     if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
@@ -21017,7 +21093,7 @@ impl BlockchainNode {
                                             // PRODUCTION v2.78: REWARD DISTRIBUTION RULES
                                             // ═══════════════════════════════════════════════════════════════
                                             // Pool 1: Base emission (halves every 4 years)
-                                            //   - Distributed to ALL eligible nodes (Light/Full/Super)
+                                            //   - Distributed to ALL eligible nodes (Light + Super; v3.18: "Full" removed)
                                             //   - Equal share per node type weight:
                                             //     * Super: 1.0 weight
                                             //     * Full:  1.0 weight  
@@ -21028,7 +21104,7 @@ impl BlockchainNode {
                                             //   - See fees_collected in MicroBlock
                                             // 
                                             // Pool 3: Activation bonuses (Phase 2 only)
-                                            //   - Equal share to ALL eligible nodes (Light/Full/Super)
+                                            //   - Equal share to ALL eligible nodes (Light + Super; v3.18: "Full" removed)
                                             //   - Only active in Phase 2 (QNC economy)
                                             // ═══════════════════════════════════════════════════════════════
                                             
@@ -21052,7 +21128,7 @@ impl BlockchainNode {
                                                     gas_price: u64::MAX, // MAX priority - FIRST in block
                                                     gas_limit: 0,
                                                     nonce: 0,
-                                                    data: Some(format!("Emission Block {}: {} QNC distributed to {} eligible nodes (Full/Super={} Light={})",
+                                                    data: Some(format!("Emission Block {}: {} QNC distributed to {} eligible nodes (Super={} Light={})",
                                                                      next_block_height,
                                                                      total_emission / 1_000_000_000,
                                                                      total_eligible_count,
@@ -21063,9 +21139,10 @@ impl BlockchainNode {
                                                     chain_id: 0,
                                                 };
                                                 
-                                                // PRODUCTION v2.78: Process Full/Super + Light node rewards via unified deterministic path
-                                                // Convert Light nodes to HeartbeatSummaryData format to process with Full/Super nodes
-                                                // This ensures ALL nodes (Light/Full/Super) are processed IDENTICALLY on all blockchain nodes
+                                                // PRODUCTION v2.78: Process Super + Light node rewards via unified deterministic path.
+                                                // Convert Light nodes to HeartbeatSummaryData format to process alongside Super-node heartbeats.
+                                                // This ensures BOTH node roles (Light, Super) are processed IDENTICALLY on every Super node.
+                                                // (v3.18: the "Full" tier was removed from the protocol.)
                                                 let mut all_summaries = heartbeat_summaries.clone();
                                                 
                                                 if !light_node_rewards.is_empty() {
@@ -21151,7 +21228,7 @@ impl BlockchainNode {
                                                     emission_tx_opt = Some((emission_tx.hash.clone(), tx_bytes));
                                                     
                                                     if is_info() {
-                                                        println!("[INFO][EMISSION] tx_created block={} mb={} amount={} QNC eligible={} (full/super={} light={}) hash={}", 
+                                                        println!("[INFO][EMISSION] tx_created block={} mb={} amount={} QNC eligible={} (super={} light={}) hash={}", 
                                                                  next_block_height, prev_macroblock_index,
                                                                  total_emission / 1_000_000_000,
                                                                  total_eligible_count,
@@ -24956,7 +25033,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     // REMOVED: is_light_node() function - now using REAL node type information
     // Light node detection now uses peer.node_type and own_node_type directly
-    // This eliminates guessing and potential misclassification of Full/Super nodes
+    // This eliminates guessing and potential misclassification of Super nodes
     
     /// Helper: Get count of recent producer failures for deterministic exclusion
     /// ARCHITECTURE: Uses actual failover history from blockchain storage
@@ -26019,7 +26096,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         println!("  └── Selecting {} validators from {} qualified nodes", max_count, sorted_qualified.len());
         
         // QNet specification: "Equal chance for all qualified nodes"
-        // No distinction between Full and Super nodes in consensus participation
+        // Only Super nodes participate in consensus
+        // (v3.18: the "Full" tier was removed from the protocol).
         for i in 0..max_count.min(sorted_qualified.len()) {
             let mut hasher = Sha3_256::new();
             
@@ -26466,7 +26544,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // - No CPU usage when no blocks are being produced
                 // - Instant reaction to new blocks (no 1-second delay)
                 // - Scales to millions of nodes (O(1) per node, not O(N) polling)
-                // - With 100K Full/Super nodes: 0μs CPU (vs 100μs polling) when idle
+                // - With 100K Super nodes: 0μs CPU (vs 100μs polling) when idle
                 
                 let current_height = match block_event_rx.recv().await {
                     Ok(height) => height,
@@ -30519,7 +30597,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 },
                 // v2.78: LIGHT NODE ATTESTATIONS - Collected from PingCommitment TXs
-                // Each Full/Super node submits PingCommitment TX with Light nodes it pinged
+                // Each Super node submits PingCommitment TX with Light nodes it pinged
                 // MacroBlock aggregates all PingCommitments to count unique Light nodes
                 reward_light_nodes: {
                     const EMISSION_MB_INTERVAL: u64 = 160;
@@ -31273,13 +31351,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     return self.node_id.clone();
                 }
                 
-                // Full/Super nodes: Generate privacy-preserving display name
+                // Super nodes: Generate privacy-preserving display name
                 self.generate_full_super_display_name()
             }
         }
     }
     
-    /// PRIVACY: Generate display name for Full/Super nodes (preserves IP privacy)
+    /// PRIVACY: Generate display name for Super nodes (preserves IP privacy)
     fn generate_full_super_display_name(&self) -> String {
         // EXISTING PATTERN: Use blake3 hash like other identity functions
         let wallet_address = self.get_wallet_address();
@@ -31288,7 +31366,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 format!("{:?}", self.node_type)).as_bytes());
         
         // PRIVACY: Generate server-friendly display name without revealing IP
-        // v3.18: Full node type removed
+        // v3.18: Super node type removed
         let node_type_prefix = match self.node_type {
             NodeType::Super => "super",
             NodeType::Light => "light",
@@ -32036,7 +32114,29 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
-    async fn verify_dilithium_tx_signature_async(tx: &qnet_state::Transaction) -> Result<bool, QNetError> {
+    /// v25.2: Made `pub(crate)` so the block-pipeline verify stage can
+    /// delegate Dilithium3 TX-signature verification through THIS single
+    /// canonical entry point.
+    ///
+    /// Why one entry point matters: the on-the-wire signature format
+    /// differs between TX classes (see `build_canonical_verify_message`
+    /// + signer-class semantics below). The gossip-admission path was
+    /// already going through this helper; the block-apply path used to
+    /// do its own inline `hex::decode(sig)` / `hex::decode(pk)` which
+    /// is correct only for mobile-wallet (user) TXs and silently
+    /// rejected every node-signed system TX (HeartbeatCommitment,
+    /// PingCommitment, LightNodeEligibilityBitmap) because their
+    /// signature is a `dilithium_sig_<id>_<b64>` ASCII wrapper and
+    /// their `dilithium_public_key` field carries the `node_id` string
+    /// (PK looked up via `CONSENSUS_PK_REGISTRY`), NOT raw hex(1952).
+    /// The first time a node-signed TX hit a block (commitment window
+    /// at h ≈ epoch_end-50) every receiver hard-rejected the block →
+    /// network deadlock at h=14350.
+    ///
+    /// Routing the apply path through this helper closes the divergence
+    /// permanently: a future TX type that adopts a new signature format
+    /// only needs to be handled here, and both paths pick it up.
+    pub(crate) async fn verify_dilithium_tx_signature_async(tx: &qnet_state::Transaction) -> Result<bool, QNetError> {
         use crate::quantum_crypto::DilithiumSignature;
         
         let dilithium_sig = match &tx.dilithium_signature {
@@ -32775,18 +32875,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                  network_height - current_height);
                         
                         // Light nodes are thin clients - they don't sync blocks
-                        // They get all data (balance, TX history) via RPC from Full/Super nodes
+                        // They get all data (balance, TX history) via RPC from Super nodes
                         if self.node_type == NodeType::Light {
                             if is_info() { println!("[INFO][SYNC] light_node_skip reason=thin_client"); }
                         } else {
-                            // Full/Super nodes sync complete history
+                            // Super nodes sync complete history
                             // For new nodes (height 0 or 1), start from block 1 (first microblock)
                             let sync_from = if current_height <= 1 { 1 } else { current_height + 1 };
                             
                             // Sync to network height
                             self.sync_blocks(sync_from, network_height).await?;
                             
-                            // PRODUCTION v2.19.12: Sync macroblocks for Full/Super nodes
+                            // PRODUCTION v2.19.12: Sync macroblocks for Super nodes
                             // Macroblocks contain consensus data and state roots
                             let local_macro_index = current_height / 90;
                             let network_macro_index = network_height / 90;
@@ -33592,7 +33692,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
                 if !heartbeats_data.is_empty() {
                     if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
-                        // PRODUCTION v2.78: Merge Full/Super nodes with Light nodes for unified processing
+                        // PRODUCTION v2.78: Merge Super nodes with Light nodes for unified processing
                         let mut all_summaries = heartbeat_summaries.clone();
                         
                         // Extract Light node rewards from MacroBlock
@@ -33612,7 +33712,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             }
                         }
                         
-                        // Convert ALL nodes (Light/Full/Super) to HeartbeatSummaryData
+                        // Convert ALL nodes (Light + Super) to HeartbeatSummaryData
                         let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = all_summaries.iter()
                             .map(|s| qnet_consensus::HeartbeatSummaryData {
                                 node_id: s.node_id.clone(),
@@ -34159,7 +34259,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Save activation code to persistent storage with security validation
     pub async fn save_activation_code(&self, code: &str, node_type: NodeType) -> Result<(), QNetError> {
-        // v3.18: Full node type removed - use 2 for Super (backward compatible)
+        // v3.18: Super node type removed - use 2 for Super (backward compatible)
         let node_type_id = match node_type {
             NodeType::Light => 0,
             NodeType::Super => 2,
@@ -34387,11 +34487,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             println!("[INFO][ACTIVATION] burn_tx_saved");
         }
         
-        // Register Full/Super nodes in reward system (not Genesis or Light nodes)
+        // Register Super nodes in reward system (not Genesis or Light nodes)
         // Light nodes register through mobile app via RPC
         // Genesis nodes register separately
         if !bootstrap_whitelist.contains(&code) && node_type != NodeType::Light {
-            // v3.18: Full node type removed
+            // v3.18: Super node type removed
             let mut reward_manager = self.reward_manager.write().await;
             let reward_node_type = match node_type {
                 NodeType::Super => RewardNodeType::Super,
@@ -34410,9 +34510,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if is_debug() { println!("[DBG][REWARDS] wallet={}...", &wallet_address[..20.min(wallet_address.len())]); }
             }
             
-            // v2.71: Create ON-CHAIN NodeRegistration TX for Full/Super nodes
+            // v2.71: Create ON-CHAIN NodeRegistration TX for Super nodes
             // This ensures wallet→node binding is immutable and verifiable by all nodes
-            // v3.18: Full node type removed
+            // v3.18: Super node type removed
             let qnet_node_type = match node_type {
                 NodeType::Super => qnet_state::NodeType::Super,
                 NodeType::Light => qnet_state::NodeType::Light,
@@ -34588,12 +34688,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         match self.storage.load_activation_code()
             .map_err(|e| QNetError::StorageError(e.to_string()))? {
             Some((code, node_type_id, _timestamp)) => {
-                // v3.18: Full node type removed - map old Full (1) to Super
+                // v3.18: Super node type removed - map old Full (1) to Super
                 let node_type = match node_type_id {
                     0 => NodeType::Light,
                     2 => NodeType::Super,
                     1 => {
-                        // v3.18: Old Full node type - upgrade to Super for backward compatibility
+                        // v3.18: Old Super node type - upgrade to Super for backward compatibility
                         println!("[INFO][NODE] full_to_super_migration node_type_id=1");
                         NodeType::Super
                     },
@@ -34620,7 +34720,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Migrate device (same wallet, different device)
     pub async fn migrate_device(&self, code: &str, node_type: NodeType, new_device_signature: &str) -> Result<(), QNetError> {
-        // v3.18: Full node type removed - use 2 for Super (backward compatible)
+        // v3.18: Super node type removed - use 2 for Super (backward compatible)
         let node_type_id = match node_type {
             NodeType::Light => 0,
             NodeType::Super => 2,
@@ -35206,7 +35306,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                          stats.avg_replicas);
                                 
                                 // Alert if this node is non-compliant
-                                // v3.18: Full node type removed
+                                // v3.18: Super node type removed
                                 if stats.non_compliant_nodes > 0 {
                                     let required_chunks = match node_type {
                                         NodeType::Super => 8,
@@ -35329,10 +35429,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // 2. 70% of AVAILABLE memory (accounts for other processes)
             // 3. Conservative fallback (4GB)
             //
-            // MINIMUM REQUIREMENT: 4GB RAM (Full/Super nodes)
+            // MINIMUM REQUIREMENT: 4GB RAM (Super nodes)
             // ═══════════════════════════════════════════════════════════════════════════════
             
-            const MIN_MEMORY_REQUIREMENT_MB: u64 = 4_000; // 4GB minimum for Full/Super nodes
+            const MIN_MEMORY_REQUIREMENT_MB: u64 = 4_000; // 4GB minimum for Super nodes
             
             // Get total system memory first (for requirement check)
             let (mem_total_mb, mem_available_mb): (u64, Option<u64>) = {
@@ -35367,7 +35467,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if mem_total_mb < MIN_MEMORY_REQUIREMENT_MB {
                 println!("[CRIT][MEMORY] INSUFFICIENT_RAM total={}MB required={}MB", 
                          mem_total_mb, MIN_MEMORY_REQUIREMENT_MB);
-                println!("[CRIT][MEMORY] QNet Full/Super nodes require minimum 4GB RAM!");
+                println!("[CRIT][MEMORY] QNet Super nodes require minimum 4GB RAM!");
                 println!("[CRIT][MEMORY] Node will operate in DEGRADED MODE with aggressive cleanup");
             }
             

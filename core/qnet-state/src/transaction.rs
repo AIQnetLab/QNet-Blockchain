@@ -363,7 +363,8 @@ pub enum TransactionType {
     },
     
     /// Heartbeat Commitment with Merkle Tree + Sampling (PRODUCTION-READY SCALABILITY)
-    /// Self-attestation for Full/Super nodes (10 heartbeats per 4-hour epoch)
+    /// Self-attestation for Super nodes (10 heartbeats per 4-hour epoch).
+    /// (v3.18: the "Full" tier was removed; only Super nodes self-attest.)
     /// Similar to PingCommitment but for node liveness tracking instead of ping responses
     /// ARCHITECTURE: Each node submits ONE commitment TX per epoch containing:
     /// - Merkle root of all 10 heartbeats (deterministically timed)

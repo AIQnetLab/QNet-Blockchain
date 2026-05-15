@@ -136,9 +136,16 @@ pub struct KademliaRouting {
 
 | Node Type | Upload | Download | Monthly Data |
 |-----------|--------|----------|--------------|
-| Super Node | 100 Mbps | 100 Mbps | 30 TB |
-| Light Node | 1 Mbps | 1 Mbps | 300 GB |
-| Mobile Node | 100 Kbps | 100 Kbps | 30 GB |
+| Super Node (server, full archival) | 100 Mbps | 100 Mbps | 30 TB |
+| Light Node (mobile-only API client; v3.18: replaces the old "Mobile Node" entry) | < 100 Kbps | < 100 Kbps | < 50 MB |
+
+> **Light node sizing (v3.18+)**: Light is the mobile-only role. It stores
+> no on-device chain data, does not download blocks, and does not relay
+> them. Outbound traffic is ping-response signatures (a few KB per ping
+> ≈ once every 4-hour window) plus on-demand REST API queries for
+> balance / TX history. The legacy "Light Node 1 Mbps / 300 GB" sizing
+> referred to an obsolete header-syncing design and is no longer
+> accurate.
 
 ## 🔧 Implementation Changes Needed
 
