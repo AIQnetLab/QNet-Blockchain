@@ -778,7 +778,27 @@ impl PersistentStorage {
         // With this setting, RocksDB force-flushes oldest CF memtables when
         // total WAL exceeds 64MB, enabling old WAL cleanup.
         opts.set_max_total_wal_size(67_108_864); // 64MB max WAL (was: unlimited)
-        
+
+        // v25.3: BOUND RocksDB's internal diagnostic LOG file.
+        // Default RocksDB behaviour is a SINGLE `LOG` file that grows
+        // without bound until the DB is reopened (only a node restart
+        // archives it to LOG.old.<ts>). In production this was observed
+        // at ~454 MB after 27 h continuous uptime (~17 MB/h ≈ 150 GB/yr
+        // unbounded) on every node. This is RocksDB's own operational
+        // log (compaction/flush/stats) — NOT chain data, NOT the WAL,
+        // NOT consensus state — so bounding it is purely hygienic and
+        // cannot affect blockchain integrity, recovery, or determinism.
+        //
+        // size + count bounding only: rotate the LOG at 64 MB and keep
+        // at most 10 rotations → hard cap ≈ 640 MB rolling window
+        // instead of one ever-growing file. Verbosity (INFO) is
+        // deliberately UNCHANGED so RocksDB-internal forensics
+        // (compaction stalls, write-stalls, corruption events) remain
+        // fully available — we only stop the unbounded growth, we do
+        // not trade away diagnostic detail.
+        opts.set_max_log_file_size(67_108_864);  // 64 MB → then rotate
+        opts.set_keep_log_file_num(10);          // keep ≤10 rotations (~640 MB cap)
+
         // v3.19: AGGRESSIVE compaction settings
         opts.set_level_compaction_dynamic_level_bytes(true);
         opts.set_max_bytes_for_level_base(67108864); // 64MB base level

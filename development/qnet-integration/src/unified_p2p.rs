@@ -16724,9 +16724,12 @@ impl SimplifiedP2P {
                         println!("[INFO][P2P] Dilithium signature verified for {}", node_id);
                     }
                 } else {
-                    if crate::node::is_info() {
-                        println!("[ERR][P2P] Invalid Dilithium signature for {}", node_id);
-                    }
+                    // v25.3: governed — collapses spoofer flood (shares the
+                    // per-claimed-id window with the consensus-layer sites).
+                    qnet_consensus::consensus_crypto::log_sig_reject(
+                        node_id,
+                        &format!("[ERR][P2P] Invalid Dilithium signature for {}", node_id),
+                    );
                 }
                 valid
             }
@@ -16738,7 +16741,7 @@ impl SimplifiedP2P {
             }
         }
     }
-    
+
     /// OPTIMIZED v2.24: Verify HYBRID P2P BINARY signature (bincode+zstd)
     async fn verify_hybrid_p2p_binary_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
         use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
@@ -17080,9 +17083,13 @@ impl SimplifiedP2P {
                                         println!("[INFO][P2P] Dilithium signature verified for {}", node_id);
                                     }
                                 } else {
-                                    if crate::node::is_info() {
-                                        println!("[ERR][P2P] Invalid Dilithium signature for {}", node_id);
-                                    }
+                                    // v25.3: governed — collapses spoofer flood
+                                    // (shares the per-claimed-id window with the
+                                    // consensus-layer reject sites).
+                                    qnet_consensus::consensus_crypto::log_sig_reject(
+                                        &node_id,
+                                        &format!("[ERR][P2P] Invalid Dilithium signature for {}", node_id),
+                                    );
                                 }
                                 valid
                             }

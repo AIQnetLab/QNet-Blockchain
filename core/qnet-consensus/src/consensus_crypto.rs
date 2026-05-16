@@ -255,6 +255,153 @@ const ATTACKER_PK_BLACKLIST_CAP: usize = 12_288;
 /// connection attempt because the Tier-2 check is always evaluated.
 const ATTACKER_PK_EVICT_FRACTION: usize = 4;
 
+// ════════════════════════════════════════════════════════════════════════
+// SECURITY-REJECT LOG RATE GOVERNOR (v25.3)
+// ════════════════════════════════════════════════════════════════════════
+// An external attacker can flood garbage signatures that fail the cheap
+// structural checks (all-zero, low-entropy, bad length) which run BEFORE
+// the Dilithium3 public key is even parsed. Those failures cannot be
+// fingerprinted by `ATTACKER_PK_BLACKLIST` (no PK is extracted), so each
+// rejected garbage frame previously produced an unconditional
+// `[ERR][CONSENSUS] sig_*` line. Observed in production: ~13 000
+// reject-log lines / 20 h on every node a spoofer targeted — pure log
+// noise that can DoS the logging subsystem / fill disk while telling the
+// operator nothing new after the first occurrence.
+//
+// This governor rate-limits the LOG OUTPUT per claimed identity. The
+// REJECTION itself is unconditional at every call site — the security
+// boundary is unchanged. We keep the first `SIG_REJECT_LOG_PER_WINDOW`
+// rejections per claimed `node_id` per `SIG_REJECT_LOG_WINDOW_S` fully
+// visible (so a genuine transient fault on a real node is never hidden),
+// emit one explicit suppression notice at the threshold, then stay
+// silent until the window rolls — at which point a single
+// `sig_reject_flood` summary reports how many were suppressed and that
+// the flood is ongoing. Standard production practice for
+// attacker-controlled inputs.
+//
+// Keyed PER claimed `node_id`: a flood against one identity cannot
+// starve the reject-log budget of a different identity's genuine fault.
+// Bounded memory: soft cap + lazy 25 % LRU eviction, identical to the
+// `ATTACKER_PK_BLACKLIST` discipline.
+
+lazy_static::lazy_static! {
+    /// claimed_node_id → rolling-window reject-log state.
+    static ref SIG_REJECT_LOG_GOVERNOR: dashmap::DashMap<String, SigRejectLogState> =
+        dashmap::DashMap::new();
+}
+
+#[derive(Debug, Clone)]
+struct SigRejectLogState {
+    /// UNIX seconds when the current window opened.
+    window_start_s: u64,
+    /// Detailed reject lines already emitted in the current window.
+    logged_in_window: u32,
+    /// Reject lines suppressed in the current window (reported on roll).
+    suppressed_in_window: u64,
+}
+
+/// Rolling window length for the reject-log governor.
+const SIG_REJECT_LOG_WINDOW_S: u64 = 60;
+/// Detailed reject lines allowed per claimed identity per window before
+/// suppression engages. Small enough to collapse a flood, large enough
+/// that a genuine transient fault on a real node is still visible.
+const SIG_REJECT_LOG_PER_WINDOW: u32 = 5;
+/// Soft cap on the governor map (≤ ~1 MB resident at this size).
+const SIG_REJECT_GOVERNOR_CAP: usize = 8_192;
+
+enum SigRejectLogAction {
+    /// Under the per-window cap — caller emits its detailed reject line.
+    Emit,
+    /// Cap just crossed — caller emits ONE suppression notice instead.
+    EmitSuppressNotice,
+    /// Over the cap — caller stays silent (rejection already happened).
+    Suppress,
+}
+
+fn sig_reject_log_decision(claimed_node_id: &str) -> SigRejectLogAction {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Lazy soft-eviction (only when a NEW identity would grow past cap).
+    if !SIG_REJECT_LOG_GOVERNOR.contains_key(claimed_node_id)
+        && SIG_REJECT_LOG_GOVERNOR.len() >= SIG_REJECT_GOVERNOR_CAP
+    {
+        let mut entries: Vec<(String, u64)> = SIG_REJECT_LOG_GOVERNOR
+            .iter()
+            .map(|e| (e.key().clone(), e.value().window_start_s))
+            .collect();
+        entries.sort_by_key(|(_, w)| *w);
+        let to_drop = entries.len() / 4;
+        for (k, _) in entries.into_iter().take(to_drop) {
+            SIG_REJECT_LOG_GOVERNOR.remove(&k);
+        }
+    }
+
+    let mut action = SigRejectLogAction::Emit;
+    let mut flood_summary: Option<u64> = None;
+
+    SIG_REJECT_LOG_GOVERNOR
+        .entry(claimed_node_id.to_string())
+        .and_modify(|st| {
+            if now.saturating_sub(st.window_start_s) >= SIG_REJECT_LOG_WINDOW_S {
+                // Window rolled: report any suppression from the closed
+                // window, then reopen counting this rejection as #1.
+                if st.suppressed_in_window > 0 {
+                    flood_summary = Some(st.suppressed_in_window);
+                }
+                st.window_start_s = now;
+                st.logged_in_window = 1;
+                st.suppressed_in_window = 0;
+                action = SigRejectLogAction::Emit;
+            } else if st.logged_in_window < SIG_REJECT_LOG_PER_WINDOW {
+                st.logged_in_window += 1;
+                action = SigRejectLogAction::Emit;
+            } else if st.logged_in_window == SIG_REJECT_LOG_PER_WINDOW {
+                st.logged_in_window += 1; // mark the notice as emitted
+                action = SigRejectLogAction::EmitSuppressNotice;
+            } else {
+                st.suppressed_in_window = st.suppressed_in_window.saturating_add(1);
+                action = SigRejectLogAction::Suppress;
+            }
+        })
+        .or_insert_with(|| SigRejectLogState {
+            window_start_s: now,
+            logged_in_window: 1,
+            suppressed_in_window: 0,
+        });
+
+    if let Some(n) = flood_summary {
+        eprintln!(
+            "[WARN][SECURITY] sig_reject_flood claimed_node={} window_s={} suppressed={} action=window_rolled_still_under_attack",
+            claimed_node_id, SIG_REJECT_LOG_WINDOW_S, n
+        );
+    }
+    action
+}
+
+/// Rate-governed security-reject logger.
+///
+/// `full_line` is the exact `[ERR][...]` line the call site would have
+/// emitted unconditionally before v25.3. The rejection has ALREADY
+/// happened at the call site (the caller `return false`s immediately
+/// after) — this governs only whether the line reaches the log, so an
+/// attacker flooding pre-PK-parse garbage cannot DoS logging. First
+/// `SIG_REJECT_LOG_PER_WINDOW` per claimed identity per window pass
+/// through verbatim; then one suppression notice; then silence with a
+/// per-window flood summary. Security semantics are unchanged.
+pub fn log_sig_reject(claimed_node_id: &str, full_line: &str) {
+    match sig_reject_log_decision(claimed_node_id) {
+        SigRejectLogAction::Emit => eprintln!("{}", full_line),
+        SigRejectLogAction::EmitSuppressNotice => eprintln!(
+            "[WARN][SECURITY] sig_reject_log_suppressed claimed_node={} window_s={} threshold={} action=silencing_until_window_roll",
+            claimed_node_id, SIG_REJECT_LOG_WINDOW_S, SIG_REJECT_LOG_PER_WINDOW
+        ),
+        SigRejectLogAction::Suppress => { /* rejection already enforced at call site */ }
+    }
+}
+
 /// Compute the 32-byte SHA3-256 fingerprint of an extracted public key.
 /// Collision-resistant and post-quantum safe; fits as a DashMap key
 /// with no allocations on the lookup path.
@@ -1675,8 +1822,8 @@ async fn verify_dilithium_signature(
     // Combined format: [sig_len(4)] + [SignedMessage(sig+msg)] + [pk_len(4)] + [pk(1952)]
     // Minimum size: ML-DSA-65 signature (3309 bytes) + message + metadata
     if signature_bytes.len() < 3309 {
-        eprintln!("[ERR][CONSENSUS] sig_too_small node={} size={} min=3309",
-                 node_id, signature_bytes.len());
+        log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_too_small node={} size={} min=3309",
+                 node_id, signature_bytes.len()));
         return false;
     }
 
@@ -1686,9 +1833,13 @@ async fn verify_dilithium_signature(
     if valid {
         println!("[INFO][CONSENSUS] sig_verified node={}", node_id);
     } else {
-        eprintln!("[ERR][CONSENSUS] sig_invalid node={}", node_id);
+        // Governed: a spoofer flooding garbage under a claimed identity
+        // would otherwise emit one of these per frame. Rejection is
+        // already final (the inner verify returned false); this only
+        // rate-limits the log line.
+        log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_invalid node={}", node_id));
     }
-    
+
     valid
 }
 
@@ -1700,7 +1851,7 @@ async fn verify_with_real_dilithium(
 ) -> bool {
     // Verify signature structure: all-zero is trivially invalid
     if signature_bytes.iter().all(|&b| b == 0) {
-        eprintln!("[ERR][CONSENSUS] sig_all_zeros node={}", node_id);
+        log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_all_zeros node={}", node_id));
         return false;
     }
 
@@ -1708,14 +1859,14 @@ async fn verify_with_real_dilithium(
     let sig_part = &signature_bytes[..std::cmp::min(3309, signature_bytes.len())];
     let unique_bytes: std::collections::HashSet<_> = sig_part.iter().collect();
     if unique_bytes.len() < 200 {
-        eprintln!("[ERR][CONSENSUS] sig_low_entropy node={} unique={} threshold=200",
-                 node_id, unique_bytes.len());
+        log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_low_entropy node={} unique={} threshold=200",
+                 node_id, unique_bytes.len()));
         return false;
     }
 
     // Parse combined format: [sig_len(4)] + [SignedMessage(sig+msg)] + [pk_len(4)] + [pk(1952)]
     if signature_bytes.len() < 8 {
-        eprintln!("[ERR][CONSENSUS] sig_too_short node={} size={}", node_id, signature_bytes.len());
+        log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_too_short node={} size={}", node_id, signature_bytes.len()));
         return false;
     }
 
@@ -1728,7 +1879,7 @@ async fn verify_with_real_dilithium(
 
     // ML-DSA-65 SignedMessage must be at least 3309 bytes (sig) + 1 byte (msg) = 3310 minimum
     if signed_len <= 3309 || 4 + signed_len >= signature_bytes.len() {
-        eprintln!("[ERR][CONSENSUS] sig_format_invalid node={} signed_len={}", node_id, signed_len);
+        log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_format_invalid node={} signed_len={}", node_id, signed_len));
         return false;
     }
     
@@ -1751,13 +1902,13 @@ async fn verify_with_real_dilithium(
     // CRITICAL: Dilithium3 public key MUST be exactly 1952 bytes (NIST standard)
     use pqcrypto_mldsa::mldsa65 as dilithium3;
     if pk_len != dilithium3::public_key_bytes() {
-        eprintln!("[ERR][CONSENSUS] pk_size_invalid node={} got={} expected={}",
-                 node_id, pk_len, dilithium3::public_key_bytes());
+        log_sig_reject(node_id, &format!("[ERR][CONSENSUS] pk_size_invalid node={} got={} expected={}",
+                 node_id, pk_len, dilithium3::public_key_bytes()));
         return false;
     }
 
     if pk_start + pk_len != signature_bytes.len() {
-        eprintln!("[ERR][CONSENSUS] sig_len_mismatch node={}", node_id);
+        log_sig_reject(node_id, &format!("[ERR][CONSENSUS] sig_len_mismatch node={}", node_id));
         return false;
     }
 
