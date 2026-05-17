@@ -18068,20 +18068,35 @@ impl BlockchainNode {
                             let expected_producer =
                                 crate::node::get_expected_producer(next_height)
                                     .map(|(producer, _round)| producer);
+
+                            // v26 D2: heartbeat/self may only DELAY view-change,
+                            // never veto it indefinitely. Suppression honoured only
+                            // while no-progress < ceiling; past it the timeout-vote
+                            // fires unconditionally (pacemaker on lack of PROGRESS,
+                            // not liveness). Fixes the alive-but-stuck permanent
+                            // lock (h=144001 self_exclude missing_prev).
+                            const D2_PROGRESS_HARD_CEILING_SECS: u64 = 180;
+                            let progress_ceiling_exceeded =
+                                local_delay > D2_PROGRESS_HARD_CEILING_SECS;
+
                             let suppression_reason: Option<&'static str> =
-                                match expected_producer.as_deref() {
-                                    Some(p) if p == node_id.as_str() => {
-                                        Some("self_expected")
-                                    }
-                                    Some(p) => {
-                                        match crate::unified_p2p::last_remote_producer_heartbeat_age_ms(p) {
-                                            Some(age_ms) if age_ms <= HEARTBEAT_SILENT_MS => {
-                                                Some("heartbeat_fresh")
-                                            }
-                                            _ => None,
+                                if progress_ceiling_exceeded {
+                                    None // ceiling passed → emit unconditionally
+                                } else {
+                                    match expected_producer.as_deref() {
+                                        Some(p) if p == node_id.as_str() => {
+                                            Some("self_expected")
                                         }
+                                        Some(p) => {
+                                            match crate::unified_p2p::last_remote_producer_heartbeat_age_ms(p) {
+                                                Some(age_ms) if age_ms <= HEARTBEAT_SILENT_MS => {
+                                                    Some("heartbeat_fresh")
+                                                }
+                                                _ => None,
+                                            }
+                                        }
+                                        None => None,
                                     }
-                                    None => None,
                                 };
 
                             if let Some(reason) = suppression_reason {
@@ -29481,15 +29496,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // async work, negligible overhead even at the 1000-validator cap.
         // ═══════════════════════════════════════════════════════════════════════
         let committee_len = all_participants.len() as u64;
-        let round_timeout_secs = 10u64
+        // v26 D3: per-round exponential view-change backoff.
+        // base scales with committee: clamp(10 + N/40, 10, 45)s.
+        // timeout(r) = min(base · 2^min(r, SHIFT_CAP), CAP). Computed per
+        // round from the 2f+1-certified round (deterministic, no clock).
+        // Guarantees convergence once timeout > real network delay
+        // (partial-synchrony liveness); fixed timeout caused the
+        // unbounded view-change storm (h=144000 freeze).
+        let base_timeout_secs = 10u64
             .saturating_add(committee_len / 40)
             .clamp(10, 45);
-        if is_debug() {
-            println!(
-                "[DBG][MB_PART] round_timeout_secs={} committee={}",
-                round_timeout_secs, committee_len,
-            );
-        }
+        const D3_BACKOFF_SHIFT_CAP: u64 = 5;      // ≤ 32× base
+        const D3_TIMEOUT_CAP_SECS: u64 = 600;     // per-round hard ceiling
 
         let mut iter_guard: u64 = 0;
         let mut last_round_seen: u64 = u64::MAX;
@@ -29504,6 +29522,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Read the 2f+1-certified round. This is authoritative: every honest
             // node sees the same value, so every node computes the same leader.
             let current_round = p2p.get_highest_certified_round(macroblock_index);
+
+            // v26 D3: timeout(r) = min(base·2^min(r,CAP), CAP).
+            let backoff_shift = current_round.min(D3_BACKOFF_SHIFT_CAP);
+            let round_timeout_secs = base_timeout_secs
+                .saturating_mul(1u64 << backoff_shift)
+                .min(D3_TIMEOUT_CAP_SECS);
 
             if current_round != last_round_seen {
                 if is_info() {

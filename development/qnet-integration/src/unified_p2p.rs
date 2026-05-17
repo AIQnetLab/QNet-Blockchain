@@ -5789,13 +5789,17 @@ impl SimplifiedP2P {
                     let total_chunks = assembly.total_chunks;
                     let required = ((total_chunks as f32) * 0.67).ceil() as usize;
 
-                    // CRITICAL FIX v2.83: Check if chunk#0 is present (required for reconstruction!)
-                    // Without chunk#0, block CANNOT be reconstructed even if we have enough parity
-                    let chunk0_received = assembly.chunks_received.get(0).map(|c| c.is_some()).unwrap_or(false);
+                    // v26 D4b: skip repair when reconstructable AND cert in
+                    // hand. Reed-Solomon recovers any missing data shard
+                    // (incl. chunk #0) from parity, so chunk #0 is NOT
+                    // specially required for reconstruction; it was only
+                    // special because the cert used to live solely there.
+                    // D4 spreads the cert across chunk #0 + parity and the
+                    // receiver stores it from any chunk, so the true
+                    // skip-repair condition is "enough chunks AND cert".
+                    let cert_present = assembly.certificate.is_some();
 
-                    // If we have enough AND chunk#0 - reconstruction should happen, skip
-                    // BUT if chunk#0 is missing - MUST request repair!
-                    if total_received >= required && chunk0_received {
+                    if total_received >= required && cert_present {
                         continue;
                     }
 
@@ -6706,7 +6710,12 @@ impl SimplifiedP2P {
             }
         }
 
-        // Collect parity chunks (no certificate - only in data chunk #0)
+        // v26 D4: cert was ONLY in chunk #0 → its loss = block without
+        // cert = macroblock can't certify (freeze trigger). Replicate
+        // cert onto first N parity chunks (bounded: O(1) in cert size,
+        // not O(parity) → scales 5→1000). RS data path untouched, so it
+        // cannot make a block unreconstructable.
+        const CERT_REDUNDANT_PARITY: usize = 4;
         for (parity_index, parity_data) in parity_chunks.into_iter().enumerate() {
             let shred_protocol_chunk = ShredProtocolChunk {
                 block_height: height,
@@ -6716,7 +6725,12 @@ impl SimplifiedP2P {
                 is_parity: true,
                 original_block_size,  // CRITICAL: Include original size
                 is_macroblock,  // PRODUCTION: Tag block type
-                certificate: None,  // v2.26: Certificate only in data chunk #0
+                // v26 D4: cert on first N parity chunks (bounded redundancy)
+                certificate: if parity_index < CERT_REDUNDANT_PARITY {
+                    producer_certificate.clone()
+                } else {
+                    None
+                },
                 block_hash: Some(block_hash),  // FIX R23-P3
             };
             
@@ -6811,101 +6825,26 @@ impl SimplifiedP2P {
                     send_items.push((quic_addr, msg.clone()));
                 }
                 
-                // ============================================================================
-                // PRODUCTION v2.45.1: PRIORITY CHUNK #0 DELIVERY
-                // ============================================================================
-                // Certificate is ONLY in chunk #0! If parity arrives first and reconstructs
-                // the block, chunk #0 gets discarded → block has NO certificate → INVALID!
-                //
-                // SOLUTION: Send chunk #0 FIRST, separately from other chunks
-                // This guarantees certificate arrives before any reconstruction can happen
-                // ============================================================================
-                
-                // Separate chunk #0 (with certificate) from other chunks
-                let (chunk0_sends, other_sends): (Vec<_>, Vec<_>) = send_items
-                    .into_iter()
-                    .partition(|(_, msg)| {
-                        if let NetworkMessage::ShredProtocolChunk { chunk } = msg {
-                            chunk.chunk_index == 0 && !chunk.is_parity
-                        } else {
-                            false
-                        }
-                    });
-                
+                // v26 D5: chunk-#0-first priority machinery REMOVED.
+                // It existed ONLY because the producer certificate lived
+                // solely in chunk #0 (v2.45.1 race: parity reconstructs the
+                // block before chunk #0 → block has no certificate). D4
+                // replicates the cert onto chunk #0 + the first parity
+                // chunks and the receiver accepts it from ANY chunk, so
+                // chunk arrival order is now irrelevant. Removing the
+                // partition + 500ms blocking wait + 3ms sleep eliminates up
+                // to ~503ms of critical-path latency per block plus a
+                // self-amplifying serialization under load (which itself
+                // worsened late-chunk delivery). ALL chunks now flow through
+                // the single adaptive-paced fire-and-forget path below;
+                // UDP-burst protection (adaptive batching) is retained.
                 #[allow(unused_assignments)]
                 let mut total_success = 0usize;
                 
-                // STEP 1: Send chunk #0 FIRST (contains certificate!)
-                // No pacing needed - just send immediately to all targets
-                if !chunk0_sends.is_empty() {
-                    let mut chunk0_tasks = Vec::with_capacity(chunk0_sends.len());
-                    
-                    for (quic_addr, msg) in &chunk0_sends {
-                        let transport_clone = transport_arc.clone();
-                        let msg_clone = msg.clone();
-                        let addr = *quic_addr;
-                        let permit = semaphore.clone();
-                        
-                        // PRODUCTION v2.56: Use dedicated broadcast runtime (like Solana's broadcast_stage)
-                        // Prevents main Tokio runtime contention from starving broadcast tasks
-                        chunk0_tasks.push(BROADCAST_RUNTIME.spawn(async move {
-                            let _permit = match permit.acquire().await {
-                                Ok(p) => p,
-                                Err(_) => return Err("Semaphore closed".to_string()),
-                            };
-                            let transport = transport_clone.read().await;
-                            transport.broadcast_to(addr, &msg_clone).await
-                        }));
-                    }
-                    
-                    // ═══════════════════════════════════════════════════════════════════════════
-                    // PRODUCTION v2.54: Wait for chunk #0 with timeout (certificate is critical!)
-                    // ═══════════════════════════════════════════════════════════════════════════
-                    // - QUIC RTT ~50-100ms, 4 peers parallel ~100-200ms normal
-                    // - 500ms = 2.5x margin for jitter/congestion
-                    // - If timeout: slow peers recover via gap detection + sync_blocks()
-                    // - At least 1 peer with chunk0 = block is in network
-                    // ═══════════════════════════════════════════════════════════════════════════
-                    let chunk0_result = tokio::time::timeout(
-                        std::time::Duration::from_millis(500),
-                        futures::future::join_all(chunk0_tasks)
-                    ).await;
-                    
-                    let (chunk0_success, chunk0_timeout) = match chunk0_result {
-                        Ok(results) => {
-                            let success = results.iter()
-                                .filter(|r| matches!(r, Ok(Ok(_))))
-                                .count();
-                            (success, false)
-                        }
-                        Err(_) => {
-                            // Timeout - some peers slow, continue anyway
-                            // Reed-Solomon + gap detection will handle recovery
-                            (0, true)
-                        }
-                    };
-                    
-                    if height_for_log <= 100 || height_for_log % 50 == 0 || chunk0_timeout {
-                        if chunk0_timeout {
-                            if crate::node::is_warn() {
-                                println!("[WARN][SHRED] chunk0_timeout block={} (continuing)", height_for_log);
-                            }
-                        } else {
-                            if crate::node::is_info() {
-                                println!("[INFO][SHRED] chunk0_sent block={} ok={}/{}", 
-                                    height_for_log, chunk0_success, chunk0_sends.len());
-                            }
-                        }
-                    }
-                    
-                    // Small delay to ensure chunk #0 arrives before parity
-                    // This is critical to prevent race condition!
-                    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-                }
-                
-                // STEP 2: Send remaining chunks with adaptive pacing
-                let num_batches = if other_sends.is_empty() { 0 } else {
-                    (other_sends.len() + batch_size - 1) / batch_size
+                // v26 D5: send ALL chunks (data + parity) through one
+                // adaptive-paced fire-and-forget path. No chunk priority.
+                let num_batches = if send_items.is_empty() { 0 } else {
+                    (send_items.len() + batch_size - 1) / batch_size
                 };
                 
                 // ═══════════════════════════════════════════════════════════════════════════
@@ -6920,9 +6859,9 @@ impl SimplifiedP2P {
                 // 6. QUIC provides implicit ACK (connection-level reliability)
                 // ═══════════════════════════════════════════════════════════════════════════
                 
-                let sends_count = other_sends.len();
-                
-                    for (batch_idx, batch) in other_sends.chunks(batch_size).enumerate() {
+                let sends_count = send_items.len();
+
+                    for (batch_idx, batch) in send_items.chunks(batch_size).enumerate() {
                         for (quic_addr, msg) in batch {
                             let transport_clone = transport_arc.clone();
                             let msg_clone = msg.clone();
@@ -6984,10 +6923,10 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                let total_sends = chunk0_sends.len() + other_sends.len();
+                let total_sends = send_items.len();
                 if height_for_log <= 500 || height_for_log % 10 == 0 {
                     if crate::node::is_info() {
-                        println!("[INFO][SHRED] Block #{} delivered: {}/{} (chunk0_first, batch={}, delay={}ms, fail_rate={:.1}%)",
+                        println!("[INFO][SHRED] Block #{} delivered: {}/{} (all_paced, batch={}, delay={}ms, fail_rate={:.1}%)",
                             height_for_log, total_success, total_sends, batch_size, delay_ms, failure_rate * 100.0);
                     }
                 }
@@ -7298,14 +7237,14 @@ impl SimplifiedP2P {
                 }
             }
 
-            // v2.26: Extract certificate from chunk #0 (eliminates race condition!)
-            // Certificate is included in data chunk #0 by producer
-            if !chunk.is_parity && chunk.chunk_index == 0 {
+            // v26 D4: accept cert from ANY chunk carrying it (idempotent
+            // via assembly.certificate.is_none()) — not only chunk #0.
+            if chunk.certificate.is_some() {
                 if let Some(ref cert) = chunk.certificate {
                     if assembly.certificate.is_none() {
                         if crate::node::is_info() {
-                            println!("[INFO][SHRED] Certificate received in chunk #0 for block #{}: {} ({})",
-                                     height, cert.serial_number, cert.node_id);
+                            println!("[INFO][SHRED] cert_received block=#{} via_chunk={} parity={} serial={} node={}",
+                                     height, chunk.chunk_index, chunk.is_parity, cert.serial_number, cert.node_id);
                         }
                         assembly.certificate = Some(cert.clone());
                         
@@ -7413,36 +7352,47 @@ impl SimplifiedP2P {
             }
         }
         
-        // ============================================================================
-        // PRODUCTION v2.45.1: CHUNK #0 REQUIRED FOR PROCESSED STATUS
-        // ============================================================================
-        // Certificate is ONLY in chunk #0! Without it, block is INVALID!
-        // 
-        // PROBLEM: If parity arrives first and reconstructs block via Reed-Solomon,
-        // block gets marked as "processed" and chunk #0 is discarded when it arrives.
-        // Result: Block has no certificate → validation fails → network stalls!
-        //
-        // SOLUTION: Only mark as processed if chunk #0 is present
-        // ============================================================================
-        
-        // Check if chunk #0 (with certificate) has been received
-        let chunk0_received = if let Some(assembly) = self.shred_protocol_assemblies.get(&height) {
-            assembly.chunks_received.get(0).map(|c| c.is_some()).unwrap_or(false)
-        } else {
-            false
-        };
-        
-        // CRITICAL FIX: Only mark as processed if we can reconstruct AND have chunk #0!
-        // This prevents race condition where parity arrives before data chunk #0
-        if (should_reconstruct_all || should_reconstruct_parity) && chunk0_received {
+        // v26 D4b: CERT-PRESENCE gate (decoupled from raw chunk #0).
+        // Pre-D4 the cert lived ONLY in chunk #0, so "chunk #0 received"
+        // was a valid proxy for "cert received" and the block was gated
+        // on chunk #0. D4 replicates the cert onto chunk #0 + the first
+        // parity chunks and the receiver stores it into
+        // `assembly.certificate` from ANY cert-bearing chunk. The gate's
+        // TRUE intent is "do we have the certificate?", so it must check
+        // `assembly.certificate.is_some()` directly — NOT raw chunk #0.
+        // Without this, D4's parity-cert path never unblocks finalization
+        // (the freeze) and D5 (no chunk-#0 send priority) would strand
+        // blocks waiting for a chunk #0 that may never arrive.
+        // `cert_present`  → cert obtained from ANY cert-bearing chunk
+        //                   (gate / forward / cert-repair use this).
+        // `chunk0_received` → raw data chunk #0 present; ONLY for the
+        //                   all-data fast reconstruction path below, which
+        //                   genuinely needs chunk #0's bytes (Reed-Solomon
+        //                   recovers it from parity otherwise). This is a
+        //                   DATA concern, NOT a cert proxy — kept distinct.
+        let (cert_present, chunk0_received) =
+            if let Some(assembly) = self.shred_protocol_assemblies.get(&height) {
+                (
+                    assembly.certificate.is_some(),
+                    assembly.chunks_received.get(0).map(|c| c.is_some()).unwrap_or(false),
+                )
+            } else {
+                (false, false)
+            };
+
+        // Only mark processed if we can reconstruct AND the cert is in
+        // hand (from any of the cert-bearing chunks). Prevents the
+        // parity-before-cert race without making chunk #0 special.
+        if (should_reconstruct_all || should_reconstruct_parity) && cert_present {
             self.processed_shred_blocks.insert(height);
-        } else if should_reconstruct_parity && !chunk0_received {
-            // Can reconstruct from parity but missing chunk #0 - DON'T mark as processed!
-            // Keep waiting for chunk #0 to arrive with certificate
+        } else if should_reconstruct_parity && !cert_present {
+            // Reconstructable but cert not yet received from any chunk —
+            // do NOT finalize; keep waiting/repairing for a cert-bearing
+            // chunk (chunk #0 OR a cert parity chunk).
             if height <= 500 || height % 100 == 0 {
                 if crate::node::is_info() {
-                    println!("[INFO][SHRED] Block #{} can reconstruct ({}/{} + {}/{} parity) but WAITING for chunk #0 (certificate)",
-                        height, chunks_count, total_chunks, parity_count, 
+                    println!("[INFO][SHRED] block=#{} reconstructable ({}/{} + {}/{} parity) WAITING for certificate (any cert-bearing chunk)",
+                        height, chunks_count, total_chunks, parity_count,
                         ((total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize);
                 }
             }
@@ -7452,20 +7402,23 @@ impl SimplifiedP2P {
         // v2.60: CRITICAL FIX - Only forward NEW chunks to prevent infinite loops!
         // Problem: Without is_new_chunk check, duplicates forwarded 292x causing network storm
         // Solution: Forward ONLY if chunk is new AND block not ready for reconstruction
-        let should_forward = is_new_chunk && !should_reconstruct_all && (!should_reconstruct_parity || !chunk0_received);
+        // v26 D4b: keep forwarding until cert is in hand (not raw chunk #0).
+        let should_forward = is_new_chunk && !should_reconstruct_all && (!should_reconstruct_parity || !cert_present);
         if should_forward {
             self.forward_shred_protocol_chunk(from_peer, chunk.clone());
         }
         
-        // CRITICAL FIX v2.83: Priority request for chunk#0 OUTSIDE of should_forward!
-        // Problem: When parity received but chunk#0 missing, should_forward=false and repair never triggers
-        // Solution: ALWAYS check for missing chunk#0 regardless of forward decision
-        if !chunk0_received {
+        // v26 D4b: cert-missing priority repair (decoupled from raw chunk #0).
+        // Triggers on !cert_present (not !chunk0_received): once the cert
+        // has arrived via ANY chunk we stop spamming chunk-#0 requests.
+        // chunk #0 is still the requested target — it is a cert carrier
+        // AND a data chunk needed for reconstruction (double duty), so
+        // fetching it resolves the cert gap and a data gap at once.
+        if !cert_present {
             if let Some(mut assembly) = self.shred_protocol_assemblies.get_mut(&height) {
                 let elapsed_ms = assembly.started_at.elapsed().as_millis();
-                
-                // v14.9: Priority request for chunk#0 after 200ms; repeat every 500ms.
-                // (was 500ms/2s — too slow for 1-sec block cadence)
+
+                // Priority request for chunk#0 after 200ms; repeat every 500ms.
                 let chunk0_missing = assembly.chunks_received.get(0).map(|c| c.is_none()).unwrap_or(true);
                 let can_request_chunk0 = chunk0_missing
                     && elapsed_ms >= 200
@@ -7473,14 +7426,14 @@ impl SimplifiedP2P {
                     && assembly.retransmit_requested_at
                         .map(|t| t.elapsed().as_millis() >= 500)
                         .unwrap_or(true);
-                
+
                 if can_request_chunk0 {
                     assembly.retransmit_attempts += 1;
                     assembly.retransmit_requested_at = Some(Instant::now());
                     drop(assembly);
-                    
+
                     if crate::node::is_info() {
-                        println!("[INFO][REPAIR] priority_chunk0_request h={} elapsed={}ms can_reconstruct={}", 
+                        println!("[INFO][REPAIR] cert_missing_chunk0_request h={} elapsed={}ms can_reconstruct={}",
                                  height, elapsed_ms, should_reconstruct_parity);
                     }
                     self.request_missing_chunks(height, vec![0], from_peer);
