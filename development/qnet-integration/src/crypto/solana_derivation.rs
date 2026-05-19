@@ -126,6 +126,13 @@ fn bip39_mnemonic_to_seed(mnemonic: &str) -> [u8; 64] {
     output
 }
 
+/// v27 HOLE1: public accessor for the BIP-39 64-byte seed. The consensus
+/// ML-DSA-65 key is derived (domain-separated) from this SAME seed as the
+/// wallet address, so one mnemonic deterministically yields one identity.
+pub fn bip39_seed64(mnemonic: &str) -> [u8; 64] {
+    bip39_mnemonic_to_seed(mnemonic)
+}
+
 /// PBKDF2-HMAC-SHA512 implementation (RFC 8018).
 fn pbkdf2_hmac_sha512(password: &[u8], salt: &[u8], iterations: u32, output: &mut [u8]) {
     let hlen = 64usize; // SHA-512 output = 64 bytes

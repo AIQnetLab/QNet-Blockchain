@@ -414,42 +414,18 @@ impl SyncManager {
                      local_h, target, target - local_h, peer_count);
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // v14.10: ADAPTIVE WINDOW + CREDIT-BASED BACKPRESSURE CONFIG
-        // ═══════════════════════════════════════════════════════════════════════
-        // HONEST NOTE on constants: these are INITIAL choices, not measured
-        // under load. They are safe bounds (never exceed pipeline capacity) but
-        // may leave throughput on the table. Re-tune via metrics after rollout.
-        //
-        // MAX_INFLIGHT_*: per-iteration cap on unapplied blocks in the system.
-        //   Bootstrap (local<100): 300
-        //     — Pipeline verify_stage uses 4 workers (PipelineConfig::production).
-        //     — Dilithium3 verify ≈ 5-20 ms/block, so 4 workers ≈ 200-800 blk/s.
-        //     — Apply stage is serial (RocksDB writer): 10-50 ms/block ≈ 20-100 blk/s.
-        //     — 300 in-flight gives apply ~6-15 s of work — absorbs RTT jitter
-        //       WITHOUT allowing the deferred buffer (DEFERRED_MAX=2000) to
-        //       overflow under worst-case out-of-order delivery.
-        //   Steady: equal to DEFERRED_MAX so we never overflow by construction.
-        //
-        // MIN_DISPATCH_THRESHOLD: don't dispatch if fewer than ~1/6 of MAX — avoids
-        //   dispatch-thrash near the cap. Value chosen as 50 because it gives
-        //   half a RANGE_CHUNK of margin; re-tune if thrash appears in logs.
-        //
-        // RANGE_CHUNK: must be ≤ server-side MAX_BATCH (unified_p2p.rs:17789=100).
-        //
-        // MAX_REQUESTS_PER_ITER: caps fan-out burst. 8 × RANGE_CHUNK(100) = 800
-        //   blocks/iter — matches typical apply capacity per 500 ms-1 s window.
-        //
-        // NOTIFY_TIMEOUT: safety-net if apply_notify is lost (should never happen
-        //   due to Notify::notify_waiters semantics, but defensive).
-        //
-        // GENESIS_WAIT: bounded primary-retry window. After this the main loop's
-        //   own missing-scan keeps retrying forever — so GENESIS_WAIT is the
-        //   "best effort" ceiling, not a hard fail point.
-        //
-        // These are module-level `const` to allow a future config file or
-        // env-var override to replace them without touching hot-path code.
-        // ═══════════════════════════════════════════════════════════════════════
+        // Adaptive-window + credit-based backpressure config. HONEST NOTE:
+        // initial choices, not yet measured under load — safe bounds (never
+        // exceed pipeline capacity) but may leave throughput on the table;
+        // re-tune via metrics. MAX_INFLIGHT = unapplied-block cap: bootstrap
+        // 300 (apply is the serial bottleneck at ~20-100 blk/s; 300 ≈ 6-15s
+        // of work, absorbs RTT jitter without overflowing DEFERRED_MAX=2000);
+        // steady = DEFERRED_MAX (no overflow by construction).
+        // MIN_DISPATCH_THRESHOLD=50 avoids dispatch-thrash near the cap.
+        // RANGE_CHUNK MUST be ≤ server MAX_BATCH(100). MAX_REQUESTS_PER_ITER
+        // caps fan-out burst. NOTIFY_TIMEOUT is a defensive safety net.
+        // GENESIS_WAIT is a best-effort ceiling, not a hard fail (the main
+        // loop's missing-scan retries forever after).
         const DEFERRED_MAX_HINT:      u64 = 2000;  // matches block_pipeline.rs DEFERRED_MAX
         const MAX_INFLIGHT_BOOTSTRAP: u64 = 300;
         const MAX_INFLIGHT_STEADY:    u64 = DEFERRED_MAX_HINT;

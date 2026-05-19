@@ -60,38 +60,13 @@ const MIN_OUTBOUND_SLOTS: usize = 8;
 /// Genesis nodes and bootstrap peers bypass this check.
 const MIN_INBOUND_PEER_REPUTATION: f64 = 50.0;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v15.9: NETWORK-LAYER ECLIPSE DEFENCE — IP SUBNET DIVERSITY
-// ───────────────────────────────────────────────────────────────────────────
-// At thousands-of-nodes scale a single hosting provider (cloud region, ISP
-// pop) can spin up dozens of cheap nodes in seconds. Without subnet
-// diversity those nodes flood our peer table from a single /24 / /16
-// netblock — every "diverse" peer slot in the K-bucket is actually owned
-// by the attacker, and the node's view of the network is replaced by a
-// curated minority chain (eclipse). The 2f+1 BFT threshold protects
-// against safety violation only when the ATTACKER'S keys are bounded;
-// it gives no protection when the attacker's PEER LIST is biased.
-//
-// Defence: cap how many concurrent inbound connections may share an IP
-// netblock. The /24 cap is the strict diversity floor (≤ 2 peers from
-// the same 256-address block); the /16 cap is a soft regional floor
-// (≤ 8 peers from the same 65 536-address block, accommodating large
-// data centres while preventing single-AZ saturation).
-//
-// CONFIGURABILITY
-// ───────────────────────────────────────────────────────────────────────────
-// Operators can override via env vars without recompilation:
-//   QNET_MAX_PEERS_PER_24  — default 2
-//   QNET_MAX_PEERS_PER_16  — default 8
-// Genesis IPs and outbound connections are exempt (we chose them; we
-// already have signed activation evidence).
-//
-// SCALABILITY (1 000+ super nodes)
-// ───────────────────────────────────────────────────────────────────────────
-// Per-admission cost: O(N) scan over `connected_peers_lockfree` where
-// N ≤ MAX_CONNECTED_PEERS (= 1000). At 1000 peers × ~50 ns per DashMap
-// iter step this is ≤ 50 µs per admission — negligible relative to
-// the QUIC handshake cost that already dominates new-peer setup.
+// Network-layer eclipse defence (IP subnet diversity). One provider can
+// spin up many cheap nodes from a single /24 or /16 and flood the peer
+// table → eclipse (2f+1 protects safety only when attacker KEYS are
+// bounded, not when the PEER LIST is biased). Cap concurrent inbound per
+// netblock: /24 ≤2 (strict floor), /16 ≤8 (soft regional, fits large DCs).
+// Env-overridable (QNET_MAX_PEERS_PER_24 / _16); genesis IPs and outbound
+// exempt. O(N≤1000) per admission, negligible vs the QUIC handshake.
 const DEFAULT_MAX_PEERS_PER_SUBNET_24: usize = 2;
 const DEFAULT_MAX_PEERS_PER_SUBNET_16: usize = 8;
 
@@ -204,30 +179,13 @@ pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> =
 // Replaces O(N) scan of active_full_super_nodes on every consensus tick.
 pub static BEST_PEER_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v24: PENDING-GAP QUEUE (multiple disjoint gaps, lock-free)
-// ═══════════════════════════════════════════════════════════════════════════
-// Pre-v24 the gap queue was a single `Mutex<(u64, u64)>` slot — only ONE
-// gap range could be tracked at a time. When a second gap was detected
-// before the first was consumed, it OVERWROTE the first entry, silently
-// dropping the earlier range. On a fast-cadence chain under packet loss,
-// gaps can pile up faster than the sync loop drains them, so the old
-// design routinely lost detection events.
-//
-// v24 stores gaps in a DashMap keyed by `gap_from_height`. The consumer
-// loop drains all entries on each tick and dispatches a sync_blocks
-// request per range. Same-range duplicate insertions are absorbed by the
-// hash-key — the consumer sees one entry per distinct start.
-//
-// Retention: drained entries are removed on consume. Stale entries that
-// the consumer can't drain in time fall under the periodic cleanup that
-// already prunes timeout-state maps (`cleanup_old_timeout_data` extended
-// with `cleanup_old_gap_entries` below).
-//
-// Scalability: O(1) insert per detected gap; O(K) drain where K = pending
-// gaps (bounded by recent stall events, typically <50 even on a noisy
-// 100K-node network).
-// ═══════════════════════════════════════════════════════════════════════════
+// Pending-gap queue (multiple disjoint gaps, lock-free). The pre-v24
+// single Mutex<(u64,u64)> slot tracked only ONE gap, so a second gap
+// overwrote the first → lost detection events under packet-loss pile-up.
+// Now a DashMap keyed by gap_from_height; the consumer drains all entries
+// per tick (one sync_blocks per range, same-range dups absorbed by key).
+// Drained on consume + swept by cleanup_old_gap_entries. O(1) insert,
+// O(K) drain (K<50 typical).
 pub static PENDING_GAP_SYNC_QUEUE: Lazy<DashMap<u64, u64>> = Lazy::new(DashMap::new);
 
 /// Insert (or update) a pending gap-sync range. `gap_from` is the key, so
@@ -1236,35 +1194,16 @@ pub static QUIC_FALLBACK_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atom
 pub static QUIC_FALLBACK_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static QUIC_FALLBACK_RATE_LIMITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v15.1: GLOBAL PEER LIVENESS REGISTRY (keyed by IP address)
-// ═══════════════════════════════════════════════════════════════════════════
-// Root-cause fix for the cascade observed on 001 at 09:47:32: the
-// runtime TCP-probe path in `filter_working_genesis_nodes_static`
-// disagreed with reality. Node 001 was actively RECEIVING shred chunks
-// from 002 at t=31.9s, then a 2s TCP-connect probe to 002 timed out at
-// t=32.2s (002 was busy with its own consensus work), and 002 was
-// marked `offline` even though message flow proved it alive.
-//
-// Two liveness sub-systems existed and contradicted each other:
-//   * `PeerInfo.last_seen` (per-instance) — updated on every received
-//     message. Ground truth for runtime liveness. Unreachable from the
-//     `static` helper below.
-//   * `filter_working_genesis_nodes_static` — separate 2-second TCP
-//     SYN probe with no retry, cache TTL 30s. Over-rules reality.
-//
-// This global mirrors `PeerInfo.last_seen` keyed by IP (strip port),
-// updated from the same `update_peer_last_seen_with_height` hook. The
-// static filter then consults it BEFORE issuing a TCP probe: a peer
-// with recent received traffic is trivially alive and bypasses the
-// probe entirely. TCP probe remains only as a cold-start / silent-peer
-// fallback — its original legitimate purpose.
-//
-// Single source of truth = no possibility for the two paths to disagree.
-// At 1000-super-node committee cap the map is bounded; periodic sweeps
-// expire entries older than `PEER_ALIVE_FRESHNESS_SECS` under the same
-// cleanup loop that prunes the other global trackers.
-// ═══════════════════════════════════════════════════════════════════════════
+// Global peer-liveness registry (keyed by IP). Root-cause fix for a
+// false-offline cascade: the static TCP-probe path disagreed with reality
+// (001 was receiving shreds from 002 when a 2s probe to a busy 002 timed
+// out → 002 marked offline). Two liveness subsystems contradicted: per-
+// instance PeerInfo.last_seen (ground truth, unreachable from the static
+// helper) vs a 2s no-retry TCP SYN probe that over-ruled it. This mirrors
+// last_seen by IP so the static filter checks recent traffic BEFORE
+// probing (recent traffic = alive, skip probe); the TCP probe stays only
+// as a cold-start / silent-peer fallback. Single source of truth; bounded
+// and swept by PEER_ALIVE_FRESHNESS_SECS.
 
 /// IP → last_seen (unix seconds). Mirror of `PeerInfo.last_seen` exposed
 /// to the static-context `filter_working_genesis_nodes_static` helper.
@@ -1388,43 +1327,16 @@ static HIGHEST_ADOPTED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
 static VOTER_MAX_ROUND: Lazy<Arc<DashMap<(u64, String), u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v15.11: PER-MACROBLOCK BASELINE FINALIZED ROUND
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// Problem this solves:
-//   HIGHEST_CERTIFIED_ROUND[mb] and HIGHEST_ADOPTED_ROUND[mb] are keyed per
-//   macroblock and persist across all 90 heights in that macroblock. When a
-//   stall occurs at height K with rotation reaching round=R, every subsequent
-//   height in the same mb starts production with `current_rotation_round=R`
-//   while its own `microblock.timeout_round` snapshot is 0. The pre-save guard
-//   then yields every block until the macroblock boundary — effectively muting
-//   the elected producer for the rest of the mb (~30+ blocks ≈ 30+ seconds).
-//
-// Forensic case h=15886 → h=15899: producer 005 yielded 14 consecutive blocks
-// after a single rotation event because the round counter remained at 27 for
-// the whole mb=176, while each new height started with snapshot=0.
-//
-// Industry-grade fix:
-//   Track the rotation round at which the LAST microblock of a given mb was
-//   finalized (saved by producer or applied by validator). For subsequent
-//   heights in the same mb, the EFFECTIVE rotation round is
-//   `live_consensus_round - last_finalized_round`. This naturally resets to 0
-//   at the start of each new height after a successful finalization, while
-//   still detecting in-flight rotation advances for the current production.
-//
-// Safety:
-//   * Monotonic — only advances upward; no regression on out-of-order applies.
-//   * Synced across nodes through block application: any peer that applies a
-//     block at height K with `microblock.timeout_round=R` records baseline=R
-//     for mb=K/90, matching the producer's view.
-//   * Cleanup tied to `cleanup_sweep` (~5 min retention window).
-//
-// Scalability:
-//   * O(1) DashMap lookup per block save / apply.
-//   * Per-mb storage — at 1000 validators × 24h × 86400 blocks = ~960 entries
-//     pre-cleanup, ~15KB memory.
-// ═══════════════════════════════════════════════════════════════════════════
+// Per-macroblock baseline finalized round. HIGHEST_CERTIFIED/ADOPTED_ROUND
+// are keyed per-mb and persist across all 90 heights, so after a stall at
+// height K reaching round R every later height in the mb starts with
+// rotation_round=R while its own snapshot is 0 → the pre-save guard yields
+// every block to the mb boundary, muting the elected producer ~30+ blocks
+// (forensic h=15886→15899: producer 005 yielded 14 in a row, round stuck
+// at 27 for mb=176). Fix: track the round at which the LAST microblock of
+// the mb finalized; effective round = live_round − last_finalized_round
+// (resets to 0 each new height after finalization, still detects in-flight
+// advances). Monotonic; synced via block application; O(1), ~15KB.
 
 /// Per-macroblock baseline: the rotation round at which the last block of
 /// this macroblock was finalized. Used to compute effective rotation round
@@ -1460,35 +1372,16 @@ pub fn get_baseline_round(mb_index: u64) -> u64 {
 /// Returns the BFT-CERTIFIED rotation round for `mb_index`, relative to the
 /// last finalized baseline in this macroblock.
 ///
-/// ═══════════════════════════════════════════════════════════════════════════
-/// v23.1: STRICT 2f+1 CERTIFIED-ONLY (h=556 split-brain class fix)
-/// ═══════════════════════════════════════════════════════════════════════════
-/// `HIGHEST_ADOPTED_ROUND` (f+1 plurality) is REMOVED from this calculation.
-/// Why: f+1 voters' max-round can DIVERGE across nodes under partial gossip
-/// propagation — two nodes can see different f+1 subsets, compute different
-/// `adopted` values, and therefore elect DIFFERENT leaders for the same
-/// height. Result: split-brain microblock fork at one height, observed in
-/// the h=556 forensic incident (commit b0c39aa, "strict 2f+1 BFT-certified
-/// producer rotation").
-///
-/// Only the 2f+1 SUPERMAJORITY-certified round is safe to drive producer
-/// selection. The certified round is cryptographically unforgeable
-/// (Dilithium3-signed votes verified at handle_timeout_vote ingestion),
-/// monotonic per macroblock index, and identical on every honest node
-/// within one gossip RTT of the supermajority being reached.
-///
-/// `HIGHEST_ADOPTED_ROUND` remains computed elsewhere (handle_timeout_vote
-/// pacemaker path) for vote-collection acceleration and observability —
-/// but it MUST NOT enter the producer-selection path. Re-introducing it
-/// here re-introduces the h=556 split-brain class.
-///
-/// Returns 0 if no rotation advance has been BFT-certified since the last
-/// finalized block in this macroblock. Returns N > 0 only if 2f+1 signed
-/// timeout votes have aggregated for round (baseline + N).
-///
-/// This is the value that MUST be embedded in `microblock.timeout_round`
-/// at production start, used for ingest-side Category B authority check,
-/// and is the SOLE rotation input to `select_microblock_producer_with_round`.
+/// Strict 2f+1 certified-only. HIGHEST_ADOPTED_ROUND (f+1) is NOT used here:
+/// f+1 voters' max-round can diverge across nodes under partial gossip →
+/// different `adopted` → different leaders for the same height → split-brain
+/// fork (h=556). Only the 2f+1 supermajority-certified round is safe — it is
+/// Dilithium3-unforgeable, monotonic per mb, and identical on every honest
+/// node within a gossip RTT. Adopted stays computed elsewhere (pacemaker /
+/// observability) but MUST NOT enter producer selection. Returns 0 if no
+/// advance is certified, else N where 2f+1 votes aggregated for baseline+N.
+/// This is the SOLE rotation input to select_microblock_producer_with_round
+/// and the value embedded in microblock.timeout_round (Category-B check).
 ///
 /// Scalability: O(1) DashMap reads. Identical cost from 5 to 10 000 super-
 /// nodes.
@@ -1521,29 +1414,15 @@ pub fn get_effective_rotation_round(mb_index: u64) -> u64 {
     live.saturating_sub(baseline)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v15.0: PACEMAKER-CERTIFIED SUPPORT
-// ═══════════════════════════════════════════════════════════════════════════
-// Closes the cascade livelock previously observed at h=2880..3151:
-//   * voters stretched across rounds 3..7 during a partial network stall
-//   * no single round ever collected 2f+1 same-round signatures
-//   * HIGHEST_CERTIFIED_ROUND stayed at 0 while HIGHEST_ADOPTED_ROUND kept
-//     climbing — commit/reveal phase (requiring 2f+1 finality) hung
-//
-// Pacemaker semantics: the k-th highest per-voter max_round across all
-// signed votes, where k = 2f+1, is the highest round with ≥ 2f+1 cumulative
-// support. Each voter's signature at round R supports ALL rounds ≤ R
-// (because "I saw R" implies "I saw every prior round"). This converges
-// even when voters are asynchronously spread across rounds.
-//
-// Safety: identical byzantine resistance to same-round 2f+1 — each
-// contributing vote is Dilithium3-verified at handle_timeout_vote before
-// VOTER_MAX_ROUND entry, so ≤ f attackers cannot reach the 2f+1 threshold.
-//
-// Scalability: per-vote O(voters_at_height) partial sort — 1000-validator
-// cap bounds this to ~1000 u64 compares per incoming vote. Flat in
-// committee size thanks to the active-mb-window cleanup sweep.
-// ═══════════════════════════════════════════════════════════════════════════
+// Pacemaker-certified support. Closes the cascade livelock at
+// h=2880..3151 (voters spread across rounds 3..7 in a partial stall, no
+// single round got 2f+1 same-round sigs, certified stuck at 0 while
+// adopted climbed → commit/reveal hung). Pacemaker = the k-th highest
+// per-voter max_round (k=2f+1) = highest round with ≥2f+1 cumulative
+// support, since a vote@R implies all rounds ≤R; converges even with
+// asynchronously-spread voters. Same byzantine resistance as same-round
+// 2f+1 (each vote Dilithium3-verified before VOTER_MAX_ROUND). O(voters)
+// partial sort.
 
 /// v15.0: Per-voter signed vote data for aggregated certificate construction.
 /// Key: (macroblock_index, voter_id). Value: (vote_round, vote_block_hash,
@@ -1571,32 +1450,12 @@ static AGGREGATED_TC: Lazy<Arc<DashMap<(u64, u64), AggregatedTimeoutCertificate>
 static AGGREGATED_TC_BROADCAST: Lazy<Arc<DashMap<u64, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v16.1: REMOTE PRODUCER HEARTBEAT TRACKING (network-wide liveness signal)
-// ═══════════════════════════════════════════════════════════════════════════
-// Stored as separate DashMaps so the watchdog reads are wait-free and the
-// producer-side broadcast hot path doesn't serialise on a single mutex.
-//
-//   REMOTE_PRODUCER_HEARTBEAT_MS:
-//     producer_id → producer-stamped timestamp (the time the producer THINKS
-//     it sent the heartbeat). Monotonic per producer; replays rejected at
-//     handler entry. Used by signature anti-replay guard.
-//
-//   REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS:
-//     producer_id → local wall-clock at receive time. Used by the watchdog
-//     to compute "silence" duration without trusting the producer's clock.
-//     This is the source of truth for the silent-threshold check, NOT the
-//     producer's own timestamp (which could be skewed by NTP drift).
-//
-// Capacity: bounded to MAX_REMOTE_PRODUCER_TRACKED entries. When the cap is
-// reached the oldest observation is evicted — at 1000 active producers
-// rotating through slots, ~10× headroom is enough to retain everyone in the
-// committee without unbounded growth from churn.
-//
-// Scalability: O(1) per insert/lookup via DashMap shard hashing. At 100k
-// super nodes only the actively-rotating subset (≤ committee size) writes
-// here, so map size is bounded by validator-set ceiling not network size.
-// ═══════════════════════════════════════════════════════════════════════════
+// Remote-producer heartbeat tracking (two wait-free DashMaps).
+// REMOTE_PRODUCER_HEARTBEAT_MS = producer-stamped ts (monotonic, anti-
+// replay). REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS = local wall-clock at
+// receive — the source of truth for the silence check, NOT the producer's
+// clock (which can be NTP-skewed). Bounded by MAX_REMOTE_PRODUCER_TRACKED
+// (oldest evicted at cap). O(1)/op.
 
 const MAX_REMOTE_PRODUCER_TRACKED: usize = 10_000;
 
@@ -1606,18 +1465,11 @@ pub static REMOTE_PRODUCER_HEARTBEAT_MS: Lazy<DashMap<String, u64>> =
 pub static REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS: Lazy<DashMap<String, u64>> =
     Lazy::new(DashMap::new);
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v16.2: OBSERVER-BASED BLOCK REJECTION AGGREGATOR
-// ═══════════════════════════════════════════════════════════════════════════
-// Maps (height, source_peer_id) → set of distinct observer_ids that
-// signed and verified a BlockRejection. When the set crosses 2f+1, fork
-// recovery fires. Keyed on (height, source) so two simultaneous Byzantine
-// producers at the same height can be tracked independently.
-//
-// Capacity: bounded by committee size; each tuple bounded by N observers.
-// Cleanup sweep evicts entries below current chain tip via the existing
-// timeout-state cleanup (extended below in cleanup_block_rejections).
-// ═══════════════════════════════════════════════════════════════════════════
+// Observer-based block-rejection aggregator: (height, source_peer_id) →
+// set of distinct observer_ids that signed+verified a BlockRejection;
+// ≥2f+1 → fork recovery. Keyed on (height,source) so two simultaneous
+// Byzantine producers at one height are tracked independently. Bounded by
+// committee size; swept by cleanup_block_rejections.
 pub static BLOCK_REJECTION_OBSERVERS: Lazy<DashMap<(u64, String), DashSet<String>>> =
     Lazy::new(DashMap::new);
 
@@ -1680,74 +1532,18 @@ pub fn last_remote_producer_heartbeat_age_ms(producer_id: &str) -> Option<u64> {
     Some(now_ms.saturating_sub(observed))
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v25: VALIDATOR LIVENESS — MISS TRACKING + REPUTATION PENALTY (H9 + H16)
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// CONTEXT
-// ───────
-// In a BFT-PoS chain with up to 1000 validators per round drawn from a
-// network of 100k+ super-nodes, a permanently-offline validator that stays
-// in the active rotation creates two production-grade problems:
-//
-//   (1) LIVENESS — every slot the offline validator is elected leader for
-//       costs ≥ STALL_GRACE_SECS (5 s) to detect + one round of 2f+1
-//       timeout-vote aggregation before a fallback leader produces. At
-//       1 sec target cadence that's a 6-8 sec penalty per offline-slot.
-//
-//   (2) ECONOMICS — the offline validator continues to receive its share
-//       of the validator-set rotation rewards even though it contributes
-//       zero blocks. Honest producers carry the load while a dead identity
-//       collects unearned emission, distorting incentives.
-//
-// CANONICAL TOP-L1 SOLUTION
-// ─────────────────────────
-// Two complementary mechanisms operating from the same data source
-// (`REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS`):
-//
-//   H9. EJECTION — when a validator misses N consecutive expected
-//       production slots AND has no fresh heartbeat for the same window,
-//       it's marked `ejected_until_recovery`. The next macroblock-boundary
-//       VRF candidate selection skips ejected identities. The validator
-//       can re-enter rotation when its heartbeat resumes (proves it's
-//       back online and its consensus key is still operative).
-//
-//   H16. REPUTATION PENALTY — for each detected miss the validator's
-//       deterministic-reputation score drops by `OFFLINE_MISS_PENALTY`
-//       (small, e.g. 0.5 points on a 0-100 scale). Repeated misses
-//       cumulatively erode the reputation, which directly lowers the
-//       node's selection probability in subsequent VRF candidate draws
-//       through the existing `qualified_candidates` reputation filter.
-//
-// PRODUCTION SAFETY GATING
-// ────────────────────────
-// Automatic ejection is GATED behind the `QNET_LIVENESS_EJECTION` env var
-// (default OFF). When the gate is off the miss tracker still runs but only
-// logs WARN events at the configured threshold; no consensus state is
-// mutated. This lets operators deploy the observability surface in
-// production, calibrate thresholds against real network behaviour, and
-// only enable enforcement once thresholds are proven safe. The reputation
-// penalty (H16) is always on — it is non-destructive (slow drift toward
-// lower selection probability) and self-correcting (resumed heartbeat
-// arrests further decay).
-//
-// SCALABILITY
-// ───────────
-// All operations are O(1) DashMap reads/writes. Memory bounded by the
-// `MAX_REMOTE_PRODUCER_TRACKED` cap and the active-mb-window cleanup
-// sweep. Identical cost at 5 or 100 000 super-nodes.
-//
-// SAFETY INVARIANTS
-// ─────────────────
-//   * Miss detection key is `(node_id, expected_slot_height)`. Each height
-//     can be counted as a miss at most once, eliminating double-counting
-//     under gossip jitter.
-//   * Ejection requires N CONSECUTIVE misses (not cumulative) — a brief
-//     network blip doesn't permanently remove an honest validator.
-//   * Re-entry on heartbeat recovery is automatic and unconditional from
-//     this module's POV; the validator-set rotation logic handles any
-//     additional gating (e.g. minimum reputation floor).
-// ═══════════════════════════════════════════════════════════════════════════
+// v25: validator liveness — miss tracking + reputation penalty (H9+H16).
+// A permanently-offline validator left in rotation hurts liveness
+// (>=STALL_GRACE_SECS + a timeout-vote round per elected-offline slot) and
+// economics (unearned rewards). From REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS:
+//   H9 EJECTION: N CONSECUTIVE missed expected slots + no fresh heartbeat
+//     -> ejected_until_recovery; macroblock VRF candidate selection skips
+//     ejected; auto re-entry on heartbeat resume. GATED behind
+//     QNET_LIVENESS_EJECTION (default OFF -> observe-only WARN, no state).
+//   H16 REPUTATION: each miss drops deterministic-reputation by
+//     OFFLINE_MISS_PENALTY -> lowers VRF selection. Always on; self-correcting.
+// Miss key (node_id, slot_height) counted once; consecutive not cumulative
+// (a blip won't eject an honest node). O(1), bounded.
 
 /// Per-validator consecutive-miss counter. Resets to 0 on observed
 /// heartbeat. Key: validator node_id. Value: (consecutive_miss_count,
@@ -6583,39 +6379,13 @@ impl SimplifiedP2P {
         let chunks = self.split_into_chunks(&block_data);
         let total_chunks = chunks.len();
         
-        // ═══════════════════════════════════════════════════════════════════════════
-        // PRODUCTION v2.55: ADAPTIVE REDUNDANCY for large blocks
-        // ═══════════════════════════════════════════════════════════════════════════
-        // PRODUCTION v2.55: ADAPTIVE REDUNDANCY
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Problem: Fixed 1.5x redundancy insufficient for large blocks
-        // Solution: Scale redundancy with block size for optimal reliability
-        // ═══════════════════════════════════════════════════════════════════════════
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v15.11: COMMITTEE-AWARE ADAPTIVE REDUNDANCY
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Small committees (≤ 50 super-nodes — typical genesis or regional mesh)
-        // benefit from a higher base redundancy: a single dropped chunk on a 5-node
-        // mesh hits 25% packet loss perceived per receiver, vs ~5% on a 100-node
-        // committee. The recovery threshold is 67% of total chunks, so at 1.5x
-        // redundancy a 5-node receiver missing 2/3 chunks (e.g. Wi-Fi burst loss)
-        // can no longer reconstruct without a repair round-trip.
-        //
-        // Large super-node committees (1000+) have stronger statistical resilience
-        // from broader fan-out — every receiver sees chunks from many peers, so the
-        // marginal benefit of higher redundancy is offset by the bandwidth cost
-        // (1.5x → 2x doubles outbound BW for 90 blocks × 90 nodes × hourly committee
-        // rotation = a meaningful bill on metered links).
-        //
-        // Tier scheme:
-        //   * Tiny block (< 100KB):       2.0x for genesis/LAN, 1.5x at scale
-        //   * Small block (< 500KB):      2.0x for genesis/LAN, 1.75x at scale
-        //   * Medium block (< 2MB):       2.0x always
-        //   * Large block (≥ 2MB):        2.5x always (already scaled)
-        //
-        // We don't have committee size in this scope, but the producer's
-        // `connected_peers_lockfree` set is a proxy: ≤ 50 peers ≈ small committee.
-        // ═══════════════════════════════════════════════════════════════════════════
+        // Committee-aware adaptive redundancy. Small committees (≤50) need
+        // higher base redundancy — one dropped chunk on a 5-node mesh is 25%
+        // perceived loss vs ~5% on 100 nodes, and recovery needs 67% of
+        // chunks. Large committees (1000+) get statistical resilience from
+        // fan-out, so extra redundancy isn't worth the bandwidth. Tiers:
+        // <100KB 2.0x genesis / 1.5x scale; <500KB 2.0 / 1.75; <2MB 2.0;
+        // ≥2MB 2.5. Proxy for committee size: connected_peers_lockfree ≤50.
         let live_peer_count = self.connected_peers_lockfree.len();
         let small_committee = live_peer_count <= 50;
         let adaptive_redundancy = if original_block_size < 100_000 {
@@ -7021,37 +6791,15 @@ impl SimplifiedP2P {
     
     /// Build the per-block ShredProtocol routing list.
     ///
-    /// ═══════════════════════════════════════════════════════════════════════
-    /// v24: BLOCK-HEIGHT-SEEDED DETERMINISTIC SHUFFLE (anti-exclusion)
-    /// ═══════════════════════════════════════════════════════════════════════
-    /// Pre-v24 the list was a flat Kademlia-bucket sort. The downstream
-    /// chunk-to-peer selector used `(chunk_index * fanout) % len`, which is
-    /// fully deterministic — meaning a peer at a particular position in the
-    /// sorted bucket order would CONSISTENTLY receive the same chunk indices
-    /// for every block. If the relationship between (chunk_index, fanout,
-    /// peer_count) happens to systematically exclude one peer for many chunks,
-    /// that peer suffers permanent block loss. Observed live on 5-node
-    /// testnet: node-001 missing 267 of 1260 blocks (21 %) — a textbook
-    /// modular-arithmetic hash exclusion.
-    ///
-    /// v24 fix: the routing list is the same Kademlia-sorted set BUT shuffled
-    /// per-block using a deterministic permutation derived from a public,
-    /// chain-anchored value (block_height). Every honest node computes the
-    /// IDENTICAL permutation for a given block, so chunks are routed to a
-    /// well-defined target set and forwarding behaves consistently — but the
-    /// target set rotates between blocks, so no peer is permanently
-    /// excluded. Over N blocks, each peer's expected chunk count converges
-    /// to `fanout * total_chunks / N` (uniform).
-    ///
-    /// Algorithm: Fisher-Yates shuffle seeded by `block_height` via a
-    /// SplitMix64 PRNG. Deterministic, O(N) shuffle, no allocations beyond
-    /// the result vector.
-    ///
-    /// Scalability: identical cost from 5 to 100 000 super-nodes. The shuffle
-    /// is done once per block at broadcast time and once per chunk-receive
-    /// at forwarding time (cached implicitly by the caller passing the same
-    /// routing_tree to multiple `select_shred_protocol_targets` calls).
-    /// ═══════════════════════════════════════════════════════════════════════
+    /// Block-height-seeded deterministic shuffle (anti-exclusion). A flat
+    /// Kademlia sort + the `(chunk_index*fanout)%len` selector consistently
+    /// routed the same chunk indices to the same peer every block, so a peer
+    /// the modular arithmetic excluded suffered permanent block loss
+    /// (node-001 missing 267/1260 = 21%). Fix: shuffle the same sorted set
+    /// per-block via a deterministic permutation seeded by block_height
+    /// (every honest node computes the IDENTICAL permutation, but the target
+    /// set rotates between blocks → no permanent exclusion; expected
+    /// per-peer chunk count is uniform). Fisher-Yates via SplitMix64, O(N).
     fn build_shred_protocol_routing_tree(&self, peers: &[PeerInfo]) -> Vec<PeerInfo> {
         // Legacy callers (forwarders that don't know block_height) use this
         // overload, which keeps the bucket-sorted ordering as before.
@@ -7491,39 +7239,15 @@ impl SimplifiedP2P {
             }
         }
         
-        // ═══════════════════════════════════════════════════════════════════
-        // v24: CHUNK-#0 CERT GATE DECOUPLED FROM PARITY RECONSTRUCTION
-        // ═══════════════════════════════════════════════════════════════════
-        // Pre-v24 the reconstruction path required chunk #0 to be present
-        // even when sufficient data + parity chunks were available to recover
-        // it via Reed-Solomon. The certificate lives inside chunk #0, so the
-        // intent was "do not apply a block whose certificate we haven't
-        // verified" — but the implementation conflated TWO independent
-        // concerns:
-        //
-        //   (1) Can we reconstruct chunk #0 from the parity we already
-        //       have? Reed-Solomon answers YES whenever
-        //       received_chunks >= total_data_chunks (with proper indexing).
-        //   (2) Once reconstructed, is the certificate inside it valid?
-        //       That is verified downstream in the apply pipeline.
-        //
-        // Conflating them caused permanent block loss whenever chunk #0 was
-        // dropped in transit and parity-based recovery would have succeeded.
-        // Observed live: 21 % block loss on the slowest peer.
-        //
-        // v24 decouples: attempt parity reconstruction unconditionally when
-        // the math allows it. The reconstructed chunk #0 still carries the
-        // producer's signed certificate (binding height + state_root + merkle
-        // + producer + timeout_round per v23.1 hash binding), so a tampered
-        // or absent certificate fails downstream signature verification and
-        // the block is rejected before apply — same end-to-end safety as
-        // the pre-v24 gate, without throwing away recoverable blocks.
-        //
-        // Scalability: identical cost. One extra Reed-Solomon decode per
-        // recoverable block in the rare case chunk #0 was dropped. At
-        // 100 000 super-nodes the savings from NOT permanently losing
-        // chunk-#0-dropped blocks dominate the reconstruction overhead.
-        // ═══════════════════════════════════════════════════════════════════
+        // Chunk-#0 cert gate decoupled from parity reconstruction. The
+        // cert lives in chunk #0, but requiring #0 to be physically present
+        // conflated "can we Reed-Solomon-recover #0?" with "is its cert
+        // valid?" → permanent block loss when #0 dropped but parity could
+        // recover it (21% loss on the slowest peer). Now reconstruct
+        // whenever the math allows; the recovered #0 still carries the
+        // producer's signed cert, so a tampered/absent cert fails downstream
+        // sig verify and is rejected before apply — same safety, no
+        // discarded recoverable blocks.
         if should_reconstruct_all && chunk0_received {
             // Fast path: all data chunks received including chunk #0.
             self.reconstruct_block_from_shred_protocol(height);
@@ -7588,42 +7312,14 @@ impl SimplifiedP2P {
             return;
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        // v25 H12: PER-CHUNK FORWARD-ONCE DEDUP (cascade-depth bound)
-        // ───────────────────────────────────────────────────────────────────
-        // The legacy relay forwarded a chunk on EVERY arrival from a peer.
-        // In the cascade tree this produces O(F^h) duplicate emissions for
-        // every node that already sees the chunk via multiple parents:
-        // total per-block message count blows up multiplicatively with
-        // committee size. At 100K super-nodes this saturates east-west
-        // bandwidth.
-        //
-        // Canonical Turbine-style relay (Solana, Aptos) bounds the cascade
-        // by structural layer assignment over a wire-tagged hop counter.
-        // QNet's wire format (bincode 1.x, positional encoding without
-        // forward-compat for new struct fields) does NOT support adding a
-        // layer-id field non-disruptively — old peers would reject the
-        // new payload, new peers would reject the old.
-        //
-        // We achieve the same cascade-depth bound through PURELY LOCAL
-        // state: each node forwards each unique `(block_height, chunk_idx)`
-        // tuple AT MOST ONCE. Re-arrivals (same chunk from a different
-        // parent in the gossip tree) are dropped at the forwarder
-        // boundary. Coverage stays O(N) because the first arrival from
-        // any parent fans out via the normal Kademlia + Fisher-Yates
-        // routing; subsequent arrivals only contribute to local
-        // reconstruction, never to additional re-broadcast.
-        //
-        // Memory cost: one `(u64, u32)` per chunk seen, ≤ 8 KB per block
-        // (≤ 1000 chunks/block at the configured upper bound). Pruned by
-        // the existing block-processed sweep — entries for finalized
-        // heights are dropped alongside `processed_shred_blocks`.
-        //
-        // Wire-compat: ZERO. No protocol byte changes. Old peers continue
-        // to exchange chunks with the new dedup gate transparently — the
-        // gate is observed only by the local forwarder. Rolling upgrade
-        // safe.
-        // ═══════════════════════════════════════════════════════════════════
+        // Per-chunk forward-once dedup (cascade-depth bound). The legacy
+        // relay forwarded on EVERY arrival → O(F^h) duplicate emissions,
+        // saturating bandwidth at scale. Bound it with purely local state:
+        // forward each unique (block_height, chunk_idx) AT MOST ONCE; drop
+        // re-arrivals at the forwarder. Coverage stays O(N) (the first
+        // arrival fans out via normal routing; later arrivals only feed
+        // local reconstruction). ≤8 KB/block, pruned with
+        // processed_shred_blocks.
         let forward_key = (chunk.block_height, chunk.chunk_index as u32);
         if !FORWARDED_SHRED_CHUNKS.insert(forward_key) {
             // Already forwarded this chunk once — drop the duplicate
@@ -13877,79 +13573,14 @@ impl SimplifiedP2P {
                     return;
                 }
 
-                // Convergence check: ack ONLY if our local certified_round
-                // EXACTLY matches the requested round.
-                //
-                // v16.2: tightened from `≥ round` to `== round` so the
-                // handshake quorum proves the network has converged on
-                // EXACTLY this round, not just "advanced past it". The
-                // looser semantics let two producers at different rounds
-                // both collect 2f+1 acks if certified was racing — both
-                // would still produce one canonical block each via VRF
-                // determinism, but the conceptual model becomes harder to
-                // reason about. Strict equality keeps the proof simple:
-                // 2f+1 acks ⇒ 2f+1 nodes are AT this round right now ⇒
-                // single producer per (height, round) pair, no ambiguity.
-                //
-                // ═══════════════════════════════════════════════════════════
-                // v25 UNITS-MISMATCH FIX — forensic h=1261 deadlock
-                // ───────────────────────────────────────────────────────────
-                // The producer-side `timeout_round` passed in the
-                // `ProducerReady` message is the BASELINE-RELATIVE value
-                // computed by `get_certified_rotation_round(mb_idx)`
-                // (= `HIGHEST_CERTIFIED_ROUND[mb_idx] - baseline_round[mb_idx]`).
-                // That is the exact value the producer embeds in
-                // `microblock.timeout_round` and uses for VRF rotation
-                // index `(round0_idx + timeout_round) % candidates.len()`.
-                //
-                // The receiver MUST compare in the same relative space.
-                // Comparing the raw absolute `HIGHEST_CERTIFIED_ROUND[mb_idx]`
-                // to the relative `round` is a units mismatch — the two
-                // quantities agree by coincidence only when
-                // `baseline_round[mb_idx] == 0` (no rotation has ever
-                // closed a block inside this macroblock yet). The moment a
-                // block in mb=N is finalized at a non-zero relative
-                // timeout_round, the baseline becomes positive, and any
-                // subsequent ProducerReady for the same `mb_idx` fails the
-                // equality test on every receiver — including those whose
-                // certificate state is perfectly converged with the
-                // producer's. The forensic h=1261 deadlock is exactly
-                // this case:
-                //   * h=1260 was produced at relative timeout_round=2
-                //     (handshake_quorum mb_idx=14 round=2 acks=4/4) →
-                //     baseline_round[14] = 2 across all honest nodes.
-                //   * The 37-second mb=14 commit-reveal window let stall
-                //     detection emit one extra timeout vote at absolute
-                //     round=3 → `HIGHEST_CERTIFIED_ROUND[14]=3` everywhere.
-                //   * Producer for h=1261 computed relative
-                //     timeout_round = 3 - 2 = 1 and sent
-                //     `ProducerReady{round=1}`.
-                //   * Every receiver checked `3 != 1` and refused to ack,
-                //     including peers whose state was identical to the
-                //     producer's.
-                //   * Result: acks=1/4 forever, rotation cycles 213+
-                //     iterations without producing a block.
-                //
-                // The architecturally correct comparison evaluates the
-                // receiver's view in the SAME relative units the producer
-                // uses, via the same `get_baseline_round(mb_idx)` helper
-                // that drives `get_certified_rotation_round`. baseline_round
-                // is sourced from on-chain `microblock.timeout_round` of
-                // the last applied block — Dilithium3-signed, monotonic,
-                // identical across honest nodes after consistent apply.
-                // The receiver-side subtraction therefore yields the same
-                // relative value the producer-side embedded, so the strict
-                // equality check now meaningfully proves convergence.
-                //
-                // Safety preserved (v16.2 invariant): two producers
-                // claiming different RELATIVE rounds for the same height
-                // still cannot both collect 2f+1 acks under this check —
-                // the equality is strict, just in the correct units.
-                //
-                // Scalability: one extra O(1) DashMap read per ack. Cost
-                // independent of committee size; identical at 5 and 1000
-                // validators per round.
-                // ═══════════════════════════════════════════════════════════
+                // Convergence check: ack ONLY if local certified_round EXACTLY == the
+                // requested round (v16.2: == not >=, so 2f+1 acks => 2f+1 nodes AT this
+                // round => single producer per (height,round)).
+                // v25 units fix (forensic h=1261 deadlock): producer timeout_round is
+                // BASELINE-RELATIVE (HIGHEST_CERTIFIED_ROUND[mb]-baseline_round[mb]); the
+                // receiver MUST compare in the same relative units (get_baseline_round),
+                // NOT raw absolute — once baseline>0 a units mismatch makes receivers
+                // refuse to ack (acks=1/4 forever). v16.2 safety preserved. O(1)/ack.
                 let local_certified_abs = HIGHEST_CERTIFIED_ROUND
                     .get(&mb_idx)
                     .map(|e| *e.value())
@@ -14371,44 +14002,17 @@ impl SimplifiedP2P {
                     return;
                 }
 
-                // ───────────────────────────────────────────────────────────
-                // v18: COUNT-BASED RATE LIMIT REMOVED for signed TimeoutVotes
-                // ───────────────────────────────────────────────────────────
-                // The legacy `is_consensus_rate_limited(voter_id, "timeout", 30)`
-                // gate was the immediate cause of the v17.x stall observed at
-                // h=180-241. Under sustained pacemaker stall the rotation round
-                // increments at ≈1 / second, so each honest validator emits
-                // ≈60 TimeoutVotes / minute. That trips the 30 / min cap on
-                // EVERY receiver, blocking the legitimate voter for 5 minutes.
-                // With strict 2f+1 BFT-certified rotation (see node.rs v15.13),
-                // even a single blocked voter prevents `HIGHEST_CERTIFIED_ROUND`
-                // from advancing — producer rotation freezes permanently.
-                //
-                // The vote is signed (Dilithium3 over the consensus PK registry)
-                // and authenticated end-to-end. Industry-standard L1 BFT
-                // protocols never count-rate-limit signed consensus messages —
-                // their natural cap is `(height, round, voter_id)` uniqueness
-                // enforced by `TIMEOUT_VOTES`, with conflicting payloads
-                // triggering equivocation slashing via
-                // `report_timeout_equivocation`. The sender side of this
-                // protocol (`broadcast_timeout_vote`) already enforces one
-                // vote per (height, round) via `TIMEOUT_VOTED_HEIGHTS`,
-                // bounding emission at the protocol level.
-                //
-                // Spoofers / malformed signatures are still rejected — the
-                // signature check inside `handle_timeout_vote` (cheap registry
-                // lookup + Dilithium3 open) returns false on any unbound
-                // identity claim. Receiver CPU cost for a rejected vote is
-                // negligible (≈5 ms), and a spoofer flooding fake votes would
-                // be observed in the operator logs as a sustained rejection
-                // pattern, surfacing the attacker for manual mitigation.
-                //
-                // Scalability: at 1000+ super-node deployment this change
-                // ELIMINATES a liveness fault that would otherwise grow worse
-                // with committee size — under the legacy gate, every additional
-                // peer added another rate-limited voter that could disable
-                // certified-round advancement.
-                // ───────────────────────────────────────────────────────────
+                // Count-based rate limit removed for signed TimeoutVotes. The
+                // legacy is_consensus_rate_limited(30/min) caused the v17.x
+                // stall (h=180-241): under pacemaker stall the round
+                // increments ≈1/s → ≈60 votes/min → trips the 30/min cap on
+                // every receiver, muting a legit voter 5 min; with strict
+                // 2f+1, one muted voter freezes HIGHEST_CERTIFIED_ROUND
+                // permanently. Signed consensus messages aren't count-limited
+                // — their natural cap is (height,round,voter_id) uniqueness
+                // via TIMEOUT_VOTES + equivocation slashing, and the sender
+                // already emits one vote per (height,round). Spoofed/malformed
+                // votes are still rejected by the Dilithium3 sig check (~5 ms).
 
                 if crate::node::is_debug() {
                     println!("[DBG][TIMEOUT] vote_recv h={} round={} voter={}", height, timeout_round, voter_id);
@@ -15070,13 +14674,28 @@ impl SimplifiedP2P {
 
             // v3.16: Producer vote for Byzantine 66% consensus on producer selection
             NetworkMessage::ProducerVote { block_height, voted_producer, voter_id, timeout_round: _ } => {
-                // Store vote in PRODUCER_VOTES for consensus verification
-                // Key: (height, voter_id), Value: voted_producer
-                crate::node::PRODUCER_VOTES.insert((block_height, voter_id.clone()), voted_producer.clone());
-                
-                if crate::node::is_debug() {
-                    println!("[DBG][VOTE] recv h={} voter={} vote={}", 
-                            block_height, voter_id, voted_producer);
+                // v27 HOLE5: same gate as timeout-vote — 66% producer
+                // numerator must be from the committee. Scoped (no return).
+                let voter_in_committee = match self.deterministic_eligible_ids() {
+                    Some(committee) => {
+                        let ok = committee.contains(&voter_id);
+                        if !ok && crate::node::is_warn() {
+                            println!("[WARN][VOTE] producervote_noncommittee h={} voter={} committee={} action=drop",
+                                     block_height, voter_id, committee.len());
+                        }
+                        ok
+                    }
+                    None => true, // non-deterministic fallback → unchanged doctrine
+                };
+                if voter_in_committee {
+                    // Store vote in PRODUCER_VOTES for consensus verification
+                    // Key: (height, voter_id), Value: voted_producer
+                    crate::node::PRODUCER_VOTES.insert((block_height, voter_id.clone()), voted_producer.clone());
+
+                    if crate::node::is_debug() {
+                        println!("[DBG][VOTE] recv h={} voter={} vote={}",
+                                block_height, voter_id, voted_producer);
+                    }
                 }
             }
             
@@ -16015,29 +15634,13 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                // ARCHITECTURE FIX v2.19.25: REMOVED INFLATION CHECK
-                // ═══════════════════════════════════════════════════════════════════════════
-                // WHY REMOVED:
-                // 1. Reputation is now synchronized via BLOCKS (not gossip)
-                //    - When node receives block at rotation boundary (every 30 blocks)
-                //    - ALL nodes update producer's reputation locally (+2%)
-                //    - This guarantees 100% consistency without extra traffic
-                //
-                // 2. INFLATION check caused FALSE POSITIVES:
-                //    - ReputationSync runs every 5 minutes
-                //    - Reputation changes every 30 seconds (rotation)
-                //    - Diff accumulated → honest nodes BANNED!
-                //
-                // 3. Producer selection uses LOCAL reputation (not announced):
-                //    - Even if node lies about reputation in announcement
-                //    - Other nodes use THEIR OWN local reputation for selection
-                //    - Lying provides NO advantage
-                //
-                // 4. Real attacks are detected via blocks:
-                //    - Invalid block → -20% penalty (consensus confirmed)
-                //    - Malicious behavior → -50% penalty
-                //    - Jail status synced via ReputationSync
-                // ═══════════════════════════════════════════════════════════════════════════
+                // Inflation check removed: reputation is synced via blocks
+                // (all nodes apply the producer's +2% at the rotation
+                // boundary), so an announced value can't gain an advantage —
+                // producer selection uses LOCAL reputation. The old check
+                // false-positived (5-min sync vs 30-s reputation change → diff
+                // accumulated → honest nodes banned). Real attacks are caught
+                // via blocks (invalid −20%, malicious −50%, jail via sync).
                 
                 // MONITORING ONLY: Log significant differences for debugging
                 let reputation_diff = (reputation - real_reputation).abs();
@@ -19942,41 +19545,13 @@ impl SimplifiedP2P {
             .map(|ip| is_genesis_node_ip(ip))
             .unwrap_or(false);
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // v24: JOINT IP + NODE_ID RATE-LIMIT KEY (anti-spoofing hardening)
-        // ═══════════════════════════════════════════════════════════════════════
-        // Pre-v24 the rate-limit key was just `from_peer` (the transport IP:port).
-        // That meant:
-        //   * Two honest nodes behind the same NAT shared a single rate-budget,
-        //     so one node's catch-up burst exhausted the bucket for both.
-        //   * A Byzantine peer at IP X could spoof multiple `requester_id` values
-        //     while reusing the same transport IP, and the rate-limiter could
-        //     not distinguish them — but each fake id received its own 10/min
-        //     budget via separate code paths elsewhere, multiplying the DoS
-        //     surface 10x or more.
-        //
-        // v24 derives the key from BOTH:
-        //   (a) the transport-verified IP (`from_peer.split(':').next()`)
-        //   (b) the self-declared `requester_id`
-        //
-        // This binds the budget to the identity claim that the sender is making
-        // at THIS request — a Byzantine peer can still vary its requester_id,
-        // but each (IP, id) tuple gets its own bucket and exceeding any one
-        // bucket triggers per-tuple back-off without affecting honest peers
-        // sharing the same IP under a different identity (e.g. two services
-        // on the same host using distinct node_ids).
-        //
-        // Sanitisation: `requester_id` is taken at face value (untrusted) —
-        // the IP component is the cryptographically-anchored half via QUIC+TLS.
-        // Worst case, a Byzantine peer cycles N fake ids and earns N × budget
-        // bucket allocations; this is bounded by the rate-limiter map size cap
-        // (DashMap-internal eviction at high cardinality) and is acceptable
-        // because the per-bucket cost itself is small.
-        //
-        // Scalability: O(1) DashMap insert/get per request. The map size
-        // grows with distinct (IP, id) pairs, naturally bounded by the
-        // honest validator-set size at large committee sizes.
-        // ═══════════════════════════════════════════════════════════════════════
+        // Rate-limit key = (transport-verified IP, self-declared
+        // requester_id). An IP-only key let NAT-shared honest nodes starve
+        // each other's budget, and let a Byzantine peer at one IP spoof many
+        // requester_ids. Binding both gives each (IP,id) tuple its own
+        // bucket; the IP half is QUIC+TLS-anchored while the id is untrusted,
+        // so the worst case (cycling N fake ids → N buckets) is bounded by
+        // DashMap eviction. O(1)/request.
         let from_ip = from_peer.split(':').next().unwrap_or(from_peer);
         // Truncate requester_id to a safe prefix to prevent attacker-driven
         // unbounded map-key growth.
@@ -20751,54 +20326,15 @@ impl SimplifiedP2P {
     ///         Previous bug: sent to one peer, returned Ok(), peer didn't respond,
     ///         next call picked same peer again → deadlock
     pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), String> {
-        // ═══════════════════════════════════════════════════════════════════
-        // v25 H10: SYNC COORDINATION GATE
-        // ───────────────────────────────────────────────────────────────────
-        // 22+ call sites scattered through node.rs invoke `sync_blocks(...)`
-        // for distinct stall-recovery scenarios (chronic stall, view-change
-        // mismatch, peer-fork detection, snapshot bootstrap, etc.). Without
-        // a central coordinator, multiple parallel paths can fire the same
-        // range at the same instant — producing a thundering-herd request
-        // pattern to peers and saturating downstream queues with duplicate
-        // block streams.
-        //
-        // This gate runs in front of `sync_blocks_inner` and applies two
-        // independent dampening rules:
-        //
-        //   1. PER-RANGE COOLDOWN — a request for the exact same
-        //      `(from_height, to_height)` tuple that completed (or
-        //      started) within the last `SYNC_RANGE_COOLDOWN_SECS` window
-        //      returns `Ok(())` immediately without dispatching. The
-        //      previous run is either still in flight (its peer responses
-        //      will land in the block channel) or has just finished and
-        //      its blocks are already in storage. Either way, repeating
-        //      the request adds zero progress and only burns peer
-        //      bandwidth.
-        //
-        //   2. GLOBAL CONCURRENCY BOUND — at most
-        //      `MAX_CONCURRENT_SYNC_BLOCKS` calls hold a permit
-        //      simultaneously. Above that, callers wait briefly for a
-        //      permit instead of stacking parallel peer fan-outs. Bounded
-        //      semaphore depth means the per-peer in-flight request count
-        //      stays predictable even when a stall storm wakes up many
-        //      independent recovery paths at once.
-        //
-        // The `(0, 0)` "tip-sync" sentinel (`request latest blocks from
-        // peers`) is gated by the cooldown like any other tuple, which
-        // is exactly the desired behaviour: 5 different watchdogs each
-        // calling `sync_blocks(0, 0)` within 100 ms now produces ONE
-        // peer request, not five.
-        //
-        // Scalability:
-        //   * Cooldown table is a single DashMap keyed by `(u64, u64)`.
-        //     O(1) check, O(1) insert. Bounded by recent activity —
-        //     entries older than the cooldown window are pruned lazily
-        //     on every access.
-        //   * Semaphore is a tokio primitive sized at a small constant
-        //     (≪ committee). At 100K-node scale a tip-of-chain stall
-        //     causes many independent watchdog wakeups; this bounds the
-        //     real peer load to a fixed, predictable maximum.
-        // ═══════════════════════════════════════════════════════════════════
+        // v25 H10: sync coordination gate. 22+ call sites fire sync_blocks for
+        // different stall-recovery scenarios; without a coordinator parallel
+        // paths request the same range at once → thundering herd + dup streams.
+        // Gate before sync_blocks_inner: (1) PER-RANGE COOLDOWN — same (from,to)
+        // within SYNC_RANGE_COOLDOWN_SECS returns Ok(()) immediately (prev run
+        // in flight or just landed); (2) GLOBAL CONCURRENCY BOUND —
+        // <= MAX_CONCURRENT_SYNC_BLOCKS permits, else wait (no stacked fan-outs).
+        // (0,0) tip-sync cooldown-gated too → 5 watchdogs/100ms = 1 request.
+        // O(1) DashMap (lazy-pruned) + small semaphore; bounded at 100k.
         const SYNC_RANGE_COOLDOWN_SECS: u64 = 2;
         const MAX_CONCURRENT_SYNC_BLOCKS: usize = 4;
 
@@ -20945,42 +20481,13 @@ impl SimplifiedP2P {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v2.105: CRITICAL FIX - SEQUENTIAL retry with WAIT for response
-        // ═══════════════════════════════════════════════════════════════════════════
-        // PROBLEM (before v2.105):
-        //   - Sent to 3 peers in parallel → returned Ok() immediately
-        //   - If peers didn't respond, no retry to OTHER peers
-        //   - Infinite loop requesting from same unresponsive peers
-        //
-        // SOLUTION:
-        //   - Try peers SEQUENTIALLY (not parallel)
-        //   - Wait 2s after each request to see if blocks arrive
-        //   - Check storage to verify blocks were received
-        //   - If not received → try next peer
-        //   - Return error only if ALL peers fail
-        // ═══════════════════════════════════════════════════════════════════════════
-        
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v14.2: RANGE-SHARDED PARALLEL SYNC
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Previous behaviour: the SAME range was sent to all N peers. Result — N× network
-        // traffic for 1× useful data. Two peers returning blocks 5582-5601 = 40 blocks
-        // received for 20 blocks of value. Wasteful at scale and saturates fast peers.
-        //
-        // New behaviour: split [from..to] into N sub-ranges, one per peer. All N requests
-        // fly in parallel, each peer fetches DIFFERENT blocks. At peer count = 3 and gap
-        // of 300 blocks, each peer delivers ~100 blocks in parallel — 3× throughput.
-        //
-        // Fallback: if range is too small to shard (<3× peer count), fall back to full-
-        // range parallel request for redundancy against a single flaky peer.
-        //
-        // Determinism: sort by (height desc, reputation desc) above ensures each node
-        // selects the same peer ordering (within its view) — sync behaviour is stable.
-        //
-        // Scalability: up to MAX_PARALLEL_SYNC_PEERS (8). At 1000 Super nodes scale,
-        // extra parallelism beyond ~8 brings diminishing returns (peer bandwidth saturates).
-        // ═══════════════════════════════════════════════════════════════════════════
+        // Range-sharded parallel sync. Sending the same range to all N peers
+        // wastes N× bandwidth for 1× data; instead split [from..to] into N
+        // sub-ranges (one per peer) fetched in parallel → ~N× throughput.
+        // Fallback to full-range parallel when the range is too small to
+        // shard (<3× peer count) for redundancy vs a flaky peer. The
+        // (height desc, reputation desc) sort above gives every node a
+        // stable peer ordering. Up to MAX_PARALLEL_SYNC_PEERS=8.
         // v14.2: Exclude peers in active cool-down (they failed a recent sync).
         // Keeps wave retries from hitting the same stalled peer repeatedly.
         let cooling_down_before = live_peers.len();
@@ -24071,7 +23578,21 @@ impl SimplifiedP2P {
             }
             return;
         }
-        
+
+        // v27 HOLE5: count vote only if voter ∈ deterministic committee
+        // (same set as the BFT threshold). Valid sig ≠ consensus participant;
+        // non-committee votes desync view-change → fork (h=53731). Receiver-
+        // enforced (sender self-gating untrustworthy). None = fallback.
+        if let Some(committee) = self.deterministic_eligible_ids() {
+            if !committee.contains(&voter_id) {
+                if crate::node::is_warn() {
+                    println!("[WARN][TIMEOUT] vote_noncommittee h={} round={} voter={} committee={} action=drop",
+                             height, timeout_round, voter_id, committee.len());
+                }
+                return;
+            }
+        }
+
         // Check if we already have proof for this (height, round)
         if TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round)) {
             if crate::node::is_debug() {
@@ -24111,38 +23632,17 @@ impl SimplifiedP2P {
                      height, timeout_round, voter_id, votes_count, byzantine_threshold);
         }
 
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v14.8.10: BFT CONSENSUS-DRIVEN ROTATION — f+1 adopted + 2f+1 certified
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Microblock producer rotation in this network is driven by BFT-agreed
-        // state (adopted/certified rounds from signed votes), never by local
-        // wall clock. Local wall clock only decides WHEN to vote (stall
-        // detection). This aggregation advances the two trackers:
-        //
-        //   HIGHEST_CERTIFIED_ROUND[mb]: advanced only by signed 2f+1 same-round
-        //     TimeoutCertificate (below at the byzantine_threshold branch, and
-        //     on remote broadcast via handle_timeout_proof_broadcast). This
-        //     is the strongest — cryptographic supermajority, unforgeable.
-        //
-        //   HIGHEST_ADOPTED_ROUND[mb]: f+1 aggregation of per-voter max rounds.
-        //     Weaker than certified (f+1 proves at least one honest), but
-        //     converges faster because it does not require 2f+1 at the SAME
-        //     round — a voter's signed vote at round R supports all rounds ≤ R.
-        //
-        // Catch-up node safety: a newly-synced validator receives signed votes
-        // from peers' gossip before participating. Their VOTER_MAX_ROUND map
-        // is populated from those signed broadcasts → HIGHEST_ADOPTED_ROUND
-        // matches the network → their rotation round matches → they select
-        // the same producer as every other honest validator. No wall-clock
-        // divergence.
-        //
-        // Scalability: per-vote insert into VOTER_MAX_ROUND is O(1). Partial
-        // sort for f+1-th element is O(voters_at_height). At the 1000-validator
-        // committee cap, f+1 = 334 and the scan is a small constant per
-        // message. Cleanup sweep (cleanup_old_timeout_data) prunes entries
-        // older than the active macroblock window, keeping memory flat at
-        // any committee size.
-        // ═══════════════════════════════════════════════════════════════════════════
+        // BFT consensus-driven rotation (never wall clock; wall clock only
+        // decides WHEN to vote). Two trackers:
+        //   HIGHEST_CERTIFIED_ROUND[mb] — advanced only by a signed 2f+1
+        //     same-round TimeoutCertificate. Strongest, unforgeable.
+        //   HIGHEST_ADOPTED_ROUND[mb] — f+1 aggregation of per-voter max
+        //     rounds. Weaker (f+1 = ≥1 honest) but converges faster: it
+        //     doesn't need 2f+1 at the SAME round — a vote@R supports all ≤R.
+        // Catch-up safety: a synced validator's VOTER_MAX_ROUND fills from
+        // peers' signed vote gossip → its adopted round matches the network
+        // → same producer selected, no wall-clock divergence. O(1) insert +
+        // O(voters) partial-sort; pruned by cleanup_old_timeout_data.
 
         // Track this voter's max round for f+1 adoption aggregation and
         // remember the highest signed payload so we can reconstruct a
@@ -24184,54 +23684,17 @@ impl SimplifiedP2P {
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        // v15.0: PACEMAKER-CERTIFIED DERIVATION — 2f+1 with round ≥ R.
-        //
-        // Closes the cascade livelock where voters stretch across rounds
-        // 3..7 and no single round collects 2f+1. Each vote's Dilithium3
-        // signature was verified at the top of this function before
-        // VOTER_MAX_ROUND insert, so the 2f+1 threshold is as strong as
-        // same-round 2f+1.
-        //
-        // Strategy:
-        //   1. Locally advance HIGHEST_CERTIFIED_ROUND[height] to the
-        //      pacemaker value so this node's rotation logic unblocks
-        //      immediately (verification already paid for at insert time).
-        //   2. Build + broadcast an AggregatedTimeoutCertificate carrying
-        //      2f+1 signed votes at rounds ≥ R so late/catch-up peers can
-        //      independently verify and advance on their own.
-        //
-        // Monotonic: HIGHEST_CERTIFIED_ROUND only advances upward; repeated
-        // broadcasts for the same R are de-duped via AGGREGATED_TC_BROADCAST.
-        // Committee-bounded (≤ MAX_VALIDATORS) per height, and pruned by the
-        // same cleanup sweep that handles the rest of timeout state.
-        //
-        // ─────────────────────────────────────────────────────────────────
-        // v16.2: COLD-BOOT SPECIALIZATION — same-round-only at mb_idx == 0
-        // ─────────────────────────────────────────────────────────────────
-        // Cross-round aggregation is correct under steady-state production
-        // (signed votes at staggered rounds collectively prove a 2f+1
-        // supermajority crossed any round R≤max). But during cold-boot,
-        // before the first macroblock is finalised, the same mechanism
-        // creates a pronounced timing race: pacemaker_certified can jump
-        // from 1 → 6 → 11 in seconds as votes from different nodes arrive
-        // at staggered moments, and each node observes the jump in its OWN
-        // order. Two nodes can each see "I am the elected producer" for
-        // the same height because they each saw a different intermediate
-        // certified value first — exactly the v15.x cold-boot fork
-        // signature observed at h=154.
-        //
-        // At mb_idx == 0 the network is small and homogeneous (5 genesis
-        // nodes, NTP-synced). Same-round 2f+1 is sufficient — they will
-        // converge on the same proposed_round naturally. Cross-round
-        // aggregation provides no liveness benefit in this regime because
-        // there is no propagation jitter to absorb. After the first
-        // macroblock is finalised, cross-round resumes.
-        //
-        // Safety preserved: same-round 2f+1 IS the canonical BFT threshold;
-        // this only DEFERS aggregation that v15.0 introduced for liveness,
-        // not weakens any 2f+1 invariant.
-        // ─────────────────────────────────────────────────────────────────
+        // v15.0: cross-round pacemaker-certified — 2f+1 with round >= R. Closes
+        // the cascade livelock where voters stretch rounds 3..7 and no single
+        // round gets 2f+1. Each vote's Dilithium3 sig is verified before insert
+        // → as strong as same-round 2f+1. Locally advance HIGHEST_CERTIFIED_ROUND
+        // + broadcast AggregatedTimeoutCertificate (2f+1 votes >=R) for catch-up;
+        // monotonic, deduped, committee-bounded, pruned.
+        // v16.2: at mb_idx==0 (cold-boot, pre-first-macroblock) SAME-ROUND ONLY —
+        // cross-round causes a timing race (pacemaker jumps 1→6→11, each node
+        // sees a different intermediate → two each think "I'm elected" → cold-
+        // boot fork h=154). 5 genesis NTP-synced: same-round 2f+1 suffices.
+        // Cross-round resumes after the first macroblock; 2f+1 invariant intact.
         let cross_round_pacemaker_enabled = height > 0;
         if cross_round_pacemaker_enabled {
             let two_f_plus_1 = (2 * total_validators + 2) / 3; // ceil(2n/3) = 2f+1
@@ -24280,38 +23743,15 @@ impl SimplifiedP2P {
             self.generate_and_broadcast_timeout_proof(height, timeout_round, hash_arr);
         }
 
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v15.11: VOTE GOSSIP — fast round-convergence under partial network reach
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Without re-broadcasting received votes, a TimeoutVote propagates only
-        // along the direct producer-emitted edge: every peer that did not receive
-        // the original broadcast (network jitter, peer cooldown, brief link loss)
-        // is left with a stale view of HIGHEST_*_ROUND for that mb. This is the
-        // forensic root cause of the h=15901 split-view incident — node 005 saw
-        // round=0 while node 001 saw round=27 because votes from 002/003/004
-        // never reached 005's TimeoutVotes set.
-        //
-        // Gossip protocol:
-        //   * Skip self-emitted votes (broadcast_timeout_vote already does the
-        //     full fan-out; gossiping our own vote would amplify needlessly).
-        //   * Skip duplicates — the early return at the dedup check above
-        //     already filtered repeat deliveries; we only get here on a
-        //     genuinely-new vote.
-        //   * Re-broadcast to a small RANDOM peer subset (3 for ≤ 100 nodes,
-        //     5 for larger committees). O(log N) hops cover the full committee
-        //     without the O(N) bandwidth overhead of full re-broadcast.
-        //   * Receivers re-verify Dilithium3 signatures and dedup via
-        //     TIMEOUT_VOTES — no trust in the gossiper required.
-        //   * No infinite loop: each peer that already has the vote returns
-        //     early at the dedup check, terminating the gossip wave.
-        //
-        // Bandwidth at 1000-validator scale: per height, f+1=334 honest votes
-        // × 5-peer fanout = ~1670 messages vs 334 × 1000 = 334K for full
-        // re-broadcast. ~200× reduction while still guaranteeing O(log N)
-        // propagation depth to every honest validator.
-        //
-        // Safety: the dedup-then-rebroadcast pattern is identical to the
-        // gossipsub family; signed payloads cannot be forged or re-targeted.
+        // Vote gossip for fast round-convergence under partial reach. Without
+        // re-broadcasting received votes a TimeoutVote travels only the direct
+        // producer edge, leaving jitter/cooldown-missed peers with a stale
+        // HIGHEST_*_ROUND (forensic h=15901 split-view: 005 saw round=0 while
+        // 001 saw round=27). Protocol: skip self-emitted and duplicate votes;
+        // re-broadcast to a small RANDOM subset (3 ≤100 nodes, else 5) → O(log
+        // N) hops; receivers re-verify Dilithium3 + dedup (no gossiper trust);
+        // the dedup early-return terminates the wave (no loop). ~200× less
+        // bandwidth than full re-broadcast at 1000-validator scale.
         if voter_id != self.node_id {
             let total_for_gossip = total_validators;
             if total_for_gossip > 1 {
@@ -24840,23 +24280,10 @@ impl SimplifiedP2P {
     
     /// Create and broadcast timeout vote for specified height/round
     /// signature: Pre-computed hybrid signature from node's quantum_crypto
-    // ═══════════════════════════════════════════════════════════════════
-    // ═══════════════════════════════════════════════════════════════════
-    // v4.3: VRF LEADER CLAIM BROADCAST WITH GOSSIP TTL
-    // Sends our VRF proof to all direct peers with TTL for relay.
-    //
-    // GOSSIP_TTL determines how many hops a claim can travel:
-    //   TTL=3: 1000^3 = 1B node reach (3 hops × 1000 peers/hop)
-    //   TTL=4: covers any practical network size
-    //
-    // At each hop, fanout = √(connected_peers), ensuring:
-    //   5 nodes:    fanout=2 → all reached in 1 hop (direct)
-    //   1000 nodes: fanout=32 → all reached in 1 hop (direct, <1000 peers)
-    //   10K nodes:  fanout=32 → 32×32=1024 reached in 2 hops
-    //   100K nodes: fanout=32 → 32^3=32K reached in 3 hops (+ direct 1000)
-    //
-    // BANDWIDTH: ~20 claims × 5.3 KB × 3 hops × 32 fanout ≈ 10 MB/round
-    // ═══════════════════════════════════════════════════════════════════
+    // VRF leader-claim broadcast with gossip TTL: send the VRF proof to
+    // direct peers with a relay TTL. GOSSIP_TTL = hop budget (TTL=3 ≈ 1B
+    // reach); per-hop fanout = √(connected_peers), so the full committee is
+    // reached in ≤3 hops at any scale up to 100K.
     /// v4.6: Broadcast own VRF public key to all peers.
     /// Called on startup and at every macroblock boundary.
     /// Uses stored wallet_identity (set via set_wallet_identity()).
@@ -25357,6 +24784,9 @@ impl SimplifiedP2P {
         let mut seen_voters: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut prepared: Vec<(String, u64, [u8; 32], Vec<u8>, String)> =
             Vec::with_capacity(votes.len());
+        // v27 HOLE5: all aggregate signers must be committee members
+        // (else crafted non-committee 2f+1 forks the view). Fetched once.
+        let committee_gate = self.deterministic_eligible_ids();
         for (voter_id, vote_round, vote_hash_vec, signature) in votes.into_iter() {
             if vote_round < certified_round {
                 if crate::node::is_warn() {
@@ -25381,6 +24811,16 @@ impl SimplifiedP2P {
                     println!("[WARN][TIMEOUT] agg_tc_duplicate_voter h={} voter={}", height, voter_id);
                 }
                 return;
+            }
+            // v27 HOLE5: signer must be committee (reject-cert idiom).
+            if let Some(ref committee) = committee_gate {
+                if !committee.contains(&voter_id) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][TIMEOUT] agg_tc_noncommittee h={} voter={} committee={} action=reject_cert",
+                                 height, voter_id, committee.len());
+                    }
+                    return;
+                }
             }
 
             let mut hash_arr = [0u8; 32];
@@ -25521,20 +24961,10 @@ impl SimplifiedP2P {
         HIGHEST_ADOPTED_ROUND.get(&height).map(|v| *v).unwrap_or(0)
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // SKIP-MARKER MACROBLOCK SUPPORT (v15.7)
-    // ═══════════════════════════════════════════════════════════════════════════
-    // The fallback path in `participate_in_macroblock_consensus` uses these
-    // helpers to surface a 2f+1-signed AggregatedTimeoutCertificate as the
-    // cryptographic evidence for a skip-marker macroblock, and to verify the
-    // certificate carried by an incoming skip-marker received from peers.
-    //
-    // Skip markers are an explicit on-chain record that `previous_hash`
-    // linkage at this macroblock index is preserved even when the canonical
-    // commit-reveal protocol failed to drive 2f+1 reveals. They never
-    // process rewards or mutate state — they only seal the chain so the
-    // next macroblock can start.
-    // ═══════════════════════════════════════════════════════════════════════════
+    // Skip-marker macroblock support: surface a 2f+1 AggregatedTimeout-
+    // Certificate as evidence for a skip marker and verify the cert carried
+    // by an incoming peer skip marker. Skip markers seal previous_hash
+    // linkage when commit-reveal failed 2f+1 reveals — no rewards, no state.
 
     /// v15.7: Retrieve the highest-round AggregatedTimeoutCertificate stored
     /// for a given macroblock index, picking the strongest evidence currently
@@ -26080,86 +25510,30 @@ impl SimplifiedP2P {
         // v9.0: Acquire ordering — BFT threshold depends on correct height
         let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
 
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v14.1: BFT VALIDATOR COUNT — UNIQUE BY node_id, LIVENESS-FILTERED
-        // ═══════════════════════════════════════════════════════════════════════════
-        // ROOT CAUSE OF v14.0 DEADLOCK:
-        //   `connected_peers_lockfree` is keyed by (address, port). A single peer
-        //   connects on 3 endpoints: HTTP :8001, QUIC-main :9876, QUIC-alt :9877.
-        //   Therefore `len()` over-counts by factor of 3. With 4 real peers + self,
-        //   raw `len()+1 = 13` — BFT threshold becomes (13*2+2)/3 = 9, unreachable
-        //   with 5 real validators. Network deadlocks: no TimeoutCertificate, no
-        //   finalization, production_gate locks, no progress.
-        //
-        // CORRECT SEMANTICS:
-        //   For BFT safety threshold, we need the count of distinct IDENTITIES
-        //   (unique node_ids), not distinct connections. Multiple transports to the
-        //   same peer count as one validator.
-        //
-        // LIVENESS FILTER:
-        //   Only peers seen within BFT_LIVENESS_WINDOW_SECS (300s) are counted.
-        //   A peer that crashed 2 hours ago should not inflate the quorum we need.
-        //   This preserves BFT safety (2f+1 correct votes among live validators)
-        //   while restoring liveness.
-        //
-        // SCALABILITY BOUND:
-        //   Result capped at MAX_VALIDATORS (1000). At scale with thousands of
-        //   Super nodes, we sample down to 1000 per round via VRF (see
-        //   create_eligible_producers_snapshot). This matches top-tier L1 BFT
-        //   committee-size design.
-        //
-        // DETERMINISM NOTE:
-        //   Macroblock-snapshot path is deterministic (all nodes read same MB).
-        //   Fallback path is node-local — only used during genesis epoch and when
-        //   N-2 macroblock is unavailable. This is acceptable because threshold
-        //   mismatch during fallback only affects that one node's view; safety
-        //   still holds via signature verification on accepted votes.
-        // ═══════════════════════════════════════════════════════════════════════════
+        // BFT validator count — distinct node_id IDENTITIES, liveness-filtered.
+        // connected_peers_lockfree is keyed by (addr,port) and one peer has 3
+        // endpoints (HTTP/QUIC-main/QUIC-alt), so raw len() over-counts 3× →
+        // BFT threshold unreachable → deadlock (the v14.0 bug). Count unique
+        // node_ids (multi-transport = one validator), and only peers seen
+        // within BFT_LIVENESS_WINDOW_SECS so a long-dead peer can't inflate
+        // the quorum. Capped at MAX_VALIDATORS=1000 (VRF-sampled at scale).
+        // Determinism: macroblock-snapshot path is deterministic (all nodes
+        // read the same MB); the node-local fallback runs only at genesis /
+        // N-2-absent and is safe because accepted votes are still sig-verified.
         const BFT_LIVENESS_WINDOW_SECS: u64 = 300; // 5 minutes
         const GENESIS_MIN_VALIDATORS: usize = 5;
 
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v19: AUTHENTICATED VALIDATOR-SET SOURCE (anti-spoof hardening)
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Pre-v19 the genesis-epoch path counted unique-by-node_id LIVE peers from
-        // `connected_peers_lockfree`. That set is admitted by the QUIC-handshake
-        // layer (X.509 SAN + TOFU) which does not cryptographically bind the
-        // claimed identity to a registered Dilithium3 key. A peer holding any
-        // self-signed cert with `qnet-{claimed_node_id}` in its SAN is admitted
-        // and its `node_id` (or its privacy-hash variant) becomes a +1 to the
-        // counted validator set — an unauthenticated entry inflates `2f+1`,
-        // making consensus thresholds harder to reach for honest validators.
-        //
-        // Authoritative source for genesis epoch is the consensus PK registry
-        // (`CONSENSUS_PK_REGISTRY`), which is populated in three audited paths:
-        //   1. `install_genesis_anchors_at_startup` — pre-pinned canonical PKs
-        //      from the deploy-shipped `genesis_anchors.json`. Locked at boot
-        //      BEFORE the P2P layer accepts a single packet.
-        //   2. `register_consensus_pk_from_chain` — invoked from the chain
-        //      apply path on a finalized `NodeRegistration` TX (super-node
-        //      activation via burn). Anti-squat enforced against anchors.
-        //   3. `register_consensus_pk_with_proof` — explicit challenge-signature
-        //      path; signature must verify under the supplied PK. Admits
-        //      proven-ownership entries only.
-        //
-        // Every entry in this registry has cryptographic proof of ownership;
-        // a spoofer that did not solve the challenge for `genesis_node_001`
-        // does not appear here regardless of how many TLS connections it
-        // opens. Substituting the registry size for the genesis-epoch
-        // counter eliminates the inflation vector in O(1) without changing
-        // any existing security path.
-        //
-        // Scalability: the registry is a `parking_lot::RwLock<HashMap>` capped
-        // at MAX_CONSENSUS_PK_REGISTRY (50K). Read path is wait-free at any
-        // committee size; write path runs once per identity registration.
-        //
-        // Compatibility: when the registry is unexpectedly empty (e.g. very
-        // early boot before anchor install completes — should not happen in
-        // production because `install_genesis_anchors_at_startup` runs before
-        // P2P, but defended here in depth), the helper falls back to the
-        // legacy live-peer count. The fallback emits a `[WARN][BFT]` so the
-        // anomaly is visible in operational logs.
-        // ═══════════════════════════════════════════════════════════════════════════
+        // v19: authenticated validator-set source (anti-spoof). Pre-v19 the
+        // genesis-epoch count used unique live peers (QUIC X.509-SAN+TOFU, NOT
+        // crypto-bound to a registered key) → a self-signed-cert peer inflates
+        // the set → inflates 2f+1 → harder for honest to reach threshold.
+        // Authoritative = CONSENSUS_PK_REGISTRY (3 audited paths:
+        // install_genesis_anchors_at_startup pinned-at-boot;
+        // register_consensus_pk_from_chain on finalized NodeRegistration TX
+        // anti-squat-vs-anchors; register_consensus_pk_with_proof challenge-sig).
+        // Every entry has proof-of-ownership → a spoofer can't appear via TLS.
+        // O(1). Empty registry (very early boot) → legacy live-peer fallback +
+        // [WARN][BFT].
 
         if local_h <= 180 {
             let registry_size = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
@@ -26186,37 +25560,15 @@ impl SimplifiedP2P {
             return total;
         }
 
-        // Normal epoch: read eligible_producers from macroblock snapshot (N-2 rule).
-        // This is the deterministic path — all nodes produce identical counts.
-        let current_epoch = (local_h - 1) / 90 + 1;
-        let required_macroblock = current_epoch.saturating_sub(2);
-
-        if required_macroblock > 0 {
-            if let Some(storage) = crate::node::try_get_storage() {
-                if let Ok(Some(mb_data)) = storage.get_macroblock_by_height(required_macroblock) {
-                    if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
-                        if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
-                            if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
-                                if !producers.is_empty() {
-                                    // v14.1: Defensive dedup — snapshot already deduped at build time,
-                                    // but a corrupted or legacy snapshot might contain dupes. Safety first.
-                                    let mut seen = std::collections::HashSet::with_capacity(producers.len());
-                                    let unique_count = producers.iter()
-                                        .filter(|p| !p.node_id.is_empty() && seen.insert(p.node_id.clone()))
-                                        .count();
-                                    let capped = unique_count.min(crate::node::MAX_VALIDATORS);
-                                    if crate::node::is_info() {
-                                        println!("[INFO][BFT] validator_count={} source=macroblock_{} epoch={} raw={} unique={}",
-                                                 capped, required_macroblock, current_epoch,
-                                                 producers.len(), unique_count);
-                                    }
-                                    return capped;
-                                }
-                            }
-                        }
-                    }
-                }
+        // Normal epoch: deterministic N-2 committee (v27 HOLE5 single source
+        // — same set the quorum-vote gates use; numerator==denominator).
+        if let Some(ids) = self.deterministic_eligible_ids() {
+            let capped = ids.len().min(crate::node::MAX_VALIDATORS);
+            if crate::node::is_info() {
+                println!("[INFO][BFT] validator_count={} source=macroblock_n2 epoch={} unique={}",
+                         capped, (local_h - 1) / 90 + 1, ids.len());
             }
+            return capped;
         }
 
         // Fallback: macroblock snapshot unavailable → use live unique peers.
@@ -26226,9 +25578,41 @@ impl SimplifiedP2P {
             .min(crate::node::MAX_VALIDATORS);
         if crate::node::is_info() {
             println!("[INFO][BFT] validator_count={} source=p2p_fallback epoch={} unique_peers={} raw_len={}",
-                     total, current_epoch, unique_live, self.connected_peers_lockfree.len());
+                     total, (local_h - 1) / 90 + 1, unique_live, self.connected_peers_lockfree.len());
         }
         total
+    }
+
+    /// v27 HOLE5: deterministic N-2 eligible-producer node_id set for the
+    /// current height — single source of truth shared with the BFT-threshold
+    /// denominator and every quorum-vote gate (numerator==denominator set).
+    /// `None` = non-deterministic fallback (genesis pre-180 / snapshot
+    /// absent) → unchanged signature-only doctrine. O(1) lookup, ≤1000.
+    fn deterministic_eligible_ids(&self) -> Option<std::collections::HashSet<String>> {
+        let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
+        if local_h <= 180 {
+            return None; // genesis bootstrap → fallback (signature-only) doctrine
+        }
+        let current_epoch = (local_h - 1) / 90 + 1;
+        let required_macroblock = current_epoch.saturating_sub(2);
+        if required_macroblock == 0 {
+            return None;
+        }
+        let storage = crate::node::try_get_storage()?;
+        let mb_data = match storage.get_macroblock_by_height(required_macroblock) {
+            Ok(Some(d)) => d,
+            _ => return None,
+        };
+        let macroblock = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data).ok()?;
+        let snapshot_data = macroblock.consensus_data.eligible_producers.as_ref()?;
+        let producers =
+            bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data).ok()?;
+        let set: std::collections::HashSet<String> = producers
+            .into_iter()
+            .map(|p| p.node_id)
+            .filter(|id| !id.is_empty())
+            .collect();
+        if set.is_empty() { None } else { Some(set) }
     }
 
     /// Count unique alive peers by node_id, excluding self and stale entries.
@@ -28285,7 +27669,7 @@ mod tests {
     #[test]
     fn test_shred_retransmit_constants() {
         assert_eq!(SHRED_CHUNK_TIMEOUT_SECS, 5, "Timeout should be 5 seconds (v2.31)");
-        assert_eq!(SHRED_CHUNK_CACHE_SIZE, 100, "Cache should hold 100 blocks");
+        assert_eq!(SHRED_CHUNK_CACHE_SIZE, 5_000, "Cache holds the ~83min (5000-block @1s) repair window");
         assert_eq!(SHRED_CHUNK_MAX_RETRIES, 4, "Max retries should be 4 (v2.31)");
     }
     

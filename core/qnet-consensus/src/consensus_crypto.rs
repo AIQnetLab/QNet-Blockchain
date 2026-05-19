@@ -87,74 +87,20 @@
 use base64::{Engine as _, engine::general_purpose};
 use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SignedMessage as PQSignedMessage, DetachedSignature as PQDetachedSignature};
 
-// ============================================================================
-// Consensus-layer PK registry with proof-of-ownership (v14.8 / v20)
-// ============================================================================
-// Prevents self-attested PK attacks AND first-seen PK squatting at scale.
-//
-// Two registration paths, both cryptographically authenticated:
-//
-//   1) ANCHORED GENESIS: for the fixed 5-node genesis set, PKs are hard-coded
-//      in `genesis_anchor_pks()` and cannot be overwritten. This closes the
-//      "attacker races node_001 to register fake PK first" window.
-//
-//   2) PROOF-OF-OWNERSHIP: for Super-node joiners post-genesis,
-//      register_consensus_pk_with_proof(node_id, pk, challenge_sig) requires
-//      a Dilithium3 signature over the canonical challenge
-//      "qnet-pk-register-v1:{node_id}" made by the private key corresponding
-//      to `pk`. Without a valid sig, registration is rejected.
-//
-// Once registered, a node's PK is IMMUTABLE for the lifetime of the process.
-// Re-registration with a DIFFERENT PK is rejected; re-registration with the
-// SAME PK is a no-op (idempotent, safe for multi-call).
-//
-// ─── v20: SCALABILITY HARDENING (multi-tier eviction) ──────────────────────
-//
-// Default cap raised from 50 000 to 100 000 entries (~210 MB peak — fits
-// every operator with ≥ 4 GB RAM). Cap is overridable at boot via
-// `QNET_PK_REGISTRY_CAP` env var so large deployments can tune up to
-// hardware limits without recompiling.
-//
-// LRU idle-eviction removes entries whose owner has not produced a single
-// signature-verified consensus message within `QNET_PK_REGISTRY_IDLE_DAYS`
-// (default 30). Activity is tracked lock-free in a separate DashMap that is
-// updated on every successful PK lookup (`get_consensus_pk`) plus every
-// explicit `observe_pk_activity` call from signature-verification paths.
-// Registry rotation is therefore driven by REAL participation, not by
-// registration order — a node that registered at boot and went silent for
-// a month vacates its slot for a new joiner.
-//
-// Genesis anchor entries are PINNED — `pinned: true` forbids eviction
-// regardless of staleness. The 5 anchored identities never lose their
-// registry slot even if they crash for months: BFT safety requires their
-// PKs available for verification when they return.
-//
-// Capacity-full path:
-//   1. On insert at cap, attempt single-shot eviction of the most-stale
-//      non-pinned entry (≥ idle-threshold) — defence in depth.
-//   2. Background sweep `evict_idle_consensus_pks(threshold)` is invoked
-//      from the integration layer's hourly cleanup loop for proactive
-//      reclamation.
-//   3. If after eviction the registry is still at cap, the new
-//      registration is rejected with `[WARN][CONSENSUS] pk_registry_full`
-//      including the actual cap and idle-min so operators can diagnose.
-//
-// Memory profile (per entry):
-//   - HashMap bucket overhead ......................   ~32 B
-//   - Owned String node_id (16-32 chars) ...........   ~48 B
-//   - Vec<u8> Dilithium3 PK ......................... 1 952 B
-//   - DashMap<String, ActivityRecord> entry .........   ~80 B
-//   ────────────────────────────────────────────────────────
-//   ≈ 2.1 KB / entry
-//
-//   100 000 entries → ~210 MB
-//   200 000 entries → ~420 MB
-//   1 000 000 entries → ~2.1 GB
-//
-// Reads stay on parking_lot::RwLock (no tokio contention); the activity
-// tracker is fully lock-free. Eviction sweeps take a single short write
-// lock per pass.
-// ============================================================================
+// Consensus-layer PK registry (v14.8/v20) — anti-squat, anti-self-attest.
+// Two cryptographically authenticated registration paths:
+//   1) ANCHORED GENESIS: the fixed 5 genesis PKs are hard-coded in
+//      genesis_anchor_pks(), immutable, PINNED (never evicted) — closes
+//      the "race node_001 to register a fake PK first" window.
+//   2) PROOF-OF-OWNERSHIP: post-genesis super joiners must pass
+//      register_consensus_pk_with_proof() — a Dilithium3 sig over
+//      "qnet-pk-register-v1:{node_id}" by the private key for `pk`.
+// Once registered a PK is IMMUTABLE for the process lifetime (different-PK
+// re-register rejected; same-PK is an idempotent no-op).
+// v20 scale: cap 100k (QNET_PK_REGISTRY_CAP env); LRU idle-eviction of
+// non-pinned entries silent > QNET_PK_REGISTRY_IDLE_DAYS (default 30),
+// activity-driven (real participation, not registration order). Cap-full:
+// single-shot evict most-stale non-pinned, else reject (pk_registry_full).
 
 /// Per-entry record held inside the registry. The PK bytes never change
 /// after insert; the `pinned` flag is decided at insert time and stays
@@ -255,34 +201,15 @@ const ATTACKER_PK_BLACKLIST_CAP: usize = 12_288;
 /// connection attempt because the Tier-2 check is always evaluated.
 const ATTACKER_PK_EVICT_FRACTION: usize = 4;
 
-// ════════════════════════════════════════════════════════════════════════
-// SECURITY-REJECT LOG RATE GOVERNOR (v25.3)
-// ════════════════════════════════════════════════════════════════════════
-// An external attacker can flood garbage signatures that fail the cheap
-// structural checks (all-zero, low-entropy, bad length) which run BEFORE
-// the Dilithium3 public key is even parsed. Those failures cannot be
-// fingerprinted by `ATTACKER_PK_BLACKLIST` (no PK is extracted), so each
-// rejected garbage frame previously produced an unconditional
-// `[ERR][CONSENSUS] sig_*` line. Observed in production: ~13 000
-// reject-log lines / 20 h on every node a spoofer targeted — pure log
-// noise that can DoS the logging subsystem / fill disk while telling the
-// operator nothing new after the first occurrence.
-//
-// This governor rate-limits the LOG OUTPUT per claimed identity. The
-// REJECTION itself is unconditional at every call site — the security
-// boundary is unchanged. We keep the first `SIG_REJECT_LOG_PER_WINDOW`
-// rejections per claimed `node_id` per `SIG_REJECT_LOG_WINDOW_S` fully
-// visible (so a genuine transient fault on a real node is never hidden),
-// emit one explicit suppression notice at the threshold, then stay
-// silent until the window rolls — at which point a single
-// `sig_reject_flood` summary reports how many were suppressed and that
-// the flood is ongoing. Standard production practice for
-// attacker-controlled inputs.
-//
-// Keyed PER claimed `node_id`: a flood against one identity cannot
-// starve the reject-log budget of a different identity's genuine fault.
-// Bounded memory: soft cap + lazy 25 % LRU eviction, identical to the
-// `ATTACKER_PK_BLACKLIST` discipline.
+// Security-reject log rate governor. Garbage-sig floods fail the cheap
+// structural checks before the PK is parsed, so they are unblacklistable
+// and previously emitted one [ERR][CONSENSUS] line each (~13k lines/20h
+// under a spoofer → log-DoS / disk fill). This rate-limits LOG OUTPUT
+// only — the rejection stays unconditional, security boundary unchanged.
+// Per claimed node_id: first N/window fully visible (a real node's
+// transient fault is never hidden), one suppression notice, then a single
+// sig_reject_flood summary at window roll. Keyed per node_id so one
+// identity's flood can't starve another's; bounded by soft cap + LRU.
 
 lazy_static::lazy_static! {
     /// claimed_node_id → rolling-window reject-log state.
@@ -2554,26 +2481,10 @@ mod tests_v20_pk_registry {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v19.1: REGRESSION TESTS — TIER 3 FRESH-BOOTSTRAP WINDOW
-// ═══════════════════════════════════════════════════════════════════════════
-// The Tier 3 path of `verify_consensus_signature` makes a policy decision
-// for first-seen identities. v19.1 widens the policy for genesis identities
-// during the documented fresh-bootstrap window; these tests pin the new
-// contract:
-//
-//   * anchors loaded → strict reject for first-seen genesis (anchor squat)
-//   * anchors absent + QNET_BOOTSTRAP_FRESH=1 → admit TOFV (signature math
-//     is the cryptographic gate; an attacker without the SK cannot pass it)
-//   * anchors absent + no opt-in → strict reject (misconfigured deploy
-//     surfaces explicitly to the operator)
-//
-// The tests assert the POLICY decision via a dedicated pure helper rather
-// than going through the full `verify_consensus_signature` path — that path
-// also performs Dilithium3 math which would require keypair generation +
-// real signatures and is covered by upper-layer integration tests. The
-// policy helper isolates exactly the v19.1 logic added here.
-// ═══════════════════════════════════════════════════════════════════════════
+// Regression tests pinning the Tier-3 first-seen genesis policy: anchors
+// loaded → strict reject (anchor squat). Asserted via the pure policy
+// helper below, which isolates the decision from the Dilithium3 math
+// (keypair/signature path is covered by integration tests).
 
 /// Pure-logic helper for the Tier 3 first-seen genesis policy.
 ///

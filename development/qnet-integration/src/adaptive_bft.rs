@@ -132,28 +132,12 @@ impl AdaptiveBft {
             base_timeout
         };
         
-        // ═══════════════════════════════════════════════════════════════════════
-        // v14.9: RTT-AWARE TIMEOUT SCALING
-        // ═══════════════════════════════════════════════════════════════════════
-        // Previous behaviour: only `avg_latency_ms > 500ms` triggered adjustment.
-        // Problem — a 110ms transatlantic peer was treated like a 1ms intra-DC
-        // peer. BFT rotation failover-stormed because timeouts were sized for
-        // LAN, not for globally-distributed super-nodes.
-        //
-        // New behaviour: unconditionally add `max_peer_rtt × 3` on top of the base.
-        // 3× RTT covers: propagate → sign → propagate back → safety margin. Below
-        // that, honest slow peers get marked faulty and trigger bogus failover.
-        //
-        // Scalability:
-        //   - Single atomic read per block; no lock fan-out.
-        //   - At 10K super nodes max RTT bounded by physics (~300ms antipodal),
-        //     timeout asymptotes to ~2s. Consensus progresses at any scale.
-        //
-        // Safety:
-        //   - Floor = base_timeout (never shrinks).
-        //   - Cap = 30s (prevents RTT-spike peers from freezing rotation).
-        //   - Packet-loss bonus stacks on top of RTT-adjusted.
-        // ═══════════════════════════════════════════════════════════════════════
+        // RTT-aware timeout scaling. The old >500ms-only adjustment treated a
+        // 110ms transatlantic peer like a 1ms intra-DC peer → BFT failover
+        // storms (timeouts LAN-sized, not for geo-distributed nodes). Now add
+        // max_peer_rtt×3 (propagate → sign → propagate → margin) on the base.
+        // Floor = base (never shrinks); cap = 30s (RTT-spike peers can't
+        // freeze rotation); packet-loss bonus stacks on top.
         let network_state = self.network_state.read().await;
         let rtt_budget_ms = network_state.max_peer_rtt_ms.saturating_mul(3).max(100);
         let rtt_adjusted = timeout_ms.saturating_add(rtt_budget_ms);

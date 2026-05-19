@@ -351,52 +351,18 @@ impl CommitRevealConsensus {
         // v15.15: idempotent path now UPGRADES participants when the existing
         //         round was auto-created from an early-arriving commit.
         if self.rounds.contains_key(&round_number) {
-            // ═══════════════════════════════════════════════════════════════════
-            // v15.15: PARTICIPANTS UPGRADE on idempotent re-entry.
-            //
-            // Why this matters:
-            //   `process_commit` auto-creates a round entry when a commit
-            //   arrives BEFORE the local node has called start_round_at_height
-            //   for that round (race between P2P delivery and local consensus
-            //   tick). The auto-create path uses `vec![commit.node_id.clone()]`
-            //   as a stub participants list — i.e. participants.len() == 1.
-            //
-            //   When the producer-side macroblock loop later calls
-            //   start_round_at_height with the FULL committee
-            //   (genesis_node_count() = 5, or VRF committee up to MAX_VALIDATORS
-            //   = 1000), the previous version returned without updating the
-            //   stub. That stub then propagated into finalize_round_by_number,
-            //   which derives the canonical 2f+1 byzantine threshold from
-            //   `participants.len().max(commits.len())`. With participants=1
-            //   and commits=2 the threshold collapsed to 2 — far below the
-            //   real 2f+1 of 4 (genesis) or 668 (1000-validator committee).
-            //   Producer then finalized macroblocks with sub-quorum data which
-            //   the validator-side strict 2f+1 check rejected, halting the
-            //   chain.
-            //
-            // Fix:
-            //   When the new participants list is larger than the existing
-            //   stub, replace the participants vector. We only ever GROW the
-            //   list — never shrink — so a later attempt with an incomplete
-            //   peer view cannot weaken an already-validated committee.
-            //
-            // Correctness:
-            //   * Participants is metadata used to derive the 2f+1 threshold;
-            //     swapping it does not invalidate already-collected commits
-            //     or reveals (those are signature-bound to round_number,
-            //     not to the participants list).
-            //   * Authoritative committee_size for genesis epochs (mb_idx ≤ 2)
-            //     is `genesis_node_count()` baked into the binary. For mb_idx ≥ 3
-            //     it's the N-2 macroblock's eligible_producers snapshot.
-            //     Both sources are chain-anchored and identical across honest
-            //     nodes — the upgrade does not introduce non-determinism.
-            //
-            // Scalability:
-            //   At 1000-validator committees the participants vector is ~64KB
-            //   (1000 × ~64-byte node_ids). Swap is a Vec move — O(1).
-            //   Happens once per round at most. No locking beyond the existing
-            //   `&mut self` borrow on the consensus engine.
-            // ═══════════════════════════════════════════════════════════════════
+            // v15.15: participants upgrade on idempotent re-entry. process_commit
+            // auto-creates a round with a STUB participants vec![commit.node_id]
+            // (len 1) when a commit arrives before local start_round_at_height
+            // (P2P-vs-tick race). If not upgraded the stub flows into
+            // finalize_round_by_number which derives 2f+1 from
+            // participants.len().max(commits.len()) → threshold collapses (e.g. 2
+            // « real 4/668) → producer finalizes sub-quorum → validator 2f+1
+            // rejects → halt. Fix: when the new committee is LARGER, replace
+            // (grow-only — a later incomplete peer view can't weaken a validated
+            // committee). Safe: commits/reveals are sig-bound to round_number, not
+            // participants; committee_size chain-anchored (genesis_node_count mb<=2
+            // / N-2 snapshot mb>=3) → deterministic. O(1) Vec move, once/round.
             if let Some(existing) = self.rounds.get_mut(&round_number) {
                 if existing.participants.len() < participants.len() {
                     let prev = existing.participants.len();
@@ -1080,40 +1046,15 @@ impl CommitRevealConsensus {
         })
     }
     
-    /// PRODUCTION v2.32: DETERMINISTIC + UNPREDICTABLE leader selection
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// 
-    /// PROBLEM (v2.30): reveal_data varies between nodes → FORK!
-    /// PROBLEM (v2.31): No beacon → leader predictable (DoS risk)
-    /// 
-    /// SOLUTION (v2.32):
-    /// - Use randomness_beacon from MacroBlock N-2 as entropy source
-    /// - Beacon is accumulated reveal_data from previous epochs
-    /// - Unpredictable until N-2 finalized, then deterministic for all nodes
-    /// - Fallback to Genesis seed for first 2 epochs (no N-2 yet)
+    /// Deterministic + unpredictable leader selection.
     ///
-    /// ENTROPY SOURCES (all deterministic across nodes):
-    /// 1. prev_randomness_beacon (from MacroBlock N-2) - unpredictable!
-    /// 2. round_number (same on all nodes)
-    /// 3. sorted participant list (same on all nodes)
-    ///
-    /// SCALABILITY: Works with 1000 validators per round
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// PRODUCTION v2.40.3: XOR-based leader selection with CURRENT epoch entropy
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// 
-    /// PROBLEM (v2.32-v2.40.2): Beacon N-2 is PUBLIC after MacroBlock N-2 finalized!
-    ///   → Leader for epoch N is PREDICTABLE → DDoS attack possible!
-    /// 
-    /// SOLUTION (v2.40.3): Use CURRENT reveals as PRIMARY entropy source
-    ///   1. current_beacon = XOR(all reveal nonces in THIS round) - UNPREDICTABLE!
-    ///   2. prev_beacon (N-2) = historical entropy accumulation
-    ///   3. Combined: hash(current_beacon, prev_beacon, round, participants)
-    /// 
-    /// SECURITY: Leader cannot be predicted until ALL reveals are collected!
-    ///   - Even if attacker knows 4/5 reveals, the 5th reveal changes the beacon
-    ///   - 1-bit bias attack possible (last revealer) but not practical for leader selection
-    /// ═══════════════════════════════════════════════════════════════════════════
+    /// Entropy = hash(current_beacon, prev_beacon, round, sorted_participants)
+    /// where current_beacon = XOR(all reveal nonces in THIS round) is the
+    /// primary source. A public N-2 beacon alone makes the leader predictable
+    /// (DDoS); using current reveals means the leader cannot be predicted
+    /// until ALL reveals are collected (last revealer has a 1-bit bias only,
+    /// impractical for leader selection). Deterministic across nodes once
+    /// reveals are in. Works at 1000 validators/round.
     fn select_leader(&self, reveals: &HashMap<String, Reveal>) -> Option<String> {
         if reveals.is_empty() {
             return None;
@@ -1621,42 +1562,18 @@ impl CommitRevealConsensus {
             return None;
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // v15.2: ROUND-ROBIN LEADER ROTATION — mirrors the microblock producer
-        // rotation and the macroblock initiator picker in `should_initiate_consensus`.
-        //
-        // Formula:
+        // Round-robin leader rotation (same model as the microblock producer
+        // and macroblock initiator pickers — one rotation model, identical
+        // failover across both tiers):
         //   base_idx = SHA3-512(entropy ‖ height ‖ sorted_participants) % N
-        //   leader   = sorted_participants[ (base_idx + round) % N ]
-        //
-        // Why this replaced the previous hash-with-round approach:
-        //   The old compute mixed `round` INTO the hash input, which meant every
-        //   view-change gave a fresh random pick from N candidates. A dead or
-        //   partitioned validator could be re-selected multiple rounds in a
-        //   row with probability 1/N each round — livelock when that node
-        //   kept being picked. Round-robin advances by exactly one slot per
-        //   view-change, so after N rounds every candidate has had its turn.
-        //   Guaranteed progress even against hostile leader hashing.
-        //
-        // Symmetry: matches
-        //   * `select_microblock_producer_with_round` at the microblock layer
-        //   * `should_initiate_consensus` at the macroblock initiator layer
-        //   Three leader decisions, one rotation model. Identical failover
-        //   guarantees across both consensus tiers.
-        //
-        // Safety:
-        //   * `base_idx` derives only from on-chain/entropy inputs shared by
-        //     every honest node at the same (height, participants, beacon).
-        //   * `round` comes from `HIGHEST_CERTIFIED_ROUND[mb]`, advanced only
-        //     by 2f+1 Dilithium3-signed TimeoutVotes, so no ≤ f adversary can
-        //     skew it.
-        //   * Sorted participants list is the same canonical committee view
-        //     used by the initiator picker.
-        //
-        // Scalability: O(N) hash prep + O(1) modular arithmetic. At the
-        // MAX_VALIDATORS=1000 committee cap this is sub-millisecond. No
-        // allocation per round beyond the one-time sorted participant vector.
-        // ═══════════════════════════════════════════════════════════════════════
+        //   leader   = sorted_participants[(base_idx + round) % N]
+        // Replaces the old hash-with-round: mixing round INTO the hash re-picked
+        // a dead validator w.p. 1/N every view-change → livelock. Round-robin
+        // advances exactly one slot per view-change → every candidate has a
+        // turn within N rounds (progress even against hostile hashing).
+        // Safety: base_idx from shared on-chain entropy; round from
+        // HIGHEST_CERTIFIED_ROUND[mb], advanced only by 2f+1 signed votes
+        // (no ≤f skew). O(N) hash prep + O(1) arithmetic.
 
         use sha3::{Sha3_512, Digest};
         let mut hasher = Sha3_512::new();
@@ -1717,40 +1634,12 @@ impl CommitRevealConsensus {
         Some(selected_leader)
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // v15.10 STAGE-2B: SHARD-AWARE LEADER COMPUTATION
-    // ────────────────────────────────────────────────────────────────────────
-    // Wraps `compute_leader_for_round` with optional shard awareness. When
-    // the global `ShardCommitteeCache` carries an assignment for the
-    // requested epoch, the sub-committee for `shard_id` is consulted
-    // instead of the global participants list — every shard runs
-    // round-robin leader rotation INDEPENDENTLY within its own
-    // committee, which is the precondition for parallel per-shard
-    // microblock production once Stage-2B activates fully.
-    //
-    // FALLBACK PATH
-    // ────────────────────────────────────────────────────────────────────────
-    // When the cache holds no assignment (the canonical case before
-    // Stage-2B activation) OR the assignment carries `num_shards == 1`
-    // (single-shard configuration), the call delegates straight to
-    // `compute_leader_for_round` with the supplied global participants.
-    // This means call sites can adopt the shard-aware API today and
-    // get bit-for-bit identical behaviour to the legacy path until
-    // operators bump `num_shards`.
-    //
-    // VALIDATOR-ONLY PARTICIPANTS
-    // ────────────────────────────────────────────────────────────────────────
-    // The `participants` slice MUST contain only Genesis + Super node
-    // ids. Light wallets are HTTP-API clients, never validators, never
-    // appear here. The committee assignment honours the same invariant
-    // — see `assign_committees`.
-    //
-    // SCALABILITY (1 000+ super-node committees, 256 shards)
-    // ────────────────────────────────────────────────────────────────────────
-    // At the cap (1 000 validators ÷ 256 shards ≈ 4 validators per
-    // shard), per-shard sort + hash is sub-millisecond. The cache
-    // lookup is a single parking_lot RwLock read; no allocation on
-    // the hot path.
+    // Shard-aware wrapper over compute_leader_for_round: if the
+    // ShardCommitteeCache has an assignment for the epoch, leader rotation
+    // runs independently within shard_id's sub-committee; otherwise (no
+    // assignment or num_shards==1) it delegates to the global path with
+    // bit-for-bit identical behaviour. `participants` MUST be Genesis+Super
+    // ids only (no light wallets) — same invariant as assign_committees.
     pub fn compute_shard_aware_leader_for_round(
         &self,
         height: u64,

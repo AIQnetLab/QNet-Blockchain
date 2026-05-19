@@ -64,6 +64,11 @@ pub mod vrf_hybrid;
 /// Dilithium key generation, storage, rotation
 pub mod key_manager;
 
+/// v27 HOLE1: deterministic ML-DSA-65 keypair derivation from a mnemonic.
+/// Identity becomes a pure function of the wallet seed (wipe-safe, no
+/// random keygen, no runtime TOFU). Carries a mandatory fail-closed KAT.
+pub mod genesis_key;
+
 /// Solana address derivation from mnemonic (BIP39 + SLIP-10)
 /// Used to verify mnemonic ownership during server node activation
 pub mod solana_derivation;

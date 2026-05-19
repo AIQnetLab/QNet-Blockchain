@@ -473,32 +473,16 @@ impl ParallelValidator {
         }
     }
     
-    /// v15.9: Per-batch transaction acceptance gate.
+    /// Per-batch transaction acceptance gate.
     ///
-    /// CRYPTOGRAPHIC AUTHORITY
-    /// ────────────────────────────────────────────────────────────────────
-    /// This check INTENTIONALLY does not perform cryptographic verification.
-    /// The authoritative cryptographic gate is the mempool admission path
-    /// (`SimpleMempool::add_binary_transaction`), which verifies the
-    /// canonical transaction hash and, by extension, the post-quantum
-    /// signature. Every transaction that reaches the parallel executor
-    /// has already been verified at admission; re-running the same
-    /// per-signature work here would be a duplicated cost on the hot
-    /// block-construction path with no security gain.
-    ///
-    /// What this function DOES enforce is the structural floor that
-    /// mempool admission also enforces — non-empty signature bytes —
-    /// so that an obviously malformed entry that somehow bypassed
-    /// admission (test harness, internal injection) is rejected here
-    /// rather than propagated through the pipeline. This is an
-    /// integrity tripwire, not a security boundary.
-    ///
-    /// SCALABILITY (1 000+ super nodes)
-    /// ────────────────────────────────────────────────────────────────────
-    /// Avoiding redundant Dilithium3 verification here saves ~50 ms per
-    /// transaction × thousands of TX per macroblock — at 1 000-validator
-    /// scale this is the difference between meeting the macroblock
-    /// deadline and missing it.
+    /// INTENTIONALLY not a cryptographic check. The authoritative gate is
+    /// mempool admission (`SimpleMempool::add_binary_transaction`), which
+    /// verifies the canonical hash and post-quantum signature; every TX
+    /// reaching the executor is already verified, so re-running Dilithium3
+    /// here would add ~50 ms/TX on the hot path with no security gain.
+    /// This only enforces the non-empty-signature structural floor — an
+    /// integrity tripwire for entries that bypassed admission (test /
+    /// internal injection), NOT a security boundary.
     fn validate_signature(&self, signature: &str, _from: &str, _to: &str, _amount: u64, _nonce: u64) -> bool {
         // Integrity tripwire — see doc above for full rationale.
         !signature.is_empty()

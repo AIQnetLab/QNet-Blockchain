@@ -559,10 +559,7 @@ pub fn verify_merkle_proof_bytes(
     current_hash == *merkle_root
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// v3.11: STATE MERKLE TREE for Light Client Proofs
-// Sparse Merkle Tree implementation for account state proofs
-// ═══════════════════════════════════════════════════════════════════════════════
+// State Merkle Tree (Sparse Merkle Tree) for light-client account proofs.
 
 /// State Merkle Tree for account balance proofs
 /// Enables trustless verification for Light clients
@@ -916,35 +913,13 @@ impl StateMerkleTree {
         Self::verify_proof(address, &[], proof, root)
     }
     
-    // ═══════════════════════════════════════════════════════════════════════
-    // v14.7 (F): SNAPSHOT / RESTORE  —  hooks for external persistence
-    // ═══════════════════════════════════════════════════════════════════════
-    // Super-nodes backing a large state (millions of accounts) cannot keep
-    // every leaf in RAM indefinitely. These two methods give the embedding
-    // layer a way to periodically snapshot the entire tree — including
-    // cached intermediate nodes — to disk and reload it on process
-    // start, WITHOUT any change to the core consensus logic.
-    //
-    // Wire format (bincode): tuple of
-    //   * root hash                [u8; 32]
-    //   * leaves map               Vec<([u8;32], [u8;32])>
-    //   * intermediate_nodes map   Vec<((u16,[u8;32]), [u8;32])>
-    //
-    // Backwards compatibility: old snapshots that don't include the
-    // intermediate_nodes portion are accepted — the tree simply runs a
-    // full recompute on the first `finalize()` after restore. This lets
-    // existing persistence layers roll forward without migration.
-    //
-    // The proof LRU is deliberately NOT persisted — it is purely a
-    // runtime cache and survives a fresh rebuild at O(log) per hot entry.
-    //
-    // Scalability: serialisation is O(leaves + intermediate), each entry
-    // is a fixed 64-80 bytes. For 10M leaves that's roughly 640 MB —
-    // embedders are expected to stream writes via the RocksDB layer
-    // rather than hold one big Vec. A stream-oriented API can be added
-    // later if needed; the current Vec form is sufficient for snapshot
-    // replay and for the testnet-scale persistence used today.
-    // ═══════════════════════════════════════════════════════════════════════
+    // Snapshot/restore hooks for external persistence: serialise the whole
+    // tree (incl. cached intermediate nodes) to disk and reload on start,
+    // without touching consensus logic. Wire format (bincode):
+    // (root [u8;32], leaves Vec<([u8;32],[u8;32])>,
+    //  intermediate_nodes Vec<((u16,[u8;32]),[u8;32])>). The proof LRU is
+    // NOT persisted (runtime cache, rebuilt O(log)/hot entry).
+    // O(leaves + intermediate) serialisation, ~64-80 B/entry.
 
     /// v14.7 (F): Serialise the tree state to a byte vector suitable for
     /// writing into a storage layer (RocksDB CF, S3, etc.). Must be called

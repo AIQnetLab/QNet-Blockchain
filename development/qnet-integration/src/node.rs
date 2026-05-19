@@ -11,122 +11,18 @@ use crate::{
 pub const PROTOCOL_VERSION: u32 = 1;  // Increment when breaking changes are made
 pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 
-// ═════════════════════════════════════════════════════════════════════════════
-// v15.15: BFT SCALING ARCHITECTURE — single source of truth.
-// ═════════════════════════════════════════════════════════════════════════════
-//
-// The chain runs a two-tier BFT pipeline:
-//
-//   • MICROBLOCKS (1 s cadence) — single-producer authority. Each microblock
-//     carries the producer's own Dilithium3 signature; no per-block 2f+1
-//     quorum. Producer is rotated every ROTATION_INTERVAL_BLOCKS (= 30
-//     microblocks) deterministically from the previous macroblock's
-//     randomness beacon.
-//
-//   • MACROBLOCKS (every 90 microblocks) — full BFT 2f+1 commit-reveal.
-//     This is the consensus finality boundary; safety against long-range
-//     rewrites lives at this layer. Threshold formula `(N * 2 + 2) / 3`
-//     applied identically on the producer-side finalisation path AND on
-//     the validator-side macroblock validation path. Single source of
-//     truth for `N` per epoch (see SCALING below).
-//
-// ─────────────────────────────────────────────────────────────────────────────
-// SCALING PIPELINE — how `N` (committee size) is derived as the network
-// grows from 5 to 1 000 000 + super-nodes:
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//                  ┌────────────────────────────────────┐
-//                  │  Full Super-node set (≤ millions)  │
-//                  │  Arbitrary size; not directly used │
-//                  │  for any consensus threshold.      │
-//                  └────────────────┬───────────────────┘
-//                                   ▼
-//          [VRF: deterministic seed = mb_(N-2).randomness_beacon]
-//                                   ▼
-//                  ┌────────────────────────────────────┐
-//                  │  Eligible producers per macroblock │
-//                  │  truncated to MAX_VALIDATORS=1000  │
-//                  │  (snapshot stored on-chain in mb)  │
-//                  └────────────────┬───────────────────┘
-//                                   ▼
-//          [VRF subsample if eligible.len() > COMMITTEE_THRESHOLD=120]
-//                                   ▼
-//                  ┌────────────────────────────────────┐
-//                  │  Consensus committee per round     │
-//                  │  size = CONSENSUS_COMMITTEE_SIZE   │
-//                  │  = 100 (when subsampled), or       │
-//                  │  = eligible.len() (≤ 120)          │
-//                  └────────────────┬───────────────────┘
-//                                   ▼
-//                       BFT 2f+1 = (N * 2 + 2) / 3
-//
-// ─────────────────────────────────────────────────────────────────────────────
-// THRESHOLDS at concrete network sizes:
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//   Bootstrap (genesis 5 nodes):
-//     eligible = 5,  committee = 5,  2f+1 = 4   (tolerate 1 byzantine)
-//
-//   Mid-size network (100 active super-nodes):
-//     eligible = 100, committee = 100, 2f+1 = 67   (tolerate 33 byzantine)
-//
-//   Large network (1 000 + active super-nodes):
-//     eligible = 1000, committee = 100, 2f+1 = 67  (tolerate 33 byzantine)
-//
-//   The committee subsample at scale keeps the per-round message complexity
-//   constant (100 commits + 100 reveals + signature aggregation) while
-//   randomly rotating committee membership across epochs so every
-//   super-node participates statistically over time.
-//
-// ─────────────────────────────────────────────────────────────────────────────
-// COMMITTEE SOURCE BY EPOCH (validator and producer agree per-epoch):
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//   • mb_idx ≤ 2 (genesis epochs 1, 2) →
-//       N = genesis_constants::genesis_node_count() (baked into binary).
-//       No chain dependency; identical on every honest node by construction.
-//
-//   • mb_idx ≥ 3 →
-//       N = eligible_producers.len() from macroblock (mb_idx - 2)
-//       (the "N-2 snapshot" rule). Strict — no fallback. If the local node
-//       is missing mb_(N-2), it triggers a sync and abstains from the
-//       current round; other honest nodes do the same.
-//
-// ─────────────────────────────────────────────────────────────────────────────
-// RELATED CONSTANTS (defined throughout this file):
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//   pub const MAX_VALIDATORS:                 1000  (≈line below)
-//   const ROTATION_INTERVAL_BLOCKS:           30
-//   const CONSENSUS_COMMITTEE_SIZE:           100   (impl block, ≈line 3917)
-//   const COMMITTEE_THRESHOLD:                120   (impl block, ≈line 3918)
-//   pub const MEDIAN_PAST_WINDOW:             11    (≈line 1408)
-//   pub const FINALITY_WINDOW:                10    (≈line 40)
-//   pub const TIMESTAMP_FUTURE_TOLERANCE:     7200 s (≈line 1403)
-//
-// ─────────────────────────────────────────────────────────────────────────────
-// AGREEMENT POINTS (producer ↔ validator must use the same N):
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//   1. trigger_macroblock_consensus pre-round gate
-//      → checks  all_participants.len() ≥ ((N * 2 + 2) / 3)
-//
-//   2. commit_reveal::finalize_round_by_number
-//      → checks  reveals.len() ≥ ((participants.len() * 2 + 2) / 3)
-//        (participants is upgraded from any auto-create stub during
-//        start_round_at_height — see commit_reveal.rs::start_round_at_height
-//        v15.15 PARTICIPANTS UPGRADE block.)
-//
-//   3. validate_macroblock (validator on receive)
-//      → checks  commits.len() ≥ ((committee_size * 2 + 2) / 3)
-//        AND     reveals.len() ≥ ((committee_size * 2 + 2) / 3)
-//        (committee_size from genesis_node_count() OR mb_(N-2) snapshot.)
-//
-// All three paths derive `N` from the SAME chain-anchored source per epoch
-// and apply the SAME formula. By construction, an honest producer cannot
-// finalise a macroblock that an honest validator will reject.
-//
-// ═════════════════════════════════════════════════════════════════════════════
+// v15.15: BFT scaling — single source of truth for committee size N.
+// Two-tier: microblocks (1s, single-producer Dilithium3, rotate every
+// ROTATION_INTERVAL_BLOCKS); macroblocks (every 90, 2f+1 commit-reveal =
+// finality). Threshold = (N*2+2)/3 on every path.
+// N per epoch: mb_idx<=2 -> genesis_node_count() (baked); mb_idx>=3 ->
+// eligible_producers.len() of macroblock (mb_idx-2) [N-2 snapshot, strict,
+// no fallback]. Eligible <= MAX_VALIDATORS=1000; VRF-subsampled to
+// CONSENSUS_COMMITTEE_SIZE=100 when > COMMITTEE_THRESHOLD=120.
+// Producer & validator MUST derive N from this same per-epoch source on
+// the three agreement paths (pre-round gate / finalize_round_by_number /
+// validate_macroblock) — an honest producer cannot finalize a macroblock
+// an honest validator would reject.
 
 // PRODUCTION CONSTANTS - No hardcoded magic numbers!
 /// Maximum eligible producers/validators per epoch AND per consensus round.
@@ -243,33 +139,14 @@ pub fn get_timestamp_safe() -> u64 {
 }
 use std::env;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// DEPRECATED v4.0: Emergency producer flag replaced by BFT Timeout Protocol
-// ═══════════════════════════════════════════════════════════════════════════════
-// WHY REMOVED:
-// 1. Non-deterministic: Different nodes may have different flags
-// 2. Race condition: Flag set by one node, others don't know
-// 3. No consensus: Producer change without 2/3+ agreement
-//
-// NEW ARCHITECTURE (v14.8.10):
-// - Producer rotation is driven by BFT-agreed rounds: for every macroblock
-//   index, each validator tracks
-//     * HIGHEST_CERTIFIED_ROUND — the highest round with a 2f+1 signed
-//       TimeoutCertificate (Dilithium3-verified supermajority), and
-//     * HIGHEST_ADOPTED_ROUND   — f+1 voters' max signed round
-//       (accountable-safety threshold, Dilithium3-verified).
-//   `rotation_round = certified.max(adopted)` is identical on every node
-//   once the corresponding signed messages have been gossiped, so all
-//   validators derive the same producer via the VRF formula
-//   `candidates[(base_idx + rotation_round) % N]`.
-// - Wall clock only gates WHEN to vote (stall detection via `local_delay`)
-//   and is explicitly capped at 30 s under catch-up, so a node whose clock
-//   has drifted from the canonical parent timestamp cannot broadcast
-//   inflated rounds.
-// - Macroblock commit view change reuses the same certified-round path
-//   for its 2f+1 TimeoutCertificate finalisation — one consensus domain,
-//   one deterministic derivation.
-// ═══════════════════════════════════════════════════════════════════════════════
+// Emergency producer flag removed (non-deterministic, racy, no consensus).
+// Replaced by BFT-agreed rotation: the producer is
+// candidates[(base_idx + rotation_round) % N] where rotation_round is the
+// strict 2f+1 BFT-certified round (HIGHEST_CERTIFIED_ROUND; f+1 adopted is
+// telemetry-only — see the v23.1 invariant), identical on every node once
+// signed votes are gossiped. Wall clock only gates WHEN to vote (capped
+// 30 s under catch-up). Macroblock commit view-change reuses the same
+// certified-round path — one consensus domain, one deterministic derivation.
 use std::sync::atomic::{AtomicU64 as StdAtomicU64, Ordering as StdOrdering};
 use parking_lot::RwLock as ParkingRwLock;
 
@@ -547,48 +424,17 @@ static FAST_SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
 /// Deadlock = no progress for 120s (instead of fixed 300s cap).
 pub static LAST_SYNC_PROGRESS_TIME: AtomicU64 = AtomicU64::new(0);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// v3.8: DETERMINISTIC TIMEOUT-BASED FAILOVER
-// ═══════════════════════════════════════════════════════════════════════════════
-// v3.14: REAL-TIME BASED DETERMINISTIC FAILOVER
-// ═══════════════════════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════════════
-// v14.8.10: BFT-CONSENSUS-DRIVEN MICROBLOCK ROTATION ROUND
-// ═══════════════════════════════════════════════════════════════════════════
-// Microblock producer rotation round is driven by BFT-agreed state:
-//
-//     timeout_round_for_rotation = certified.max(adopted)
-//
-// where `certified` is `HIGHEST_CERTIFIED_ROUND[mb_idx]` (signed 2f+1 TC)
-// and `adopted` is `HIGHEST_ADOPTED_ROUND[mb_idx]` (f+1 aggregated signed
-// votes). Both are populated from DILITHIUM3-VERIFIED messages received
-// over gossip — a catch-up validator sees the same certified/adopted as
-// the rest of the network as soon as their P2P sync delivers the votes.
-//
-// Wall-clock pacemaker (local wall time) is NOT used for the rotation
-// formula. Attempting that in v14.8.7/8/9 caused the observed h=339
-// catch-up fork: a freshly-synced node computes `(now − parent_ts)` with
-// a `now` far from the canonical `parent_ts`, gets a very high rank that
-// cycles back to themselves via `(base_idx + rank) % N`, and produces
-// a second block at the same height as the live primary. BFT-driven
-// rotation eliminates that race: a catch-up node reads `certified/adopted`
-// from the exact same signed network state as every other honest node,
-// so rotation round (and therefore producer) matches.
-//
-// Wall clock is used ONLY for:
-//   * `local_delay` — how long since THIS node saw a block, to decide
-//     WHEN to broadcast a TimeoutVote. Capped at 30 s when the node is
-//     not `PRODUCTION_UNLOCKED` (post-restart stale-LBPT protection).
-//   * Stall/progress diagnostics (watchdog, chronic-stall resync).
-// It never enters the microblock producer-selection formula.
-//
-// `CURRENT_TIMEOUT_ROUND` is the in-memory cache of the latest
-// `timeout_round_for_rotation` computed by the main consensus loop.
-// Producer selection and block construction read it to keep one source
-// of truth per-tick without re-loading from storage. It is RESET to 0
-// on each tip advance (new canonical block received) because the next
-// slot starts fresh.
-// ═══════════════════════════════════════════════════════════════════════════
+// v14.8.10: BFT-driven microblock rotation round.
+// timeout_round_for_rotation = certified.max(adopted): certified=
+// HIGHEST_CERTIFIED_ROUND[mb_idx] (signed 2f+1 TC), adopted=
+// HIGHEST_ADOPTED_ROUND[mb_idx] (f+1 aggregated signed votes) — both
+// from Dilithium3-verified gossip, so a catch-up node sees the same as
+// the network. Wall clock is NEVER in the rotation formula (the
+// v14.8.7/8/9 wall-clock pacemaker caused the h=339 catch-up fork:
+// (now-parent_ts) → high rank cycles to self → 2nd block same height).
+// Wall clock only: local_delay (when to broadcast TimeoutVote; capped
+// 30s pre-PRODUCTION_UNLOCKED) + stall diagnostics. CURRENT_TIMEOUT_
+// ROUND caches the value; reset to 0 on tip advance.
 
 /// v19: TELEMETRY-ONLY snapshot of the rotation round most recently observed
 /// by the stall-detection loop. Once read by producer selection / block
@@ -631,101 +477,28 @@ pub fn reset_timeout_round() {
     CURRENT_TIMEOUT_ROUND.store(0, Ordering::SeqCst);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// v23: BFT-CERTIFIED MICROBLOCK LEADER ROTATION — CANONICAL L1 PATTERN
-// ═══════════════════════════════════════════════════════════════════════════════
-// Microblock leader for every height h is computed as a PURE FUNCTION over
-// finalised on-chain state:
-//
-//     leader(h) = select_microblock_producer_with_round(
-//         height          = h,
-//         candidates      = eligible_producers from macroblock(N-2),
-//         vrf_entropy     = SHA3(macroblock(N-2).deterministic_fields),
-//         leadership_round= (h-1) / ROTATION_INTERVAL_BLOCKS,
-//         timeout_round   = get_effective_rotation_round(h / 90),
-//     )
-//
-// EVERY input is on-chain finalised state. `timeout_round` is the BFT-
-// CERTIFIED rotation counter for the containing macroblock, advanced ONLY
-// when 2f+1 Dilithium3-signed TimeoutVotes have aggregated for round R
-// (HIGHEST_CERTIFIED_ROUND) or the f+1 pacemaker has lifted
-// HIGHEST_ADOPTED_ROUND. Local wall clock is NEVER an input to leader
-// selection — only to the stall-detector that triggers signed TimeoutVote
-// emission (which feeds the 2f+1 aggregator that advances the certified
-// round).
-//
-// Why this is safe / scalable / top-L1-grade
-// ──────────────────────────────────────────────────
-//   * SAFETY: leader(h) is a pure function. Identical inputs → identical
-//     output on every honest node by construction. NTP drift cannot
-//     elect two leaders at the same height because clock is not an input.
-//     The previous v22 design injected `empty_slot_offset = (now -
-//     last_block_ts) / 3` into the seed; under any NTP drift > 1 second
-//     between two nodes the offset diverged, electing different
-//     "fallback" producers at the same height, signing different blocks
-//     at one height — a chain split. v23 makes this structurally
-//     impossible.
-//
-//   * LIVENESS: when the primary at round R is silent, every honest node
-//     observes `local_delay >= grace_period` independently and emits a
-//     signed TimeoutVote for round R+1. After 2f+1 votes aggregate
-//     (one gossip RTT), HIGHEST_CERTIFIED_ROUND[mb_idx] advances to R+1
-//     simultaneously on every honest node — same input → same fallback
-//     producer. Bounded recovery latency = grace_period + 1 RTT ≈ 1–3 s.
-//
-//   * SCALABILITY: O(1) DashMap read for `HIGHEST_CERTIFIED_ROUND[mb_idx]`,
-//     O(1) cached VRF result per 30-block rotation period. Identical cost
-//     from 5 to 10 000 super-nodes.
-//
-//   * POST-QUANTUM: all signatures are Dilithium3; no aggregate signature
-//     scheme required. TimeoutVote / TimeoutCertificate already operate on
-//     individual Dilithium3 sigs with explicit voter sets — no threshold
-//     primitive needed.
-//
-// Macroblock layer is UNCHANGED — commit-reveal + view-change continues
-// to govern finality on 90-block boundaries. v23 restores the canonical
-// BFT-certified rotation invariant that v18/v19 had and that v22 broke
-// by injecting a clock-derived path. v22.1's removal of the cross-domain
-// `yield_stale_round` guard remains in force.
-// ═══════════════════════════════════════════════════════════════════════════════
+// v23: BFT-certified microblock leader rotation (canonical L1). leader(h)
+// is a PURE function of finalised on-chain state:
+//   select_microblock_producer_with_round(h,
+//     candidates=eligible_producers(macroblock N-2),
+//     vrf_entropy=SHA3(macroblock(N-2).deterministic_fields),
+//     leadership_round=(h-1)/ROTATION_INTERVAL_BLOCKS,
+//     timeout_round=get_effective_rotation_round(h/90))
+// timeout_round advances ONLY on 2f+1 Dilithium3 TimeoutVotes (or the f+1
+// pacemaker); wall clock is NEVER a leader-selection input → identical
+// leader on every honest node (no NTP-drift dual-production split; the
+// v22 clock-derived seed that caused it is gone). Liveness: silent
+// primary → 2f+1 TimeoutVote → certified round advances same on all →
+// bounded recovery ≈ grace + 1 RTT. O(1). Macroblock commit-reveal=final.
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// v14.8.10: RUNTIME CLOCK-DRIFT MONITOR
-// ═══════════════════════════════════════════════════════════════════════════════
-// Problem: startup NTP sync + 30s lbpt cap catch most drift cases, but clock
-// can drift during operation (VM migration, hypervisor pauses, NTP server
-// issues). Drift never breaks safety (rotation is BFT-signed), but degrades
-// this node's liveness: stale LBPT → wrong proposed_round → vote not
-// aggregated.
-//
-// Design (inspired by TimesNet-BFT 2026 lazy-recalibration pattern and
-// Ethereum attestation-based drift tolerance):
-//
-//   1. Every time a block from the network is applied, observe
-//      `drift = local_now - block.timestamp`. Block timestamps are
-//      producer-signed wall clock — ≥ 2f+1 honest nodes agree on median.
-//
-//   2. Maintain exponential moving average (EMA) of |drift| over last N
-//      blocks. A single outlier (ours or theirs) does not trigger.
-//
-//   3. Thresholds (conservative):
-//        * EMA > 10 s  → [WARN][DRIFT] log, continue operating
-//        * EMA > 30 s  → rate-limited re-sync trigger (once per 5 min)
-//
-//   4. Re-sync trigger calls the same NTP commands as startup:
-//      `timedatectl set-ntp true` → `chronyc makestep` → `ntpdate -u`.
-//      Non-blocking (spawn), non-fatal (log on failure). Safety path
-//      NEVER waits for NTP — we only nudge the OS daemon.
-//
-// Safety invariant: this code is purely observational + side-effect
-// (external NTP tool). It does NOT feed back into rotation round,
-// producer selection, or any consensus decision. Forks cannot be caused
-// or prevented by drift monitor state.
-//
-// Scalability: O(1) per block observation. Works identically at 5 or
-// 5000 validators.
-// ═══════════════════════════════════════════════════════════════════════════
+// Runtime clock-drift monitor. On each applied network block observe
+// drift = local_now - block.timestamp (producer-signed wall clock, 2f+1-
+// agreed median). Track EMA of |drift|: >10s → [WARN][DRIFT]; >30s →
+// rate-limited (5 min) NTP re-sync nudge (timedatectl/chronyc/ntpdate,
+// spawned, non-fatal). Purely observational — never feeds rotation,
+// producer selection or any consensus decision, so it cannot cause or
+// prevent forks. O(1)/block.
 
 /// Fixed-point EMA of |drift_seconds| × 1000 (millisecond precision).
 /// Reset to 0 on genesis boot. Updated on every applied network block.
@@ -734,69 +507,20 @@ static CLOCK_DRIFT_EMA_MILLIS: AtomicU64 = AtomicU64::new(0);
 /// Peak observed drift (seconds). Informational, never cleared.
 static CLOCK_DRIFT_PEAK_SECS: AtomicU64 = AtomicU64::new(0);
 
-/// v14.8.11: SELF-PAUSE REMOVED.
-///
-/// Earlier revision (v14.8.10) paused nodes with persistent drift to stop
-/// them polluting the consensus round aggregation. On a small committee
-/// this rapidly killed the 2f+1 quorum — two paused nodes out of five
-/// removed 40% of the committee, and the network froze.
-///
-/// Canonical patterns adopted instead (proven in multiple production L1
-/// systems, see FILE HEADER):
-///   * Median-aware block timestamp generation — a drifted node still
-///     produces blocks whose timestamp is pulled back into the canonical
-///     network range via the median of the last 32 on-chain timestamps.
-///   * Wide future-tolerance window (2 h) for validation — absorbs the
-///     vast majority of real-world hypervisor / live-migration events
-///     without rejecting honest blocks.
-///   * Median-Past rule (last 11 samples, strictly greater than median)
-///     — blocks cannot be pushed into the past, preventing rewrite
-///     attempts via stale timestamps.
-///   * Rotation round is still driven by BFT-agreed signed votes, so a
-///     drifted node's local proposed round never affects producer
-///     selection unless it converges with the network via signed 2f+1
-///     evidence.
-///
-/// Net effect: drifted nodes remain productive; the committee keeps
-/// its quorum; safety is preserved via macroblock finality.
+// Self-pause on drift was removed: pausing drifted nodes killed the 2f+1
+// quorum on small committees and froze the network. Drift is instead
+// absorbed by median-aware timestamp generation, the wide future-tolerance
+// window, the Median-Past rule, and BFT-signed rotation — so drifted nodes
+// stay productive without endangering quorum or safety.
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// v14.8.10: MEDIAN-LBPT NETWORK-TIME SELF-CALIBRATION
-// ═══════════════════════════════════════════════════════════════════════════════
-// Problem:
-//   `local_delay = wall_clock_now − last_block_produced_time − 1`
-//
-//   When this node's wall clock is BEHIND the network (e.g. VM paused, chrony
-//   lost NTP server, hypervisor skew), wall_clock_now < last_block_produced_time
-//   and `saturating_sub` pins local_delay at 0 forever. The node NEVER votes
-//   for timeout even during a real stall — it effectively leaves f+1 adopted
-//   aggregation one voter short. At small committee size (genesis 5), losing
-//   even one voter can push f+1 under threshold and block rotation.
-//
-// Solution (network-native time calibration, scalable to 10K+ validators):
-//   1. Maintain a 32-slot ring buffer of the most recent on-chain block
-//      timestamps (producer-signed wall clocks). These are 2f+1-agreed at
-//      the macroblock boundary and cannot be forged by ≤ f Byzantine.
-//   2. `effective_now()` = max(wall_clock_now, network_time_estimate)
-//      where network_time_estimate = median(ring) + elapsed_blocks_since_median
-//      (using a conservative 1 s/block assumption).
-//   3. Apply `effective_now()` ONLY in local stall-detection timing —
-//      NEVER in signed fields (block.timestamp, vote timestamps,
-//      attestation.timestamp) because those must be raw wall clock for
-//      network-wide agreement via TIMESTAMP_FUTURE_TOLERANCE check.
-//
-// Safety invariants:
-//   * Only L-channel (local decision) uses effective_now(); signed fields
-//     use `get_timestamp_safe()`.
-//   * Ring buffer update is monotonic — we never accept a timestamp older
-//     than our latest observed block.
-//   * Median over 32 samples tolerates up to 15 Byzantine producers within
-//     the window (well above realistic f for any committee we support).
-//
-// Scalability: ring buffer is O(1) insert + O(n log n) median over 32
-// elements — dozens of nanoseconds per call. Works identically at any
-// validator count; memory cost is a single fixed-size array.
-// ═══════════════════════════════════════════════════════════════════════════════
+// Median-LBPT network-time self-calibration. A wall clock behind the
+// network pins local_delay at 0 (saturating_sub), so the node never votes
+// timeout during a real stall and starves f+1 aggregation. Fix:
+// effective_now() = max(wall, median(32 on-chain producer-signed ts) +
+// elapsed_blocks). Used ONLY in local stall-detection timing — NEVER in
+// signed fields (those use raw wall clock via get_timestamp_safe() for
+// network-wide TIMESTAMP_FUTURE_TOLERANCE agreement). Ring update is
+// monotonic; 32-sample median tolerates 15 Byzantine in-window. O(1)/call.
 
 /// Size of the on-chain timestamp ring buffer used for median network-time
 /// estimation. 32 samples covers ~32 seconds of history at 1 s block
@@ -901,35 +625,13 @@ pub fn effective_now() -> u64 {
     wall
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// v14.8.11: MEDIAN-PAST RULE (canonical timestamp-rewrite defence)
-// ═══════════════════════════════════════════════════════════════════════════════
-// Rule: `block.timestamp > median(last N on-chain block timestamps)`.
-// Canonical window size N = 11 (MEDIAN_PAST_WINDOW).
-//
-// Purpose:
-//   * Prevents a producer from rewriting the near-past by signing a block
-//     with a timestamp below the agreed median. Combined with parent
-//     monotonicity (`block.timestamp > parent.timestamp`) and the wide
-//     future-tolerance window, it bounds timestamp manipulation to a very
-//     narrow window — an attacker can only push forward, never backward,
-//     and only within `TIMESTAMP_FUTURE_TOLERANCE` of real time.
-//   * Complements (but does not replace) the BFT macroblock finality path:
-//     safety for long-range rewrites comes from 2f+1 committed macroblocks
-//     every 90 blocks; the Median-Past rule is the microblock-layer
-//     backstop against nuisance timestamp games within an epoch.
-//
-// Reads from the on-chain ring buffer populated by `observe_clock_drift`
-// / `update_network_time_sample`. During the first ~11 blocks after boot
-// the ring is undersized and the rule returns None, letting the producer
-// fall back to `parent+1` monotonicity alone — this is safe because the
-// very first blocks after boot also cannot be rewritten without breaking
-// the hash chain.
-//
-// Scalability: single O(N log N) sort over a tiny fixed-size window;
-// microseconds regardless of committee size. Works identically at 5 or
-// 10 000 validators.
-// ═══════════════════════════════════════════════════════════════════════════════
+// Median-Past rule: block.timestamp > median(last 11 on-chain timestamps).
+// Prevents a producer rewriting the near-past with a below-median ts; with
+// parent-monotonicity and the future-tolerance window an attacker can only
+// push forward, within tolerance. Microblock-layer backstop complementing
+// (not replacing) 2f+1 macroblock finality. First ~11 blocks: ring
+// undersized → None → parent+1 fallback (safe; hash-chain prevents
+// rewrite). O(window) sort.
 
 /// Compute the Median-Past timestamp for a block being verified or produced
 /// at `target_height`. Median is taken over the canonical parent-chain
@@ -940,40 +642,11 @@ pub fn effective_now() -> u64 {
 /// range, in which case the caller falls back to `parent+1` monotonicity
 /// alone.
 ///
-/// ─────────────────────────────────────────────────────────────────────
-/// v15.15: Height-ordered median (canonical BIP-113 semantics).
-///
-/// The previous version walked the ring backwards from `head` (insertion
-/// order) and computed the median over the LAST WINDOW INSERTIONS,
-/// regardless of whether their heights formed a contiguous segment ending
-/// at `target_height - 1`.
-///
-/// On a healthy chain at steady-state, insertion order == height order
-/// (each new block height is inserted exactly once, monotonic), so the
-/// two definitions collapse to the same answer. Insertion order also
-/// rejects out-of-order observations via `NetworkTimeRing::insert`, which
-/// preserves the invariant.
-///
-/// HOWEVER — during catch-up sync after a force-resync rollback, blocks
-/// may legitimately re-arrive at the verify pipeline in non-height order:
-/// peer A serves [h=51..h=75], peer B serves [h=26..h=50], the verify
-/// queue may pull h=51 before h=26. With the insertion-order ring already
-/// containing recent heights from before the rollback, comparing an older
-/// re-delivered block against the insertion-order median produced false
-/// `median_past_violation` rejections — observed as 54+ verify failures
-/// per node during the bootstrap incident, blocking the pipeline.
-///
-/// This function consults the ring entries whose heights actually lie
-/// within `[target_height - WINDOW, target_height)` and computes the
-/// median strictly over those. Out-of-window samples (older or newer than
-/// the parent chain segment of interest) are ignored. The semantics now
-/// match Bitcoin BIP-113 — median of the canonical parent-chain block
-/// timestamps — and degrade gracefully (return None → skip) when the
-/// ring does not contain the full window.
-///
-/// Scalability: O(NETWORK_TIME_WINDOW) scan with a small BTreeMap dedupe.
-/// At fixed window=32 this is nanoseconds regardless of validator count.
-/// ─────────────────────────────────────────────────────────────────────
+/// v15.15: height-ordered (BIP-113) — median over ring entries whose
+/// heights lie in [target_height-WINDOW, target_height), NOT the last
+/// WINDOW insertions (the old insertion-order median produced false
+/// median_past_violation rejections when blocks re-arrived out of
+/// height order during post-rollback catch-up). O(WINDOW=32).
 pub fn median_past_timestamp_at_height(target_height: u64) -> Option<u64> {
     // The rule cannot apply to the genesis-adjacent prefix where there
     // are not yet WINDOW prior heights to take a median over.
@@ -1176,32 +849,13 @@ pub fn try_get_storage() -> Option<&'static Arc<Storage>> {
 pub static LAST_BLOCK_PRODUCED_TIME: AtomicU64 = AtomicU64::new(0);
 pub static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v15.11: PRODUCER LIVENESS WATCHDOG
-// ═══════════════════════════════════════════════════════════════════════════
-// Forensic case: production node 002 went COMPLETELY SILENT for 85.6 seconds
-// at h=154345. The container was healthy, but the producer task did not emit
-// a single log line — root cause was a sync RocksDB call (now fixed in v15.10
-// + v15.11) blocking the async runtime under compaction load. While the new
-// spawn_blocking coverage prevents the most common stall, a watchdog provides
-// defense-in-depth against any future async-runtime deadlock or starvation:
-//
-//   * The producer loop updates `PRODUCER_HEARTBEAT_MS` each iteration with
-//     the current monotonic millisecond timestamp.
-//   * A separate watchdog task polls the heartbeat every 500 ms and emits
-//     graduated warnings as the silence interval grows:
-//       ≥ 3 s   → [WARN][WATCHDOG] producer_silent
-//       ≥ 10 s  → [WARN][WATCHDOG] producer_dead — strong signal of runtime
-//                 stall; ops can correlate with disk I/O / compaction metrics.
-//
-// The watchdog never modifies producer state — it only emits structured
-// observability events. View-change / failover is still driven by the BFT
-// timeout vote path so the watchdog cannot itself trigger a fork.
-//
-// Scalability: a single AtomicU64 store per producer iteration (≈ 1/sec) is
-// effectively free. The watchdog task is one tokio interval and one atomic
-// load every 500 ms — fixed cost regardless of validator count.
-// ═══════════════════════════════════════════════════════════════════════════
+// Producer liveness watchdog. Forensic: node 002 went silent 85.6 s at
+// h=154345 (a sync RocksDB call under compaction blocked the async runtime;
+// fixed in v15.10/11). Defence-in-depth against any future runtime stall:
+// the producer loop stamps PRODUCER_HEARTBEAT_MS each iteration; a separate
+// task polls every 500 ms — ≥3 s → producer_silent, ≥10 s → producer_dead.
+// Log-only; never modifies producer state, so it can't fork (failover stays
+// on the BFT timeout-vote path). O(1).
 pub static PRODUCER_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
 pub static PRODUCER_WATCHDOG_STARTED: AtomicU64 = AtomicU64::new(0);
 
@@ -1702,33 +1356,15 @@ pub fn attestation_layer_warmed_up() -> bool {
     node_uptime_secs() >= ATTESTATION_WARMUP_SECS
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// v14.8.11: TIMESTAMP VALIDATION CONSTANTS
-// ═══════════════════════════════════════════════════════════════════════════════
-// These constants define acceptable timestamp ranges for incoming blocks.
-// Blocks with timestamps outside these bounds are REJECTED.
-//
-// Three validation checks (canonical model, proven in long-running L1s):
-//   1. FUTURE:         block.timestamp ≤ local_wall_clock + FUTURE_TOLERANCE
-//   2. MONOTONICITY:   block.timestamp > parent.timestamp
-//   3. MEDIAN-PAST:    block.timestamp > median(last 11 on-chain timestamps)
-//                      (prevents timestamp-in-past rewrite attempts)
-//
-// Why 7200 seconds (2 hours) for FUTURE_TOLERANCE:
-//   * Earlier value (15s) rejected honest blocks whenever this node's wall
-//     clock drifted even slightly behind the network — observed drift peaks
-//     of 465 s during VM live migration are common in virtualised hosts.
-//   * 7200 s covers essentially every real-world transient clock event
-//     (hypervisor suspend, live migration, NTP outage) without sacrificing
-//     security: the Median-Past rule (#3) together with parent monotonicity
-//     and a signed Dilithium3 header keep Byzantine timestamp inflation
-//     strictly bounded.
-//   * This is the same window that a long-running PoW L1 has used since
-//     2009 across tens of thousands of nodes worldwide with no drift-
-//     induced forks.
-//   * Our macroblock finality every 90 blocks (2f+1 commit/reveal) adds
-//     a second layer of safety independent of timestamp tolerance.
-// ═══════════════════════════════════════════════════════════════════════════════
+// Timestamp validation constants. Incoming blocks are rejected unless:
+//   1. FUTURE:       ts ≤ local_wall_clock + FUTURE_TOLERANCE
+//   2. MONOTONICITY: ts > parent.timestamp
+//   3. MEDIAN-PAST:  ts > median(last 11 on-chain ts)  (no past-rewrite)
+// FUTURE_TOLERANCE = 7200s: 15s rejected honest blocks on minor drift
+// (VM live-migration drift peaks of 465s are common); 2h covers transient
+// clock events while Median-Past + monotonicity + the signed Dilithium3
+// header keep Byzantine inflation bounded. 90-block 2f+1 macroblock
+// finality is an independent second safety layer.
 // FIX R22-T5: Made pub(crate) for unified usage in block_pipeline.rs
 // Single source of truth — prevents inconsistent tolerance windows.
 pub const TIMESTAMP_FUTURE_TOLERANCE: u64 = 7200;  // 2 hours (absolute, wall clock)
@@ -1737,6 +1373,10 @@ pub const TIMESTAMP_FUTURE_TOLERANCE: u64 = 7200;  // 2 hours (absolute, wall cl
 /// the median of the last `MEDIAN_PAST_WINDOW` block timestamps. Canonical
 /// value 11 taken from long-running PoW L1 consensus rules.
 pub const MEDIAN_PAST_WINDOW: usize = 11;
+
+/// v27 HOLE2: forward cap — block_ts may lead the raw network median by
+/// ≤ this (breaks the old unbounded max(effective_now) drift ratchet).
+pub const BLOCK_TS_MAX_FWD_SKEW_SECS: u64 = 12;
 
 /// Get current failover metrics (for Prometheus/Grafana integration)
 pub fn get_failover_metrics() -> (u64, u64, u64, u64) {
@@ -2301,27 +1941,13 @@ lazy_static::lazy_static! {
         ParkingRwLock::new(NodeState::Initializing);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v16.1: NODE STATE ESCALATION LADDER
-// ═══════════════════════════════════════════════════════════════════════════
-// Tracks consecutive ERROR transitions so the runtime can react to a node
-// that is stuck in a recovery cycle without ever reaching Validating /
-// Producing / Idle. Counter resets to zero on any non-error transition and
-// is sampled by `escalate_error_state()` to drive deterministic recovery
-// actions (force local round advance → resync → peer rediscovery → halt).
-//
-// Forensic motivation: at the v15.x h=781 deadlock the legacy state machine
-// cycled VALIDATING → WAITING_CONSENSUS → ERROR{recoverable=true} → back to
-// VALIDATING for ~11 hours. The `recoverable` flag had no consumer and the
-// transition log silently rotated forever. Cycle counter + escalation
-// converts a stuck loop into a sequence of progressively larger recovery
-// signals, every signal being a SAFE primitive (does not modify
-// finalisation guarantees).
-//
-// Scalability: single AtomicU64 read/write per transition, O(1) regardless
-// of validator count. Same gate fires identically on a 5-node genesis set
-// and on a 100k super-node mainnet.
-// ═══════════════════════════════════════════════════════════════════════════
+// Node-state escalation ladder. Counts consecutive ERROR transitions
+// (reset on any non-error) so escalate_error_state() can drive
+// deterministic recovery (force round advance → resync → peer rediscovery
+// → halt) for a node stuck in a recovery cycle. Forensic h=781: the legacy
+// machine cycled VALIDATING→WAITING→ERROR{recoverable} ~11h with the
+// recoverable flag having no consumer. Each escalation step is a SAFE
+// primitive (never modifies finalisation guarantees). O(1)/transition.
 
 /// Number of consecutive `NodeState::Error{recoverable=true}` transitions.
 /// Reset to 0 on any non-Error transition.
@@ -2482,107 +2108,32 @@ pub static PEER_REFRESH_REQUESTED: std::sync::atomic::AtomicBool =
 pub static HALT_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// v24: PER-PEER BACKPRESSURE — SUPERSEDED BY R1 (adaptive throttle removal)
-// ═══════════════════════════════════════════════════════════════════════════════
-// The pre-v24 design had a single global `PENDING_BROADCAST_COUNT` counter
-// that paused production whenever ANY peer fell behind. A per-peer backpressure
-// system was on the roadmap to isolate slow peers from healthy ones (so one
-// host's I/O contention couldn't throttle the entire chain).
-//
-// R1 (v24) made per-peer backpressure unnecessary by removing the global gate
-// entirely. The producer now runs at the full consensus slot cadence (1 s).
-// Slow peers self-recover via the independent sync subsystem (block_pipeline +
-// SyncManager + Reed-Solomon redundancy + multi-hop chunk forwarding). The
-// QUIC transport handles per-peer flow control at the TLS / UDP-stream level
-// using OS-kernel buffers — this is the canonical place for transport
-// backpressure and requires no consensus-layer involvement.
-//
-// In other words, the "per-peer backpressure" feature is now implicit in the
-// transport stack and the gossip/sync layered architecture. No additional
-// consensus-layer state is required.
-// ═══════════════════════════════════════════════════════════════════════════════
+// Per-peer backpressure was superseded by the adaptive-throttle removal:
+// the global production gate is gone (producer runs at the full 1 s
+// cadence), slow peers self-recover via the sync subsystem, and QUIC
+// handles per-peer flow control at the transport level. No consensus-layer
+// backpressure state is needed.
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// v23: STALL-DRIVEN TIMEOUT-VOTE EMISSION THROTTLE
-// ═══════════════════════════════════════════════════════════════════════════════
-// Per-macroblock-index throttle for `emit_macroblock_view_change_vote` calls
-// initiated from the microblock-stall path. Keyed by `mb_idx`, value is the
-// last emission timestamp (unix seconds). The stall detector reads this on
-// every tick and re-emits at most once per `STALL_GRACE_SECS` per macroblock
-// per node, bounding network gossip overhead during a stall regardless of
-// committee size (5 nodes or 10 000).
-//
-// Receiver-side `VOTER_MAX_ROUND` further dedupes votes from the same voter
-// at the same or lower round, so even duplicate emissions over a slow gossip
-// window cannot affect aggregation correctness — this throttle is purely a
-// network-efficiency guard.
-//
-// Retention: pruned alongside the active-macroblock-window cleanup sweep
-// (`cleanup_old_timeout_data` in unified_p2p.rs) so memory stays flat at
-// the active window irrespective of chain length.
-// ═══════════════════════════════════════════════════════════════════════════════
+// Stall-driven timeout-vote emission throttle. Per-mb_idx last-emission
+// timestamp; the stall detector re-emits emit_macroblock_view_change_vote
+// at most once per STALL_GRACE_SECS/mb/node, bounding gossip during a stall
+// at any committee size. Purely an efficiency guard — receiver-side
+// VOTER_MAX_ROUND already dedupes same/lower-round votes, so duplicate
+// emissions can't affect aggregation. Pruned by cleanup_old_timeout_data.
 pub static LAST_TIMEOUT_EMIT_PER_MB:
     once_cell::sync::Lazy<dashmap::DashMap<u64, u64>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// v23.1: STICKY LEADER PER LEADERSHIP-ROUND VIEW
-// ═══════════════════════════════════════════════════════════════════════════════
-// Once a fallback producer (`timeout_round > 0`) successfully produces a block
-// in leadership_round L, that producer STICKS as the leader for the remainder
-// of L (until the next 30-block rotation boundary at `(L+1) * 30 + 1`). The
-// "primary at round 0" of L is NOT consulted again — it just failed and its
-// failure is the reason a fallback was elected. Returning to it on every
-// subsequent height would force another 5-second stall + 2f+1 vote
-// aggregation per block, halving production rate while the primary remains
-// offline.
-//
-// Why this is the canonical BFT-PoS pattern
-// ─────────────────────────────────────────
-// Stable leader within view is a SAFETY property of every production
-// BFT-PoS protocol family (HotStuff lineage, classical PBFT, Tendermint-
-// style chains). The "view" here is the 30-block leadership_round window.
-// Once 2f+1 honest validators have certified the rotation to a new
-// leader, that leader holds the view until either:
-//   * the view ends naturally at the next leadership_round boundary
-//     (every 30 blocks), OR
-//   * 2f+1 vote again to advance certified_round (current sticky also
-//     failed — escalate to next fallback in the deterministic ordering)
-//
-// Without stickiness, every fallback success is followed by a "thrash"
-// retry of the failed primary on the next height: certified=R,
-// baseline=R → effective=0 → ask for primary → primary still dead →
-// stall → 2f+1 vote → certified=R+1 → fallback. Rinse and repeat,
-// every block, 5 seconds per cycle. Catastrophic for UX while a
-// committee member is offline. Sticky locks the recovered state.
-//
-// Safety
-// ──────
-//   * The sticky entry is ONLY honored when the sticky's locked round
-//     is ≥ current certified round. If certified has advanced beyond
-//     the sticky's round (the sticky producer also failed and 2f+1
-//     re-voted), the cache is INVALIDATED and a fresh selection runs.
-//   * Sticky producer is always the deterministic VRF result of
-//     `select_microblock_producer_with_round(h, ..., certified_round)`
-//     at the moment it was set — every honest node computes the same
-//     identity under the same on-chain state, so all honest nodes lock
-//     to the SAME sticky producer.
-//   * Sticky is per `leadership_round`, so a new 30-block window
-//     naturally starts with a fresh selection (primary at round 0).
-//     The failed primary gets another chance at the next epoch
-//     boundary; if it has recovered, normal production resumes.
-//
-// Scalability
-// ───────────
-//   * O(1) DashMap lookup per slot. Identical cost from 5 to 10 000
-//     super-nodes.
-//   * One entry per leadership_round, capped by the active-mb cleanup
-//     window (typically 3-5 epochs = 9-15 leadership rounds).
-//
-// Retention: pruned by the active-macroblock-window cleanup sweep
-// (`cleanup_old_timeout_data` in unified_p2p.rs) so memory stays flat.
-// ═══════════════════════════════════════════════════════════════════════════════
+// v23.1: sticky leader per leadership-round view. Once a fallback
+// producer (timeout_round>0) produces a block in leadership_round L it
+// STICKS as leader for the rest of L (next 30-block boundary) — not
+// re-consulting the failed primary avoids a per-block 5s-stall + 2f+1
+// thrash. Canonical BFT-PoS "stable leader within view" (view=30-block
+// round); holds until view end OR 2f+1 re-vote (sticky also failed).
+// Safety: sticky honored ONLY if locked_round >= certified_round (else
+// invalidate + fresh select); sticky = deterministic
+// select_microblock_producer_with_round(...) → all honest nodes lock the
+// SAME producer; per leadership_round → new window = fresh selection. O(1).
 pub static STICKY_LEADER_PER_VIEW:
     once_cell::sync::Lazy<dashmap::DashMap<u64, (String, u64)>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
@@ -3146,47 +2697,30 @@ impl BlockchainNode {
         // file-existence check and one log line.
         let _ = crate::genesis_constants::install_genesis_anchors_at_startup();
 
-        // Load or generate persistent Dilithium3 keypair
+        // v27 HOLE1: fail-closed backend self-test before any key use
+        // (incompat → boot refusal, not split).
+        crate::crypto::genesis_key::assert_backend_compatible_or_die();
+
+        // v27 HOLE1: deterministic keypair from mnemonic (wipe-safe, no TOFU);
+        // key_dir kept only as the process-wide cache key.
         let key_dir = std::path::PathBuf::from("/app/data/keys");
         let km = DilithiumKeyManager::new(self.node_id.clone(), &key_dir)
             .map_err(|e| format!("[ERR][NODE] key_manager_init err={}", e))?;
-        let (pk, sk) = km.get_keypair()
+        let (pk, sk) = km.get_keypair_from_mnemonic(wallet_seed)
             .map_err(|e| format!("[ERR][NODE] keypair err={}", e))?;
         let pk_bytes = PkTrait::as_bytes(&pk).to_vec();
         let sk_bytes = SkTrait::as_bytes(&sk).to_vec();
 
-        // ─────────────────────────────────────────────────────────────────
-        // v16.1: STRICT IDENTITY-KEY ANCHOR ENFORCEMENT
-        // ─────────────────────────────────────────────────────────────────
-        // Refuse to start when the local Dilithium3 PK does not match the
-        // chain-anchored PK installed by the operator (`genesis_anchors.json`).
-        //
-        // This closes the v15.x deadlock root cause: a bootstrap node lost
-        // its `dilithium_keypair.bin` between restarts, regenerated a new
-        // random PK, and silently signed with a key that no peer's registry
-        // would accept. All 168+ inbound signatures per peer per hour
-        // failed `pk_mismatch` Tier-1 hard reject in `consensus_crypto.rs`.
-        //
-        // Policy:
-        //   * If anchor exists and matches → proceed, registry is authoritative.
-        //   * If anchor exists and does NOT match → FATAL panic with operator
-        //     guidance. Recovery requires restoring the original keypair file
-        //     from backup, NEVER silently overwriting the anchor.
-        //   * If no anchor for this node_id → proceed (cold-boot path; anchor
-        //     file will be installed on next restart by the operator).
-        //
-        // Safety: panic at startup is the correct industry-standard response
-        // for unrecoverable identity corruption. A node that signs with the
-        // wrong key cannot contribute to consensus and would only consume
-        // pacemaker slots without producing any valid blocks (exact pattern
-        // observed at the v15.x h=781 deadlock).
-        //
-        // Scalability: anchor map is bounded to 5 genesis identities; this
-        // check is O(1) DashMap lookup at process start. Non-genesis super
-        // nodes have no anchor so the gate is skipped — their identity
-        // binding is established via on-chain NodeRegistration TX which is
-        // signature-validated end-to-end.
-        // ─────────────────────────────────────────────────────────────────
+        // Strict identity-key anchor enforcement: refuse to start (FATAL
+        // panic) when the local Dilithium3 PK does not match this node's
+        // chain anchor. Closes the pk_mismatch deadlock root cause — a node
+        // that lost its keypair and regenerated a random PK silently signs
+        // with a key no peer's registry accepts (every inbound sig
+        // Tier-1-rejected; it only burns pacemaker slots, h=781). Anchor
+        // present + match → proceed; mismatch → panic (restore the keypair
+        // from backup, never overwrite the anchor); no anchor → proceed
+        // (non-genesis identity binding is via signed NodeRegistration).
+        // O(1) lookup at startup.
         if let Some(anchor_pk) = qnet_consensus::consensus_crypto::get_consensus_pk_anchor(&self.node_id) {
             if anchor_pk != pk_bytes {
                 // Build a non-secret diagnostic for the operator. Hash both
@@ -3416,16 +2950,10 @@ impl BlockchainNode {
         self.deterministic_reputation.clone()
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // v10.0: SINGLE apply_block_to_state() — used by ALL code paths:
-    //   - Startup replay (TIER 2 incremental, TIER 3 full)
-    //   - Recovery replay (state_root_mismatch fast-forward)
-    //   - Normal block processing (sync from network)
-    //
-    // This eliminates divergence between replay and live processing.
-    // Caller handles: pre-image recording, state_root verification,
-    // rollback, and deferred side effect persistence.
-    // ═══════════════════════════════════════════════════════════════════════
+    // Single apply_block_to_state() for ALL paths (startup replay, recovery
+    // fast-forward, normal sync) → no replay-vs-live divergence. Caller
+    // handles pre-image recording, state_root verify, rollback, deferred
+    // side-effect persistence.
 
     /// Apply a block's transactions to state. This is the SINGLE source of truth
     /// for state mutation ordering. All 7 phases are executed in deterministic order:
@@ -3705,66 +3233,21 @@ impl BlockchainNode {
         Vec::new()
     }
     
-    // ═══════════════════════════════════════════════════════════════════════════
-    // ON-CHAIN SLASHING ANALYSIS v2.38 - CRYPTOGRAPHIC PROOF ONLY
-    // ═══════════════════════════════════════════════════════════════════════════
-    // 
-    // ARCHITECTURE DECISION: Slashing ONLY for cryptographically provable offenses!
-    //
-    // ✅ SLASHABLE (cryptographic proof exists):
-    //    - Double-Sign: 2 valid signatures from same producer on same height
-    //    - Invalid Block: Block fails hash/signature validation
-    //    - Chain Fork: Producer signed conflicting blocks
-    //
-    // ❌ NOT SLASHABLE (cannot prove deterministically):
-    //    - Missed Blocks: Cannot determine "who should have produced" post-facto
-    //      - Block structure has no `original_producer` field
-    //      - Emergency takeover overwrites producer information
-    //      - Network issues may cause false positives
-    //
-    // WHY: Missed blocks are handled via REPUTATION DECAY (gradual decrease for
-    // inactivity) which is fair and doesn't require deterministic proof.
-    //
-    // This matches industry best practices for proof-of-stake slashing.
-    // ═══════════════════════════════════════════════════════════════════════════
+    // Slashing only for cryptographically provable offenses:
+    //   SLASHABLE: double-sign (2 valid sigs, same producer+height),
+    //   invalid block (fails hash/sig), chain fork (conflicting signed blocks).
+    //   NOT SLASHABLE: missed blocks — no deterministic "who should have
+    //   produced" post-facto (no original_producer field, takeover overwrites
+    //   it, false positives from network issues). Handled via reputation decay.
     
-    // ═══════════════════════════════════════════════════════════════════════════
-    // v15.9: STATE RECONCILIATION AFTER ROLLBACK
-    // ───────────────────────────────────────────────────────────────────────────
-    // The rollback path used to delete microblocks from storage but leave the
-    // in-memory `state_manager.accounts` DashMap untouched, so transactions
-    // applied between `rollback_to+1` and the previous chain head remained
-    // mutated in RAM after their on-disk evidence was wiped. New blocks
-    // produced after the rollback were validated against this stale memory
-    // state, and any state-root computation diverged silently from the
-    // canonical chain — a class of fork that is hard to detect because the
-    // node cannot tell whose state is authoritative.
-    //
-    // This helper rebuilds the in-memory state to exactly match the chain
-    // tip at `target_height`. The strategy mirrors the standard top-tier
-    // recovery path: select the freshest snapshot whose height ≤ target,
-    // restore the snapshot accounts, then deterministically replay every
-    // microblock between the snapshot and the target through
-    // `apply_block_to_state` (the same code path used during normal
-    // application). When no snapshot is available the function falls back
-    // to a full replay from genesis.
-    //
-    // SCALABILITY (1 000+ super nodes)
-    // ───────────────────────────────────────────────────────────────────────────
-    // Reconciliation runs only on the rollback path, which is gated by a
-    // 60–300 s adaptive cooldown and only fires on real fork evidence —
-    // operationally rare. Per-call cost is bounded by the snapshot interval
-    // (≤ 3 600 microblocks of replay) when a snapshot is available, which is
-    // a few hundred milliseconds even at 1 M+ accounts. When no snapshot is
-    // available the cost is the full chain length, but in production this
-    // only happens in the first hour of the chain's lifetime.
-    //
-    // RETURN
-    // ───────────────────────────────────────────────────────────────────────────
-    // Returns Ok(()) on a successful reconciliation. On failure the caller
-    // is expected to either retry from a higher rollback target or schedule
-    // a network resync — the node should NOT continue producing blocks
-    // against a state it cannot vouch for.
+    // Rebuild in-memory state to match the chain tip at target_height after a
+    // rollback. Rollback deletes microblocks from storage but leaves the
+    // in-memory accounts DashMap mutated, so post-rollback blocks validate
+    // against stale RAM state → silent state-root fork. Strategy: restore the
+    // freshest snapshot with height ≤ target, then deterministically replay
+    // microblocks up to target via apply_block_to_state (full replay from
+    // genesis if no snapshot). Gated by 60–300 s cooldown, fork-evidence only.
+    // Err → caller must resync; do NOT keep producing on unvouched state.
     async fn reconcile_state_after_rollback(
         state: &Arc<tokio::sync::RwLock<StateManager>>,
         storage: &Arc<Storage>,
@@ -4072,39 +3555,16 @@ impl BlockchainNode {
             EQUIVOCATION_EVIDENCE.remove(&(*eq_height, eq_voter.clone()));
         }
 
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v15.11 L6: BLOCK-EQUIVOCATION SLASHING — drain proof-of-double-production
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Block equivocation = the same producer signed two different microblocks
-        // at the same height. This is strictly more severe than timeout-vote
-        // equivocation because it directly corrupts chain history (a successful
-        // block-equivocation creates a fork in honest validator storage if the
-        // L4 storage guard fails to catch it).
-        //
-        // Policy:
-        //   * Penalty: PENALTY_DOUBLE_SIGN (defined in deterministic_reputation;
-        //     historically the maximum reputation penalty — permanent ban + stake
-        //     forfeiture in PoS-equivalent deployments).
-        //   * Mapped to canonical `SlashingType::DoubleSign` so on-chain consumers
-        //     and downstream reputation logic treat block equivocation with the
-        //     same finality as cryptographic double-signing.
-        //   * Idempotent drain — entries are removed after inclusion so the same
-        //     offence cannot be slashed twice across consecutive macroblocks.
-        //
-        // Evidence integrity:
-        //   * The (hash_a, sig_a) and (hash_b, sig_b) pairs encoded in the
-        //     SlashingEvent allow any verifier to independently re-check both
-        //     Dilithium3 signatures without trusting the reporting node.
-        //   * `evidence_hash` is a SHA3-256 commitment over the full proof so
-        //     re-org / replay attacks cannot duplicate or mutate the offence
-        //     record post-inclusion.
-        //
-        // Scalability:
-        //   * Drain is O(window) per macroblock formation, where window = the
-        //     finite number of detected offences in the last ~5 minutes
-        //     (cleaned up by `cleanup_global_hashmaps`). Bounded regardless of
-        //     committee size or total network size.
-        // ═══════════════════════════════════════════════════════════════════════════
+        // L6 block-equivocation slashing: drain proof of double-production.
+        // Block equivocation = same producer signed two different microblocks
+        // at one height — strictly worse than timeout-vote equivocation (it
+        // forks honest storage if the L4 guard misses it). Penalty =
+        // PENALTY_DOUBLE_SIGN (max; permanent ban + stake forfeiture) mapped
+        // to SlashingType::DoubleSign. Idempotent drain (removed after
+        // inclusion, can't slash twice). Evidence carries both (hash,sig)
+        // pairs so any verifier re-checks Dilithium3 without trusting the
+        // reporter; evidence_hash is a SHA3-256 commitment (no replay/mutate).
+        // O(window) drain, bounded by the ~5-min cleanup sweep.
         let block_equiv_entries: Vec<_> = BLOCK_EQUIVOCATION_EVIDENCE.iter()
             .filter(|e| {
                 let (h, _) = e.key();
@@ -4277,32 +3737,16 @@ impl BlockchainNode {
             .filter(|p| p.reputation >= MIN_REPUTATION)
             .collect();
 
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v6.6 CRITICAL FIX: BREAK CLOSED CONSENSUS LOOP
-        //
-        // Previously: eligible_producers = consensus_participants ONLY
-        //   → consensus_participants come from previous macroblock's eligible_producers
-        //   → which came from THAT round's consensus_participants → CLOSED LOOP
-        //   → New nodes could NEVER enter consensus even after on-chain registration
-        //
-        // Fix: Scan blockchain for confirmed NodeRegistration TXs with Super node_type.
-        // Any registered Super node with reputation >= MIN_REPUTATION gets added to
-        // the eligible set. This is deterministic — all nodes read the same blockchain.
-        //
-        // v9.3: TWO-LEVEL RE-ENTRY for nodes not in current BFT committers:
-        //
-        // LEVEL 1: Recent registration scan (grace period for NEW nodes).
-        //   Scan last 3 epochs for NodeRegistration TXs. New nodes get a window
-        //   to join BFT consensus before their registration ages out.
-        //
-        // LEVEL 2: Carry-over from recent macroblocks (re-entry for RETURNING nodes).
-        //   If a node was in eligible_producers of ANY of the last 3 macroblocks,
-        //   keep it — it was recently active and may have just missed one BFT round.
-        //   This is fully deterministic: all nodes read the same macroblocks.
-        //
-        // Without Level 2, a genesis node offline for >3 epochs is permanently
-        // locked out (registration at block 0 is outside scan window).
-        // ═══════════════════════════════════════════════════════════════════════════
+        // Break the closed consensus loop. eligible_producers =
+        // consensus_participants ONLY was self-referential (participants came
+        // from the prev macroblock's eligible from that round's participants)
+        // → new nodes could never enter even after on-chain registration. Fix:
+        // scan the chain for confirmed Super NodeRegistration TXs (rep ≥
+        // MIN_REPUTATION; deterministic — same chain on all nodes). Two-level
+        // re-entry: L1 recent-registration scan (grace for NEW nodes), L2
+        // carry-over for nodes in any of the last 3 macroblocks' eligible
+        // sets (RETURNING nodes). Without L2 a genesis node offline >3 epochs
+        // is locked out (block-0 registration is outside the scan window).
         {
             let existing_ids: std::collections::HashSet<String> = eligible.iter()
                 .map(|p| p.node_id.clone())
@@ -4407,25 +3851,13 @@ impl BlockchainNode {
             // are carried over ONLY IF they also participated in at least one of
             // those macroblocks' BFT rounds (signed commits on-chain).
             //
-            // ═══════════════════════════════════════════════════════════════════
-            // v14.2: LIVENESS-GATED CARRYOVER
-            // ═══════════════════════════════════════════════════════════════════
-            // Previous behaviour: any node that appeared in any of the last 3 macroblock
-            // eligible_producers lists was re-added WITHOUT any activity check. A dead
-            // node would stay in carryover for 3 epochs, then get re-added if its last
-            // macroblock still listed it, and so on indefinitely — phantom accumulation.
-            //
-            // New rule: a node is carried over ONLY IF it has an on-chain commit in at
-            // least one of the last CARRYOVER_LOOKBACK macroblocks (consensus_data.commits
-            // HashMap). Commits are cryptographically signed → cannot be forged →
-            // a dead node cannot produce them → it auto-expires after the lookback window.
-            //
-            // Determinism: commits HashMaps are stored in the macroblocks on disk. All
-            // nodes read identical data → identical liveness filter output. No divergence.
-            //
-            // Scalability: O(peers × lookback) = O(1000 × 3) = 3000 HashMap reads per
-            // snapshot build. Negligible at snapshot creation (once per 90 blocks).
-            // ═══════════════════════════════════════════════════════════════════
+            // Liveness-gated carryover: a node is carried over ONLY IF it has
+            // an on-chain commit in ≥1 of the last CARRYOVER_LOOKBACK
+            // macroblocks. Without this, any node in a recent eligible list
+            // was re-added with no activity check → phantom accumulation.
+            // Commits are signed (unforgeable) so a dead node auto-expires
+            // after the window. Deterministic (commits on disk, identical
+            // across nodes). O(peers × lookback).
             const CARRYOVER_LOOKBACK: u64 = 3;
             let carryover_start = macroblock_index.saturating_sub(CARRYOVER_LOOKBACK);
             let updated_existing_ids: std::collections::HashSet<String> = eligible.iter()
@@ -8439,28 +7871,12 @@ impl BlockchainNode {
         // PRODUCTION v2.50: Set global mempool using OnceCell (lock-free)
         init_global_mempool(mempool.clone());
 
-        // ════════════════════════════════════════════════════════════════════
-        // v15.9: PERSISTENT MEMPOOL — install storage hooks
-        // ────────────────────────────────────────────────────────────────────
-        // The mempool is RAM-resident for throughput, but every admission
-        // and removal is mirrored into the `mempool` RocksDB column family
-        // through these callbacks. On a clean restart the integration
-        // layer scans that CF and replays each entry through
-        // `add_binary_transaction`, restoring the exact pre-crash queue —
-        // user submissions and MEV bundles survive a producer restart.
-        //
-        // The `Arc<dyn Fn>` indirection keeps the mempool crate
-        // dependency-free (no link to storage / rocksdb) and lets tests
-        // construct a mempool without persistence by leaving the hooks
-        // unset.
-        //
-        // SCALABILITY (1 000+ super nodes)
-        // ────────────────────────────────────────────────────────────────────
-        // Per-call cost is one RocksDB `put_cf` / `delete_cf` on the hot
-        // mempool CF — microseconds even at sustained 10 000 TPS. Boot-time
-        // restore reads up to 500 000 entries in a single sequential scan
-        // (~hundreds of ms), wrapped in spawn_blocking below to keep the
-        // tokio reactor free during startup.
+        // Persistent mempool — install storage hooks. Every admit/remove is
+        // mirrored to the `mempool` CF via these callbacks; a clean restart
+        // replays the CF through add_binary_transaction, restoring the exact
+        // pre-crash queue. Arc<dyn Fn> keeps the mempool crate storage-free
+        // (tests leave the hooks unset). One put_cf/delete_cf per call; boot
+        // restore (≤500k entries) runs in spawn_blocking.
         {
             let storage_admit = storage.clone();
             let storage_remove = storage.clone();
@@ -10018,39 +9434,16 @@ impl BlockchainNode {
             }
         });
         
-        // PRODUCTION v2.19.22: Start QUIC message handler
-        // Routes ALL QUIC messages through handle_message() for full processing
-        //
-        // ═══════════════════════════════════════════════════════════════════
-        // v25 H8b: PER-MESSAGE CPU OFFLOAD FOR CRYPTO-HEAVY HANDLERS
-        // ───────────────────────────────────────────────────────────────────
-        // The legacy loop drained the QUIC ingress channel on a SINGLE tokio
-        // task and dispatched every message synchronously. For most messages
-        // (peer-bookkeeping, sync requests, etc.) that is fine — they cost
-        // microseconds. But for messages whose handler does a Dilithium3
-        // signature verify (ConsensusCommit / ConsensusReveal / TimeoutVote
-        // / TimeoutCertificateBroadcast / TimeoutAggregateCertificate /
-        // ProducerHeartbeat / VrfLeaderClaim) the per-message cost is
-        // 1–2 ms on commodity hardware. At a 1000-validator committee a
-        // commit-reveal cycle bursts 2f+1 = 667 commits + 667 reveals back
-        // to back; serialized that is ≥ 2 seconds of receive-loop block,
-        // and during that interval the same task can't drain Block /
-        // BlockChunk messages from the same channel — bandwidth-hungry
-        // shred chunks queue up and the macroblock window deadline drifts.
-        //
-        // Targeted fix: route only the crypto-heavy message types through
-        // `tokio::task::spawn_blocking`. The blocking pool (default ≈ 512
-        // threads) executes the verify off the runtime cores; multiple
-        // verifies run truly in parallel; the receive-loop returns to the
-        // channel within microseconds. Ordering inside each heavy handler
-        // is irrelevant — they are all keyed-idempotent
-        // (`(round_id, node_id)`, `(height, round, voter_id)`, etc.) so
-        // out-of-order execution between concurrent spawned verifies is
-        // safe by construction.
-        //
-        // Cheap messages keep the synchronous path: spawning a blocking
-        // task for them would be pure overhead.
-        // ═══════════════════════════════════════════════════════════════════
+        // Start QUIC message handler. Per-message CPU offload for crypto-
+        // heavy handlers: the legacy single-task loop dispatched every
+        // message synchronously, but a Dilithium3-verify handler
+        // (ConsensusCommit/Reveal, TimeoutVote, TC broadcast/aggregate,
+        // ProducerHeartbeat, VrfLeaderClaim) costs 1-2 ms — a 1000-validator
+        // commit-reveal burst of 667+667 serialized ≥2 s, starving Block/
+        // BlockChunk drain and drifting the macroblock deadline. So route
+        // only the crypto-heavy types through spawn_blocking (parallel
+        // off-core verify, loop returns in µs); they are keyed-idempotent so
+        // out-of-order is safe. Cheap messages keep the synchronous path.
         let blockchain_for_quic = blockchain.clone();
         tokio::spawn(async move {
             while let Some((from_peer, message)) = quic_message_rx.recv().await {
@@ -14346,15 +13739,11 @@ impl BlockchainNode {
         // writes `genesis_anchors.json` and restarts the cluster — anchors
         // are then permanent for the lifetime of the network.
         //
-        // Scalability: O(file_read + 5 entries). Negligible at any cluster
-        // size. After install, every subsequent registration check is O(1)
-        // DashMap lookup against a fixed-size 5-entry map.
+        // v27 HOLE1: identity = binary-embedded GENESIS_CONSENSUS_PKS;
+        // install unconditional + fail-closed (never returns 0). O(1).
         let anchors_installed = crate::genesis_constants::install_genesis_anchors_at_startup();
-        if anchors_installed == 0 {
-            println!(
-                "[INFO][GENESIS] anchors_pending path={} hint=collect_pk_hash_from_each_node_then_write_json",
-                crate::genesis_constants::GENESIS_ANCHORS_PATH
-            );
+        if crate::node::is_info() {
+            println!("[INFO][GENESIS] anchors_pinned count={} src=embedded", anchors_installed);
         }
 
         *self.is_running.write().await = true;
@@ -14512,47 +13901,18 @@ impl BlockchainNode {
 
                     let stuck_for = last_progress_at.elapsed().as_secs();
                     if stuck_for >= WATCHDOG_STUCK_SECS {
-                        // ═══════════════════════════════════════════════════════════════
-                        // v15.15: NO process::exit on chain_stuck.
-                        //
-                        // Rationale:
-                        //   The previous policy hard-killed the process via
-                        //   std::process::exit(2) on every stuck-window. On a
-                        //   bootstrapping network (genesis cold-start) every
-                        //   node sits at h=0 until the first producer broadcasts
-                        //   microblocks — a window that legitimately exceeds
-                        //   WATCHDOG_STUCK_SECS while peer discovery, P2P
-                        //   handshake, NTP convergence, and committee election
-                        //   complete. The watchdog interpreted this normal
-                        //   bootstrap as a fault and killed the process. Docker's
-                        //   --restart=always then revived the container, but
-                        //   in-memory consensus state (active commit-reveal
-                        //   round, partial commits, pending TimeoutVotes) was
-                        //   lost on every cycle. This produced a deterministic
-                        //   permanent halt: no node ever survived long enough
-                        //   to gather 2f+1 commits for the first macroblock.
-                        //
-                        //   Top-tier BFT chains never hard-kill the consensus
-                        //   process on a stuck-chain heuristic. They alert,
-                        //   escalate via metrics, and let the operator (or the
-                        //   sync layer) take corrective action while consensus
-                        //   state remains intact. We follow that pattern here.
-                        //
-                        // Replacement policy:
-                        //   * Throttled [CRIT] alert (one per stuck-window)
-                        //   * Reset stuck-timer so the alert does not re-fire
-                        //     every tick after the threshold is crossed
-                        //   * Existing block_pipeline / sync coordinator already
-                        //     poll for catch-up — they make progress on their
-                        //     own; the watchdog's job is observability, not
-                        //     forced restart.
-                        //
-                        // Scalability: at 1000 super-nodes each watchdog runs
-                        // independently. With one [CRIT] per stuck-window the
-                        // log volume is bounded; alert-management tooling
-                        // operates per-node. No global state, no cross-node
-                        // coordination, no network traffic.
-                        // ═══════════════════════════════════════════════════════════════
+                        // No process::exit on chain_stuck. The old policy
+                        // hard-killed via exit(2) every stuck-window; on
+                        // genesis cold-start every node legitimately sits at
+                        // h=0 past WATCHDOG_STUCK_SECS (peer discovery,
+                        // handshake, NTP, committee election), so the watchdog
+                        // killed the process, Docker restarted it, and in-
+                        // memory consensus state was lost every cycle →
+                        // deterministic permanent halt (no node survived to
+                        // gather 2f+1 for the first macroblock). Instead: a
+                        // throttled [CRIT] alert (one per window) + stuck-timer
+                        // reset; the pipeline/sync coordinator drives catch-up.
+                        // Observability, not forced restart.
                         let should_alert = last_alert_at
                             .map(|t| t.elapsed().as_secs() >= WATCHDOG_ALERT_REPEAT_SECS)
                             .unwrap_or(true);
@@ -15374,28 +14734,16 @@ impl BlockchainNode {
                                             // CRITICAL FIX v2.81: Clone tx_bytes for broadcast BEFORE adding to mempool
                                             let tx_bytes_for_broadcast = tx_bytes.clone();
 
-                                            // ═══════════════════════════════════════════════════════════════════
-                                            // v15.5: RETRY MEMPOOL CLEANUP — eliminates duplicated commitment TXs
-                                            // landing in the same block.
-                                            //
-                                            // Without this cleanup, every retry created a NEW TX (different hash
-                                            // due to changed timestamp) but left the previous attempts in the
-                                            // local mempool. When the next producer pulled from mempool, both
-                                            // the original AND the retry were included in the same block. The
-                                            // state-level `check_duplicate_commitment` rejected the second
-                                            // application, but the rejected TX still consumed block space and
-                                            // bandwidth, and surfaced as visible duplicates in the explorer
-                                            // (observed at h=29731: 4 nodes × 2 HBC TXs each).
-                                            //
-                                            // Confirmation-tracker semantics are preserved: `all_tx_hashes`
-                                            // continues to record every attempt for confirmation matching.
-                                            // The cleanup affects only the LOCAL mempool — TXs already
-                                            // included in blocks (chain history) are not impacted.
-                                            //
-                                            // Idempotent and cheap: no-op on the very first send (tracker
-                                            // empty); O(retry_count) on a retry, with retry_count ≤ MAX_RETRIES
-                                            // (3). Safe at thousands-of-nodes scale.
-                                            // ═══════════════════════════════════════════════════════════════════
+                                            // Retry mempool cleanup: each retry makes a NEW
+                                            // TX (changed timestamp → new hash) but left
+                                            // prior attempts in the local mempool, so the
+                                            // next producer pulled both into one block
+                                            // (state check_duplicate_commitment rejected the
+                                            // second, but the bytes still cost space/bandwidth
+                                            // and showed as explorer dups — h=29731). Affects
+                                            // only the local mempool; all_tx_hashes still
+                                            // records every attempt for confirmation.
+                                            // Idempotent, O(retry_count ≤ 3).
                                             let stale_hashes: Vec<String> = heartbeat_tracker
                                                 .get(&current_epoch)
                                                 .map(|e| e.all_tx_hashes.clone())
@@ -17029,34 +16377,16 @@ impl BlockchainNode {
                     std::process::exit(1);
                 }
 
-                // ═══════════════════════════════════════════════════════════════════
-                // v24: ADAPTIVE_RATE THROTTLE REMOVED — produce at full slot cadence
-                // ═══════════════════════════════════════════════════════════════════
-                // The v15.11 self-pause-when-ahead heuristic was empirically harmful.
-                // Forensic case h=2791 (v23.1 deploy): producer consistently 18-30
-                // blocks ahead of slowest peer triggered `pause_ms=100` on every
-                // single slot, producing 1.107 s real cadence instead of the 1 s
-                // consensus target. The "slowest peer" was always behind because
-                // its apply pipeline was naturally slower (host I/O scheduling +
-                // RocksDB compaction); waiting for it merely meant the chain
-                // moved at the slowest host's speed — a guaranteed liveness
-                // degradation that gets WORSE at scale (1000 validators → one
-                // slow host pins the entire network).
-                //
-                // The original premise — that producer "running ahead" causes
-                // network-wide stalls — was inverted: in reality the chain
-                // stalls when producer slows DOWN. Catch-up is handled by the
-                // existing sync subsystem (block_pipeline + SyncManager
-                // pipelined window + Reed-Solomon 1.5× redundancy + multi-hop
-                // chunk forwarding), not by the producer's own self-throttle.
-                //
-                // Top-L1 canonical behaviour: producer runs at the fixed
-                // consensus slot interval. Slow peers self-recover via the
-                // independent sync path. Permanently slow peers either catch
-                // up via background sync, get ejected (v24 H9 validator
-                // ejection — separate fix), or fall out of the active
-                // committee at the next epoch boundary.
-                // ═══════════════════════════════════════════════════════════════════
+                // Adaptive-rate throttle removed — produce at full slot
+                // cadence. The self-pause-when-ahead heuristic was harmful
+                // (forensic h=2791: producer 18-30 blocks ahead paused 100ms
+                // every slot → 1.107s cadence vs 1s target). Waiting for the
+                // slowest peer meant the chain moved at the slowest host's
+                // speed — worse at scale (one slow host pins 1000 validators).
+                // The premise was inverted: the chain stalls when the producer
+                // slows DOWN; catch-up is the sync subsystem's job, not the
+                // producer's. Slow peers self-recover via sync or fall out at
+                // the epoch boundary.
 
                 // ═══════════════════════════════════════════════════════════════════
                 // SLOT-BASED TIMING v2.42: Wait based on UNIX timestamp (not Instant!)
@@ -17757,28 +17087,14 @@ impl BlockchainNode {
                         last_production_time = std::time::Instant::now();
                     }
                     
-                    // ═══════════════════════════════════════════════════════════════════════════
-                    // v3.13: BLOCK-TIMESTAMP BASED DETERMINISTIC FAILOVER
-                    // ═══════════════════════════════════════════════════════════════════════════
-                    // KEY PRINCIPLE: Use PREVIOUS BLOCK TIMESTAMP, not genesis_ts + height!
-                    //
-                    // WHY THIS IS CORRECT:
-                    //   - prev_block.timestamp is IDENTICAL on all synchronized nodes
-                    //   - delay = current_time - (prev_block_ts + 1) is small (0-10 sec normally)
-                    //   - NTP drift (±2 sec) < grace period (5 sec) → SAME timeout_round!
-                    //
-                    // WHY genesis_ts + height WAS WRONG:
-                    //   - It accumulated ALL previous delays (could be 85+ seconds!)
-                    //   - NTP drift of 2 sec in 85 sec delay → different timeout_round!
-                    //   - Example: delay=85 → round=16, delay=87 → round=16 (OK)
-                    //             but delay=89 → round=17 (DIFFERENT!) → FORK!
-                    //
-                    // NEW APPROACH:
-                    //   - delay = current_time - prev_block.timestamp - 1
-                    //   - Normal: delay ≈ 0-2 sec → timeout_round = 0
-                    //   - Stall: delay > 5 sec → timeout_round = 1, 2, 3...
-                    //   - NTP drift (±2 sec) cannot cause round difference!
-                    // ═══════════════════════════════════════════════════════════════════════════
+                    // Block-timestamp-based deterministic failover. Use the
+                    // PREVIOUS block timestamp, not genesis_ts+height:
+                    // prev_block.timestamp is identical on all synced nodes and
+                    // delay = now - (prev_ts+1) is small (0-10s), so ±2s NTP
+                    // drift < 5s grace → same timeout_round on every node.
+                    // genesis_ts+height accumulated all prior delays (85s+), so
+                    // ±2s drift flipped the round across nodes → fork. delay>5s
+                    // → timeout_round 1,2,3…
                     let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
                     let next_height = microblock_height + 1;
                     let current_time = get_timestamp_safe();
@@ -17868,38 +17184,18 @@ impl BlockchainNode {
                             local_delay
                         };
 
-                        // ═══════════════════════════════════════════════════════════════
-                        // v23: BFT-CERTIFIED ROTATION INVARIANT (microblock layer)
-                        // ═══════════════════════════════════════════════════════════════
-                        // Microblock leader rotation is driven STRICTLY by the
-                        // 2f+1 BFT-certified rotation round
-                        // (HIGHEST_CERTIFIED_ROUND[mb_idx]). The adopted (f+1)
-                        // round is computed for telemetry/observability only
-                        // and is NEVER consumed by leader selection — only the
-                        // supermajority guarantee is safe for producer-selection
-                        // state advancement.
-                        //
-                        // Forensic for the rule (h=556, 2026-04-30):
-                        //   The pre-v15.13 logic `rotation = certified.max(adopted)`
-                        //   could elevate rotation via `adopted` (f+1), which is
-                        //   built from local TimeoutVote view and divergent under
-                        //   partial gossip. Different `adopted` → different
-                        //   leader → split-brain at one height. Industry-standard
-                        //   BFT chains require 2f+1 supermajority before any
-                        //   leader-rotation state mutates; v15.13 aligned, v22
-                        //   broke it by injecting a clock-derived bypass, v23
-                        //   restores it as the SOLE rotation source.
-                        //
-                        // Why v22 was wrong (h=4742 split-brain, 2026-05-11):
-                        //   The previous design replaced 2f+1 BFT timeout votes
-                        //   with `empty_slot_offset = (local_now - last_block_ts) / 3`,
-                        //   then injected the offset into VRF seed. Under any NTP
-                        //   drift > 1 second the offset diverged across nodes,
-                        //   electing different "fallback" producers at one height
-                        //   → two valid signed blocks → fork. v23 makes this
-                        //   structurally impossible by removing clock from the
-                        //   leader-selection input set entirely.
-                        // ═══════════════════════════════════════════════════════════════
+                        // BFT-certified rotation invariant (microblock layer).
+                        // Leader rotation is driven STRICTLY by the 2f+1
+                        // HIGHEST_CERTIFIED_ROUND; the f+1 adopted round is
+                        // telemetry-only and NEVER feeds leader selection —
+                        // only a supermajority is safe for rotation-state
+                        // advancement. Forensic: pre-v15.13 `certified.max(
+                        // adopted)` elevated rotation via the divergent f+1
+                        // adopted → split-brain (h=556); v22 then injected a
+                        // clock-derived bypass (empty_slot_offset from local_now;
+                        // NTP drift >1s → different fallback producer → fork
+                        // h=4742). v23 removes the clock from leader-selection
+                        // inputs entirely, making it structurally impossible.
 
                         // v23.1: ROTATION-ROUND TELEMETRY — strict 2f+1 BFT-certified
                         // rotation round for the current macroblock (no f+1 adopted),
@@ -17912,141 +17208,29 @@ impl BlockchainNode {
                         };
                         update_failover_metrics(local_delay, current_rotation_round);
 
-                        // ═══════════════════════════════════════════════════════════════
-                        // v23: SIGNED TIMEOUT-VOTE EMISSION ON MICROBLOCK STALL
-                        // ═══════════════════════════════════════════════════════════════
-                        // When this node observes the slot-leader silent for longer
-                        // than the grace period (`local_delay > STALL_GRACE_SECS`),
-                        // it emits a Dilithium3-signed TimeoutVote for the current
-                        // macroblock at round = `certified + 1`. After 2f+1 honest
-                        // nodes co-sign at the same proposed round, the receiver-
-                        // side aggregator advances `HIGHEST_CERTIFIED_ROUND[mb_idx]`
-                        // — and the producer loop on every honest node then computes
-                        // the SAME fallback leader (pure function of new round +
-                        // on-chain candidate set).
-                        //
-                        // Throttling
-                        // ──────────
-                        // Re-emission is gated by `LAST_TIMEOUT_EMIT_PER_MB`
-                        // (DashMap<mb_idx, last_emit_unix_secs>). At most one
-                        // emission per `STALL_GRACE_SECS` per macroblock per node.
-                        // Receiver-side `VOTER_MAX_ROUND` further dedupes votes from
-                        // the same voter at the same or lower round — so even
-                        // duplicated emissions over a slow gossip window do not
-                        // affect aggregation correctness.
-                        //
-                        // Safety
-                        // ──────
-                        //   * Vote is Dilithium3-signed by this node's consensus key.
-                        //     Receivers verify against the on-chain PK registry
-                        //     before considering the signature for aggregation.
-                        //   * Byzantine voters with ≤ f keys cannot reach the 2f+1
-                        //     threshold required to advance HIGHEST_CERTIFIED_ROUND,
-                        //     so rotation cannot be hijacked by minority attackers.
-                        //
-                        // Liveness
-                        // ────────
-                        //   * Bounded failover latency: STALL_GRACE_SECS (grace) +
-                        //     O(log N) RTT for 2f+1 gossip aggregation ≈ 3–5 s for
-                        //     N=5, 3–8 s for N=1000 (committee-bounded).
-                        //   * Far below the macroblock-boundary view-change cycle
-                        //     (~90 s), giving mid-window rotation as required by
-                        //     the canonical L1 pattern.
-                        //
-                        // Scalability
-                        // ───────────
-                        //   * O(1) DashMap throttle read + one signature emission
-                        //     per stalled mb per node. Receiver-side aggregator is
-                        //     O(votes_received), bounded by committee size.
-                        // ═══════════════════════════════════════════════════════════════
+                        // v23: on slot-leader silent > grace (local_delay > STALL_GRACE_SECS)
+                        // emit a Dilithium3-signed TimeoutVote for the current macroblock at
+                        // round=certified+1. After 2f+1 co-sign the same round the receiver
+                        // aggregator advances HIGHEST_CERTIFIED_ROUND[mb_idx] → every honest node
+                        // computes the SAME fallback leader (pure fn of round + on-chain
+                        // candidates). Throttle LAST_TIMEOUT_EMIT_PER_MB (<=1/grace/mb/node);
+                        // receiver VOTER_MAX_ROUND dedupes same-voter same/lower round. Safety:
+                        // receiver verifies sig vs on-chain PK registry; <=f byzantine can't
+                        // reach 2f+1 (rotation not hijackable). Failover ≈ grace + O(log N) RTT
+                        // (3–8s) « 90s view-change. O(1).
                         const STALL_GRACE_SECS: u64 = 5;
 
-                        // ═══════════════════════════════════════════════════════════════
-                        // v23.2: HEARTBEAT-GATED TIMEOUT-VOTE EMISSION
-                        // ═══════════════════════════════════════════════════════════════
-                        // The pre-v23.2 emit-gate triggered SOLELY on `local_delay`
-                        // (wall-clock elapsed since last block). That created a
-                        // self-perpetuating rotation cascade at macroblock boundaries:
-                        //
-                        //   1. block h=H+1 not produced within STALL_GRACE_SECS
-                        //   2. local_delay > 5s on every node → all 5 emit
-                        //   3. 2f+1 votes propagate → HIGHEST_CERTIFIED_ROUND advances
-                        //   4. producer-loop re-derives expected leader at new round
-                        //   5. gossip lag means each node sees a slightly different cert
-                        //      → each node computes a DIFFERENT expected leader at the
-                        //      same wall clock instant
-                        //   6. no node thinks it is its own turn → no production
-                        //   7. 5 s later local_delay still grows → emit again → loop
-                        //
-                        // Observed live at h=2791 (mb=31 boundary) with HIGHEST_CERTIFIED_
-                        // ROUND[31] reaching 783 in ~2 hours of stall, while the
-                        // expected producer was actually broadcasting valid signed
-                        // heartbeats every second.
-                        //
-                        // Architecture
-                        // ────────────
-                        // Producer broadcasts a Dilithium3-signed `ProducerHeartbeat`
-                        // once per second while it is the elected leader. Peers
-                        // verify the signature against the on-chain PK registry and
-                        // record the local wall-clock receive time in
-                        // `REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS`. The helper
-                        // `last_remote_producer_heartbeat_age_ms(producer_id)`
-                        // returns the elapsed ms since the most recent signed
-                        // heartbeat from `producer_id`.
-                        //
-                        // The new pre-emit gate: read the expected producer for the
-                        // stalled height from the local cache (populated each
-                        // iteration of the producer loop). If that producer's most
-                        // recent heartbeat is FRESH (age ≤ HEARTBEAT_SILENT_MS),
-                        // skip the timeout-vote emission entirely — the leader is
-                        // cryptographically proven alive, just slow this slot.
-                        // Rotation should NOT churn merely because one block
-                        // landed a few seconds late.
-                        //
-                        // Edge cases:
-                        //   * Expected producer == this node (self):
-                        //     never vote against self. Other nodes' stall detectors
-                        //     will rotate us out if we are actually broken; voting
-                        //     against ourselves is semantically meaningless and
-                        //     wastes bandwidth.
-                        //   * No expected producer cached yet:
-                        //     defensive — proceed to emit. This only happens during
-                        //     bootstrap before the producer loop has populated its
-                        //     cache for the first time.
-                        //   * Heartbeat never observed for that producer:
-                        //     treat as silent → emit. Either the producer never came
-                        //     online or we have not yet received its first heartbeat.
-                        //
-                        // Safety
-                        // ──────
-                        //   * Heartbeat is Dilithium3-signed by the registered
-                        //     consensus key for `producer_id`. Receivers verify
-                        //     signature before storing the receive time, so a
-                        //     Byzantine peer cannot forge a fresh heartbeat for
-                        //     another identity.
-                        //   * A Byzantine producer can sign heartbeats while
-                        //     refusing to produce blocks. In that case the gate
-                        //     SUPPRESSES emission and the chain stalls — but only
-                        //     until the macroblock-boundary view-change fires
-                        //     (≤ 90 s), at which point 2f+1 macroblock-finalize
-                        //     timeout votes route around the Byzantine producer.
-                        //     This is an acceptable trade — bounded liveness loss
-                        //     vs unbounded runaway rotation under partial sync.
-                        //   * Heartbeat freshness is per-receiver wall clock,
-                        //     unforgeable by gossip lag. NTP drift between
-                        //     receivers affects timing within ±2s but does not
-                        //     create cross-node divergence in the gate decision
-                        //     (each receiver judges independently).
-                        //
-                        // Scalability
-                        // ───────────
-                        //   * Heartbeat broadcast: 1 msg/sec from current elected
-                        //     leader only — independent of validator count.
-                        //   * Receive path: one DashMap insert + Dilithium3
-                        //     signature verify (≈ 35 µs) per heartbeat per receiver.
-                        //   * Gate decision: one O(1) DashMap read.
-                        //   * Identical cost from 5 to 100 000 super-nodes.
-                        // ═══════════════════════════════════════════════════════════════
+                        // v23.2: heartbeat-gated timeout-vote emission. Pre-v23.2 the gate fired
+                        // solely on local_delay → self-perpetuating rotation cascade at macroblock
+                        // boundaries (gossip-lagged certs → nodes compute different leaders → none
+                        // produces → loop; observed h=2791). Fix: elected leader broadcasts a
+                        // Dilithium3-signed ProducerHeartbeat 1/s; if the expected producer's
+                        // heartbeat is FRESH (age ≤ HEARTBEAT_SILENT_MS) skip emission — proven
+                        // alive, just slow. Edge: self → never vote vs self; no cached/never-seen
+                        // producer → emit. Safety: heartbeat sig-verified (no forge); a Byzantine
+                        // producer signing-but-not-producing only stalls until the ≤90s macroblock
+                        // view-change routes around it (bounded liveness loss, accepted). O(1),
+                        // 1 msg/s from leader only, identical 5→100k.
                         const HEARTBEAT_SILENT_MS: u64 = 3_000;
 
                         if local_delay > STALL_GRACE_SECS && production_unlocked {
@@ -18145,38 +17329,18 @@ impl BlockchainNode {
                                         );
                                     }
 
-                                    // ═══════════════════════════════════════════════════════
-                                    // v25 H9/H16: VALIDATOR LIVENESS — MISS PATH
-                                    // ───────────────────────────────────────────────────────
-                                    // We emit a primary-silent timeout vote at most once per
-                                    // STALL_GRACE_SECS per macroblock (debounced by
-                                    // `LAST_TIMEOUT_EMIT_PER_MB` above). Record this as a
-                                    // single miss against the expected producer.
-                                    //
-                                    // The underlying `record_validator_miss` is itself
-                                    // idempotent on `(validator_id, expected_height)` — repeat
-                                    // calls for the same height are coalesced to one logical
-                                    // miss. This double-layer of debouncing keeps the counter
-                                    // free of pathological double-counts even if the emit
-                                    // gate fires twice in adjacent ticks due to clock skew.
-                                    //
-                                    // SELF-EJECT GUARD: the heartbeat-staleness filter inside
-                                    // `record_validator_miss` only consults the REMOTE producer
-                                    // heartbeat map (it is populated exclusively from received
-                                    // `ProducerHeartbeat` messages). The local node never
-                                    // appears there even when emitting heartbeats normally,
-                                    // so without an explicit `expected_id != &node_id` check
-                                    // a miss could be recorded against ourselves in any edge
-                                    // path where our own id is cached as the expected producer
-                                    // for a stalled slot. Skip recording in that case — a
-                                    // node grading its own liveness would self-eject during
-                                    // the very stall its own emit is trying to resolve.
-                                    //
-                                    // Strictly observation-only when
-                                    // `QNET_LIVENESS_EJECTION` is unset — the counter still
-                                    // accumulates so operators can grade validators offline,
-                                    // but ejection state is never mutated. Safe at thousands
-                                    // of validators (O(1) DashMap update per call).
+                                    // Validator liveness — miss path. Emit a
+                                    // primary-silent timeout vote at most once per
+                                    // STALL_GRACE_SECS/mb (debounced) and record one miss
+                                    // against the expected producer (record_validator_miss
+                                    // is itself idempotent on (validator_id, height)).
+                                    // SELF-EJECT GUARD: its staleness filter only consults
+                                    // the REMOTE heartbeat map (the local node never
+                                    // appears there), so without an explicit
+                                    // expected_id != node_id check a node could record a
+                                    // miss against itself and self-eject during its own
+                                    // stall. Observation-only unless QNET_LIVENESS_EJECTION
+                                    // is set. O(1)/call.
                                     // ═══════════════════════════════════════════════════════
                                     if let Some(ref expected_id) = expected_producer {
                                         if !expected_id.is_empty() && expected_id != &node_id {
@@ -18734,36 +17898,16 @@ impl BlockchainNode {
                                 tokio::spawn(async move {
                                     let _guard = FastSyncGuard;
 
-                                    // ═══════════════════════════════════════════════════════════════════
-                                    // v15.8: SNAPSHOT FAST-PATH IN RUNTIME SYNC LOOP
-                                    // ═══════════════════════════════════════════════════════════════════
-                                    // The startup bootstrap path at the node-init site already calls
-                                    // `fast_sync_with_snapshot`, but a node may enter the runtime sync
-                                    // loop directly without passing through that code (e.g. fresh
-                                    // container with chain_height=0 starting after the network has
-                                    // long-published snapshots). Without this fallback the runtime
-                                    // loop walks the chain block-by-block from genesis at MB-SYNC
-                                    // throughput — observably ~10-15 minutes per 10k blocks of catch-up.
-                                    //
-                                    // Strategy: when the gap is large enough that snapshot replay is
-                                    // strictly faster than block replay, query peers for a snapshot
-                                    // and load it in one chunked parallel download (existing
-                                    // infrastructure in `download_snapshot_chunked`). On any failure
-                                    // — no peers have a snapshot, chunk verification fails, IPFS
-                                    // unavailable — `fast_sync_with_snapshot` returns Err and we
-                                    // fall through to the regular block-by-block path unchanged.
-                                    //
-                                    // Threshold chosen as 5 000 blocks (~83 min worth at 1/sec) to
-                                    // ensure the snapshot download cost amortises against block
-                                    // replay; below that the block path is comparable in time and
-                                    // simpler.
-                                    //
-                                    // Scalability: zero overhead for nodes already at tip (gap < 5k
-                                    // skips this branch entirely). For catch-up nodes the snapshot
-                                    // download is bounded by `download_snapshot_chunked` which fans
-                                    // out 4 MB chunks across multiple peers in parallel and is the
-                                    // canonical fast-path on this codebase.
-                                    // ═══════════════════════════════════════════════════════════════════
+                                    // Snapshot fast-path in the runtime sync loop. A node
+                                    // can enter this loop without the startup bootstrap
+                                    // (fresh container, chain_height=0, network already
+                                    // has snapshots) and would otherwise walk block-by-
+                                    // block (~10-15 min / 10k blocks). When the gap makes
+                                    // snapshot replay faster, query peers and chunked-
+                                    // parallel-download a snapshot; on any failure fall
+                                    // through to block-by-block unchanged. Threshold
+                                    // 5000 blocks (~83 min) so the download amortises;
+                                    // zero overhead for nodes already at tip.
                                     const RUNTIME_SNAPSHOT_GAP_THRESHOLD: u64 = 5_000;
                                     if sync_from_height == 0 || height_difference > RUNTIME_SNAPSHOT_GAP_THRESHOLD {
                                         if is_info() {
@@ -19030,53 +18174,12 @@ impl BlockchainNode {
                     println!("[DBG][NODE] active_node_count={}", active_node_count);
                 }
                 
-                // ═══════════════════════════════════════════════════════════════════
-                // v15.15: DEAD-CODE REMOVAL.
-                //
-                // Removed in this revision: a microblock-layer "byzantine_safety_required"
-                // gate that performed progressive-degradation checks on
-                // `active_node_count` against a height/size-derived threshold
-                // (4 → 3 → 2 → 1 over genesis epochs, or 1..4 by network size
-                // at runtime).
-                //
-                // Why removed:
-                //   * The gate's controlling flag `byzantine_safety_required`
-                //     was bound to `network_phase` which was hard-coded to
-                //     `false` and labelled "Deprecated - always use registry".
-                //     The entire body — wait_time ladder, degradation_mode
-                //     logging, producer_wait branch — was therefore unreachable.
-                //   * Microblock production is NOT a BFT-quorum operation
-                //     in this design: each microblock carries the producer's
-                //     own Dilithium3 signature, and 2f+1 BFT consensus is
-                //     applied at the macroblock layer (every 90 microblocks)
-                //     via the commit-reveal engine. The "byzantine wait" at
-                //     the microblock layer was the wrong place to enforce
-                //     that property even when active.
-                //   * The progressive-degradation ladder (allowing 1-of-N
-                //     on critical heights) directly contradicted the
-                //     v15.15 "no degraded threshold" policy enforced at the
-                //     macroblock gate (trigger_macroblock_consensus) and
-                //     validator-side. Two different rules in two places is
-                //     a classic source of producer/validator mismatch.
-                //
-                // Net effect on operation:
-                //   None. The gate was dead — execution always fell through
-                //   to the synchronisation check below. Removal eliminates
-                //   ~75 lines of compiler-warning-prone unreachable code,
-                //   simplifies the audit surface, and removes a tempting
-                //   re-activation hook that could re-introduce the
-                //   producer/validator mismatch.
-                //
-                // BFT enforcement that REPLACES this gate:
-                //   * Macroblock production gate (trigger_macroblock_consensus,
-                //     v15.15 canonical 2f+1) — single arithmetic threshold
-                //     `((committee_size * 2) + 2) / 3`.
-                //   * Macroblock finalisation
-                //     (commit_reveal::finalize_round_by_number) — same formula.
-                //   * Macroblock validation (validate_macroblock) — same
-                //     formula, with committee_size from baked
-                //     genesis_node_count() (mb ≤ 2) or N-2 snapshot (mb ≥ 3).
-                // ═══════════════════════════════════════════════════════════════════
+                // v15.15: removed a dead microblock-layer byzantine-safety gate (flag
+                // hard-coded false → unreachable) — also wrong layer: microblocks are
+                // single-producer Dilithium3-signed, 2f+1 is at the macroblock layer.
+                // Its progressive 1-of-N degradation contradicted the no-degraded policy
+                // (producer/validator mismatch risk). BFT enforced solely by
+                // (committee*2+2)/3 at the macroblock gate/finalize/validate.
 
                 // CRITICAL: Synchronization check before participating in consensus
                 let local_stored_height = storage.get_chain_height().unwrap_or(0);
@@ -19155,37 +18258,15 @@ impl BlockchainNode {
                 // Nodes at different heights naturally select different producers (by design)
                 let next_block_height = microblock_height + 1;
 
-                // ═══════════════════════════════════════════════════════════════════════════
-                // v15.11 L3: PRODUCER OWN-HEIGHT PRE-CHECK — anti-fork at production entry
-                // ═══════════════════════════════════════════════════════════════════════════
-                // Forensic case h=174582: TWO different nodes (001 and 002) BOTH produced
-                // a block at the same height because the pipeline had not yet caught up to
-                // the in-memory `microblock_height` counter — each node's producer task
-                // started fresh on a height that had ALREADY been finalized in storage by
-                // a peer's broadcast. The pre-save guard fired only AFTER the heavy work
-                // (PoH mixing, signing, serialize) was already done — too late to prevent
-                // the race when the SAME height was already on disk.
-                //
-                // Industry-grade defense:
-                //   Read storage at the very entry of the production cycle. If a block at
-                //   `next_block_height` already exists, abort production immediately and
-                //   yield to the apply pipeline so the in-memory counter advances next
-                //   iteration. This shrinks the race window from ~50 ms (full PoH+sign)
-                //   down to a single RocksDB read (≈1-2 ms).
-                //
-                // Safety:
-                //   * Idempotent — same height, same producer = no-op (caller continues).
-                //   * Different producer at same height = race detected, we yield silently.
-                //   * Fork attempt (different hash same height) is caught by L4 storage
-                //     guard at save-time as a last-line-of-defense.
-                //
-                // Scalability:
-                //   * One spawn_blocking RocksDB read per producer iteration. At 1 block/s
-                //     across a 1000-validator committee, this is ~1000 reads/s globally,
-                //     bounded by committee size (not network size). Per-node cost: O(1).
-                //   * Single bloom-filter-friendly key lookup; cold-cache hit ~50 µs,
-                //     warm-cache ~5 µs. Negligible against the production budget.
-                // ═══════════════════════════════════════════════════════════════════════════
+                // Producer own-height pre-check (anti-fork at production
+                // entry). Forensic h=174582: two nodes produced the same
+                // height because the pipeline hadn't caught up to the in-
+                // memory counter and the pre-save guard fired only after the
+                // heavy PoH+sign work. Read storage at cycle entry — if a
+                // block at next_block_height already exists, abort and yield
+                // (shrinks the race ~50ms → ~1-2ms). Idempotent (same
+                // producer no-op); different producer → yield; a fork attempt
+                // is still caught by the L4 save-time guard. O(1) read.
                 {
                     let storage_for_precheck = storage.clone();
                     let precheck_height = next_block_height;
@@ -19369,102 +18450,14 @@ impl BlockchainNode {
                     }
                 }
 
-                // ═══════════════════════════════════════════════════════════════
-                // v19: BFT-CERTIFIED ROTATION ROUND — DIRECT READ
-                // ═══════════════════════════════════════════════════════════════
-                // Producer selection reads the rotation round DIRECTLY from the
-                // 2f+1 BFT-certified state for this height's macroblock index
-                // instead of via the globally mutable `CURRENT_TIMEOUT_ROUND`
-                // atomic.
-                //
-                // Why: the legacy atomic was set by the stall-detection loop
-                // every tick AND reset to 0 on every tip-advance. Under load,
-                // these two writes interleaved with the producer-selection
-                // read in this loop, occasionally yielding 0 when the actual
-                // BFT-agreed round was non-zero (or vice versa). When local
-                // and remote nodes computed different rounds for the same
-                // height, they selected different producers — the validator
-                // produced an empty-slot attestation while the producer
-                // signed a microblock, and the network stalled until gossip
-                // reconciled (~30 s × N blocks).
-                //
-                // The new path queries `get_highest_certified_round(mb_index)`,
-                // which is:
-                //   * a lock-free DashMap read keyed by macroblock index
-                //   * monotonic (advances only on 2f+1 Dilithium3-verified
-                //     TimeoutVote certificates) — never resets per-block
-                //   * deterministic across honest validators once vote
-                //     gossip propagates (≤ 1 s in steady state)
-                //
-                // The legacy `CURRENT_TIMEOUT_ROUND` atomic stays in place
-                // for telemetry / debug logging and is still updated by the
-                // stall-detection loop, but is no longer on the consensus
-                // path.
-                //
-                // Scalability: O(1) DashMap lookup per slot. Identical cost
-                // at 5 or 5000 super-nodes.
-                // ═══════════════════════════════════════════════════════════════
-                // ═══════════════════════════════════════════════════════════════
-                // v23: BFT-CERTIFIED MICROBLOCK LEADER ROTATION (canonical L1)
-                // ═══════════════════════════════════════════════════════════════
-                // Leader selection for the next microblock is a PURE FUNCTION
-                // of on-chain state:
-                //
-                //     leader(h) = select_microblock_producer_with_round(
-                //         height          = h,
-                //         candidates      = eligible_producers from macroblock(N-2),
-                //         vrf_entropy     = SHA3(macroblock(N-2).deterministic_fields),
-                //         leadership_round= (h-1) / ROTATION_INTERVAL_BLOCKS,
-                //         timeout_round   = HIGHEST_CERTIFIED_ROUND[mb_idx] - baseline,
-                //     )
-                //
-                // EVERY input is finalised on-chain state. Two honest nodes
-                // at the same height compute the IDENTICAL leader by
-                // construction. Local wall clock is NEVER an input.
-                //
-                // The `timeout_round` argument is the BFT-CERTIFIED rotation
-                // round for the containing macroblock, derived via
-                // `get_effective_rotation_round(mb_idx)`:
-                //
-                //   * advances ONLY when 2f+1 Dilithium3-signed TimeoutVotes
-                //     have been aggregated for round R (HIGHEST_CERTIFIED_ROUND)
-                //     OR the f+1 pacemaker has lifted HIGHEST_ADOPTED_ROUND
-                //   * monotonic per macroblock index — never regresses
-                //   * propagates over the network in ≤ 1 RTT via signed gossip
-                //   * is therefore identical on all honest nodes within one
-                //     gossip window of any rotation event
-                //
-                // FAILURE MODE COVERED — primary silent:
-                //   1. Primary at round R fails to produce at slot h.
-                //   2. Stall-detection on every node signs TimeoutVote for mb_idx
-                //      at round R+1 once `local_delay >= grace_period`.
-                //   3. After 2f+1 signed timeout votes, HIGHEST_CERTIFIED_ROUND[mb_idx]
-                //      advances to R+1 — same value on every honest node.
-                //   4. Next call to this loop computes `timeout_round = R+1` →
-                //      same fallback producer on every honest node.
-                //   5. Fallback producer signs h with `microblock.timeout_round = R+1`.
-                //   6. Receiving nodes verify producer authority by recomputing
-                //      the same pure function with `block.timeout_round` —
-                //      Category B reject only fires when round matches but
-                //      producer doesn't (= unauthorised signer at that rank).
-                //
-                // FAILURE MODE PROHIBITED — clock-derived dual production:
-                //   The previous v22 design injected a locally-computed
-                //   `empty_slot_offset = (now - last_block_ts) / 3` into the
-                //   leader-selection seed. Under any NTP drift > 1 second between
-                //   two nodes, the offset diverged across nodes, electing
-                //   different "fallback" producers at the same height — two
-                //   valid signed blocks at one height → chain split. With v23
-                //   this is structurally impossible: `timeout_round` is the
-                //   ONLY rotation input and is BFT-CERTIFIED, not clock-derived.
-                //
-                // Macroblock commit-reveal at 90-block boundaries retains the
-                // full 2f+1 vote / cert / view-change machinery for finality.
-                //
-                // Scalability: O(1) DashMap lookup for HIGHEST_CERTIFIED_ROUND +
-                // O(1) cached VRF result per 30-block rotation period. Identical
-                // cost at 5 or 10 000 super-nodes.
-                // ═══════════════════════════════════════════════════════════════
+                // v19/v23: BFT-certified microblock leader rotation. Leader is a pure
+                // function of on-chain state: select_microblock_producer_with_round(h,
+                // candidates=eligible(mb N-2), vrf=SHA3(mb N-2),
+                // leadership_round=(h-1)/ROTATION_INTERVAL_BLOCKS,
+                // timeout_round=HIGHEST_CERTIFIED_ROUND[mb_idx]-baseline).
+                // timeout_round is 2f+1-certified, NEVER clock-derived → honest nodes
+                // compute the same leader (no dual-production split). O(1), same cost
+                // at 5 or 10000 nodes. Macroblock 2f+1 commit-reveal = finality.
                 let mb_idx = next_block_height / 90;
                 // v23.1: STRICT 2f+1 CERTIFIED-ONLY for producer selection.
                 // Calling `get_certified_rotation_round` (not
@@ -19574,37 +18567,16 @@ impl BlockchainNode {
 
                 let mut is_my_turn_to_produce = current_producer == node_id;
 
-                // ═══════════════════════════════════════════════════════════════════
-                // v16.1: NETWORK PRODUCER HEARTBEAT BROADCAST
-                // ═══════════════════════════════════════════════════════════════════
-                // Whenever this node observes itself as the elected producer for the
-                // next slot, broadcast a Dilithium3-signed `ProducerHeartbeat` to
-                // all validator peers. This converts the legacy local-only watchdog
-                // (`PRODUCER_HEARTBEAT_MS`, which only saw THIS node's loop) into a
-                // network signal — receivers track the latest heartbeat per
-                // producer and immediately broadcast empty-slot attestations when
-                // the elected producer goes silent. This is the architectural
-                // fix that prevents the v15.x h=781 deadlock where node_001 was
-                // VRF-elected but dead from boot and no other node could detect it.
-                //
-                // Throttled to 1 broadcast per second per producer — matches the
-                // slot cadence and is well below receivers' 60/min/peer rate
-                // limit. Skipped when sync is in progress (we are not yet a
-                // valid producer) or when not the elected producer.
-                //
-                // Safety:
-                //   * Heartbeat is signed by THIS node's Dilithium3 key, which is
-                //     bound to `node_id` via consensus_pk_registry / genesis
-                //     anchors. Receivers verify against the same registry that
-                //     gates TimeoutVote signatures — same trust boundary.
-                //   * Heartbeat does not advance any consensus state; it only
-                //     accelerates the entry condition for empty-slot attestation,
-                //     which is still gated by 2f+1 supermajority.
-                //
-                // Scalability: at any committee size only the SINGLE elected
-                // producer broadcasts per slot — total network rate is 1 msg/sec
-                // regardless of validator count. Receivers update O(1) DashMap
-                // entries.
+                // Network producer-heartbeat broadcast. The elected producer
+                // broadcasts a Dilithium3-signed ProducerHeartbeat, turning
+                // the local-only watchdog into a network signal: receivers
+                // track per-producer heartbeats and broadcast empty-slot
+                // attestations when the producer goes silent (fixes the h=781
+                // deadlock where a VRF-elected node was dead from boot and
+                // undetectable). Throttled 1/s/producer; skipped when syncing
+                // or not elected. Signed and verified vs the same registry as
+                // TimeoutVotes; advances no consensus state — only accelerates
+                // empty-slot entry, still gated by 2f+1.
                 if is_my_turn_to_produce {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -19670,50 +18642,17 @@ impl BlockchainNode {
                     }
                 }
 
-                // ═══════════════════════════════════════════════════════════════════════════
-                // v16.2: ROUND-CHANGE READY HANDSHAKE — eliminate cold-boot rotation race
-                // ═══════════════════════════════════════════════════════════════════════════
-                // When this node is the elected producer at `timeout_round > 0`, it has
-                // converged on the rotation round LOCALLY based on its view of the
-                // 2f+1 timeout votes. But other committee members may have observed
-                // those votes in different orders — so we cannot assume they agree
-                // on the same round at this exact moment. Without this barrier, two
-                // honest producers could each emit blocks at different rounds for
-                // the same height, creating the race that produced the v15.x h=154
-                // fork.
-                //
-                // The handshake makes the convergence explicit:
-                //   1. Producer broadcasts a Dilithium3-signed `ProducerReady` to
-                //      all validator peers (carrying mb_idx, round, height).
-                //   2. Each peer that ALSO has local certified ≥ round signs and
-                //      sends back a `ReadyAck` (point-to-point to the producer).
-                //   3. Producer waits for 2f+1 distinct acks before constructing
-                //      the block. Reaching 2f+1 acks proves at least f+1 honest
-                //      peers have converged on the same round — sufficient for
-                //      determinism.
-                //   4. If acks do not reach 2f+1 within `READY_HANDSHAKE_TIMEOUT_MS`,
-                //      producer YIELDS the slot. Pacemaker advances naturally on
-                //      the next stall cycle — same liveness path as a missing
-                //      block.
-                //
-                // Steady-state (round = 0): no handshake, zero overhead. The
-                // barrier only fires at rotation events — rare under healthy
-                // network conditions.
-                //
-                // Scalability: at committee size N the handshake exchanges
-                // O(N) messages (1 broadcast + up-to-N acks). For committee=1000
-                // this is well within the existing TimeoutVote bandwidth budget,
-                // and the cost is paid only on round-change events, not per
-                // microblock.
-                //
-                // Safety: handshake is signal-based, not state-mutating. It
-                // does not change `HIGHEST_CERTIFIED_ROUND` — only confirms
-                // peers have already converged on it. Bypassing the barrier
-                // (e.g., a Byzantine producer skipping it) would emit a block
-                // without 2f+1 ack evidence, but receivers' cert presence
-                // check (verify stage) still requires the AggregatedTimeoutCertificate
-                // for the round to be locally observed before applying. So the
-                // handshake is a LIVENESS HARDENING, not the safety boundary.
+                // v16.2: round-change ready handshake (anti cold-boot rotation fork
+                // h=154). At timeout_round>0 the producer converged on the round
+                // LOCALLY; peers may have seen votes in other orders, so without a
+                // barrier two honest producers emit blocks at different rounds for the
+                // same height. (1) producer broadcasts Dilithium3-signed ProducerReady;
+                // (2) peers with local certified>=round sign ReadyAck back; (3) producer
+                // waits 2f+1 distinct acks before building (>=f+1 honest converged →
+                // deterministic); (4) timeout → YIELD slot (pacemaker advances next
+                // stall = same liveness as a missing block). round=0: no handshake.
+                // Safety: signal-only (doesn't mutate HIGHEST_CERTIFIED_ROUND); a
+                // Byzantine skip is still caught by the receiver cert-presence check.
                 if is_my_turn_to_produce && timeout_round > 0 {
                     if let Some(ref p2p) = unified_p2p {
                         // Compute mb_idx from the height we are about to produce,
@@ -19750,44 +18689,17 @@ impl BlockchainNode {
                     // Don't continue - let timeout_round failover handle it
                 }
 
-                // v14.8.11: drift self-pause gate REMOVED. A drifted node now
-                // stays productive — its block timestamp is pulled back into
-                // the canonical network range via the median-aware generation
-                // rule (see block-construction site below), and peers accept
-                // it within the wide future-tolerance window. Removing the
-                // pause gate preserves liveness on small committees where
-                // otherwise losing two nodes to drift would collapse the
-                // 2f+1 quorum.
+                // Drift self-pause gate removed: a drifted node stays
+                // productive (median-aware timestamp pulls it into range,
+                // peers accept within the wide tolerance), preserving 2f+1
+                // quorum on small committees.
 
-                // ═══════════════════════════════════════════════════════════════════════════
-                // v2.104: SELF-EXCLUDE CHECK - Producer must be synced to produce
-                // ═══════════════════════════════════════════════════════════════════════════
-                // PROBLEM: If selected producer is significantly behind (>100 blocks), it cannot
-                // produce valid blocks because it doesn't have the correct state/entropy.
-                // 
-                // SOLUTION: Producer self-excludes and initiates emergency failover to next candidate.
-                // This prevents network deadlock when producer is desynchronized.
-                //
-                // WHY 100 BLOCKS THRESHOLD:
-                // - Normal sync lag (<10 blocks): Expected during network propagation
-                // - Minor lag (10-100 blocks): Warning but can still produce (state is recent)
-                // - Critical lag (>100 blocks): State is too stale, must self-exclude
-                // ═══════════════════════════════════════════════════════════════════════════
-                // ═══════════════════════════════════════════════════════════════════════════
-                // v3.9: SELF-EXCLUDE - Producer must be synced, BUT NO BROADCAST!
-                // ═══════════════════════════════════════════════════════════════════════════
-                // WHY NO BROADCAST:
-                //   - Broadcast is non-deterministic (different nodes receive at different times)
-                //   - This breaks consensus → forks!
-                //
-                // HOW IT WORKS WITHOUT BROADCAST:
-                //   1. Node A is selected as producer for h=1000
-                //   2. Node A sees it's behind by >100 blocks → does NOT produce
-                //   3. After 5 seconds, all nodes see slot_delay > 5
-                //   4. All nodes compute timeout_round=1 → select NEXT producer DETERMINISTICALLY!
-                //   5. No broadcast needed - pure slot-based failover!
-                //
-                // ═══════════════════════════════════════════════════════════════════════════
+                // Producer self-exclude when >100 blocks behind (stale
+                // state/entropy → can't produce valid blocks). No broadcast
+                // (non-deterministic → fork): the behind node simply doesn't
+                // produce; after the grace window all nodes see slot_delay>5,
+                // compute timeout_round=1, and deterministically select the
+                // next producer — pure slot-based failover.
                 // self_exclude at lag > 0 already prevents stale production after restart.
                 // No additional lockout needed — the lag check is sufficient.
 
@@ -19864,35 +18776,15 @@ impl BlockchainNode {
                     && next_block_height % FORK_CHECK_INTERVAL == 0
                     && !is_rotation_boundary_check; // Skip when rotation does full entropy check
 
-                // ═══════════════════════════════════════════════════════════════
-                // v14.7 (pt 1): ENTROPY LOOKAHEAD — pre-request for next rotation
-                // ═══════════════════════════════════════════════════════════════
-                // Problem: the rotation-boundary block (every 30 microblocks) is
-                // the slow block — its producer must complete an entropy
-                // bft_wait loop (up to 3 s) before signing. That wait is
-                // synchronous inside the production path, which blows the
-                // 1 s/block budget and opens a 10 s fork window at every
-                // rotation.
-                //
-                // Fix: start collecting entropy responses for the UPCOMING
-                // rotation height N+2 blocks in advance. Requests are
-                // fire-and-forget (no await on response), so they add no
-                // latency to the current block. By the time we actually
-                // reach the rotation boundary, ENTROPY_RESPONSES already
-                // contains >= 60% peer replies and the bft_wait loop exits
-                // on its first poll iteration (< 200 ms).
-                //
-                // Lookahead distance: 2 blocks. Gives ~2 s for WAN propagation
-                // + response processing even on continental links. Larger
-                // windows risk stale entropy; smaller windows leave no
-                // headroom. 2 is the sweet spot for 1 s block time.
-                //
-                // Scales: fire-and-forget, O(sample_size) per lookahead call.
-                // With MAX_VALIDATORS=1000 and sample=100 the added load is
-                // ~100 outbound requests per 30 blocks = 3.3 req/s per node.
-                // Bandwidth-neutral vs. the unsolicited stream the entropy
-                // system would generate during bft_wait anyway.
-                // ═══════════════════════════════════════════════════════════════
+                // Entropy lookahead. The rotation-boundary block (every 30)
+                // is slow — its producer must finish a synchronous entropy
+                // bft_wait (up to 3 s), blowing the 1 s budget and opening a
+                // fork window. Fix: pre-request entropy for the upcoming
+                // rotation 2 blocks ahead, fire-and-forget (no added latency);
+                // by the boundary ENTROPY_RESPONSES already has ≥60% replies
+                // so bft_wait exits on its first poll (<200 ms). 2-block
+                // lookahead ≈ 2 s WAN headroom without staleness.
+                // O(sample_size), bandwidth-neutral.
                 const ENTROPY_LOOKAHEAD_BLOCKS: u64 = 2;
                 let is_entropy_lookahead = next_block_height > 1
                     && !is_rotation_boundary_check
@@ -20032,33 +18924,13 @@ impl BlockchainNode {
                         println!("[INFO][CONS] rotation_boundary h={} role={} entropy_check", next_block_height, entropy_role);
                     }
 
-                    // ═══════════════════════════════════════════════════════════
-                    // v14.7.1: pt 6 QC-before-produce guard REMOVED.
-                    // ═══════════════════════════════════════════════════════════
-                    // The previous implementation compared a rotation-index
-                    // (`(h-1)/ROTATION_INTERVAL_BLOCKS`) with a timeout-round
-                    // (escalates to 1000+ during stalls). Those are distinct
-                    // scales — the check always tripped after the first
-                    // timeout escalation and livelocked the chain at every
-                    // rotation boundary.
-                    //
-                    // The BFT safety property it attempted to enforce — "do
-                    // not extend a chain whose predecessor round has been
-                    // certified past us" — is already enforced correctly and
-                    // atomically by the v14.6 pre-save stale-round guard
-                    // (see node.rs in the production path, just before the
-                    // RocksDB write). That guard is a SELF-CHECK on the
-                    // producing node: we read our own latest certified /
-                    // adopted round and yield if we've been rotated past.
-                    // It does NOT cross-compare microblock rounds against
-                    // macroblock consensus rounds (v14.8.6 removed that
-                    // broken cross-domain reject at the ingest side).
-                    // Retroactive ratification by 2f+1 macroblock commit
-                    // remains the hard-finality layer.
-                    //
-                    // Removing this duplicate check restores liveness while
-                    // preserving all real BFT-safety properties.
-                    // ═══════════════════════════════════════════════════════════
+                    // QC-before-produce guard removed: it compared a rotation
+                    // index against a timeout-round (distinct scales) and so
+                    // always tripped after the first timeout escalation,
+                    // livelocking every rotation boundary. The real property
+                    // ("don't extend a chain whose predecessor round was
+                    // certified past us") is enforced by the pre-save stale-
+                    // round self-check + retroactive 2f+1 macroblock commit.
 
                     if let Some(p2p) = &unified_p2p {
                         // CRITICAL FIX: Use FINALITY_WINDOW for entropy consensus (Byzantine-safe)
@@ -20372,54 +19244,13 @@ impl BlockchainNode {
                                 }
                             }
                             
-                            // ═══════════════════════════════════════════════════════════════════
-                            // v3.10 BUG 5 FIX: Improved fork detection logic
-                            // v3.11 FIX: Added minimum response threshold for network startup
-                            // ═══════════════════════════════════════════════════════════════════
-                            // PROBLEM: At network startup, nodes may not have entropy yet
-                            //   → They return empty entropy → looks like mismatch
-                            //   → matches=0 triggered fork detection incorrectly!
-                            //
-                            // FIX: Only trigger fork if:
-                            //   1. We have at least min_fork_detection_responses (3)
-                            //   2. AND all of them disagree (matches == 0)
-                            //   3. AND we're past Genesis phase (height > 10)
-                            // ═══════════════════════════════════════════════════════════════════
-                            // v3.24: CONSENSUS-BASED PRODUCTION CONTROL
-                            // ═══════════════════════════════════════════════════════════════════
-                            // ARCHITECTURE: Node CANNOT produce blocks without minimum consensus
-                            // This prevents isolated nodes from creating orphan chains.
-                            //
-                            // MIN_PRODUCTION_RESPONSES: Minimum peers that must respond before production
-                            //   - Prevents isolated node from producing blocks alone
-                            //   - Ensures at least basic network connectivity
-                            //   - Value 2 = at least 2 peers must confirm our entropy
-                            //
-                            // min_fork_detection_responses: Minimum for definite fork detection
-                            //   - Higher threshold for fork declaration (more certainty needed)
-                            //
-                            // EXCEPTION: Genesis phase (h <= 10) - allow bootstrap production
-                            // ═══════════════════════════════════════════════════════════════════
-                            // v14.7.2: CANONICAL LIVENESS GATE — f+1 dynamic threshold
-                            // ═══════════════════════════════════════════════════════════════════
-                            // Purpose: detect that THIS node is isolated from at least one
-                            // honest peer before producing a block. This is a liveness /
-                            // partition detector, NOT a safety threshold.
-                            //
-                            // Threshold = f+1 where n = sample_size, f = floor((n-1)/3).
-                            // Formula `(n+2)/3` gives the canonical ceiling of (n/3) which
-                            // equals f+1 for any n that satisfies the BFT invariant
-                            // n ≥ 3f+1. Scales uniformly — no buckets, no magic numbers,
-                            // works for n=5 as well as n=1_000_000.
-                            //
-                            // f+1 semantics: with at most f byzantine, any set of f+1
-                            // distinct responders contains at least one honest peer.
-                            // That is sufficient evidence we are not network-partitioned
-                            // from the honest supermajority.
-                            //
-                            // Fork-confirmation threshold (below) remains at f+1 as well;
-                            // we do NOT use a different fork detection constant anymore.
-                            // ═══════════════════════════════════════════════════════════════════
+                            // v14.7.2: canonical f+1 liveness/partition gate before producing —
+                            // threshold = (n+2)/3 = ceil(n/3) = f+1 (n=sample_size). With <=f
+                            // byzantine, any f+1 distinct responders contain >=1 honest → proof this
+                            // node is NOT partitioned from the honest supermajority. LIVENESS/
+                            // partition detector, NOT a safety threshold; fork-confirmation uses the
+                            // same f+1. Genesis (h<=10) bootstrap exception. (Supersedes v3.10/v3.11
+                            // fork-detect + v3.24 min-response heuristics.)
                             let min_production_responses = ((sample_size + 2) / 3).max(1); // f+1 canonical
                             let min_fork_detection_responses: usize = min_production_responses;
                             
@@ -20601,56 +19432,16 @@ impl BlockchainNode {
                                 println!("[WARN][CONS] no_responses h={} phase=genesis", next_block_height);
                             }
                             
-                            // ═══════════════════════════════════════════════════════════════════════════
-                            // v14.4: REMOVED LOCAL FALLBACK — TRUST BFT TIMEOUT PROTOCOL v4.0
-                            // ═══════════════════════════════════════════════════════════════════════════
-                            // Prior versions contained a local "producer sync check" followed by an
-                            // unconditional `fallback_select → fallback_selected_self` path that produced
-                            // blocks WITHOUT any 2f+1 BFT vote. Root cause of the h=301 / h=302 split-brain:
-                            //
-                            //   1. Validator sends entropy request to peers (including designated leader).
-                            //   2. Validator's bft_wait succeeds at 60% of non-leader peers (~200ms).
-                            //   3. Designated leader is STILL inside its own bft_wait + production (~220ms).
-                            //   4. Leader hasn't answered the validator's entropy query yet.
-                            //   5. Fix C (v14.2) interpreted that silence as "not synced".
-                            //   6. Fallback_select re-hashed locally → picked another candidate → self.
-                            //   7. Two producers emit h=N in parallel → different prev_hash chains.
-                            //
-                            // This duplicate-check + local fallback has THREE architectural problems:
-                            //   A. No 2f+1 vote — one node unilaterally promotes itself.
-                            //   B. Triggered by timing, not by proof of liveness failure.
-                            //   C. Bypasses the properly implemented BFT Timeout Vote path at line ~14778
-                            //      (`certified_timeout_round = p2p.get_highest_certified_timeout_round()`),
-                            //      which already provides deterministic failover backed by Dilithium-signed
-                            //      votes from ≥ 2f+1 validators and an explicit TimeoutCertificate.
-                            //
-                            // The existing L1-grade path is sufficient:
-                            //   • bft_wait (≥ 60%) proves entropy consensus among peers.
-                            //   • A genuinely silent / dead leader fails to produce a block for the slot.
-                            //   • Validators broadcast signed TimeoutVote (unified_p2p.rs:11227).
-                            //   • 2f+1 votes → TimeoutCertificate (unified_p2p.rs:21341).
-                            //   • HIGHEST_CERTIFIED_ROUND advances → next select_microblock_producer_with_round
-                            //     call deterministically picks a new producer across ALL nodes.
-                            //   • Equivocation attempts are logged and slashed (node.rs:2228,
-                            //     unified_p2p.rs:21257).
-                            //
-                            // SAFETY / LIVENESS TRADE-OFF:
-                            //   • SAFETY — no node produces unless it is the deterministically selected
-                            //     leader (primary at round 0 OR certified-failover leader at round > 0).
-                            //   • LIVENESS — bounded: a stuck leader is replaced within one timeout
-                            //     interval once 2f+1 timeout votes gather, exactly as in top-tier BFT
-                            //     protocol designs.
-                            //   • SCALABILITY — unchanged; BFT Timeout Protocol already supports up to
-                            //     MAX_VALIDATORS (1000) producers per round.
-                            //   • DETERMINISM — every node consumes the same certified round and the same
-                            //     candidate list from the N-2 macroblock snapshot; no divergence possible.
-                            //
-                            // The only action taken here now is observational: when `bft_wait` returned
-                            // a zero-entropy response from the designated producer, we log it (so that
-                            // operators can correlate with timeout votes). Production of blocks is NOT
-                            // altered on that signal alone. The timeout vote handler in unified_p2p.rs
-                            // is the single source of truth for producer change.
-                            // ═══════════════════════════════════════════════════════════════════════════
+                            // v14.4: NO local producer fallback here — deliberately. The old
+                            // "sync-check → unconditional fallback_select→self" produced blocks
+                            // WITHOUT 2f+1 and caused the h=301/302 split-brain (timing race → two
+                            // producers emit h=N → divergent chains). The ONLY producer-change path
+                            // is BFT timeout: silent leader → signed TimeoutVote → 2f+1
+                            // TimeoutCertificate → HIGHEST_CERTIFIED_ROUND advances → deterministic
+                            // new producer on ALL nodes (equivocation slashed). Safety: only the
+                            // deterministically-selected leader produces; liveness bounded (<= one
+                            // timeout); no divergence. Here = observational only; the timeout-vote
+                            // handler is the single source of truth for producer change.
                             if current_producer != node_id {
                                 let producer_entropy = ENTROPY_RESPONSES.get(&(entropy_height, current_producer.clone()));
                                 if let Some(ref entry) = producer_entropy {
@@ -21536,29 +20327,15 @@ impl BlockchainNode {
                     let mut user_txs: Vec<qnet_state::Transaction> = Vec::new();
                     let mut rejection_reasons: Vec<(String, String)> = Vec::new(); // v3.1: Track reasons
                     
-                    // ═══════════════════════════════════════════════════════════════════════
-                    // v15.5: PRODUCER-SIDE COMMITMENT DEDUP — defense-in-depth.
-                    //
-                    // The mempool's per-receive replacement (`SimpleMempool::commitment_index`)
-                    // already keeps a single canonical version of each logical commitment in
-                    // the local mempool. This filter is the LAST line of defense before the
-                    // block sealing path: a transient race between an inbound gossip TX and a
-                    // concurrent producer pull could, in theory, surface two versions of the
-                    // same commitment in the candidate set. Deduplication here guarantees
-                    // that no block ever ships duplicate commitments regardless of upstream
-                    // race conditions.
-                    //
-                    // Coverage matches `Transaction::commitment_dedup_key()` and therefore
-                    // mirrors `state.rs::check_duplicate_commitment` 1-to-1: HeartbeatCommitment,
-                    // PingCommitmentWithSampling, LightNodeEligibilityBitmap, NodeRegistration,
-                    // NodeReactivation. A duplicate is removed from mempool via
-                    // `invalid_tx_hashes` so it cannot be retried back into the next block.
-                    //
-                    // Scalability: HashSet is bounded by the count of distinct logical
-                    // commitments in this microblock window (≤ active validator committee
-                    // size per type). At thousands of super nodes this remains a tight
-                    // bound — commitments are at most one per validator per epoch boundary.
-                    // ═══════════════════════════════════════════════════════════════════════
+                    // Producer-side commitment dedup (last line of defence
+                    // before block sealing). The mempool's commitment_index
+                    // already keeps one canonical version, but a gossip-vs-
+                    // producer-pull race could surface two in the candidate
+                    // set; this guarantees no block ever ships duplicate
+                    // commitments. Coverage = commitment_dedup_key(), mirrors
+                    // state.rs::check_duplicate_commitment 1:1; a duplicate is
+                    // removed via invalid_tx_hashes so it isn't retried. Bounded
+                    // HashSet (one commitment/validator/epoch).
                     let mut seen_commit_keys: std::collections::HashSet<(String, u64, u8)> =
                         std::collections::HashSet::new();
 
@@ -21575,53 +20352,15 @@ impl BlockchainNode {
                                 || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. })
                                 || matches!(tx.tx_type, qnet_state::TransactionType::LightNodeEligibilityBitmap { .. });
 
-                            // ═══════════════════════════════════════════════════════════════════════
-                            // v15.12 L2: STATE-AWARE PRODUCER DEDUP — closes the cross-block gap
-                            // ═══════════════════════════════════════════════════════════════════════
-                            // The pre-v15.12 producer-side filter (v15.5) only deduplicated
-                            // commitments WITHIN a single block via the per-iteration HashSet
-                            // `seen_commit_keys` below. It did NOT consult the state for
-                            // commitments already finalized on chain — so when a peer-applied
-                            // block deposited an epoch's HeartbeatCommitment into state at h=K,
-                            // and another producer's mempool still held the same TX (because
-                            // pre-v15.12 peer-apply did not clean its mempool), the next time
-                            // that producer was selected (h=K+N) it included the same
-                            // already-on-chain TX again. Apply rejected it via
-                            // `state.rs::check_duplicate_commitment`, but the TX bytes still
-                            // occupied block storage and produced visible duplicates in the
-                            // explorer (forensic case h=14351 → h=14461: same 5 commitments
-                            // shipped twice 110 blocks apart).
-                            //
-                            // Industry-grade fix:
-                            //   Before either dedup tier, ask the state directly: is this
-                            //   commitment epoch ALREADY on chain? Use the same
-                            //   `is_epoch_committed(type, identity, epoch)` API the apply
-                            //   path uses, against the state read-guard already held for TX
-                            //   validation in this iteration. If yes, drop the TX from this
-                            //   block entirely and from the local mempool — it can never be
-                            //   applied again, retaining it is pure waste.
-                            //
-                            // Coverage matches `commitment_dedup_key()` 1-to-1 (same five
-                            // commitment types). Type-id → state-key string follows the
-                            // mapping in `state.rs::check_duplicate_commitment`.
-                            //
-                            // Safety:
-                            //   * Read-only state lookup; no state mutation here.
-                            //   * `state_snapshot` is the same read-guard used a few lines
-                            //     above for nonce / balance validation — consistent view.
-                            //   * NodeRegistration uses epoch=0 always (one-shot), so the
-                            //     check naturally rejects any second registration attempt for
-                            //     a node-id already on chain.
-                            //
-                            // Scalability:
-                            //   * `is_epoch_committed` = O(1) DashMap lookup against the
-                            //     committed-epochs map. ~50 ns per call.
-                            //   * Called once per candidate TX × commitment-class — bounded
-                            //     by active validator committee size at epoch boundaries
-                            //     (~1000 max under MAX_VALIDATORS cap).
-                            //   * Zero allocation in the hot path beyond the type-string
-                            //     literal lookup.
-                            // ═══════════════════════════════════════════════════════════════════════
+                            // v15.12: state-aware producer dedup (closes the cross-block gap). The
+                            // v15.5 filter only deduped WITHIN a block; a commitment already
+                            // finalized on chain (peer-apply at h=K) still sat in another producer's
+                            // mempool and was re-included at h=K+N — apply rejected it but the bytes
+                            // bloated block storage + explorer (h=14351→14461). Fix: before the dedup
+                            // tiers, is_epoch_committed(type,identity,epoch) against the held read-
+                            // guard; if on chain → drop the TX from the block AND local mempool.
+                            // Same 5 types as commitment_dedup_key; NodeRegistration epoch=0
+                            // (one-shot) → rejects 2nd registration. Read-only, O(1) ~50ns.
                             let is_already_on_chain = if let Some((identity, epoch, type_id)) =
                                 tx.commitment_dedup_key()
                             {
@@ -21797,40 +20536,17 @@ impl BlockchainNode {
                     // Other nodes validate and accept/reject - this is the blockchain way!
                     // NO SYNC CHECKS, NO NETWORK QUERIES, NO WAITING!
                     
-                    // ═══════════════════════════════════════════════════════════════════
-                    // v14.8.11: MEDIAN-AWARE WALL-CLOCK TIMESTAMP
-                    // ═══════════════════════════════════════════════════════════════════
-                    // Block timestamp is the maximum of four canonical sources:
-                    //
-                    //   1. `wall_clock`    — this node's local Unix time (base case).
-                    //   2. `network_median + blocks_ahead`  — derived from the last 32
-                    //      on-chain block timestamps (our ring buffer). Pulls a
-                    //      behind-clock producer back into the canonical network
-                    //      range so its block is accepted within the wide future-
-                    //      tolerance window on peers.
-                    //   3. `parent_ts + 1` — hard strict-monotonicity guarantee,
-                    //      independent of clocks. Hash-chain continuity already
-                    //      requires monotonic ordering.
-                    //   4. `median_past + 1` — Median-Past rule lower bound (last-11
-                    //      median). A block must be strictly above this value or
-                    //      peers reject it as an attempt to rewrite the near-past.
-                    //      Undefined for the first ~11 blocks (ring too small);
-                    //      falls back to (3) which is stricter or equivalent.
-                    //
-                    // The `max` across all four yields the smallest legal timestamp
-                    // that satisfies every rule simultaneously. A node with clock
-                    // drift ≤ FUTURE_TOLERANCE (2 h) therefore always produces a
-                    // block that every honest peer accepts on first validation,
-                    // with zero NTP dependency at consensus-critical path and zero
-                    // self-pause machinery.
-                    //
-                    // Safety: `block.timestamp` is part of the Dilithium3-signed
-                    // header, so the producer cannot lie about this value to
-                    // different peers — it is network-wide identical bytes.
-                    //
-                    // Scalability: four O(1) atomic / locked reads regardless of
-                    // committee size. Ring snapshot is a tiny fixed-size array.
-                    // ═══════════════════════════════════════════════════════════════════
+                    // Median-aware wall-clock timestamp = max of four sources:
+                    // (1) wall_clock; (2) network_median + blocks_ahead (last-32
+                    // ring — pulls a behind-clock producer into the accepted
+                    // range); (3) parent_ts+1 (strict monotonicity, clock-
+                    // independent); (4) median_past+1 (Median-Past lower bound;
+                    // undefined for the first ~11 blocks → falls back to (3)).
+                    // The max is the smallest legal timestamp satisfying every
+                    // rule, so a node within 2h drift is accepted on first
+                    // validation with zero NTP dependency. block.timestamp is
+                    // Dilithium3-signed, so the producer can't show different
+                    // peers different values. Four O(1) reads.
                     let deterministic_timestamp = {
                         let wall_ts = get_timestamp_safe();
                         let parent_ts = if next_block_height > 0 {
@@ -21842,36 +20558,46 @@ impl BlockchainNode {
                             0
                         };
 
-                        // Network median (via `effective_now`): returns wall_ts in
-                        // the happy case, or the forward-projected network estimate
-                        // if this node's clock is behind the canonical median.
-                        let network_ts = effective_now();
+                        // v27 HOLE2: NTP wall clock clamped to
+                        // [lower, raw_median+MAX_FWD_SKEW] — replaces the old
+                        // one-way max(effective_now()) drift ratchet (11s→33s).
+                        // lower = max(parent+1, median_past+1): strict
+                        // monotonic + anti-rewrite; clock-behind node pulled
+                        // up here (bounded, no projection).
+                        let lower = parent_ts
+                            .saturating_add(1)
+                            .max(
+                                median_past_timestamp_at_height(next_block_height)
+                                    .map(|m| m.saturating_add(1))
+                                    .unwrap_or(0),
+                            );
 
-                        // Median-Past lower bound: strictly greater than the median
-                        // of the last MEDIAN_PAST_WINDOW on-chain timestamps. Ring
-                        // is undersized for the very first blocks — in that case
-                        // parent_ts+1 already provides the strict monotonicity we
-                        // need and we skip this source.
-                        // v15.15: height-ordered — median is over the parent
-                        // segment [next_block_height - WINDOW, next_block_height).
-                        let median_past_plus_one = median_past_timestamp_at_height(next_block_height)
-                            .map(|m| m.saturating_add(1))
-                            .unwrap_or(0);
+                        // RAW network median (no forward projection — that was the
+                        // ratchet). Used only for the anti-inflation upper cap.
+                        let network_median = {
+                            let ring = NETWORK_TIME_RING.lock();
+                            let m = ring.median_sample().map(|(ts, _h)| ts);
+                            drop(ring);
+                            m
+                        };
 
-                        // Strict-monotonicity lower bound from parent. Matches the
-                        // check a peer performs in `validate_received_microblock`.
-                        let parent_plus_one = parent_ts.saturating_add(1);
-
-                        let candidate = wall_ts
-                            .max(network_ts)
-                            .max(parent_plus_one)
-                            .max(median_past_plus_one);
+                        let candidate = match network_median {
+                            Some(m) => {
+                                // Lead the network median by ≤ MAX_FWD_SKEW; never
+                                // below `lower` (validity wins over anti-inflation).
+                                let upper = m
+                                    .saturating_add(BLOCK_TS_MAX_FWD_SKEW_SECS)
+                                    .max(lower);
+                                wall_ts.clamp(lower, upper)
+                            }
+                            // Ring undersized (first blocks): no median yet.
+                            None => wall_ts.max(lower),
+                        };
 
                         if is_debug() && next_block_height > 0 {
                             println!(
-                                "[DBG][TIMESTAMP] gen h={} wall={} net={} parent+1={} medp+1={} → chosen={}",
-                                next_block_height, wall_ts, network_ts, parent_plus_one,
-                                median_past_plus_one, candidate
+                                "[DBG][TIMESTAMP] gen h={} wall={} lower={} net_med={:?} → chosen={}",
+                                next_block_height, wall_ts, lower, network_median, candidate
                             );
                         }
                         candidate
@@ -22164,57 +20890,15 @@ impl BlockchainNode {
                         txs.truncate(limit_idx);
                     }
                     
-                    // ═══════════════════════════════════════════════════════════════════════════
-                    // v15.11: ATOMIC EFFECTIVE-ROUND SNAPSHOT
-                    // ═══════════════════════════════════════════════════════════════════════════
-                    // Snapshot the effective rotation round ONCE at production start. The
-                    // effective round is `live_consensus_round - last_finalized_round_in_mb`,
-                    // which naturally resets to 0 at the start of each new height after a
-                    // successful finalization in the same macroblock.
-                    //
-                    // Without this baseline, a single stall at height K with rotation R would
-                    // cause every subsequent height in the same mb to start with snapshot=0
-                    // while live=R, making the pre-save guard yield every block — silently
-                    // muting the elected producer for ~30 blocks (forensic case h=15886→15899).
-                    //
-                    // The local timeout-round cache (set by stall detector) is preserved as
-                    // an upper bound — if it's higher than the effective round, the local
-                    // node has already committed to a higher round locally.
-                    // ═══════════════════════════════════════════════════════════════
-                    // v22: SLOT-BASED MICROBLOCK PRODUCTION (no rotation rounds)
-                    // ═══════════════════════════════════════════════════════════════
-                    // Microblocks always emit `timeout_round = 0`. The microblock
-                    // layer is purely optimistic: a single VRF-elected leader per
-                    // 30-block rotation window produces sequential blocks. If the
-                    // leader is silent, the producer-loop's local-fallback path
-                    // (consecutive-empty-slot counter) deterministically swaps to
-                    // the next eligible identity for the remainder of the rotation
-                    // window — no votes, no certs, no aggregation needed at the
-                    // microblock layer.
-                    //
-                    // Finality lives ONE tier above: the macroblock commit-reveal
-                    // (every 90 blocks) gives 2f+1 BFT finality and view-change.
-                    // That is the canonical safety anchor; microblocks ride on top
-                    // optimistically.
-                    //
-                    // Why this eliminates the failure modes observed in v15-v21
-                    // ────────────────────────────────────────────────────────────
-                    //   * cascade livelock (v15.0 forensic h=2880-3150):
-                    //     no microblock rounds → no per-voter round scatter.
-                    //   * split-brain producer (v15.13 h=556, v22 h=367):
-                    //     single VRF leader per height → no two leaders can claim
-                    //     the same height legitimately.
-                    //   * macroblock-boundary timeout-cert deadlock (v21 h=360):
-                    //     `mb.timeout_round == 0` always → cert-presence gate at
-                    //     `block_pipeline.rs::cert_check` never fires for
-                    //     microblocks.
-                    //   * empty-slot attestation race (h=367 fork): gone — the
-                    //     in-rotation fallback is purely local + deterministic,
-                    //     no gossip race window.
-                    //
-                    // Scalability: identical from 5 to 1M super-nodes — the model
-                    // is per-slot O(1) work. The 1000-validator-per-round cap on
-                    // macroblock committee is unaffected.
+                    // v22: slot-based optimistic microblock production. A single VRF-elected
+                    // leader per 30-block rotation window produces sequential blocks; a silent
+                    // leader is replaced by the producer-loop's deterministic local fallback
+                    // (consecutive-empty-slot counter) to the next eligible identity for the
+                    // rest of the window — no votes/certs/aggregation at the microblock layer.
+                    // Finality is ONE tier up: macroblock commit-reveal (every 90) = 2f+1 BFT
+                    // finality + view-change (the canonical safety anchor; microblocks ride
+                    // optimistically). Supersedes the v15.11 effective-round snapshot and the
+                    // v15–v21 round-scatter/split-brain failure modes. O(1)/slot.
                     let mut microblock = qnet_state::MicroBlock {
                         height: next_block_height,
                         timestamp: deterministic_timestamp,
@@ -22737,45 +21421,19 @@ impl BlockchainNode {
                     let p2p_for_reward = unified_p2p.clone();
                     let rotation_tracker_clone = rotation_tracker.clone();
 
-                    // ═══════════════════════════════════════════════════════════════════════════
-                    // v22.1 / v23: pre-save STALE-ROUND GUARD remains removed
-                    // ═══════════════════════════════════════════════════════════════════════════
-                    // The legacy `effective_round_now > microblock.timeout_round`
-                    // self-check (v14.6 / v15.11) compared two values that, under
-                    // the v23 architecture, are by construction equal on every
-                    // honest producer attempt:
-                    //
-                    //   * `microblock.timeout_round` — value snapshotted from
-                    //     `get_effective_rotation_round(mb_idx)` at the top of the
-                    //     producer loop, used for leader election.
-                    //   * `effective_round_now` — same `get_effective_rotation_round`
-                    //     read a few microseconds later before save.
-                    //
-                    // The two reads can only differ if a concurrent 2f+1 cert
-                    // aggregation completed between them, which (a) advances the
-                    // rotation and (b) makes THIS node no longer the elected
-                    // producer at the new round. The Category B / B' ingest
-                    // check on every other validator will harmlessly reject the
-                    // late block; producing it locally is wasted CPU but never a
-                    // safety risk. Re-introducing the pre-save guard adds no
-                    // safety beyond what Category B already provides, and on a
-                    // network where macroblock-boundary view-change drives mid-
-                    // window certified-round bumps it fires on every honest
-                    // attempt (v22.1 forensic — permanent h=90 stall).
-                    //
-                    // Safety after removal
-                    // ────────────────────
-                    // Producer authority is enforced at INGEST on every peer via
-                    // `block_pipeline.rs` Category B reject (same round, different
-                    // producer → HARD REJECT). Storage-layer L4 anti-fork guard
-                    // (`storage.rs::save_block_with_delta`) rejects a second block
-                    // with a different hash at the same height even on this node.
-                    // Equivocation slashing pipeline (`record_block_equivocation`
-                    // + `analyze_chain_for_slashing`) catches Byzantine producers
-                    // who attempt to sign two blocks at one height — the proof is
-                    // unforgeable and slashing fires deterministically on every
-                    // honest validator at the next macroblock commit.
-                    // ═══════════════════════════════════════════════════════════════════════════
+                    // Pre-save stale-round guard stays removed. The legacy
+                    // `effective_round_now > microblock.timeout_round` self-
+                    // check compared two get_effective_rotation_round reads
+                    // that are equal by construction in v23; they differ only
+                    // if a concurrent 2f+1 cert completed between them — which
+                    // advances rotation and makes this node no longer the
+                    // producer, so every peer's Category-B ingest check
+                    // harmlessly rejects the late block (local production =
+                    // wasted CPU, not a safety risk). The guard added no safety
+                    // beyond Category-B and fired on every honest attempt on
+                    // view-change networks (v22.1 permanent h=90 stall).
+                    // Authority is still enforced by Category-B ingest reject,
+                    // storage L4 anti-fork, and equivocation slashing.
 
                     // Save synchronously to ensure block exists before height increment
                     // This is FAST (just RocksDB write, ~10-50ms) and prevents race conditions
@@ -23017,58 +21675,15 @@ impl BlockchainNode {
                         // Clone P2P for async task
                         let p2p_clone = p2p.clone();
                         
-                        // ═══════════════════════════════════════════════════════════════════════════
-                        // v24: SLOWEST-PEER BACKPRESSURE REMOVED — restore 1-sec slot cadence
-                        // ═══════════════════════════════════════════════════════════════════════════
-                        // Legacy v2.43 backpressure (`PENDING_BROADCAST_COUNT >= MAX_PENDING_BROADCASTS`)
-                        // delayed every block by 50-ms polling loops whenever the slowest peer was
-                        // behind. In a network with even one persistently slow validator (which is
-                        // statistically guaranteed at any non-trivial committee size), the counter
-                        // was almost always at the cap, so the producer was throttling on EVERY
-                        // block. Measured live: target 1000 ms → actual 1107 ms (+10.7 %) with the
-                        // gate active, even on a 5-node testnet with only 18-block lag.
-                        //
-                        // At 1 000+ super-nodes the failure mode is catastrophic: one slow peer
-                        // pins the entire chain. This is the opposite of how a BFT-PoS chain
-                        // should behave — the producer must run at full slot cadence while slow
-                        // peers self-recover via the sync subsystem (block_pipeline + SyncManager
-                        // pipelined catch-up + chunked-parallel snapshot restore). Production
-                        // bandwidth at 1 producer × 1 block/s × 5 MB block ≈ 40 Mbps egress —
-                        // well below any reasonable host's link capacity, so there is no
-                        // physical reason to throttle.
-                        //
-                        // Safety after removal
-                        // ────────────────────
-                        // No safety property depended on this gate. It was a *liveness throttle*
-                        // intended to prevent the producer from "racing ahead" of consumers
-                        // during stress tests, but:
-                        //   * Block-pipeline backpressure already enforces ingest-side flow
-                        //     control via bounded mpsc channels (capacity 1024-8192 per stage).
-                        //   * Reed-Solomon erasure coding (1.5× redundancy, 170+85 shards)
-                        //     ensures delivery survives transient packet loss.
-                        //   * Multi-hop chunk forwarding (`forward_shred_protocol_chunk`)
-                        //     propagates blocks in O(log N) hops via cascading gossip.
-                        //   * SyncManager pipelined catch-up + range-sharded sync_blocks fills
-                        //     any gaps via dedicated request path with per-peer cooldown.
-                        // The producer's slot cadence is a CONSENSUS PARAMETER, not a network
-                        // capacity flow-control input.
-                        //
-                        // Scalability
-                        // ───────────
-                        //   * O(1) per slot — one tokio::spawn for the async broadcast.
-                        //   * Reed-Solomon redundancy handles single-peer slowness without any
-                        //     coordination from the producer.
-                        //   * At 100 000 nodes: producer fans out to ~32 layer-1 peers, each
-                        //     forwards to ~32 layer-2 peers, etc. Producer's local CPU/network
-                        //     is independent of total network size.
-                        //
-                        // The `PENDING_BROADCAST_COUNT` AtomicU64 and `MAX_PENDING_BROADCASTS`
-                        // const are RETAINED at module scope for backward compatibility with
-                        // any external observability tooling that may grep them, but they are
-                        // no longer read on the consensus hot path. The fetch_add / fetch_sub
-                        // below are kept so the counter remains queryable for diagnostics
-                        // without changing memory layout.
-                        // ═══════════════════════════════════════════════════════════════════════════
+                        // v24: slowest-peer backpressure REMOVED. The legacy v2.43 gate
+                        // (PENDING_BROADCAST_COUNT>=MAX) 50ms-throttled EVERY block whenever the
+                        // slowest peer lagged (one slow validator is statistically guaranteed) —
+                        // 1000→1107ms measured; one slow peer pins the chain at scale. Slot
+                        // cadence is a CONSENSUS PARAMETER, not flow control: no safety property
+                        // depended on it; flow control = bounded mpsc + Reed-Solomon + multi-hop
+                        // forward + SyncManager catch-up. PENDING_BROADCAST_COUNT/MAX (+ the
+                        // fetch_add/sub below) kept at module scope for observability only — NOT
+                        // on the consensus hot path; do not delete as dead code.
 
                         // Diagnostic-only counter — never gates the slot.
                         PENDING_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -24069,46 +22684,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         println!("[INFO][NODE] genesis_reputation_init_complete");
     }
     
-    /// PRODUCTION v4.0: Select microblock producer using Dilithium3-VRF Secret Leader Election
-    /// every 30 blocks. VRF output = f(secret_key, slot_seed) → unpredictable, verifiable.
-    /// 
-    /// v3.8→v4.0: CRITICAL FIX - Added timeout_round for DETERMINISTIC failover
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// PROBLEM: Previous emergency broadcast system was NON-DETERMINISTIC!
-    ///   - Different nodes received broadcast at different times
-    ///   - Some nodes had emergency flag, others didn't
-    ///   - Different nodes selected different producers → FORK!
-    ///
-    /// SOLUTION: VRF election + BFT timeout failover
-    ///   - Round 0: VRF Secret Leader Election (lowest output wins)
-    ///   - Round 1+: Exclude failed producers from previous rounds DETERMINISTICALLY
-    ///   - ALL nodes compute SAME excluded list from SAME blockchain data
-    ///   - NO BROADCAST NEEDED for failover!
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// v16.2: Round-change ready handshake. Producer at `round > 0` invokes
-    /// this BEFORE constructing the block. Returns true iff 2f+1 distinct
-    /// `ReadyAck` signatures arrive within the configured timeout window.
-    ///
-    /// Implementation:
-    ///   1. Sign and broadcast `ProducerReady{mb_idx, round, height}` to
-    ///      all validator peers via `broadcast_producer_ready`.
-    ///   2. Self-record the producer's own ack contribution (handshake
-    ///      participation by definition).
-    ///   3. Poll `count_ready_acks()` every 50 ms until the running total
-    ///      reaches 2f+1 of the active validator count, or the timeout
-    ///      window elapses.
-    ///   4. Return true on quorum, false on timeout (caller yields slot).
-    ///
-    /// Timeout: 800 ms — empirically sized to cover one cross-region RTT
-    /// plus signature verification overhead at committee=1000. Larger
-    /// committees may tune via `QNET_READY_HANDSHAKE_TIMEOUT_MS` ENV.
-    /// Yielding the slot on timeout is a NO-OP for safety: pacemaker
-    /// advances naturally on the next stall cycle, exact same code path
-    /// as a missing-block timeout.
-    ///
-    /// Scalability: O(committee) network cost per round-change event,
-    /// fired only at rotation boundaries (rare). At steady-state
-    /// (round = 0) this function is never called — zero overhead.
+    /// Round-change ready handshake (v16.2). A producer at round > 0 calls
+    /// this BEFORE constructing the block: sign+broadcast ProducerReady,
+    /// self-record its own ack, poll count_ready_acks() every 50 ms until
+    /// 2f+1 of the active validators ack or the 800 ms timeout
+    /// (QNET_READY_HANDSHAKE_TIMEOUT_MS) elapses. Returns true on quorum;
+    /// on timeout the caller yields the slot — a NO-OP for safety (the
+    /// pacemaker advances on the next stall, same path as a missing block).
+    /// Never called at round 0 (no rotation event → zero steady-state cost).
     async fn wait_for_round_change_ready_quorum(
         p2p: &std::sync::Arc<crate::unified_p2p::SimplifiedP2P>,
         node_id: &str,
@@ -24436,30 +23019,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         }
                     }
                 } else {
-                    // ═══════════════════════════════════════════════════════════════════
-                    // PRODUCTION FIX v2.30: Use MACROBLOCK for entropy (not microblock!)
-                    // ═══════════════════════════════════════════════════════════════════
-                    // 
-                    // PROBLEM with microblock entropy:
-                    // - If fork exists, microblock[height-10] is DIFFERENT on different nodes!
-                    // - Different entropy → different producer selection → fork continues!
-                    //
-                    // SOLUTION:
-                    // - Use MACROBLOCK N-2 hash for entropy (Byzantine finalized + SAFE MARGIN!)
-                    // - All nodes have IDENTICAL macroblock N-2 (consensus completed ~90 blocks ago)
-                    // - Same entropy → same producer selection → NO FORK!
-                    //
-                    // WHY N-2 NOT N-1:
-                    // - MacroBlock N-1 consensus STARTS at block (N-1)*90
-                    // - Consensus takes TIME (seconds to minutes)
-                    // - Block N*90+1 needs entropy IMMEDIATELY
-                    // - N-2 guarantees macroblock is FULLY READY (90+ blocks buffer)
-                    //
-                    // ARCHITECTURE:
-                    // - Epoch 1-2 (height 1-180): Genesis entropy (no ready macroblock yet)
-                    // - Epoch 3 (height 181-270): MacroBlock #1 hash
-                    // - Epoch N: MacroBlock N-2 hash
-                    // ═══════════════════════════════════════════════════════════════════
+                    // Use MACROBLOCK N-2 hash for entropy, not a microblock:
+                    // under a fork microblock[h-10] differs across nodes →
+                    // different producer → fork persists. Macroblock N-2 is
+                    // Byzantine-finalized and identical on every node (~90
+                    // blocks old) → same entropy → no fork. N-2 not N-1
+                    // because N-1 consensus only starts at (N-1)*90 and takes
+                    // time, while block N*90+1 needs entropy immediately;
+                    // N-2 guarantees a fully-ready macroblock. (Epochs 1-2 use
+                    // genesis entropy; epoch N uses macroblock N-2.)
                     
                     let current_epoch = (current_height - 1) / 90 + 1;
                     let required_macroblock = current_epoch.saturating_sub(2);  // N-2 for safety!
@@ -24560,30 +23128,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 vrf_seed
             };
             
-            // ═══════════════════════════════════════════════════════════════════════════
-            // PRODUCTION v4.5: DETERMINISTIC LEADER ELECTION (Ethereum/Solana model)
-            // ═══════════════════════════════════════════════════════════════════════════
-            //
-            // leader = candidates[ SHA3-256(slot_seed ‖ height ‖ round ‖ timeout) % N ]
-            //
-            // ALL inputs are on-chain → ALL nodes compute SAME result. Zero P2P.
-            //
-            //   slot_seed   = SHA3-256(macroblock_N-2_deterministic_hash ‖ leadership_round)
-            //   candidates  = sorted list from macroblock N-2 eligible_producers snapshot
-            //   timeout     = 0 (normal) or BFT-certified failover round
-            //
-            // VRF proof is generated during BLOCK PRODUCTION (entropy pipeline)
-            // but leader SELECTION has zero P2P dependency.
-            //
-            // Timeout failover: timeout_round changes the hash → different leader.
-            // If collision (same idx), scan forward to next non-excluded candidate.
-            //
-            // SECURITY:
-            //   - Unpredictable: slot_seed depends on macroblock hash (includes VRF proofs)
-            //   - Deterministic: all synced nodes compute identical result
-            //   - Post-quantum: Dilithium3 VRF proof in each block
-            //   - Fork-resistant: no P2P claim dependency, impossible to disagree
-            // ═══════════════════════════════════════════════════════════════════════════
+            // Deterministic leader election (zero P2P, no claims/quorum):
+            //   leader = candidates[SHA3-256(slot_seed ‖ height ‖ round ‖ timeout) % N]
+            //   slot_seed = SHA3-256(macroblock_N-2_hash ‖ leadership_round)
+            //   candidates = sorted N-2 eligible_producers snapshot
+            //   timeout    = 0 normal, or BFT-certified failover round
+            // All inputs on-chain → every synced node computes the same
+            // leader (fork-resistant). Unpredictable (slot_seed binds the
+            // macroblock hash, which includes VRF proofs); timeout failover
+            // changes the hash; index collision → scan forward.
             
             if is_debug() { println!("[DBG][PROD] select round={} candidates={}", leadership_round, candidates.len()); }
             
@@ -24599,27 +23152,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 slot_seed.copy_from_slice(&vrf_entropy);
                 let slot_input = DilithiumVrf::compute_slot_seed(&slot_seed, leadership_round);
 
-                // ═══════════════════════════════════════════════════════════════
-                // v4.5: DETERMINISTIC LEADER ELECTION (Ethereum/Solana model)
-                //
-                // ALL inputs are from on-chain state → ALL nodes compute the
-                // SAME leader. Zero P2P dependency. No collection window.
-                // No claims. No quorum. Mathematically identical result.
-                //
-                //   leader = candidates[ hash(slot_seed, height, round, timeout) % N ]
-                //
-                // Inputs (all deterministic):
-                //   slot_input  = SHA3-256(macroblock_N-2_hash ‖ leadership_round)
-                //   candidates  = sorted list from macroblock N-2 snapshot
-                //   timeout_round = 0 default, or BFT-certified failover round
-                //
-                // VRF proof is still generated during BLOCK PRODUCTION (not here)
-                // for the entropy pipeline → unpredictability of future rounds.
-                //
-                // Timeout failover: different timeout_round → different hash →
-                // different leader index. If by chance same index (1/N probability),
-                // we scan forward to find a different candidate.
-                // ═══════════════════════════════════════════════════════════════
+                // Deterministic leader election (restated): leader =
+                // candidates[hash(slot_seed, height, round, timeout) % N],
+                // all inputs on-chain. Timeout failover changes the hash;
+                // index collision → scan forward. See the fuller note above.
 
                 // v4.6 FIX: Use ROUND START HEIGHT (deterministic, identical on all nodes)
                 // instead of current_height which varies depending on when cache miss occurs.
@@ -25146,39 +23682,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     return failed_producer.to_string();
                 }
                 
-                // ═══════════════════════════════════════════════════════════════════════════
-                // CRITICAL FIX v2.92: DETERMINISTIC emergency candidate selection
-                // ═══════════════════════════════════════════════════════════════════════════
-                // REMOVED: peer_heights filtering - it's NON-DETERMINISTIC!
-                // 
-                // PROBLEM: Each node sees DIFFERENT peer_heights during network split
-                //   → Different nodes exclude different candidates
-                //   → Different candidate lists → SHA3 produces different results
-                //   → Each node selects ITSELF as emergency producer → FORK!
-                //
-                // SOLUTION: Use ONLY deterministic data for candidate list:
-                //   1. qualified list from macroblock N-2 snapshot (SAME for all nodes)
-                //   2. Exclude ONLY failed_producer (DETERMINISTIC)
-                //   3. SHA3-512 selection from finality block (DETERMINISTIC)
-                //
-                // If selected emergency producer is not synced:
-                //   → It will SELF-EXCLUDE (not produce block)
-                //   → Timeout triggers NEXT emergency selection
-                //   → All nodes again select SAME next producer (deterministic)
-                // ═══════════════════════════════════════════════════════════════════════════
-                
-                // v3.6 CRITICAL FIX: REMOVED get_failed_producers() - IT WAS NON-DETERMINISTIC!
-                // ═══════════════════════════════════════════════════════════════════════════
-                // PROBLEM: get_failed_producers() uses LOCAL DashMap that differs per node:
-                //   - Node A sees timeout for X → adds X to local failed list
-                //   - Node B hasn't seen timeout yet → X not in its list
-                //   - Both call select_emergency_producer → DIFFERENT candidates → FORK!
-                //
-                // SOLUTION: Exclude ONLY the deterministic failed_producer parameter
-                //   - All nodes receive SAME failed_producer in emergency message
-                //   - If emergency producer ALSO fails → new emergency with IT as failed_producer
-                //   - Chain of emergency selections is DETERMINISTIC (same on all nodes)
-                // ═══════════════════════════════════════════════════════════════════════════
+                // Deterministic emergency candidate selection. Any per-node
+                // input (peer_heights, get_failed_producers() local DashMap)
+                // differs across nodes during a split → different candidate
+                // lists → different SHA3 pick → each selects itself → FORK.
+                // Use only deterministic data: qualified list from the N-2
+                // snapshot, exclude ONLY the failed_producer param (same on
+                // every node via the emergency message), SHA3-512 from the
+                // finality block. An unsynced pick self-excludes → timeout →
+                // next deterministic selection (same chain on all nodes).
                 
                 for (node_id, reputation) in qualified {
                     // DETERMINISTIC: Exclude ONLY the explicitly passed failed_producer
@@ -26174,30 +24686,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // New nodes MUST sync before they can participate in macroblock creation
         let stored_height = storage.get_chain_height().unwrap_or(0);
         
-        // ═══════════════════════════════════════════════════════════════════
-        // v15.2: NO EARLY desync_skip RETURN.
-        //
-        // The previous `if stored_height + 50 < network_height { return false; }`
-        // short-circuit was the catastrophic amplifier of the mb=10 halt. When
-        // the deterministic hash picked a node that happened to be behind the
-        // chain, that node silently stepped out — and because non-primary nodes
-        // always return `false` from this function (see `we_are_initiator`
-        // branch below), NO node took over. The macroblock never got created.
-        //
-        // Correct behaviour: let the round-robin leader rotation drive the
-        // decision. The chosen initiator ATTEMPTS creation; if it fails (for
-        // any reason — desync, crash, network loss, storage issue), the
-        // participating nodes detect the timeout, emit signed view-change
-        // votes, HIGHEST_CERTIFIED_ROUND[mb] advances, and the next invocation
-        // of `should_initiate_consensus` picks `(base_idx + view_round + 1) % N`
-        // — the next candidate in the committee — who then attempts creation.
-        //
-        // This delegates "is the chosen leader able?" from a local
-        // best-effort check into the BFT protocol itself, which is what every
-        // scale-correct L1 consensus protocol does. We keep network_height
-        // available for logging and for informed best-effort attempts, but it
-        // no longer pre-disqualifies participation.
-        // ═══════════════════════════════════════════════════════════════════
+        // No early desync_skip return. The old `if stored_height+50 <
+        // network_height { return false }` amplified the mb=10 halt: when the
+        // deterministic hash picked a behind node it stepped out, and since
+        // non-primary nodes always return false here, NO node took over.
+        // Instead the chosen initiator ATTEMPTS creation; on any failure the
+        // participants time out, emit signed view-change votes, certified
+        // advances, and the next candidate is picked — "is the leader able?"
+        // is delegated to the BFT protocol. network_height kept for logging
+        // only, no longer pre-disqualifies participation.
         let network_height = p2p.get_cached_network_height().unwrap_or(0);
         if network_height > 0 && stored_height + 50 < network_height && is_warn() {
             println!(
@@ -26357,46 +24854,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         selection_hasher.update(&entropy_source);
         selection_hasher.update(macroblock_round.to_le_bytes());
 
-        // v14.8: CANONICAL MACROBLOCK VIEW CHANGE.
-        // Mix the 2f+1-certified timeout round for THIS macroblock boundary
-        // into the leader-selection hash. When a macroblock's commit/reveal
-        // phase fails to reach 2f+1, validators broadcast a Dilithium3-signed
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v15.2: ROUND-ROBIN LEADER ROTATION (copied from microblock layer)
-        // ═══════════════════════════════════════════════════════════════════════════
-        // The canonical BFT leader-rotation pattern that the microblock layer has
-        // been running in production:
-        //
+        // Canonical macroblock view-change — round-robin leader rotation,
+        // same model as the microblock layer:
         //   base_idx = hash(entropy, mb_round, sorted_candidates) % N
-        //   leader   = sorted_candidates[ (base_idx + view_round) % N ]
-        //
-        // Properties:
-        //   * Base index is a VRF-style pick from on-chain data — unpredictable
-        //     for future epochs yet identical on every honest node at the same
-        //     macroblock index.
-        //   * Each view-change advances the leader by EXACTLY one slot in the
-        //     sorted committee, so after N view rounds we have covered every
-        //     distinct candidate. No probabilistic re-roll, no risk of the same
-        //     unreachable node being picked twice in a row.
-        //   * Symmetric with `select_microblock_producer_with_round` — one
-        //     leader-selection model across both consensus layers, easier to
-        //     reason about and to audit.
-        //
-        // Why this replaces the previous hash-with-view-round approach:
-        //   The prior design mixed `HIGHEST_CERTIFIED_ROUND[mb]` into the hash
-        //   input. That made every view-change give a fresh random pick from N
-        //   candidates, so a dead or partitioned node could be re-selected
-        //   multiple rounds in a row (probability 1/N per round). When the
-        //   chosen candidate was behind the network it fell into the old
-        //   `desync_skip` early return and NO node stepped up — the observed
-        //   failure mode at the mb=10 halt. Round-robin is deterministic and
-        //   monotonically advances through every candidate.
-        //
-        // Scalability: at the MAX_VALIDATORS=1000 committee cap, N view rounds
-        // cover every candidate. Combined with reputation-filtered committee
-        // (`create_eligible_producers_snapshot`), a handful of view-changes is
-        // almost always enough to reach a live honest leader.
-        // ═══════════════════════════════════════════════════════════════════════════
+        //   leader   = sorted_candidates[(base_idx + view_round) % N]
+        // base_idx is a VRF-style pick from on-chain data (identical on every
+        // honest node); each view-change advances exactly one slot so all N
+        // candidates are covered in N rounds. Replaces hash-with-view-round:
+        // mixing the certified round in re-rolled randomly, so a dead node
+        // could be re-picked repeatedly and fall into the old desync_skip
+        // with no one stepping up (the mb=10 halt). Deterministic, monotonic.
 
         // Add all candidate IDs to ensure consistent ordering — sorted committee is
         // the shared canonical input for BOTH the base-index hash and the view-round
@@ -26458,29 +24925,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return true;
         }
         
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v3.2: NO EARLY FALLBACK INITIATOR DECISION!
-        // ═══════════════════════════════════════════════════════════════════════════
-        //
-        // OLD BEHAVIOR (BROKEN):
-        //   Check if primary initiator is available via get_validated_active_peers()
-        //   If not available, next node becomes fallback initiator
-        //   PROBLEM: Different nodes have different local P2P state → race condition!
-        //   
-        //   Node A sees primary unavailable → creates macroblock
-        //   Node B sees primary available → waits for primary
-        //   Result: potential fork or consensus failure!
-        //
-        // NEW BEHAVIOR (CORRECT):
-        //   Only deterministically selected initiator returns true here
-        //   Fallback happens via TIMEOUT in participate_in_macroblock_consensus()
-        //   All nodes use same timeout → deterministic fallback behavior
-        //
-        // If primary initiator fails to create macroblock within timeout:
-        //   1. All nodes detect via timeout (not local P2P state)
-        //   2. Emergency macroblock creation triggered (separate mechanism)
-        //   3. Sync from peers who received the macroblock
-        // ═══════════════════════════════════════════════════════════════════════════
+        // No early fallback-initiator decision. Deciding fallback from local
+        // P2P state raced (node A sees primary down → creates; node B sees it
+        // up → waits → fork). Only the deterministically-selected initiator
+        // returns true here; fallback happens via TIMEOUT in
+        // participate_in_macroblock_consensus (all nodes share the timeout →
+        // deterministic).
         
         // I'm participant (not initiator) - wait for macroblock via timeout
         false
@@ -26603,69 +25053,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         // Check if node is synchronized before participating
                         let is_synchronized = coordinator_is_synchronized();
 
-                        // ═══════════════════════════════════════════════════════════════
-                        // v15.15: GENESIS-EPOCH BOOTSTRAP EXCEPTION
-                        //
-                        // Problem the exception solves:
-                        //   The unconditional "skip consensus while SYNCING" rule
-                        //   below is correct for steady-state operation, but it
-                        //   creates a chicken-and-egg deadlock on genesis cold-start.
-                        //
-                        //   Concretely: on a fresh 5-genesis network all nodes start
-                        //   simultaneously at height 0. Producer election fires the
-                        //   first microblock; peers consume it and ingest h=1, h=2,
-                        //   etc. Even nodes that are running the consensus listener
-                        //   see their own LOCAL_BLOCKCHAIN_HEIGHT lag the network
-                        //   median for the first few seconds (P2P propagation,
-                        //   rate-limit cool-downs, decode pipeline) — coordinator
-                        //   reports SYNCING. By the time a node reaches the first
-                        //   macroblock boundary (h=90) it has the full microblock
-                        //   chain locally, but coordinator may STILL report SYNCING
-                        //   because the cached network height moved on to h=91+.
-                        //   The previous guard refused to participate in MB1
-                        //   consensus on every node simultaneously — no commits
-                        //   collected, fallback-initiator finalised an empty
-                        //   macroblock with sub-quorum data, validator-side strict
-                        //   2f+1 rejected it everywhere, deadlock.
-                        //
-                        // Exception:
-                        //   A SYNCING node MAY participate in macroblock consensus
-                        //   if and only if:
-                        //     (1) it is a genesis-epoch macroblock (mb_idx ≤ 2),
-                        //         where the committee is the baked genesis set and
-                        //         the leader-selection beacon is the genesis seed —
-                        //         no chain-state dependency on a previous MB,
-                        //     (2) the node's local height has reached the
-                        //         macroblock-end boundary (it has the full
-                        //         microblock chain for THIS MB locally), and
-                        //     (3) it can compute its own commit/reveal from local
-                        //         state alone (PoH, VRF, randomness beacon are all
-                        //         genesis-derived for these epochs).
-                        //
-                        // Safety:
-                        //   * Each commit/reveal is cryptographically bound to the
-                        //     round_number and the node's Dilithium3 keypair —
-                        //     other nodes verify the signature regardless of the
-                        //     sender's sync state.
-                        //   * Threshold (2f+1) is enforced on the receiver side
-                        //     using the canonical baked committee_size for genesis
-                        //     epochs, not derived from any sender-controlled value.
-                        //   * The exception is hard-gated by `macroblock_index ≤ 2`
-                        //     so it cannot be exploited beyond the bootstrap
-                        //     window. Post-genesis epochs (mb_idx ≥ 3) require the
-                        //     N-2 macroblock snapshot which a SYNCING node may not
-                        //     yet have — the strict guard remains in effect.
-                        //
-                        // Scalability:
-                        //   * The exception fires at most twice per genesis cold
-                        //     start (mb=1 and mb=2). For all subsequent macroblocks
-                        //     in the lifetime of the network — including all
-                        //     macroblocks for the eventual 1000-validator-committee
-                        //     production load — the strict synchronisation gate
-                        //     remains in force.
-                        //   * Two atomic loads: LOCAL_BLOCKCHAIN_HEIGHT read and
-                        //     coordinator_is_synchronized read.
-                        // ═══════════════════════════════════════════════════════════════
+                        // v15.15: genesis-epoch bootstrap exception to "skip consensus while
+                        // SYNCING". On a fresh 5-genesis cold-start every node lags the network
+                        // median for the first seconds → all would refuse MB1 → empty sub-quorum
+                        // macroblock → 2f+1 rejects → deadlock. Exception: a SYNCING node MAY
+                        // join macroblock consensus iff (1) genesis-epoch MB (mb_idx<=2: baked
+                        // committee + genesis-seed beacon, no prior-MB dep), (2) local height
+                        // reached this MB's end boundary, (3) commit/reveal computable from local
+                        // genesis-derived state. Safety: commit/reveal Dilithium-sig-bound
+                        // (verified regardless of sender sync); receiver 2f+1 uses the baked
+                        // genesis committee_size; HARD-gated mb_idx<=2. Fires <=2x per cold start.
                         let local_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                             .load(std::sync::atomic::Ordering::Relaxed);
                         let mb_end_height = macroblock_index * 90;
@@ -29123,50 +27520,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
-    // ═══════════════════════════════════════════════════════════════════════════
-    // SKIP-MARKER MACROBLOCK CONSTRUCTION (v15.7)
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Build a skip-marker macroblock for `mb_idx` once the canonical
-    // commit-reveal path AND every deterministic fallback-initiator attempt
-    // have exhausted their retries. The skip marker:
-    //
-    //   1. occupies the macroblock-chain slot at `mb_idx` so subsequent
-    //      macroblocks have a valid `previous_hash` linkage,
-    //   2. carries the strongest 2f+1 AggregatedTimeoutCertificate currently
-    //      known to this node as cryptographic evidence of consensus
-    //      failure (`is_skip_marker = true`, `skip_certificate = Some(...)`)
-    //      so peers can independently re-verify the failure proof,
-    //   3. inherits the previous macroblock's `state_root` because no state
-    //      mutations are processed for a skipped epoch,
-    //   4. uses the boundary microblock's `timestamp`, `poh_hash` and
-    //      `poh_count` for deterministic header fields — every honest node
-    //      has the same boundary microblock for `mb_idx`, so every honest
-    //      node deriving a skip marker for this index produces the same
-    //      `MacroBlock::hash()` (since hash() does not include consensus_data,
-    //      a TC-bytes mismatch across nodes does not break chain linkage),
-    //   5. lists the actual microblock hashes for the skipped epoch so the
-    //      regular `validate()` invariants (≤ 100 micro_blocks, non-empty
-    //      vec) hold without special-casing.
-    //
-    // Determinism guarantees
-    // ─────────────────────────────────────────────────────────────────────
-    // The macroblock hash is fully deterministic across honest nodes:
-    //   * height          deterministic (the missing index)
-    //   * timestamp       sourced from microblock at end_height — deterministic
-    //   * previous_hash   sourced from prev macroblock — deterministic
-    //   * state_root      sourced from prev macroblock — deterministic
-    //   * micro_blocks    iterated h=start..=end, deterministic
-    // The skip_certificate bytes themselves may differ across nodes (each
-    // sees a slightly different aggregated vote set), but `MacroBlock::hash()`
-    // does NOT cover consensus_data, so chain linkage stays intact.
-    //
-    // Scalability
-    // ─────────────────────────────────────────────────────────────────────
-    // Construction reads exactly one prev macroblock and the 90 microblocks
-    // of the skipped epoch. Cost is independent of validator count and
-    // matches the regular finalization read pattern. Each honest node
-    // performs this construction at most once per skipped index.
-    // ═══════════════════════════════════════════════════════════════════════════
+    // Build a skip-marker macroblock for mb_idx after commit-reveal and
+    // every fallback exhausted retries. It: (1) occupies the slot so the
+    // next macroblock's previous_hash links; (2) carries the strongest 2f+1
+    // AggregatedTimeoutCertificate (is_skip_marker=true) so peers re-verify
+    // the failure proof; (3) inherits prev state_root (no mutations);
+    // (4) takes header fields (timestamp/poh) from the boundary microblock
+    // so every honest node derives the same MacroBlock::hash() — hash()
+    // excludes consensus_data, so differing skip_certificate bytes don't
+    // break linkage; (5) lists the real microblock hashes so validate()
+    // invariants hold. Reads one prev macroblock + the 90 microblocks.
     async fn build_skip_marker_macroblock(
         storage: &Arc<Storage>,
         p2p: &Arc<SimplifiedP2P>,
@@ -29455,46 +27818,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // back to direct macroblock sync from peers (same as before).
         // ═══════════════════════════════════════════════════════════════════════════
         const MAX_ROUNDS: u64 = 8;
-        // ═══════════════════════════════════════════════════════════════════════
-        // v15.11: COMMITTEE-AWARE DYNAMIC ROUND TIMEOUT (recalibrated).
-        //
-        // The v15.2 baseline of 40s was overly conservative — empirical p95
-        // leader-to-participant latency on the 5-node genesis mesh is well
-        // under 5s. A 40s timeout meant a stalled initiator burned the whole
-        // 90-block macroblock window before view-change rotated to a healthy
-        // candidate (forensic case mb=1477: 52s primary timeout + 48s for
-        // sync retries = 100s total dead-time on a 90s mb window).
-        //
-        // New formula (industry-grade tuned for both small genesis and large
-        // super-node committees):
-        //     timeout = clamp( 10 + committee / 40 , 10 .. 45 )
-        //
-        //   * 5-node mesh     → 10s   (4× faster than v15.2's 40s)
-        //   * 100-node mesh   → 12s
-        //   * 500-node mesh   → 22s
-        //   * 1000-node cap   → 35s
-        //   * 2000+           → 45s   (large super-node deployments)
-        //
-        // Recovery cadence at small committees (8 rounds × 10s = 80s) now
-        // fits inside a single macroblock window, so a Byzantine or stalled
-        // initiator triggers full failover before the next mb starts. At
-        // 1000+ super-node scale (35s × 3 rounds = 105s) the network still
-        // surfaces a healthy producer well within the practical timeout
-        // budget the consensus state machine permits.
-        //
-        // Lower floor 10s comfortably exceeds Dilithium3 vote signing +
-        // 2f+1 aggregation latency even on saturated links; below 10s the
-        // BFT path itself becomes the bottleneck, not the timeout.
-        // Upper cap 45s leaves room for multi-region propagation under
-        // heavy global load.
-        //
-        // Deterministic across honest nodes: `all_participants` is the
-        // canonical N-2 snapshot committee, identical on every node at the
-        // same macroblock boundary. No gossip-dependent inputs, no fork risk.
-        //
-        // Scalability: a single `.len()` read and arithmetic per round — zero
-        // async work, negligible overhead even at the 1000-validator cap.
-        // ═══════════════════════════════════════════════════════════════════════
+        // Committee-aware dynamic round timeout. The v15.2 40s was too
+        // conservative (p95 latency <5s on the 5-node mesh; 40s burned the
+        // whole 90s mb window — forensic mb=1477 had 100s dead-time). Base =
+        // clamp(10 + committee/40, 10..45)s (5-node→10s, 1000→35s, 2000+→45s)
+        // so 8-round recovery fits inside one mb window. Floor 10s exceeds
+        // Dilithium3 sign + 2f+1 aggregation latency; cap 45s covers multi-
+        // region load. Deterministic: all_participants is the canonical N-2
+        // snapshot, no gossip inputs → no fork risk.
         let committee_len = all_participants.len() as u64;
         // v26 D3: per-round exponential view-change backoff.
         // base scales with committee: clamp(10 + N/40, 10, 45)s.
@@ -29618,51 +27949,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Ok(());
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // v15.7: FALLBACK-INITIATOR PROTOCOL — every honest participant can
-        // assume the initiator role when the primary path fails to produce a
-        // macroblock for this index.
-        //
-        // Why this is canonical for our two-layer consensus
-        // ─────────────────────────────────────────────────────────────────────
-        // Every node in the participant set ran the same commit and reveal
-        // phases against the same end-height boundary. Once 2f+1 reveals were
-        // observed locally, this node holds *exactly* the evidence the chosen
-        // initiator would have used, so it can construct the same canonical
-        // macroblock independently. The single-initiator design is an
-        // optimisation, not a safety property — when it stalls, the safety
-        // property remains intact and every participant can deterministically
-        // resume progress on its own.
-        //
-        // Race-free convergence
-        // ─────────────────────────────────────────────────────────────────────
-        // Without ordering, all participants would race to build and broadcast
-        // the same macroblock, wasting bandwidth and producing transient
-        // log-noise. We sort the participant set by node_id and offset the
-        // fallback attempt by `our_rank * FALLBACK_GRACE_PER_RANK` seconds.
-        // The lowest-ranked active participant goes first; every higher rank
-        // re-checks storage on wake and short-circuits if the lower rank
-        // already produced and broadcast the macroblock. Convergence is at
-        // most a single canonical macroblock per index because
-        // `trigger_macroblock_consensus` short-circuits on a storage hit at
-        // its top.
-        //
-        // Bound on recovery time
-        // ─────────────────────────────────────────────────────────────────────
-        // For N participants the worst-case recovery is `(N-1) *
-        // FALLBACK_GRACE_PER_RANK` seconds when every lower-ranked node is
-        // unhealthy — same as a sequential fail-over. With FALLBACK_GRACE = 5s
-        // and committee size = 1000 this caps at ~83 minutes; in practice
-        // the first one or two ranks succeed within seconds.
-        //
-        // Scalability
-        // ─────────────────────────────────────────────────────────────────────
-        // Each rank performs at most one trigger attempt; one trigger fully
-        // builds and broadcasts the macroblock for every participant to fetch.
-        // No new state, no new synchronisation primitives — just a sorted
-        // participant list and a `tokio::time::sleep`. Safe at any committee
-        // size.
-        // ═══════════════════════════════════════════════════════════════════════
+        // v15.7: fallback-initiator protocol. Single-initiator macroblock build
+        // is an optimization, not safety: every participant ran the same commit/
+        // reveal, so once 2f+1 reveals are observed locally ANY honest node
+        // holds the same evidence and builds the SAME canonical macroblock if
+        // the primary stalls. Race-free: sort participants by node_id, offset
+        // the attempt by our_rank*FALLBACK_GRACE_PER_RANK; higher ranks re-check
+        // storage on wake and short-circuit (trigger_macroblock_consensus
+        // short-circuits on storage hit → <=1 canonical mb/index). Worst-case
+        // recovery (N-1)*FALLBACK_GRACE; in practice rank 0-1 win in seconds.
         let mut sorted_participants: Vec<String> = all_participants.clone();
         sorted_participants.sort();
         let our_rank = sorted_participants
@@ -29755,32 +28050,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // v15.7: SKIP-MARKER LAST-RESORT PATH
-        // ═══════════════════════════════════════════════════════════════════════
-        // At this point the canonical consensus path AND every deterministic
-        // fallback-initiator attempt have failed to produce a macroblock for
-        // `macroblock_index`. The network has, however, gathered ≥ 2f+1
-        // Dilithium3-signed view-change votes at the maximum round (the
-        // pacemaker has stored an AggregatedTimeoutCertificate for this
-        // index). That certificate is the cryptographic proof that
-        // consensus genuinely failed, and it is sufficient evidence to seal
-        // the index with a skip-marker macroblock so that the next
-        // macroblock's `previous_hash` linkage is well-defined.
-        //
-        // Each honest node deterministically computes the same skip-marker
-        // header fields (height, timestamp from boundary microblock,
-        // previous_hash, state_root from prev macroblock, micro_blocks vec).
-        // `MacroBlock::hash()` does not include consensus_data, so even when
-        // the embedded skip_certificate bytes differ across nodes (each
-        // local pacemaker may aggregate a slightly different vote subset),
-        // the macroblock hash itself is byte-stable across the cohort.
-        //
-        // After save we broadcast the skip marker so peers that did not
-        // independently construct it can pick it up via the regular
-        // macroblock receive path (which validates the embedded
-        // certificate via `verify_skip_certificate_bytes`).
-        // ═══════════════════════════════════════════════════════════════════════
+        // Skip-marker last-resort path. Canonical + every fallback attempt
+        // failed for macroblock_index, but the pacemaker has a ≥2f+1 view-
+        // change AggregatedTimeoutCertificate — cryptographic proof consensus
+        // failed and sufficient to seal the index so the next macroblock's
+        // previous_hash is well-defined. Every honest node derives the same
+        // header (MacroBlock::hash() excludes consensus_data, so differing
+        // skip_certificate bytes don't break linkage). Broadcast after save
+        // so peers can pick it up and re-verify the certificate.
         match Self::build_skip_marker_macroblock(
             &storage,
             p2p,
@@ -29891,62 +28168,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         let network_size = all_participants.len();
 
-        // ═══════════════════════════════════════════════════════════════════
-        // v15.15: CANONICAL 2f+1 GATE (replaces hardcoded "4" / progressive
-        // degradation ladder).
-        //
-        // Purpose:
-        //   This gate runs BEFORE start_round_at_height. It rejects rounds
-        //   that lack enough committee members to even ATTEMPT a Byzantine-
-        //   safe finalisation. The actual finalisation threshold is enforced
-        //   in commit_reveal::finalize_round_by_number AND in the validator-
-        //   side macroblock validation — both use the same canonical
-        //   `(N * 2 + 2) / 3` formula. This gate must agree with them so
-        //   we don't start a round that finalisation will inevitably reject.
-        //
-        // Why the previous code was wrong:
-        //   * `network_size > 10` branch hardcoded `4`, which is correct for
-        //     a 5-node committee but undefined for a 1000-node committee
-        //     where the real 2f+1 is 668. The gate would let any size round
-        //     start with just 4 participants — finalise would then reject
-        //     it, wasting a full commit-reveal cycle.
-        //   * `0..=900 -> 4/3/2/1` ladder allowed rounds to start with 2 or
-        //     even 1 commit during genesis-bootstrap windows. The validator
-        //     demands canonical 4 from baked genesis_node_count and would
-        //     reject — exactly the producer/validator threshold mismatch
-        //     we observed in the v15.14 halt.
-        //
-        // New design:
-        //   Single canonical formula `((N * 2) + 2) / 3`. The committee
-        //   size N is taken from the SAME source the validator uses, so
-        //   producer and validator can never disagree on the threshold:
-        //     * Genesis epochs (mb_idx ≤ 2): `genesis_node_count()` baked
-        //       into the binary. Validator does the same in
-        //       node.rs::validate_macroblock.
-        //     * Normal epochs (mb_idx ≥ 3): `all_participants.len()` —
-        //       the committee derived from the N-2 snapshot via the same
-        //       deterministic VRF subsample every honest node computes.
-        //
-        //   For genesis bootstrap: N=5, threshold=4. If the live committee
-        //   shrinks below 4 (e.g., one genesis node temporarily offline),
-        //   the gate refuses and the consensus listener re-evaluates on
-        //   the next block event when the peer rejoins. BFT safety does
-        //   not relax just because we are early in the chain.
-        //
-        // Safety:
-        //   * No degraded threshold path. A round either has 2f+1 capacity
-        //     or does NOT start.
-        //   * Producer and validator share an identical formula and an
-        //     identical N source per epoch — by construction they cannot
-        //     disagree on whether a macroblock meets quorum.
-        //
-        // Scalability:
-        //   Single arithmetic operation, no branching by network size.
-        //   Identical cost at 5 or 100K nodes. Threshold scales linearly:
-        //     5 → 4, 100 → 67, 668 → 446, 1000 → 668.
-        // ═══════════════════════════════════════════════════════════════════
-        // Re-use the macroblock_index already computed at the top of this
-        // function (line where end_height/90 was first taken).
+        // v15.15: canonical 2f+1 pre-round gate (no degraded ladder). Before
+        // start_round_at_height, reject rounds lacking 2f+1 capacity using the
+        // SAME (N*2+2)/3 formula and SAME N-source as
+        // commit_reveal::finalize_round_by_number AND validator-side
+        // validate_macroblock — so the producer never starts a round the
+        // validator will inevitably reject (the v15.14 threshold-mismatch halt).
+        // N: genesis (mb_idx<=2)=genesis_node_count() baked; normal (>=3)=
+        // all_participants.len() (N-2 snapshot VRF subsample). A round either has
+        // 2f+1 capacity or does NOT start. Scales 5→4 … 1000→668.
         let canonical_committee_size = if macroblock_index <= 2 {
             // Match validator-side genesis path. genesis_node_count() is
             // baked-in and identical on every honest node by construction.
@@ -30106,58 +28336,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     }
                 }
                 Err(e) => {
-                    // ═══════════════════════════════════════════════════════
-                    // v15.0: UNIFIED CONSENSUS-STALL FALLBACK PATH
-                    // ═══════════════════════════════════════════════════════
-                    // Previously only phase errors (`Not in reveal phase` /
-                    // `NoActiveRound`) triggered a deterministic fallback
-                    // leader; reveal-shortage errors ("Insufficient VALID
-                    // reveals for Byzantine safety") bubbled up as hard
-                    // `return Err(…)` which ABORTED macroblock creation.
-                    //
-                    // An aborted macroblock leaves a gap in the chain —
-                    // the N-2 snapshot rule at mb+2 then cannot find its
-                    // source macroblock and the network halts at the NEXT
-                    // macroblock boundary. This was the observed halt mode
-                    // of the last cascade: mb=34 failed finalization,
-                    // mb=35 proceeded, mb=36 could not start because its
-                    // N-2 snapshot pointed at the missing mb=34 row.
-                    //
-                    // Fix: treat ALL finalize errors as triggers for the
-                    // deterministic fallback leader, mark the macroblock
-                    // index as CONSENSUS_STALLED so operators/RPC/explorer
-                    // see the degradation, and let chain progression
-                    // continue. The randomness beacon assembled later from
-                    // accumulated VRF outputs is independent of the
-                    // commit-reveal leader and remains usable by mb+2.
-                    //
-                    // Safety argument:
-                    //   * The fallback leader is a pure deterministic
-                    //     function of (end_height / 90, sorted participants).
-                    //     Every honest node computes the same leader, so
-                    //     liveness is preserved without sacrificing agreement.
-                    //   * Reveal shortage does NOT let an attacker pick the
-                    //     leader: the seed is already mixed with the
-                    //     macroblock index before indexing, and participants
-                    //     come from the canonical N-2 snapshot which no ≤ f
-                    //     adversary can alter.
-                    //   * The CONSENSUS_STALLED flag is authoritative state
-                    //     feeding the next-macroblock production guard
-                    //     (prevents silent degradation from cascading).
-                    //
-                    // Scalability: O(|participants|) hash update per fallback —
-                    // bounded by the committee cap. One fallback per failed
-                    // finalize, which is at most once per 90 microblocks.
-                    // ═══════════════════════════════════════════════════════
-                    // v15.0: Match the exact error payload emitted by
-                    // `CommitRevealConsensus::finalize_round` for the
-                    // reveal-shortage case. Using the full phrase avoids
-                    // false-positives from unrelated errors that happen
-                    // to contain the single word "Insufficient" (e.g.
-                    // future "Insufficient peers" style diagnostics) —
-                    // those should bubble up the unknown-error branch so
-                    // operators see the real cause instead of silently
-                    // degrading to the fallback leader.
+                    // v15.0: ALL finalize errors (incl. reveal-shortage, not just phase
+                    // errors) trigger the deterministic fallback leader + mark the macroblock
+                    // CONSENSUS_STALLED — a hard Err aborts the mb, leaving a chain gap so the
+                    // N-2 snapshot at mb+2 can't find its source → halt at next boundary
+                    // (observed mb34→mb36). Fallback leader = pure fn(end_height/90, sorted
+                    // N-2 participants) → same on all honest; reveal shortage can't let <=f
+                    // attackers pick it. CONSENSUS_STALLED feeds the next-mb guard (anti-
+                    // cascade). Match the FULL reveal-shortage phrase (not just "Insufficient")
+                    // so unrelated errors bubble up instead of silently degrading.
                     let err_str = e.to_string();
                     let is_reveal_shortage = err_str.contains("Insufficient VALID reveals");
                     let is_phase_error = err_str.contains("Not in reveal phase")
@@ -30802,45 +28989,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // emits regular macroblocks backed by 2f+1 reveals.
                 is_skip_marker: false,
                 skip_certificate: None,
-                // ═══════════════════════════════════════════════════════════════════
-                // v15.9: SNAPSHOT BINDING — populate snapshot_root only at
-                // canonical snapshot boundaries (every SNAPSHOT_INCREMENTAL_INTERVAL
-                // microblocks ≡ every 40th macroblock). The storage layer keys
-                // snapshots by *microblock height* (the boundary block that
-                // closes the interval), not by macroblock index — so the
-                // producer must translate `round_number` (= mb_idx) to the
-                // boundary microblock height (`mb_idx * 90`) before querying
-                // the snapshot store. Without this translation every lookup
-                // returns None and the supermajority binding never activates.
-                //
-                // Each honest node materialises the snapshot deterministically
-                // through the apply-stage trigger (block_pipeline) and
-                // serialises it with canonical key ordering, so every node
-                // computes the same digest. The resulting hash is implicitly
-                // endorsed by the supermajority through the macroblock's
-                // commit-reveal Dilithium3 signatures, giving fresh
-                // bootstrappers a trust-less anchor to verify any snapshot
-                // bytes they download from peers.
-                //
-                // RACE-WINDOW HANDLING
-                // ───────────────────────────────────────────────────────────
-                // The apply-stage trigger spawns the snapshot creation task
-                // on the blocking pool when the boundary microblock is
-                // applied; for very large states (1M+ accounts) the
-                // background task may still be running when MB construction
-                // begins. We therefore poll the snapshot store with a bounded
-                // budget (up to 30 attempts × 100 ms = 3 s) before falling
-                // back to the legacy path. Non-boundary macroblocks skip the
-                // lookup entirely (no I/O cost on the hot path).
-                //
-                // SCALABILITY
-                // ───────────────────────────────────────────────────────────
-                // At 1 000+ super-node committees, every honest node performs
-                // the same binding deterministically — total network cost is
-                // unchanged versus the producer-only model, the binding is
-                // simply present on every node so any peer can serve as a
-                // verification anchor for an incoming bootstrapper.
-                // ═══════════════════════════════════════════════════════════════════
+                // Populate snapshot_root only at snapshot boundaries (every
+                // SNAPSHOT_INCREMENTAL_INTERVAL microblocks). Storage keys
+                // snapshots by microblock height, so round_number (=mb_idx)
+                // must be translated to mb_idx*90 or every lookup returns None
+                // and the binding never activates. Deterministic
+                // materialisation → identical digest, endorsed by the 2f+1
+                // commit-reveal → trustless bootstrap anchor. Race window: the
+                // snapshot task may still be running at MB construction, so
+                // poll the store (≤30×100ms=3s) before the legacy fallback;
+                // non-boundary macroblocks skip the lookup.
                 snapshot_root: {
                     const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
                     let mb_end_height = consensus_data.round_number * 90;
@@ -32000,34 +30158,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         valid_indices
     }
     
-    /// PRODUCTION v2.57: Verify Dilithium3 on SIGVERIFY_RUNTIME
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// ISOLATION: Runs on dedicated SIGVERIFY_RUNTIME
-    /// PERFORMANCE: ~1,000 verifications/sec/core (10x slower than Ed25519)
-    /// SECURITY: CRYSTALS-Dilithium3 - NIST PQC Standard
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// CRITICAL FIX v3.31: Build canonical message matching the format used at signing time.
-    /// User TXs (signed by mobile app) use "transfer:from:to:amount:nonce:gas_price:gas_limit".
-    /// System TXs (signed by nodes) use "from|to|amount|nonce|gas_price|gas_limit|timestamp".
-    /// Without this, Ed25519/Dilithium verification fails for gossiped user TXs.
-    /// CRITICAL v3.31.1: Build canonical message for signature verification
-    /// This MUST match EXACTLY how the client/RPC signed the message!
-    /// 
-    /// FORMAT MATRIX (source of truth):
-    /// ┌─────────────────────┬──────────────────────────────────────────────────────────┬──────────────┐
-    /// │ TX Type             │ Canonical Message Format                                 │ Signed By    │
-    /// ├─────────────────────┼──────────────────────────────────────────────────────────┼──────────────┤
-    /// │ Transfer            │ transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas}  │ User (mobile)│
-    /// │ BatchTransfers      │ batch_transfer:{from}:{total}:{count}:{batch_id}         │ User (batch) │
-    /// │ ContractDeploy      │ contract_deploy:{from}:{code_hash}:{nonce}               │ User (dApp)  │
-    /// │ ContractCall        │ contract_call:{from}:{contract}:{method}:{nonce}          │ User (dApp)  │
-    /// │ HeartbeatCommitment │ {from}|{to}|{amount}|{nonce}|{gas_price}|{gas}|{ts}      │ Node (hybrid)│
-    /// │ PingCommitment      │ {from}|{to}|{amount}|{nonce}|{gas_price}|{gas}|{ts}      │ Node (hybrid)│
-    /// │ RewardDistribution  │ claim_rewards:{node_id}:{wallet} (system_rewards_pool)   │ Client Ed25519│
-    /// │ RewardDistribution  │ (SKIPPED in batch verify — emission/unsigned)             │ System       │
-    /// │ NodeRegistration    │ (SKIPPED in batch verify — unsigned system TX)            │ System       │
-    /// │ LightNodeBitmap     │ (SKIPPED in batch verify — unsigned system TX)            │ System       │
-    /// └─────────────────────┴──────────────────────────────────────────────────────────┴──────────────┘
+    /// Build the canonical verify message — MUST byte-match how the
+    /// client/RPC signed, or Dilithium3/Ed25519 verification fails. Formats
+    /// (source of truth; per-arm comments below point at each signer):
+    ///   Transfer        transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas}
+    ///   BatchTransfers  batch_transfer:{from}:{total}:{count}:{batch_id}
+    ///   ContractDeploy  contract_deploy:{from}:{code_hash}:{nonce}
+    ///   ContractCall    contract_call:{from}:{contract}:{method}:{nonce}
+    ///   Heartbeat/Ping  {from}|{to}|{amount}|{nonce}|{gas_price}|{gas}|{ts}
+    ///   RewardClaim     claim_rewards:{node_id}:{wallet}
+    /// System/unsigned TXs (emission RewardDistribution, NodeRegistration,
+    /// LightNodeBitmap) are SKIPPED in batch verify.
     pub fn build_canonical_verify_message(tx: &qnet_state::Transaction) -> String {
         let to_str = tx.to.as_ref().map(|s| s.as_str()).unwrap_or("");
         match &tx.tx_type {
@@ -33207,28 +31348,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         if let Some(ref p2p) = self.unified_p2p {
-            // ═══════════════════════════════════════════════════════════════════════════
-            // CRITICAL FIX v2.61: SIZE-BASED BATCHING for macroblocks
-            // Macroblocks are typically larger, use conservative limit
-            // ═══════════════════════════════════════════════════════════════════════════
-            // v15.8: BATCH SIZE INCREASED FROM 500 KB → 5 MB.
-            // The previous 500 KB cap was extremely conservative — at the
-            // canonical macroblock size of ~50–500 KB it forced one
-            // macroblock per response on average, which throttled fresh-node
-            // catch-up to the per-batch round-trip cost (sequential request
-            // → wait → next request). Raising to 5 MB keeps a single
-            // response well under the 87 MB SHRED ceiling and well under
-            // the 16 MB QUIC stream window, while letting the server pack
-            // up to ~10 macroblocks (the existing per-response upper bound
-            // in `sync_macroblocks_inner`) into one wire message. Catch-up
-            // throughput scales near-linearly until either the network
-            // window or the apply pipeline becomes the bottleneck.
-            //
-            // Defense levels still hold: the 80 MB block-size limit at
-            // production time (`MAX_BLOCK_SIZE_BYTES` in the producer
-            // path) caps any single macroblock the network can produce,
-            // and the QUIC transport already enforces per-stream and
-            // per-connection memory ceilings.
+            // Size-based batching for macroblocks. The old 500 KB cap forced
+            // ~1 macroblock/response → catch-up throttled to the per-batch
+            // RTT. 5 MB packs ~10 macroblocks/response while staying under
+            // the 87 MB SHRED ceiling and 16 MB QUIC stream window; the
+            // 80 MB MAX_BLOCK_SIZE_BYTES cap + QUIC memory ceilings still hold.
             const MAX_BATCH_SIZE_BYTES: usize = 5_000_000;  // 5 MB max per message (≤10 macroblocks per response)
             const MB_SYNC_BATCH_DELAY_MS: u64 = 10;  // 10ms pacing between batches
             
@@ -33350,41 +31474,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             )));
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // SKIP-MARKER MACROBLOCK ACCEPTANCE PATH (v15.7)
-        // ═══════════════════════════════════════════════════════════════════════
-        // Skip-marker macroblocks substitute the commit-reveal evidence with a
-        // 2f+1-signed AggregatedTimeoutCertificate carried in
-        // `consensus_data.skip_certificate`. They are produced only when both
-        // the canonical commit-reveal path and every deterministic
-        // fallback-initiator attempt have failed for this index, AND the
-        // local pacemaker has stored a TimeoutCertificate at the maximum
-        // view-change round.
-        //
-        // Validation strategy
-        //   1. Refuse if `is_skip_marker == true` but `skip_certificate` is
-        //      missing — the certificate is the proof, no proof = invalid.
-        //   2. Re-verify every signature in the certificate against the
-        //      active validator set (`SimplifiedP2P::verify_skip_certificate_bytes`).
-        //      The same Dilithium3 verification used for live timeout
-        //      certificates is reused here, so a Byzantine peer cannot
-        //      fabricate a skip marker by reusing or forging signatures.
-        //   3. Bypass the structural commits/reveals envelope checks below —
-        //      a valid skip marker carries empty commits and reveals by
-        //      construction (see `build_skip_marker_macroblock`).
-        //
-        // Once the certificate verifies, fall through to the standard save
-        // path further down (the regular code already saves to storage,
-        // updates finality only when constituent microblocks are present,
-        // and applies the reputation snapshot). Skip markers carry no
-        // reputation snapshot, so the conditional snapshot apply naturally
-        // becomes a no-op.
-        //
-        // Scalability: signature verification is parallelised through
-        // rayon inside `verify_skip_certificate_bytes`, so this scales with
-        // the active committee size at the same cost profile as live TC
-        // verification on the timeout-vote hot path.
-        // ═══════════════════════════════════════════════════════════════════════
+        // Skip-marker macroblock acceptance. A skip marker substitutes
+        // commit-reveal evidence with a 2f+1 AggregatedTimeoutCertificate in
+        // consensus_data.skip_certificate (produced only when commit-reveal
+        // and every fallback failed AND the pacemaker has a TC at the max
+        // view-change round). Validate: refuse if is_skip_marker but no
+        // skip_certificate; re-verify every cert signature vs the active
+        // validator set (same Dilithium3 path as live TCs — no forging);
+        // bypass the structural commits/reveals checks (empty by
+        // construction). Then fall through to the standard save path; skip
+        // markers carry no reputation snapshot so that apply is a no-op.
+        // rayon-parallel sig verify.
         if macroblock.consensus_data.is_skip_marker {
             let cert_bytes = match macroblock.consensus_data.skip_certificate.as_ref() {
                 Some(b) => b,
@@ -33923,35 +32023,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
-    // =========================================================================
-    // END MACROBLOCK SYNC METHODS
-    // =========================================================================
-    
-    /// v15.11: Start the producer liveness watchdog.
-    ///
-    /// Runs on a dedicated tokio task with a 500 ms tick. On every tick it
-    /// reads `PRODUCER_HEARTBEAT_MS` and emits structured warnings if the
-    /// silence interval crosses configured thresholds:
-    ///
-    ///   * 3 s silent: [WARN][WATCHDOG] producer_silent — recoverable stall,
-    ///     usually a transient await point or short blocking op.
-    ///   * 10 s silent: [WARN][WATCHDOG] producer_dead — strong signal of
-    ///     async-runtime deadlock or hard I/O stall; ops should correlate
-    ///     with disk metrics.
-    ///
-    /// The watchdog emits each escalation only ONCE per silence episode
-    /// (state machine: silent_warned, dead_warned). It re-arms on the next
-    /// heartbeat update — i.e. once the producer recovers, future stalls
-    /// trigger fresh warnings.
-    ///
-    /// Safety: the watchdog only emits log events; it never modifies producer
-    /// state, never emits BFT messages, and never triggers view-change. So a
-    /// false-positive watchdog warning (e.g. paused-debugger) cannot fork the
-    /// chain. Failover remains driven exclusively by the BFT timeout vote
-    /// path (Dilithium3 signed, 2f+1 threshold).
-    ///
-    /// Scalability: one tokio task, one atomic load every 500 ms. Identical
-    /// cost regardless of validator count or block height.
+    /// Start the producer liveness watchdog: a 500 ms-tick tokio task that
+    /// reads PRODUCER_HEARTBEAT_MS and warns on silence (3 s → producer_silent,
+    /// 10 s → producer_dead), each escalation once per episode, re-armed on
+    /// the next heartbeat. Log-only — never mutates producer state, emits BFT
+    /// messages, or triggers view-change, so a false positive cannot fork the
+    /// chain (failover stays driven solely by the 2f+1 timeout-vote path).
     fn start_producer_watchdog() {
         tokio::spawn(async move {
             use std::sync::atomic::Ordering;
@@ -35752,64 +33829,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             println!("[DBG][NODE] id_priority3_miss genesis_bootstrap={}", genesis_bootstrap);
         }
         
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v15.11: WALLET-DERIVED PSEUDONYM IDENTITY for non-genesis super nodes
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Forensic case (super-node 62.171.138.98, 2026-04-28):
-        //   The pre-v15.11 generator emitted `node_<sanitized_hostname>` for
-        //   non-genesis super nodes (Priority 4-6 below). Three independent
-        //   architectural defects followed:
-        //
-        //     1. The HeartbeatCommitment validator
-        //        (qnet-state/transaction.rs:1072) accepts only the
-        //        `light_*` / `super_*` / `genesis_node_*` whitelist. An
-        //        `node_*` ID failed validation on every committee node →
-        //        every HeartbeatCommitment TX from a regular super node
-        //        was silently rejected → 0 rewards regardless of uptime.
-        //
-        //     2. Sanitized hostname / IP / pid is ephemeral identity:
-        //        container restart with a new Docker hostname re-issues a
-        //        fresh node_id and discards reputation / committee history.
-        //
-        //     3. Embedding network identifiers in the on-chain node_id is
-        //        a fingerprinting hazard top-tier L1 designs avoid.
-        //
-        // Industry-grade fix:
-        //   Mirror the Light-node pseudonym scheme (rpc.rs::
-        //   generate_light_node_pseudonym) one-for-one with a separate
-        //   domain tag. Identity is derived from the wallet address via
-        //   Blake3 over a domain-separated string, producing a stable,
-        //   privacy-preserving, recoverable pseudonym in the
-        //   `super_<region>_<8hex>` namespace already accepted by the
-        //   transaction-format whitelist.
-        //
-        // Fallback strategy:
-        //   When `QNET_WALLET_SEED` is absent (legacy dev / testing setups
-        //   without an activation wallet) the prior IP/hostname-derived
-        //   format is preserved so existing dev environments do not break.
-        //   Production deployments always supply the seed via the
-        //   activation flow, so the pseudonym path is the steady-state
-        //   identity for every paying super-node operator.
-        //
-        // Scalability:
-        //   * Wallet derivation: BIP44 → SLIP-10 → Ed25519 path, performed
-        //     once at startup. O(1) per node. Cost amortised across the
-        //     node's lifetime.
-        //   * Pseudonym hash: single Blake3 over `SUPER_NODE_PRIVACY_<wallet>`.
-        //     ~1 μs on commodity hardware. O(1) regardless of network size.
-        //   * Pseudonym space: 2^32 = 4.29×10⁹. At MAX_VALIDATORS=1000
-        //     active committee the birthday-bound collision probability is
-        //     ~1.16×10⁻⁴; at 100 000 registered super nodes still <1 %.
-        //
-        // Safety:
-        //   * Domain separator (`SUPER_NODE_PRIVACY_*`) prevents collisions
-        //     with the Light pseudonym namespace even when one wallet
-        //     activates both tiers.
-        //   * Wallet hashed (not exposed) — pseudonym is not reversible to
-        //     the wallet address.
-        //   * Generator is deterministic per (wallet, region) — every honest
-        //     observer derives the same pseudonym for the same operator.
-        // ═══════════════════════════════════════════════════════════════════════════
+        // v15.11: non-genesis super nodes use the wallet-derived pseudonym
+        // (super_<region>_<blake3>; see generate_super_node_pseudonym) instead of
+        // the old ephemeral node_<host> (broke the heartbeat-validator whitelist
+        // & leaked network identity). Falls back to the legacy IP/host format
+        // only when QNET_WALLET_SEED is absent (dev/testing).
         println!("[DBG][NODE] id_priority4_check mode=wallet_pseudonym");
         if let Ok(seed) = std::env::var("QNET_WALLET_SEED") {
             let wallet = crate::crypto::vrf::WalletIdentity::derive_wallet_address(&seed);
@@ -36277,31 +34301,11 @@ mod tests {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v23.1: REGRESSION TESTS — BFT-CERTIFIED MICROBLOCK ROTATION DETERMINISM
-// ═══════════════════════════════════════════════════════════════════════════
-// `get_certified_rotation_round(mb_idx)` is the canonical source of the
-// `timeout_round` argument passed to `select_microblock_producer_with_round`.
-// Two honest nodes converging on the same on-chain state MUST read the
-// same value; these tests pin the monotonicity, saturating-subtraction
-// and baseline-relative semantics so a regression cannot silently
-// reintroduce a clock-derived fallback path OR an f+1 adopted-based
-// rotation source.
-//
-// The function MUST be:
-//   * A pure function of HIGHEST_CERTIFIED_ROUND (2f+1 supermajority only,
-//     NEVER HIGHEST_ADOPTED_ROUND) and the per-mb baseline — no clock
-//     input, no per-process atomics on the read path.
-//   * Saturating on `certified - baseline` (no wrap when a stale baseline
-//     transiently exceeds certified during finalisation races).
-//   * Monotonic in the supplied state — if both `certified` and `baseline`
-//     only ever advance, the function output never regresses for the
-//     same `mb_idx` between any two stable observations.
-//
-// The deprecated `get_effective_rotation_round` retains its OLD semantics
-// (max of certified + adopted) for observability callers only; producer
-// selection MUST NOT use it (h=556 forensic).
-// ═══════════════════════════════════════════════════════════════════════════
+// Regression tests pinning get_certified_rotation_round determinism: it
+// MUST be a pure function of HIGHEST_CERTIFIED_ROUND (2f+1 only, NEVER
+// adopted) + the per-mb baseline — no clock, no read-path atomics —
+// saturating on certified-baseline and monotonic, so a regression can't
+// reintroduce a clock-derived or f+1-adopted rotation source (h=556).
 #[cfg(test)]
 mod tests_v23_rotation_round {
     // No `use super::*` — tests reference `crate::unified_p2p::*` fully

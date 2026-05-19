@@ -24,6 +24,19 @@ pub const GENESIS_WALLETS: &[(&str, &str)] = &[
     ("005", "02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb74cb"), // Genesis Node #5
 ];
 
+/// v27 HOLE1: pinned genesis consensus PKs (ML-DSA-65, hex, 1952B) —
+/// deterministic `genesis_key` derivation of each node's mnemonic,
+/// reproducible via `gen_genesis_consensus_pks`. SOLE genesis-identity
+/// source (no runtime/file/TOFU → squat structurally impossible). Public
+/// keys only. Rotation = binary release.
+pub const GENESIS_CONSENSUS_PKS: &[(&str, &str)] = &[
+    ("genesis_node_001", "069c1b294f5f4bc98639edc701440ba235aaf74998c4c0ee9494b7f20f31643301e3f04c67c6504d8d9e9e931b348bfd70798937a16bd52dc6d192d8688e36ce63f7cd25ba648bcc8ba9b072f7a33b328c80a25ab2c95da0a5672f7b4c16f93afe59cbd8fd1dccdd981a20d1ff4bb0053b48f09fb235775ae701d6567030e7ecab9368381c95311bdad1c4c0c99c62be7ce08703d4473dfaea7302dc620829e67535f4bd0921f0f084910951576e449e6286c5a39c98310d10acfca7f56005f902dafd04f58eea634482bd10d29e6ebfdcaadf1153258238a64f2f047e8f5bb21f86d683e3da20ae94e32ef8862b76ecbd3bae128cd0f75af4ac6127e22e6a22a90fc56abff02cecce80db9a421f9d51be7fbb0aa1ac509277ec5098c027ac635aac88cd75277a3a5c080f031cbeffea8b1fd2455b04c50f56c2460d7dabb2a888d47c601a50f8e160ab34c7da560750e95d97067f7ff302617e1b6bd474244c5d58f4dbe82cb3cfe244394530f14581dd7fe20ccb0386a49a76f66b249167c50f4830fa0de42dc5934b0ecfddb78d3e452676ed2794228b985044fbdeb92b3727d3bad87ee6161e3eaeddc05e6907f8d6f6ba71a96e0e940cdc396c33ff1c9bcba0e92a2f81b38ab9c33a6fd557bdbd0d991a09105f28dcb2b84b42bb300d111acac71d71e38d180ed9721a446382df7c901d932bb36c1f045683867822f38b2d8837e5e282f259e45de520096efdbad1dc1979d2ecfd7b3b35fb2557a40136aa5c9f6974dc10cee9d7dd8cd30f950a8d96420a85944c006d8eccc1d5a2d8b0013a2cf363ed464f3a8cb82c61737433da23ba6efb72bfa25de1f1a96fed041c7255f1b6213d040f956fd66ae135df241d6d5f54172638bccf8cb6e04601a3e0c7cb59894bad435f876fed860ecb851273277daabab2cc6017d001317153ca70ab908f9a0e2516ecd19c4058185e62ee2d3b27df28237a4daf9184726cc8f7830c2ec75e4e2fa96379bd03ce71ea192e692d806ddb92bbee68da69b5618f0fab5882a5490b43c3df52ffed057196c8278b79f7681d70af4a13fedd89404c14f283c873b7bd3eaf59fdbf5d7562283fb5471f8047fc8573ec8da32690ff00769a4342e3c72a47fde5f3d66586cbf7aa390fdebe57421e41c83fed1118464c60683d15738ffc365ef83e1431a9b80442f80001a4fb32ca1f6becb65b6e33b21a508deac2437a60082be7d56179044ad2835ebfd73b068860197d5af4ae108b4c9a49bc71f628651a92f27f1bca044711f5c36fcbece1d1e1b05c4362684a1a18ff1cf2c6be2e5858a9c241382d647bbc93e05a5de2e6c4ecff92d49ea358fbacc35e9fc25bc5af8e716ca0fc2f4039fc164f1a6eb1e26838c99c615d8a1e2532b2a8b9dab315140553df8154fdb59420671c1e816f26ddc7703b0a558aa4aa1307ba277c690edd323141e3a799af741fc400a2c58230101fff74d8912de88da9ac18bf9c479a6032b8c806daadd133263a13f7f325f0d994d6be1fb527c5118e311cbb51332ad57dc2506cf3e2b6b3c6cf11d3279eee1e0656cd002eccea8f116bc47f134d3e3126d4324f87b07acb3393ce2ba92e0142f022319b042ef1c816aa7537ba20251af7896bf6c0ce1001a5231ae5ef82bb8e4cecc73a199ac5dfa4b73fecf5b83b883d7f730b7a988d66560b1d3205f73ce96f1eae06e402d7008b88c63081d902b4d9d1e4d2cd234a0edd1ff24fcd3eb2c26ee06139198f4408031ccd3ec056adff91fe92edc6dbad45e1d253a16a438df4d0727c404425438e9eeb7bce9238e01e5bb35684c4dc8eb01550eb8da93f8a899f31861912362b85066ef1593868eeb16d9f7e24566f51c80d82115d09a734b08e9fc45ed13274f6ab91321a41fbc066367b828e2a2f4a7af6c678380cc95dfee7d52abc6458182aa6f4d00d2913a40b201547e759bf7f2fa29626c5fe9eda31675ddac95d8b7c915fd8d20959fa9df5bdf1f8abb59ace966cb36decddb88adb68d0ee4662296786cedb1ab28045166f44fd9e3c95951b93b8384f1733b64ba91ee91cc970a988410059b7b05f5d0a862af891625cfa6b9a618aad9ea42626e52cd60df303dd13147bdb0ae05feab32fe7657ac1468086c39a28bcf5c76137fdd856ed3a633c365b67b58b282bb3273ccaab26a61c91dec4d86362ae46120f2f03629d59634a1e676bc42fde1a3dbdc74930228e9aeb2bc23b8630e76162c3b3c62bd7918f5512318971fa7e458108cbc6fb72b5b871164515fe8a0c67b46cd577bb0ed5ac34e00001fc999a9fa7d36ca45027ed4f5922e8e3b10e01206d70f86092fdf31270e21b02bd810ebeafb0f36600f6ee5ef422d6213ddd5f77737641ff155afb099598acee72588ff0bdd5d1a31a3053a03cb61f85eb596979b3222cf5938ef9c233ddb35356c5ed3178aba298101a216d2ec42d52bcd8a4ebd29cf9d2dddb4181bc8f8a989a714f83ec17a0c63fa4a2223c26a843b3b38a66953fdb4e1bf2e39729e1d09acdb6a86161ffb4ad79b4f293157369804ea1e79dcd44bdc9277b00a9b65dc37807285d834074c784eea41f19ee89b9f71d6c89a8e9541471c0dd099a3c3569affa9b001f6a2530be6f43e9bb96c93a8d550a06f1b47d13cc4f318a5a4ec0dd87250c631f1fedf5ce942fa5742736a589381d49203e5f2e2e7191154e74f0ec04f286d5408ac28fadc486f2d40c271968e19e08e878e480613c5e6925104d50c5cf"),
+    ("genesis_node_002", "47f7fad259ea0ae57d12ae3b9e4a4056defc3375eea2fa83a4d32af61dec76fdca8d4ce9b20e12855bfcbdd4a2871ee60f74510be356f018649e04c36802886863995081da12c2b12c0d4166063ed8d9f713e8f3f511d50587e8f432d8104213a2a95e86166ae781c912be1316adcaeb2bb7d15e9f8ec13bc923ce06774d8eafe6dd5a09d8e1a19661b791b3977e1af7fd14b6dd33e803c4f37c5f6de492f53e12534c419c148744b4a400f955086c61bcef097d6efb14afb9fb829d797f6e7fdd0719fc47cc1a0a071cd58b9cb11de0d477c9cd28b4f2a153471ac1f2e979fabcf2e7f45f3c72519cd71c6f9691d0fa487bc3edfa2f49107fda9ac0aa8c4ea47d8cdd3da05ede61cfb53fd59982a330d800480f965f2c8238759f053cd5847e6d5e07280cc0df2477110f70cf204cc1459f46fd9766ea70f0b47ee8d71485ac27146501cabba66cc50d1e0d9da2dd48db8b2f225ee24d85174cccf1c3b6e3a13e0fc4ddf5fb10ccd6e8e4ebf3bcc78e75fc89fa5ce41bf242b4da3a51cbdcb76c61f7abdacd608313da6ada1de31d10143a478afb50305ec591fcd99308cc3b7b92d1ca3a220d384548df7bc928ecabef311d54ce60d8c7948e3c969d13b00c31a21288f70714eb69dd71d14d83078afb52810bff8ba6eb7562f4be37cad14a0fd8ba28476eec2f4aa74fb673abcc484b5f57f1ec4a1246f0de4853b3e8972e55ab4230e6d90e0b1c3b25678414d8d880c6024da7de3fa9f223c16afa63223bcfee5c57098ad2bf978ee4e2dee95dad97a4dcd75f80f1fac057e288321bf37aa6415b1cf3ad6ed335567ec18ecf3276269884078729841c8edea1062ab9a719d55b60400088f468e64e14140ad45a91191814e6a4c882ad88021fbabd80d64cc1e96b066eaf431138b1be6299ac8e085dcd48077204a176d6d86a89af05c30e22be4be5cdee73abf743ade91c46ae1d7d21ab0327922c2d8b9429c44262df06d2e53f014cebcd70aabd12dcd9df14f13ab454a55c6037928501591a2e66a973319255aec73c1deac8f44c6fa53ea82c126df68229e474a9f3cd0997719ab0d04f0ce7cdaed1b06672c9e8ddd2ff4052cbf36c4d2df26de0278f663400cbe996e6f492af2a77661022ba859404cceac845fcd32e0a987d6237ff4bf95603d8f693a4b1612b1105b9f358d8fb222ab0e586868e2369768e962afd911f3cefbaae4c680315b05d8098daf6a145a16239a2054e570389509b9aad7f65737ad7139a5e46e5c6697f8c558b40d03d8e9f429915c4527e2b777e94dde3e8d0ab0384e65f4b88abdc45bd0aa4f13804ee62fd15425a6c99c8f698c367b7b3c46935edbc0a9a3d1b9ab17f608904f07d22b7522af7bd4f31685788e4353546207ab6369d5befef1ce08e034c17d6e3bb7a41d3aee443cc3332486f043cd76548d4834433c24a592a518cc46ef9fdd6e672be1fa4eb41261dcf5fdb3c6fe6cc3ed2b39018e113b0a1f942e3cb3a198dd544c2cb2d3cb194346b575c2e591dedff8829fb47457282633147d84fbaca32e7b3af9f816e8a17c85fa69ff055eaff1bcda009ad90a0237860fd2430eecd170575e33d5c825eaf4005f583b8552a6e6dc100caa69be23fbef03b66aae2a1e070610de037f91cf5488d4c94dc521a009d0a26d3f6c9d6a116170230b0657192a8b88177a494272f6528e29ce0052986c125384a6a80e5a484caedb01b2a30523c5199a021744c29fafe17f6a130d93e30ac9befa9faa5675f9b83c57638dd5b4a813017f0c2a2ccbbc956cd5bef1e64df526141605e1c6b9cc16d9984a3f0d68b6477199a7cb2865197d00baac3dc273d6bdb87cb10b4ea5a3718d636f3b81e03b831e883c922c9636b9580a7ae730a91c2a79e3130cf7ee13377e8909ecf95875af583caa817f83729766469f52d4bf76c1ca893040fb6adc52817e3ca0d5009b7d4761d048ea9903cfcdcbc169c239534fdfee5ecb608cb197504dc4d97b00e0dd7aa5d2880db34585323f4d89ef3fa8c8227ba6d2d6b9478c764f2ba8a0178a64c0216f34101231d7c1ef1451f1ff061249fd20c9d61fcae8c09699e7e470a62756eb23394bfa7c6d1e1eac2e5cc3f64d3f57576f2bdf90859315a42f921f403ebe5a63ef373fe57eb1d517d93e781fc644430411a718bd1058adf7a25d698a882d600eb0ed4b26c5010a7bf1eb7e9b3437146d09f5da70cd5f0956aed77682299fd3e37590bd6fed09e9c92b926373c78bd1c9ad3aabd7639e73344a0d568c9493e71e7160ac4be644beceedfa487e7dca19f2d653159693b693bf00c07f4a2f34214e894e8f98bd0f2eb8f74dc30874ff70480d7c2e7dfa8e7f2d07c4600145be4ad82fe9278126275b50ebc53f70fcaff9066eaf3556ad9897c8e4fd44b800759d05c25691c1b9081ba01e05987f7655c1599490614971ee06b59b649a0c8aea714b2f9e76acb7f20f0c48cb7d1d424916eef2db5ae151ac72ae58d158cfd061831b20a5a31a1e8bc7ac871932ea1d83a947fa1fb1d0d4549b7ca1b1506c568ae0c47a9a0c12fee0eb3c5547599cc4fb4d996994cd7d099730477fda8006e25545ec6da29d51168106a425c3a1f63555fdbb06bf245c720e9e74f8ce7ea3ac7399c0b64de90c0fe3310af7d141b0b6677cbfc38461fab3c5e8c882c7c046370c61fdbea98a7e6d5d27d942d3aba0e021cb328d5ddf3b1a2448b23556d44657eaacf6c7db367fc94ac39e3b3c00b3d38615d"),
+    ("genesis_node_003", "19a8b8e79aaaed30f4c7b16a6059d8c9d491b69962dfe25250612607dc949e55b8d572c71a3ecdfda52810ace2c7b68138ed80154704a2d71b21561b227d1271b5d9ee2bc8cbdb8cef125c5699f2aa2f2634aadde1dda2cfab3925373cf81b6dd2e1e4ab8d86ce2108a8cac61f146a94ce6dea024859ba9217cf0342b5b767889b2f32942921c9cf40c566a15a16bd603c57326217818fa2990399421f10aeab99a7da4c776331d971d5ed7290bacb85e3a78f0edc11f18ef90ef3d1a75b9b957d2957725b960aa37943a86adda3f0c00adc55b379f2561753f8e327b2d3c2bec0f25549e7b9ae1fecd2aab3fb3a2f1aa562229abe6d3243568c19f278b6261dd4cc1984d36c64559ffc470fd5ff9dbc22cee7d92aadf33bc5415ba699aeb4802b605e00d7f4863d4a2200f9448c81f2928d9b4e5a5361cdc13cb9a040e73bc58a2027fcfd623616fa44c501f5e3a1ad25c02b732dbc207163a944420f85811c00ed9ae55a7291459ddf5f6b76237b0332ef9191bc5e2649e2a596fef1fbd2eb14f31947ffb14103b505423622f7382ac8847ec399e7698c75651703463854f2ee39cda8179ae45f26f865d0ed30f65ca8d7f7366d3a5eb7bbc72ae6e0d2602cd2e5ad55865b0c41164669548d57c7ce640da1923b784c9cf15fca061950b1368252542e0a8ad8a583a4b79745b6f87190ad44e24ea851bdb6c09585979141a0c97c8994989d628cde244310971588e7bb19de9094b6c42e6814e149ea74d8160188621e400dd9fae39dad063ea417ce6932ada738e03395de59910c854afef3d82b0072ab17b4bf88bfd7872ece0e732f8adc6f0389c00b3159f4db0d72838a58ec911c036ddb81e82fc308393438a9c75ddb88efd41f9eb255b6460b897af1d191f0d40962d7f099716904f43ed1e222b8a3fe0590defa0579bf3f552ce2107db77083b2940195c93db7c0c204df2b65216e4da57b365a900e59af521d2f5c880b10d6f656c65fcf712f5d1f553436eb5d57cee2a1900ac6ae657e5a098fb7530df960a66aee278fed0eeecf627d7267170264be7bd89aa3212cf245af51e7027ea1e6af91e17ad0a464679b9467bfdf4b1c488f5206138ffffec31a7d0d4c4520c542ed86009149bceee43b53ab32276a170ae4571f5d4884ac7cc228343bea44a33e902e8e4c82d579be48df54390dc3d923216e26d5e7c6085aba5d694d82863d88cf82629344060338b187b34a8e720eacbc8da8a4f9f5b24a2a5c07fe409045a1d044c73a69cd8282f6dbb6c1a1d3b7186bc1e740b8eee428f8132371d90033d9840153c8175bdaa649de80892d769cb0ac30f543dfd8a51581f856af9a63453369296a6c35f8f699701b61c0c1851d5600d9eba86b5ecc345dd2a63f044487572e59a41cc80ec609ec7fdc706a3fd57bf76246e87785e4b716a67676b84384b0adfdc5dcadac4dc61fca0db3bc2d461925c90150d0ad20e916be82ee0af86e8f03268cc74f9bdf833e564e14e53ed5c567af8d8237c2e830a953d60124fc7b23cf6982e6a77ae38f3d0fe070e4a0a50e1134a20a0815f852201cd6cefd4831defc9f2908fa0901a106430259b583dcee9dd63c92156f7d62bc45e16a31605a41a111aa7b45c4144aea3d66bf5e98e5344913eabccc9e1179caf803d1deae81021917d53dd31510ad6410a0e790ba1e99d10fbbc1337a7dc418b34cf0f01d7be2a5289a905334a7e937bd18d62969cc09ca0a532ca1b06047a724c9bf04c51ec68526c46cf3dbe50a82d83b52c259fd11c075041cd813d95ece5853b1ad3f287443cebbf4e19fb4cb944c1a2d155f3e992d1c693bb0dbd494e57be97add5360d90f2ecd804e7a01a9b13b6aef21cdc9b95c74388aa437422beee91559ae275ddde1ffc9a8626ce2dcc7094b34a98c854234e44765c24a0241c889f1854cebca728b435c061aab9c371700ab0b9fc3947fe0bb4c173b4fd1c270a5c3b6827bf9a5898c529b5cad68df6fc0676579022ea83521e779ab98c5e4963513a6e5331221b29555f4cebcb37135f7e3e23d672e09fae60cb9bac638fc296c1cd4a182641d50c6602695d9ecfc97fef83e5cd5778cde3c80b30a5509b6b0f98bc45a57921aa8c544072d488d79681079c449d8519c88b5ef17a6d3b1c963e0cae300e11a34e3bbe25b4dc7519818d06db9b4d4e092be8c2acb59bbe5524606a5ecd8b872d4be3d913bc54581970dea3ff2ee0e3067d70d52d1f43a382bb3fb7c2f0635ea2dee913c6a2e08ee471f6dd7f784a98ff2baba23fe04b0ac26b274fbab4c3a35a230aa73bb9e896e5895236d7f8a44d06d364730b058e714f16855764ac2b1b8a7ace168d84589887af426e81da0a0b42065a02a399df9c2dfdd9614d51df9716bbef81109f42375f1733c349fac36fe7a44b974336fcef700ff793190eb531ba5fedc1fe4ed48ab0d193c01e66a8d8bce6bf5d689fa8c5ead3ac3571a4132ad3b18e41eed501e546ca11e24b9dd0d86e03c6084eeb1b759497fb5ad8d3d8b140cdca4f83cef52fadc20ca3ceae7873459390bed019e41508732a4c7fb57ffa4a48a151e59c452eee6dfa9f855b3a9505233e64bdd4554276f2d43fd9263fdbbd4dffef1063a972175b45194ecebe659c7dc51630531d53253628966b6bbac96c5ae1117180bca39efb828512d82fea13d9ca6b3201ebf131760507be90292257e4bcb63820464b841370d70c36b42656b079a4a8a8198d49117b06645"),
+    ("genesis_node_004", "d135f421e651ff38db0db25346d985737c5a03891a8a9d620e7611ef2361d70e3e2b05ce1ac885154e9f4db87e76631aa6db296885e43c63a2851fd7e015a6813f82d20a0700bb4e15431c851d34de8dfaf14fd472c6151cba98c63103ed0fcd09d14fa58694f32ea4446322bee91a8bcaeeaa2b5b5519e2ea6bfb74e7827f1e89138b688b505505f675340ac46a1d1577331ac58a2378a26245fceddcfaf8a5ec8db275643c49b99ddd1ac48300e0784942b17cfd1dce88a5303d7c6009639394ef31f8d442cafd9a9efe6dd60c7ac5b9cbf538214ee67ad36f2e5567e36f090396f457d1a048615e661f85e9cc5b041825d73968b487ceb7a5f3629af74d0fcabeaf2df9b178154abf233f5cc2237ab2deb443478cc586a50ba10fd6cfe56c7be14135185d63d90760f6b40b0308bb2924c2650402f2134cf885349dded1375f0ec9d4bc12d8cfcc5c4e48354fa9314fd699174032286a0aa9b9a9a04c1ee0329313c5341357b281afe7624c998cebf3b67fd2a19a7f676a35dc1fbcb5a60e206bc806c40812f7d2d512f881129e436416113f84f4c0be099ffe2452fb89c23589c606d664ab94ddb6a98bd7d01584cce41f8e404d0053c39a3e8476278d1b1a4e5ab17de16ad237dbf698b8b8d92c10b3efc490447b83b3591e73a1e727f738a870a8a4a509438d3a0b427cc03fbcdd279f9af5bcd01af94d4d31921dc1f5ec537115dabd83a0a7e8daa16fbac500b720cf45d206bbfc7efec4b59d472ebb23802fa0bd5f4ced2ab55484bcb64fe47621061d17dfe08503ec8b658cec699a7733268ba0560769cb77bdce18867c3bf78cb82c195bb9f18e11945f3a1ebb2588608a20c69c4f9f5f4cebf77f54f90b8dc3a8b5da70a9677d09f493d66ed796f05ff886939851cc4c4825c1ec5cebf0017dc7eb3ebfd6d7055fae17e25dd0574071f326c52409cd4df91392435426b24a95dfe29ea16abf5d9fef681667f4ecf897020b5a26aa39e97f0db6f5a8d95a50f117118447e43dc353a92d6c8050ae550a0aed6738440c5bed92086180cc61b903cb6a9254b4e5b484a366eb10d07d20d3af224a540f2cea1598f01a846dca9da8450e1d23419ef4e36d963d6319056735a50ebb33bd11a2948dc052206e787b05152836ae9aead97c9f1418c3d2c68d60cd098de494e06248e1df4a22c8564829e52b3e8b09f2131a89ee6bdbe2893d292fa9a2bd35fc99c21f36c38c18e4e7caf15660aeb6dcee4d3e36058abf4e7a13a4e186553e6e0bdd39f823aac23794e29a27fb8c9e055b6d6915811e2999a3c3cbaf502d695053819621e657e325dc9b73ae6b608259567bcf9bb19d08fb0f12bfddb9c6b498a978d8996127874847ea8c90f114fb85a700836e27e5cc6a7bb83d7c0635d5d477f5f44b5dfe830ef65e91987d3c5624606f985b92b28a5d2309f93b9f2f0196c850659c3c1bb642485fcfc0f04998cb55272575f4a8ad114c3cf978b7709aa489b527218d40ac8ffb4a74eb38760b9e07fed261d54712725d8f762808e9083d9e3e7b54ef8a2f5fccf64b3071557323ac1bc38adfac0a20044bf09d8d7ab112e21f6b5cb83ba07feefcc3e78b38e0e111170a38c6197c00e43d636dd9fee736cb945868dd557280956ec2941db91697469a0cf3f370b616bb4dafb144259105b00ced279802f4417cef7f2c9ee567525d1bcb0417f36426a55cd20434e0671d3bfdcad30b5394e857dfdb900ae5a6a56cf1e600af53ebbf3d4ebfd427ae0223ce570ccd56983238f5b9a7b533b643c39c369b5acf71647d479bc7ef6203c2ca5eabfd3bdbb7adece0fcd203b06c3959c3f01ffa758586d74ffa8b7579b5866438cbe03b0addba9a0e5968101dccda3bca244a939d1ede77593eac6b8b924a87f43911d6a30c5ac688e6c3de5a787f13b7c0120c1520c2591235e896aec592b8a8ef25d6c4c8cfada03de9d05f26cffa32b7a403c6f41ff7d8ffaa3a099982af80a35f68c8d0be90d2300381d9973342a6915728151ce686c10d1f0671736f92f1a3d6f5bb7dde96f23a87c0bc05d0874d4e48a812c76f86fc17cf4e7d8c565a8a61f46b96744afcd3c4896c7c1d6119b2ea7626525028768466276d13700722d3f10032e911e004b8bb8ee6b5bd5c3e9ca68693f126b578c690d907a289e5e3b202595a0d691e1b084ceb8086bf628f0e57fcf41843de367bf73d31835e045dd85699a627b6de554311310c7990bd2dd3ff6b1bc83fe8f3e09598fffbce04144cb4546b236c8a8be7dca9996fd5e2691dab1a84c6abe828d7d7e62444f9ba6b70a21f748228d99472e27e6e29e3478e657ff288f81c13eec0cb70c59743260708f6ad80757d9602cf1f6ddd71985d296e87003e06afc35b807c88cb44da6e7a0683d07b36563e57142532be1daad32446d3ce14e6ccecd0555458a2bd1d02430f440437ab2e497abbce25e0783f2297b9e03a39502c4a72a414563eabf5e4e3fe9d5ad7e75fb7274b34a53d723f18a6fb5447c659422e1a3a27c1f570d34d9866fde5fd3bf6b296308769d319b24027d00a7116f702544c6f03800b3376e18d4f2554d326a6a60d7dfcc028613863108cf6e1a215b3fb6e22d9cee3edc578d4cc11eef086ff45d20eed9449df349cdc166a59dd65f53b6aef9ee76a37474253e4e7d959bd9ff64a0b156a73efc3cbbac0338893fa87aaa2db6c7420654ca0b7c9d02960b0c8835c1a0b3f6b2f61f9aefeaf39f316d021eb"),
+    ("genesis_node_005", "906bcfc96772992169471746a317a3006ba20c839b5b3f9c8ae18b0acdfd7a6e8a0133cc19c9c608e61c9a99caba2750afa86e2159d0d4de54eea609d9aee8e4373d5add14d2727afd49ac4e46f12b748bcf746b5f73b07ae064542b76722dbce1da10a3cebc97d30fe99fe929c568f0af4652587d2a32f52f13530754daebb810c70c7881191532cc77c3117b33aa2a6e33791f836bed74b6d8666ba65692838e7ed79e9aabf75c151f363cd4b8785743aa82c36a2831ac82b20828a29b5ecad16b39003d0309aee7cf451ee54f23d7285262d6a28570b19b68fb984bfbf1b9e6d5dae6c232ff0f19321aa1fcf3edbe7e84033b00604c4324f3615e2719203e0ce3cb5b17c80faa67bc3bd217d5c26962f75541bfcf18ffee1fa8944013992949a27d3eb508533a0c2068bf4bfd7d7fa95805ace4dad52ad84b574a19f5a91a7de5238cb72668714156017348bb673768ddd2ce634e7f019ba865f1b52346bc572eeee3a96fb36132e7d37082cba9a3f7eb001401be216dddad56fb8a0bf449a912378b564d3123806ddbbbdda80119fdb8223873f6fcfc7a864e008153abea2cad57a2bff011a058ea2fcd74976fa8aade5e9736a328acb163d077b633cf96d97130fedc806b44f2de0233cf5571c975abea5bb0993d909afbc0392aaf2a691e27fb23dc550a36bb4619a5326a0970c3c50534a33832a576490f60faaa1082aabfb8079def5793852f985f41fa65e8991562bfd615075a437054ed238a79570cdd5149564ddfa492e3f852c826162712b6e863edf38cfc218e3a978c0bb5f4ac5b1ae361b1e5f02f32c0be5809fc450f270ab0559de0f1130210d0ee9fb314c83a0b84837160dcf64fe49b82950a5c55ca9977a93b7c835b18c27ff5c8eb453c99aaa5fc498c45bb8237b7a2241bb9d48b0e3642924f40474dcd5d5ab2bb9cb7326165001edcdab59e234ee60e32be4f469cb625844f8028db638ba9a9fc58b4c3347095016d0e63d7dc35306ab37be45460160f34c2bed5cda73997fc80e0902580606a4c536b5e085e6017f623960b30066272c5370ad3ebec393ca9b038bbb3b8159feded8ed01c27d669d513c9a899beb4d2265ee4ac00c3e529fb004431dd221b4274bfbe56059e73f6f3901bfcd57352b60f0f7a838b8413c45a72fc1c9369ae03a95dc37e5e36297bed91c7ad20bc0be7b59b727ffa046cc57aadd2e7da0ec304b512e73d1b707b6a60edf3d3db4222a7265cdab6d071fbd7b012fd4d45ef59771f7dab7f4d178a2b6e05110408cf93e0ee57db4693c29ebd3d2ba27a2b52075106c4996f9bd9993b836cd227a098a1a11552ae7db3a4d40a9c090e4c0c2841baa816c53deebdd6a901018425dfb14b0e07f428b07f38ffd55828a621e4525a930d6bd74e64d594b85bcabaf6abfada1734b36c7acfa7c477eb2314617d19f51e345466aaa382c52b3f1d72b029ecfef62f6d6e487ed6ce7915cf9f767d12044147152ad81236bcb0ae3887e6856b2c954f2692252f927e5c6eadb1862ee79c07ff95fc9cf539a8bece9583bf138ba22e12a8edb8731f522728b718cb0e52b4ba3bc684e59260d98810b6fcc6ccaacf60ce321c8e42f7b3e5b1092bd842de1493309cbf54d8881bee8629365f7cd8524ed89121d27343e1908f3ca517628be4352376216af3cf6b5a3af8c9d977fa4af9baf8cd2b95e37f66349fa3298b84c101afbc2c8d87db159e1a9347e36faee9520756f4b033c0c6a2a4307743883f7f608d4584294dde8926533c147affa0e2a620b5a3e5c716d6cfe0345763d6311f2089136abfe8dc1b812571a5eecd176958da06b117e133b93873709d66a9fb00e83576610e65e721022096790922fcb01702fee7d93d743fa7ec41f78daacaa174312354f22c3cdbef2938f7b9a59a268a4dbdb42de7285084d617f4b26e1c1e7ed373af35f270b6e04eabc5f6ac8702011ab551801c901a94ea6f7a2ae97d666bd056296ce7ec70f8f40699e559f91d6db3ad77502437b4e724628edb0c6eae30ef7a85cd3204e5cb612430691889bb49a96a6d95993815b3c320bf5c0054e0821bda4e2df4a06db0dfe753ccd10a55c49dcc772ea01f2110b7989f403451ceef5b97d2152f0e0e8a542032fa0bce2cd4b120aab4d2cf58d12b20f5ee3ba1fada05cebe880ae839e927a13f15a708b7cfe4557c70899d008720801826281cfed56c338e64dd9f43a93071b7b38cec2be00cd6d2b32923a21aab82958c39bfe56650e899bfb7ab033bbfeb3821da0ab09bcfda83f3760512bb24d9f0908130ccb2f97faa84f9bf77dd50e38eac2d18f25a049b1a3b21d06e252f2952b26a7a5d0b99dce73035c99dade288ebb719503ec9b0c6f3857471099102660958254d5dcd0c64efe90df19a4ae49f14c2c5991d551b146ee6b604467c9b196832382be398cae8d9bd994fc9f7393232ea75fa3d009ed17cdcb1706284806bf716aff72777cc6dd1835bb11e22f46e5f110714e5456e9ccc905d7943bb7e8f4fbc44ef4bfa642aabf33d603f8e36ea2ac77040e9597154429e29aad769b6cd06d763b53d403d655e6f5cbfdd318b2550d42ec212625819380a39e476f945a6c6b991911b021b420acc411bbb903d700fcd5ee5525de6dbc99f2905875d0a23bd5e71602edb939670734d96865f589d5a89d33da61827e8df71bec84db8a750ffb35545065c6769d50dbd8b2e32b189c0980485e0276beeace1a418bcb4674503"),
+];
+
 /// Genesis node IP addresses (PRODUCTION)
 /// These IPs are authorized to run Genesis nodes
 pub const GENESIS_NODE_IPS: &[(&str, &str)] = &[
@@ -178,12 +191,14 @@ const MAX_VRF_REGISTRY_SIZE: usize = 50_000;
 
 /// Register a node's VRF public key.
 ///
-/// Genesis-side effect: when this call brings the VRF registry up to the
-/// full set of 5 genesis identities (and an anchor file does not yet exist
-/// on disk), `try_autowrite_genesis_anchors_locked` writes it atomically.
-/// On every subsequent restart the strict identity-anchor guard at
-/// `initialize_wallet_identity` activates with a non-empty anchor map,
-/// closing the bootstrap race window for genesis-to-genesis traffic.
+/// SECURITY (v27): genesis identity is NEVER established or persisted at
+/// runtime from gossip. The (node_id → consensus PK) binding for the 5
+/// genesis identities is pinned by the binary-embedded `GENESIS_CONSENSUS_PKS`
+/// constant and installed before P2P opens. This function only fills the
+/// working VRF lookup for non-genesis (super-node) identities and for the
+/// already-pinned genesis set; it performs no anchor disk-write — the prior
+/// `try_autowrite_genesis_anchors_locked` path could cement a transient
+/// identity-squat into the immutable anchor map and has been removed.
 pub fn register_vrf_public_key(node_id: &str, pk_bytes: &[u8]) {
     if pk_bytes.len() != 1952 {
         println!("[WARN][VRF_REG] invalid pk_size={} node={}", pk_bytes.len(), node_id);
@@ -197,129 +212,12 @@ pub fn register_vrf_public_key(node_id: &str, pk_bytes: &[u8]) {
     }
     registry.insert(node_id.to_string(), pk_bytes.to_vec());
     println!("[INFO][VRF_REG] pk_registered node={} total={}", node_id, registry.len());
-
-    // Auto-genesis-anchor write. Triggered only for genesis identity inserts,
-    // and only fires the disk-write code path when the registry now contains
-    // all 5 genesis PKs. Idempotent — subsequent calls observe the file on
-    // disk and short-circuit. Safe to call under the write lock: I/O cost is
-    // amortised across the lifetime of the process (writes ≤ 1).
-    if node_id.starts_with("genesis_node_") {
-        // `registry` is a parking_lot::RwLockWriteGuard. Function arguments
-        // do not trigger Deref coercion the way method calls do, so pass
-        // an explicit `&*registry` to obtain `&HashMap<String, Vec<u8>>`.
-        try_autowrite_genesis_anchors_locked(&*registry);
-    }
+    // v27: no runtime genesis-anchor disk-write (squat-cementing path removed).
 }
 
-/// Internal: when all 5 genesis identities are present in the VRF registry
-/// and `genesis_anchors.json` does not yet exist, write it atomically.
-///
-/// Why this exists
-/// ───────────────
-/// The clean-bootstrap path of a genesis cluster looks like:
-///   1. Each node generates a fresh Dilithium3 keypair on first start
-///      (the `dilithium_keypair.bin` file is absent).
-///   2. After P2P comes online each node broadcasts a `VrfKeyAnnounce`,
-///      gossiped + IP-gated against the canonical Genesis IPs. Receivers
-///      install the canonical (node_id → PK) binding into the in-memory
-///      VRF and consensus registries.
-///   3. After this cross-registration completes, every node has all 5
-///      genesis PKs in memory but the binding still lives ONLY in memory.
-///      A subsequent restart loses it and reruns the same dance, which
-///      keeps the strict anchor guard at `initialize_wallet_identity`
-///      disabled (anchor map empty → guard skipped).
-///
-/// Persisting `genesis_anchors.json` as soon as the in-memory cross-set is
-/// complete eliminates the disabled-guard window from boot N+1 onward:
-///   * boot N+1: `install_genesis_anchors_at_startup` reads the file →
-///     anchor map populated → strict guard enforces local PK == anchor.
-///   * Genesis NodeRegistration TXs at later epochs embed the anchored PK
-///     (see `create_genesis_registration_txs` at node.rs).
-///   * The Tier-3 hard-reject for genesis pk_first_seen
-///     (consensus_crypto.rs) becomes redundant defence-in-depth rather
-///     than a bootstrap-blocker.
-///
-/// Idempotency / safety
-/// ────────────────────
-///   * No-op when the registry is incomplete (< 5 genesis entries).
-///   * No-op when the file already exists (operator-provided OR previous
-///     auto-write). Operator-managed anchors are never overwritten.
-///   * Atomic write: `*.tmp` + fsync + rename. A crash mid-write leaves the
-///     previous file (or absence) untouched.
-///   * Logged at `[INFO][GENESIS] anchors_autowritten` on success and
-///     `[WARN][GENESIS] anchors_autowrite_*` on every failure mode. Never
-///     panics — fallback path is exactly the original behaviour (anchors
-///     missing → VrfKeyAnnounce TOFV continues to repopulate on each boot).
-///
-/// Scalability note
-/// ────────────────
-/// The branch only triggers for `node_id.starts_with("genesis_node_")`,
-/// which is a fixed set of 5. For thousands of Super-node insertions this
-/// function performs zero I/O work — the prefix check is the only added
-/// cost on the hot path.
-fn try_autowrite_genesis_anchors_locked(
-    registry: &HashMap<String, Vec<u8>>,
-) {
-    use std::path::Path;
-
-    let path = Path::new(GENESIS_ANCHORS_PATH);
-
-    // Don't clobber an existing file. Operator-supplied anchors take
-    // precedence and any earlier auto-write is already there.
-    if path.exists() {
-        return;
-    }
-
-    // Need exactly the 5 canonical genesis IDs. Use GENESIS_NODE_IPS as the
-    // source of truth — adding/removing genesis identities anywhere in the
-    // codebase MUST go through that table.
-    let mut anchors: HashMap<String, String> = HashMap::with_capacity(GENESIS_NODE_IPS.len());
-    for (_ip, bootstrap_id) in GENESIS_NODE_IPS {
-        let node_id = format!("genesis_node_{}", bootstrap_id);
-        match registry.get(&node_id) {
-            Some(pk_bytes) if pk_bytes.len() == 1952 => {
-                anchors.insert(node_id, hex::encode(pk_bytes));
-            }
-            _ => return, // incomplete set — wait for next call
-        }
-    }
-
-    // Serialise. `serde_json::to_string_pretty` keeps the file
-    // human-inspectable for the operator; ordering is HashMap-iter (not
-    // stable across runs, but we don't depend on stability — only on
-    // membership).
-    let json = match serde_json::to_string_pretty(&anchors) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[WARN][GENESIS] anchors_autowrite_serialize_fail err={}", e);
-            return;
-        }
-    };
-
-    // Atomic on POSIX: write tmp, fsync, rename.
-    let tmp_path = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp_path, json.as_bytes()) {
-        eprintln!("[WARN][GENESIS] anchors_autowrite_tmp_fail path={:?} err={}", tmp_path, e);
-        return;
-    }
-    // Best-effort fsync of the file before rename. Errors here are non-fatal
-    // — the rename will still take effect, just without a hard durability
-    // guarantee, which matches the existing operator-write workflow.
-    if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp_path) {
-        let _ = f.sync_all();
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        eprintln!("[WARN][GENESIS] anchors_autowrite_rename_fail src={:?} dst={:?} err={}",
-                  tmp_path, path, e);
-        // Leave behind the tmp for operator inspection.
-        return;
-    }
-
-    println!(
-        "[INFO][GENESIS] anchors_autowritten path={} count={} hint=will_be_loaded_on_next_restart",
-        GENESIS_ANCHORS_PATH, anchors.len()
-    );
-}
+// v27: `try_autowrite_genesis_anchors_locked` REMOVED — it cemented a
+// gossip-squatted PK set into the immutable on-disk anchors. Genesis
+// identity is pinned by GENESIS_CONSENSUS_PKS (below), never gossip.
 
 /// Get a node's VRF public key for proof verification
 pub fn get_vrf_public_key(node_id: &str) -> Option<Vec<u8>> {
@@ -336,247 +234,65 @@ pub fn get_all_vrf_keys() -> HashMap<String, Vec<u8>> {
     VRF_PK_REGISTRY.read().clone()
 }
 
-// =========================================================================
-// v16.1: GENESIS DILITHIUM ANCHOR LOADER (chain-anchored identity binding)
-// =========================================================================
-//
-// Identity-key binding for the 5 genesis bootstrap nodes is anchored at boot
-// time from a JSON file shipped with the deployment. Once installed via
-// `consensus_crypto::set_genesis_anchor_pks`, the anchor map is immutable and
-// guards every subsequent registration: any PK that does not match the anchor
-// is rejected as a squat attempt.
-//
-// File format (`/app/data/genesis_anchors.json`):
-//   { "genesis_node_001": "<hex_1952_bytes>", ... "genesis_node_005": "..." }
-//
-// Operator workflow:
-//   1. On a clean cluster, every bootstrap node generates its own keypair
-//      (lazy, on first start) under `/app/data/keys/dilithium_keypair.bin`.
-//   2. Operator collects each node's PK (hex from `pk_hash` log or RPC) and
-//      writes them all into ONE JSON file deployed to every node BEFORE the
-//      first restart that loads anchors.
-//   3. Subsequent restarts read the file and install anchors at startup,
-//      BEFORE P2P comes online — closes the trust-on-first-verify race that
-//      caused the v15.x pk_mismatch deadlock.
-//
-// Operational property: keypair files MUST be backed up. If a node's
-// `dilithium_keypair.bin` is lost while the anchor map still binds the old
-// PK, the node refuses to start (via `initialize_wallet_identity`'s strict
-// guard) — operator must restore from backup.
-//
-// Scalability: anchors are bounded to the 5 genesis identities. For
-// thousands of super-node operators, identity-key binding is established via
-// signed `NodeRegistration` transactions (already implemented at
-// `cache_node_registrations_from_transactions_with_dashmap`), which carry
-// `dilithium_public_key` in TX payload and feed `register_consensus_pk_from_chain`.
-// =========================================================================
+// Optional genesis Dilithium anchor loader. If present, the file binds the
+// 5 genesis identities to fixed PKs via set_genesis_anchor_pks (immutable
+// once installed; any non-matching PK is rejected as a squat). Super-node
+// identity binding is instead established by signed NodeRegistration TXs
+// feeding register_consensus_pk_from_chain.
 
 /// Default location of the genesis anchors JSON file inside the container.
 pub const GENESIS_ANCHORS_PATH: &str = "/app/data/genesis_anchors.json";
 
-/// Outcome of the bootstrap-race guard in `install_genesis_anchors_at_startup`
-/// when the anchors file is absent. Exposed (and computed by the pure helper
-/// `anchors_missing_boot_decision`) so the policy can be unit-tested without
-/// touching process env or invoking `std::process::exit`.
-#[derive(Debug, Eq, PartialEq, Clone, Copy)]
-pub(crate) enum BootDecision {
-    /// Not a genesis node — anchors are irrelevant. Proceed.
-    Allowed,
-    /// Genesis node, no anchors, operator explicitly opted in via
-    /// `QNET_BOOTSTRAP_FRESH=1`. Proceed but emit a CRIT warning every boot
-    /// so the dangerous mode is impossible to miss in operational logs.
-    AllowedFreshOptIn,
-    /// Genesis node, no anchors, no opt-in. Caller must abort startup —
-    /// silently continuing would open the squat-on-bootstrap race window.
-    Refused,
-}
+// v27 HOLE1: BootDecision / anchors_missing_boot_decision /
+// load_genesis_anchor_pks_from_file REMOVED (file/TOFV/QNET_BOOTSTRAP_FRESH
+// was the squat window). Identity = embedded GENESIS_CONSENSUS_PKS.
+// GENESIS_ANCHORS_PATH kept only for legacy log refs.
 
-/// Pure-logic decision for whether `install_genesis_anchors_at_startup` may
-/// proceed when the anchors file is absent. Inputs are taken explicitly so
-/// this function is fully testable without reading env vars or panicking.
-///
-/// Policy:
-///   * Super-node (no `QNET_BOOTSTRAP_ID`): always allowed — they bind
-///     identity via signed `NodeRegistration` TX, not via anchors.
-///   * Genesis node + opt-in via `QNET_BOOTSTRAP_FRESH=1`: allowed with a
-///     CRIT warning. The operator has accepted the race risk.
-///   * Genesis node, no opt-in: refused. Caller must terminate the process.
-///
-/// The opt-in is intentionally a single discrete env var rather than a
-/// timeout / heuristic — silent continuation in dangerous mode is exactly
-/// what we are defending against, so the gate must be operator-explicit.
-pub(crate) fn anchors_missing_boot_decision(
-    is_genesis_node: bool,
-    fresh_opt_in: bool,
-) -> BootDecision {
-    if !is_genesis_node {
-        BootDecision::Allowed
-    } else if fresh_opt_in {
-        BootDecision::AllowedFreshOptIn
-    } else {
-        BootDecision::Refused
-    }
-}
-
-/// Load genesis Dilithium3 anchor PKs from `path`. Returns empty map if file
-/// missing or malformed (logged as WARN, not fatal — boot proceeds without
-/// anchors so a fresh cluster can complete first-time keygen + anchor write).
-///
-/// Format: JSON object `{ node_id: pk_hex_1952_bytes }`. Each PK MUST decode
-/// to exactly 1952 bytes; invalid entries are skipped with WARN.
-pub fn load_genesis_anchor_pks_from_file(path: &str) -> HashMap<String, Vec<u8>> {
-    use std::fs;
-    let raw = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => {
-            // Not present is normal for first cluster boot — operator writes
-            // the file after collecting PKs. Don't WARN at this stage.
-            return HashMap::new();
-        }
-    };
-
-    let parsed: HashMap<String, String> = match serde_json::from_str(&raw) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("[WARN][GENESIS] anchors_parse_fail path={} err={}", path, e);
-            return HashMap::new();
-        }
-    };
-
-    let mut out = HashMap::with_capacity(parsed.len());
-    for (node_id, pk_hex) in parsed {
-        match hex::decode(&pk_hex) {
+/// v27 HOLE1: install pinned `GENESIS_CONSENSUS_PKS` into the immutable
+/// anchor map + pre-populate VRF/consensus-PK registries (Tier-1 match from
+/// t=0, no TOFV race). Idempotent; fail-closed on malformed/incomplete set;
+/// MUST run before P2P. Super-nodes bind via signed NodeRegistration TX
+/// (unaffected). O(5).
+pub fn install_genesis_anchors_at_startup() -> usize {
+    let mut map: HashMap<String, Vec<u8>> =
+        HashMap::with_capacity(GENESIS_CONSENSUS_PKS.len());
+    for (node_id, pk_hex) in GENESIS_CONSENSUS_PKS {
+        match hex::decode(pk_hex) {
             Ok(bytes) if bytes.len() == 1952 => {
-                out.insert(node_id, bytes);
+                map.insert((*node_id).to_string(), bytes);
             }
             Ok(bytes) => {
                 eprintln!(
-                    "[WARN][GENESIS] anchor_invalid_size node={} got={} expected=1952",
+                    "[CRIT][GENESIS] embedded_pk_bad_size node={} got={} want=1952 \
+                     action=halt_startup",
                     node_id, bytes.len()
                 );
+                std::process::exit(2);
             }
             Err(e) => {
-                eprintln!("[WARN][GENESIS] anchor_hex_decode_fail node={} err={}", node_id, e);
-            }
-        }
-    }
-    out
-}
-
-/// One-shot startup hook: load anchors from `GENESIS_ANCHORS_PATH` and
-/// install them into BOTH the consensus-layer anchor map AND the working
-/// registries (VRF + consensus PK). Idempotent.
-///
-/// Returns the count of anchors installed (0 if the file is absent — caller
-/// may then proceed in fresh-cluster mode where keys are exchanged via
-/// `VrfKeyAnnounce` and the file is auto-written by
-/// `try_autowrite_genesis_anchors_locked` once cross-registration completes).
-///
-/// Two-step propagation
-/// ────────────────────
-/// 1. `set_genesis_anchor_pks` populates the immutable anchor map. The
-///    strict identity-anchor guard at `initialize_wallet_identity` reads
-///    this and refuses to start when the local keypair does not match.
-///    `register_consensus_pk_from_chain` reads it as the anti-squat check.
-///
-/// 2. **Pre-population of the working registries** (this function): for
-///    every anchored identity we also call
-///      * `register_vrf_public_key` → `VRF_PK_REGISTRY`
-///      * `register_consensus_pk_from_chain` → `CONSENSUS_PK_REGISTRY`
-///    so that EVERY inbound genesis-bound signature finds a Tier-1 match
-///    from t=0. Without this step, even with the anchor file present,
-///    the working registry would still be filled lazily by inbound
-///    `VrfKeyAnnounce` messages — leaving a brief race window where
-///    cross-genesis traffic could be hard-rejected by the Tier-3 genesis
-///    no-binding policy.
-///
-/// MUST be called BEFORE any P2P traffic is accepted (specifically, before
-/// the first `VrfLeaderClaim` / `VrfKeyAnnounce` could trigger a TOFV path).
-///
-/// Scalability: 5 genesis entries — fixed cost regardless of network size.
-pub fn install_genesis_anchors_at_startup() -> usize {
-    let map = load_genesis_anchor_pks_from_file(GENESIS_ANCHORS_PATH);
-    if map.is_empty() {
-        // ─────────────────────────────────────────────────────────────────
-        // v17.1: GENESIS BOOTSTRAP RACE GUARD
-        // ─────────────────────────────────────────────────────────────────
-        // A genesis node started without anchors is in the dangerous "fresh
-        // bootstrap" path: cross-registration via `VrfKeyAnnounce` uses
-        // trust-on-first-verify (the announce handler verifies a self-
-        // signature against the SUPPLIED public key, not against the
-        // registry — see unified_p2p.rs::NetworkMessage::VrfKeyAnnounce).
-        // Whichever peer announces a genesis identity FIRST locks that
-        // identity to its PK in the local consensus PK registry. If a
-        // non-genesis peer (e.g. a whitelisted but otherwise hostile IP)
-        // is online and faster than the legitimate genesis bootstrap, it
-        // can squat the slot.
-        //
-        // Refuse to start unless the operator has explicitly acknowledged
-        // the race by setting `QNET_BOOTSTRAP_FRESH=1`. Two situations are
-        // legitimate uses of that opt-in:
-        //   * Truly first-ever cluster boot before any anchors have ever
-        //     been auto-written.
-        //   * Operator-driven full state cleanup where the
-        //     `dilithium_keypair.bin` files were also wiped (so a new
-        //     round of cross-registration is required).
-        //
-        // Any other situation — anchors lost between restarts, deploy
-        // script forgot to copy the file, host filesystem corruption —
-        // should fail loudly so the operator can restore from backup
-        // BEFORE the race window opens. Silent continuation in fresh-boot
-        // mode after operator-unaware anchor loss is exactly how an
-        // attacker squat succeeds on the next restart.
-        //
-        // Super-node identities (no `QNET_BOOTSTRAP_ID` env var) do NOT
-        // need anchors — their identity binding is established via signed
-        // `NodeRegistration` TX, which carries the Dilithium3 PK in the
-        // payload and is verified end-to-end. The guard skips them.
-        //
-        // Scalability: O(1) — two env-var lookups and a string compare.
-        // Independent of cluster size or network state.
-        let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-        let fresh_opt_in = std::env::var("QNET_BOOTSTRAP_FRESH")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        match anchors_missing_boot_decision(is_genesis_node, fresh_opt_in) {
-            BootDecision::Allowed => { /* proceed below */ }
-            BootDecision::AllowedFreshOptIn => {
-                let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
                 eprintln!(
-                    "[CRIT][GENESIS] fresh_bootstrap_mode_active bootstrap_id={} path={} \
-                     risk=identity_squat_window_open \
-                     hint=ensure_QNET_WHITELIST_IPS_contains_only_genesis_or_trusted_peers",
-                    bootstrap_id, GENESIS_ANCHORS_PATH
-                );
-            }
-            BootDecision::Refused => {
-                let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
-                eprintln!(
-                    "[CRIT][GENESIS] genesis_node_started_without_anchors \
-                     bootstrap_id={} path={} action=halt_startup",
-                    bootstrap_id, GENESIS_ANCHORS_PATH
-                );
-                eprintln!(
-                    "[CRIT][GENESIS] hint=restore_genesis_anchors_json_from_backup \
-                     OR set_QNET_BOOTSTRAP_FRESH=1_to_acknowledge_race_risk"
-                );
-                eprintln!(
-                    "[CRIT][GENESIS] race_summary=a_non-genesis_peer_with_valid_dilithium3_keypair \
-                     can_announce_first_and_lock_genesis_identity_to_its_PK_squat_attack"
+                    "[CRIT][GENESIS] embedded_pk_bad_hex node={} err={} action=halt_startup",
+                    node_id, e
                 );
                 std::process::exit(2);
             }
         }
-        return 0;
     }
+    if map.len() != GENESIS_NODE_IPS.len() {
+        eprintln!(
+            "[CRIT][GENESIS] embedded_pk_count={} expected={} action=halt_startup \
+             hint=GENESIS_CONSENSUS_PKS_must_cover_every_genesis_id",
+            map.len(), GENESIS_NODE_IPS.len()
+        );
+        std::process::exit(2);
+    }
+
     let count = map.len();
 
-    // Pre-populate working registries BEFORE handing the map off to
-    // `set_genesis_anchor_pks` — registering against an empty anchor map
-    // skips the anti-squat branch in `register_consensus_pk_from_chain`,
-    // and once the anchor map is set the same calls would be no-ops on the
-    // immutability check anyway. This ordering is intentional and makes the
-    // pre-population path a single straight line.
+    // Pre-populate working registries, then install the immutable anchor
+    // map. Ordering is intentional: registering against the not-yet-set
+    // anchor map skips the anti-squat branch (these are the canonical PKs);
+    // after `set_genesis_anchor_pks` the same calls are immutability no-ops.
     for (node_id, pk_bytes) in &map {
         register_vrf_public_key(node_id, pk_bytes);
         if !qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, pk_bytes) {
@@ -590,16 +306,14 @@ pub fn install_genesis_anchors_at_startup() -> usize {
     let installed = qnet_consensus::consensus_crypto::set_genesis_anchor_pks(map);
     if installed {
         println!(
-            "[INFO][GENESIS] anchors_installed count={} src={} prepopulated_registries=true",
-            count, GENESIS_ANCHORS_PATH
+            "[INFO][GENESIS] anchors_installed count={} src=embedded_GENESIS_CONSENSUS_PKS \
+             prepopulated_registries=true",
+            count
         );
-        count
     } else {
-        // Already installed (immutable). Treat as success, but log so an
-        // operator restart with a different file is visible.
         println!("[INFO][GENESIS] anchors_already_installed count={}", count);
-        count
     }
+    count
 }
 
 /// Lookup the anchored PK for a given genesis node_id. Returns None if no
@@ -737,58 +451,45 @@ mod tests_v17_security {
         assert_eq!(genesis_node_count(), GENESIS_NODE_IPS.len());
     }
 
-    // ────────────────────────────────────────────────────────────────────────
-    // v17.1: BOOTSTRAP-RACE GUARD (anchors_missing_boot_decision)
-    // ────────────────────────────────────────────────────────────────────────
-    // The four cases below exhaustively cover the truth table of the policy
-    // documented above the function. A regression on ANY of these means the
-    // refuse-to-start guard has been broken — either we'd start dangerously
-    // (squat window open) or we'd crash super-nodes that have no business
-    // touching anchors. Both are loud production failures.
+    // v27 HOLE1: genesis identity binary-pinned — lock that the embedded
+    // GENESIS_CONSENSUS_PKS is complete + well-formed (replaces the obsolete
+    // v17.1 boot-race-guard tests; there is no runtime squat path now).
 
-    /// Super-node (no `QNET_BOOTSTRAP_ID`) MUST always boot regardless of
-    /// the `QNET_BOOTSTRAP_FRESH` flag — they have no anchor relationship.
+    /// Embedded set covers EXACTLY the canonical genesis ids, once each.
     #[test]
-    fn boot_decision_super_node_no_opt_in_allowed() {
+    fn genesis_consensus_pks_cover_all_ids_uniquely() {
+        use std::collections::BTreeSet;
+        let ids: BTreeSet<&str> =
+            GENESIS_CONSENSUS_PKS.iter().map(|(id, _)| *id).collect();
         assert_eq!(
-            anchors_missing_boot_decision(false, false),
-            BootDecision::Allowed
+            ids.len(), GENESIS_CONSENSUS_PKS.len(),
+            "duplicate node_id in GENESIS_CONSENSUS_PKS"
         );
+        assert_eq!(
+            ids.len(), GENESIS_NODE_IPS.len(),
+            "GENESIS_CONSENSUS_PKS must cover every genesis id"
+        );
+        for (_ip, bootstrap_id) in GENESIS_NODE_IPS {
+            let want = format!("genesis_node_{}", bootstrap_id);
+            assert!(
+                ids.contains(want.as_str()),
+                "missing embedded PK for {}", want
+            );
+        }
     }
 
-    /// Super-node + opt-in: still allowed. Opt-in is irrelevant for a node
-    /// type that doesn't consult anchors. We don't error on irrelevant flags.
+    /// Every embedded PK is a valid 1952-byte ML-DSA-65 (FIPS-204) key.
+    /// A bad entry makes `install_genesis_anchors_at_startup` fail-closed.
     #[test]
-    fn boot_decision_super_node_with_opt_in_allowed() {
-        assert_eq!(
-            anchors_missing_boot_decision(false, true),
-            BootDecision::Allowed
-        );
-    }
-
-    /// Genesis node + no opt-in is the SECURITY-CRITICAL case. Booting here
-    /// would let any whitelisted hostile peer with a fresh Dilithium3 keypair
-    /// announce a genesis identity first and pin its PK in the local
-    /// registry — squat-on-bootstrap. The guard MUST refuse.
-    #[test]
-    fn boot_decision_genesis_no_anchors_no_opt_in_refused() {
-        assert_eq!(
-            anchors_missing_boot_decision(true, false),
-            BootDecision::Refused
-        );
-    }
-
-    /// Genesis node + explicit opt-in: allowed but flagged. This is the
-    /// legitimate first-cluster-boot path; it must succeed so a brand-new
-    /// network can complete cross-registration and auto-write its anchors.
-    /// The CRIT log emitted alongside this decision is the operator's
-    /// evidence that they are running in dangerous mode for this boot.
-    #[test]
-    fn boot_decision_genesis_no_anchors_with_opt_in_allowed_with_warning() {
-        assert_eq!(
-            anchors_missing_boot_decision(true, true),
-            BootDecision::AllowedFreshOptIn
-        );
+    fn genesis_consensus_pks_are_well_formed_mldsa65() {
+        for (id, pk_hex) in GENESIS_CONSENSUS_PKS {
+            let bytes = hex::decode(pk_hex)
+                .unwrap_or_else(|e| panic!("{} pk not hex: {}", id, e));
+            assert_eq!(
+                bytes.len(), 1952,
+                "{} pk must be 1952 bytes (ML-DSA-65)", id
+            );
+        }
     }
 }
 

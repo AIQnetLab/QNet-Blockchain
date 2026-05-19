@@ -156,46 +156,16 @@ impl DilithiumVrf {
 
     // ── Core VRF ─────────────────────────────────────────────────────────
 
-    /// Evaluate VRF (deterministic: same sk+input → same output).
+    /// Evaluate VRF — deterministic: same (sk, input) → same output.
     ///
-    /// v5: SK-DERIVED OUTPUT — works correctly under randomized Dilithium signing
-    /// ────────────────────────────────────────────────────────────────────
-    /// FIPS 204 ML-DSA-65 (Dilithium3) uses RANDOMIZED signing — the same
-    /// (sk, msg) pair produces a different signature every call. The
-    /// pre-v5 code derived the VRF output from the signature bytes,
-    /// which broke the canonical VRF determinism property: two evaluate
-    /// calls with the same input returned different outputs. That made
-    /// every secret-leader-election claim non-reproducible by the
-    /// claimer, leading to broken consensus on who was elected at any
-    /// given height.
-    ///
-    /// The v5 construction decouples the OUTPUT from the signature
-    /// bytes:
-    ///   * **Output** is a SHA3-512 digest over `(domain ‖ pk ‖ sk ‖
-    ///     input)` truncated to 32 bytes. Because `sk` is bound into
-    ///     the hash, the value is unique per (sk, input) pair AND
-    ///     deterministic across calls (no randomness involved).
-    ///   * **Proof** is a Dilithium3 detached signature over
-    ///     `(domain_proof ‖ pk ‖ input ‖ output)`. The proof is still
-    ///     randomised at the signature byte level (FIPS 204 default),
-    ///     but verification only checks signature validity, so
-    ///     determinism of the output is preserved.
-    ///
-    /// SECURITY PROPERTIES
-    /// ────────────────────────────────────────────────────────────────────
-    ///   * **Deterministic** — same (sk, input) → same output. ✓
-    ///   * **Unforgeable** — output cannot be computed without sk. ✓
-    ///   * **Verifiable authorship** — signature ties (input, output)
-    ///     to the claimed pk; only the holder of the matching sk could
-    ///     have produced a valid signature on that exact pair. ✓
-    ///   * **Hidden until reveal** — output is sk-private; observers
-    ///     cannot precompute election outcomes. ✓
-    ///
-    /// The construction matches the `EpochVRF` pattern used across
-    /// post-quantum BFT designs that pair randomised signing schemes
-    /// with hash-based determinism. All honest QNet validators
-    /// produce identical outputs for identical inputs, which is the
-    /// bedrock invariant the leader-election machinery relies on.
+    /// ML-DSA-65 signing is randomized (FIPS 204), so the output must NOT
+    /// be derived from signature bytes (that breaks determinism and makes
+    /// leader-election claims non-reproducible). Instead:
+    ///   output = SHA3-512(domain ‖ pk ‖ sk ‖ input)[..32]  (sk-bound, deterministic)
+    ///   proof  = Dilithium3 sig over (domain_proof ‖ pk ‖ input ‖ output)
+    /// Output is sk-private (unforgeable, hidden until reveal); the proof
+    /// ties (input, output) to pk. Output determinism despite randomized
+    /// signature bytes is the invariant leader election relies on.
     pub fn evaluate(&self, input: &[u8]) -> Result<VrfOutput, String> {
         let sk_bytes = self.sk.as_ref()
             .ok_or("[ERR][VRF] not initialized")?;

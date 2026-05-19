@@ -17,30 +17,15 @@ use dashmap::DashMap;
 /// Cached writable key directory - set once, read forever (lock-free after init)
 static CACHED_KEY_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PRODUCTION v15.14: Process-wide keypair singleton (fixes pk_mismatch race)
-//
-// Problem solved: multiple DilithiumKeyManager instances created across the codebase
-// (node.rs startup, quantum_crypto.rs signing cache, rpc.rs registration) each held
-// their own cached_keypair. When two raced before the disk file existed, each called
-// the random dilithium3::keypair() and persisted a different keypair → split-brain
-// identity, signatures from one path failed verification against the registered PK
-// from another path (pk_mismatch).
-//
-// Fix: keypairs are keyed by their canonical disk path. ALL DilithiumKeyManager
-// instances pointing to the same dilithium_keypair.bin share one Arc<(PK, SK)>.
-//
-// Concurrency model:
-//   - GLOBAL_KEYPAIR_CACHE: DashMap shards lock by hash; reads are wait-free.
-//   - GLOBAL_KEYPAIR_INIT_LOCKS: per-path Mutex held only during first-time keygen
-//     or first-time disk-load. Zero contention during steady-state reads.
-//   - Atomic insert via double-checked locking pattern: fast lock-free read first,
-//     then under the per-path Mutex re-check the cache, then generate or load.
-//
-// Scalability: O(1) memory per node process (one entry per process), wait-free reads
-// scale linearly with cores. Init lock is held for milliseconds during the very first
-// keygen on a fresh data directory and never thereafter.
-// ═══════════════════════════════════════════════════════════════════════════════
+// Process-wide keypair singleton (fixes the pk_mismatch race). Multiple
+// DilithiumKeyManager instances (node startup, signing cache, rpc
+// registration) each held their own cached_keypair; racing before the disk
+// file existed, each generated a different random keypair → split-brain
+// identity → signatures failed cross-path verification. Fix: keypairs are
+// keyed by canonical disk path so all managers for the same
+// dilithium_keypair.bin share one Arc<(PK,SK)>. Wait-free DashMap reads;
+// a per-path init Mutex serialises only the first keygen/load
+// (double-checked locking). O(1) memory/process.
 
 /// Process-wide cache: canonical disk path → shared keypair.
 /// Eliminates the in-process race where two managers generated different random keys.
@@ -333,6 +318,74 @@ impl DilithiumKeyManager {
         Ok((pk, sk))
     }
     
+    /// v27 HOLE1: deterministic ML-DSA-65 keypair from the wallet mnemonic
+    /// (replaces random keygen + dilithium_keypair.bin → wipe-safe, pin-able,
+    /// no TOFU squat window). Sign/verify path unchanged (pqcrypto-mldsa);
+    /// keygen=fips204 (byte-compat KAT-proven, fail-closed at boot). Shares
+    /// the process-wide keypair cache; no disk source of truth.
+    pub fn get_keypair_from_mnemonic(
+        &self,
+        mnemonic: &str,
+    ) -> Result<(dilithium3::PublicKey, dilithium3::SecretKey)> {
+        let cache_key = canonical_cache_key(&self.key_dir);
+
+        // FAST PATH: process-wide cache (shared with get_keypair()).
+        let cached_pair = keypair_cache().get(&cache_key).map(|entry| {
+            let (pk, sk) = entry.value().as_ref();
+            (pk.clone(), sk.clone())
+        });
+        if let Some((pk, sk)) = cached_pair {
+            let mut local = self.cached_keypair.write();
+            if local.is_none() {
+                *local = Some((pk.clone(), sk.clone()));
+            }
+            return Ok((pk, sk));
+        }
+
+        // SLOW PATH: serialize first-time derivation per canonical path.
+        let init_lock = {
+            let entry = keypair_init_locks()
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())));
+            entry.value().clone()
+        };
+        let _guard = init_lock.lock();
+
+        if let Some((pk, sk)) = keypair_cache().get(&cache_key).map(|entry| {
+            let (pk, sk) = entry.value().as_ref();
+            (pk.clone(), sk.clone())
+        }) {
+            let mut local = self.cached_keypair.write();
+            if local.is_none() {
+                *local = Some((pk.clone(), sk.clone()));
+            }
+            return Ok((pk, sk));
+        }
+
+        // Deterministic derivation (fips204 KeyGen from mnemonic-bound xi).
+        let (pk_bytes, sk_bytes) =
+            crate::crypto::genesis_key::derive_mldsa65_from_mnemonic(mnemonic);
+        let pk = <dilithium3::PublicKey as PublicKeyTrait>::from_bytes(&pk_bytes)
+            .map_err(|e| anyhow!("[ERR][KEY] derived_pk_parse err={:?}", e))?;
+        let sk = <dilithium3::SecretKey as SecretKeyTrait>::from_bytes(&sk_bytes)
+            .map_err(|e| anyhow!("[ERR][KEY] derived_sk_parse err={:?}", e))?;
+
+        let arc_kp = Arc::new((pk.clone(), sk.clone()));
+        keypair_cache().insert(cache_key, arc_kp);
+        {
+            let mut local = self.cached_keypair.write();
+            *local = Some((pk.clone(), sk.clone()));
+        }
+        if crate::node::is_info() {
+            let pk_hash = hex::encode(&Sha3_256::digest(PublicKeyTrait::as_bytes(&pk))[..8]);
+            println!(
+                "[INFO][KEY] keypair_derived_deterministic node={} pk_hash={} src=mnemonic",
+                self.node_id, pk_hash
+            );
+        }
+        Ok((pk, sk))
+    }
+
     /// Get public key bytes (1952 bytes for Dilithium3)
     pub fn get_public_key(&self) -> Result<Vec<u8>> {
         let (public_key, _) = self.get_keypair()?;

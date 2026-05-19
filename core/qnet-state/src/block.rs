@@ -283,46 +283,17 @@ pub struct ConsensusData {
     #[serde(default)]
     pub excluded_producers_for_next_epoch: Option<Vec<u8>>,
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // SKIP-MARKER MACROBLOCK (v15.7)
-    // ═══════════════════════════════════════════════════════════════════════════
-    // When the network's primary consensus path AND the deterministic
-    // fallback-initiator path both exhaust their retries for this macroblock
-    // index, the chain still must not develop a permanent gap. Without an
-    // explicit on-chain record of the failure, mb=N+1's `previous_hash`
-    // would dangle into nothing and every honest validator would refuse to
-    // proceed (PERMANENT NETWORK HALT).
-    //
-    // Resolution: when a 2f+1 BFT-signed TimeoutCertificate exists for this
-    // macroblock index and its certified round has reached the maximum
-    // view-change ceiling, every honest node deterministically constructs
-    // and saves a *skip-marker macroblock* that:
-    //
-    //   * occupies the missing index in the macroblock chain,
-    //   * carries the AggregatedTimeoutCertificate as cryptographic
-    //     evidence (`skip_certificate`),
-    //   * is flagged via `is_skip_marker = true` so validation distinguishes
-    //     it from a regular finalised macroblock,
-    //   * processes no rewards, includes no microblock state mutations
-    //     (consensus_data fields are empty / None) — the skip marker only
-    //     preserves chain integrity for `previous_hash` linkage.
-    //
-    // Validation of an incoming skip-marker macroblock requires:
-    //   1. is_skip_marker = true,
-    //   2. skip_certificate present and decodes to AggregatedTimeoutCertificate,
-    //   3. certificate verifies against the active validator set with 2f+1
-    //      Dilithium3-signed votes at certified_round ≥ MAX_VIEW_CHANGE_ROUNDS.
-    //
-    // Skip markers are NOT created speculatively. The fallback path runs
-    // through every healthy participant in deterministic rank order before
-    // a skip is even considered. By the time a skip marker is produced,
-    // the network has demonstrably failed to reach 2f+1 reveals for this
-    // macroblock, and the 2f+1 view-change votes themselves are the
-    // cryptographic proof of that failure.
-    //
-    // Backward compat: defaulted fields keep historical macroblocks
-    // deserialising unchanged (is_skip_marker = false, skip_certificate =
-    // None), so chain replay across the upgrade boundary is seamless.
+    // Skip-marker macroblock: when both the primary and deterministic-
+    // fallback paths exhaust retries for this index, an explicit on-chain
+    // placeholder must occupy it — else mb=N+1's previous_hash dangles and
+    // every honest node halts permanently. When a 2f+1 TimeoutCertificate
+    // exists at certified_round ≥ MAX_VIEW_CHANGE_ROUNDS, every honest node
+    // deterministically builds a skip marker: occupies the index, carries
+    // the AggregatedTimeoutCertificate as evidence, is_skip_marker=true,
+    // no rewards / no state mutations (only preserves previous_hash linkage).
+    // Validation requires: flag set; skip_certificate decodes; cert verifies
+    // 2f+1 Dilithium3 votes at round ≥ MAX_VIEW_CHANGE_ROUNDS. Never
+    // speculative — the 2f+1 view-change votes ARE the proof of failure.
 
     /// True iff this macroblock is a skip-marker placeholder produced after
     /// every fallback path failed to drive consensus to 2f+1 reveals.
@@ -335,45 +306,12 @@ pub struct ConsensusData {
     #[serde(default)]
     pub skip_certificate: Option<Vec<u8>>,
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // SNAPSHOT BINDING (v15.8) — cryptographic anchor for trust-less bootstrap
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Set by every honest node when constructing a macroblock whose end_height
-    // is a snapshot boundary (multiples of `SNAPSHOT_INCREMENTAL_INTERVAL` /
-    // `SNAPSHOT_FULL_INTERVAL` from the storage layer). The value is a
-    // SHA3-256 digest computed over the **canonical** byte representation
-    // of the snapshot artefact at this boundary — every committee member
-    // computes the same digest because:
-    //
-    //   1. each node materialises the snapshot deterministically through
-    //      the apply-stage trigger (every node, not just producer);
-    //   2. snapshot serialisation enforces canonical key ordering so that
-    //      different DashMap iteration orders cannot diverge on bytes.
-    //
-    // The macroblock's commit-reveal phase already gathers 2f+1 Dilithium3
-    // signatures over the macroblock content, which means after finalisation
-    // the `snapshot_root` is implicitly endorsed by the supermajority — no
-    // additional signing or aggregator infrastructure is required.
-    //
-    // A new node bootstrapping via snapshot sync now has a trust-less path:
-    //
-    //   * download snapshot bytes from peers via the chunked sync protocol;
-    //   * compute SHA3-256 of the canonical bytes locally;
-    //   * load the macroblock at the snapshot's boundary height (already
-    //     synchronised through normal block-sync earlier);
-    //   * compare the local digest to `consensus_data.snapshot_root`;
-    //   * accept the snapshot ONLY when the digests match — i.e. the
-    //     supermajority that finalised the macroblock attests to this
-    //     snapshot's content.
-    //
-    // Backward compat: defaulted to `None`, so historical macroblocks
-    // produced before this revision deserialise unchanged. Validation
-    // treats `None` the same as "no binding available" and falls back to
-    // a non-trust-less load (existing behaviour).
-    //
-    // Scalability: 32 bytes of additional macroblock payload, computed
-    // once per snapshot boundary (every 3 600 blocks ≈ 1h). Independent
-    // of validator count.
+    // Snapshot binding for trustless bootstrap: SHA3-256 of the canonical
+    // snapshot bytes at a snapshot-boundary macroblock. Identical across the
+    // committee (deterministic apply-stage materialisation + canonical key
+    // ordering) and implicitly endorsed by the 2f+1 commit-reveal that
+    // finalises the macroblock. A bootstrapping node computes the digest
+    // locally and accepts the downloaded snapshot only when it matches.
     /// SHA3-256 digest of the canonical snapshot artefact at this macroblock's
     /// end_height. Present only when this macroblock terminates a snapshot
     /// interval boundary AND the local snapshot was successfully created.
@@ -976,36 +914,14 @@ impl MicroBlock {
         }
     }
 
-    /// Calculate microblock hash
+    /// Calculate microblock hash.
     ///
-    /// ═══════════════════════════════════════════════════════════════════════
-    /// v23.1: TIMEOUT_ROUND INCLUDED IN HASH (consensus-relevant binding)
-    /// ═══════════════════════════════════════════════════════════════════════
-    /// The `timeout_round` field is consensus-relevant state — it determines
-    /// which producer is legitimately elected at this height via the pure
-    /// function `select_microblock_producer_with_round(h, candidates, round)`.
-    /// It also drives `record_finalized_round` → `LAST_FINALIZED_ROUND_PER_MB`
-    /// → `get_certified_rotation_round` for all subsequent heights in the
-    /// macroblock window. Any field that influences consensus decisions
-    /// MUST be cryptographically bound to the block.
-    ///
-    /// Pre-v23.1 the field was omitted from the hash because v22 hardcoded
-    /// it to 0 (single value, omission harmless). v23 restored real values
-    /// (0, 1, 2, ...) for BFT-certified rotation; the omission then became
-    /// a real attack surface: a peer-relay or man-in-the-middle could mutate
-    /// `timeout_round` without breaking the hash → storage L4 anti-fork
-    /// guard would silently treat the mutated block as idempotent re-save
-    /// → divergent baseline tracking across nodes → potential leader-
-    /// selection divergence on subsequent heights.
-    ///
-    /// Including `timeout_round` in the hash closes that surface: any
-    /// mutation produces a different hash → storage L4 detects it as
-    /// equivocation (different content at same height) → reject + record
-    /// evidence for slashing.
-    ///
-    /// Scalability: one extra `to_le_bytes` + `hasher.update` per block.
-    /// Negligible cost at any committee size.
-    /// ═══════════════════════════════════════════════════════════════════════
+    /// `timeout_round` IS bound into the hash: it is consensus-relevant
+    /// (selects the elected producer and drives certified rotation for the
+    /// macroblock window). Once v23 used real values, omitting it let a
+    /// MITM mutate it without changing the hash → storage L4 anti-fork
+    /// guard treats it as an idempotent re-save → leader divergence.
+    /// Binding it turns any mutation into an L4 equivocation (reject + slash).
     pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha3_256::new();
         hasher.update(&self.height.to_le_bytes());

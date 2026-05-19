@@ -307,63 +307,16 @@ fn build_adaptive_transport(initial_rtt_ms: u64) -> quinn::TransportConfig {
     transport
 }
 
-// ============================================================================
-// NODE HANDSHAKE
-// ============================================================================
-//
-// v19: AUTHENTICATED IDENTITY BINDING (peer-level anti-spoof)
-//
-// The handshake exchange now carries an OPTIONAL post-quantum proof:
-//   `dilithium_proof = Dilithium3_sign(SK, handshake_challenge_message)`
-//
-// where `handshake_challenge_message` is the canonical string
-//   `qnet-quic-handshake-v1:{node_id}:{timestamp}:{block_height}`
-//
-// formed by the SENDER. Verification on the RECEIVER side is performed via
-// `consensus_crypto::verify_consensus_signature` against the immutable
-// `CONSENSUS_PK_REGISTRY` (genesis anchors + on-chain super-node
-// registrations). A peer that does not control the Dilithium3 secret key
-// for the claimed identity cannot produce a valid proof — the X.509-SAN +
-// TOFU layer that historically admitted any self-signed certificate with
-// a matching SAN string is now subordinate to a cryptographic identity
-// gate rooted in the same trust source as consensus messages.
-//
-// Backward compatibility (Phase 2.A — current rollout)
-// ────────────────────────────────────────────────────
-//   * `dilithium_proof` is `Option<Vec<u8>>`. Pre-v19 senders that do not
-//     emit the field deserialize via `NodeHandshakeV2` and reach the
-//     receiver with `proof = None`. Such peers are still admitted, but
-//     a `[WARN][HANDSHAKE]` log is emitted so operators can audit which
-//     peers in their fleet have not yet been upgraded.
-//   * v19 senders ALWAYS attempt to attach a proof. If the local Dilithium
-//     keypair is not yet available at handshake time (extremely early
-//     boot — should not happen in production because keypair init runs
-//     before P2P startup), the field falls back to `None` rather than
-//     panicking.
-//   * Receiver-side enforcement is currently **advisory** (verify-and-log).
-//     Phase 2.B (strict mode, separate patch after migration window)
-//     flips the flag so peers without a valid proof are refused at
-//     handshake time. Deferring strict enforcement allows a smooth
-//     mainnet rollout without simultaneous-upgrade requirements.
-//
-// Scalability / security properties
-// ─────────────────────────────────
-//   * Cost: one Dilithium3 verify per QUIC connection establishment
-//     (~5 ms). Long-lived connections amortise this to effectively
-//     zero per message. At 1000+ super-nodes with `sqrt(N)` mesh
-//     topology the steady-state verify cost is < 0.5 % of a core.
-//   * No new attack surface: a malicious peer that omits the proof
-//     gains no privilege beyond what pre-v19 already allowed; one
-//     that supplies a valid proof IS the legitimate identity by
-//     construction. An attacker that supplies a bogus proof is
-//     trivially detected and logged.
-//   * The handshake message is bound to `(node_id, timestamp,
-//     block_height)`, so a captured proof cannot be replayed against
-//     a different identity or a stale boot. Replay within the same
-//     identity is acceptable — the receiver still uses the QUIC
-//     duplicate-connection guard plus signature gating on every
-//     subsequent consensus message.
-// ============================================================================
+// NODE HANDSHAKE — v19: authenticated identity binding (anti-spoof).
+// Handshake carries an OPTIONAL dilithium_proof = Dilithium3_sign(SK,
+// "qnet-quic-handshake-v1:{node_id}:{ts}:{block_height}"); receiver
+// verifies via consensus_crypto::verify_consensus_signature against the
+// immutable CONSENSUS_PK_REGISTRY (genesis anchors + on-chain super regs),
+// subordinating the old X.509-SAN/TOFU admit to a crypto identity gate.
+// Phase 2.A: proof is Option — pre-v19 (None) still admitted + [WARN];
+// enforcement ADVISORY (verify-and-log); Phase 2.B → strict refuse after
+// the migration window. Challenge bound to (node_id,ts,height) → no
+// cross-identity / stale-boot replay. ~1 Dilithium verify per conn.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeHandshake {
@@ -496,74 +449,23 @@ pub async fn build_handshake_proof(
     }
 }
 
-/// v19.1: Advisory verification of a handshake proof.
-///
-/// Three-state contract — each state reflects a different operational
-/// reality and the caller's response is calibrated accordingly:
-///
-///   * `Ok(true)`  — proof was supplied AND verified successfully under
-///                   the claimed identity's REGISTERED Dilithium PK.
-///                   Peer is cryptographically authenticated.
-///
-///   * `Ok(false)` — peer is admitted under a documented advisory path
-///                   (no signature gate violation). One of:
-///                       a) no proof attached (pre-v19 sender)
-///                       b) crypto subsystem not yet initialised
-///                          (very early boot, before P2P startup
-///                          completes)
-///                       c) PK is NOT yet present in the consensus PK
-///                          registry — the peer is a fresh-bootstrap
-///                          joiner whose identity binding will be
-///                          established by its inbound `VrfKeyAnnounce`
-///                          (see `unified_p2p.rs::VrfKeyAnnounce`,
-///                          which carries its own self-signature
-///                          verified inline and registers the PK on
-///                          success). Without this state, fresh
-///                          clusters cannot bootstrap because the
-///                          first connection from each genesis peer
-///                          arrives BEFORE that peer's PK has been
-///                          cross-registered.
-///
-///   * `Err(reason)` — proof was supplied AND the PK is in the registry
-///                     AND the signature did not verify. This is the
-///                     only path that drops the connection, because it
-///                     is the only path that distinguishes a real
-///                     identity-squat attempt (PK present, sig wrong)
-///                     from a legitimate first-contact peer (PK
-///                     absent).
-///
-/// Splitting "PK absent" out of the failure path is what makes the
-/// connection-level handshake compatible with the universal L1 BFT
-/// invariant: TLS/QUIC connection establishment MUST NOT require
-/// pre-knowledge of the peer's identity key, because identity binding
-/// happens through signed messages CARRIED OVER the connection, not
-/// embedded in the handshake itself. A connection-level gate that
-/// blocks unknown-PK peers creates an unrecoverable chicken-and-egg
-/// at fresh-cluster boot.
-///
-/// Security argument
-/// ─────────────────
-/// `Ok(false)` admits the connection but does NOT authenticate the
-/// peer. Every consensus-relevant message that flows over the
-/// admitted connection still passes through:
-///   * `verify_consensus_signature` (Dilithium3 against registered PK)
-///   * `verify_dilithium_heartbeat_signature_async` for heartbeats
-///   * inline self-signature verification on `VrfKeyAnnounce` payload
-///     (which is what installs the PK in the registry in the first
-///     place)
-/// An attacker who attaches a fake proof for an unknown identity gets
-/// no privilege beyond what an unsigned-handshake peer already has —
-/// their first signed message will fail verification. An attacker who
-/// attaches a bad proof for a KNOWN identity is rejected here (Err)
-/// before getting a chance to send any message at all.
-///
-/// Scalability
-/// ───────────
-/// One `has_consensus_pk` lookup (lock-free `parking_lot::RwLock` read)
-/// + at most one Dilithium3 verify (~3 ms). At thousand-node mesh with
-/// sqrt(N) topology, steady-state cost stays sub-1% of a core. The
-/// async path avoids spawning a thread per verify (which would be
-/// catastrophic at 1000+ peers reconnecting after a regional outage).
+/// v19.1: advisory handshake-proof verification. Three-state contract:
+///   Ok(true)  — proof supplied AND verified under the claimed identity's
+///               REGISTERED Dilithium PK (cryptographically authenticated).
+///   Ok(false) — admitted via a documented advisory path (NOT a sig-gate
+///               violation): (a) no proof (pre-v19 sender), (b) crypto not
+///               yet initialised, or (c) PK not yet in the consensus
+///               registry — a fresh-bootstrap joiner whose binding is set
+///               by its inbound self-signed VrfKeyAnnounce.
+///   Err       — proof supplied AND PK IS registered AND sig failed: the
+///               only drop path (real squat vs unknown-PK first contact).
+/// "PK absent" is split out of the failure path because the L1 invariant
+/// requires connection establishment to NOT need pre-knowledge of the peer
+/// key (identity binds via signed messages over the conn) — else fresh
+/// boot deadlocks. Security: Ok(false) admits but does NOT authenticate;
+/// every consensus message still passes verify_consensus_signature /
+/// heartbeat / VrfKeyAnnounce verify, so a fake proof for an unknown id
+/// gains nothing. O(1) lookup + <=1 Dilithium verify.
 pub async fn verify_handshake_proof(
     claimed_node_id: &str,
     timestamp: u64,

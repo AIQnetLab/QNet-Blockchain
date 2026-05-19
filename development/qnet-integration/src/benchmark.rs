@@ -1374,29 +1374,13 @@ mod tests {
         assert!(e2e_tps > 0.0);
     }
 
-    // =========================================================================
-    // LIVE SERVER INTEGRATION TESTS
-    // =========================================================================
-    //
-    // Require a running QNet node with QNET_BENCHMARK_MODE=true on a Genesis node.
-    // Server genesis creates EON1benchmark000000..000999 (1M QNC each).
-    //
-    // TX flow on server:
-    //   POST /api/v1/benchmark/start → server generates + signs TX internally
-    //   → submit_benchmark_batch → verify_ed25519_batch (real crypto)
-    //   → mempool → P2P broadcast → block production → finalized
-    //
-    // NOTE: benchmark TX use EON1benchmark* addresses which do NOT pass
-    // validate_eon_address (41-char format). They go through the dedicated
-    // benchmark pipeline, not through POST /api/v1/transaction.
-    //
-    // Run (set env vars to your node):
-    //   QNET_NODE_URL=http://<host>:<port> \
-    //   QNET_API_KEY=<your-api-key> \
+    // Live server integration tests. Require a running node with
+    // QNET_BENCHMARK_MODE=true (genesis creates EON1benchmark000000..000999,
+    // 1M QNC each). Benchmark TXs use EON1benchmark* addresses that do NOT
+    // pass validate_eon_address — they go through the dedicated benchmark
+    // pipeline, not POST /api/v1/transaction. #[ignore] in CI; run with:
+    //   QNET_NODE_URL=http://<host>:<port> QNET_API_KEY=<key> \
     //   cargo test --lib -- bench_server --ignored --nocapture
-    //
-    // #[ignore] — skipped in CI, only run when QNET_NODE_URL is set.
-    // =========================================================================
 
     fn make_http_client() -> reqwest::blocking::Client {
         reqwest::blocking::Client::builder()

@@ -412,38 +412,11 @@ impl TransactionPool {
     }
 }
 
-// ============================================================================
-// TIERED STORAGE ARCHITECTURE
-// ============================================================================
-// 
-// QNET uses Transaction/Compute Sharding for parallel processing,
-// NOT State Sharding for storage division.
-//
-// SHARDING = Parallel transaction PROCESSING (CPU cores)
-// STORAGE = Tiered by node type (Light/Super)
-//
-// ┌─────────────────────────────────────────────────────────────┐
-// │                    STORAGE TIERS (v3.19)                    │
-// ├─────────────────────────────────────────────────────────────┤
-// │                                                              │
-// │  ┌─────────────┐            ┌─────────────────┐             │
-// │  │   Light     │            │ Super/Bootstrap │             │
-// │  │   Node      │            │     Node        │             │
-// │  │  (wallet)   │            │   (server)      │             │
-// │  └──────┬──────┘            └────────┬────────┘             │
-// │         │                            │                      │
-// │   NO storage!                 Full blocks (archival)        │
-// │   Pure API client             NO pruning (full history)     │
-// │         │                            │                      │
-// │      0 MB                        ~500 MB/day                │
-// │                                                              │
-// │  Data via API:                Serves API requests:          │
-// │  GET /api/v1/balance          GET /api/v1/block/{height}    │
-// │  GET /api/v1/address/{w}      GET /api/v1/transaction/{h}   │
-// │                                                              │
-// └─────────────────────────────────────────────────────────────┘
-//
-// ============================================================================
+// Tiered storage architecture. QNet uses transaction/compute sharding for
+// parallel processing (CPU), NOT state sharding for storage division.
+// Storage is tiered by node type: Light = pure API client, no local
+// storage (0 MB); Super/Bootstrap = full archival blocks, no pruning
+// (~500 MB/day), serves the block/tx/balance API.
 
 /// Storage tier configuration for different node types
 /// This is about WHAT and HOW LONG to store, NOT which shards
@@ -654,32 +627,10 @@ impl GracefulDegradation {
     }
 }
 
-// ============================================================================
-// v19: LightNodeRotation — DEPRECATED LEGACY (kept for backward compatibility)
-// ============================================================================
-// Status: NOT used in production light-node deployments.
-//
-// Rationale
-// ─────────
-// Production light-node design (per `StorageTierConfig::light()` below) is
-// `Pure API client — NO local storage. max_storage_bytes = 0.`. A light
-// node is the mobile-wallet tier: it signs transactions, queries balances
-// via API endpoints, and receives uptime rewards via the ping-response
-// challenge protocol (`handle_light_node_ping_response` in rpc.rs). It
-// does NOT maintain a local block-header chain on disk.
-//
-// `LightNodeRotation` was an earlier design where light clients persisted
-// macroblock headers locally and rotated them in a FIFO buffer when the
-// retention cap was hit. That scheme was retired when the storage tier
-// config flipped `max_storage_bytes` to zero — the rotation code path now
-// runs against an empty buffer and is effectively a no-op. The struct is
-// retained so the existing `Storage::light_rotation` field continues to
-// compile without ripple-effect refactors across the codebase.
-//
-// Future cleanup (post-mainnet): remove this struct and the corresponding
-// `Storage::light_rotation` field once all in-tree references are migrated.
-// Until then, `#[allow(dead_code)]` annotations document the deprecation.
-// ============================================================================
+// LightNodeRotation — DEPRECATED, no-op. Light nodes are pure API clients
+// (max_storage_bytes = 0, no local header chain); this earlier
+// header-rotation buffer now runs against an empty buffer. Struct retained
+// only so the Storage::light_rotation field compiles; remove both later.
 
 /// DEPRECATED — header rotation buffer for the historical "headers-persisted"
 /// light-node tier. Production light nodes are pure API clients with no
@@ -1616,49 +1567,15 @@ impl PersistentStorage {
         Ok(())
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // v15.9: WRITE-THROUGH ACCOUNT PERSISTENCE (Stage 1 of disk-backed migration)
-    // ───────────────────────────────────────────────────────────────────────────
-    // Batched persistence of every account mutated by a single block, called
-    // from the apply pipeline after the block has been verified, saved, and
-    // its `chain_height` advanced. The mutation set is sourced from the
-    // existing `BlockSnapshot` journal (qnet_state::state::BlockSnapshot)
-    // which already records pre-images for every touched address — we just
-    // re-read the post-image from the in-memory `accounts` DashMap and
-    // mirror it into the `accounts` column family.
-    //
-    // WHY THIS IS STAGE 1
-    // ───────────────────────────────────────────────────────────────────────────
-    // The full disk-backed migration (Stage 2) replaces the in-memory map
-    // with an LRU cache fronting the same column family — at that point the
-    // working set is bounded regardless of total account count. This stage
-    // gives us PERSISTENCE without yet giving us the RAM bound: the
-    // `accounts` CF becomes the canonical durable copy of state, so a node
-    // that crashes between snapshots can rebuild from the on-disk accounts
-    // CF + the surviving microblocks instead of replaying from genesis.
-    //
-    // BATCH SEMANTICS
-    // ───────────────────────────────────────────────────────────────────────────
-    // All puts and deletes for a single block share one `WriteBatch`, so the
-    // RocksDB commit is atomic at the block boundary. Either every account
-    // change for a block is durable, or none of them is — matching the
-    // atomicity of the in-memory apply path.
-    //
-    // BLOCKING-POOL EXECUTION
-    // ───────────────────────────────────────────────────────────────────────────
-    // bincode serialisation + WriteBatch + commit run on
-    // `tokio::task::spawn_blocking` so the async reactor never stalls on
-    // RocksDB compaction. Per-block cost is bounded by the size of the
-    // mutation set (typically ≤ 100 accounts × ~150 B = ~15 KB) — a
-    // microsecond-scale write. At 1 000+ super-node committees the work is
-    // identical on every node and runs in parallel with consensus.
-    //
-    // CONTRACT STORAGE
-    // ───────────────────────────────────────────────────────────────────────────
-    // For accounts with `is_contract == true`, per-key contract storage is
-    // mirrored to its own column family via `save_contract_storage`. This
-    // keeps the account row small (no full HashMap serialisation per put)
-    // and enables future per-key load on demand.
+    // v15.9 Stage-1: write-through account persistence. After a block is
+    // verified/saved/height-advanced, mirror every account it mutated (set
+    // from the BlockSnapshot journal; post-image re-read from the in-memory
+    // accounts DashMap) into the accounts CF. Stage 1 = durability without a
+    // RAM bound (Stage 2 = LRU+CF): the CF becomes the canonical durable
+    // state so a crash rebuilds from CF + surviving microblocks, not a
+    // genesis replay. One WriteBatch/block → block-atomic (all-or-none).
+    // Runs on spawn_blocking so the reactor never stalls on compaction
+    // (~15 KB/block). Contract storage → its own CF (small account rows).
     pub async fn persist_accounts_batch(
         &self,
         modified_accounts: Vec<(String, qnet_state::Account)>,
@@ -2823,31 +2740,13 @@ impl PersistentStorage {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // v14.7 (pt 9): TIMEOUT-CERTIFICATE PERSISTENCE
-    // ═══════════════════════════════════════════════════════════════════════════
-    // BFT TimeoutCertificates (2f+1 signed votes for a timeout_round at a given
-    // macroblock index) and the HIGHEST_CERTIFIED_ROUND / HIGHEST_ADOPTED_ROUND
-    // trackers live in DashMaps. Prior to v14.7 they were RAM-only — any node
-    // restart blanked them, so the v14.6 pre-save guard (which reads these maps
-    // to decide whether to yield as stale primary) was guaranteed to malfunction
-    // in the crucial seconds after reboot.
-    //
-    // We now persist the full certificate set plus the two derived high-water
-    // trackers under dedicated keys inside the existing "consensus" CF (hot
-    // write buffer). Calls write-through on every certificate insert/adopt.
-    // Startup code rehydrates the DashMaps before the production loop starts
-    // so the guard sees the correct view from the first tick.
-    //
-    // Keys:
-    //   "tcerts_v1"     → bincode<Vec<((u64,u64), TimeoutCertificate)>>
-    //   "hi_cert_v1"    → bincode<Vec<(u64, u64)>>  (mb_index → round)
-    //   "hi_adopt_v1"   → bincode<Vec<(u64, u64)>>  (mb_index → round)
-    //
-    // Scalability: O(k) serialise where k = active macroblock window. Cleanup
-    // retain() in unified_p2p prunes old entries every block, so k is bounded
-    // by the cert-retention window (a handful of macroblocks).
-    // ═══════════════════════════════════════════════════════════════════════════
+    // Timeout-certificate persistence. 2f+1 TimeoutCertificates and the
+    // HIGHEST_CERTIFIED/ADOPTED_ROUND trackers were RAM-only, so a restart
+    // blanked them and the pre-save stale-primary guard malfunctioned for
+    // the first seconds after reboot. Now write-through into the "consensus"
+    // CF on every insert/adopt and rehydrated at startup before the
+    // production loop. Keys: tcerts_v1 / hi_cert_v1 / hi_adopt_v1 (bincode
+    // Vec). O(k) serialise, k = retention window (pruned per block).
     pub fn save_timeout_certificates(&self, payload: &[u8]) -> IntegrationResult<()> {
         let cf = self.db.cf_handle("consensus")
             .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
@@ -3314,7 +3213,14 @@ pub struct Storage {
     /// buffer is a no-op in production. Field retained so the struct
     /// shape stays stable until all in-tree references migrate.
     light_rotation: Arc<RwLock<LightNodeRotation>>,
+    /// v27 HOLE3: bounded read-through cache (height→block), warmed by
+    /// apply, read before cold RocksDB → kills 30s verify_stuck.
+    /// Rollback-aware. O(1), scale-independent.
+    recent_microblocks: Arc<dashmap::DashMap<u64, Arc<qnet_state::MicroBlock>>>,
 }
+
+/// v27 HOLE3: recent-block cache cap (macroblock window + slack).
+const RECENT_MB_CACHE_CAP: u64 = 256;
 
 // ============================================================================
 // TIERED STORAGE IMPLEMENTATION
@@ -3685,6 +3591,7 @@ impl Storage {
             tier_config,
             graceful_degradation: Arc::new(RwLock::new(graceful_degradation)),
             light_rotation: Arc::new(RwLock::new(light_rotation)),
+            recent_microblocks: Arc::new(dashmap::DashMap::new()),
         })
     }
     
@@ -3752,39 +3659,17 @@ impl Storage {
             return Ok(()); // Silently skip - will be re-synced
         }
 
-        // =====================================================================
-        // v15.11 L4: STORAGE-LEVEL ANTI-FORK GUARD — last line of defense
-        // =====================================================================
-        // Forensic case h=174582: TWO different blocks were saved on different
-        // nodes for the same height (producer 001 saved hash A, producer 002
-        // saved hash B four seconds later). The pre-v15.11 storage layer used
-        // a presence-only check (`load_microblock_hash → Some?`) which let the
-        // *second* save silently no-op when in fact the second block was a
-        // legitimate equivocation worth detecting and rejecting.
-        //
-        // Industry-grade defence:
-        //   * Compute the canonical block hash from the incoming MicroBlock
-        //     struct (consensus property: SHA3-256 over height+ts+prev_hash+
-        //     merkle_root+producer — same algorithm as `save_microblock_efficient`).
-        //   * Compare against the stored hash for this height.
-        //   * Equal hash  → idempotent re-save (peer broadcast race), silent OK.
-        //   * Unequal     → EQUIVOCATION; record cryptographic evidence for the
-        //                   next macroblock's slashing list and REJECT the save.
-        //   * No deserialize possible → fall through to the legacy presence
-        //                               check (raw-bytes fallback path; rare).
-        //
-        // This makes a divergent fork in storage MATHEMATICALLY IMPOSSIBLE on
-        // any honest node, regardless of upstream race conditions or network
-        // partitions. It is the storage tier's contribution to defence-in-depth
-        // alongside the producer-side L3 pre-check, the network-side L5
-        // majority-wins resolver, and the L6 block-equivocation slashing.
-        //
-        // Scalability:
-        //   * Two RocksDB lookups + one hash compare per save. O(1) regardless
-        //     of validator count or chain length.
-        //   * Evidence storage bounded by the active retention window; cleared
-        //     by `cleanup_global_hashmaps` on the periodic sweep.
-        // =====================================================================
+        // L4 storage-level anti-fork guard (last line of defence). Forensic
+        // h=174582: two different blocks saved at the same height on
+        // different nodes; the pre-v15.11 presence-only check let the second
+        // save silently no-op instead of detecting the equivocation. Now:
+        // compute the canonical hash of the incoming MicroBlock (SHA3-256
+        // over height+ts+prev_hash+merkle_root+producer) and compare to the
+        // stored one — equal → idempotent silent OK; unequal → EQUIVOCATION,
+        // record slashing evidence + REJECT; undeserialisable → legacy
+        // presence fallback. Makes a divergent storage fork impossible on an
+        // honest node. Pairs with producer L3, network L5 majority-wins, L6
+        // slashing. O(1)/save; evidence bounded by the retention sweep.
         let incoming_block: Option<qnet_state::MicroBlock> =
             bincode::deserialize::<qnet_state::MicroBlock>(data).ok();
         let incoming_hash: Option<[u8; 32]> = incoming_block.as_ref().map(|mb| mb.hash());
@@ -4456,26 +4341,11 @@ impl Storage {
         // serialized MacroBlock data into state_snap keys, causing deserialization failures
         // on node restart (bincode expected Vec<(String,Account)> but got MacroBlock).
         
-        // ═══════════════════════════════════════════════════════════════════════════
-        // STORAGE STRATEGY (v3.19)
-        // ═══════════════════════════════════════════════════════════════════════════
-        // 
-        // SUPER/GENESIS NODES (servers):
-        //   - ARCHIVAL mode - keep ALL microblocks forever
-        //   - Required for network sync (other nodes download from them)
-        //   - Storage: ~500MB-1GB per day
-        //
-        // LIGHT NODES (mobile wallets):
-        //   - Pure API clients - NO local storage at all!
-        //   - They never call save_macroblock() - this code path is unreachable
-        //   - All data fetched via API: /api/v1/address/{wallet}, etc.
-        //   - Wallet app stores TX history in localStorage/AsyncStorage
-        //
-        // New Super nodes use snapshot-based sync:
-        // 1. Download snapshot from /api/v1/snapshot/latest
-        // 2. Restore accounts/balances from snapshot
-        // 3. Sync only blocks from snapshot_height to current
-        // ═══════════════════════════════════════════════════════════════════════════
+        // Storage strategy: Super/Genesis = archival (keep all microblocks
+        // forever, serve sync, ~500MB-1GB/day); Light = pure API client, no
+        // local storage (never reaches save_macroblock). New Super nodes
+        // bootstrap via snapshot (download latest → restore accounts → sync
+        // only snapshot_height..current).
         
         let is_genesis = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
         
@@ -4910,7 +4780,31 @@ impl Storage {
     /// v12.1: Uses `microblock_fmt_{height}` metadata key for deterministic format selection.
     /// Falls back to try-both logic for blocks saved before v12.1 (backward compat).
     /// Handles Zstd compression transparently.
+    /// v27 HOLE3: warm cache post-apply. No-op during rollback; prunes
+    /// above rollback target + beyond window (never serves stale height).
+    pub fn cache_recent_microblock(&self, height: u64, mb: &qnet_state::MicroBlock) {
+        let (rb_in_progress, rb_target) = get_rollback_status();
+        if rb_in_progress {
+            self.recent_microblocks.retain(|&h, _| h <= rb_target);
+            return;
+        }
+        self.recent_microblocks.insert(height, Arc::new(mb.clone()));
+        let floor = height.saturating_sub(RECENT_MB_CACHE_CAP);
+        if floor > 0 {
+            self.recent_microblocks.retain(|&h, _| h >= floor);
+        }
+    }
+
     pub fn load_microblock_auto_format(&self, height: u64) -> IntegrationResult<Option<qnet_state::MicroBlock>> {
+        // v27 HOLE3: read-through fast path. Skipped + pruned during
+        // rollback (RocksDB authoritative; never serve rolled-back height).
+        let (rb_in_progress, rb_target) = get_rollback_status();
+        if rb_in_progress {
+            self.recent_microblocks.retain(|&h, _| h <= rb_target);
+        } else if let Some(cached) = self.recent_microblocks.get(&height) {
+            return Ok(Some(cached.value().as_ref().clone()));
+        }
+
         // Try to load raw microblock data
         let raw_data = match self.load_microblock(height)? {
             Some(data) => data,
@@ -7270,47 +7164,17 @@ impl Storage {
         Ok(())
     }
     
-    // PRODUCTION: Snapshot system for fast node synchronization
-    // Creates FULL snapshots every 10,000 blocks (~2.7 hours at 1s/block)
-    // Creates INCREMENTAL snapshots every 1,000 blocks (~16.7 minutes at 1s/block)
-    
-    /// Create state snapshot at specified height.
+    /// Create state snapshot at the given height (snapshot system for fast
+    /// node sync; runs at every INCREMENTAL_INTERVAL boundary).
     ///
-    /// v15.9: ALWAYS WRITES A FULL SNAPSHOT
-    /// ────────────────────────────────────────────────────────────────────
-    /// The previous incremental implementation wrote a `delta_{height}`
-    /// placeholder containing only a magic header and a `change_count = 0`
-    /// counter — every actual delta was empty (the diff-tracking against
-    /// `StateManager` was a TODO that never landed). Receivers and the
-    /// macroblock `snapshot_root` binding both look up `full_snap_*` /
-    /// `state_snap_*` keys, so the placeholder delta was unreachable from
-    /// every consumer in the system.
-    ///
-    /// Effect of the bug: the `snapshot_root` consensus binding only ever
-    /// activated on the 12-hour FULL-snapshot boundary (43 200, 86 400 …),
-    /// not on the intended 1-hour boundary (3 600, 7 200 …). 11 of every
-    /// 12 hourly boundaries silently fell through to `legacy_accept`,
-    /// leaving the `Level 4` defence dormant.
-    ///
-    /// Fix: at every snapshot boundary (every `INCREMENTAL_INTERVAL`
-    /// microblocks) we now run `create_state_snapshot`, which writes a
-    /// complete `full_snap_{height}` artefact. This is the same artefact
-    /// the receiver downloads and verifies, the same artefact the
-    /// macroblock producer hashes into `snapshot_root`, and the same
-    /// artefact the rollback reconciler reads when restoring state — one
-    /// canonical snapshot, one canonical key prefix, one verifiable hash
-    /// per boundary.
-    ///
-    /// SCALABILITY (1 000+ super nodes)
-    /// ────────────────────────────────────────────────────────────────────
-    /// The full snapshot runs on the blocking thread pool (see
-    /// `create_state_snapshot`). At 1 M+ accounts a single hourly
-    /// snapshot costs a few seconds of a blocking thread; at 10 M+
-    /// accounts tens of seconds. Reactor stays free either way. The
-    /// proper delta-snapshot optimisation is a future concern — once
-    /// `StateManager` exposes a per-boundary change set the body below
-    /// can be specialised back to a real delta path while preserving
-    /// the current single-key-prefix invariant.
+    /// Always writes a FULL snapshot. The old incremental path wrote an
+    /// empty `delta_{height}` placeholder no consumer read, so the
+    /// `snapshot_root` consensus binding only activated on the 12h FULL
+    /// boundary — 11/12 hourly boundaries fell through to legacy_accept and
+    /// the L4 defence stayed dormant. Now one canonical full_snap_{height}
+    /// per boundary feeds the receiver, snapshot_root, and the rollback
+    /// reconciler alike. Runs on the blocking pool (seconds at 1M+
+    /// accounts); a real delta path is future work.
     pub async fn create_incremental_snapshot(&self, height: u64) -> IntegrationResult<()> {
         // Match the apply-stage trigger (block_pipeline.rs) — both must
         // reference the same constant or boundaries diverge silently.
@@ -7622,36 +7486,13 @@ impl Storage {
     /// v2.99: Load state snapshot by height and restore into StateManager
     /// Load a state snapshot by height and return (state_root, accounts_bincode) for StateManager restoration.
     /// Payload: [type=0x01 | state_root(32) | accounts_bincode]
-    // ═══════════════════════════════════════════════════════════════════════
-    // v15.9: PERSISTENT MEMPOOL API
-    // ───────────────────────────────────────────────────────────────────────
-    // Pending transactions are mirrored from the in-RAM mempool into the
-    // dedicated `mempool` column family on every admission, and removed on
-    // block inclusion / TTL expiration / explicit drop. This crash-safety
-    // surface means a producer that goes down between accepting a TX and
-    // including it in a block does not silently drop user submissions —
-    // the next process to come up reloads the queue and the TX has another
-    // shot at inclusion under the same gas-price ordering.
-    //
-    // KEY SCHEME
-    // ───────────────────────────────────────────────────────────────────────
-    // Each TX is stored under its hash, prefix-free. Both the raw payload
-    // bytes and the admission timestamp (for TTL on reload) are bundled
-    // into a tiny header so the load path can rebuild the in-RAM
-    // metadata structures (tx_timestamps, by_gas_price) without any
-    // additional storage round-trip.
-    //
-    // Wire format per entry:
-    //   [admission_ts: u64 little-endian | tx_payload: variable]
-    //
-    // SCALABILITY (1 000+ super nodes, 500 K-entry mempool)
-    // ───────────────────────────────────────────────────────────────────────
-    // RocksDB writes are batched and the CF is hot — admission cost is a
-    // single `put_cf` per accepted TX. At a sustained 10 000 TPS network
-    // this is well within RocksDB's write budget. Boot scan reads up to
-    // 500 K entries in a few hundred milliseconds; we intentionally run
-    // it in tokio::task::spawn_blocking on startup to keep the async
-    // reactor free.
+    // Persistent mempool API: pending TXs are mirrored to the `mempool` CF
+    // on admission and removed on inclusion / TTL / drop, so a producer that
+    // dies between accepting and including a TX doesn't silently drop it —
+    // the next process reloads the queue under the same gas-price ordering.
+    // Per entry, keyed by tx hash: [admission_ts u64 LE | tx_payload] (ts
+    // rebuilds TTL/by_gas_price on reload with no extra round-trip). One
+    // put_cf per TX; boot scan runs in spawn_blocking to free the reactor.
 
     /// Persist a single pending mempool entry.
     /// Called from the integration layer immediately after a TX is admitted
@@ -8857,40 +8698,15 @@ impl Storage {
             return Err(IntegrationError::Other("No peers available for snapshot download".to_string()));
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        // v15.8: TWO-PHASE SNAPSHOT NEGOTIATION
-        // ═══════════════════════════════════════════════════════════════════════
-        // Phase 1: query every peer's locally-advertised snapshot height. Each
-        // peer reports the highest snapshot height present on its own disk —
-        // these can differ between peers because snapshot creation is per-node
-        // and not all peers create at the same boundary heights.
-        //
-        // Phase 2: pick the highest height observed (`best_height`) and
-        // restrict the download peer set to ONLY those peers that explicitly
-        // reported `best_height` available. Peers that reported a lower
-        // height (or no height) are excluded from the chunk-fan-out: their
-        // `get_snapshot_chunk(best_height, _)` would return None and break
-        // the manifest hash chain, forcing the fallback path even when one
-        // capable peer exists. With targeted filtering the chunked download
-        // proceeds against the actually-capable subset; if more than one
-        // peer reported `best_height`, parallel chunk fan-out works as
-        // designed; if exactly one did, the download serialises against
-        // that single peer (still strictly faster than block-by-block sync
-        // for any non-trivial snapshot size).
-        //
-        // Scalability: O(active_peers) for the discovery phase regardless of
-        // network size; the download phase is bounded by the number of peers
-        // with the matching snapshot, which on a healthy network grows with
-        // the snapshot replication factor (currently per-producer; future
-        // work spreads it via deterministic apply-stage creation across the
-        // committee).
-        //
-        // IPFS fast path is preserved unchanged: any peer that advertises a
-        // non-empty `ipfs_cid` and the local node has `IPFS_ENABLED=1`
-        // short-circuits to the IPFS gateway, bypassing the peer-fan-out
-        // entirely — that path scales horizontally with the IPFS swarm
-        // independent of the validator committee size.
-        // ═══════════════════════════════════════════════════════════════════════
+        // Two-phase snapshot negotiation. Phase 1: query each peer's
+        // advertised snapshot height (differ per-node — creation is per-node).
+        // Phase 2: pick best_height and download ONLY from peers that
+        // reported exactly it — including lower/no-height peers would return
+        // None on get_snapshot_chunk and break the manifest chain, forcing
+        // fallback even when a capable peer exists. >1 such peer → parallel
+        // fan-out; exactly 1 → serial (still faster than block-by-block).
+        // IPFS fast path preserved: ipfs_cid + IPFS_ENABLED short-circuits
+        // to the gateway, bypassing peer fan-out. O(active_peers) discovery.
 
         // ── Phase 1: discover snapshot offerings ──
         let mut best_height = 0u64;
@@ -8957,59 +8773,18 @@ impl Storage {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // SNAPSHOT-CONSENSUS BINDING VERIFICATION (v15.8)
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Closes the trust-less-bootstrap gap: a peer serving a snapshot also
-    // serves the manifest hashes, so a single byzantine peer (or a colluding
-    // ≤ f minority) can return a forged snapshot whose chunks all match a
-    // forged manifest. Per-chunk hashes alone do not bind the snapshot to
-    // the canonical chain — they only confirm "what I downloaded matches
-    // the metadata the peer sent".
-    //
-    // The fix: every macroblock at a snapshot-boundary height embeds a
-    // `snapshot_root` field in its `consensus_data`. That field is filled
-    // by the producer with the SHA3-256 digest of the canonical snapshot
-    // bytes at the boundary; every honest committee member computes the
-    // same digest because both snapshot creation (deterministic apply-stage
-    // trigger) and snapshot serialisation (canonical key ordering, boundary
-    // microblock timestamp) are byte-stable across the committee. The
-    // macroblock is finalised by ≥ 2f+1 Dilithium3 commit-reveal signatures,
-    // so an attacker would need to compromise 2f+1 keys to forge the
-    // `snapshot_root` value on chain — the same supermajority threshold
-    // that protects every other consensus-bound field.
-    //
-    // After download, the verifier:
-    //   1. computes SHA3-256 over the locally-saved snapshot bytes,
-    //   2. fetches the macroblock at `mb_idx = height / 90` (locally first,
-    //      then via P2P sync_macroblocks if absent),
-    //   3. reads `consensus_data.snapshot_root` from that macroblock,
-    //   4. compares — accepts on match, ROLLS BACK on mismatch.
-    //
-    // BYZANTINE-SAFE BINDING: snapshot acceptance requires a consensus-
-    // finalised `snapshot_root` from the binding macroblock. The previous
-    // implementation had three "graceful degradation" exits that accepted
-    // snapshots without verification:
-    //
-    //   * `verifier_macroblock_fetch_failed` — peer returned no macroblock
-    //   * `verifier_macroblock_unavailable`  — local cache miss after fetch
-    //   * `verifier_no_binding`              — macroblock had `snapshot_root = None`
-    //
-    // Each of those let an attacker peer feed an arbitrary snapshot whenever
-    // the local node could not retrieve the matching macroblock — and with
-    // a controlled peer that's trivially arrangeable. Now every failure
-    // returns Err so the caller falls through to byzantine-safe
-    // block-by-block sync. Liveness cost is one extra sync round-trip;
-    // safety gain is no attacker-controlled state contamination.
-    //
-    // Rollback: on digest mismatch the snapshot keys
-    // (`full_snap_{height}` / `state_snap_{height}`) are deleted to prevent
-    // the bad data from being read by subsequent state-recovery passes.
-    //
-    // Scalability: O(1) per bootstrap (one SHA3 over the snapshot, one
-    // macroblock fetch). Independent of validator committee size. The
-    // P2P fetch is bounded by the macroblock-sync timeout window.
-    // ═══════════════════════════════════════════════════════════════════════════
+    // Trustless-bootstrap binding. A byzantine peer can serve a self-
+    // consistent forged snapshot (per-chunk hashes only prove "download
+    // matches the peer's metadata", not chain-canonicity). Binding: the
+    // snapshot-boundary macroblock embeds consensus_data.snapshot_root =
+    // SHA3-256 of the canonical snapshot bytes (byte-stable across the
+    // committee, finalised by 2f+1 commit-reveal → forging needs 2f+1 keys).
+    // Verifier: SHA3 the saved snapshot → fetch macroblock at height/90
+    // (local then P2P) → compare → accept or ROLL BACK (delete
+    // full_snap_/state_snap_ keys). Every fetch/binding failure returns Err
+    // (no graceful-degradation accept) so the caller falls to byzantine-safe
+    // block-by-block sync — costs 1 RTT, no attacker state contamination.
+    // O(1)/bootstrap.
     async fn verify_snapshot_consensus_binding(
         &self,
         p2p: &crate::unified_p2p::SimplifiedP2P,
@@ -9584,30 +9359,12 @@ impl Storage {
     // ═══════════════════════════════════════════════════════════════════════════
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v15.10 STAGE-2: AccountStore impl — read-through fallback for StateManager
-// ───────────────────────────────────────────────────────────────────────────
-// `Storage::load_account` exposes the synchronous point read.
-// `qnet_state::AccountStore` is the trait the StateManager warm-cache pass
-// calls into on every cache miss. The impl is a thin error-swallowing
-// wrapper: on transient RocksDB errors we return `None` (the caller treats
-// it identically to a genuine miss), and on success we return the
-// deserialised Account.
-//
-// PRIVACY-FIRST LOGGING
-// ───────────────────────────────────────────────────────────────────────────
-// Errors are logged at INFO level with the address truncated to the first
-// 16 hex characters, matching the rest of the codebase's privacy posture.
-//
-// HOT-PATH BUDGET
-// ───────────────────────────────────────────────────────────────────────────
-// `load_account` is invoked once per cold address per block (warm-cache
-// pass). At ~1 000 unique addresses per block × ≤ 100 µs RocksDB point
-// read = ≤ 100 ms of disk reads concentrated at apply-time. Runs synchronously
-// because `qnet_state::AccountStore::load_account` is a sync trait method —
-// the disk reads are safe at this latency budget on SSD-backed Super nodes
-// and the warm pass itself runs OUTSIDE the state-write lock window
-// (see block_pipeline.rs apply path for the lock-free pre-warm site).
+// AccountStore impl: read-through fallback the StateManager warm-cache pass
+// calls on every cache miss. Thin error-swallowing wrapper — transient
+// RocksDB error → None (caller treats as a miss), success → Account.
+// Errors logged at INFO with the address truncated to 16 hex (privacy).
+// One sync point read per cold address per block; the warm pass runs
+// OUTSIDE the state-write lock (see block_pipeline.rs pre-warm site).
 impl qnet_state::AccountStore for Storage {
     fn load_account(&self, address: &str) -> Option<qnet_state::Account> {
         match self.persistent.load_account(address) {

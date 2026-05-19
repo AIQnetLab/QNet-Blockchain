@@ -137,6 +137,7 @@ warp = "0.3.7"
 clap = { version = "4.4.0", features = ["derive"] }
 atty = "0.2"
 once_cell = "1.21.3"
+fips204 = "0.4.6"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }

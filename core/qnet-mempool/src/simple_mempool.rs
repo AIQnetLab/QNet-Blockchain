@@ -57,32 +57,16 @@ pub struct SimpleMempool {
     tx_sender_map: DashMap<String, String>,
     /// Max transactions per sender
     max_per_sender: u32,
-    // ════════════════════════════════════════════════════════════════════════
-    // v15.5: COMMITMENT-CLASS TX DEDUPLICATION (sender+epoch replacement)
-    // ════════════════════════════════════════════════════════════════════════
-    // Forward index: `(identity, epoch_or_index, type_id)` → current canonical
-    // hash for that logical commitment. On admission of a commitment-class
-    // TX (HeartbeatCommitment, PingCommitmentWithSampling,
-    // LightNodeEligibilityBitmap, NodeRegistration, NodeReactivation), this
-    // index is consulted: any prior version with the same key is removed
-    // from every storage structure before the new TX is inserted, so the
-    // next producer can never pull two semantically-equivalent commitments
-    // into a single block.
-    //
-    // Without this index, retries created TXs with different hashes (because
-    // the per-attempt timestamp changed) which the hash-based dedup did not
-    // catch — the explorer-observable duplication at h=29731 (4 nodes ×
-    // 2 HeartbeatCommitment each) is the symptom this fixes.
-    //
-    // Scalability: lock-free `DashMap` keyed on a tight `(String, u64, u8)`
-    // tuple; admissions are O(1) and entries are bounded by the count of
-    // distinct logical commitments currently in flight (≤ active validator
-    // committee size per type — well-bounded at thousands of nodes).
-    //
-    // Identity / epoch derivation in `Transaction::commitment_dedup_key`
-    // MIRRORS `state.rs::check_duplicate_commitment` 1-to-1, so the mempool
-    // can never admit a TX that would later be rejected at apply time as
-    // a duplicate of one already on chain.
+    // Commitment-class dedup forward index: (identity, epoch_or_index,
+    // type_id) → canonical hash. On admission of a commitment-class TX
+    // (Heartbeat / PingCommitmentWithSampling / LightNodeEligibilityBitmap /
+    // NodeRegistration / NodeReactivation) any prior same-key version is
+    // removed before insert, so a producer can't pull two equivalent
+    // commitments into one block. Needed because retries change the
+    // timestamp → different hash → hash-dedup misses (symptom: dup at
+    // h=29731). commitment_dedup_key MIRRORS state.rs::check_duplicate_
+    // commitment 1:1, so the mempool can't admit what apply would reject.
+    // Lock-free DashMap, O(1), bounded by in-flight commitment count.
     commitment_index: Arc<DashMap<(String, u64, u8), String>>,
     /// Reverse index: `tx_hash → (identity, epoch_or_index, type_id)`. Used
     /// when a TX leaves the mempool by any path (replacement, block
@@ -92,55 +76,20 @@ pub struct SimpleMempool {
     /// pair under the same admission/removal logic.
     commitment_reverse: Arc<DashMap<String, (String, u64, u8)>>,
 
-    // ════════════════════════════════════════════════════════════════════════
-    // v15.9: PERSISTENT MEMPOOL HOOKS
-    // ────────────────────────────────────────────────────────────────────────
-    // The integration layer sets these callbacks at node start so every
-    // admission and removal is mirrored to a RocksDB column family. On
-    // restart the integration layer scans that CF and replays each
-    // entry back through `add_binary_transaction`, restoring the
-    // pending-TX queue exactly as it was before the crash. Hooks are
-    // optional — when unset, the mempool behaves as a pure RAM cache
-    // (legacy behaviour for tooling that links the crate directly).
-    //
-    // The signatures use simple `Arc<dyn Fn>` so the mempool crate stays
-    // free of any storage dependency and can be reused in tests.
+    // Persistent mempool hooks: optional callbacks set by the integration
+    // layer to mirror every admit/remove to a RocksDB CF and replay it on
+    // restart. Unset → pure RAM cache. Arc<dyn Fn> keeps this crate free of
+    // any storage dependency.
     persist_admit: Arc<RwLock<Option<Arc<dyn Fn(&str, &[u8], u64) + Send + Sync>>>>,
     persist_remove: Arc<RwLock<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
 
-    // ════════════════════════════════════════════════════════════════════════
-    // v15.12: ON-CHAIN COMMITMENT-EPOCH CACHE (subscriber pattern)
-    // ────────────────────────────────────────────────────────────────────────
-    // Records every commitment-class epoch that has been finalized on chain.
-    // Populated by the integration layer's apply path (producer + peer) via
-    // `mark_commitment_finalized`, consumed by every admission path to reject
-    // duplicate commitment TXs at the door — the third tier of the
-    // defence-in-depth ladder behind the in-flight `commitment_index` and
-    // the producer-side block-construction filter.
-    //
-    // Architectural rationale:
-    //   * The state's authoritative `committed_epochs` map lives in the
-    //     `qnet-state` crate and is updated synchronously inside
-    //     `apply_to_state`. Mirroring its cumulative set into a mempool-local
-    //     `DashMap` keeps the admission path lock-free (no cross-crate state
-    //     read-guard, no async runtime coupling) while preserving the
-    //     mempool-cleanliness invariant: once an epoch is finalized, no fresh
-    //     admission can resurrect a commitment for that epoch.
-    //   * Both producer and peer apply paths call `mark_commitment_finalized`
-    //     — symmetric with the L1 peer-apply mempool cleanup. Honest nodes
-    //     converge on the same cached set deterministically.
-    //
-    // Key shape: `(identity, epoch_or_index, type_id)` — exactly the
-    // `commitment_dedup_key()` tuple. `bool` value is a placeholder; presence
-    // of the key is the only signal the admission path needs.
-    //
-    // Memory bound:
-    //   * One entry per (validator, type, finalized_epoch). At MAX_VALIDATORS
-    //     = 1000 cap × 5 commitment types × ~6 epochs/24h retention =
-    //     ~30 000 entries. ~50 bytes/entry → ~1.5 MB worst case. Trivial.
-    //   * Pruned by the `prune_committed_epochs_below` helper called from the
-    //     periodic TTL sweep so older finalized epochs don't accumulate
-    //     indefinitely (epoch_or_index ≤ now − retention_window).
+    // On-chain commitment-epoch cache (third dedup tier behind
+    // commitment_index and the producer filter). Mirrors the state crate's
+    // authoritative `committed_epochs` set (filled by mark_commitment_
+    // finalized on producer+peer apply) into a lock-free DashMap so the
+    // admission path can reject finalized-epoch commitments without a
+    // cross-crate state guard. Key = commitment_dedup_key() tuple. Bounded
+    // (~1000×5×~6 ≈ 30k entries) and pruned by prune_committed_epochs_below.
     committed_epochs_cache: Arc<DashMap<(String, u64, u8), ()>>,
 }
 
@@ -421,30 +370,13 @@ impl SimpleMempool {
             return false;
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        // ═══════════════════════════════════════════════════════════════════
-        // v15.12 L3: ON-CHAIN COMMITMENT-EPOCH ADMISSION GUARD
-        // ═══════════════════════════════════════════════════════════════════
-        // Defence-in-depth against gossip TXs that arrive AFTER the same
-        // commitment epoch has been finalized on chain (typically: peer
-        // re-broadcast late, or local peer-apply notification raced with
-        // the gossip arrival). The producer-side filter (L2) and peer-apply
-        // cleanup (L1) handle the on-chain side; this guard prevents the
-        // mempool from holding an unreachable TX for the rest of its TTL,
-        // saving memory and bandwidth at thousands-of-validators scale.
-        //
-        // Cache is populated by `mark_commitment_finalized` calls from the
-        // integration layer's apply path on every block apply event. Lookup
-        // is a single lock-free DashMap query — adds ~50 ns to admissions
-        // for non-commitment TXs (single miss), and is the cheapest
-        // available rejection path for commitment TXs whose epoch has been
-        // finalized.
-        //
-        // Safe to ship a TX whose key is not yet in the cache: the producer
-        // L2 filter will catch it at block construction time, and the
-        // state-level `check_duplicate_commitment` is the final arbiter.
-        // L3 is purely an optimisation — never the sole source of truth.
-        // ═══════════════════════════════════════════════════════════════════
+        // L3 on-chain commitment-epoch admission guard: reject gossip TXs
+        // that arrive after their commitment epoch was finalized (late
+        // rebroadcast, or apply-vs-gossip race) so the mempool doesn't hold
+        // an unreachable TX for its whole TTL. Cache filled by
+        // mark_commitment_finalized on apply; lock-free ~50ns lookup.
+        // Pure optimisation — never the sole arbiter (producer L2 filter +
+        // state check_duplicate_commitment are authoritative).
         let commitment_key = parsed_tx.commitment_dedup_key();
         if let Some(ref key) = commitment_key {
             if self.is_commitment_already_on_chain(key) {
@@ -785,32 +717,14 @@ impl SimpleMempool {
                 continue;
             }
 
-            // ═══════════════════════════════════════════════════════════════
-            // v15.5: COMMITMENT DEDUP FOR TRUSTED BATCH PATH.
-            //
-            // Without this branch the trusted-batch ingestion would bypass
-            // the per-receive replacement that single-TX paths enforce, and
-            // a commitment-class TX flowing through this path could leave a
-            // stale prior version in the local mempool. Producer-side
-            // filtering would still keep duplicates out of any block, but
-            // the mempool itself would temporarily carry redundant entries
-            // — a divergence from the top-tier L1 invariant of "one
-            // canonical version per logical commitment in mempool".
-            //
-            // The replacement is inlined here (rather than delegated to
-            // `replace_or_register_commitment`) because the helper acquires
-            // its own write on `by_gas_price`, and we already hold that
-            // lock for the duration of the batch. Inlining avoids a
-            // re-entrant lock attempt while preserving identical
-            // semantics for the dedup indices.
-            //
-            // Fast path: only parse TXs whose gas_price hint marks them as
-            // system-class (u64::MAX). User TXs — the bulk of any trusted
-            // batch — skip parsing entirely and pay only a single `u64`
-            // comparison of overhead. Worst case (a batch of all
-            // commitments at an epoch boundary) parses each TX exactly
-            // once with no extra lock acquisitions.
-            // ═══════════════════════════════════════════════════════════════
+            // Commitment dedup for the trusted-batch path: it must also do
+            // per-receive replacement, else a commitment-class TX leaves a
+            // stale prior version in the mempool (breaks "one canonical
+            // version per commitment"). Inlined rather than via
+            // replace_or_register_commitment because we already hold the
+            // by_gas_price write lock (avoid re-entrant lock). Fast path:
+            // only system-class TXs (gas_price == u64::MAX) are parsed;
+            // user TXs cost one u64 compare.
             let key_opt = if gas_price == u64::MAX {
                 bincode::deserialize::<Transaction>(&tx_bytes)
                     .ok()

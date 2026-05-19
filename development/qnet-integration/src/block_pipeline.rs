@@ -83,42 +83,15 @@ pub fn take_fork_recovery_signal() -> Option<u64> {
     }
 }
 
-// ============================================================================
-// v14.8.7: DISTINCT-PEER WITNESS TRACKER for microblock minority-fork detection.
-// ============================================================================
-// Keyed by height; value is the set of distinct peer_ids that reported a
-// `hash_chain_break` at that height. The threshold for DETECTION is f+1
-// (not 2f+1 which is the threshold for COMMIT decisions). Rationale:
-//
-//   * 2f+1 is required when we want to COMMIT a decision — only a Byzantine
-//     supermajority can outvote any colluding f. Using 2f+1 for a rollback
-//     trigger was a v14.8.5 mistake: it requires MORE honest witnesses
-//     than actually exist when the local node is on the minority fork.
-//     Observed: when n=5 and one node is on a minority 1-node fork, only
-//     2 distinct honest peers report the break; 2f+1=3 never trips; the
-//     node stays stuck forever.
-//   * f+1 is correct for DETECTION because it is the "at least one honest"
-//     threshold: any set of f+1 distinct peers contains at least one
-//     honest validator. Since each witness is a Dilithium3-authenticated
-//     peer_id bound to a registered validator public key (not a socket),
-//     an attacker cannot inflate the witness count with Sybils; they
-//     would need f+1 distinct validator keys to trigger a false positive,
-//     which by definition is outside the Byzantine fault model (adversary
-//     controls ≤ f keys).
-//
-//   Safety: an f+1 threshold does not cause false rollbacks because an
-//   honest validator only reports hash_chain_break for a real parent_hash
-//   mismatch at the reported height, which it observed in a signed
-//   envelope from a peer on a different chain. A real break = real fork.
-//
-//   Liveness: this recovers a node trapped on a minority fork as soon as
-//   f+1 peers advance past it, which is the smallest network-observable
-//   quorum that proves we are behind the canonical chain.
-//
-// DashMap+DashSet combo gives lock-free concurrent writes across pipeline
-// worker threads. Bounded by height cleanup (cleanup_break_tracker) to keep
-// memory flat regardless of chain length.
-// ============================================================================
+// Distinct-peer witness tracker for microblock minority-fork detection.
+// Height → set of distinct peer_ids that reported hash_chain_break there.
+// DETECTION threshold is f+1, NOT 2f+1: a node on a minority fork cannot
+// gather 2f+1 honest witnesses (it would never trip → stuck forever, the
+// v14.8.5 bug). f+1 = "at least one honest" and is Sybil-proof because each
+// witness is a Dilithium3-authenticated validator peer_id (a false positive
+// needs f+1 real keys, outside the ≤f fault model). Safe: an honest node
+// only reports a break on a real parent_hash mismatch from a signed peer
+// envelope. Lock-free DashMap/DashSet; bounded by cleanup_break_tracker.
 use dashmap::DashSet;
 static HASH_CHAIN_BREAK_WITNESSES: once_cell::sync::Lazy<
     dashmap::DashMap<u64, DashSet<String>>
@@ -284,64 +257,15 @@ pub fn cleanup_break_tracker(min_height: u64) {
     HASH_CHAIN_BREAK_WITNESSES.retain(|h, _| *h >= min_height);
 }
 
-// ============================================================================
-// v18: MISSING-PARENT ACTIVE SYNC TRIGGER (storage gap recovery)
-// ============================================================================
-//
-// When the verify stage attempts `load_microblock_auto_format(parent_h)` and
-// the parent is absent from local storage (Ok(None)), the legacy behaviour
-// was to defer the child block and wait for the parent to arrive on its own
-// via gossip. Under partial propagation that wait can be unbounded — the
-// deferred buffer fills up, the child is evicted, and the gap stays open
-// indefinitely. This is the storage-side root cause of the v17.x stall
-// observed at h=180-241 where individual nodes had block subsets like
-// {1, 2, 211, 213, 214, 216, ...} with permanent holes.
-//
-// v18: when a parent miss is detected, the verify stage proactively triggers
-// `request_block_repair(parent_h)` on the global P2P instance, which fans
-// out a `RequestBlocks{from=parent_h, to=parent_h}` to the top peers by
-// reputation in parallel. The first response that arrives is decoded by
-// the existing `handle_blocks_batch` path and re-enters the pipeline as
-// a normal incoming block, where it is verified, applied, and triggers
-// retry of the deferred child via the existing deferred-drain loop.
-//
-// Design properties
-// ─────────────────
-//   * Single-flight per height: a height already in the request map is
-//     not re-requested while the previous request is in-flight (within
-//     the cooldown window). Eliminates thundering-herd amplification when
-//     many child blocks arrive for the same missing parent.
-//   * TTL retention: stale entries (older than the cooldown) are evicted
-//     opportunistically on read. Memory bounded by the active request
-//     fan, which equals the gap size in the worst case (≪ chain height).
-//   * Detached spawn: the request is fired from a `tokio::spawn` task so
-//     the verify stage never blocks on network I/O. Failure to enqueue
-//     leaves the deferred entry in place — the legacy passive-wait path
-//     remains as the last-resort fallback, so this code only ever ADDS
-//     a recovery vector, never removes one.
-//   * Idempotent across pipeline workers: the dedup map is process-wide
-//     so multiple verify tasks (e.g. parallel verify pool) never race on
-//     duplicate sends.
-//
-// Scalability
-// ───────────
-//   * O(1) DashMap operation per missing-parent encounter (insert-and-check).
-//   * `request_block_repair` itself sends to top-3 peers in parallel,
-//     bounded send fan-out regardless of network size.
-//   * Cooldown evicts stale entries lazily; periodic sweep below caps
-//     long-tail growth at any committee size.
-//
-// Security
-// ────────
-//   * Returned blocks pass the full pipeline (signature + hash chain +
-//     state apply) before being committed — no trust in the responding
-//     peer beyond the canonical verify stages.
-//   * No new attack surface: an attacker who sends bogus blocks to
-//     `RequestBlocks` is rejected at verify just like any other malformed
-//     gossip block. Attacker cannot exhaust this map because TTL eviction
-//     drops stale entries; sustained DoS would also fail the existing
-//     `is_consensus_rate_limited` check on the request handler side.
-// ============================================================================
+// v18: missing-parent active sync. When verify finds parent_h absent
+// (load_microblock=Ok(None)), legacy defer+passive-wait was unbounded
+// under partial propagation → deferred buffer fills, gap stays open (v17.x
+// stall h=180-241). Fix: proactively request_block_repair(parent_h)
+// (parallel fan to top-rep peers); response re-enters the normal pipeline
+// and drains the deferred child. Single-flight per height (process-wide
+// dedup + cooldown → no thundering herd across verify workers); detached
+// spawn (verify never blocks); passive-wait fallback retained (ADDS a
+// recovery vector only). Returned blocks pass full canonical verify.
 
 /// How long a single (height) request stays in the dedup map before another
 /// retry is allowed. Long enough to cover RTT + decode + apply on slow links
@@ -416,65 +340,15 @@ pub fn request_missing_parent(parent_h: u64) -> bool {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// v19: RANGE-SYNC TRIGGER for large storage gaps
-// ════════════════════════════════════════════════════════════════════════════
-//
-// Problem the v18 single-flight path leaves open
-// ──────────────────────────────────────────────
-// `request_missing_parent` issues one request per missing height with a 30 s
-// dedup TTL. When the local pipeline finds itself N blocks behind the network
-// tip (observed at h=90 vs network tip h=121, gap=31), the cascade of
-// individual single-height requests recovers at most one block per TTL window
-// per missing height, which produces a worst-case recovery time of
-// `gap × TTL ≈ 15 minutes` on a 31-block gap — orders of magnitude slower
-// than the underlying network can deliver. While the cascade is in flight
-// the producer's downstream blocks keep arriving and queue up in the
-// deferred buffer, never converting into applied state.
-//
-// What the network actually has
-// ─────────────────────────────
-// `unified_p2p::sync_blocks(from, to)` is the canonical block-range sync
-// primitive used elsewhere in the codebase: parallel fan-out to the
-// top-reputation validators with `MAX_BATCH_BLOCKS = 500` per request and
-// timeout-aligned peer rotation. A single call retrieves every block in the
-// requested range from authenticated peers in one round-trip; the responses
-// arrive as `BlocksBatch` envelopes that re-enter the same pipeline through
-// `handle_blocks_batch → block_tx → ingest`.
-//
-// The v19 fix simply wires that primitive into the verify-stage gap-detection
-// path: when the missing parent is more than `RANGE_SYNC_GAP_THRESHOLD`
-// blocks below the just-arrived child, dispatch a single range request
-// instead of N single-flights.
-//
-// Single-flight per RANGE
-// ───────────────────────
-// The legacy per-height dedup map (`MISSING_BLOCK_REQUESTED`) is preserved
-// for the small-gap path. Range sync uses a separate, time-windowed dedup
-// (`MISSING_BLOCK_RANGE_REQUESTED`) keyed by `(local_tip, target_height)`
-// pair — multiple gap detections within the cooldown window collapse to
-// one outbound request, so a hot stream of deferred children does not
-// amplify into a request storm.
-//
-// Scalability
-// ───────────
-//   * O(1) dedup-map ops per gap detection. Bounded by the active gap set,
-//     typically << 100 entries even on a 100K-super-node deployment.
-//   * Range request itself caps at MAX_BATCH_BLOCKS = 500 blocks per peer.
-//     Top-3 peers parallel send ⇒ ~1500 blocks delivered per round-trip
-//     under contention, ~500 under healthy single-peer fan-out.
-//   * Detached `tokio::spawn` keeps the verify stage non-blocking.
-//
-// Security
-// ────────
-//   * Range responses re-enter the canonical pipeline (signature + hash
-//     chain + state apply). Attacker cannot inject blocks bypassing
-//     `verify_consensus_signature`, equivalence with the v18 single-flight
-//     security boundary.
-//   * Dedup map is per-target-height keyed; an attacker cannot exhaust
-//     it because TTL eviction releases slots, and `cleanup_missing_block_requests`
-//     evicts in periodic sweeps regardless of activity.
-// ════════════════════════════════════════════════════════════════════════════
+// v19: range-sync for large gaps. v18 single-flight (1 req/height, 30s
+// TTL) recovers ~1 block/TTL → a 31-block gap ≈ gap×TTL ≈ 15min while the
+// deferred buffer fills. Fix: when the missing parent is >
+// RANGE_SYNC_GAP_THRESHOLD below the child, dispatch ONE sync_blocks(from,
+// to) (canonical: parallel top-rep fan, MAX_BATCH_BLOCKS=500/req; responses
+// re-enter via handle_blocks_batch→ingest) instead of N single-flights.
+// Separate range dedup MISSING_BLOCK_RANGE_REQUESTED keyed (local_tip,
+// target), time-windowed → no request storm; per-height dedup kept for the
+// small-gap path. Detached spawn; responses pass full canonical verify.
 
 /// Threshold (in blocks) above which the verify stage prefers a single
 /// range-sync over the cascade of single-height requests. Picked to keep
@@ -940,42 +814,16 @@ impl PipelineIngest {
     /// Scalability: 4 atomic loads, O(1). Safe at 10K+ super-nodes — this is
     /// read by SyncManager on every iteration, no locks.
     pub fn in_flight(&self) -> u64 {
-        // ═══════════════════════════════════════════════════════════════════
-        // v15.3: SCALE-CORRECT BACKPRESSURE METRIC.
-        //
-        // The original `ingested - finished` formula treated only "applied
-        // or rejected at decode/verify/apply" as terminal — but during a
-        // multi-thousand-block catch-up the same block height arrives many
-        // times via SHRED redundancy and sync retries, each arrival
-        // incrementing `ingested` while only one eventually applies. The
-        // accumulated "phantom" delta inflated the in-flight estimate well
-        // past the bounded channel/buffer capacity (~16K), forced
-        // backpressure credits to zero, and starved sync_manager of
-        // dispatch budget exactly when it needed to fetch parents to
-        // unblock the pipeline. Observed 58K phantom on node 001 against a
-        // real pipeline occupancy of < 2K.
-        //
-        // Two corrections:
-        //
-        //   1. Add `future_dropped` and `deferred_evicted` to the
-        //      `finished` set. Both are terminal drops with no retry
-        //      pending in this pipeline — sync re-requests later when the
-        //      tip approaches. Counting them as finished prevents them
-        //      from accumulating into the in-flight estimate.
-        //
-        //   2. Hard-clamp the result to the sum of all bounded buffers in
-        //      the pipeline. The actual occupancy can NEVER exceed the
-        //      sum of channel capacities + deferred buffer size, regardless
-        //      of historical counter behaviour. Clamping protects against
-        //      any future double-count source we might miss — the metric
-        //      always reports a number physically achievable by the
-        //      pipeline.
-        //
-        // Scalability: 9 atomic loads, O(1). Read by SyncManager on every
-        // dispatch iteration; bounded by `MAX_PIPELINE_OCCUPANCY` so
-        // credits stay sensible at any historical-drop volume. Safe for
-        // 10K+ super-node committees.
-        // ═══════════════════════════════════════════════════════════════════
+        // Scale-correct backpressure metric. `ingested - finished`
+        // over-counted: during catch-up the same height arrives many times
+        // (SHRED redundancy, sync retries), each bumping `ingested` while
+        // only one applies → phantom delta inflated in-flight past buffer
+        // capacity → backpressure credits hit 0 → starved sync exactly when
+        // it needed to fetch parents (observed 58K phantom vs <2K real on
+        // node 001). Fixes: (1) count future_dropped + deferred_evicted as
+        // finished (terminal, sync re-requests later); (2) hard-clamp to the
+        // sum of bounded buffers (occupancy can't physically exceed it).
+        // 9 atomic loads, O(1).
         let ingested = self.metrics.ingested.load(Ordering::Relaxed);
         let finished = self.metrics.applied.load(Ordering::Relaxed)
             .saturating_add(self.metrics.decode_failed.load(Ordering::Relaxed))
@@ -1041,76 +889,13 @@ impl BlockPipeline {
             p2p_decode,
         ));
 
-        // ════════════════════════════════════════════════════════════════════
-        // v25: REAL PARALLEL SIGNATURE-VERIFY WORKER POOL
-        // ════════════════════════════════════════════════════════════════════
-        // Replaces the v24 cosmetic semaphore with an actual N-worker pool.
-        //
-        // Architecture
-        // ────────────
-        //   decode_rx
-        //       ↓ (dispatcher reads one block at a time)
-        //   [N parallel signature-verify worker tasks]
-        //       ↓ (each verifies Dilithium3 producer signature)
-        //   sig_verified_rx (FIFO buffer of size verify_buffer)
-        //       ↓
-        //   verify_stage (state-bound: deferred buffer + hash chain +
-        //                 producer authority + state coordinator)
-        //       ↓
-        //   verify_tx → apply_stage
-        //
-        // The CPU-bound signature-verify step runs IN PARALLEL across N
-        // workers; the state-bound checks remain single-threaded inside
-        // verify_stage where the deferred buffer + hash-chain ordering
-        // requirements live. Out-of-order arrival at verify_stage is
-        // already handled by the deferred buffer (blocks waiting on a
-        // missing parent are stored and drained when the parent arrives),
-        // so the parallel pre-verification cannot cause incorrect ordering
-        // in the downstream apply.
-        //
-        // Scalability
-        // ───────────
-        // This pipeline is a SUPER-node code path. Mobile Light nodes
-        // never reach it — they are a wholly separate role (Proof-of-
-        // Presence via Genesis-driven ping/attest, macroblock-headers-
-        // only sync, ~1000-block local cache, consensus-disqualified by
-        // `is_consensus_qualified()`). Pool sizing here is therefore
-        // exclusively about Super-node behaviour.
-        //
-        // Per-block cost on every Super node, regardless of whether the
-        // node sits in the current 1000-validator macroblock committee:
-        //   * One Dilithium3 producer-signature verify per microblock.
-        //     ~3 ms serialised; the 1-block-per-second cadence means
-        //     a single worker keeps up at steady state. The worker
-        //     pool exists for CATCH-UP and BURST regimes where a
-        //     backlog must be drained as fast as host CPU allows
-        //     (joining the network, recovering from a view-change
-        //     stall, applying a long resync window).
-        //
-        // Extra signature-verify cost incurred ONLY by the 1000-node
-        // committee elected for the current macroblock:
-        //   * 2f+1 ≈ 667 attestation/commit/reveal signatures per
-        //     macroblock boundary. Verified via rayon-parallel batches
-        //     inside `handle_aggregated_timeout_cert` and
-        //     `handle_timeout_proof_broadcast` — completely separate
-        //     from this worker pool, so macroblock attestation bursts
-        //     do not contend with microblock apply throughput.
-        //
-        // Sizing guideline:
-        //   * Catch-up / burst: verify_workers = number_of_cpu_cores —
-        //     saturates available cores to drain backlog quickly.
-        //   * Steady state (committee or not): verify_workers = 2
-        //     suffices; one verify per 1-sec slot with comfortable
-        //     headroom.
-        //
-        // Safety
-        // ──────
-        // Signature verification is a PURE function of (payload, public_key,
-        // signature). Running it in parallel cannot produce different
-        // results across workers. The downstream state-bound stage is
-        // unchanged and serialises the deferred-buffer / hash-chain decision
-        // exactly as before.
-        // ════════════════════════════════════════════════════════════════════
+        // v25: N-worker parallel signature-verify pool. decode_rx -> N workers
+        // (Dilithium3 producer-sig verify, CPU-bound, parallel) -> sig_verified_rx
+        // FIFO -> verify_stage (state-bound: deferred buffer + hash-chain,
+        // single-threaded) -> apply. Parallel pre-verify is safe: verify is a pure
+        // fn; downstream out-of-order handled by the deferred buffer. Super-node
+        // path only. Steady ~1 verify/s (1 worker ok); pool for catch-up/burst.
+        // Sizing: catch-up=num_cpus, steady=2.
         let verify_workers = std::cmp::max(1, config.verify_workers);
 
         // Pre-verify FIFO between worker pool and the state-bound stage.
@@ -1316,40 +1101,14 @@ impl BlockPipeline {
             }
         });
 
-        // ════════════════════════════════════════════════════════════════════
-        // v15.4 DIAGNOSTICS: PIPELINE PROGRESS WATCHDOG
-        // ════════════════════════════════════════════════════════════════════
-        // Background poller that detects when verify or apply stages stop
-        // making forward progress. Designed to surface the exact hung
-        // operation when the verified/applied counters freeze — observed
-        // in production on node 001 with verified=applied=5256 frozen for
-        // 5 minutes while macroblock saves continued (different code
-        // path), with no error logs. Without this watchdog the only
-        // visible signal was the WATCHDOG-driven 300 s process restart.
-        //
-        // Trigger semantics:
-        //   * Sample `verified` and `applied` counters every WATCHDOG_TICK
-        //     seconds.
-        //   * If a counter has not advanced for STUCK_THRESHOLD seconds
-        //     AND the corresponding stage's op marker is non-idle, emit a
-        //     CRIT diagnostic dump. Idle-with-no-progress means the stage
-        //     is correctly waiting on an empty channel — the issue is
-        //     upstream and a separate alarm path will surface it.
-        //   * Re-arm only after the counter advances. Repeated dumps for
-        //     the same hang are suppressed by tracking the last reported
-        //     counter; a new dump fires only when stuck-state persists
-        //     past another STUCK_THRESHOLD window or after recovery.
-        //
-        // Cost: O(1) atomics read every 5 s, lock-free. Negligible for
-        // any node count. Diagnostic-only — never participates in
-        // consensus, never gates block flow.
-        //
-        // Why this is safe to deploy: pure observation. The watchdog
-        // makes no state mutations — it reads atomic counters and writes
-        // log lines. Even if the diagnostic logic is wrong, the worst
-        // case is a noisy log; consensus, networking, storage are
-        // entirely unaffected.
-        // ════════════════════════════════════════════════════════════════════
+        // Pipeline progress watchdog. Background poller detecting when the
+        // verify/apply stages stop advancing (observed node 001 frozen at
+        // verified=applied=5256 for 5 min with no error logs). Samples the
+        // counters every WATCHDOG_TICK; if one hasn't advanced for
+        // STUCK_THRESHOLD AND that stage's op marker is non-idle, emit a CRIT
+        // dump (idle-no-progress = correctly waiting on an empty channel).
+        // Re-arms after the counter advances; repeat dumps suppressed.
+        // O(1) lock-free, pure observation — never gates flow or consensus.
         let metrics_watchdog = metrics.clone();
         tokio::spawn(async move {
             const WATCHDOG_TICK: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1605,45 +1364,16 @@ impl BlockPipeline {
         const DEFERRED_MAX: usize = 2000;
         let mut deferred: HashMap<u64, DecodedBlock> = HashMap::new();
 
-        // ═══════════════════════════════════════════════════════════════════
-        // v15.3: GOSSIP HORIZON — drop blocks far beyond local chain tip.
-        //
-        // Root-cause fix for the catch-up backpressure deadlock observed on
-        // node 001 at h=3960 with network at h=39800. Without a horizon
-        // filter the pipeline received SHRED-broadcast blocks from the
-        // network tip continuously while the node was thousands of blocks
-        // behind. Those blocks could never verify (parents missing), filled
-        // the bounded deferred buffer with future-state material, forced
-        // legitimate sync responses (close to local tip) to be dropped on
-        // arrival, and inflated the historical drop counter beyond the
-        // backpressure threshold. The result was a self-perpetuating
-        // throttle on sync request dispatch — sync_manager believed the
-        // pipeline was overloaded when in reality it was being starved of
-        // the very blocks it needed.
-        //
-        // Fix: any block more than `GOSSIP_HORIZON` ahead of the current
-        // local chain tip is dropped immediately, BEFORE entering the
-        // deferred buffer. It is counted in `future_dropped`, not
-        // `verify_failed`, so the backpressure formula treats it as a
-        // permanent drop with no retry pending in the pipeline. Sync
-        // re-requests the block when the local tip is close enough.
-        //
-        // Sizing: GOSSIP_HORIZON = 200 covers ~200 seconds of network
-        // production at 1 block/s — large enough to absorb normal
-        // re-broadcast turbulence at the tip, small enough to keep the
-        // deferred buffer pointed at near-tip blocks where it does useful
-        // work. Independent of committee size.
-        //
-        // Scalability: O(1) check per block (one storage read for chain_h).
-        // The chain-height read is cached lazily inside this loop so it
-        // does not become a per-block syscall.
-        //
-        // Safety: dropping a future block here is safe — it is identical to
-        // the block never reaching us via gossip in the first place. The
-        // block is finalised and replayable from the canonical chain;
-        // sync_manager will pull it via range request once the local tip
-        // crosses (block.height - GOSSIP_HORIZON).
-        // ═══════════════════════════════════════════════════════════════════
+        // Gossip horizon: drop blocks > GOSSIP_HORIZON ahead of the local
+        // tip BEFORE the deferred buffer. Root cause = catch-up backpressure
+        // deadlock: far-ahead SHRED blocks can never verify (missing parents),
+        // fill the bounded deferred buffer, starve near-tip sync responses,
+        // and inflate the drop counter → false backpressure throttle that
+        // self-perpetuates. Counted as future_dropped (not verify_failed) so
+        // it's a permanent drop with no pending retry; sync re-pulls once the
+        // tip is close. 200 ≈ 200s at 1 blk/s. Safe — identical to never
+        // receiving the block via gossip; it stays replayable from the chain.
+        // O(1)/block (chain_h read cached in-loop).
         const GOSSIP_HORIZON: u64 = 200;
         let mut horizon_cache_h: u64 = 0;
         let mut horizon_cache_age: u32 = 0;
@@ -1763,41 +1493,18 @@ impl BlockPipeline {
                             metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                         }
 
-                        // ───────────────────────────────────────────────────
-                        // v18: ACTIVE SYNC TRIGGER (storage gap recovery)
-                        // ───────────────────────────────────────────────────
-                        // Passive defer alone is insufficient under partial
-                        // gossip propagation: if the parent never arrives via
-                        // broadcast (peer offline, network partition healed
-                        // mid-window, dropped shred), the deferred buffer
-                        // fills with orphaned children and the gap stays
-                        // open indefinitely — observed at h=180-241 with
-                        // permanent block subsets like {1, 2, 211, 213,
-                        // 214, ...}. Proactively request the missing parent
-                        // from peers in parallel; the request is single-
-                        // flighted per height and runs on a detached task,
-                        // so the verify stage never blocks on network I/O.
-                        //
-                        // v19: SIZE-ADAPTIVE RECOVERY
-                        // ───────────────────────────────────────────────────
-                        // The v18 single-flight path is well-tuned for the
-                        // small-gap regime (1–5 blocks of normal gossip
-                        // jitter) but recovers a 30-block gap in about
-                        // `gap × 30 s = 15 min`. For real catch-up windows
-                        // we now switch to a single batched range request
-                        // covering `local_tip+1 ..= child_h`, served by
-                        // `unified_p2p::sync_blocks` in a single round-trip.
-                        //
-                        // The two paths are complementary, not redundant:
-                        // - Small gap (≤ RANGE_SYNC_GAP_THRESHOLD): per-
-                        //   height single-flight remains the cheapest
-                        //   recovery and avoids range-fanout amplification
-                        //   for transient gossip jitter.
-                        // - Large gap (> threshold): batched range avoids
-                        //   the multi-minute cascade. Single-flight per
-                        //   range tuple prevents request storms when many
-                        //   children for the same parent arrive at once.
-                        // ───────────────────────────────────────────────────
+                        // Active sync trigger (storage gap recovery). Passive
+                        // defer is insufficient under partial gossip: if the
+                        // parent never arrives (peer offline, partition,
+                        // dropped shred) the deferred buffer fills with orphans
+                        // and the gap stays open forever (observed h=180-241).
+                        // Proactively request the missing parent, single-
+                        // flighted per height on a detached task (verify never
+                        // blocks on I/O). Size-adaptive: small gap (≤
+                        // RANGE_SYNC_GAP_THRESHOLD) → per-height single-flight
+                        // (cheapest, no fanout amplification for jitter); large
+                        // gap → one batched range request local_tip+1..=child_h
+                        // via sync_blocks (avoids the multi-minute cascade).
                         let local_tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                             .load(Ordering::Relaxed);
                         let gap = child_h.saturating_sub(local_tip);
@@ -1842,33 +1549,16 @@ impl BlockPipeline {
                     }
                     metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
 
-                    // ═══════════════════════════════════════════════════════════════════════
-                    // v16.2: OBSERVER-BASED BLOCK REJECTION + ADVISORY WITNESS
-                    // ═══════════════════════════════════════════════════════════════════════
-                    // Two parallel paths fire on every locally-detected hash chain
-                    // break — each addresses a different recovery mechanism:
-                    //
-                    //   1. Source-witness counting (advisory): records `from_peer`
-                    //      in the per-height witness DashMap and tags the source
-                    //      for the fork-cooldown peer-selection helper. Useful for
-                    //      operator visibility and resync-source steering, but
-                    //      never destructive on its own (single-source ceiling).
-                    //
-                    //   2. Observer-based rejection (destructive): broadcasts a
-                    //      Dilithium3-signed `BlockRejection` to all validator
-                    //      peers, declaring "I, observer X, locally rejected
-                    //      block_hash H from source S at height N because my
-                    //      local prev was P, not block.previous_hash". Receivers
-                    //      verify the observer signature, aggregate distinct
-                    //      observer_ids per (height, source), and trigger
-                    //      destructive rollback when the count crosses 2f+1.
-                    //
-                    // This is the BFT-canonical pattern — supermajority of
-                    // INDEPENDENT OBSERVERS justifies state mutation. A single
-                    // Byzantine source cannot trigger rollback against an honest
-                    // chain because ≤f Byzantine observers cannot reach 2f+1.
-                    //
-                    // Non-genesis-only: skip for h=0 (no prev to compare against).
+                    // Two parallel paths on a locally-detected hash-chain
+                    // break: (1) advisory source-witness counting — records
+                    // from_peer for resync-source steering, non-destructive
+                    // (single-source ceiling); (2) destructive observer-based
+                    // rejection — broadcast a Dilithium3-signed BlockRejection;
+                    // receivers verify the observer sig, aggregate distinct
+                    // observer_ids per (height,source), and roll back at 2f+1.
+                    // BFT-canonical: a supermajority of independent observers
+                    // justifies state mutation; one Byzantine source can't
+                    // (≤f can't reach 2f+1). Skip h=0 (no prev).
                     if mb.height > 0 {
                         record_hash_chain_break_witness(
                             mb.height,
@@ -1932,6 +1622,20 @@ impl BlockPipeline {
                                 }
                             }
                         }
+                    }
+
+                    // v27 HOLE4: liveness — without this, persistent chain
+                    // break at the frontier spins forever (applied=0; the
+                    // 5.4h h=53731 wedge). Re-pull canonical range from last
+                    // committed (request_missing_range is self-deduped 60s,
+                    // detached — safe per break).
+                    let local_tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if mb.height > local_tip {
+                        let _ = request_missing_range(
+                            local_tip.saturating_add(1),
+                            mb.height,
+                        );
                     }
 
                     continue;
@@ -2093,92 +1797,31 @@ impl BlockPipeline {
                 }
             }
 
-            // ═══════════════════════════════════════════════════════════════════════════
-            // 4. Producer authority check — v14.8.10 CANONICAL (same-round ≡ HARD reject)
-            // ═══════════════════════════════════════════════════════════════════════════
-            // Two categories of producer mismatch remain possible on ingest:
-            //
-            //   A. timeout_divergence: block.timeout_round != locally cached round.
-            //      The cached `(expected_producer, expected_round)` pair was
-            //      populated by the main loop using `get_current_timeout_round()`
-            //      — the BFT-agreed `certified.max(adopted)` value. A remote
-            //      producer may have produced at a different round because its
-            //      view of HIGHEST_CERTIFIED_ROUND / HIGHEST_ADOPTED_ROUND had
-            //      advanced by the time of signing, or because we have not yet
-            //      received the signed votes that moved our local value. We do
-            //      NOT re-derive the expected producer at the block's claimed
-            //      round on ingest (that would require refreshing VRF state
-            //      with the remote's pre-image), so we only log and let hash
-            //      chain + signature + 2f+1 macroblock commit handle it.
-            //
-            //   B. same_round_mismatch: cached round == block.timeout_round, but
-            //      block.producer != expected. The cache was populated by the
-            //      deterministic VRF formula `(base_idx + timeout_round) % N`,
-            //      which is the same formula every honest validator uses. A
-            //      block claiming this rank MUST be signed by the cached
-            //      producer — any other signer does not have authority for
-            //      that slot. HARD REJECT.
-            //
-            // Historical note: rejecting on producer mismatch was blamed for
-            // forks in v13.3 because the expected-producer cache at that time
-            // depended on LOCAL non-deterministic state. Under v14.8.10 the
-            // cache is populated from the stored BFT-agreed round, which is a
-            // pure function of Dilithium3-verified signed votes and on-chain
-            // VRF state — every validator at the same height & round derives
-            // the same expected producer. Hard rejection is therefore
-            // consistent across honest validators: either all reject the block,
-            // or none do. No fork.
-            //
-            // Gated to `!is_syncing()` so historical blocks received during
-            // catch-up aren't judged against the live cache.
-            //
-            // Scalability: O(1) cache lookup. Identical cost at 5 or 5000 validators.
+            // Producer authority check (same-round mismatch ≡ HARD reject).
+            //   A. timeout_divergence (block round != cached round): views of
+            //      HIGHEST_CERTIFIED/ADOPTED_ROUND diverged in transit. Soft —
+            //      log only; hash-chain + sig + 2f+1 commit resolve it. Expected
+            //      producer is NOT re-derived on ingest (needs remote VRF preimage).
+            //   B. same_round_mismatch (cached round == block round, wrong signer):
+            //      cached producer is the sole authority for the slot via the
+            //      deterministic VRF formula (base_idx + round) % N. HARD REJECT.
+            // Fork-safe: cache = stored BFT-agreed round (pure fn of Dilithium3-
+            // verified votes + on-chain VRF) → every honest node derives the same
+            // expected producer; all reject or none. (Pre-v14.8.10 used local
+            // non-deterministic state and did fork.) Gated to !is_syncing() so
+            // catch-up blocks aren't judged vs live cache. O(1) lookup.
             if !snap.is_syncing() && mb.height > 0 {
-                // ═══════════════════════════════════════════════════════════════
-                // v23.1: BFT-CERTIFIED ROUND AUTHENTICITY GATE
-                // ═══════════════════════════════════════════════════════════════
-                // A block claims to have been produced at rotation round
-                // `mb.timeout_round`. Verify the claim is plausible against
-                // this node's local view of supermajority-certified rounds
-                // for the containing macroblock.
-                //
-                // Allow a small forward drift (TIMEOUT_ROUND_DRIFT_WINDOW)
-                // to absorb honest gossip propagation latency — a producer
-                // can legitimately see 2f+1 votes for round R before this
-                // node's local DashMap has been updated by the same gossip
-                // stream. After the drift window, the claim is implausibly
-                // far ahead of any cert this node could ever have seen,
-                // so it must come from a Byzantine signer (authentic
-                // producer with valid Dilithium3 key but signing an
-                // unsupportable claim).
-                //
-                // Why this matters
-                // ────────────────
-                // After v23.1's timeout_round binding in hash+signature
-                // (block.rs:hash, sign_microblock_with_dilithium), the
-                // producer's claim is CRYPTOGRAPHICALLY ATTESTED — it
-                // cannot be mutated in transit. But a Byzantine producer
-                // can still SIGN an arbitrary round claim. Without this
-                // gate, downstream code (notably `record_finalized_round`
-                // called at apply) would advance `LAST_FINALIZED_ROUND_PER_MB`
-                // to the Byzantine value, locking out future rotation
-                // until 2f+1 honest evidence catches up to the inflated
-                // baseline. This is a DoS class — bounded here.
-                //
-                // The v15.0 `rotation_backfill_request` path below still
-                // fires as a soft signal: if the producer's claim is
-                // legitimate (cert exists somewhere), peer-side retrieval
-                // catches our local certified up to match.
-                //
-                // Drift window = 3: covers ~3 gossip RTTs at the
-                // 1000-validator committee cap (log_5 propagation depth
-                // ≈ 4 hops × ~50ms each = 200ms; cross-region asymmetry
-                // could extend this to ~1s; 3 rounds × 5s emit grace
-                // covers the worst-case propagation race).
-                //
-                // Scalability: one O(1) DashMap read per block ingest.
-                // Identical cost at 5 or 10 000 super-nodes.
-                // ═══════════════════════════════════════════════════════════════
+                // v23.1: BFT-certified round authenticity gate. A block claims rotation
+                // round mb.timeout_round; verify it's plausible vs this node's local
+                // 2f+1-certified rounds for the macroblock, allowing a small forward
+                // drift (TIMEOUT_ROUND_DRIFT_WINDOW=3) for honest gossip latency. Past
+                // the window the claim is implausibly ahead of any cert → Byzantine
+                // signer. timeout_round is in hash+sig (immutable in transit) but a
+                // Byzantine producer can still SIGN an arbitrary round; without this,
+                // record_finalized_round at apply would advance LAST_FINALIZED_ROUND_
+                // PER_MB to the Byzantine value and lock out rotation until 2f+1 honest
+                // catches up — a bounded DoS. v15.0 rotation_backfill_request still
+                // fires as a soft signal. O(1)/ingest.
                 const TIMEOUT_ROUND_DRIFT_WINDOW: u64 = 3;
                 let mb_idx = mb.height / 90;
                 let local_certified =
@@ -2226,94 +1869,21 @@ impl BlockPipeline {
                 }
             }
 
-            // ═══════════════════════════════════════════════════════════════════════════
-            // v14.8.6: INGEST-SIDE STALE-ROUND REJECT REMOVED (semantic bug fix)
-            // ═══════════════════════════════════════════════════════════════════════════
-            // Earlier revisions (v14.6 → v14.8.5) compared an incoming microblock's
-            // `timeout_round` against this node's cached `HIGHEST_CERTIFIED_ROUND` for
-            // the containing macroblock index and rejected any block whose round was
-            // lower. That check mixed TWO INDEPENDENT DOMAINS:
-            //
-            //   * `mb.timeout_round`       — microblock producer-rotation counter.
-            //                                0 on the happy path (first producer ok),
-            //                                increments only when this particular slot
-            //                                was skipped and a failover leader signed.
-            //
-            //   * `HIGHEST_CERTIFIED_ROUND[mb_idx]` — view round of the MACROBLOCK
-            //                                commit/reveal consensus (90-block epoch).
-            //                                Advances on macroblock-level timeouts when
-            //                                2f+1 is temporarily unreachable, entirely
-            //                                decoupled from microblock production.
-            //
-            // These counters are orthogonal by design. A healthy producer will sign
-            // microblocks at round=0 all day long while, simultaneously, macroblock
-            // view changes may have escalated certified_round to N>0 because the
-            // epoch's 2f+1 aggregator is flaky. Rejecting valid microblocks because
-            // `0 < N` breaks liveness without adding safety. The canonical rule is
-            // to compare rounds only WITHIN the same consensus domain; cross-domain
-            // comparison is never valid.
-            //
-            // Safety for microblocks is preserved by four independent invariants
-            // which remain in force:
-            //   1. Dilithium3 producer signature   — checked above at step 3.
-            //   2. `prev_hash` continuity          — checked above at step 2.
-            //   3. VRF-deterministic producer      — soft-check at step 4 (logs
-            //                                        timeout_divergence / producer
-            //                                        mismatch without rejecting).
-            //   4. 2f+1 macroblock commit/reveal   — retroactively ratifies every
-            //                                        microblock below the epoch
-            //                                        boundary; any split-brain
-            //                                        branch cannot collect 2f+1.
-            //
-            // v22 update: the legacy producer-side pre-save `yield_stale_round`
-            // guard (v15.11) was deleted alongside the round-based microblock
-            // failover model. v22 microblock production is pure VRF + time-
-            // derived skip-slot offset; there is exactly ONE valid producer
-            // per height, so the cross-domain comparison the guard relied on
-            // is no longer meaningful. Safety on the producer's own path is
-            // preserved by deterministic VRF expectation (`get_expected_producer`)
-            // + Dilithium3 self-signature + hash-chain continuity.
-            // ═══════════════════════════════════════════════════════════════════════════
+            // No ingest-side stale-round reject: mb.timeout_round (microblock
+            // rotation counter, 0 on happy path) and HIGHEST_CERTIFIED_ROUND
+            // (macroblock commit/reveal view round) are orthogonal — comparing
+            // them rejected valid microblocks (liveness loss, no safety gain).
+            // Per-microblock QC verify is also removed (redundant with the 2f+1
+            // macroblock finality below + caused a rate-limit collision).
+            // Microblock safety holds via: Dilithium3 producer sig; prev_hash
+            // continuity; VRF-deterministic producer (soft); 2f+1 macroblock
+            // commit/reveal retroactively ratifying (split-brain can't reach 2f+1).
 
-            // v14.7.2: per-microblock pipelined-QC verify REMOVED.
-            // BFT safety for microblocks is delivered by the combination of:
-            //   1. Dilithium3 producer signature (identity binding);
-            //   2. hash-chain continuity (parent_hash check above);
-            //   3. Deterministic VRF-derived `expected_producer` (Category B
-            //      ingest reject; v22 collapse left a single valid signer per
-            //      slot, so any second candidate is invalid by construction);
-            //   4. 2f+1 macroblock commit/reveal at the 90-block boundary
-            //      that hard-finalises and, by implication, retroactively
-            //      ratifies every microblock below it.
-            // A per-block QC is redundant with (4) and was also the source
-            // of a production rate-limit collision. Removed.
-
-            // ═══════════════════════════════════════════════════════════════════════════
-            // 4b. INTERNAL-ONLY TRANSACTION TYPE GUARD (post-genesis)
-            // ═══════════════════════════════════════════════════════════════════════════
-            // Some transaction types are produced ONLY by genesis-block construction
-            // (CreateAccount with mint) or are deprecated enum variants that should
-            // never appear at all. A Byzantine producer could construct a block that
-            // bypasses mempool admission and directly contains such a TX — this
-            // backstop rejects the entire block at ingest time.
-            //
-            // ALLOWED in genesis (height == 0): CreateAccount (initial supply setup).
-            // ALLOWED ONLY in genesis: nothing else from the deprecated set.
-            //
-            // REJECTED post-genesis (height > 0):
-            //   * CreateAccount       — locked to genesis bootstrap
-            //   * BatchRewardClaims   — deprecated, never instantiated
-            //   * BatchNodeActivations — deprecated, never instantiated
-            //   * BatchTransfers      — unused enum variant
-            //
-            // SAFETY: this is a HARD REJECT of the whole block, not just the
-            // offending transaction. Including a forbidden TX is a sign of a
-            // malicious producer; the block is unsafe to apply, and the peer
-            // sending it accumulates negative reputation.
-            //
-            // SCALABILITY: O(tx_count) per block, single match per TX. Bounded
-            // identical at 5 or 5000 validators.
-            // ═══════════════════════════════════════════════════════════════════════════
+            // Internal-only TX type guard: post-genesis, HARD REJECT the whole
+            // block (+ peer reputation penalty) if it carries a genesis-only or
+            // deprecated variant (CreateAccount / BatchRewardClaims /
+            // BatchNodeActivations / BatchTransfers) — a Byzantine producer
+            // could embed one bypassing mempool admission. O(tx_count).
             if mb.height > 0 {
                 for tx in &decoded.microblock.transactions {
                     let forbidden = matches!(tx.tx_type,
@@ -2343,96 +1913,18 @@ impl BlockPipeline {
                 }
             }
 
-            // ═══════════════════════════════════════════════════════════════════════════
-            // 5. PER-TRANSACTION SIGNATURE VERIFICATION (post-genesis only)
-            // ═══════════════════════════════════════════════════════════════════════════
-            // SECURITY INVARIANT: every user-submitted transaction inside the block
-            // MUST carry a cryptographically valid Ed25519 signature (and Dilithium3
-            // when present). Without this check, a Byzantine producer could include
-            // forged transactions that drain arbitrary wallets — the producer's own
-            // block signature (step 3) authenticates the BLOCK envelope but says
-            // nothing about whether the transactions WITHIN the block were authorised
-            // by their senders.
-            //
-            // GENESIS BYPASS (mb.height == 0):
-            //   The genesis block is a one-time deterministic bootstrap whose content
-            //   is fixed by network configuration (genesis distribution, system
-            //   account creation, genesis-node registration). Its in-block TXs use
-            //   literal-string authorisation tokens ("system", "genesis") that
-            //   pre-date the Ed25519 client-signing model — they are NOT real
-            //   Ed25519 signatures. Authority is enforced at apply time by string
-            //   match against the well-known reserved sender set.
-            //
-            //   Genesis safety is guaranteed by THREE independent invariants that
-            //   do NOT require per-TX signature verification:
-            //     1. Producer signature (step 3) — the genesis producer's
-            //        Dilithium3 signature on the BLOCK envelope is verified.
-            //     2. Genesis-hash determinism — every honest node computes the
-            //        identical genesis block from the identical config, so any
-            //        deviation (extra TX, modified amount, swapped recipient)
-            //        is rejected by hash-chain continuity at the next block.
-            //     3. One-time event — genesis runs exactly once at network
-            //        bootstrap, height==0; no reusable attack surface exists.
-            //
-            //   Skipping per-TX signature verification at height==0 therefore
-            //   loses no real security property while restoring the legitimate
-            //   bootstrap path. All blocks at height>0 receive full per-TX
-            //   verification, closing the byzantine-producer drain vector that
-            //   motivated this section.
-            //
-            // WHY THIS LIVES IN THE PIPELINE, NOT THE STATE LAYER:
-            //   * Mempool ingestion already verifies signatures before admission
-            //     (verify_ed25519_batch in node.rs). That covers the user-submitted
-            //     path: TX → RPC → mempool → producer.
-            //   * Block ingestion bypasses the local mempool entirely: a remote
-            //     producer's block contains TXs that THIS node never validated.
-            //     Without a verification step here, those TXs reach state-apply
-            //     unchecked. apply_transaction_lazy in state.rs intentionally does
-            //     NOT verify signatures (single-responsibility — it applies state
-            //     mutations on already-validated TXs, and re-checking inside the
-            //     state lock would serialise verification needlessly).
-            //   * Therefore signature verification of in-block TXs is the ingest
-            //     pipeline's responsibility. This step closes the gap.
-            //
-            // SCOPE — WHAT IS VERIFIED:
-            //   * Ed25519 batch verify for every TX with `tx.signature.is_some()`.
-            //   * Dilithium3 verify for every TX with `tx.dilithium_signature.is_some()`.
-            //   * SYSTEM TXs (RewardDistribution from system_emission, CreateAccount
-            //     bootstrap, BatchRewardClaims, BatchNodeActivations) are exempt —
-            //     they are signed at block-construction time by the producer and
-            //     validated against on-chain proofs (1DEV burn, 2f+1 macroblock
-            //     evidence, ping commitment chain) elsewhere in the apply path.
-            //     The same exemption set is mirrored from `verify_ed25519_batch`
-            //     in node.rs to keep the mempool and ingest paths consistent.
-            //
-            // SCOPE — WHAT IS NOT VERIFIED HERE:
-            //   * Nonce, balance, business-logic checks remain in apply stage where
-            //     account state is mutated atomically.
-            //   * Replay protection is enforced by per-account nonce monotonicity
-            //     in apply_to_state — a replayed signed TX still fails on nonce.
-            //
-            // PERFORMANCE:
-            //   * Ed25519 batch verify is ~5-10 ms per 100-TX block (negligible
-            //     against the 1-second slot budget). The batch path uses the same
-            //     `verify_ed25519_batch` helper as mempool admission so the cost
-            //     curve and CPU profile are identical to the well-understood
-            //     gossip-ingest path.
-            //   * Dilithium3 individual verify is ~3 ms per signature; only runs
-            //     for TXs that opted into post-quantum signing. At committee=128
-            //     and 100 TXs of which ~5 are hybrid, this adds ~15 ms — bounded.
-            //   * The check runs OFF the apply-stage state lock, so it never
-            //     blocks block application or state mutation paths.
-            //
-            // SCALABILITY (thousands of validators):
-            //   * Verification cost is per-block, not per-validator. Every node
-            //     verifies its own ingest stream independently — no cross-node
-            //     coordination, no extra gossip traffic. O(tx_count) per block,
-            //     identical at 5 or 5000 validators.
-            //   * Batch verification amortises elliptic-curve operations across
-                //     all signed TXs in a block, multiplying throughput vs naïve
-            //     per-TX verification.
-            //
-            // ═══════════════════════════════════════════════════════════════════════════
+            // 5. Per-TX signature verification (post-genesis). The block sig (step
+            // 3) authenticates only the ENVELOPE, not the TXs within — without this
+            // a Byzantine producer could include forged TXs. Remote-block TXs bypass
+            // the mempool (which verifies on ingest) and apply_transaction_lazy
+            // intentionally doesn't verify, so the pipeline must: Ed25519 batch +
+            // Dilithium3 (when present).
+            // Genesis (h==0) bypass: genesis TXs use reserved-sender tokens, not
+            // real sigs; safe via producer sig + genesis-hash determinism + one-time
+            // bootstrap. System TXs (RewardDistribution, CreateAccount bootstrap,
+            // BatchRewardClaims, BatchNodeActivations) are exempt (validated via
+            // on-chain proofs) — exemption set MUST mirror verify_ed25519_batch in
+            // node.rs. O(tx)/block, off the state lock.
             if mb.height == 0 {
                 if is_info() {
                     println!(
@@ -2468,87 +1960,15 @@ impl BlockPipeline {
                     continue; // HARD REJECT — Byzantine producer included forged TXs
                 }
 
-                // Dilithium3 verification for TXs that opted into PQ signing.
-                //
-                // v25.2 — UNIFIED VERIFIER ENTRY POINT
-                // ─────────────────────────────────────────────────────────────
-                // Pre-v25.2 this stage decoded `tx.dilithium_signature` and
-                // `tx.dilithium_public_key` as fixed-length hex strings:
-                //   * sig = hex(3309 raw ML-DSA-65 detached bytes)
-                //   * pk  = hex(1952 raw ML-DSA-65 public key bytes)
-                // That layout matches MOBILE-WALLET TXs (Transfer, ContractCall
-                // and similar user-originated traffic) where the wallet ships
-                // raw key material inline.
-                //
-                // Node-signed SYSTEM TXs use a DIFFERENT on-the-wire layout
-                // because the signing path runs through `create_consensus_signature`:
-                //   * sig = ASCII wrapper `"dilithium_sig_<node_id>_<b64>"`
-                //   * pk  = `Some(node_id)` — a node-identity STRING; the
-                //           authoritative public key is the one bound to that
-                //           `node_id` in `CONSENSUS_PK_REGISTRY` (immutable
-                //           per identity once registered).
-                //
-                // The inline decoder rejected the system-TX format by
-                // construction (`hex::decode("dilithium_sig_...")` fails,
-                // `hex::decode("genesis_node_004")` fails). The receiver-side
-                // result was a HARD block reject every time the producer
-                // included a HeartbeatCommitment, PingCommitment,
-                // PingCommitmentWithSampling, or LightNodeEligibilityBitmap.
-                // First such inclusion lands at the commitment window
-                // (last 50 blocks of every epoch) — and that is exactly where
-                // the testnet froze at h=14350 (first epoch boundary on
-                // post-v25 code).
-                //
-                // Fix: delegate to the canonical helper used by the gossip
-                // and RPC admission paths. The helper:
-                //   1. Selects `signer_id` per signer-class semantics
-                //      (`node_id` for system TXs, `dilithium_public_key` for
-                //      user TXs — see `verify_dilithium_tx_signature_async`).
-                //   2. Forwards into `consensus_crypto::verify_consensus_signature`,
-                //      which knows every wrapper format
-                //      (`dilithium_sig_*`, `compact_bin:*`, `compact:*`,
-                //      `hybrid_bin:*`, …) AND enforces the
-                //      identity→PK registry binding (Tier 1/2/3, blacklist).
-                //   3. Runs the cryptographic verify on the canonical
-                //      message produced by `build_canonical_verify_message`.
-                //
-                // After this change apply-path verdicts are byte-identical to
-                // gossip-path verdicts for every TX class. Future signature
-                // format additions need to be wired in ONLY at the helper —
-                // both paths pick the change up automatically, eliminating
-                // the format-divergence class of bugs entirely.
-                //
-                // PARALLEL BATCH VERIFY (v25.2).
-                //
-                // The helper internally hands every signature off to the
-                // dedicated `SIGVERIFY_RUNTIME` (multi-threaded tokio runtime
-                // sized to ~num_cpus, see `unified_p2p::SIGVERIFY_RUNTIME`),
-                // so simultaneously-pending Dilithium verifies execute on
-                // distinct worker threads. Sequential `await` in a `for`
-                // loop would serialise the dispatch — every future would
-                // not even *start* its math until the previous one
-                // returned. Building a `Vec<Future>` and feeding it to
-                // `join_all` is the canonical parallel-batch pattern used
-                // elsewhere in the integration crate (see
-                // `unified_p2p.rs:8059` and `unified_p2p.rs:10543`).
-                //
-                // Performance characteristics:
-                //   * 5-node testnet, ≤ 1 HBC per block in commitment
-                //     window: 1 verify, parallelism irrelevant.
-                //   * 1000-validator committee in mature mainnet, ~20 HBC
-                //     per block at commitment-window peak: 20 verifies
-                //     parallel across ~num_cpus threads → ~ceil(20/cores) *
-                //     5 ms ≈ 10 ms wall-clock on a 16-core super-node,
-                //     well under the 1-second slot budget.
-                //   * Stage runtime is not blocked: each future awaits a
-                //     `JoinHandle` from a separate runtime, so the verify
-                //     stage thread continues to drive other I/O between
-                //     dispatch and join.
-                //
-                // Memory: futures hold immutable borrows on `&tx`. The
-                // borrow set lives until `join_all().await` returns, which
-                // is before we move on from `decoded`. Multiple concurrent
-                // immutable borrows are safe.
+                // Dilithium3 verify for PQ-signed TXs. v25.2: delegate to the canonical
+                // helper (verify_dilithium_tx_signature_async ->
+                // consensus_crypto::verify_consensus_signature) used by gossip/RPC, so
+                // apply-path verdicts are byte-identical to gossip for every signer class.
+                // Two on-wire layouts: user/mobile TXs ship raw hex sig(3309)/pk(1952);
+                // node system TXs use "dilithium_sig_<node_id>_<b64>" + pk=node_id (key
+                // from CONSENSUS_PK_REGISTRY). The old inline hex decoder hard-rejected
+                // the system format -> froze testnet at h=14350 (commitment window).
+                // Helper batches verifies on SIGVERIFY_RUNTIME (parallel, not seq await).
                 let mut dilithium_invalid = 0usize;
                 {
                     use futures::future::join_all;
@@ -2746,34 +2166,15 @@ impl BlockPipeline {
                 continue;
             }
 
-            // ── State application with snapshot + rollback support ──
-            // v15.4 DIAG: mark state-lock acquisition. If a competing
-            // writer holds the state RwLock for an extended period
-            // (e.g., a slow snapshot operation in BlockchainNode), this
-            // ────────────────────────────────────────────────────────────────
-            // v15.10 STAGE-2: PRE-WARM ACCOUNT CACHE
-            // ────────────────────────────────────────────────────────────────
-            // Before we acquire the state write lock and start mutating
-            // accounts, walk the block's transactions and ensure every
-            // address the apply path will touch is resident in the
-            // in-memory account map. Addresses that are already cached
-            // get a refreshed `last_access` timestamp; cold addresses
-            // are loaded from disk via the `AccountStore` fallback (read
-            // path is lock-free and concurrent-safe).
-            //
-            // Rationale: with a bounded cache, the apply path's
-            // `accounts.get_mut(from)` would fail for any cold sender
-            // address. Pre-warming under a READ lock guarantees the
-            // working set is resident at the moment the WRITE lock is
-            // taken, while keeping the disk-read latency outside the
-            // critical section.
-            //
-            // Cost (typical block, ~100-1000 TX):
-            //   * ≤ 2 × tx_count point reads on the `accounts` CF
-            //   * RocksDB SSD ~50-100 µs per read
-            //   * ≤ 100 ms total — runs concurrent with other apply
-            //     paths (reader lock allows fan-out).
-            // ────────────────────────────────────────────────────────────────
+            // State application with snapshot + rollback support.
+            // Pre-warm account cache: before taking the state WRITE lock,
+            // walk the block's TXs and ensure every touched address is
+            // resident (cached → refresh last_access; cold → AccountStore
+            // disk load, lock-free). With a bounded cache the apply path's
+            // accounts.get_mut(from) would miss a cold sender; pre-warming
+            // under a READ lock makes the working set resident while keeping
+            // disk latency outside the write critical section. ≤2×tx_count
+            // point reads.
             {
                 use std::collections::HashSet;
                 let mut warm_set: HashSet<String> = HashSet::new();
@@ -2961,6 +2362,13 @@ impl BlockPipeline {
                             block.microblock.timeout_round,
                         );
 
+                        // v27 HOLE3: warm read-through cache (verify h+1 hits
+                        // memory, not cold RocksDB → kills 30s verify_stuck).
+                        ctx.storage.cache_recent_microblock(
+                            height,
+                            &block.microblock,
+                        );
+
                         // ═══════════════════════════════════════════════════════
                         // v25 H9: VALIDATOR LIVENESS — SUCCESS PATH
                         // ───────────────────────────────────────────────────────
@@ -2983,46 +2391,15 @@ impl BlockPipeline {
                             crate::unified_p2p::record_validator_success(&producer);
                         }
 
-                        // ═══════════════════════════════════════════════════════════════════════════
-                        // v15.12 L1: PEER-APPLY MEMPOOL CLEANUP — closes the cross-block dedup gap
-                        // ═══════════════════════════════════════════════════════════════════════════
-                        // Forensic case h=14351 → h=14461:
-                        //   Block 14351 (producer=node_004) included 5 HeartbeatCommitments.
-                        //   Every other validator applied that block via this pipeline path,
-                        //   but the v15.5 mempool cleanup hook lived ONLY on the producer-side
-                        //   block-construction path (node.rs:21199 `block_produced_cleanup`).
-                        //   Result: peer validators kept the same 5 TXs in their local mempools,
-                        //   so when one of them (node_002) became producer at h=14461 it pulled
-                        //   the same 5 commitments from its mempool again and re-included them
-                        //   in the block. State-level `check_duplicate_commitment` rejected the
-                        //   apply (good — no double accounting), but the TX bytes still
-                        //   occupied block storage and produced visible duplicates in the
-                        //   explorer + a 75 KB / block bandwidth tax for every subsequent
-                        //   producer until mempool TTL eviction kicked in.
-                        //
-                        // Industry-grade fix:
-                        //   Mempool cleanup must fire on EVERY block apply event — both the
-                        //   producer-side path (already covered in `node.rs::start_microblock_production`)
-                        //   AND this peer-side pipeline path. Symmetric semantics: once a TX is
-                        //   on chain, no honest validator's mempool should re-offer it for
-                        //   inclusion in any subsequent block.
-                        //
-                        // Also stamps `record_included_txs` so any in-flight gossip carrying a
-                        // late copy of the same TX hash gets dropped at the next admission
-                        // attempt (already-included guard in `SimpleMempool::add_*`).
-                        //
-                        // Scalability:
-                        //   * O(tx_count) hash compute + 1 batched DashMap remove per apply.
-                        //     Typical block: 0-50 TXs → microseconds. Genesis-mesh emission
-                        //     boundary peak ~150 TXs → still sub-millisecond.
-                        //   * Runs on the apply task's tokio thread inline — no blocking I/O,
-                        //     no extra task spawn, no inter-task signalling.
-                        //   * Safe at thousands of super-node committee size: the mempool's
-                        //     per-receive replacement (`replace_or_register_commitment`) and
-                        //     this cleanup form a closed-loop invariant that bounds mempool
-                        //     occupancy to (active_validators × commitment_types) regardless
-                        //     of total network size.
-                        // ═══════════════════════════════════════════════════════════════════════════
+                        // Peer-apply mempool cleanup. The producer-side cleanup
+                        // hook covers only the producer path, so peer validators
+                        // retained on-chain TXs and re-included them in later
+                        // blocks (state dup-check stops double-accounting but the
+                        // bytes still cost storage + bandwidth; observed h=14351→
+                        // 14461, 5 HeartbeatCommitments shipped twice). Symmetric
+                        // rule: once on chain, no honest mempool re-offers a TX.
+                        // record_included_txs also drops late gossip copies.
+                        // O(tx_count) hash + 1 batched DashMap remove, inline.
                         if !block.microblock.transactions.is_empty() {
                             let included_hashes: Vec<String> = block.microblock.transactions.iter()
                                 .map(|tx| tx.hash.clone())
@@ -3031,26 +2408,10 @@ impl BlockPipeline {
                                 mempool_arc.record_included_txs(&included_hashes);
                                 mempool_arc.batch_remove_transactions(&included_hashes);
 
-                                // ═══════════════════════════════════════════════════════════════════
-                                // v15.12 L3: NOTIFY MEMPOOL OF FINALIZED COMMITMENT EPOCHS
-                                // ═══════════════════════════════════════════════════════════════════
-                                // Walk the applied block's transactions; for every commitment-class
-                                // TX, mark its `(identity, epoch_or_index, type_id)` key in the
-                                // mempool's `committed_epochs_cache`. Subsequent admission attempts
-                                // for the same key are rejected at the door (lock-free DashMap
-                                // lookup, ~50 ns), preventing late gossip / re-broadcast traffic
-                                // from re-populating the local mempool with already-on-chain TXs.
-                                //
-                                // Together with the producer-side L2 state check and the bulk
-                                // mempool removal above, this closes the cross-block duplication
-                                // window observed at h=14351 → h=14461 (5 HeartbeatCommitments
-                                // shipped twice 110 blocks apart due to peer-apply mempool
-                                // retention).
-                                //
-                                // Scalability: one DashMap insert per commitment TX per applied
-                                // block. At MAX_VALIDATORS=1000 epoch boundary peak = ~1000 inserts
-                                // per epoch boundary block — sub-millisecond at any committee size.
-                                // ═══════════════════════════════════════════════════════════════════
+                                // Mark each commitment TX's dedup key finalized so
+                                // later re-admission of the same on-chain TX is
+                                // rejected at the door (lock-free DashMap, ~50ns).
+                                // 1 insert/commitment TX; ≤1000 at epoch boundary.
                                 let mut commitment_marks = 0usize;
                                 for tx in &block.microblock.transactions {
                                     if let Some(key) = tx.commitment_dedup_key() {
@@ -3160,53 +2521,18 @@ impl BlockPipeline {
                             }
                         }
 
-                        // ═══════════════════════════════════════════════════════════════
-                        // v15.10: Cross-shard 2PC apply hook removed.
-                        // Architectural decision: QNet stays single-shard for the
-                        // foreseeable future. Sharding scaffolding remains as
-                        // dormant scaffolding in `qnet_consensus::cross_shard` and
-                        // `qnet_consensus::sharded_consensus` modules — the
-                        // primitives are tested and ready, but the apply path no
-                        // longer touches them and the wire-format `CrossShard*`
-                        // transaction variants have been removed from
-                        // `TransactionType` to prevent any accidental
-                        // activation. See `qnet-sharding/lib.rs` module header
-                        // for the full rationale.
-                        // ═══════════════════════════════════════════════════════════════
+                        // Cross-shard 2PC apply hook removed — single-shard for
+                        // now; sharding primitives stay dormant and CrossShard*
+                        // TransactionType variants are removed to block accidental
+                        // activation (see qnet-sharding/lib.rs header).
 
-                        // ═══════════════════════════════════════════════════════════
-                        // v15.9: WRITE-THROUGH ACCOUNT PERSISTENCE (Stage 1)
-                        // ───────────────────────────────────────────────────────────
-                        // Mirror every account that this block mutated into the
-                        // persistent `accounts` column family. The mutation set is
-                        // sourced from the `BlockSnapshot` journal, which already
-                        // tracks every address touched by the block (modified
-                        // pre-images + freshly created keys). For each address we
-                        // re-read the post-image from the in-memory map and stage
-                        // it into a single `WriteBatch` committed atomically on
-                        // the blocking thread pool.
-                        //
-                        // CRASH SAFETY
-                        // ───────────────────────────────────────────────────────────
-                        // After this commit returns, a node that crashes can
-                        // restart with a durable copy of every account at this
-                        // block's height. Together with `set_chain_height`
-                        // (already persisted above) this gives the runtime an
-                        // on-disk source-of-truth for state at every committed
-                        // block — no more "lost mutations between snapshots"
-                        // when an unexpected restart hits the production node.
-                        //
-                        // Skipped when `block_snapshot` is None (genesis-window
-                        // blocks without state_root verification) — there is no
-                        // mutation set to persist in that case.
-                        //
-                        // SCALABILITY (1 000+ super nodes)
-                        // ───────────────────────────────────────────────────────────
-                        // Cost: one batch put per touched account per block.
-                        // Typical block touches ≤ 100 accounts × ~150 B = ~15 KB
-                        // committed atomically — single-digit millisecond on
-                        // commodity SSDs. Runs on the blocking pool so the
-                        // tokio reactor stays free for consensus / P2P / RPC.
+                        // Write-through account persistence: mirror every account
+                        // this block mutated (addresses from the BlockSnapshot
+                        // journal) into the persistent `accounts` CF via one
+                        // atomic WriteBatch on the blocking pool, so a crash
+                        // restart has durable per-block state (no lost mutations
+                        // between snapshots). Skipped when block_snapshot is None
+                        // (genesis window, no mutation set). O(touched accounts).
                         if let Some(ref snapshot) = block_snapshot {
                             let mut modified: Vec<(String, qnet_state::Account)> =
                                 Vec::with_capacity(snapshot.accounts().len() + snapshot.created_keys().len());
@@ -3296,30 +2622,17 @@ impl BlockPipeline {
                             if is_info() { println!("[INFO][PIPELINE] block_rollback h={} reason=save_failed", height); }
                         }
 
-                        // ═══════════════════════════════════════════════════════════════════════════
-                        // v15.11 L5: MAJORITY-WINS FORK RESOLUTION TRIGGER
-                        // ═══════════════════════════════════════════════════════════════════════════
-                        // Save failed with `fork_conflict` means the storage L4 guard caught a
-                        // different block at the same height (the local one we previously stored
-                        // does NOT match the incoming one). The L4 guard already recorded
-                        // cryptographic equivocation evidence for the slashing pipeline; here we
-                        // additionally invoke the BFT majority resolver to decide which chain is
-                        // canonical and roll back the local minority chain if needed.
-                        //
-                        // Triggered ONLY on the `fork_conflict` error path; other StorageError
-                        // variants (full disk, IO error, corruption) are propagated unchanged.
-                        //
-                        // Safety:
-                        //   * Resolver requires 2f+1 supermajority before any rollback — Byzantine
-                        //     ≤ f cannot induce a wrong rollback.
-                        //   * On Abstain (no quorum), local chain is preserved — defensive bias.
-                        //   * Rollback is gated by `try_fork_recovery()` to prevent simultaneous
-                        //     rollback storms (only one fork-recovery in flight at a time).
-                        //
-                        // Scalability:
-                        //   * Triggered only on fork conflict (rare event by design).
-                        //   * One async task per conflict, bounded by the resolver's 800 ms
-                        //     timeout. No load on the apply pipeline itself — fire-and-forget.
+                        // L5 majority-wins fork-resolution trigger. A
+                        // fork_conflict save error means the storage L4 guard
+                        // caught a different block at this height (and already
+                        // recorded equivocation evidence); here we also invoke
+                        // the BFT majority resolver to pick the canonical chain
+                        // and roll back the local minority. ONLY on
+                        // fork_conflict (other StorageErrors propagate).
+                        // Resolver needs 2f+1 (≤f can't induce a wrong
+                        // rollback); Abstain → keep local (defensive); gated by
+                        // try_fork_recovery (no rollback storms); fire-and-
+                        // forget, 800 ms timeout.
                         let err_msg = format!("{}", e);
                         if err_msg.contains("fork_conflict") {
                             if let Some(ref p2p) = ctx.unified_p2p {
@@ -3436,44 +2749,17 @@ impl BlockPipeline {
             // Clear pending sync for this block
             crate::unified_p2p::clear_block_pending_sync(height);
 
-            // ────────────────────────────────────────────────────────────────
-            // v15.0: CHAIN-DERIVED ROTATION STATE CATCH-UP
-            //
-            // Closes the rotation-state-desync cascade. A node that came
-            // back online at h=2790 and synced forward to h=2880 previously
-            // applied the block with timeout_round=6 but had
-            // HIGHEST_CERTIFIED_ROUND[mb_idx] = 0 because it never witnessed
-            // the live BFT voting. Its producer-selection therefore computed
-            // the primary leader (VRF winner at round 0) instead of the
-            // rotated-to-round-6 producer, leading to the observed two-
-            // producer fork for the same height.
-            //
-            // Fix: if an applied block was produced at timeout_round > local
-            // HIGHEST_CERTIFIED_ROUND for the containing macroblock index,
-            // proactively request timeout certificates from peers. The
-            // response path re-verifies each certificate's 2f+1 signatures
-            // (`handle_timeout_proof_broadcast` / `handle_aggregated_timeout_cert`)
-            // before advancing state — so this is NOT a trust-the-block
-            // shortcut; the block merely triggers the backfill.
-            //
-            // Safety:
-            //   * timeout_round in the block is NOT used to advance rotation
-            //     state directly (that would let ≤ f byzantine producers
-            //     forge arbitrary rotation). It only signals "a certificate
-            //     exists somewhere in the network — fetch it."
-            //   * Self-limiting via the monotonic local_certified guard:
-            //     as soon as the first successful backfill response advances
-            //     HIGHEST_CERTIFIED_ROUND past this block's timeout_round,
-            //     subsequent blocks in the same catch-up batch stop firing
-            //     requests. Worst case during partition-induced catch-up is
-            //     ~N requests (one per block applied faster than the peer
-            //     RTT), bounded by the sync window.
-            //
-            // Scalability: one fan-out request to ≤ 5 peers only when the
-            // condition fires. For the steady-state (block.timeout_round
-            // matches local state) this costs zero. Bounded by the
-            // active-macroblock cleanup window.
-            // ────────────────────────────────────────────────────────────────
+            // Chain-derived rotation-state catch-up. A node that synced
+            // forward applied a block with timeout_round=6 while its local
+            // HIGHEST_CERTIFIED_ROUND was still 0 (never saw the live BFT
+            // votes), so it elected the round-0 leader instead of round-6 →
+            // two-producer fork. Fix: when an applied block's timeout_round
+            // exceeds local certified, proactively request timeout certs
+            // from peers. The block's timeout_round is NOT used to advance
+            // rotation directly (≤f byzantine could forge it) — it only
+            // signals "a cert exists, fetch it"; the response path
+            // re-verifies 2f+1 sigs before advancing. Self-limiting via the
+            // monotonic local_certified guard. ≤5-peer fan-out only on fire.
             let block_timeout_round = block.microblock.timeout_round;
             if block_timeout_round > 0 {
                 let mb_idx = height / 90;
@@ -3494,61 +2780,16 @@ impl BlockPipeline {
                 }
             }
 
-            // ────────────────────────────────────────────────────────────────
-            // v15.9: COMMITTEE-WIDE SNAPSHOT CREATION (deterministic apply-stage trigger)
-            //
-            // Every honest node materialises the canonical snapshot at every
-            // `SNAPSHOT_INCREMENTAL_INTERVAL` boundary so that:
-            //   * fresh nodes can chunked-parallel-download from any of the
-            //     N committee members, not just the producer;
-            //   * the macroblock `snapshot_root` consensus binding has a
-            //     byte-identical artefact to hash on every honest node;
-            //   * the rollback-reconciliation path can deterministically
-            //     find a snapshot ≤ any rollback target.
-            //
-            // SOURCE OF TRUTH — IN-MEMORY STATE (not RocksDB accounts CF)
-            // ────────────────────────────────────────────────────────────────
-            // Earlier revisions delegated to `Storage::create_incremental_snapshot`,
-            // which iterated the persistent `accounts` column family. That CF
-            // is only ever written during snapshot RESTORE (boot-time / sync),
-            // never during runtime block apply, so it carried whatever data
-            // the last bootstrap restored — completely disconnected from the
-            // current chain tip. The resulting snapshots were either empty
-            // (on a fresh node) or stale (post-restart), and the
-            // `snapshot_root` binding hashed those bad bytes.
-            //
-            // The fix: serialise from `state.accounts` (the in-memory
-            // `Arc<DashMap>` that every block-apply path mutates), the same
-            // source the emission-rewards path uses (node.rs:27680+). This
-            // is the canonical runtime view of account state.
-            //
-            // CANONICAL ENCODING
-            // ────────────────────────────────────────────────────────────────
-            // DashMap iteration order is shard-dependent and varies node-to-
-            // node even with identical content. We sort by account address
-            // before bincode-serialising so every honest node produces the
-            // SAME bytes — without this the SHA3-256 in `snapshot_root`
-            // would diverge across the committee and the supermajority
-            // binding could never converge.
-            //
-            // OFF-REACTOR EXECUTION
-            // ────────────────────────────────────────────────────────────────
-            // At 1 M+ accounts the iterate+clone+sort+serialise+zstd path
-            // takes seconds and 100s of MB of working memory. We spawn it
-            // on the tokio blocking pool with a strong `Arc` to the
-            // accounts map; the apply pipeline returns immediately and the
-            // next block can be processed while the snapshot writes in the
-            // background. A failure is logged at WARN level — never blocks
-            // consensus liveness.
-            //
-            // SCALABILITY (1 000+ super nodes)
-            // ────────────────────────────────────────────────────────────────
-            // Per-block overhead is a single integer modulus check; the
-            // heavy work fires once every 3 600 blocks (~1 hour). Each node
-            // performs identical work — total network cost is unchanged
-            // versus the producer-only model, the artefact is simply
-            // replicated to every committee member.
-            // ────────────────────────────────────────────────────────────────
+            // v15.9: committee-wide canonical snapshot at each
+            // SNAPSHOT_INCREMENTAL_INTERVAL — fresh nodes parallel-download from any
+            // committee member; macroblock snapshot_root has a byte-identical
+            // artefact on every honest node; rollback finds a snapshot <= target.
+            // SOURCE = in-memory state.accounts (the Arc<DashMap> every apply
+            // mutates), NOT the RocksDB accounts CF (only written on restore →
+            // stale/empty → bad snapshot_root). Sort by address before bincode
+            // (DashMap iter order is shard/node-dependent) → identical bytes → root
+            // converges. Off-reactor (blocking pool, Arc to accounts); pipeline
+            // returns immediately; failure WARN-only, never blocks liveness.
             const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
             if height > 0 && height % SNAPSHOT_INCREMENTAL_INTERVAL == 0 {
                 let storage_for_snapshot = ctx.storage.clone();

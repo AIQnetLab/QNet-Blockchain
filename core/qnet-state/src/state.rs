@@ -584,67 +584,13 @@ impl BlockSnapshot {
 /// v3.11: Integrated State Merkle Tree for trustless balance proofs
 /// v3.33: Removed unused ValidatorSet - using MacroBlock.eligible_producers instead
 ///
-/// ═══════════════════════════════════════════════════════════════════════════
-/// v15.9: SCALE LIMIT — IN-MEMORY ACCOUNTS
-/// ───────────────────────────────────────────────────────────────────────────
-/// `accounts` is currently a fully in-RAM `DashMap`. Each entry costs roughly
-/// 300–800 bytes (40 B address + Account struct + per-account
-/// `contract_storage` HashMap if any). This places a HARD CEILING on the
-/// sustainable account count per Super node:
-///
-///   1 M accounts → ~600 MB  (comfortable)
-///   5 M accounts → ~3 GB    (tight on a 4 GB node)
-///   10 M accounts → ~6 GB   (requires high-RAM nodes)
-///   100 M accounts → ~60 GB (requires server-class hardware OR refactor)
-///
-/// MIGRATION PATH — STAGE-2 RocksDB-backed account state
-/// ───────────────────────────────────────────────────────────────────────────
-/// When state surpasses ~5 M accounts the canonical solution is to back
-/// the account map with a column family in the existing RocksDB instance
-/// and front it with an LRU cache for hot keys. The migration breaks
-/// down as:
-///
-///   1. Add a private `disk: Arc<dyn AccountStore + Send + Sync>` handle
-///      next to `accounts` and `merkle_tree`. The trait exposes
-///      `get`/`put`/`remove`/`iter` returning `Account` values.
-///   2. Reroute `apply_transaction` and `restore_accounts` through a
-///      `cached_get_or_load` helper that consults `accounts` (LRU) first
-///      and falls back to `disk` on miss; writes go through both.
-///   3. Bound the LRU at ~512 K entries (≈ 200 MB) — this is the
-///      working set for steady-state transfer traffic. Every TX hot-loads
-///      its sender/receiver, every block evicts the cold tail.
-///   4. Snapshot creation iterates `disk` directly via the existing
-///      `iterator_cf("accounts")` path, never the LRU, so canonical
-///      bytes do not depend on cache state.
-///   5. Merkle tree stays incremental — no change required, since it
-///      already updates per-account on insert/remove.
-///
-/// SCALABILITY (1 000+ super nodes, 100 M+ accounts)
-/// ───────────────────────────────────────────────────────────────────────────
-/// Post-migration, per-block hot path stays at O(k) where k = touched
-/// accounts (typically ≤ 100 / block); total per-node memory becomes
-/// LRU-bounded (~200 MB) plus the Merkle leaf set, regardless of total
-/// account count. The trade-off is RocksDB read-amplification on cache
-/// misses, which is acceptable on SSD-backed Super nodes.
-///
-/// Until that work lands, operators MUST provision enough RAM to hold
-/// the entire account set in `accounts`.
-/// ═══════════════════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════════════
-// v15.10 STAGE-2: MONOTONIC LOGICAL CLOCK FOR LRU TIMESTAMPS
-// ───────────────────────────────────────────────────────────────────────────
-// Every `touch_access` / `touch_accesses` call burns one slot of this
-// global counter. The counter is process-local: cache state is never
-// transmitted between nodes, and eviction order is a per-node concern,
-// so cross-node coherence is not required.
-//
-// SCALABILITY
-// ───────────────────────────────────────────────────────────────────────────
-// `Relaxed` ordering is sufficient: we only need monotonicity of the
-// counter, NOT happens-before with the cache map. At thousands of
-// touches per second on 1 000 super-nodes, the atomic `fetch_add`
-// adds ~5 ns of CPU per touch — invisible against the surrounding
-// DashMap insert.
+/// SCALE: the account map is in-RAM (~300-800 B/entry) — a HARD per-node
+/// ceiling. Until the RocksDB-CF + hot-key-LRU migration lands, operators
+/// MUST provision RAM for the full account set (~600 MB/1M, ~6 GB/10M).
+/// Post-migration the per-block hot path stays O(touched) with an
+/// LRU-bounded (~200 MB) cache; the Merkle tree stays incremental.
+// v15.10: monotonic process-local logical clock for LRU timestamps
+// (Relaxed ok — per-node eviction order, no cross-node coherence; ~5 ns).
 static LOGICAL_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[inline]
@@ -652,32 +598,11 @@ fn next_logical_timestamp() -> u64 {
     LOGICAL_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v15.10 STAGE-2A: STATE PARTITIONING — DETERMINISTIC SHARD ASSIGNMENT
-// ───────────────────────────────────────────────────────────────────────────
-// `account_shard_index` is the canonical mapping from an account address
-// to a shard index in the range `[0, num_shards)`. Every node in the
-// network MUST agree on this assignment for Stage-2B per-shard consensus
-// committees to converge: deterministic + stateless + cheap.
-//
-// HASH CHOICE
-// ───────────────────────────────────────────────────────────────────────────
-// Blake3 over the address bytes, then take the leading u32 modulo
-// `num_shards`. Blake3 is the same hash already used elsewhere in the
-// sharding crate (`qnet-sharding/src/lib.rs`), so cross-crate shard
-// assignments line up bit-for-bit. The hash is fast (~1 GB/s on modern
-// CPUs) and uniformly distributed — load imbalance across shards is
-// bounded by the law-of-large-numbers tail (≈ 1/√N for N shards).
-//
-// EDGE CASES
-// ───────────────────────────────────────────────────────────────────────────
-//   * `num_shards == 0` is treated as `num_shards == 1` (single shard).
-//     This keeps the helper safe to call before the operator configures
-//     shard count, and matches the `set_num_shards` invariant that 0
-//     never reaches the runtime.
-//   * Empty addresses map to shard 0. Production paths never pass empty
-//     addresses (mempool admission rejects them upstream); this is a
-//     defensive default.
+// Canonical account→shard mapping. MUST be deterministic + stateless so
+// every node agrees (precondition for per-shard committees). blake3(addr)
+// leading-u32 % num_shards — same hash as the sharding crate, so cross-
+// crate assignments line up bit-for-bit; uniform distribution. Edge cases:
+// num_shards==0 treated as 1; empty address → shard 0 (defensive).
 pub fn account_shard_index(address: &str, num_shards: u32) -> u32 {
     let n = if num_shards == 0 { 1 } else { num_shards };
     if address.is_empty() {
@@ -734,29 +659,12 @@ pub struct StateManager {
     /// Deterministic: populated from block application, identical across all nodes
     registered_nodes: Arc<DashMap<String, String>>,
 
-    // ════════════════════════════════════════════════════════════════════════
-    // v15.10 STAGE-2: LRU CACHE INFRASTRUCTURE
-    // ────────────────────────────────────────────────────────────────────────
-    // Three pieces back the read-through cache:
-    //   * `last_access` — wall-clock timestamps recorded at warm-time and
-    //     touch-time. Eviction picks the entries with the oldest
-    //     timestamps when the cache exceeds capacity.
-    //   * `cache_capacity` — soft bound on the number of accounts kept in
-    //     `accounts` between eviction passes. Configured at startup from
-    //     `QNET_ACCOUNT_CACHE_CAPACITY` (default 500 000 accounts).
-    //   * `disk_store` — read-through handle to the persistent account
-    //     CF. Set once at startup via `set_disk_store`; reads are
-    //     lock-free at steady state (parking_lot RwLock).
-    //
-    // SCALABILITY (1 000+ super nodes, 100 M+ accounts)
-    // ────────────────────────────────────────────────────────────────────────
-    // The cache is the working set, not the chain state. At 100 M total
-    // accounts with a 500 K cap, ~99.5 % of accounts live exclusively on
-    // disk; per-block warm-up reads only the 100–2 000 addresses the
-    // block touches (point reads on the hot CF, microsecond-scale on
-    // SSD). RAM stays bounded at ~200 MB regardless of total account
-    // count — exactly the property the public design comment above
-    // promises.
+    // Read-through LRU cache backing `accounts` (working set, not chain
+    // state): last_access drives oldest-first eviction; cache_capacity is a
+    // soft cap (QNET_ACCOUNT_CACHE_CAPACITY, default 500k); disk_store is
+    // the persistent-CF fallback set once at startup. Per-block warm-up
+    // reads only the touched addresses, so RAM stays ~200 MB even at 100M+
+    // total accounts.
     /// Last-access wall-clock seconds per cached account. Set at warm-time
     /// and on explicit touches; consulted by the eviction sweep to pick
     /// the oldest entries first.
@@ -767,63 +675,17 @@ pub struct StateManager {
     /// Read-through fallback to the persistent account store. Set once
     /// at node startup by the integration layer.
     disk_store: Arc<parking_lot::RwLock<Option<Arc<dyn AccountStore>>>>,
-    // ════════════════════════════════════════════════════════════════════════
-    // v15.10 STAGE-2A: SHARD COUNT
-    // ────────────────────────────────────────────────────────────────────────
-    // Number of logical shards the network is currently configured with.
-    // Used by:
-    //   * Stage-2A — the sharded routing layer (`account_shard_index`)
-    //     consults this when callers want the canonical shard for an
-    //     address.
-    //   * Stage-2B (future) — per-shard consensus committees split the
-    //     active validator set against this count.
-    //   * Stage-2C (future) — cross-shard 2PC routes transactions whose
-    //     `from`/`to` addresses fall into different shards through the
-    //     coordinator path.
-    //
-    // Default `1` keeps the runtime behaviour identical to the pre-2A
-    // shipped implementation: every address maps to shard 0, every
-    // microblock is built against the global account map, no cross-
-    // shard coordination is needed.
-    //
-    // Operators raise this via `set_num_shards` once the network has
-    // grown enough to support multiple consensus sub-committees
-    // (typically when the active validator count comfortably exceeds
-    // `MIN_VALIDATORS_PER_SHARD × num_shards`). The value is
-    // deterministic across all honest nodes — it ships in the chain
-    // configuration, NOT per-node ENV.
+    // Logical shard count. Default 1 = pre-shard behaviour (all addresses
+    // → shard 0, global account map, no cross-shard coordination). Consumed
+    // by account_shard_index (and future per-shard committees / cross-shard
+    // 2PC). Deterministic across nodes — ships in chain config via
+    // set_num_shards, NOT per-node ENV.
     num_shards: Arc<std::sync::atomic::AtomicU32>,
-    // ════════════════════════════════════════════════════════════════════════
-    // v15.10 STAGE-2: PRODUCTION CACHE METRICS
-    // ────────────────────────────────────────────────────────────────────────
-    // Lock-free counters exposed for operational monitoring (Prometheus
-    // scrape, operator dashboards, post-mortem diagnostics). At 1 000+
-    // super-node scale, blind cache behaviour is the difference between a
-    // node hitting its 200 MB RAM budget and silently OOMing — these
-    // counters are how operators verify the cache is doing what it
-    // promises.
-    //
-    // SEMANTICS
-    // ────────────────────────────────────────────────────────────────────────
-    //   * cache_hits — `warm_account` resolved from RAM (no disk read).
-    //   * cache_misses — `warm_account` had to call `disk_store.load_account`.
-    //     Includes both successful disk loads and "address absent on disk"
-    //     probes; the two are distinguished by `disk_load_hits` /
-    //     `disk_load_misses`.
-    //   * disk_load_hits — disk fallback returned `Some(Account)`.
-    //   * disk_load_misses — disk fallback returned `None` (genuinely
-    //     absent address; typically a brand-new wallet referenced for
-    //     the first time).
-    //   * evictions — total accounts dropped from RAM by the eviction
-    //     sweep across the node's lifetime.
-    //
-    // RATIO OF INTEREST
-    // ────────────────────────────────────────────────────────────────────────
-    // Steady-state cache_hits / (cache_hits + cache_misses) is the
-    // "warm working set efficiency". A healthy production node should
-    // see ≥ 95 % even with cap = 500 K and total state in the millions
-    // — this is the canonical signal that the cap is correctly sized
-    // for the active wallet population.
+    // Lock-free cache metrics for monitoring. cache_hits/misses =
+    // warm_account resolved from RAM vs needing disk_store; disk_load_hits/
+    // misses = disk fallback returned Some vs None (absent address);
+    // evictions_total = accounts dropped by the eviction sweep.
+    // Steady-state hit ratio ≥95% indicates the cap is correctly sized.
     cache_hits: Arc<std::sync::atomic::AtomicU64>,
     cache_misses: Arc<std::sync::atomic::AtomicU64>,
     disk_load_hits: Arc<std::sync::atomic::AtomicU64>,
