@@ -1189,6 +1189,11 @@ static QUIC_FALLBACK_RATE_LIMITER: Lazy<Arc<DashMap<String, (u32, u64)>>> =
 const QUIC_FALLBACK_MAX_PER_MIN: u32 = 10;  // Max 10 QUIC fallback requests per minute
 const QUIC_FALLBACK_WINDOW_SECS: u64 = 60;  // Rolling window: 60 seconds
 
+/// QoS bulk lane drop counter (lane full → request shed). Log-governed by
+/// the bulk worker; shedding here is the hard DoS bound that protects the
+/// consensus lane — a flooding cold-sync peer's excess is dropped, never queued.
+pub static BULK_LANE_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// QUIC Fallback Metrics (global counters for monitoring)
 pub static QUIC_FALLBACK_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static QUIC_FALLBACK_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2290,7 +2295,11 @@ pub struct SimplifiedP2P {
     /// All QUIC messages are sent here and processed via handle_message()
     /// This ensures QUIC messages use same logic as HTTP (no duplication)
     quic_message_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<(String, NetworkMessage)>>>>,
-    
+    /// QoS bulk lane: floodable sync-serving msgs (RequestBlocks/RequestMacroblocks/
+    /// Blocks|MacroblocksBatch/StateSnapshot) routed here, drained by a dedicated
+    /// worker so a cold-sync flood can never delay the consensus lane.
+    quic_bulk_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<(String, NetworkMessage)>>>>,
+
     /// PRODUCTION v2.19.25: Transaction processing channel
     /// Received transactions from P2P are sent here for validation and mempool
     /// This enables full transaction propagation across the network
@@ -3182,7 +3191,8 @@ impl SimplifiedP2P {
             
             // PRODUCTION v2.19.22: QUIC message channel (set via set_quic_message_channel)
             quic_message_tx: Arc::new(Mutex::new(None)),
-            
+            quic_bulk_tx: Arc::new(Mutex::new(None)),
+
             // PRODUCTION v2.19.25: Transaction channel (set via set_transaction_channel)
             transaction_tx: Arc::new(Mutex::new(None)),
             
@@ -3282,7 +3292,29 @@ impl SimplifiedP2P {
         *guard = Some(quic_message_tx);
         if crate::node::is_info() { println!("[INFO][QUIC] Message processing channel established"); }
     }
-    
+
+    /// QoS bulk lane sender (sync-serving / bulk transfer). Separate from the
+    /// consensus lane so a cold-sync request flood cannot delay consensus.
+    pub fn set_quic_bulk_channel(&mut self, quic_bulk_tx: tokio::sync::mpsc::Sender<(String, NetworkMessage)>) {
+        let mut guard = self.quic_bulk_tx.lock();
+        *guard = Some(quic_bulk_tx);
+        if crate::node::is_info() { println!("[INFO][QUIC] Bulk lane channel established"); }
+    }
+
+    /// True for floodable bulk-serving / bulk-transfer messages that must NOT
+    /// share the consensus FIFO. Everything else (consensus, tip blocks,
+    /// shred chunks, tx, discovery) stays on the high-priority lane.
+    #[inline]
+    fn is_bulk_lane_message(msg: &NetworkMessage) -> bool {
+        matches!(msg,
+            NetworkMessage::RequestBlocks { .. }
+            | NetworkMessage::RequestMacroblocks { .. }
+            | NetworkMessage::BlocksBatch { .. }
+            | NetworkMessage::MacroblocksBatch { .. }
+            | NetworkMessage::StateSnapshot { .. }
+        )
+    }
+
     /// PRODUCTION v2.19.21: Initialize QUIC transport for high-performance P2P
     /// 
     /// Features:
@@ -3316,24 +3348,33 @@ impl SimplifiedP2P {
         // PRODUCTION v2.19.22: Route ALL QUIC messages through channel to handle_message()
         // This ensures QUIC uses SAME logic as HTTP - no code duplication!
         let quic_message_tx = self.quic_message_tx.clone();
-        
+        let quic_bulk_tx = self.quic_bulk_tx.clone();
+
         // v6.5: Share peer_id_to_addr with QUIC transport for bidirectional mapping
         transport.set_peer_id_to_addr(self.peer_id_to_addr.clone());
 
         let handler: MessageHandler = Arc::new(move |peer_addr, msg| {
-            // Convert QUIC SocketAddr to API port format (matches handle_message expectation)
             let peer_str = format!("{}:8001", peer_addr.ip());
-            
-            // CRITICAL: Send ALL messages through channel for full processing
-            // This calls handle_message() which has complete logic for all message types
+
+            // QoS split: bulk-serving msgs → bounded bulk lane (drop-on-full =
+            // hard DoS bound, never blocks); everything consensus-critical →
+            // high-priority lane. Two channels + two drain tasks = a cold-sync
+            // flood structurally cannot delay consensus.
+            if Self::is_bulk_lane_message(&msg) {
+                let bg = quic_bulk_tx.lock();
+                if let Some(ref tx) = *bg {
+                    if tx.try_send((peer_str, msg)).is_err() {
+                        BULK_LANE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                return;
+            }
             let tx_guard = quic_message_tx.lock();
             if let Some(ref tx) = *tx_guard {
                 if let Err(e) = tx.try_send((peer_str.clone(), msg)) {
                     if crate::node::is_warn() { println!("[WARN][QUIC] Failed to queue message from {}: {}", peer_str, e); }
                 }
             } else {
-                // Channel not set yet - this is a CRITICAL startup race condition!
-                // Log this as it means messages are being lost
                 if crate::node::is_warn() { println!("[WARN][QUIC] Message from {} dropped - channel not initialized yet!", peer_str); }
             }
         });
@@ -14514,9 +14555,10 @@ impl SimplifiedP2P {
             }
 
             NetworkMessage::RequestBlocks { from_height, to_height, requester_id } => {
-                // Handle block request for sync
-                if crate::node::is_info() {
-                    println!("[INFO][SYNC] Received block request from {} for heights {}-{}",
+                // Per-request serving log is DEBUG: at thousands-of-nodes
+                // scale an INFO line per inbound sync request is a log-DoS.
+                if crate::node::is_debug() {
+                    println!("[DBG][SYNC] block_request from={} heights={}-{}",
                              requester_id, from_height, to_height);
                 }
                 self.handle_block_request(from_peer, from_height, to_height, requester_id);
@@ -19652,8 +19694,8 @@ impl SimplifiedP2P {
             to_height
         };
 
-        if crate::node::is_info() {
-            println!("[INFO][SYNC] serve heights={}-{} peer={}", from_height, actual_to, requester_id);
+        if crate::node::is_debug() {
+            println!("[DBG][SYNC] serve heights={}-{} peer={}", from_height, actual_to, requester_id);
         }
         
         // CRITICAL FIX: Send sync request to node.rs where storage is available
@@ -20326,84 +20368,82 @@ impl SimplifiedP2P {
     ///         Previous bug: sent to one peer, returned Ok(), peer didn't respond,
     ///         next call picked same peer again → deadlock
     pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), String> {
-        // v25 H10: sync coordination gate. 22+ call sites fire sync_blocks for
-        // different stall-recovery scenarios; without a coordinator parallel
-        // paths request the same range at once → thundering herd + dup streams.
-        // Gate before sync_blocks_inner: (1) PER-RANGE COOLDOWN — same (from,to)
-        // within SYNC_RANGE_COOLDOWN_SECS returns Ok(()) immediately (prev run
-        // in flight or just landed); (2) GLOBAL CONCURRENCY BOUND —
-        // <= MAX_CONCURRENT_SYNC_BLOCKS permits, else wait (no stacked fan-outs).
-        // (0,0) tip-sync cooldown-gated too → 5 watchdogs/100ms = 1 request.
-        // O(1) DashMap (lazy-pruned) + small semaphore; bounded at 100k.
-        const SYNC_RANGE_COOLDOWN_SECS: u64 = 2;
+        // Unified client sync coordinator — single owner for all ~15 callers
+        // (runtime loop, pipeline missing-range, fork/gap/genesis recovery).
+        // Per-exact-(from,to) cooldown was bypassed by distinct/overlapping
+        // tiny ranges → request storm. This is a frontier+interval window:
+        //   1. WINDOW backpressure — clamp to [applied+1, applied+SYNC_WINDOW];
+        //      never request faster than the apply pipeline drains (the apply
+        //      frontier IS LOCAL_BLOCKCHAIN_HEIGHT). Far-behind nodes sync in
+        //      bounded sequential windows, not one giant fan-out.
+        //   2. Overlap-dedup — a range overlapping any in-flight range is
+        //      skipped (kills the duplicate/overlapping-range storm that
+        //      distinct tuples slipped past).
+        //   3. Bounded concurrency + hard timeout (defence-in-depth).
+        // (0,0) = tip-nudge idiom → [applied+1, applied+SYNC_WINDOW].
+        // Scales: O(in_flight ≤ MAX) interval check; one small Mutex.
+        const SYNC_WINDOW: u64 = 2_000;
         const MAX_CONCURRENT_SYNC_BLOCKS: usize = 4;
+        const SYNC_BLOCKS_HARD_TIMEOUT_SECS: u64 = 45;
 
-        // Global state — lazy-init the cooldown map + semaphore once per process.
-        static SYNC_RANGE_LAST_FIRE: Lazy<DashMap<(u64, u64), u64>> =
-            Lazy::new(DashMap::new);
+        static SYNC_INFLIGHT: Lazy<std::sync::Mutex<Vec<(u64, u64)>>> =
+            Lazy::new(|| std::sync::Mutex::new(Vec::new()));
         static SYNC_CONCURRENCY: Lazy<tokio::sync::Semaphore> =
             Lazy::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_SYNC_BLOCKS));
 
-        let now_s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Lazy prune: drop entries older than the cooldown window so the
-        // table stays bounded under sustained activity.
-        SYNC_RANGE_LAST_FIRE.retain(|_, last| {
-            now_s.saturating_sub(*last) <= SYNC_RANGE_COOLDOWN_SECS.saturating_mul(4)
-        });
-
-        // Range-cooldown gate (ATOMIC: single-key DashMap entry holds the
-        // per-key lock across the read+write, so concurrent callers see a
-        // consistent "first one wins" semantics without a TOCTOU race).
-        let key = (from_height, to_height);
-        let suppress = {
-            let mut entry = SYNC_RANGE_LAST_FIRE.entry(key).or_insert(0u64);
-            let last = *entry;
-            if last != 0 && now_s.saturating_sub(last) < SYNC_RANGE_COOLDOWN_SECS {
-                // Still within cooldown — leave `last` untouched so the
-                // window measures from the first successful dispatch.
-                Some(now_s.saturating_sub(last))
-            } else {
-                *entry = now_s;
-                None
-            }
+        let applied = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
+        let (req_from, req_to) = if from_height == 0 && to_height == 0 {
+            (applied.saturating_add(1), applied.saturating_add(SYNC_WINDOW))
+        } else {
+            (from_height, to_height)
         };
-        if let Some(age_s) = suppress {
-            if crate::node::is_debug() {
-                println!(
-                    "[DBG][SYNC] coalesced from={} to={} age_s={}",
-                    from_height, to_height, age_s,
-                );
-            }
+        // Backpressure clamp to the apply-frontier window.
+        let lo = req_from.max(applied.saturating_add(1));
+        let hi = req_to.min(applied.saturating_add(SYNC_WINDOW));
+        if lo > hi {
+            // Already applied, or beyond the window the pipeline can absorb.
             return Ok(());
         }
 
-        // Concurrency permit — bounded fan-out across all call sites.
+        // Overlap-dedup + register (short sync critical section, no await).
+        {
+            let mut inflight = match SYNC_INFLIGHT.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(), // poisoned: recover, never block sync
+            };
+            if inflight.iter().any(|&(a, b)| !(hi < a || lo > b)) {
+                if crate::node::is_debug() {
+                    println!("[DBG][SYNC] coalesced lo={} hi={} reason=overlaps_inflight", lo, hi);
+                }
+                return Ok(());
+            }
+            inflight.push((lo, hi));
+        }
+        // Guarantees the in-flight entry is removed on EVERY exit path.
+        struct InflightGuard(u64, u64);
+        impl Drop for InflightGuard {
+            fn drop(&mut self) {
+                if let Ok(mut v) = SYNC_INFLIGHT.lock() {
+                    v.retain(|&(a, b)| !(a == self.0 && b == self.1));
+                }
+            }
+        }
+        let _ig = InflightGuard(lo, hi);
+
         let _permit = match SYNC_CONCURRENCY.acquire().await {
             Ok(p) => p,
-            Err(_) => {
-                // Semaphore closed — only happens at runtime shutdown.
-                return Err("sync_blocks_semaphore_closed".to_string());
-            }
+            Err(_) => return Err("sync_blocks_semaphore_closed".to_string()),
         };
 
-        // v14.8: Top-level hard timeout. Internal per-peer timeouts already
-        // bound each attempt (≤5s × 8 peers ≈ 40s), but a hard overall cap
-        // is our defence-in-depth against a stuck inner loop (e.g. a
-        // pathological tokio scheduling case or an unexpected await).
-        const SYNC_BLOCKS_HARD_TIMEOUT_SECS: u64 = 45;
         match tokio::time::timeout(
             std::time::Duration::from_secs(SYNC_BLOCKS_HARD_TIMEOUT_SECS),
-            self.sync_blocks_inner(from_height, to_height),
+            self.sync_blocks_inner(lo, hi),
         ).await {
             Ok(res) => res,
             Err(_) => {
                 if crate::node::is_warn() {
-                    println!("[WARN][SYNC] hard_timeout from={} to={} after={}s",
-                             from_height, to_height, SYNC_BLOCKS_HARD_TIMEOUT_SECS);
+                    println!("[WARN][SYNC] hard_timeout lo={} hi={} after={}s",
+                             lo, hi, SYNC_BLOCKS_HARD_TIMEOUT_SECS);
                 }
                 Err(format!("sync_blocks_hard_timeout {}s", SYNC_BLOCKS_HARD_TIMEOUT_SECS))
             }
@@ -25599,20 +25639,50 @@ impl SimplifiedP2P {
             return None;
         }
         let storage = crate::node::try_get_storage()?;
-        let mb_data = match storage.get_macroblock_by_height(required_macroblock) {
-            Ok(Some(d)) => d,
-            _ => return None,
-        };
-        let macroblock = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data).ok()?;
-        let snapshot_data = macroblock.consensus_data.eligible_producers.as_ref()?;
-        let producers =
-            bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data).ok()?;
-        let set: std::collections::HashSet<String> = producers
-            .into_iter()
-            .map(|p| p.node_id)
-            .filter(|id| !id.is_empty())
-            .collect();
-        if set.is_empty() { None } else { Some(set) }
+        // P1.5 self-healing: the committee is the eligible_producers snapshot
+        // of macroblock N-2. If N-2 is absent (a transient finality gap), do
+        // NOT collapse to empty/p2p-fallback (that diverges per-node and is
+        // unrecoverable). Deterministically walk back to the most recent
+        // AVAILABLE finalized snapshot ≤ N-2. Macroblocks below the gap are
+        // 2f+1-finalized and universally present; the eligible set is sticky
+        // across a few epochs, so honest nodes converge on the same set and
+        // the gap stays recoverable. Bounded depth — a deeper outage needs
+        // snapshot/restart, not a divergent local guess.
+        const MAX_FALLBACK_DEPTH: u64 = 8;
+        let floor = required_macroblock.saturating_sub(MAX_FALLBACK_DEPTH).max(1);
+        let mut idx = required_macroblock;
+        while idx >= floor {
+            if let Ok(Some(mb_data)) = storage.get_macroblock_by_height(idx) {
+                if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
+                    // Identical predicate as try_load_macroblock_beacon:
+                    // a REAL finalized macroblock (eligible_producers non-empty
+                    // AND beacon present) → committee+beacon land on the SAME
+                    // macroblock, leader selection stays consistent.
+                    if mb.consensus_data.randomness_beacon.is_none() { idx = idx.saturating_sub(1); continue; }
+                    if let Some(snap) = mb.consensus_data.eligible_producers.as_ref() {
+                        if let Ok(producers) =
+                            bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snap)
+                        {
+                            let set: std::collections::HashSet<String> = producers
+                                .into_iter()
+                                .map(|p| p.node_id)
+                                .filter(|id| !id.is_empty())
+                                .collect();
+                            if !set.is_empty() {
+                                if idx != required_macroblock && crate::node::is_warn() {
+                                    println!("[WARN][BFT] committee_fallback used_mb={} wanted_mb={} depth={} reason=n2_absent_self_heal",
+                                             idx, required_macroblock, required_macroblock - idx);
+                                }
+                                return Some(set);
+                            }
+                        }
+                    }
+                }
+            }
+            if idx == floor { break; }
+            idx -= 1;
+        }
+        None
     }
 
     /// Count unique alive peers by node_id, excluding self and stale entries.

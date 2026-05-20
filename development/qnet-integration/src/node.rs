@@ -4088,51 +4088,49 @@ impl BlockchainNode {
             return Some([0u8; 32]);
         }
         let n_minus_2 = macroblock_index - 2;
-        match storage.get_macroblock_by_height(n_minus_2) {
-            Ok(Some(data)) => match bincode::deserialize::<qnet_state::MacroBlock>(&data) {
-                Ok(mb) => {
-                    match mb.consensus_data.randomness_beacon {
-                        Some(b) => Some(b),
-                        None => {
-                            if crate::node::is_warn() {
-                                println!(
-                                    "[WARN][VRF] seed_beacon_absent mb={} — macroblock present but randomness_beacon=None",
-                                    n_minus_2,
-                                );
+        // P1.5 self-healing: strict N-2 froze finality irreversibly when N-2
+        // was absent (and every later epoch's N-2 in turn). Walk back to the
+        // most recent REAL finalized macroblock ≤ N-2 — IDENTICAL predicate
+        // and depth as the committee fallback (non-empty eligible_producers
+        // AND randomness_beacon present), so beacon + committee always come
+        // from the SAME macroblock → leader selection stays consistent
+        // network-wide. Bounded depth; deeper gap → None (abstain, needs sync).
+        const MAX_FALLBACK_DEPTH: u64 = 8;
+        let floor = n_minus_2.saturating_sub(MAX_FALLBACK_DEPTH).max(1);
+        let mut idx = n_minus_2;
+        loop {
+            match storage.get_macroblock_by_height(idx) {
+                Ok(Some(data)) => {
+                    if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&data) {
+                        let has_set = mb.consensus_data.eligible_producers.as_ref()
+                            .and_then(|s| bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(s).ok())
+                            .map(|v| v.iter().any(|p| !p.node_id.is_empty()))
+                            .unwrap_or(false);
+                        if has_set {
+                            if let Some(b) = mb.consensus_data.randomness_beacon {
+                                if idx != n_minus_2 && crate::node::is_warn() {
+                                    println!("[WARN][VRF] beacon_fallback used_mb={} wanted_mb={} depth={} reason=n2_absent_self_heal",
+                                             idx, n_minus_2, n_minus_2 - idx);
+                                }
+                                return Some(b);
                             }
-                            None
                         }
                     }
                 }
+                Ok(None) => {}
                 Err(e) => {
                     if crate::node::is_warn() {
-                        println!(
-                            "[WARN][VRF] seed_deserialize_failed mb={} err={}",
-                            n_minus_2, e,
-                        );
+                        println!("[WARN][VRF] seed_storage_error mb={} err={}", idx, e);
                     }
-                    None
                 }
-            },
-            Ok(None) => {
-                if crate::node::is_warn() {
-                    println!(
-                        "[WARN][VRF] seed_missing_local mb={} — node is behind the chain, trigger sync",
-                        n_minus_2,
-                    );
-                }
-                None
             }
-            Err(e) => {
-                if crate::node::is_warn() {
-                    println!(
-                        "[WARN][VRF] seed_storage_error mb={} err={}",
-                        n_minus_2, e,
-                    );
-                }
-                None
-            }
+            if idx <= floor { break; }
+            idx -= 1;
         }
+        if crate::node::is_warn() {
+            println!("[WARN][VRF] seed_missing_local n2={} depth={} — node behind, trigger sync", n_minus_2, MAX_FALLBACK_DEPTH);
+        }
+        None
     }
 
     fn select_consensus_committee(
@@ -8156,7 +8154,11 @@ impl BlockchainNode {
         let (macroblock_sync_tx, mut macroblock_sync_rx) = tokio::sync::mpsc::channel::<(u64, u64, String)>(1_000);
 
         // PRODUCTION v2.19.22: Create QUIC message channel for full message processing
+        // QoS: consensus/high-priority lane.
         let (quic_message_tx, mut quic_message_rx) = tokio::sync::mpsc::channel::<(String, crate::unified_p2p::NetworkMessage)>(10_000);
+        // QoS bulk lane: bounded smaller (droppable) so a cold-sync flood is
+        // shed at ingress instead of starving consensus. Drained by its own task.
+        let (quic_bulk_tx, mut quic_bulk_rx) = tokio::sync::mpsc::channel::<(String, crate::unified_p2p::NetworkMessage)>(2_000);
 
         // PRODUCTION v2.19.25: Create transaction processing channel
         let (transaction_tx, mut transaction_rx) = tokio::sync::mpsc::channel::<crate::unified_p2p::ReceivedTransaction>(50_000);
@@ -8185,6 +8187,7 @@ impl BlockchainNode {
         
         // PRODUCTION v2.19.22: Set QUIC message channel for full message processing
         unified_p2p_instance.set_quic_message_channel(quic_message_tx);
+        unified_p2p_instance.set_quic_bulk_channel(quic_bulk_tx);
         
         // PRODUCTION v2.19.25: Set transaction channel for mempool integration
         unified_p2p_instance.set_transaction_channel(transaction_tx);
@@ -9473,7 +9476,51 @@ impl BlockchainNode {
                 }
             }
         });
-        
+
+        // QoS bulk-lane worker — fully isolated from the consensus consumer.
+        // Drains the bounded bulk channel; bounded-concurrency spawn_blocking
+        // per message so heavy serve/decode never contends for consensus
+        // cores. Lane drop counter is log-governed here (one summary / 30s)
+        // so a flood does not spam logs. This task carries the entire
+        // cold-sync serving cost; a flooding peer can saturate ONLY this
+        // lane, never the chain.
+        let blockchain_for_bulk = blockchain.clone();
+        tokio::spawn(async move {
+            const BULK_SERVE_CONCURRENCY: usize = 8;
+            let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(BULK_SERVE_CONCURRENCY));
+            let mut last_drop_log = std::time::Instant::now();
+            let mut last_dropped: u64 = 0;
+            while let Some((from_peer, message)) = quic_bulk_rx.recv().await {
+                if last_drop_log.elapsed().as_secs() >= 30 {
+                    let d = crate::unified_p2p::BULK_LANE_DROPPED
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if d > last_dropped && is_warn() {
+                        println!("[WARN][QUIC] bulk_lane_shed total={} delta={} window=30s reason=lane_full_dos_bound",
+                                 d, d - last_dropped);
+                    }
+                    last_dropped = d;
+                    last_drop_log = std::time::Instant::now();
+                }
+                if let Some(ref p2p) = blockchain_for_bulk.unified_p2p {
+                    let permit = match permits.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            // All serve slots busy → shed (bounded serving is
+                            // the fairness guarantee; client re-requests).
+                            crate::unified_p2p::BULK_LANE_DROPPED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+                    let p2p_clone = p2p.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        p2p_clone.handle_message(&from_peer, message);
+                    });
+                }
+            }
+        });
+
         // PRODUCTION v2.19.25: Start transaction receiver handler
         // Processes transactions received from P2P network and adds to mempool
         let blockchain_for_transactions = blockchain.clone();
@@ -24340,11 +24387,57 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         });
                     }
                     
+                    // P1.5 self-healing: N-2 absent must NOT collapse the
+                    // participant set to empty (that froze finality
+                    // irreversibly — a missing macroblock made every later
+                    // epoch's N-2 missing too). Deterministically walk back to
+                    // the most recent AVAILABLE finalized eligible_producers
+                    // snapshot ≤ N-2 (same rule/depth as
+                    // deterministic_eligible_ids → numerator==denominator
+                    // preserved). Macroblocks below the gap are 2f+1-finalized
+                    // and universally present; the set is sticky → honest
+                    // nodes converge and the gap is recoverable. Background
+                    // N-2 fetch (above) still runs to restore the exact set.
+                    const MAX_FALLBACK_DEPTH: u64 = 8;
+                    let fb_floor = required_macroblock.saturating_sub(MAX_FALLBACK_DEPTH).max(1);
+                    let mut fb_idx = required_macroblock;
+                    loop {
+                        if let Ok(Some(fb_data)) = storage.get_macroblock_by_height(fb_idx) {
+                            if let Ok(fb_mb) = bincode::deserialize::<qnet_state::MacroBlock>(&fb_data) {
+                                // Identical predicate as try_load_macroblock_beacon /
+                                // deterministic_eligible_ids: real finalized macroblock
+                                // (beacon present) → committee+beacon same macroblock.
+                                if fb_mb.consensus_data.randomness_beacon.is_none() {
+                                    if fb_idx <= fb_floor { break; }
+                                    fb_idx -= 1;
+                                    continue;
+                                }
+                                if let Some(ref snap) = fb_mb.consensus_data.eligible_producers {
+                                    if let Ok(prods) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snap) {
+                                        let mut fb: Vec<(String, f64)> = prods.iter()
+                                            .filter(|p| !crate::unified_p2p::is_validator_ejected(&p.node_id))
+                                            .map(|p| (p.node_id.clone(), p.reputation))
+                                            .collect();
+                                        if !fb.is_empty() {
+                                            fb.sort_by(|a, b| a.0.cmp(&b.0));
+                                            if fb_idx != required_macroblock {
+                                                println!("[WARN][CAND] committee_fallback used_mb={} wanted_mb={} depth={} reason=n2_absent_self_heal participants={}",
+                                                         fb_idx, required_macroblock, required_macroblock - fb_idx, fb.len());
+                                            }
+                                            return fb;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if fb_idx <= fb_floor { break; }
+                        fb_idx -= 1;
+                    }
                     return Vec::new();
                 }
                 Err(e) => {
                     // v2.47: Storage error = node is broken, cannot participate
-                    eprintln!("[ERR][CAND] mb={} storage_err={} - node MUST SYNC!", 
+                    eprintln!("[ERR][CAND] mb={} storage_err={} - node MUST SYNC!",
                              required_macroblock, e);
                     
                     // Return EMPTY - node with storage errors must not participate!
@@ -31123,8 +31216,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Ok(());
         }
 
-        if is_info() {
-            println!("[INFO][SYNC] request from={} addr={} heights={}-{}", requester_id, from_peer_addr, from_height, to_height);
+        if is_debug() {
+            println!("[DBG][SYNC] serve_request from={} addr={} heights={}-{}", requester_id, from_peer_addr, from_height, to_height);
         }
 
         // Get microblocks from storage (already in network format)
@@ -31135,7 +31228,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         if blocks_data.is_empty() {
-            if is_info() { println!("[INFO][SYNC] empty_range heights={}-{} sending_empty_batch", from_height, to_height); }
+            if is_debug() { println!("[DBG][SYNC] empty_range heights={}-{} sending_empty_batch", from_height, to_height); }
             // v6.5 FIX: ALWAYS send a response, even for empty ranges
             // PROBLEM: Silent return Ok(()) caused requesting node to timeout after 2s
             //   with "3 peers did not respond for h=0-0" — infinite retry loop
@@ -31281,9 +31374,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let small_blocks_count = small_blocks.len();
             let large_blocks_count = total_blocks - small_blocks_count;
             
-            if is_info() { 
-                println!("[INFO][SYNC] sending blocks={} (small={} large={}) size={}KB batches={} to={}", 
-                         total_blocks, small_blocks_count, large_blocks_count, 
+            if is_debug() {
+                println!("[DBG][SYNC] sending blocks={} (small={} large={}) size={}KB batches={} to={}",
+                         total_blocks, small_blocks_count, large_blocks_count,
                          total_size / 1024, num_batches, requester_id); 
             }
             
