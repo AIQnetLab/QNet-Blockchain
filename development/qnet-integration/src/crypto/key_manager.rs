@@ -283,39 +283,22 @@ impl DilithiumKeyManager {
             return Ok((pk, sk));
         }
 
-        // First initialization for this path. Either load from disk or generate new.
-        let key_path = self.key_dir.join("dilithium_keypair.bin");
-        let (pk, sk) = if key_path.exists() {
-            // CRITICAL: If file exists, it MUST be loaded successfully.
-            // Generating new keys would cause node identity loss.
-            println!("[INFO][KEY] loading_persisted_keypair node={} path={:?}", self.node_id, key_path);
-            self.load_keypair_from_disk(&key_path)?
-        } else {
-            // Generate new keypair ONCE and persist it. Subsequent restarts load it.
-            println!("[INFO][KEY] generating_new_mldsa65_keypair node={} (one-time, no disk file)", self.node_id);
-            let (new_pk, new_sk) = dilithium3::keypair();
-            self.save_keypair_to_disk(&new_pk, &new_sk, &key_path)?;
-            println!("[INFO][KEY] keypair_persisted node={} path={:?}", self.node_id, key_path);
-            (new_pk, new_sk)
-        };
-
-        // Atomic insert into the process-wide cache. After this point, all other
-        // DilithiumKeyManager instances for this path will hit the fast path.
-        let arc_kp = Arc::new((pk.clone(), sk.clone()));
-        keypair_cache().insert(cache_key, arc_kp);
-
-        // Mirror into local view for backward-compatible Drop bookkeeping.
-        {
-            let mut local = self.cached_keypair.write();
-            *local = Some((pk.clone(), sk.clone()));
-        }
-
-        if crate::node::is_info() {
-            let pk_hash = hex::encode(&Sha3_256::digest(PublicKeyTrait::as_bytes(&pk))[..8]);
-            println!("[INFO][KEY] keypair_ready node={} pk_hash={}", self.node_id, pk_hash);
-        }
-
-        Ok((pk, sk))
+        // v29 IDENTITY HARDENING — fail-closed. The legacy disk-load /
+        // random-keygen path here was the pk_mismatch root cause: peers had
+        // the mnemonic-derived PK registered while this node sometimes
+        // signed with a random keypair generated on cache miss. Identity is
+        // now mnemonic-derived ONLY (HOLE 1, fips204 deterministic),
+        // installed once via get_keypair_from_mnemonic from
+        // initialize_wallet_identity and lives in keypair_cache(). A cache
+        // miss here means the canonical install has not happened yet —
+        // refusing to sign is the correct top-L1 behaviour (signing with
+        // the wrong key would silently fork identity for every super node).
+        let _ = cache_key; // declared above for the fast-path lookup
+        Err(anyhow!(
+            "identity_not_installed node={} — get_keypair_from_mnemonic must be \
+             called via initialize_wallet_identity before any signing",
+            self.node_id
+        ))
     }
     
     /// v27 HOLE1: deterministic ML-DSA-65 keypair from the wallet mnemonic
@@ -621,6 +604,7 @@ impl DilithiumKeyManager {
     
     /// Save keypair to disk (encrypted with file-based secret)
     /// SECURITY: Uses random encryption key, NOT derived from public node_id
+    #[allow(dead_code)] // v29: kept for tooling; not used in identity flow (mnemonic-only)
     fn save_keypair_to_disk(&self, pk: &dilithium3::PublicKey, sk: &dilithium3::SecretKey, path: &Path) -> Result<()> {
         use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce, Key};
         
@@ -672,6 +656,7 @@ impl DilithiumKeyManager {
     
     /// Load keypair from disk (decrypt with file-based secret)
     /// SECURITY: Uses random encryption key from file, NOT derived from public node_id
+    #[allow(dead_code)] // v29: kept for tooling; not used in identity flow (mnemonic-only)
     fn load_keypair_from_disk(&self, path: &Path) -> Result<(dilithium3::PublicKey, dilithium3::SecretKey)> {
         use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce, Key};
         
@@ -910,6 +895,10 @@ mod tests {
     /// IDENTICAL keypair. Before v15.14 each manager held its own cache and
     /// raced on first-time keygen, producing two different random keypairs
     /// and a split-brain identity.
+    /// v29: BIP39 test vector mnemonic (valid checksum, deterministic derivation).
+    const TEST_MNEMONIC_A: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const TEST_MNEMONIC_B: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
     #[test]
     fn test_singleton_same_dir_returns_same_keypair() {
         let temp = tempdir().expect("tempdir");
@@ -920,6 +909,8 @@ mod tests {
         let m2 = DilithiumKeyManager::new("node_beta".to_string(), &key_dir)
             .expect("m2 new");
 
+        // v29: identity install (canonical mnemonic path) populates the cache.
+        let _ = m1.get_keypair_from_mnemonic(TEST_MNEMONIC_A).expect("m1 install");
         let (pk1, sk1) = m1.get_keypair().expect("m1 keypair");
         let (pk2, sk2) = m2.get_keypair().expect("m2 keypair");
 
@@ -957,16 +948,13 @@ mod tests {
         let key_dir = temp.path().join("keys_concurrent_b");
         fs::create_dir_all(&key_dir).expect("mkdir");
 
-        // Pre-warm CACHED_KEY_DIR so all threads observe the SAME final
-        // key_dir. This mirrors production where `ensure_writable_directory`
-        // runs once at startup before any concurrent signing path engages.
-        // Without this warm-up the candidate-search slow path is entered
-        // concurrently — `ensure_writable_directory`'s SEARCH_LOCK serialises
-        // it, but the warm-up is the canonical production sequence and
-        // represents the most realistic test of get_keypair() race fix.
-        let _warm = DilithiumKeyManager::new("warmer".to_string(), &key_dir)
+        // Pre-warm CACHED_KEY_DIR + install canonical mnemonic identity so
+        // the global keypair_cache has the (pk,sk) populated by the v29
+        // canonical path before threads race on get_keypair().
+        let warmer = DilithiumKeyManager::new("warmer".to_string(), &key_dir)
             .expect("warmer new");
-        drop(_warm);
+        let _ = warmer.get_keypair_from_mnemonic(TEST_MNEMONIC_A).expect("warmer install");
+        drop(warmer);
 
         let thread_count = 16usize;
         // Barrier: release all threads at the same instant so the first
@@ -1014,8 +1002,9 @@ mod tests {
         let key_dir = temp.path().join("keys_canon_c");
         fs::create_dir_all(&key_dir).expect("mkdir");
 
-        // Path 1: as given.
+        // Path 1: as given. v29: canonical mnemonic install populates cache.
         let m1 = DilithiumKeyManager::new("n1".to_string(), &key_dir).expect("m1");
+        let _ = m1.get_keypair_from_mnemonic(TEST_MNEMONIC_A).expect("m1 install");
         let (pk1, _) = m1.get_keypair().expect("kp1");
 
         // Path 2: same directory but accessed via PathBuf round-trip
@@ -1060,6 +1049,9 @@ mod tests {
             node_id: "node_dist_b".to_string(),
         };
 
+        // v29: distinct mnemonics → distinct deterministic keypairs.
+        let _ = m_a.get_keypair_from_mnemonic(TEST_MNEMONIC_A).expect("a install");
+        let _ = m_b.get_keypair_from_mnemonic(TEST_MNEMONIC_B).expect("b install");
         let (pk_a, _) = m_a.get_keypair().expect("kp a");
         let (pk_b, _) = m_b.get_keypair().expect("kp b");
 

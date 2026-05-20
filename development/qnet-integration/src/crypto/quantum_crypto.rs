@@ -1386,6 +1386,22 @@ mod tests {
         let node_id = "test_node_001";
         let message = "heartbeat:test_node_001:1234567890:100:0";
 
+        // v29 IDENTITY HARDENING: install canonical mnemonic-derived identity
+        // before signing. Mirrors the production path create_consensus_signature
+        // uses (QNET_STORAGE_PATH/keys, default /app/data/keys via the same
+        // ensure_writable_directory chain → same canonical cache key).
+        {
+            use crate::key_manager::DilithiumKeyManager;
+            let storage_path = std::env::var("QNET_STORAGE_PATH")
+                .unwrap_or_else(|_| "/app/data".to_string());
+            let key_dir = std::path::Path::new(&storage_path).join("keys");
+            let installer = DilithiumKeyManager::new(node_id.to_string(), &key_dir)
+                .expect("v29 installer DKM");
+            let _ = installer.get_keypair_from_mnemonic(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+            ).expect("v29 identity install");
+        }
+
         let sign_result = crypto.create_consensus_signature(node_id, message).await;
         assert!(sign_result.is_ok(), "Signature creation failed: {:?}", sign_result.err());
 
