@@ -180,9 +180,158 @@ const MAX_CONNECTIONS_PER_IP_UNKNOWN: u32 = 10;
 
 /// v9.3: Check if IP belongs to a genesis node (compile-time known validators).
 fn is_genesis_ip(ip: &std::net::IpAddr) -> bool {
-    let ip_str = ip.to_string();
+    let ip_str = canonical_ip_str(ip);
     crate::genesis_constants::GENESIS_NODE_IPS.iter()
         .any(|(genesis_ip, _)| *genesis_ip == ip_str)
+}
+
+/// v30.B1: render `IpAddr` as the canonical dotted/colon string used by the
+/// pinned tables (IPv4-mapped IPv6 collapsed to IPv4). Without this an
+/// IPv4-mapped form (`::ffff:1.2.3.4`) would never match the IPv4 string in
+/// `GENESIS_NODE_IPS` and a legitimate IPv4 peer arriving over an IPv6
+/// socket would be falsely rejected by the IP-identity gate.
+#[inline]
+fn canonical_ip_str(ip: &std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => v6.to_string(),
+        },
+    }
+}
+
+// ============================================================================
+// v30.B1/B2: cost-asymmetric DoS killer — early IP-identity gate + per-IP
+// failed-handshake token bucket.
+//
+// Attack model: attacker sends ~100-byte UDP datagrams to the QUIC accept
+// port; victim pays TLS state + ~3.3 KB Dilithium parse + ML-DSA-65 verify
+// per attempt. Without this gate a 5-6 pkt/s flood from a single IP costs
+// the receiver tens of thousands of Dilithium verifies per hour. With it
+// the attacker is refused before TLS handshake completes; CPU cost on the
+// receiver collapses to a single DashMap lookup + counter bump.
+//
+// Two independent layers:
+//   B1 (IP-identity gate): once the wire handshake is deserialised, the
+//       claimed node_id is checked against either the pinned genesis IP
+//       table OR the registered endpoint registry. Mismatch is conclusive
+//       impersonation evidence — drop without paying for Dilithium verify.
+//   B2 (per-IP fail bucket): every failed handshake from a non-genesis IP
+//       increments a sliding-window counter; on threshold breach the IP is
+//       refused at accept time for a cooldown period. Genesis IPs are
+//       NEVER banned (consensus path is privileged).
+//
+// Scalability: DashMap is sharded → O(1) under contention; ban entries are
+// ~40 bytes; even with a million unique attacker IPs total RAM stays under
+// 50 MB. Cleanup is implicit: window rollover + cooldown expiry are checked
+// inline, so stale entries clear themselves on next touch.
+// ============================================================================
+
+const HANDSHAKE_FAIL_WINDOW_SECS: u64 = 60;
+const HANDSHAKE_FAIL_THRESHOLD: u64 = 20;
+const HANDSHAKE_FAIL_BAN_SECS: u64 = 600;
+
+struct HandshakeFailState {
+    fail_count: AtomicU64,
+    window_start_secs: AtomicU64,
+    banned_until_secs: AtomicU64,
+}
+
+impl Default for HandshakeFailState {
+    fn default() -> Self {
+        Self {
+            fail_count: AtomicU64::new(0),
+            window_start_secs: AtomicU64::new(0),
+            banned_until_secs: AtomicU64::new(0),
+        }
+    }
+}
+
+static HANDSHAKE_FAIL_TRACKER: once_cell::sync::Lazy<
+    DashMap<std::net::IpAddr, HandshakeFailState>
+> = once_cell::sync::Lazy::new(DashMap::new);
+
+#[inline]
+fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// True if `ip` is in active cooldown — caller refuses the connection
+/// before any TLS state is allocated. Genesis IPs always return false.
+fn is_handshake_ip_banned(ip: std::net::IpAddr) -> bool {
+    if is_genesis_ip(&ip) {
+        return false;
+    }
+    HANDSHAKE_FAIL_TRACKER
+        .get(&ip)
+        .map(|s| s.banned_until_secs.load(Ordering::Relaxed) > unix_secs_now())
+        .unwrap_or(false)
+}
+
+/// Record one failed handshake from `ip`. Window rollover and cooldown
+/// promotion happen inline. Genesis IPs are exempt.
+fn record_handshake_fail(ip: std::net::IpAddr) {
+    if is_genesis_ip(&ip) {
+        return;
+    }
+    let now = unix_secs_now();
+    let entry = HANDSHAKE_FAIL_TRACKER.entry(ip).or_default();
+    let window_start = entry.window_start_secs.load(Ordering::Relaxed);
+    if window_start == 0 || now.saturating_sub(window_start) > HANDSHAKE_FAIL_WINDOW_SECS {
+        entry.window_start_secs.store(now, Ordering::Relaxed);
+        entry.fail_count.store(1, Ordering::Relaxed);
+        return;
+    }
+    let new_count = entry.fail_count.fetch_add(1, Ordering::Relaxed) + 1;
+    if new_count >= HANDSHAKE_FAIL_THRESHOLD
+        && entry.banned_until_secs.load(Ordering::Relaxed) <= now
+    {
+        entry.banned_until_secs.store(now + HANDSHAKE_FAIL_BAN_SECS, Ordering::Relaxed);
+        if crate::node::is_warn() {
+            println!(
+                "[WARN][QUIC] ip_fail_ban ip={} fails={} window={}s cooldown={}s",
+                ip, new_count, HANDSHAKE_FAIL_WINDOW_SECS, HANDSHAKE_FAIL_BAN_SECS
+            );
+        }
+    }
+}
+
+/// Clear fail counter on a confirmed-successful handshake — promotes the
+/// IP back to clean state and removes any residual ban.
+fn clear_handshake_fail(ip: std::net::IpAddr) {
+    HANDSHAKE_FAIL_TRACKER.remove(&ip);
+}
+
+/// v30.B1: bind claimed node_id to allowed source IP. Returns true if the
+/// gate permits the connection to proceed to Dilithium verification.
+///
+///   * `genesis_node_NNN` MUST originate from its pinned IPv4 in
+///     `GENESIS_NODE_IPS` — the 5-entry table is the singular source of
+///     truth; any other source is impersonation.
+///   * Super-node identity present in `NODE_ENDPOINT_REGISTRY` MUST match
+///     the registered endpoint IP — populated by chain-authenticated
+///     NodeRegistration TX during block apply (O(1) DashMap).
+///   * Unbound identity (no registry record yet) is admitted: this is the
+///     first-contact / TOFV window where the peer is about to register via
+///     a signed VrfKeyAnnounce or NodeRegistration TX. The cryptographic
+///     floor (verify_handshake_proof) still gates everything they assert.
+fn ip_identity_gate(claimed_node_id: &str, peer_ip: std::net::IpAddr) -> bool {
+    let peer_ip_str = canonical_ip_str(&peer_ip);
+    if claimed_node_id.starts_with("genesis_node_") {
+        match crate::genesis_constants::genesis_ip_for_node_id(claimed_node_id) {
+            Some(expected) => expected == peer_ip_str,
+            None => false,
+        }
+    } else {
+        match crate::genesis_constants::get_node_endpoint_ip(claimed_node_id) {
+            Some(expected) => expected == peer_ip_str,
+            None => true,
+        }
+    }
 }
 
 /// v9.2: TOFU pin lifetime (24 hours). After this, the pin expires and re-pins
@@ -890,6 +1039,19 @@ impl QuicTransport {
                 
                 let peer_addr = incoming.remote_address();
 
+                // v30.B2: per-source-IP failed-handshake ban — refuse pre-TLS
+                // for IPs that crossed the fail threshold within the rolling
+                // window. Reclaims the TLS state + Dilithium parse cost an
+                // attacker would otherwise extract per packet. Genesis IPs
+                // are never banned by design (consensus must stay reachable).
+                if is_handshake_ip_banned(peer_addr.ip()) {
+                    incoming.refuse();
+                    if crate::node::is_debug() {
+                        println!("[DBG][QUIC] pre_tls_ip_banned ip={}", peer_addr.ip());
+                    }
+                    continue;
+                }
+
                 // FIX R23-P5: Global connection limit check BEFORE TLS handshake.
                 // Previously only checked post-handshake (line ~910), wasting TLS CPU.
                 const MAX_TOTAL_CONNECTIONS: usize = 500;
@@ -966,6 +1128,7 @@ impl QuicTransport {
                             Ok(Ok(connection)) => {
                                 let hs = Self::handle_server_handshake(
                                     &connection,
+                                    peer_addr,
                                     &node_id_clone,
                                     &cert_serial_clone,
                                     &node_type_clone
@@ -1131,34 +1294,54 @@ impl QuicTransport {
     /// v2.24: Added timeout to prevent hanging connections
     /// v9.7: Returns (node_id, cert_serial, node_type, block_height) — height enables
     /// immediate BEST_PEER_HEIGHT update instead of waiting 15s for first HealthPing.
+    /// v30.B1: `peer_addr` is now part of the signature — the early IP-identity
+    /// gate binds the claimed `node_id` to its registered source IP and rejects
+    /// impersonation before paying for the Dilithium verify (~3.3 KB parse +
+    /// ML-DSA-65 math). Any Err exit increments the per-IP fail counter so
+    /// repeat offenders trip the pre-TLS ban at the accept loop.
     async fn handle_server_handshake(
         conn: &Connection,
+        peer_addr: SocketAddr,
         our_node_id: &str,
         our_cert_serial: &str,
         our_node_type: &str,
     ) -> Result<(String, String, String, u64), String> {
         // v2.24: Timeout for entire handshake (prevents "aborted by peer" errors)
         let handshake_timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
-        
-        tokio::time::timeout(handshake_timeout, async {
+
+        let result = tokio::time::timeout(handshake_timeout, async {
             // Accept bidirectional stream for handshake
             let (mut send, mut recv) = conn.accept_bi().await
                 .map_err(|e| format!("Accept stream failed: {}", e))?;
-            
+
             // Receive peer's handshake
             let mut len_buf = [0u8; 4];
             recv.read_exact(&mut len_buf).await.map_err(|e| format!("Read len failed: {}", e))?;
             let len = u32::from_be_bytes(len_buf) as usize;
-            
+
             if len > MAX_MESSAGE_SIZE {
                 return Err(format!("Handshake too large: {}", len));
             }
-            
+
             let mut data = vec![0u8; len];
             recv.read_exact(&mut data).await.map_err(|e| format!("Read data failed: {}", e))?;
-            
+
             // v9.7: Backward-compatible deserialization (supports pre-v9.7 nodes)
             let peer_handshake = deserialize_handshake(&data)?;
+
+            // v30.B1: early IP-identity gate. Reject impersonation BEFORE
+            // the ~ms Dilithium verify pass. Genesis identity from a non-
+            // pinned IP and registered super-node identity from a different
+            // IP than its on-chain endpoint are conclusively rejected.
+            if !ip_identity_gate(&peer_handshake.node_id, peer_addr.ip()) {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][HANDSHAKE] ip_identity_gate_reject side=server node={} src_ip={} action=close",
+                        peer_handshake.node_id, peer_addr.ip()
+                    );
+                }
+                return Err("ip_identity_gate_reject".to_string());
+            }
 
             // v19: Verify peer's Dilithium identity proof BEFORE sending ours.
             // On Err the connection is aborted — we never reveal our own proof
@@ -1174,6 +1357,20 @@ impl QuicTransport {
                     if is_info() {
                         println!("[INFO][HANDSHAKE] dilithium_proof_verified side=server node={} h={}",
                                  peer_handshake.node_id, peer_handshake.block_height);
+                    }
+                    // v30.A3: Dilithium-verified handshake binds (node_id, block_height)
+                    // as an authenticated tuple — attest peer height immediately so the
+                    // sync state machine sees real network state without waiting for the
+                    // first HealthPing tick. Non-zero heights only; h=0 leaves the
+                    // attestation unset so a fresh-cluster cold start does not falsely
+                    // declare consensus on "everyone at 0".
+                    if peer_handshake.block_height > 0 {
+                        if let Some(p2p) = crate::node::try_get_p2p() {
+                            p2p.update_peer_last_seen_with_height(
+                                &peer_handshake.node_id,
+                                Some(peer_handshake.block_height),
+                            );
+                        }
                     }
                 }
                 Ok(false) => {
@@ -1239,7 +1436,26 @@ impl QuicTransport {
 
             // v9.7: Return height from handshake for immediate BEST_PEER_HEIGHT update
             Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type, peer_handshake.block_height))
-        }).await.map_err(|_| "Handshake timeout".to_string())?
+        }).await;
+
+        // v30.B2: account success/failure for the per-IP fail bucket. A
+        // verified handshake clears any residual ban; any error path (gate
+        // reject, proof reject, timeout, malformed wire) bumps the counter
+        // so a repeat offender trips the pre-TLS ban at the accept loop.
+        match result {
+            Ok(Ok(outcome)) => {
+                clear_handshake_fail(peer_addr.ip());
+                Ok(outcome)
+            }
+            Ok(Err(e)) => {
+                record_handshake_fail(peer_addr.ip());
+                Err(e)
+            }
+            Err(_) => {
+                record_handshake_fail(peer_addr.ip());
+                Err("Handshake timeout".to_string())
+            }
+        }
     }
     
     /// Handle incoming streams from a connection

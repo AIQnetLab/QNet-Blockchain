@@ -234,6 +234,73 @@ pub fn get_all_vrf_keys() -> HashMap<String, Vec<u8>> {
     VRF_PK_REGISTRY.read().clone()
 }
 
+// =========================================================================
+// v30.B1: NODE ENDPOINT REGISTRY — node_id → canonical IPv4 string.
+//
+// Closes the cost-asymmetric DoS where an attacker fires forged
+// handshake_proof at a victim's QUIC accept loop from any IP, forcing the
+// victim to pay TLS state + ~3.3 KB Dilithium parse per attempt. The early
+// IP-identity gate (in quic_transport.rs::handle_server_handshake) consults
+// this registry to refuse impersonation BEFORE the expensive verify step.
+//
+// Source of truth: signed NodeRegistration TX in chain state. Populated by
+// the block-apply path (cache_node_registrations_from_transactions_with_dashmap)
+// for super-node identities. Genesis identities resolve via the pinned
+// GENESIS_NODE_IPS table and do not go through this registry.
+//
+// Scalability: DashMap (sharded, lock-free O(1)). Sized for hundreds of
+// thousands of super-node identities; ~24 bytes overhead per entry.
+// =========================================================================
+
+use dashmap::DashMap;
+
+/// Capacity ceiling matches CONSENSUS_PK_REGISTRY (100K). Beyond this, eviction
+/// uses the LAST_ACTIVITY tracker that already governs PK registry eviction.
+const MAX_NODE_ENDPOINT_REGISTRY_SIZE: usize = 100_000;
+
+lazy_static::lazy_static! {
+    pub static ref NODE_ENDPOINT_REGISTRY: DashMap<String, String> = DashMap::new();
+}
+
+/// Strip an "ip:port" or "ip" endpoint to its IPv4/IPv6 part only.
+fn endpoint_ip_only(api_endpoint: &str) -> String {
+    // Accept "scheme://host:port" form too — strip scheme and trailing path.
+    let after_scheme = api_endpoint.split("://").nth(1).unwrap_or(api_endpoint);
+    let host_only = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // IPv6 may use [::1]:8001 form; bracket-strip and split last colon.
+    if let Some(rest) = host_only.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_string();
+        }
+    }
+    host_only.split(':').next().unwrap_or(host_only).to_string()
+}
+
+/// Register/refresh a node's canonical endpoint IP. Called on every
+/// NodeRegistration / NodeReactivation TX during block apply.
+pub fn register_node_endpoint(node_id: &str, api_endpoint: &str) {
+    let ip = endpoint_ip_only(api_endpoint);
+    if ip.is_empty() {
+        return;
+    }
+    if NODE_ENDPOINT_REGISTRY.len() >= MAX_NODE_ENDPOINT_REGISTRY_SIZE
+        && !NODE_ENDPOINT_REGISTRY.contains_key(node_id)
+    {
+        // At capacity — let LAST_ACTIVITY-driven eviction reclaim later.
+        if std::env::var("QNET_DETAILED_LOGGING").ok().as_deref() == Some("1") {
+            println!("[WARN][REG] endpoint_registry_full size={}", NODE_ENDPOINT_REGISTRY.len());
+        }
+        return;
+    }
+    NODE_ENDPOINT_REGISTRY.insert(node_id.to_string(), ip);
+}
+
+/// Lookup canonical endpoint IP for `node_id`. Returns None for unbound
+/// identities (first-contact / not-yet-registered super-nodes).
+pub fn get_node_endpoint_ip(node_id: &str) -> Option<String> {
+    NODE_ENDPOINT_REGISTRY.get(node_id).map(|e| e.value().clone())
+}
+
 // Optional genesis Dilithium anchor loader. If present, the file binds the
 // 5 genesis identities to fixed PKs via set_genesis_anchor_pks (immutable
 // once installed; any non-matching PK is rejected as a squat). Super-node

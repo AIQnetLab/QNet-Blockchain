@@ -4678,11 +4678,15 @@ impl BlockchainNode {
                         node_id.clone(),
                         (node_type.clone(), wallet_address.clone(), api_endpoint.clone())
                     );
+                    // v30.B1: mirror endpoint IP into global registry for the
+                    // QUIC accept-path IP-identity gate. Chain-authenticated
+                    // (TX is signature-validated before this code path).
+                    crate::genesis_constants::register_node_endpoint(node_id, api_endpoint);
                     // Level 2: RocksDB persistent cache (forward + reverse index)
                     if let Err(e) = storage.save_node_registration(node_id, type_str, wallet_address, INITIAL_REPUTATION) {
                         eprintln!("[WARN][REG] cache_from_block_fail node={} err={}", node_id, e);
                     } else if is_info() {
-                        println!("[INFO][REG] cached_from_produced_block node={} wallet={}...", 
+                        println!("[INFO][REG] cached_from_produced_block node={} wallet={}...",
                                  node_id, &wallet_address[..wallet_address.len().min(16)]);
                     }
 

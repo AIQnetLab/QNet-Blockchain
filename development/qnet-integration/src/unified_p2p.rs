@@ -300,6 +300,16 @@ const PENDING_SYNC_BLOCK_TTL_SECS: u64 = 300;
 // v11.0: Soft limit before cleanup triggers (80% of max)
 const SOFT_LIMIT_PENDING_SYNC_BLOCKS: usize = 1600;
 
+// v30.A3: freshness window for peer height attestation. A peer's
+// last_block_height is consulted for `network_height` ONLY if its
+// last_height_attested_at falls within this window. Attestation is set by
+// authenticated signal paths (applied block, certified shred, signed
+// HealthPing) — NEVER by empty-batch echo or gossip-relayed claims.
+// 120 s ≈ 1 macroblock (90 microblocks × 1 s slot + jitter): a peer that
+// hasn't emitted a signed height in 2 minutes is treated as height-unknown,
+// preventing stale or poisoned values from steering sync indefinitely.
+const PEER_HEIGHT_ATTEST_TTL_SECS: u64 = 120;
+
 /// v3.0: Check if block is already pending in sync queue
 pub fn is_block_pending_sync(height: u64) -> bool {
     PENDING_SYNC_BLOCKS.contains_key(&height)
@@ -1980,6 +1990,15 @@ pub struct PeerInfo {
     // Enables QUIC-only sync without HTTP height queries
     #[serde(default)]
     pub last_block_height: u64,
+
+    // v30.A3: wall-clock secs of the last height-attesting event for this peer
+    // (signed HealthPing, applied block, certified shred). Heights that were
+    // populated via empty-batch echo or unauthenticated paths leave this at 0.
+    // `get_max_peer_height` filters on freshness against this — stale or
+    // unattested entries are excluded from `network_height` consensus, which
+    // collapses the empty-batch → cache-poisoning → permanent sync-mode loop.
+    #[serde(default)]
+    pub last_height_attested_at: u64,
 
     // FIX R23-P1: Track connection direction for eclipse protection.
     // true = we initiated the connection (outbound), false = they connected to us (inbound).
@@ -4097,6 +4116,7 @@ impl SimplifiedP2P {
             successful_pings: 0,
             failed_pings: 0,
             last_block_height: 0,
+            last_height_attested_at: 0,  // v30.A3: unattested until signed event
             is_outbound: false,
         };
 
@@ -4110,20 +4130,34 @@ impl SimplifiedP2P {
         }
     }
     
-    /// CRITICAL FIX: Update peer last_seen AND optionally update their height
-    /// v5.0: Verify Dilithium3 signature on HealthPing message
-    /// Returns true only if signature is cryptographically valid
-    fn verify_health_ping_signature(from: &str, timestamp: u64, height: u64, sig_hex: &str, pk_hex: &str) -> bool {
+    /// v30.C1: identity-bound HealthPing verification. The verifying PK is
+    /// resolved from CONSENSUS_PK_REGISTRY against the claimed `from` —
+    /// NEVER from the message body. The `pk_hex` argument is retained for
+    /// wire backward-compat but is ignored on the verify path. Closes the
+    /// last identity-squat hole at the height-gossip layer: an attacker
+    /// holding any valid ML-DSA-65 keypair would otherwise sign
+    /// `QNET_HEALTH_PING_V1:genesis_node_001:<ts>:<h>` with their own SK,
+    /// attach their PK, and have a poisoned height accepted as authentic.
+    /// Now `from` must already be bound (genesis anchor or on-chain
+    /// NodeRegistration); unknown identities are rejected outright.
+    /// Scalability: O(1) DashMap lookup — caps at hundreds of thousands of
+    /// super-node identities without contention.
+    fn verify_health_ping_signature(from: &str, timestamp: u64, height: u64, sig_hex: &str, _pk_hex_ignored: &str) -> bool {
         use pqcrypto_traits::sign::{PublicKey as PqPublicKey, DetachedSignature as PqDetachedSignature};
+        let registered_pk = match qnet_consensus::consensus_crypto::get_consensus_pk(from) {
+            Some(pk) => pk,
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][HEALTH] sig_reject reason=identity_unbound from={}", from);
+                }
+                return false;
+            }
+        };
         let sig_bytes = match hex::decode(sig_hex) {
             Ok(b) => b,
             Err(_) => return false,
         };
-        let pk_bytes = match hex::decode(pk_hex) {
-            Ok(b) => b,
-            Err(_) => return false,
-        };
-        let pk = match pqcrypto_mldsa::mldsa65::PublicKey::from_bytes(&pk_bytes) {
+        let pk = match pqcrypto_mldsa::mldsa65::PublicKey::from_bytes(&registered_pk) {
             Ok(pk) => pk,
             Err(_) => return false,
         };
@@ -4177,14 +4211,16 @@ impl SimplifiedP2P {
         if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&peer_addr) {
             peer.last_seen = current_time;
             if let Some(h) = height {
-                // Direct update - height comes from Dilithium-signed heartbeat
+                // v30.A3: caller passes Some(h) ONLY from authenticated sources
+                // (applied block, certified shred, signed HealthPing, verified
+                // handshake). Attestation timestamp is set unconditionally to
+                // refresh the freshness window even when h does not exceed the
+                // current value (e.g., a steady-state peer at unchanged height
+                // is still attested by every signed HealthPing it emits).
+                peer.last_height_attested_at = current_time;
                 if h > peer.last_block_height {
                     peer.last_block_height = h;
-                    // v9.5: O(1) atomic update — avoids O(N) scan in get_best_peer_height()
                     BEST_PEER_HEIGHT.fetch_max(h, std::sync::atomic::Ordering::Relaxed);
-                    // v14.2: event-driven sync nudge — trigger desync check if we're behind.
-                    // Threshold matches sync_manager's auto_sync_gap (20). Avoids pointless nudges
-                    // for normal 1-2 block transient lag during block propagation.
                     let our_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                     if h > our_h.saturating_add(20) {
                         crate::sync_manager::nudge_sync_check();
@@ -4201,12 +4237,11 @@ impl SimplifiedP2P {
                 if stored_ip == peer_ip {
                     entry.last_seen = current_time;
                     if let Some(h) = height {
-                        // Direct update - height comes from Dilithium-signed heartbeat
+                        // v30.A3: same attestation refresh as the primary branch
+                        entry.last_height_attested_at = current_time;
                         if h > entry.last_block_height {
                             entry.last_block_height = h;
-                            // v9.5: O(1) atomic update
                             BEST_PEER_HEIGHT.fetch_max(h, std::sync::atomic::Ordering::Relaxed);
-                            // v14.2: event-driven sync nudge on peer height jump
                             let our_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                             if h > our_h.saturating_add(20) {
                                 crate::sync_manager::nudge_sync_check();
@@ -4393,16 +4428,17 @@ impl SimplifiedP2P {
             if let Some(existing_addr_entry) = self.peer_id_to_addr.get(&peer_info.id) {
                 let existing_addr = existing_addr_entry.value().clone();
                 drop(existing_addr_entry);
-                // Refresh last_seen/height on existing entry; skip duplicate insert
+                // v30.A3: refresh last_seen ONLY; height is NOT taken from
+                // peer_info on this gossip-discovered path because its source
+                // (PeerListResponse / DHT relay) is unauthenticated for the
+                // claimed peer. The peer's own signed HealthPing / inbound
+                // block delivery is the canonical attestation channel.
                 if let Some(mut entry) = self.connected_peers_lockfree.get_mut(&existing_addr) {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
                     entry.last_seen = now;
-                    if peer_info.last_block_height > entry.last_block_height {
-                        entry.last_block_height = peer_info.last_block_height;
-                    }
                 }
                 if crate::node::is_debug() {
                     println!("[DBG][P2P] peer_dedup id={} existing_addr={} new_addr={} — refreshed (skipping insert)",
@@ -4935,6 +4971,7 @@ impl SimplifiedP2P {
                                 successful_pings: 0,
                                 failed_pings: 0,
                                 last_block_height: 0,  // v2.24.3
+                                last_height_attested_at: 0,  // v30.A3
                                 is_outbound: true,  // Outbound - we initiated discovery
                             };
 
@@ -8792,29 +8829,50 @@ impl SimplifiedP2P {
     /// v2.26.1: Get consensus network height from connected peers (from HealthPing data)
     /// Uses median for Byzantine fault tolerance (same logic as sync_blockchain_height)
     /// This provides real-time network height without HTTP calls
+    ///
+    /// v30.A3: only entries attested within PEER_HEIGHT_ATTEST_TTL_SECS are
+    /// included. Attestation is set exclusively by authenticated paths
+    /// (applied block, certified shred, signed HealthPing); stale or
+    /// gossip-only entries are excluded — closes the empty-batch self-poison
+    /// loop and rejects single-peer height claims as a network-wide signal.
+    ///
+    /// v30.A2: requires ≥ 2 distinct attested peers (besides local) before
+    /// reporting a non-local network height. With a single attesting peer the
+    /// answer is local height — there is no Byzantine majority to act on, so
+    /// the sync state machine waits instead of chasing one peer's claim.
     pub fn get_max_peer_height(&self) -> u64 {
-        // v2.51: Lock-free height collection
-        // SAFETY: Filter u64::MAX (corrupted/uninitialized) and unreasonably large values.
-        // If a peer somehow reports u64::MAX this cascades to every node's network_height.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let stale_threshold = now_secs.saturating_sub(PEER_HEIGHT_ATTEST_TTL_SECS);
+
+        // SAFETY: drop u64::MAX (corrupted/uninitialized) and unreasonably large
+        // values. A peer reporting u64::MAX would otherwise cascade into every
+        // receiver's network_height.
         let mut peer_heights: Vec<u64> = self.connected_peers_lockfree.iter()
             .filter(|e| {
-                let h = e.value().last_block_height;
+                let v = e.value();
+                let h = v.last_block_height;
                 h > 0 && h != u64::MAX && h < 2_000_000_000
+                    && v.last_height_attested_at >= stale_threshold
             })
             .map(|e| e.value().last_block_height)
             .collect();
-        
-        // Also include local height
+
         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+
+        // v30.A2: anti-single-source. Without ≥ 2 attested peers, fall back
+        // to local height. One peer can be poisoned / malicious / partitioned;
+        // a 2f+1 view (where f=0 for tiny clusters) requires at least 2.
+        if peer_heights.len() < 2 {
+            return local_height;
+        }
+
         if local_height > 0 {
             peer_heights.push(local_height);
         }
-        
-        if peer_heights.is_empty() {
-            return local_height;
-        }
-        
-        // Use same consensus logic as sync_blockchain_height
+
         peer_heights.sort();
         if peer_heights.len() >= 3 {
             // Median for Byzantine fault tolerance
@@ -8895,12 +8953,18 @@ impl SimplifiedP2P {
         // from this function is ALREADY node-local (sync decisions only). BFT-critical
         // paths use the deterministic macroblock snapshot, not this value.
         // ═══════════════════════════════════════════════════════════════════════════
-        const PEER_HEIGHT_TTL_SECS: u64 = 120;
+        // v30.A3: unified attestation TTL with get_max_peer_height.
+        // The freshness gate consults last_height_attested_at (set ONLY by
+        // authenticated paths), not last_seen — a peer can be alive and
+        // chatty without ever signing a height claim (e.g., during an
+        // attack-driven echo storm). Without this gate, a poisoned cache
+        // value persisted by past sync-loop iterations would keep steering
+        // the sync state machine forever.
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let stale_threshold = now_secs.saturating_sub(PEER_HEIGHT_TTL_SECS);
+        let stale_threshold = now_secs.saturating_sub(PEER_HEIGHT_ATTEST_TTL_SECS);
         let mut stale_filtered = 0usize;
 
         let mut peer_heights: Vec<u64> = validated_peers.iter()
@@ -8909,7 +8973,7 @@ impl SimplifiedP2P {
                 if h == 0 || h == u64::MAX || h >= 2_000_000_000 {
                     return false;
                 }
-                if p.last_seen < stale_threshold {
+                if p.last_height_attested_at < stale_threshold {
                     stale_filtered += 1;
                     return false;
                 }
@@ -8920,21 +8984,22 @@ impl SimplifiedP2P {
 
         if stale_filtered > 0 && crate::node::is_info() {
             println!("[INFO][SYNC] stale_heights_excluded count={} ttl={}s total_peers={}",
-                     stale_filtered, PEER_HEIGHT_TTL_SECS, validated_peers.len());
+                     stale_filtered, PEER_HEIGHT_ATTEST_TTL_SECS, validated_peers.len());
         }
 
-        // Log peer heights for debugging (only fresh entries)
-        for peer in validated_peers.iter().filter(|p| p.last_block_height > 0 && p.last_seen >= stale_threshold) {
+        // Log peer heights for debugging (only attested entries)
+        for peer in validated_peers.iter().filter(|p| p.last_block_height > 0 && p.last_height_attested_at >= stale_threshold) {
             if crate::node::is_info() {
-                let age = now_secs.saturating_sub(peer.last_seen);
+                let age = now_secs.saturating_sub(peer.last_height_attested_at);
                 println!("[INFO][SYNC] peer_height id={} h={} age={}s", peer.id, peer.last_block_height, age);
             }
         }
-        
-        if peer_heights.is_empty() {
-            // Fallback: all peers have height 0 (network just started)
+
+        // v30.A2: anti-single-source — refuse to start sync with one attesting peer.
+        if peer_heights.len() < 2 {
             if crate::node::is_info() {
-                println!("[WARN][SYNC] No cached peer heights available - waiting for heartbeats");
+                println!("[INFO][SYNC] insufficient_attested_peers count={} required=2 — staying at local height",
+                         peer_heights.len());
             }
             return Ok(0);
         }
@@ -9738,6 +9803,7 @@ impl SimplifiedP2P {
             successful_pings: 0,
             failed_pings: 0,
             last_block_height: 0,  // v2.24.3
+            last_height_attested_at: 0,  // v30.A3
             is_outbound: false,
         })
     }
@@ -10358,6 +10424,7 @@ impl SimplifiedP2P {
                                     successful_pings: 0,
                                     failed_pings: 0,
                                     last_block_height: 0,
+                                    last_height_attested_at: 0,  // v30.A3
                                     is_outbound: true,  // Outbound - we connect to genesis
                                 };
                                 genesis_peers.push(peer_info);
@@ -10864,6 +10931,7 @@ impl SimplifiedP2P {
             successful_pings: 0,
             failed_pings: 0,
             last_block_height: 0,
+            last_height_attested_at: 0,  // v30.A3
             is_outbound: false,
         })
     }
@@ -14514,20 +14582,25 @@ impl SimplifiedP2P {
                 // diversity (multiple transports) without inflating the validator
                 // count — the latest-seen transport wins.
                 // ═══════════════════════════════════════════════════════════════════
-                for (addr, peer_id, height) in &peers {
+                for (addr, peer_id, _gossiped_height) in &peers {
                     if peer_id != &self.node_id && !addr.is_empty() && !peer_id.is_empty() {
-                        // Check if this node_id already exists at any address
+                        // v30.A3: PeerListResponse is relayed gossip from a peer
+                        // about OTHER peers' state. The gossiped `height` field
+                        // is NOT authenticated against the claimed peer's
+                        // identity key, so it must NEVER drive `last_block_height`.
+                        // Identity-bound height attestation flows only through
+                        // signed HealthPings, applied blocks, and certified
+                        // shreds. Liveness (`last_seen`) is refreshed because
+                        // the relay itself is an authenticated peer.
                         if let Some(existing_addr_entry) = self.peer_id_to_addr.get(peer_id) {
                             let existing_addr = existing_addr_entry.value().clone();
                             drop(existing_addr_entry);
-                            // Node_id already known — refresh last_seen & height on existing entry
                             if let Some(mut entry) = self.connected_peers_lockfree.get_mut(&existing_addr) {
                                 let now = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs();
                                 entry.last_seen = now;
-                                entry.last_block_height = *height;
                             }
                             if crate::node::is_debug() {
                                 println!("[DBG][P2P] peer_dedup id={} existing_addr={} gossiped_addr={} — refreshed",
@@ -14537,7 +14610,9 @@ impl SimplifiedP2P {
                         }
                         if let Ok(mut peer_info) = Self::parse_peer_address_static(addr) {
                             peer_info.id = peer_id.clone();
-                            peer_info.last_block_height = *height;
+                            // v30.A3: leave last_block_height at 0; new peer's
+                            // height is established by its own signed signal,
+                            // not by the gossip relay's claim.
                             // New node_id — insert (address uniqueness preserved by DashMap)
                             if !self.connected_peers_lockfree.contains_key(addr) {
                                 let ip = addr.split(':').next().unwrap_or("");
@@ -19750,8 +19825,21 @@ impl SimplifiedP2P {
     /// 
     /// v2.104: FIXED - On backpressure, cleanup stale entries first instead of dropping
     pub fn handle_blocks_batch(&self, blocks: Vec<(u64, Vec<u8>)>, from_height: u64, to_height: u64, sender_id: String) {
-        // CRITICAL FIX: Update last_seen AND height for sender (use highest block in batch)
-        self.update_peer_last_seen_with_height(&sender_id, Some(to_height));
+        // v30.A1: attest sender height ONLY from real delivered blocks. The
+        // previous implementation echoed the request's `to_height` back into
+        // `last_block_height`, so empty batches (peer has nothing in range)
+        // raised the cached height to the requester's own asking ceiling — a
+        // self-amplifying loop that locks the network into permanent SYNC mode
+        // (every poll re-requests the same window, empty responses keep
+        // re-confirming the phantom ceiling). With this fix:
+        //   * non-empty batch → attest max(block.height) — the only authentic
+        //     proof of peer height is a block the sender actually possesses;
+        //   * empty batch → no height attestation, refresh liveness only.
+        if let Some(max_block_h) = blocks.iter().map(|(h, _)| *h).max() {
+            self.update_peer_last_seen_with_height(&sender_id, Some(max_block_h));
+        } else {
+            self.update_peer_last_seen(&sender_id);
+        }
         
         // v2.104: BACKPRESSURE - Check queue size and cleanup if needed
         let queue_size = get_pending_sync_count();

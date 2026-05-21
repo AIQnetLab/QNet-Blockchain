@@ -1488,21 +1488,32 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and_then(handle_bundle_cancel);
     
         // Peer discovery endpoint (for P2P network) - BIDIRECTIONAL REGISTRATION
+        // v30.B3: rate-limited per source IP. Until v30 this endpoint was the
+        // single most attractive enumeration / DoS target — attacker could
+        // hammer GET /api/v1/peers without throttling, saturating the warp
+        // TCP accept queue and starving legitimate inter-genesis HTTP queries
+        // (visible as `[ERR][P2P] Request failed ... operation timed out`
+        // across all genesis nodes during the 198.36.48.234 incident).
     let peers_endpoint = api_v1
         .and(warp::path("peers"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::addr::remote())
         .and(warp::header::headers_cloned())
         .and(blockchain_filter.clone())
-        .and_then(|_headers: warp::http::HeaderMap, blockchain: Arc<BlockchainNode>| async move {
+        .and_then(|remote_addr: Option<std::net::SocketAddr>, _headers: warp::http::HeaderMap, blockchain: Arc<BlockchainNode>| async move {
+            if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+                return Ok::<_, Rejection>(rate_limit_response.into_response());
+            }
+
             // FIX v2.92: REMOVED auto-registration of API clients as peers
             // PROBLEM: Any browser/explorer making API request was added as P2P peer
-            // This caused nodes to endlessly try connecting to non-node IPs (node_80e2b6c2 bug)
+            // This caused nodes to endlessly try connecting to non-node IPs
             // leading to network split and emergency failover cascade
-            // 
-            // CORRECT BEHAVIOR: Only nodes that explicitly register via /api/v1/register 
+            //
+            // CORRECT BEHAVIOR: Only nodes that explicitly register via /api/v1/register
             // with valid signatures should become peers
-            
+
             // Return current peer list
             let peers = blockchain.get_connected_peers().await.unwrap_or_default();
             
@@ -1598,7 +1609,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                     "full_nodes": full_nodes, // v3.18: Always 0 (Full node type removed)
                     "light_nodes": light_nodes
                 }
-            })))
+            })).into_response())
         });
 
     // Batch operations endpoints
