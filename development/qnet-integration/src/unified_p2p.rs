@@ -19640,7 +19640,49 @@ impl SimplifiedP2P {
     pub fn handle_block_request(&self, from_peer: &str, from_height: u64, to_height: u64, requester_id: String) {
         // Update last_seen for requesting peer
         self.update_peer_last_seen(from_peer);
-        
+
+        // v31: LEADER FAST-PATH — if THIS node is the expected producer for
+        // the upcoming slot, decline sync serving with an empty batch so the
+        // production loop is not starved by RocksDB I/O contention from bulk
+        // reads. The cascade at h=7611 was triggered by exactly this pattern:
+        // gen-004 was the elected producer for h=7611 AND simultaneously
+        // serving ~10 MB/s sync responses, which held the LSM read path
+        // against apply-stage writes (op=verify:load_prev_block stuck 23 h).
+        //
+        // Determinism: `get_expected_producer(local_h + 1)` is the canonical
+        // selection function used by all peers; the requester gets the empty
+        // batch and immediately retries against another peer (`empty_batch`
+        // path already exists below). Heartbeat/consensus paths are
+        // unaffected — they use separate channels, not handle_block_request.
+        //
+        // O(1) DashMap lookup; safe to call from ANY thread (no async await).
+        // No bypass via env-var: starvation is an architectural invariant for
+        // top-L1 leader fast-path, not a deployment toggle.
+        let local_chain_height_now = LOCAL_BLOCKCHAIN_HEIGHT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let next_height = local_chain_height_now.saturating_add(1);
+        if let Some((expected_producer, _round)) = crate::node::get_expected_producer(next_height) {
+            if expected_producer == self.node_id {
+                // I am the elected producer for the next slot — defer sync serving.
+                if crate::node::is_debug() {
+                    println!(
+                        "[DBG][SYNC] leader_shed peer={} requester={} my_slot_h={} reason=current_producer",
+                        from_peer, requester_id, next_height
+                    );
+                }
+                let response = NetworkMessage::BlocksBatch {
+                    blocks: Vec::new(),
+                    from_height,
+                    to_height: from_height,
+                    sender_id: self.node_id.clone(),
+                };
+                if let Some(peer_addr) = self.peer_id_to_addr.get(&requester_id) {
+                    self.send_network_message(&peer_addr.clone(), response);
+                }
+                return;
+            }
+        }
+
         // RATE LIMITING: Check if peer is making too many sync requests
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

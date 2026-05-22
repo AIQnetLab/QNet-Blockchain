@@ -3834,16 +3834,88 @@ impl BlockchainNode {
                 }
             }
 
-            // Count registrations without reactivation (for logging)
+            // v31: PHASE 2A — IMPLICIT ELIGIBILITY via signed HeartbeatCommitment.
+            // Fresh super-nodes prove (a) registration on-chain (Phase 1 set),
+            // (b) sync proximity via HeartbeatCommitment.heartbeat_samples[*].
+            // block_height in the same scan window. This restores the v6.6
+            // onboarding path that v10.0 inadvertently neutered by requiring
+            // an explicit NodeReactivation TX even for first-time joiners.
+            //
+            // NodeReactivation reverts to its original "post-jail unjail"
+            // semantics (Cosmos-style); fresh nodes never need it.
+            //
+            // Determinism: HeartbeatCommitment TXs are on-chain, signed by
+            // the node's identity key, validator-checked. The sync proof
+            // (sample.block_height ∈ [window_start, window_end]) is computed
+            // identically on every node. No external data, no race conditions.
+            //
+            // Scaling: scan range is the same 3-epoch window already walked
+            // for Phase 2 NodeReactivation, so this adds at most one extra
+            // TX-type match per microblock — O(epoch_blocks * txs_per_block).
+            let mut added_heartbeat_count = 0usize;
+            for height in scan_start..=scan_end {
+                if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
+                    for tx in &block.transactions {
+                        if let qnet_state::TransactionType::HeartbeatCommitment {
+                            node_id,
+                            heartbeat_samples,
+                            window_end_height,
+                            ..
+                        } = &tx.tx_type {
+                            if !registered_super_nodes.contains(node_id) {
+                                continue; // not a registered super-node
+                            }
+                            if existing_ids.contains(node_id)
+                                || eligible.iter().any(|p| p.node_id == *node_id)
+                            {
+                                continue;
+                            }
+
+                            // Sync proof: the commitment covers a window whose
+                            // end is within SYNC_PROXIMITY_BLOCKS of scan_end,
+                            // AND at least one sample's block_height is in the
+                            // proximity band. The commitment is signed and
+                            // validator-checked at TX admission, so we trust
+                            // the embedded heights here without re-verifying.
+                            if *window_end_height + SYNC_PROXIMITY_BLOCKS < scan_end {
+                                continue; // commitment too old
+                            }
+                            let max_sample_h = heartbeat_samples.iter()
+                                .map(|s| s.block_height)
+                                .max()
+                                .unwrap_or(0);
+                            if max_sample_h + SYNC_PROXIMITY_BLOCKS < scan_end
+                                || max_sample_h > scan_end + SYNC_PROXIMITY_BLOCKS
+                            {
+                                continue; // sample heights out of proximity band
+                            }
+
+                            let reputation = reputation_map.get(node_id).copied()
+                                .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION / 100.0);
+                            if reputation < MIN_REPUTATION {
+                                continue;
+                            }
+
+                            eligible.push(qnet_state::EligibleProducer {
+                                node_id: node_id.clone(),
+                                reputation,
+                            });
+                            added_heartbeat_count += 1;
+                        }
+                    }
+                }
+            }
+
+            // Count registrations without ANY sync proof (NodeReactivation OR HeartbeatCommitment)
             for reg_node in &registered_super_nodes {
                 if !existing_ids.contains(reg_node) && !eligible.iter().any(|p| p.node_id == *reg_node) {
                     skipped_unsynced_reg += 1;
                 }
             }
 
-            if added_react_count > 0 || skipped_unsynced_reg > 0 || skipped_unsynced_react > 0 {
-                println!("[INFO][SNAP] v10.0 L1_SCAN: added={} skipped_reg_no_reactivation={} skipped_react_unsynced={} (h={}-{}) total={}",
-                         added_react_count, skipped_unsynced_reg, skipped_unsynced_react, scan_start, scan_end, eligible.len());
+            if added_react_count > 0 || added_heartbeat_count > 0 || skipped_unsynced_reg > 0 || skipped_unsynced_react > 0 {
+                println!("[INFO][SNAP] v31 L1_SCAN: added_react={} added_heartbeat={} skipped_no_proof={} skipped_react_unsynced={} (h={}-{}) total={}",
+                         added_react_count, added_heartbeat_count, skipped_unsynced_reg, skipped_unsynced_react, scan_start, scan_end, eligible.len());
             }
 
             // ── LEVEL 2: Carry-over from recent macroblock eligible sets ──
@@ -17959,7 +18031,15 @@ impl BlockchainNode {
                                     // through to block-by-block unchanged. Threshold
                                     // 5000 blocks (~83 min) so the download amortises;
                                     // zero overhead for nodes already at tip.
-                                    const RUNTIME_SNAPSHOT_GAP_THRESHOLD: u64 = 5_000;
+                                    // v31: lowered from 5000 → 1500. At 1 block/s
+                                    // the old threshold meant >83 min behind
+                                    // before snapshot path engaged, leaving
+                                    // bulk block-by-block to do the heavy
+                                    // lifting under load — exactly the path
+                                    // that triggered the h=7611 cascade.
+                                    // 1500 blocks ≈ 25 min, snapshot replays
+                                    // in <60 s.
+                                    const RUNTIME_SNAPSHOT_GAP_THRESHOLD: u64 = 1_500;
                                     if sync_from_height == 0 || height_difference > RUNTIME_SNAPSHOT_GAP_THRESHOLD {
                                         if is_info() {
                                             println!(
@@ -28797,12 +28877,33 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // BLOCKCHAIN STORAGE for deterministic reputation:
                 slashing_events_data,
                 automatic_jails_data,
-                // v2.24: REPUTATION SNAPSHOT - deterministic state sync
-                // All nodes MUST have IDENTICAL reputation after applying macroblock
+                // v2.24/v31: REPUTATION SNAPSHOT — deterministic state sync.
+                // v31 SCALING FIX: full snapshot is emitted ONLY on epoch
+                // boundaries (every 160 macroblocks = 4 h); intra-epoch
+                // macroblocks emit None. At 1M tracked nodes the full
+                // snapshot is ~60 MB per macroblock = ~57 GB/day if emitted
+                // every block — structurally infeasible. Epoch-only cadence
+                // shrinks the on-chain footprint to ~600 MB/day (4 h × 6
+                // emissions/day × 25 MB compressed) with no loss of
+                // determinism: nodes that miss an intra-epoch snapshot
+                // reconstruct from the next epoch boundary + replay of the
+                // intervening commits/reveals (already on-chain).
+                //
+                // Boundary: `macroblock_height % EPOCH_MACROBLOCKS == 0`,
+                // where EPOCH_MACROBLOCKS = 160 (4 h × 3600 s / 90 s/mb).
+                // First macroblock of the chain (mb_height=0) is included
+                // so a fresh super-node always gets a starting baseline.
                 reputation_snapshot: {
-                    if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                        let rep_state = rep_arc.read();
-                        Some(rep_state.create_snapshot())
+                    const EPOCH_MACROBLOCKS: u64 = 160;
+                    let is_epoch_boundary = macroblock_height == 0
+                        || macroblock_height % EPOCH_MACROBLOCKS == 0;
+                    if is_epoch_boundary {
+                        if let Some(rep_arc) = p2p.get_deterministic_reputation() {
+                            let rep_state = rep_arc.read();
+                            Some(rep_state.create_snapshot())
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }

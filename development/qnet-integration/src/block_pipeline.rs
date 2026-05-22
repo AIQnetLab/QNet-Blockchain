@@ -97,6 +97,53 @@ static HASH_CHAIN_BREAK_WITNESSES: once_cell::sync::Lazy<
     dashmap::DashMap<u64, DashSet<String>>
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
+// v31: RECENT_BLOCK_HASHES — RAM cache of (height → block.hash()) for the
+// verify-stage parent-block lookup. Apply-stage populates this immediately
+// after a microblock is durably saved; verify-stage reads from here BEFORE
+// touching RocksDB. Eliminates the cascade observed at h=7611 where verify's
+// `load_microblock_auto_format(parent_h)` blocked on the LSM read lock while
+// apply-stage was writing the same column family during a macroblock-burst —
+// the exact failure mode documented at the verify_load_prev_block log site.
+// Bounded LRU (RECENT_BLOCK_HASHES_MAX) — only the last ≥2 epochs (~28800
+// blocks) need fast lookup; deeper history falls through to RocksDB which is
+// off the hot path. O(1) DashMap; ~40 bytes/entry; ~1.2 MB at cap.
+const RECENT_BLOCK_HASHES_MAX: usize = 30_000;
+pub static RECENT_BLOCK_HASHES: once_cell::sync::Lazy<
+    dashmap::DashMap<u64, [u8; 32]>
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// Record a microblock's canonical hash so subsequent verify-stage chain
+/// checks can resolve `previous_hash` without a RocksDB read. Called by the
+/// apply-stage right after the block is committed; producer self-save and
+/// genesis-init paths also call this to keep the cache warm from the very
+/// first microblock.
+#[inline]
+pub fn cache_block_hash(height: u64, hash: [u8; 32]) {
+    RECENT_BLOCK_HASHES.insert(height, hash);
+    // Lock-free LRU: trim when the map exceeds the cap by removing the
+    // oldest height (lowest u64). Single eviction per insert keeps the cap
+    // soft but bounded; never blocks the apply hot path.
+    let len = RECENT_BLOCK_HASHES.len();
+    if len > RECENT_BLOCK_HASHES_MAX {
+        let mut min_h = u64::MAX;
+        for entry in RECENT_BLOCK_HASHES.iter() {
+            let h = *entry.key();
+            if h < min_h { min_h = h; }
+        }
+        if min_h != u64::MAX {
+            RECENT_BLOCK_HASHES.remove(&min_h);
+        }
+    }
+}
+
+/// Fast in-memory lookup for the parent-block hash. Returns None on cache
+/// miss — caller falls back to a RocksDB read (cold path). Used by the
+/// verify stage's chain-continuity check to bypass the LSM contention point.
+#[inline]
+pub fn lookup_block_hash(height: u64) -> Option<[u8; 32]> {
+    RECENT_BLOCK_HASHES.get(&height).map(|e| *e.value())
+}
+
 /// Record that `peer_id` reported a hash_chain_break at `height`.
 ///
 /// v16.2: ADVISORY-ONLY MODEL. Witness count here measures how many
@@ -1419,40 +1466,48 @@ impl BlockPipeline {
 
             // 1. Hash chain continuity (except genesis)
             if mb.height > 0 {
-                // v15.4 DIAG: mark verify stage as entering the prev-block
-                // load. If the watchdog later observes verified counter
-                // frozen with op=verify:load_prev_block, we know RocksDB
-                // read on the parent height is hung — most likely point of
-                // contention with apply-stage writes during macroblock
-                // bursts. `load_start` instruments the read to log slow
-                // tail latencies (>500 ms) without spamming on healthy
-                // nodes.
                 metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_LOAD_PREV);
-                let load_start = std::time::Instant::now();
-                // v15.6: Run the synchronous RocksDB read on the dedicated blocking
-                // pool so it never starves a tokio worker. Under macroblock-burst
-                // contention the same async worker also drives apply-stage state
-                // mutations and consensus message handling — leaving the read on
-                // the async path made a single hot-row scan stall every other
-                // task on this thread for tens of seconds (observed at h=12247
-                // with op_age_ms=21977). Spawn-blocking decouples the I/O
-                // latency from runtime liveness and matches the pattern already
-                // used at every other RocksDB hot-read site in this codebase.
-                let storage_for_load = storage.clone();
                 let parent_h = mb.height - 1;
-                let load_result = match tokio::task::spawn_blocking(move || {
-                    storage_for_load.load_microblock_auto_format(parent_h)
-                }).await {
-                    Ok(res) => res,
-                    Err(join_err) => {
-                        if is_warn() {
-                            println!(
-                                "[WARN][PIPELINE] verify_load_prev_join_err h={} parent_h={} err={}",
-                                mb.height, parent_h, join_err
-                            );
+
+                // v31: parent-hash resolution with RAM-cache fast path.
+                // Apply-stage populates RECENT_BLOCK_HASHES the moment a block
+                // is committed; verify-stage reads it BEFORE any RocksDB I/O.
+                // Closes the verify↔apply LSM-lock contention class that froze
+                // the network at h=7611 (op=verify:load_prev_block, 23 h stuck).
+                // Cold path (cache miss → RocksDB) is rare: only when parent
+                // is deeper than RECENT_BLOCK_HASHES_MAX (~30k blocks) AND not
+                // yet backfilled by an earlier sync of the same height.
+                //
+                // load_result mirrors the legacy three-state outcome:
+                //   Ok(Some(prev_hash))  — resolved (RAM or disk), hash compared
+                //   Ok(None)             — parent missing → defer
+                //   Err(_)               — disk failure → drop
+                let load_start = std::time::Instant::now();
+                let load_result: Result<Option<[u8; 32]>, ()> = if let Some(cached) = lookup_block_hash(parent_h) {
+                    Ok(Some(cached))
+                } else {
+                    let storage_for_load = storage.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        storage_for_load.load_microblock_auto_format(parent_h)
+                    }).await {
+                        Ok(Ok(Some(prev_block))) => {
+                            let h = prev_block.hash();
+                            // Backfill so subsequent verifies stay on the fast path.
+                            cache_block_hash(parent_h, h);
+                            Ok(Some(h))
                         }
-                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                        continue;
+                        Ok(Ok(None)) => Ok(None),
+                        Ok(Err(_)) => Err(()),
+                        Err(join_err) => {
+                            if is_warn() {
+                                println!(
+                                    "[WARN][PIPELINE] verify_load_prev_join_err h={} parent_h={} err={}",
+                                    mb.height, parent_h, join_err
+                                );
+                            }
+                            metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                     }
                 };
                 let load_elapsed = load_start.elapsed();
@@ -1460,16 +1515,12 @@ impl BlockPipeline {
                     if is_warn() {
                         println!(
                             "[WARN][PIPELINE] slow_storage_read stage=verify h={} parent_h={} elapsed_ms={}",
-                            mb.height, mb.height - 1, load_elapsed.as_millis()
+                            mb.height, parent_h, load_elapsed.as_millis()
                         );
                     }
                 }
                 let prev_hash_ok = match load_result {
-                    Ok(Some(prev_block)) => {
-                        // Verify previous_hash matches actual prev block hash
-                        let prev_hash = prev_block.hash();
-                        mb.previous_hash == prev_hash
-                    }
+                    Ok(Some(prev_hash)) => mb.previous_hash == prev_hash,
                     Ok(None) => {
                         // Capture height fields BEFORE moving `decoded` into
                         // the deferred map — `mb` is borrowed from `decoded`
@@ -1477,7 +1528,6 @@ impl BlockPipeline {
                         let child_h = mb.height;
                         let parent_h = mb.height - 1;
                         // Previous block not yet available — defer for retry.
-                        // When parent arrives, this block will be re-checked.
                         if deferred.len() < DEFERRED_MAX {
                             if is_debug() {
                                 println!("[DBG][PIPELINE] block_deferred h={} need_h={} buf={}",
@@ -1485,7 +1535,6 @@ impl BlockPipeline {
                             }
                             deferred.insert(child_h, decoded);
                         } else {
-                            // Buffer full — drop oldest to make room
                             if is_info() {
                                 println!("[INFO][PIPELINE] deferred_full h={} dropped (buf={})",
                                          child_h, DEFERRED_MAX);
@@ -1498,44 +1547,28 @@ impl BlockPipeline {
                         // parent never arrives (peer offline, partition,
                         // dropped shred) the deferred buffer fills with orphans
                         // and the gap stays open forever (observed h=180-241).
-                        // Proactively request the missing parent, single-
-                        // flighted per height on a detached task (verify never
-                        // blocks on I/O). Size-adaptive: small gap (≤
-                        // RANGE_SYNC_GAP_THRESHOLD) → per-height single-flight
-                        // (cheapest, no fanout amplification for jitter); large
-                        // gap → one batched range request local_tip+1..=child_h
-                        // via sync_blocks (avoids the multi-minute cascade).
+                        // Size-adaptive: small gap → per-height single-flight;
+                        // large gap → batched range request via sync_blocks.
                         let local_tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                             .load(Ordering::Relaxed);
                         let gap = child_h.saturating_sub(local_tip);
                         if gap > RANGE_SYNC_GAP_THRESHOLD {
-                            // Large gap — fetch the entire missing range in one batch.
                             let from = local_tip.saturating_add(1);
                             let _ = request_missing_range(from, child_h);
                         } else {
-                            // Small gap — keep the lighter per-height path.
                             let _ = request_missing_parent(parent_h);
                         }
 
-                        // ───────────────────────────────────────────────────
-                        // v18: WATCHDOG DIAGNOSTIC FIX
-                        // ───────────────────────────────────────────────────
-                        // Mark verify stage as IDLE on the deferral path so
-                        // the watchdog does not report `verify_stuck` with
-                        // a stale `op_age_ms` value (counter measured against
-                        // the last `mark_verify_op` even though the operation
-                        // logically completed via the deferral branch). Pre-
-                        // v18 the verify_op timestamp stayed pinned to the
-                        // first deferred block until a non-deferred block
-                        // arrived, producing misleading multi-hour
-                        // op_age_ms values in stalled-network logs.
-                        // ───────────────────────────────────────────────────
+                        // v18: mark verify stage as IDLE on the deferral path
+                        // so the watchdog does not report `verify_stuck` with
+                        // a stale `op_age_ms` value.
                         metrics.mark_verify_idle();
                         continue;
                     }
-                    Err(e) => {
+                    Err(()) => {
                         if is_warn() {
-                            println!("[WARN][PIPELINE] prev_load_err h={} err={}", mb.height, e);
+                            println!("[WARN][PIPELINE] prev_load_err h={} parent_h={}",
+                                     mb.height, parent_h);
                         }
                         metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -2015,6 +2048,18 @@ impl BlockPipeline {
 
             // All checks passed — forward to apply stage
             let block_height = decoded.height; // Copy before move
+            // v31: cache the verified block's canonical hash IMMEDIATELY so a
+            // subsequent verify of `block_height + 1` resolves its parent
+            // from RAM (DashMap O(1)) without ever touching RocksDB. The
+            // hash is deterministic from block content — caching here is
+            // sound even before apply-stage's save_microblock completes, and
+            // is the only ordering that keeps verify ahead of apply under
+            // pipelining (the cascade trigger at h=7611 happened precisely
+            // because verify of h+1 entered RocksDB while apply was still
+            // writing h, holding the LSM lock).
+            let verified_hash = decoded.microblock.hash();
+            cache_block_hash(block_height, verified_hash);
+
             let verified = VerifiedBlock {
                 height: block_height,
                 decompressed: decoded.decompressed,

@@ -8708,27 +8708,40 @@ impl Storage {
         // IPFS fast path preserved: ipfs_cid + IPFS_ENABLED short-circuits
         // to the gateway, bypassing peer fan-out. O(active_peers) discovery.
 
-        // ── Phase 1: discover snapshot offerings ──
+        // ── Phase 1: discover snapshot offerings (v31: parallel fan-out) ──
+        // Legacy serial loop took O(N × http_rtt) — at 5 genesis × 200 ms RTT
+        // that is 1 s of discovery before any chunk fetch could start. With
+        // N growing toward the eligible-set cap (1000), serial discovery
+        // would dominate cold-start latency. Parallel `join_all` fans every
+        // peer query out concurrently; total time = max(rtt) regardless of N.
         let mut best_height = 0u64;
-        // Per-peer height map: only peers that returned Some are tracked.
         let mut peer_heights: Vec<(String, u64)> = Vec::new();
-        for peer in &peers {
-            match self.query_peer_snapshot(&peer.addr).await {
-                Ok(Some((height, cid))) => {
-                    if height > best_height {
-                        best_height = height;
+
+        let queries: Vec<_> = peers.iter().map(|peer| {
+            let addr = peer.addr.clone();
+            let storage_ref = self;
+            async move {
+                let result = storage_ref.query_peer_snapshot(&addr).await;
+                (addr, result)
+            }
+        }).collect();
+
+        let results = futures::future::join_all(queries).await;
+
+        for (addr, result) in results {
+            if let Ok(Some((height, cid))) = result {
+                if height > best_height {
+                    best_height = height;
+                }
+                // IPFS fast path — content-addressed, scales with the swarm
+                // rather than the validator committee.
+                if !cid.is_empty() && std::env::var("IPFS_ENABLED").unwrap_or_default() == "1" {
+                    if let Ok(_) = self.download_snapshot_from_ipfs(&cid, height).await {
+                        println!("[INFO][SYNC] snapshot_from_ipfs h={}", height);
+                        return Ok(height);
                     }
-                    // IPFS fast path — content-addressed, scales with the
-                    // swarm rather than the validator committee.
-                    if !cid.is_empty() && std::env::var("IPFS_ENABLED").unwrap_or_default() == "1" {
-                        if let Ok(_) = self.download_snapshot_from_ipfs(&cid, height).await {
-                            println!("[INFO][SYNC] snapshot_from_ipfs h={}", height);
-                            return Ok(height);
-                        }
-                    }
-                    peer_heights.push((peer.addr.clone(), height));
-                },
-                _ => continue,
+                }
+                peer_heights.push((addr, height));
             }
         }
 
