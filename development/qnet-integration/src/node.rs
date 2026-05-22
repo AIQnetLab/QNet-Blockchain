@@ -3757,26 +3757,16 @@ impl BlockchainNode {
             // v10.0 CRITICAL FIX: NodeRegistration alone does NOT grant eligibility.
             // A node MUST prove it is synced via NodeReactivation TX, which contains
             // `current_height` — the node's chain height at reactivation time.
-            // Only nodes with current_height within SYNC_PROXIMITY_BLOCKS of scan_end
-            // are added to the eligible set. This is fully deterministic (on-chain data).
-            //
-            // Flow: Register (NodeRegistration) → Sync to tip → Reactivate (NodeReactivation) → Eligible
-            //
-            // Without this gate, a node at height 300 could be added to the producer pool
-            // while the chain is at height 23000, causing consensus divergence and network stall.
-            //
-            // NodeRegistration TXs are still scanned to build a set of REGISTERED nodes,
-            // but registration alone is necessary-not-sufficient for eligibility.
+            // v31.13+v31.14: HBC-only eligibility. Scan window = full epoch so a
+            // returning node's next HBC is always in range. Phase 1 builds the
+            // registered-super-node set; Phase 2A is the single eligibility path.
             let scan_end = macroblock_index * 90;
-            const REGISTRATION_GRACE_EPOCHS: u64 = 3;
-            let scan_start = scan_end.saturating_sub(REGISTRATION_GRACE_EPOCHS * 90);
-            // Sync proximity: node must be within 1 epoch (90 blocks) of the chain tip
+            const PHASE_2A_SCAN_BLOCKS: u64 = 14_400;
+            let scan_start = scan_end.saturating_sub(PHASE_2A_SCAN_BLOCKS);
             const SYNC_PROXIMITY_BLOCKS: u64 = 90;
-            let mut added_react_count = 0usize;
             let mut skipped_unsynced_reg = 0usize;
-            let mut skipped_unsynced_react = 0usize;
 
-            // Phase 1: Collect registered Super node IDs (necessary condition)
+            // Phase 1: registered Super node IDs (necessary, not sufficient).
             let mut registered_super_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
             for height in scan_start..=scan_end {
                 if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
@@ -3792,67 +3782,13 @@ impl BlockchainNode {
                 }
             }
 
-            // Phase 2: Only NodeReactivation with sync proof grants eligibility
-            for height in scan_start..=scan_end {
-                if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
-                    for tx in &block.transactions {
-                        if let qnet_state::TransactionType::NodeReactivation {
-                            node_id, current_height, ..
-                        } = &tx.tx_type {
-                            if existing_ids.contains(node_id) {
-                                continue; // Already in base consensus_participants
-                            }
-                            let already_added = eligible.iter().any(|p| p.node_id == *node_id);
-                            if already_added {
-                                continue; // Already added by earlier reactivation TX
-                            }
-
-                            // SYNC PROOF: current_height must be within SYNC_PROXIMITY_BLOCKS of scan_end
-                            // Lower bound: node must not be too far behind
-                            // Upper bound: node must not claim a height beyond chain tip (spoofing)
-                            if *current_height + SYNC_PROXIMITY_BLOCKS < scan_end || *current_height > scan_end + SYNC_PROXIMITY_BLOCKS {
-                                skipped_unsynced_react += 1;
-                                if is_info() {
-                                    let reason = if *current_height > scan_end + SYNC_PROXIMITY_BLOCKS { "future_height" } else { "behind" };
-                                    println!("[INFO][SNAP] v10.0 REJECTED reactivation node={} current_h={} scan_end={} reason={}",
-                                             node_id, current_height, scan_end, reason);
-                                }
-                                continue;
-                            }
-
-                            let reputation = reputation_map.get(node_id).copied()
-                                .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION / 100.0);
-                            if reputation >= MIN_REPUTATION {
-                                eligible.push(qnet_state::EligibleProducer {
-                                    node_id: node_id.clone(),
-                                    reputation,
-                                });
-                                added_react_count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // v31: PHASE 2A — IMPLICIT ELIGIBILITY via signed HeartbeatCommitment.
-            // Fresh super-nodes prove (a) registration on-chain (Phase 1 set),
-            // (b) sync proximity via HeartbeatCommitment.heartbeat_samples[*].
-            // block_height in the same scan window. This restores the v6.6
-            // onboarding path that v10.0 inadvertently neutered by requiring
-            // an explicit NodeReactivation TX even for first-time joiners.
-            //
-            // NodeReactivation reverts to its original "post-jail unjail"
-            // semantics (Cosmos-style); fresh nodes never need it.
-            //
-            // Determinism: HeartbeatCommitment TXs are on-chain, signed by
-            // the node's identity key, validator-checked. The sync proof
-            // (sample.block_height ∈ [window_start, window_end]) is computed
-            // identically on every node. No external data, no race conditions.
-            //
-            // Scaling: scan range is the same 3-epoch window already walked
-            // for Phase 2 NodeReactivation, so this adds at most one extra
-            // TX-type match per microblock — O(epoch_blocks * txs_per_block).
+            // Phase 2A: HBC sync proof grants eligibility.
+            // Gates: registered, dedup, window proximity, all samples
+            // chain-anchored, every sample's Dilithium sig + merkle proof
+            // verifies against the TX's merkle_root (v31.10), reputation OK.
             let mut added_heartbeat_count = 0usize;
+            let mut skipped_forged_samples = 0usize;
+            let mut skipped_bad_merkle = 0usize;
             for height in scan_start..=scan_end {
                 if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
                     for tx in &block.transactions {
@@ -3860,25 +3796,19 @@ impl BlockchainNode {
                             node_id,
                             heartbeat_samples,
                             window_end_height,
+                            merkle_root,
                             ..
                         } = &tx.tx_type {
                             if !registered_super_nodes.contains(node_id) {
-                                continue; // not a registered super-node
+                                continue;
                             }
                             if existing_ids.contains(node_id)
                                 || eligible.iter().any(|p| p.node_id == *node_id)
                             {
                                 continue;
                             }
-
-                            // Sync proof: the commitment covers a window whose
-                            // end is within SYNC_PROXIMITY_BLOCKS of scan_end,
-                            // AND at least one sample's block_height is in the
-                            // proximity band. The commitment is signed and
-                            // validator-checked at TX admission, so we trust
-                            // the embedded heights here without re-verifying.
                             if *window_end_height + SYNC_PROXIMITY_BLOCKS < scan_end {
-                                continue; // commitment too old
+                                continue;
                             }
                             let max_sample_h = heartbeat_samples.iter()
                                 .map(|s| s.block_height)
@@ -3887,7 +3817,51 @@ impl BlockchainNode {
                             if max_sample_h + SYNC_PROXIMITY_BLOCKS < scan_end
                                 || max_sample_h > scan_end + SYNC_PROXIMITY_BLOCKS
                             {
-                                continue; // sample heights out of proximity band
+                                continue;
+                            }
+
+                            // v31.7: every sample must reference a real local block.
+                            let all_samples_anchored = heartbeat_samples.iter().all(|s| {
+                                matches!(
+                                    storage.load_microblock_auto_format(s.block_height),
+                                    Ok(Some(_))
+                                )
+                            });
+                            if !all_samples_anchored {
+                                skipped_forged_samples += 1;
+                                continue;
+                            }
+
+                            // v31.10: Dilithium sig + merkle replay vs TX merkle_root.
+                            // p2p is in scope as a function parameter.
+                            let mut all_samples_valid = true;
+                            for sample in heartbeat_samples {
+                                let msg = format!(
+                                    "{}:{}:{}:{}",
+                                    node_id, sample.timestamp, sample.block_height, sample.heartbeat_index
+                                );
+                                if !p2p.verify_dilithium_heartbeat_signature(&msg, &sample.signature, node_id) {
+                                    all_samples_valid = false;
+                                    break;
+                                }
+                                use blake3::Hasher as Blake3Hasher;
+                                let mut hasher = Blake3Hasher::new();
+                                hasher.update(node_id.as_bytes());
+                                hasher.update(&[sample.heartbeat_index]);
+                                hasher.update(&sample.timestamp.to_le_bytes());
+                                hasher.update(&sample.block_height.to_le_bytes());
+                                hasher.update(sample.signature.as_bytes());
+                                let leaf_hex = hasher.finalize().to_hex().to_string();
+                                if !qnet_core::crypto::merkle::verify_merkle_proof(
+                                    &leaf_hex, merkle_root, &sample.merkle_proof
+                                ) {
+                                    all_samples_valid = false;
+                                    break;
+                                }
+                            }
+                            if !all_samples_valid {
+                                skipped_bad_merkle += 1;
+                                continue;
                             }
 
                             let reputation = reputation_map.get(node_id).copied()
@@ -3906,16 +3880,15 @@ impl BlockchainNode {
                 }
             }
 
-            // Count registrations without ANY sync proof (NodeReactivation OR HeartbeatCommitment)
             for reg_node in &registered_super_nodes {
                 if !existing_ids.contains(reg_node) && !eligible.iter().any(|p| p.node_id == *reg_node) {
                     skipped_unsynced_reg += 1;
                 }
             }
 
-            if added_react_count > 0 || added_heartbeat_count > 0 || skipped_unsynced_reg > 0 || skipped_unsynced_react > 0 {
-                println!("[INFO][SNAP] v31 L1_SCAN: added_react={} added_heartbeat={} skipped_no_proof={} skipped_react_unsynced={} (h={}-{}) total={}",
-                         added_react_count, added_heartbeat_count, skipped_unsynced_reg, skipped_unsynced_react, scan_start, scan_end, eligible.len());
+            if added_heartbeat_count > 0 || skipped_unsynced_reg > 0 || skipped_forged_samples > 0 || skipped_bad_merkle > 0 {
+                println!("[INFO][SNAP] L1_SCAN added_hb={} skipped_no_proof={} skipped_forged={} skipped_bad_merkle={} (h={}-{}) total={}",
+                         added_heartbeat_count, skipped_unsynced_reg, skipped_forged_samples, skipped_bad_merkle, scan_start, scan_end, eligible.len());
             }
 
             // ── LEVEL 2: Carry-over from recent macroblock eligible sets ──
@@ -9047,13 +9020,14 @@ impl BlockchainNode {
                     let total_macroblocks = current_height / 90;
                     let mut snapshot_applied_at: u64 = 0; // macroblock index where snapshot was found
 
-                    // Scan macroblocks in REVERSE to find latest snapshot quickly
+                    // v31.9: Scan macroblocks in REVERSE. Skip deltas without
+                    // a base; latest FULL snapshot is what we need to anchor.
                     for mb_idx in (1..=total_macroblocks).rev() {
                         if let Ok(Some(raw_data)) = blockchain.storage.get_macroblock_by_height(mb_idx) {
                             if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&raw_data) {
                                 if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
                                     if !snapshot_data.is_empty() {
-                                        if let Ok(count) = rep_state.apply_snapshot(snapshot_data) {
+                                        if let Ok(count) = rep_state.apply_snapshot_payload(snapshot_data, mb_idx) {
                                             snapshot_applied_at = mb_idx;
                                             if is_info() {
                                                 println!("[INFO][REP] snapshot_found mb={} nodes={} skipped_mbs={}",
@@ -9160,10 +9134,10 @@ impl BlockchainNode {
                                 consensus: macro_consensus,
                             };
 
-                            // Apply reputation snapshot if present (unlikely — we already found the latest)
+                            // v31.9: Apply reputation snapshot (Full or Delta) if present.
                             if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
                                 if !snapshot_data.is_empty() {
-                                    if let Ok(count) = rep_state.apply_snapshot(snapshot_data) {
+                                    if let Ok(count) = rep_state.apply_snapshot_payload(snapshot_data, macroblock_index) {
                                         if is_debug() { println!("[DBG][REP] snapshot_applied mb={} nodes={}",
                                                  macroblock_index, count); }
                                     }
@@ -10343,7 +10317,7 @@ impl BlockchainNode {
         reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
         deterministic_reputation: Arc<ParkingRwLock<DeterministicReputationState>>,
         mempool: Arc<SimpleMempool>,
-        wallet_identity: Option<Arc<crate::crypto::vrf::WalletIdentity>>,
+        _wallet_identity: Option<Arc<crate::crypto::vrf::WalletIdentity>>,
     ) {
         // CRITICAL FIX: Buffer for out-of-order blocks
         // Key: block height, Value: (block data, retry count, timestamp)
@@ -11819,15 +11793,15 @@ impl BlockchainNode {
                                 // v2.96: parking_lot - no poisoning possible
                                 {
                                     let mut rep_state = deterministic_reputation.write();
-                                    // v2.24: Apply reputation snapshot if present
-                                    // This is AUTHORITATIVE - blockchain is source of truth!
+                                    // v31.9: Apply snapshot payload (Full or Delta) if present;
+                                    // blockchain remains authoritative source.
                                     if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
                                         if !snapshot_data.is_empty() {
-                                            match rep_state.apply_snapshot(snapshot_data) {
+                                            match rep_state.apply_snapshot_payload(snapshot_data, macroblock.height) {
                                                 Ok(count) => {
-                                                    if is_debug() { 
-                                                        println!("[DBG][REP] snapshot_applied mb={} nodes={}", 
-                                                            macroblock.height, count); 
+                                                    if is_debug() {
+                                                        println!("[DBG][REP] snapshot_applied mb={} nodes={}",
+                                                            macroblock.height, count);
                                                     }
                                                 }
                                                 Err(e) => {
@@ -12058,49 +12032,9 @@ impl BlockchainNode {
                                      received_block.height, target, best_peer_h);
                         }
 
-                        // ═══════════════════════════════════════════════════════
-                        // v9.4: Auto-send NodeReactivation TX after sync
-                        // Same signing flow as NodeRegistration for Super nodes:
-                        //   Ed25519 (BIP44 mnemonic) + Dilithium3 (WalletIdentity)
-                        // Both Genesis and Super nodes sign — no bypass.
-                        // ═══════════════════════════════════════════════════════
-                        if !matches!(node_type, NodeType::Light) {
-                            let sync_height = received_block.height;
-                            let mb_index = sync_height / 90;
-                            if mb_index > 0 {
-                                let mb_hash = Self::get_latest_macroblock_hash(&storage, mb_index);
-                                if !mb_hash.is_empty() {
-                                    let mut react_tx = Self::create_node_reactivation_tx(
-                                        &node_id, sync_height, &mb_hash, mb_index,
-                                    );
-                                    // Sign: same as NodeRegistration (hybrid Ed25519+Dilithium3)
-                                    Self::sign_reactivation_tx(
-                                        &mut react_tx,
-                                        &node_id,
-                                        wallet_identity.as_ref().map(|arc| arc.as_ref()),
-                                    );
-                                    println!("[INFO][REACTIVATION] sync TX h={} mb={} hash={}",
-                                             sync_height, mb_index, &react_tx.hash[..16]);
-                                    if let Ok(tx_bytes) = bincode::serialize(&react_tx) {
-                                        let gas_price = react_tx.gas_price;
-                                        let tx_hash = react_tx.hash.clone();
-                                        if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), gas_price) {
-                                            println!("[INFO][REACTIVATION] TX in mempool hash={}", &tx_hash[..16]);
-                                            // Broadcast to network (same as NodeRegistration line 27300)
-                                            if let Some(ref p2p) = unified_p2p {
-                                                if let Err(e) = p2p.broadcast_transaction(tx_bytes) {
-                                                    if crate::node::is_warn() {
-                                                        println!("[WARN][P2P] tx_broadcast_failed err={}", e);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    println!("[WARN][REACTIVATION] no macroblock hash available mb={}", mb_index);
-                                }
-                            }
-                        }
+                        // v31.14: HBC-only eligibility model. NodeReactivation auto-send removed;
+                        // returning nodes re-enter eligible_producers via next HBC emission picked up
+                        // by Phase 2A (full-epoch scan window).
                         } // end else (sync truly complete)
                     }
 
@@ -15585,7 +15519,7 @@ impl BlockchainNode {
         let storage = self.storage.clone();
         let height = self.height.clone();
         let unified_p2p = self.unified_p2p.clone();
-        let wallet_identity_for_reactivation = self.wallet_identity.clone();
+        let _wallet_identity_for_reactivation = self.wallet_identity.clone();
         let microblock_interval = self.microblock_interval;
         let is_leader = self.is_leader.clone();
         let node_id = self.node_id.clone();
@@ -16417,41 +16351,7 @@ impl BlockchainNode {
                 }
             }
 
-            // v9.4: Send NodeReactivation TX on startup if already synced
-            // Covers quick restart scenario where sync is not needed
-            // Same signing flow as NodeRegistration for Super nodes:
-            //   Ed25519 (BIP44 mnemonic) + Dilithium3 (WalletIdentity)
-            // Both Genesis and Super nodes sign — no bypass.
-            if node_type != NodeType::Light && microblock_height > 90 {
-                let mb_idx = microblock_height / 90;
-                let mb_hash = Self::get_latest_macroblock_hash(&storage, mb_idx);
-                if !mb_hash.is_empty() {
-                    let mut react_tx = Self::create_node_reactivation_tx(
-                        &node_id, microblock_height, &mb_hash, mb_idx,
-                    );
-                    Self::sign_reactivation_tx(
-                        &mut react_tx, &node_id,
-                        wallet_identity_for_reactivation.as_ref().map(|arc| arc.as_ref()),
-                    );
-                    println!("[INFO][REACTIVATION] startup TX h={} mb={} hash={}",
-                             microblock_height, mb_idx, &react_tx.hash[..16]);
-                    if let Ok(tx_bytes) = bincode::serialize(&react_tx) {
-                        let gas_price = react_tx.gas_price;
-                        let tx_hash = react_tx.hash.clone();
-                        if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), gas_price) {
-                            println!("[INFO][REACTIVATION] startup TX in mempool hash={}", &tx_hash[..16]);
-                            // Broadcast to network (same as NodeRegistration line 27300)
-                            if let Some(ref p2p) = unified_p2p {
-                                if let Err(e) = p2p.broadcast_transaction(tx_bytes) {
-                                    if crate::node::is_warn() {
-                                        println!("[WARN][P2P] tx_broadcast_failed err={}", e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // v31.14: NodeReactivation auto-send removed. Returning nodes enter eligible via Phase 2A HBC.
 
             // CPU MONITORING: Track CPU usage periodically
             let mut cpu_check_counter = 0u64;
@@ -18021,24 +17921,9 @@ impl BlockchainNode {
                                 tokio::spawn(async move {
                                     let _guard = FastSyncGuard;
 
-                                    // Snapshot fast-path in the runtime sync loop. A node
-                                    // can enter this loop without the startup bootstrap
-                                    // (fresh container, chain_height=0, network already
-                                    // has snapshots) and would otherwise walk block-by-
-                                    // block (~10-15 min / 10k blocks). When the gap makes
-                                    // snapshot replay faster, query peers and chunked-
-                                    // parallel-download a snapshot; on any failure fall
-                                    // through to block-by-block unchanged. Threshold
-                                    // 5000 blocks (~83 min) so the download amortises;
-                                    // zero overhead for nodes already at tip.
-                                    // v31: lowered from 5000 → 1500. At 1 block/s
-                                    // the old threshold meant >83 min behind
-                                    // before snapshot path engaged, leaving
-                                    // bulk block-by-block to do the heavy
-                                    // lifting under load — exactly the path
-                                    // that triggered the h=7611 cascade.
-                                    // 1500 blocks ≈ 25 min, snapshot replays
-                                    // in <60 s.
+                                    // v31.5: runtime snapshot fast-path. If gap exceeds
+                                    // threshold (~25 min behind), try snapshot replay first;
+                                    // fall through to block-by-block on any failure.
                                     const RUNTIME_SNAPSHOT_GAP_THRESHOLD: u64 = 1_500;
                                     if sync_from_height == 0 || height_difference > RUNTIME_SNAPSHOT_GAP_THRESHOLD {
                                         if is_info() {
@@ -28877,30 +28762,27 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // BLOCKCHAIN STORAGE for deterministic reputation:
                 slashing_events_data,
                 automatic_jails_data,
-                // v2.24/v31: REPUTATION SNAPSHOT — deterministic state sync.
-                // v31 SCALING FIX: full snapshot is emitted ONLY on epoch
-                // boundaries (every 160 macroblocks = 4 h); intra-epoch
-                // macroblocks emit None. At 1M tracked nodes the full
-                // snapshot is ~60 MB per macroblock = ~57 GB/day if emitted
-                // every block — structurally infeasible. Epoch-only cadence
-                // shrinks the on-chain footprint to ~600 MB/day (4 h × 6
-                // emissions/day × 25 MB compressed) with no loss of
-                // determinism: nodes that miss an intra-epoch snapshot
-                // reconstruct from the next epoch boundary + replay of the
-                // intervening commits/reveals (already on-chain).
-                //
-                // Boundary: `macroblock_height % EPOCH_MACROBLOCKS == 0`,
-                // where EPOCH_MACROBLOCKS = 160 (4 h × 3600 s / 90 s/mb).
-                // First macroblock of the chain (mb_height=0) is included
-                // so a fresh super-node always gets a starting baseline.
+                // v31.4+v31.9: reputation snapshot with delta encoding.
+                // Full snapshot every FULL_SNAPSHOT_EVERY_K_EPOCHS epochs;
+                // intra-K-epoch boundaries emit a delta vs the last full.
+                // Non-epoch-boundary macroblocks emit None.
                 reputation_snapshot: {
                     const EPOCH_MACROBLOCKS: u64 = 160;
+                    const FULL_SNAPSHOT_EVERY_K_EPOCHS: u64 = 24; // ~ once per 24 epochs (~4 days)
                     let is_epoch_boundary = macroblock_height == 0
                         || macroblock_height % EPOCH_MACROBLOCKS == 0;
                     if is_epoch_boundary {
+                        let epoch_index = macroblock_height / EPOCH_MACROBLOCKS;
+                        let want_full = macroblock_height == 0
+                            || epoch_index % FULL_SNAPSHOT_EVERY_K_EPOCHS == 0;
                         if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                            let rep_state = rep_arc.read();
-                            Some(rep_state.create_snapshot())
+                            let mut rep_state = rep_arc.write();
+                            if want_full {
+                                Some(rep_state.create_full_snapshot_bytes())
+                            } else {
+                                // Falls back to full bytes if no base cached.
+                                Some(rep_state.create_delta_or_full_snapshot_bytes())
+                            }
                         } else {
                             None
                         }
@@ -31973,13 +31855,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
             
-            // v2.24: Apply reputation snapshot from macroblock
+            // v31.9: Apply snapshot payload (Full or Delta) from macroblock.
             if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
                 if !snapshot_data.is_empty() {
                     if let Some(ref p2p) = self.unified_p2p {
                         if let Some(rep_arc) = p2p.get_deterministic_reputation() {
                             let mut rep_state = rep_arc.write();
-                            match rep_state.apply_snapshot(snapshot_data) {
+                            match rep_state.apply_snapshot_payload(snapshot_data, index) {
                                 Ok(count) => {
                                     if is_info() {
                                         println!("[INFO][MB-SYNC] snapshot_applied nodes={}", count);

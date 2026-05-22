@@ -8708,12 +8708,8 @@ impl Storage {
         // IPFS fast path preserved: ipfs_cid + IPFS_ENABLED short-circuits
         // to the gateway, bypassing peer fan-out. O(active_peers) discovery.
 
-        // ── Phase 1: discover snapshot offerings (v31: parallel fan-out) ──
-        // Legacy serial loop took O(N × http_rtt) — at 5 genesis × 200 ms RTT
-        // that is 1 s of discovery before any chunk fetch could start. With
-        // N growing toward the eligible-set cap (1000), serial discovery
-        // would dominate cold-start latency. Parallel `join_all` fans every
-        // peer query out concurrently; total time = max(rtt) regardless of N.
+        // v31.5: Phase 1 discovery — parallel fan-out via join_all.
+        // Cost = max(rtt) regardless of peer count.
         let mut best_height = 0u64;
         let mut peer_heights: Vec<(String, u64)> = Vec::new();
 

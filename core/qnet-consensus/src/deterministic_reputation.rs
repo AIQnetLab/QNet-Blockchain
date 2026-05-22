@@ -19,7 +19,7 @@ use sha3::{Sha3_256, Digest};
 
 /// Complete reputation snapshot for blockchain storage
 /// Includes all state: reputations, jails, bans, offense counts
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FullReputationSnapshot {
     /// Node reputations (0-100%)
     pub reputations: HashMap<String, f64>,
@@ -33,6 +33,41 @@ pub struct FullReputationSnapshot {
     pub last_passive_recovery: HashMap<String, u64>,
     /// Processed rotation numbers (prevents double-counting)
     pub processed_rotations: HashSet<u64>,
+}
+
+/// v31.9: delta vs last full snapshot. Carries only entries that changed,
+/// keeping intra-K-epoch boundaries small at hundreds of thousands of nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeltaReputationSnapshot {
+    /// Reputation entries that differ from base.
+    pub reputations_changed: HashMap<String, f64>,
+    /// Node IDs removed from reputations (rare; mostly never).
+    pub reputations_removed: HashSet<String>,
+    /// Jail entries added since base.
+    pub jails_added: HashMap<String, (u64, u32)>,
+    /// Jail entries removed (released) since base.
+    pub jails_removed: HashSet<String>,
+    /// Permanent bans added since base.
+    pub bans_added: HashSet<String>,
+    /// Offense-count entries changed since base.
+    pub offense_counts_changed: HashMap<String, u32>,
+    /// Last-recovery entries changed since base.
+    pub last_passive_recovery_changed: HashMap<String, u64>,
+    /// Rotation numbers newly processed since base.
+    pub processed_rotations_added: HashSet<u64>,
+}
+
+/// v31.9: wire envelope so apply-side can distinguish full vs delta.
+/// Legacy raw-FullReputationSnapshot bincode is detected as a fallback
+/// in apply_snapshot for backward compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReputationSnapshotPayload {
+    Full(FullReputationSnapshot),
+    Delta {
+        /// Macroblock index of the base full snapshot this delta extends.
+        base_macroblock: u64,
+        delta: DeltaReputationSnapshot,
+    },
 }
 
 // ============================================================================
@@ -426,6 +461,18 @@ pub struct DeterministicReputationState {
     /// Processed rotation numbers (to handle out-of-order blocks)
     /// Prevents double-counting reputation for same rotation
     processed_rotations: HashSet<u64>,
+
+    /// v31.9: cached base for delta encoding (last full snapshot we EMITTED).
+    /// Updated by create_full_snapshot_bytes; used by create_delta_or_full
+    /// to diff. None ⇒ no base yet, callers fall back to full emission.
+    last_emitted_full: Option<FullReputationSnapshot>,
+    /// v31.9: cached base for delta decoding (last full we APPLIED).
+    /// Updated by apply_snapshot when a Full payload lands. None ⇒ next
+    /// delta is rejected; receiver waits for the next full.
+    last_applied_full: Option<FullReputationSnapshot>,
+    /// v31.9: macroblock index of the base full snapshot above. Used to
+    /// reject mis-paired deltas (delta.base_macroblock must match).
+    last_applied_full_mb: u64,
 }
 
 impl DeterministicReputationState {
@@ -440,6 +487,9 @@ impl DeterministicReputationState {
             last_macroblock: 0,
             last_passive_recovery: HashMap::new(),
             processed_rotations: HashSet::new(),
+            last_emitted_full: None,
+            last_applied_full: None,
+            last_applied_full_mb: 0,
         }
     }
     
@@ -690,6 +740,149 @@ impl DeterministicReputationState {
         };
         bincode::serialize(&snapshot).unwrap_or_default()
     }
+
+    /// v31.9: snapshot current state as a FullReputationSnapshot value
+    /// (no serialization). Used to update the in-RAM base cache.
+    fn current_full(&self) -> FullReputationSnapshot {
+        FullReputationSnapshot {
+            reputations: self.reputations.clone(),
+            active_jails: self.active_jails.clone(),
+            permanent_bans: self.permanent_bans.clone(),
+            offense_counts: self.offense_counts.clone(),
+            last_passive_recovery: self.last_passive_recovery.clone(),
+            processed_rotations: self.processed_rotations.clone(),
+        }
+    }
+
+    /// v31.9: emit a Full payload, refresh the local base, return bincode bytes.
+    pub fn create_full_snapshot_bytes(&mut self) -> Vec<u8> {
+        let full = self.current_full();
+        self.last_emitted_full = Some(full.clone());
+        bincode::serialize(&ReputationSnapshotPayload::Full(full)).unwrap_or_default()
+    }
+
+    /// v31.9: emit a Delta payload vs last_emitted_full. If no base cached,
+    /// emit a Full instead (refreshing the base).
+    pub fn create_delta_or_full_snapshot_bytes(&mut self) -> Vec<u8> {
+        let base = match self.last_emitted_full.clone() {
+            Some(b) => b,
+            None => return self.create_full_snapshot_bytes(),
+        };
+
+        let mut delta = DeltaReputationSnapshot::default();
+
+        for (k, v) in &self.reputations {
+            match base.reputations.get(k) {
+                Some(prev) if (prev - v).abs() < f64::EPSILON => {}
+                _ => { delta.reputations_changed.insert(k.clone(), *v); }
+            }
+        }
+        for k in base.reputations.keys() {
+            if !self.reputations.contains_key(k) {
+                delta.reputations_removed.insert(k.clone());
+            }
+        }
+        for (k, v) in &self.active_jails {
+            if base.active_jails.get(k) != Some(v) {
+                delta.jails_added.insert(k.clone(), *v);
+            }
+        }
+        for k in base.active_jails.keys() {
+            if !self.active_jails.contains_key(k) {
+                delta.jails_removed.insert(k.clone());
+            }
+        }
+        for k in &self.permanent_bans {
+            if !base.permanent_bans.contains(k) {
+                delta.bans_added.insert(k.clone());
+            }
+        }
+        for (k, v) in &self.offense_counts {
+            if base.offense_counts.get(k) != Some(v) {
+                delta.offense_counts_changed.insert(k.clone(), *v);
+            }
+        }
+        for (k, v) in &self.last_passive_recovery {
+            if base.last_passive_recovery.get(k) != Some(v) {
+                delta.last_passive_recovery_changed.insert(k.clone(), *v);
+            }
+        }
+        for r in &self.processed_rotations {
+            if !base.processed_rotations.contains(r) {
+                delta.processed_rotations_added.insert(*r);
+            }
+        }
+
+        // base_macroblock = last_macroblock indexes the base we diff against;
+        // the macroblock that EMITS this delta is the next epoch boundary.
+        bincode::serialize(&ReputationSnapshotPayload::Delta {
+            base_macroblock: self.last_macroblock,
+            delta,
+        }).unwrap_or_default()
+    }
+
+    /// v31.9+v31.11: apply a delta on top of last_applied_full.
+    /// Rejects if no cached base OR if the delta's base_macroblock does
+    /// not match the cached one — prevents silent state corruption when
+    /// a validator missed a Full snapshot.
+    fn apply_delta(&mut self, base_macroblock: u64, delta: DeltaReputationSnapshot) -> Result<usize, String> {
+        if self.last_applied_full.is_none() {
+            return Err(format!("delta_without_base mb={}", base_macroblock));
+        }
+        if base_macroblock != self.last_applied_full_mb {
+            return Err(format!(
+                "delta_base_mismatch want={} got={}",
+                self.last_applied_full_mb, base_macroblock
+            ));
+        }
+
+        for (k, v) in delta.reputations_changed { self.reputations.insert(k, v); }
+        for k in delta.reputations_removed { self.reputations.remove(&k); }
+        for (k, v) in delta.jails_added { self.active_jails.insert(k, v); }
+        for k in delta.jails_removed { self.active_jails.remove(&k); }
+        for k in delta.bans_added { self.permanent_bans.insert(k); }
+        for (k, v) in delta.offense_counts_changed { self.offense_counts.insert(k, v); }
+        for (k, v) in delta.last_passive_recovery_changed { self.last_passive_recovery.insert(k, v); }
+        for r in delta.processed_rotations_added { self.processed_rotations.insert(r); }
+
+        Ok(self.reputations.len())
+    }
+
+    /// v31.9: parse + apply a snapshot payload (Full or Delta). Falls back
+    /// to legacy FullReputationSnapshot and then to bare-HashMap format.
+    pub fn apply_snapshot_payload(&mut self, snapshot_data: &[u8], macroblock_height: u64) -> Result<usize, String> {
+        if snapshot_data.is_empty() {
+            return Err("Empty snapshot data".to_string());
+        }
+        if let Ok(payload) = bincode::deserialize::<ReputationSnapshotPayload>(snapshot_data) {
+            match payload {
+                ReputationSnapshotPayload::Full(full) => {
+                    let count = full.reputations.len();
+                    self.reputations = full.reputations.clone();
+                    self.active_jails = full.active_jails.clone();
+                    self.permanent_bans = full.permanent_bans.clone();
+                    self.offense_counts = full.offense_counts.clone();
+                    self.last_passive_recovery = full.last_passive_recovery.clone();
+                    self.processed_rotations = full.processed_rotations.clone();
+                    self.last_applied_full = Some(full);
+                    self.last_applied_full_mb = macroblock_height;
+                    println!("[INFO][REPUTATION] applied_full nodes={} jails={} bans={} mb={}",
+                             count, self.active_jails.len(), self.permanent_bans.len(), macroblock_height);
+                    return Ok(count);
+                }
+                ReputationSnapshotPayload::Delta { base_macroblock, delta } => {
+                    let res = self.apply_delta(base_macroblock, delta);
+                    if let Ok(count) = res {
+                        println!("[INFO][REPUTATION] applied_delta nodes={} base_mb={} mb={}",
+                                 count, base_macroblock, macroblock_height);
+                    }
+                    return res;
+                }
+            }
+        }
+        // Fallback: legacy raw FullReputationSnapshot
+        self.apply_snapshot(snapshot_data)
+    }
     
     /// Apply FULL reputation snapshot from macroblock (AUTHORITATIVE)
     /// This OVERWRITES ALL local state with blockchain-verified values
@@ -698,22 +891,43 @@ impl DeterministicReputationState {
         if snapshot_data.is_empty() {
             return Err("Empty snapshot data".to_string());
         }
-        
-        // Try new full format first
+
+        // v31.9: try wire envelope (Full/Delta) first.
+        if let Ok(payload) = bincode::deserialize::<ReputationSnapshotPayload>(snapshot_data) {
+            if let ReputationSnapshotPayload::Full(full) = payload {
+                let count = full.reputations.len();
+                self.reputations = full.reputations.clone();
+                self.active_jails = full.active_jails.clone();
+                self.permanent_bans = full.permanent_bans.clone();
+                self.offense_counts = full.offense_counts.clone();
+                self.last_passive_recovery = full.last_passive_recovery.clone();
+                self.processed_rotations = full.processed_rotations.clone();
+                self.last_applied_full = Some(full);
+                println!("[INFO][REPUTATION] applied_full_envelope nodes={} jails={} bans={}",
+                         count, self.active_jails.len(), self.permanent_bans.len());
+                return Ok(count);
+            }
+            // Delta payload without explicit macroblock context — reject;
+            // callers should use apply_snapshot_payload for delta support.
+            return Err("delta_payload_requires_context".to_string());
+        }
+
+        // Try legacy raw FullReputationSnapshot format
         if let Ok(full_snapshot) = bincode::deserialize::<FullReputationSnapshot>(snapshot_data) {
             let count = full_snapshot.reputations.len();
-            
+
             // Apply ALL state
-            self.reputations = full_snapshot.reputations;
-            self.active_jails = full_snapshot.active_jails;
-            self.permanent_bans = full_snapshot.permanent_bans;
-            self.offense_counts = full_snapshot.offense_counts;
-            self.last_passive_recovery = full_snapshot.last_passive_recovery;
-            self.processed_rotations = full_snapshot.processed_rotations;
-            
-            println!("[REPUTATION] 📸 Applied FULL snapshot: {} nodes, {} jailed, {} banned", 
+            self.reputations = full_snapshot.reputations.clone();
+            self.active_jails = full_snapshot.active_jails.clone();
+            self.permanent_bans = full_snapshot.permanent_bans.clone();
+            self.offense_counts = full_snapshot.offense_counts.clone();
+            self.last_passive_recovery = full_snapshot.last_passive_recovery.clone();
+            self.processed_rotations = full_snapshot.processed_rotations.clone();
+            self.last_applied_full = Some(full_snapshot);
+
+            println!("[INFO][REPUTATION] applied_legacy_full nodes={} jails={} bans={}",
                      count, self.active_jails.len(), self.permanent_bans.len());
-            
+
             return Ok(count);
         }
         
@@ -772,7 +986,7 @@ impl DeterministicReputationState {
     pub fn get_jail_info(&self, node_id: &str) -> Option<(u64, u32)> {
         self.active_jails.get(node_id).cloned()
     }
-    
+
     // ========================================================================
     // SCALABILITY: Batch operations and statistics
     // ========================================================================

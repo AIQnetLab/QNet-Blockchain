@@ -97,34 +97,20 @@ static HASH_CHAIN_BREAK_WITNESSES: once_cell::sync::Lazy<
     dashmap::DashMap<u64, DashSet<String>>
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
-// v31: RECENT_BLOCK_HASHES — RAM cache of (height → block.hash()) for the
-// verify-stage parent-block lookup. Apply-stage populates this immediately
-// after a microblock is durably saved; verify-stage reads from here BEFORE
-// touching RocksDB. Eliminates the cascade observed at h=7611 where verify's
-// `load_microblock_auto_format(parent_h)` blocked on the LSM read lock while
-// apply-stage was writing the same column family during a macroblock-burst —
-// the exact failure mode documented at the verify_load_prev_block log site.
-// Bounded LRU (RECENT_BLOCK_HASHES_MAX) — only the last ≥2 epochs (~28800
-// blocks) need fast lookup; deeper history falls through to RocksDB which is
-// off the hot path. O(1) DashMap; ~40 bytes/entry; ~1.2 MB at cap.
+// v31.1: height→hash RAM cache. Verify reads parent hash here before
+// RocksDB, dodging LSM-read contention with concurrent apply writes.
+// Bounded LRU; deeper history falls back to disk on miss. ~1.2 MB at cap.
 const RECENT_BLOCK_HASHES_MAX: usize = 30_000;
 pub static RECENT_BLOCK_HASHES: once_cell::sync::Lazy<
     dashmap::DashMap<u64, [u8; 32]>
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
-/// Record a microblock's canonical hash so subsequent verify-stage chain
-/// checks can resolve `previous_hash` without a RocksDB read. Called by the
-/// apply-stage right after the block is committed; producer self-save and
-/// genesis-init paths also call this to keep the cache warm from the very
-/// first microblock.
+/// Cache parent hash after apply commit / verify success / self-save.
 #[inline]
 pub fn cache_block_hash(height: u64, hash: [u8; 32]) {
     RECENT_BLOCK_HASHES.insert(height, hash);
-    // Lock-free LRU: trim when the map exceeds the cap by removing the
-    // oldest height (lowest u64). Single eviction per insert keeps the cap
-    // soft but bounded; never blocks the apply hot path.
-    let len = RECENT_BLOCK_HASHES.len();
-    if len > RECENT_BLOCK_HASHES_MAX {
+    // LRU trim by lowest height when over cap.
+    if RECENT_BLOCK_HASHES.len() > RECENT_BLOCK_HASHES_MAX {
         let mut min_h = u64::MAX;
         for entry in RECENT_BLOCK_HASHES.iter() {
             let h = *entry.key();
@@ -136,9 +122,7 @@ pub fn cache_block_hash(height: u64, hash: [u8; 32]) {
     }
 }
 
-/// Fast in-memory lookup for the parent-block hash. Returns None on cache
-/// miss — caller falls back to a RocksDB read (cold path). Used by the
-/// verify stage's chain-continuity check to bypass the LSM contention point.
+/// O(1) RAM lookup for parent hash; None ⇒ caller falls back to RocksDB.
 #[inline]
 pub fn lookup_block_hash(height: u64) -> Option<[u8; 32]> {
     RECENT_BLOCK_HASHES.get(&height).map(|e| *e.value())
@@ -1469,19 +1453,9 @@ impl BlockPipeline {
                 metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_LOAD_PREV);
                 let parent_h = mb.height - 1;
 
-                // v31: parent-hash resolution with RAM-cache fast path.
-                // Apply-stage populates RECENT_BLOCK_HASHES the moment a block
-                // is committed; verify-stage reads it BEFORE any RocksDB I/O.
-                // Closes the verify↔apply LSM-lock contention class that froze
-                // the network at h=7611 (op=verify:load_prev_block, 23 h stuck).
-                // Cold path (cache miss → RocksDB) is rare: only when parent
-                // is deeper than RECENT_BLOCK_HASHES_MAX (~30k blocks) AND not
-                // yet backfilled by an earlier sync of the same height.
-                //
-                // load_result mirrors the legacy three-state outcome:
-                //   Ok(Some(prev_hash))  — resolved (RAM or disk), hash compared
-                //   Ok(None)             — parent missing → defer
-                //   Err(_)               — disk failure → drop
+                // v31.1: parent-hash from RAM cache; fall back to RocksDB on miss.
+                // load_result: Ok(Some) resolved, Ok(None) parent missing (defer),
+                // Err disk failure (drop). Backfill on disk-hit keeps cache warm.
                 let load_start = std::time::Instant::now();
                 let load_result: Result<Option<[u8; 32]>, ()> = if let Some(cached) = lookup_block_hash(parent_h) {
                     Ok(Some(cached))
@@ -2048,15 +2022,8 @@ impl BlockPipeline {
 
             // All checks passed — forward to apply stage
             let block_height = decoded.height; // Copy before move
-            // v31: cache the verified block's canonical hash IMMEDIATELY so a
-            // subsequent verify of `block_height + 1` resolves its parent
-            // from RAM (DashMap O(1)) without ever touching RocksDB. The
-            // hash is deterministic from block content — caching here is
-            // sound even before apply-stage's save_microblock completes, and
-            // is the only ordering that keeps verify ahead of apply under
-            // pipelining (the cascade trigger at h=7611 happened precisely
-            // because verify of h+1 entered RocksDB while apply was still
-            // writing h, holding the LSM lock).
+            // v31.1: cache verified hash now so verify(h+1) hits RAM before
+            // apply finishes writing h. Hash is content-deterministic ⇒ safe.
             let verified_hash = decoded.microblock.hash();
             cache_block_hash(block_height, verified_hash);
 

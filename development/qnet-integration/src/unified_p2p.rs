@@ -19641,23 +19641,9 @@ impl SimplifiedP2P {
         // Update last_seen for requesting peer
         self.update_peer_last_seen(from_peer);
 
-        // v31: LEADER FAST-PATH — if THIS node is the expected producer for
-        // the upcoming slot, decline sync serving with an empty batch so the
-        // production loop is not starved by RocksDB I/O contention from bulk
-        // reads. The cascade at h=7611 was triggered by exactly this pattern:
-        // gen-004 was the elected producer for h=7611 AND simultaneously
-        // serving ~10 MB/s sync responses, which held the LSM read path
-        // against apply-stage writes (op=verify:load_prev_block stuck 23 h).
-        //
-        // Determinism: `get_expected_producer(local_h + 1)` is the canonical
-        // selection function used by all peers; the requester gets the empty
-        // batch and immediately retries against another peer (`empty_batch`
-        // path already exists below). Heartbeat/consensus paths are
-        // unaffected — they use separate channels, not handle_block_request.
-        //
-        // O(1) DashMap lookup; safe to call from ANY thread (no async await).
-        // No bypass via env-var: starvation is an architectural invariant for
-        // top-L1 leader fast-path, not a deployment toggle.
+        // v31.2: if I'm the next-slot producer, shed sync serving with an
+        // empty batch so my production loop keeps its RocksDB I/O budget.
+        // Requester retries another peer via existing empty_batch handling.
         let local_chain_height_now = LOCAL_BLOCKCHAIN_HEIGHT
             .load(std::sync::atomic::Ordering::Relaxed);
         let next_height = local_chain_height_now.saturating_add(1);
