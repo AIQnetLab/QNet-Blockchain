@@ -17447,8 +17447,22 @@ impl BlockchainNode {
                                     let _ = p2p.sync_macroblocks(
                                         missing_mb.saturating_sub(1), latest_mb,
                                     ).await;
-                                    let resync_from = next_height.saturating_sub(90);
-                                    let _ = p2p.sync_blocks(resync_from, next_height).await;
+                                    // v32.2: adaptive resync range. If gap to network tip > 90,
+                                    // request bulk forward range (up to 1000 blocks) instead of
+                                    // fixed backward 90-block tip window. Tip recovery only when close.
+                                    const BULK_CATCHUP_THRESHOLD: u64 = 90;
+                                    const BULK_CATCHUP_CHUNK: u64 = 1000;
+                                    let quorum_peak = p2p.get_max_peer_height();
+                                    let gap_to_tip = quorum_peak.saturating_sub(next_height);
+                                    if gap_to_tip > BULK_CATCHUP_THRESHOLD {
+                                        let bulk_to = next_height.saturating_add(gap_to_tip.min(BULK_CATCHUP_CHUNK));
+                                        println!("[INFO][SYNC] chronic_stall bulk_catchup from={} to={} gap={}",
+                                                 next_height, bulk_to, gap_to_tip);
+                                        let _ = p2p.sync_blocks(next_height, bulk_to).await;
+                                    } else {
+                                        let resync_from = next_height.saturating_sub(90);
+                                        let _ = p2p.sync_blocks(resync_from, next_height).await;
+                                    }
                                 }
                             }
                         }
@@ -18077,11 +18091,19 @@ impl BlockchainNode {
                                                 }
                                                 drop(global_h);
 
-                                                // Check if we've caught up (use lowered threshold matching fast sync trigger)
-                                                let new_target = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
+                                                // v32.1: re-verify network tip via authoritative peer-quorum height
+                                                // before declaring sync complete. BEST_PEER_HEIGHT alone can lag
+                                                // attestation TTL; pull live quorum max so we don't exit early.
+                                                let best_atomic = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
+                                                let quorum_max = p2p_clone.get_max_peer_height();
+                                                let new_target = best_atomic.max(quorum_max);
                                                 if current_from + 3 >= new_target {
-                                                    println!("[INFO][SYNC] fast_sync_complete h={} network={}", current_from, new_target);
+                                                    println!("[INFO][SYNC] fast_sync_complete h={} network={} (quorum={})",
+                                                             current_from, new_target, quorum_max);
                                                     break;
+                                                }
+                                                if new_target > best_atomic {
+                                                    crate::unified_p2p::BEST_PEER_HEIGHT.store(new_target, Ordering::Release);
                                                 }
 
                                                 // Advance from for next batch
@@ -18641,9 +18663,11 @@ impl BlockchainNode {
                     }
                 }
 
-                // v11.0: HARD GATE — no production while sync in progress
-                // Prevents producing blocks at stale height while sync is still running.
-                // Node must be fully synchronized AND production unlocked (first network block received).
+                // v11.0+v32.3: HARD GATE — no production while not synced.
+                // v32.3 addition: if local is far behind quorum peer max, trigger
+                // CHRONIC_STALL_REQUESTED so the bulk catch-up handler engages on
+                // next iteration. Without this, the gate just blocks forever
+                // waiting for sync that no path is driving.
                 if is_my_turn_to_produce {
                     let sync_active = coordinator_is_syncing();
                     let prod_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
@@ -18655,6 +18679,32 @@ impl BlockchainNode {
                                      next_block_height, sync_active, prod_unlocked, node_synced);
                         }
                         is_my_turn_to_produce = false;
+
+                        // v32.3: when blocked due to !node_synced, drive bulk catch-up.
+                        if !node_synced && !sync_active {
+                            if let Some(ref p2p) = unified_p2p {
+                                let local_h = next_block_height.saturating_sub(1);
+                                let quorum_peak = p2p.get_max_peer_height();
+                                const PROD_GATE_BULK_GAP: u64 = 50;
+                                if quorum_peak > local_h + PROD_GATE_BULK_GAP {
+                                    static LAST_GATE_BULK_TRIGGER: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    const GATE_BULK_COOLDOWN_SECS: u64 = 30;
+                                    let now_u64 = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs()).unwrap_or(0);
+                                    let last = LAST_GATE_BULK_TRIGGER.load(Ordering::Relaxed);
+                                    if now_u64.saturating_sub(last) >= GATE_BULK_COOLDOWN_SECS {
+                                        LAST_GATE_BULK_TRIGGER.store(now_u64, Ordering::Relaxed);
+                                        CHRONIC_STALL_REQUESTED.store(true, Ordering::Relaxed);
+                                        if is_info() {
+                                            println!("[INFO][PROD] catchup_requested local={} quorum={} gap={}",
+                                                     local_h, quorum_peak, quorum_peak - local_h);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 

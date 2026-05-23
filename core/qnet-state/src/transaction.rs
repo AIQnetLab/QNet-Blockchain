@@ -1339,10 +1339,11 @@ impl Transaction {
                     }
                 }
                 
-                // Validate each sample (v31.7: structural cryptographic bounds).
-                // Chain-state binding (sample.block_height must reference a real
-                // local block) is enforced at the eligibility-gate, not here,
-                // because mempool admission has no storage handle.
+                // Structural sample sanity. Crypto verification (Dilithium sig
+                // + merkle replay vs merkle_root) runs at the eligibility gate
+                // where the chain-state handle is available; admission must
+                // not whitelist signature formats — that job belongs to the
+                // verify-stage dispatcher.
                 for sample in heartbeat_samples {
                     if sample.heartbeat_index >= 10 {
                         return Err(format!("[REJECT][TX] invalid_heartbeat_index value={}", sample.heartbeat_index));
@@ -1350,28 +1351,17 @@ impl Transaction {
                     if sample.block_height < *window_start_height || sample.block_height > *window_end_height {
                         return Err(format!("[REJECT][TX] heartbeat_sample_outside_window block_height={} start={} end={}", sample.block_height, window_start_height, window_end_height));
                     }
-                    // v31.7: signature must look like a hybrid Dilithium3+Ed25519
-                    // payload; same prefix/length envelope as verify_consensus_signature.
-                    if sample.signature.len() < 100 || sample.signature.len() > 18_000 {
+                    // DoS-bound only: payload envelope ~5KB; cap generous.
+                    if sample.signature.len() < 64 || sample.signature.len() > 32_768 {
                         return Err(format!(
                             "[REJECT][TX] heartbeat_sample_signature_size len={}",
                             sample.signature.len()
                         ));
                     }
-                    let sig_prefix_ok = sample.signature.starts_with("hybrid:")
-                        || sample.signature.starts_with("hybrid_bin:")
-                        || sample.signature.starts_with("compact:")
-                        || sample.signature.starts_with("compact_bin:")
-                        || sample.signature.starts_with("dilithium_sig_");
-                    if !sig_prefix_ok {
-                        return Err("[REJECT][TX] heartbeat_sample_signature_prefix_unknown".to_string());
-                    }
                     if sample.merkle_proof.is_empty() {
                         return Err("[REJECT][TX] heartbeat_sample_missing_merkle_proof".to_string());
                     }
-                    // v31.7: merkle proof depth bounded — 10 leaves cap at log2(10)≈4,
-                    // accept up to 16 to allow future heartbeat-tree growth without
-                    // letting unbounded proofs inflate TX size.
+                    // 10 leaves ⇒ tree depth ≤ 4; cap at 16 for future growth.
                     if sample.merkle_proof.len() > 16 {
                         return Err(format!(
                             "[REJECT][TX] heartbeat_sample_merkle_proof_too_deep depth={}",

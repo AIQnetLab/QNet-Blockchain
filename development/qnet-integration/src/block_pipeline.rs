@@ -2020,12 +2020,10 @@ impl BlockPipeline {
                 }
             }
 
-            // All checks passed — forward to apply stage
-            let block_height = decoded.height; // Copy before move
-            // v31.1: cache verified hash now so verify(h+1) hits RAM before
-            // apply finishes writing h. Hash is content-deterministic ⇒ safe.
-            let verified_hash = decoded.microblock.hash();
-            cache_block_hash(block_height, verified_hash);
+            // All checks passed — forward to apply stage.
+            // v32.5: cache populated only on apply-commit, never at verify —
+            // uncommitted view-change candidates must not poison the RAM cache.
+            let block_height = decoded.height;
 
             let verified = VerifiedBlock {
                 height: block_height,
@@ -2380,6 +2378,10 @@ impl BlockPipeline {
                             height,
                             &block.microblock,
                         );
+
+                        // v32.5: publish canonical parent-hash to RAM cache only
+                        // after RocksDB commit — invariant cache == storage.
+                        cache_block_hash(height, block.microblock.hash());
 
                         // ═══════════════════════════════════════════════════════
                         // v25 H9: VALIDATOR LIVENESS — SUCCESS PATH
