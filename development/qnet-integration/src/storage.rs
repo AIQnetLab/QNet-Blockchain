@@ -3974,7 +3974,18 @@ impl Storage {
         batch.put_cf(&metadata_cf, hash_key.as_bytes(), block_hash.as_slice());
         batch.put_cf(&metadata_cf, fmt_key.as_bytes(), &[0x02u8]); // 0x02 = EfficientMicroBlock
         batch.put_cf(&poh_cf, poh_key.as_bytes(), &poh_data);
-        self.persistent.db.write(batch)?;
+        // v32.7: WAL-disabled during catch-up for ~10× apply throughput.
+        // Periodic flush every 500 blocks bounds at-risk window on crash.
+        if crate::node::FAST_SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut wopts = rocksdb::WriteOptions::default();
+            wopts.disable_wal(true);
+            self.persistent.db.write_opt(batch, &wopts)?;
+            if height % 500 == 0 {
+                let _ = self.persistent.db.flush();
+            }
+        } else {
+            self.persistent.db.write(batch)?;
+        }
         
         // Log savings for monitoring (every 100 blocks)
         if height % 100 == 0 {
@@ -3990,6 +4001,12 @@ impl Storage {
     
     pub fn load_microblock(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
         self.persistent.load_microblock(height)
+    }
+
+    /// v32.7: durable flush — used by fast-sync exit path to persist
+    /// WAL-disabled writes accumulated during catch-up.
+    pub fn flush_db(&self) {
+        let _ = self.persistent.db.flush();
     }
 
     /// v10.2: O(1) microblock hash lookup from index.
@@ -7176,18 +7193,12 @@ impl Storage {
     /// reconciler alike. Runs on the blocking pool (seconds at 1M+
     /// accounts); a real delta path is future work.
     pub async fn create_incremental_snapshot(&self, height: u64) -> IntegrationResult<()> {
-        // Match the apply-stage trigger (block_pipeline.rs) — both must
-        // reference the same constant or boundaries diverge silently.
-        const INCREMENTAL_INTERVAL: u64 = 3_600;
-
-        // Not a snapshot boundary — nothing to do.
-        if height == 0 || height % INCREMENTAL_INTERVAL != 0 {
+        // v32.6: caller (node.rs) controls trigger heights — early anchor
+        // at h=90 + baseline every 3600. This function only enforces
+        // height>0; it always writes a full state snapshot when called.
+        if height == 0 {
             return Ok(());
         }
-
-        // Always write a full state snapshot at the boundary so the
-        // canonical `full_snap_{height}` key exists for every consumer
-        // (snapshot sync, snapshot_root binding, rollback reconcile).
         self.create_state_snapshot(height).await
     }
     

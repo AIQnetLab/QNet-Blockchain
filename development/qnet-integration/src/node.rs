@@ -17820,10 +17820,15 @@ impl BlockchainNode {
                 // Mode 2: gap <= 10 → LIVE SYNC (ShredProtocol real-time blocks)
                 // No more one-shot downloads or emergency sync.
 
-                // DEADLOCK PROTECTION: Guard that automatically clears sync flag on drop
-                struct FastSyncGuard;
+                // DEADLOCK PROTECTION: Guard auto-clears sync flag on drop.
+                // v32.7: also flushes RocksDB so any WAL-disabled writes from
+                // catch-up are persisted before normal-mode writes resume.
+                struct FastSyncGuard {
+                    storage: Arc<Storage>,
+                }
                 impl Drop for FastSyncGuard {
                     fn drop(&mut self) {
+                        self.storage.flush_db();
                         FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                         FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
                         SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
@@ -17933,40 +17938,62 @@ impl BlockchainNode {
                                 let height_clone = height.clone();
 
                                 tokio::spawn(async move {
-                                    let _guard = FastSyncGuard;
+                                    let _guard = FastSyncGuard { storage: storage_clone.clone() };
 
-                                    // v31.5: runtime snapshot fast-path. If gap exceeds
-                                    // threshold (~25 min behind), try snapshot replay first;
-                                    // fall through to block-by-block on any failure.
+                                    // v31.5+v32.8: snapshot fast-path. Cold-start (sync_from=0)
+                                    // retries up to ~5 min waiting for the first network anchor
+                                    // (v32.6 makes that h=90 ≈ 90 s); warm gap > threshold tries
+                                    // once. Either way falls through to block-by-block on failure.
                                     const RUNTIME_SNAPSHOT_GAP_THRESHOLD: u64 = 1_500;
                                     if sync_from_height == 0 || height_difference > RUNTIME_SNAPSHOT_GAP_THRESHOLD {
+                                        let cold_start = sync_from_height == 0;
+                                        let max_retries: u32 = if cold_start { 30 } else { 1 };
+                                        let retry_delay = Duration::from_secs(10);
                                         if is_info() {
                                             println!(
-                                                "[INFO][SYNC] runtime_snapshot_try gap={} threshold={} target={}",
-                                                height_difference, RUNTIME_SNAPSHOT_GAP_THRESHOLD, network_height,
+                                                "[INFO][SYNC] runtime_snapshot_try gap={} threshold={} target={} cold_start={}",
+                                                height_difference, RUNTIME_SNAPSHOT_GAP_THRESHOLD,
+                                                network_height, cold_start,
                                             );
                                         }
-                                        match storage_clone.fast_sync_with_snapshot(&p2p_clone, network_height).await {
-                                            Ok(()) => {
-                                                let new_local = storage_clone.get_chain_height().unwrap_or(sync_from_height);
-                                                if new_local + 1 > sync_from_height {
-                                                    sync_from_height = new_local + 1;
-                                                    *height_clone.write().await = new_local;
-                                                    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                                        new_local, std::sync::atomic::Ordering::Release,
-                                                    );
-                                                    println!(
-                                                        "[INFO][SYNC] runtime_snapshot_loaded h={} skipped={} sync_from={}",
-                                                        new_local, new_local.saturating_sub(microblock_height), sync_from_height,
-                                                    );
+                                        let mut snapshot_loaded = false;
+                                        for attempt in 1..=max_retries {
+                                            match storage_clone.fast_sync_with_snapshot(&p2p_clone, network_height).await {
+                                                Ok(()) => {
+                                                    let new_local = storage_clone.get_chain_height().unwrap_or(sync_from_height);
+                                                    if new_local + 1 > sync_from_height {
+                                                        sync_from_height = new_local + 1;
+                                                        *height_clone.write().await = new_local;
+                                                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                                            new_local, std::sync::atomic::Ordering::Release,
+                                                        );
+                                                        println!(
+                                                            "[INFO][SYNC] runtime_snapshot_loaded h={} skipped={} sync_from={} attempt={}",
+                                                            new_local, new_local.saturating_sub(microblock_height),
+                                                            sync_from_height, attempt,
+                                                        );
+                                                    }
+                                                    snapshot_loaded = true;
+                                                    break;
                                                 }
-                                            }
-                                            Err(e) => {
-                                                if is_info() {
-                                                    println!("[INFO][SYNC] runtime_snapshot_unavailable reason={:?} fallback=block_sync", e);
+                                                Err(e) if cold_start && attempt < max_retries => {
+                                                    if is_info() {
+                                                        println!(
+                                                            "[INFO][SYNC] cold_start_snapshot_wait attempt={}/{} reason={:?}",
+                                                            attempt, max_retries, e,
+                                                        );
+                                                    }
+                                                    tokio::time::sleep(retry_delay).await;
+                                                }
+                                                Err(e) => {
+                                                    if is_info() {
+                                                        println!("[INFO][SYNC] runtime_snapshot_unavailable reason={:?} fallback=block_sync", e);
+                                                    }
+                                                    break;
                                                 }
                                             }
                                         }
+                                        let _ = snapshot_loaded;
                                     }
 
                                     // v5.5: Sync genesis block separately if chain is empty
@@ -21923,8 +21950,12 @@ impl BlockchainNode {
                         println!("[INFO][EPOCH] complete epoch={} h={}", microblock_height / 90, microblock_height);
                     }
                     
-                    // PRODUCTION: Create incremental snapshots every 1 hour (3,600 blocks), full every 12 hours (43,200 blocks)
-                    if microblock_height % SNAPSHOT_INCREMENTAL_INTERVAL == 0 && microblock_height > 0 {
+                    // v32.6: early anchor at h=90 so cold-start joiners can use
+                    // state-sync immediately; subsequent snapshots on baseline interval.
+                    let early_anchor = microblock_height == 90;
+                    let baseline_due = microblock_height % SNAPSHOT_INCREMENTAL_INTERVAL == 0
+                        && microblock_height > 0;
+                    if early_anchor || baseline_due {
                         // Create snapshot synchronously (avoids Send issues with RocksDB)
                         // This is fast enough to not block production
                         match storage.create_incremental_snapshot(microblock_height).await {
