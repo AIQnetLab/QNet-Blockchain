@@ -29150,76 +29150,42 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // emits regular macroblocks backed by 2f+1 reveals.
                 is_skip_marker: false,
                 skip_certificate: None,
-                // Populate snapshot_root only at snapshot boundaries (every
-                // SNAPSHOT_INCREMENTAL_INTERVAL microblocks). Storage keys
-                // snapshots by microblock height, so round_number (=mb_idx)
-                // must be translated to mb_idx*90 or every lookup returns None
-                // and the binding never activates. Deterministic
-                // materialisation → identical digest, endorsed by the 2f+1
-                // commit-reveal → trustless bootstrap anchor. Race window: the
-                // snapshot task may still be running at MB construction, so
-                // poll the store (≤30×100ms=3s) before the legacy fallback;
-                // non-boundary macroblocks skip the lookup.
+                // v32.9: Pattern C — snapshot_root commits to canonical state
+                // root (deterministic hash of accounts CF) instead of opaque
+                // SHA3-of-bytes. No poll wait — root is computed inline from
+                // RocksDB which is already at this height. Scales to 100M
+                // accounts because state iteration runs once on producer
+                // (apply already done) and once on joiner (post-apply verify).
+                // Gates at v32.6 anchor (h=90) and every SNAPSHOT_INCREMENTAL_INTERVAL.
                 snapshot_root: {
                     const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
+                    const EARLY_ANCHOR_HEIGHT: u64 = 90;
                     let mb_end_height = consensus_data.round_number * 90;
-                    if mb_end_height > 0 && mb_end_height % SNAPSHOT_INCREMENTAL_INTERVAL == 0 {
-                        let mut snapshot_bytes_opt: Option<Vec<u8>> = None;
-                        let mut last_err: Option<String> = None;
-                        for attempt in 0..30u32 {
-                            match storage.get_snapshot_data(mb_end_height) {
-                                Ok(Some(bytes)) => {
-                                    snapshot_bytes_opt = Some(bytes);
-                                    break;
-                                }
-                                Ok(None) => {
-                                    if attempt < 29 {
-                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    last_err = Some(format!("{:?}", e));
-                                    break;
-                                }
-                            }
-                        }
-
-                        match snapshot_bytes_opt {
-                            Some(snapshot_bytes) => {
-                                use sha3::{Sha3_256, Digest};
-                                let mut hasher = Sha3_256::new();
-                                hasher.update(&snapshot_bytes);
-                                let mut digest = [0u8; 32];
-                                digest.copy_from_slice(&hasher.finalize());
+                    let is_anchor = mb_end_height > 0
+                        && (mb_end_height == EARLY_ANCHOR_HEIGHT
+                            || mb_end_height % SNAPSHOT_INCREMENTAL_INTERVAL == 0);
+                    if is_anchor {
+                        match storage.compute_canonical_state_root(mb_end_height) {
+                            Ok(root) => {
                                 if is_info() {
                                     println!(
-                                        "[INFO][MB] snapshot_root_bound h={} digest={} size_kb={}",
-                                        mb_end_height,
-                                        hex::encode(&digest[..8]),
-                                        snapshot_bytes.len() / 1024,
+                                        "[INFO][MB] snapshot_root_bound h={} root={} pattern=C",
+                                        mb_end_height, hex::encode(&root[..8]),
                                     );
                                 }
-                                Some(digest)
+                                Some(root)
                             }
-                            None => {
+                            Err(e) => {
                                 if is_warn() {
-                                    if let Some(err) = last_err {
-                                        println!(
-                                            "[WARN][MB] snapshot_root_read_failed h={} err={} mode=legacy_accept",
-                                            mb_end_height, err,
-                                        );
-                                    } else {
-                                        println!(
-                                            "[WARN][MB] snapshot_root_unavailable h={} mode=legacy_accept reason=race_window_exhausted",
-                                            mb_end_height,
-                                        );
-                                    }
+                                    println!(
+                                        "[WARN][MB] canonical_root_compute_failed h={} err={:?} mode=legacy_accept",
+                                        mb_end_height, e,
+                                    );
                                 }
                                 None
                             }
                         }
                     } else {
-                        // Non-boundary macroblock — no snapshot expected at this height.
                         None
                     }
                 },

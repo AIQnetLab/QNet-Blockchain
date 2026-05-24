@@ -8686,6 +8686,43 @@ impl Storage {
         if latest_height > 0 { Ok(Some(latest_height)) } else { Ok(None) }
     }
     
+    /// v32.9: Canonical state root computed from accounts CF in RocksDB.
+    /// Deterministic across nodes — every honest node hashes the same
+    /// sorted (key, value) list domain-separated by height. Used for
+    /// snapshot consensus binding via Pattern C (state_root commitment
+    /// instead of opaque SHA3-of-bytes). Independent of in-memory
+    /// StateManager so verifier can compute after applying a downloaded
+    /// snapshot without re-initialising state.
+    pub fn compute_canonical_state_root(&self, height: u64) -> IntegrationResult<[u8; 32]> {
+        let accounts_cf = self.persistent.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let iter = self.persistent.db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            match item {
+                Ok((k, v)) => entries.push((k.to_vec(), v.to_vec())),
+                Err(e) => return Err(IntegrationError::StorageError(format!("canonical_root_iter_err: {}", e))),
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"QNET_CANONICAL_STATE_ROOT_V1:");
+        hasher.update(&height.to_le_bytes());
+        hasher.update(&(entries.len() as u64).to_le_bytes());
+        for (k, v) in &entries {
+            hasher.update(&(k.len() as u32).to_le_bytes());
+            hasher.update(k);
+            hasher.update(&(v.len() as u32).to_le_bytes());
+            hasher.update(v);
+        }
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&hasher.finalize());
+        Ok(root)
+    }
+
     /// Get raw snapshot data for P2P download (v2.19.12)
     /// Returns compressed binary snapshot data
     pub fn get_snapshot_data(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
@@ -8903,30 +8940,17 @@ impl Storage {
             }
         };
 
-        // Step 3: hash the locally-saved snapshot bytes.
-        let snapshot_bytes = match self.get_snapshot_data(snapshot_height)
-            .map_err(|e| IntegrationError::Other(format!("snapshot_read_err h={} err={:?}", snapshot_height, e)))?
-        {
-            Some(b) => b,
-            None => {
-                return Err(IntegrationError::Other(format!(
-                    "verifier_snapshot_data_missing_post_download h={}",
-                    snapshot_height,
-                )));
-            }
-        };
+        // v32.9 Pattern C: snapshot bytes have ALREADY been applied to the
+        // accounts CF by load_state_snapshot() upstream. We re-compute the
+        // canonical state root from RocksDB and compare to the macroblock's
+        // 2f+1-bound snapshot_root (which commits to the same canonical root).
+        let computed = self.compute_canonical_state_root(snapshot_height)
+            .map_err(|e| IntegrationError::Other(format!("canonical_root_compute_err h={} err={:?}", snapshot_height, e)))?;
 
-        use sha3::{Sha3_256, Digest};
-        let mut hasher = Sha3_256::new();
-        hasher.update(&snapshot_bytes);
-        let mut computed = [0u8; 32];
-        computed.copy_from_slice(&hasher.finalize());
-
-        // Step 4: constant-time-ish comparison and rollback on mismatch.
         if computed != expected_root {
-            // Rollback: erase the bad snapshot before returning so the
-            // caller's fall-through to block-by-block sync is not
-            // contaminated by attacker-controlled state.
+            // Rollback: erase the bad snapshot key. Note: applied accounts
+            // remain in RocksDB; caller must trigger block-by-block re-sync
+            // to overwrite from canonical chain.
             if let Some(snapshots_cf) = self.persistent.db.cf_handle("snapshots") {
                 for prefix in &["full_snap_", "state_snap_"] {
                     let key = format!("{}{}", prefix, snapshot_height);
@@ -8935,8 +8959,7 @@ impl Storage {
             }
             return Err(IntegrationError::Other(format!(
                 "snapshot_root_mismatch h={} mb={} expected={} computed={}",
-                snapshot_height,
-                mb_idx,
+                snapshot_height, mb_idx,
                 hex::encode(&expected_root[..8]),
                 hex::encode(&computed[..8]),
             )));
@@ -8944,7 +8967,7 @@ impl Storage {
 
         if crate::node::is_info() {
             println!(
-                "[INFO][SYNC] verifier_pass mb={} snapshot_h={} digest={}",
+                "[INFO][SYNC] verifier_pass mb={} snapshot_h={} root={} pattern=C",
                 mb_idx, snapshot_height, hex::encode(&computed[..8]),
             );
         }
@@ -9418,4 +9441,81 @@ pub struct StoredContractInfo {
     pub total_gas_used: u64,
     pub call_count: u64,
     pub is_active: bool,
-} 
+}
+
+// =========================================================================
+// v32.9 Pattern C tests — canonical state root determinism and binding
+// =========================================================================
+#[cfg(test)]
+mod v32_9_pattern_c_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn open_test_storage() -> (Storage, TempDir) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Storage::new(dir.path().to_str().unwrap())
+            .expect("storage init");
+        (storage, dir)
+    }
+
+    fn put_account(storage: &Storage, key: &[u8], value: &[u8]) {
+        let cf = storage.persistent.db.cf_handle("accounts").expect("accounts CF");
+        storage.persistent.db.put_cf(&cf, key, value).expect("put");
+    }
+
+    #[test]
+    fn canonical_root_is_deterministic() {
+        let (storage, _dir) = open_test_storage();
+        put_account(&storage, b"acct_aaa", b"v1");
+        put_account(&storage, b"acct_bbb", b"v2");
+        put_account(&storage, b"acct_ccc", b"v3");
+        let r1 = storage.compute_canonical_state_root(90).expect("r1");
+        let r2 = storage.compute_canonical_state_root(90).expect("r2");
+        assert_eq!(r1, r2, "compute_canonical_state_root must be deterministic");
+    }
+
+    #[test]
+    fn canonical_root_changes_on_state_mutation() {
+        let (storage, _dir) = open_test_storage();
+        put_account(&storage, b"acct_aaa", b"v1");
+        let before = storage.compute_canonical_state_root(90).expect("before");
+        put_account(&storage, b"acct_bbb", b"v2");
+        let after = storage.compute_canonical_state_root(90).expect("after");
+        assert_ne!(before, after, "root must change when accounts CF mutates");
+    }
+
+    #[test]
+    fn canonical_root_independent_of_insert_order() {
+        let (storage_a, _da) = open_test_storage();
+        put_account(&storage_a, b"acct_zzz", b"vZ");
+        put_account(&storage_a, b"acct_aaa", b"vA");
+        put_account(&storage_a, b"acct_mmm", b"vM");
+        let ra = storage_a.compute_canonical_state_root(90).expect("ra");
+
+        let (storage_b, _db) = open_test_storage();
+        put_account(&storage_b, b"acct_aaa", b"vA");
+        put_account(&storage_b, b"acct_mmm", b"vM");
+        put_account(&storage_b, b"acct_zzz", b"vZ");
+        let rb = storage_b.compute_canonical_state_root(90).expect("rb");
+
+        assert_eq!(ra, rb, "root must be insertion-order-independent");
+    }
+
+    #[test]
+    fn canonical_root_differs_by_height() {
+        let (storage, _dir) = open_test_storage();
+        put_account(&storage, b"acct_aaa", b"v1");
+        let r90 = storage.compute_canonical_state_root(90).expect("r90");
+        let r91 = storage.compute_canonical_state_root(91).expect("r91");
+        assert_ne!(r90, r91, "height is part of domain separation");
+    }
+
+    #[test]
+    fn canonical_root_empty_state_is_stable() {
+        let (storage_a, _da) = open_test_storage();
+        let (storage_b, _db) = open_test_storage();
+        let ra = storage_a.compute_canonical_state_root(90).expect("ra");
+        let rb = storage_b.compute_canonical_state_root(90).expect("rb");
+        assert_eq!(ra, rb, "empty CF root must match across instances");
+    }
+}
