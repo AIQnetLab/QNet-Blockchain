@@ -7899,16 +7899,11 @@ impl Storage {
                         }
                         self.persistent.db.write(batch)?;
                         println!("[INFO][SNAPSHOT] format_B_restored h={} accounts={}", height, account_count);
-
-                        if account_count == 0 {
-                            eprintln!("[ERR][SNAPSHOT] format_B_empty h={} — 0 accounts", height);
-                            return Err(IntegrationError::StorageError(format!(
-                                "Format B snapshot h={} restored 0 accounts", height
-                            )));
-                        }
+                        // v32.10: count check removed — Pattern C state_root binding is the
+                        // security gate. Early anchors legitimately have account_count=0.
                     }
                     Err(_) => {
-                        // Fallback: try deserializing as raw KV pairs (same format as Format A body)
+                        // Raw KV fallback (same body layout as Format A).
                         let mut batch = WriteBatch::default();
                         let mut account_count = 0u64;
                         let mut c = cursor;
@@ -7933,20 +7928,12 @@ impl Storage {
                         }
                         self.persistent.db.write(batch)?;
                         println!("[INFO][SNAPSHOT] format_B_kv_fallback h={} accounts={}", height, account_count);
-
-                        if account_count == 0 {
-                            eprintln!("[ERR][SNAPSHOT] format_B_kv_empty h={}", height);
-                            return Err(IntegrationError::StorageError(format!(
-                                "Format B snapshot h={} restored 0 accounts (kv fallback)", height
-                            )));
-                        }
+                        // v32.10: count check removed — see above.
                     }
                 }
             }
 
-            // v10.1: CRITICAL — set chain_height so node syncs only blocks AFTER snapshot.
-            // Without this, chain_height stays 0 → node re-downloads ALL blocks from genesis.
-            // Every L1 (Ethereum, Solana, Near) does this: snapshot = trusted state at height H.
+            // Set chain_height so node syncs only blocks AFTER snapshot.
             self.set_chain_height(height)?;
             println!("[INFO][SNAPSHOT] format_B_chain_height_set h={}", height);
 
@@ -8122,12 +8109,17 @@ impl Storage {
                      height, account_count, rewards_count, contract_count, registry_count);
         }
 
-        // Post-restore integrity: verify account count is plausible
-        if account_count == 0 {
-            eprintln!("[ERR][SNAPSHOT] full_snap_empty h={} — 0 accounts restored, snapshot may be corrupted", height);
-            return Err(IntegrationError::StorageError(format!(
-                "Full snapshot h={} restored 0 accounts", height
-            )));
+        // v32.10: trust Pattern C. SHA3 byte integrity + Zstd parse + format
+        // probe already reject malformed bytes upstream. Cryptographic
+        // snapshot_root verification (verify_snapshot_consensus_binding)
+        // matches macroblock 2f+1 commitment — that is the security gate,
+        // not entry counts. Empty-state anchors (h=90 fresh net: registry>0,
+        // accounts=0) are legitimate.
+        if account_count == 0 && crate::node::is_info() {
+            println!(
+                "[INFO][SNAPSHOT] empty_state_anchor h={} registry={} mode=pre_first_transfer",
+                height, registry_count,
+            );
         }
 
         // v10.1: CRITICAL — set chain_height so node syncs only blocks AFTER snapshot.
@@ -8816,14 +8808,14 @@ impl Storage {
         );
 
         // Try chunked parallel download first (v5.0), fallback to single-peer
-        match self.download_snapshot_chunked(&peer_addrs, best_height).await {
+        match self.download_snapshot_chunked(p2p, &peer_addrs, best_height).await {
             Ok(()) => {
                 self.verify_snapshot_consensus_binding(p2p, best_height).await?;
                 Ok(best_height)
             }
             Err(e) => {
                 println!("[WARN][SYNC] chunked_download_failed err={} fallback=legacy", e);
-                self.download_snapshot_legacy(&peer_addrs[0], best_height).await?;
+                self.download_snapshot_legacy(p2p, &peer_addrs[0], best_height).await?;
                 self.verify_snapshot_consensus_binding(p2p, best_height).await?;
                 Ok(best_height)
             }
@@ -9005,6 +8997,31 @@ impl Storage {
     // ═══════════════════════════════════════════════════════════════════════════
 
     const SNAPSHOT_CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB per chunk
+    // v32.10: hard bounds on untrusted manifest fields. Prevents OOM DoS via
+    // forged total_size / chunk_count from byzantine peer.
+    const MAX_SNAPSHOT_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100 GB
+    const MAX_CHUNK_COUNT: u64 = 100_000; // 100k × 4MB = 400GB max
+
+    /// v32.10: deterministic SHA3-256 over canonical manifest bytes.
+    /// Used by producer to commit into MacroBlock.snapshot_manifest_hash, and
+    /// by joiner to verify fetched manifest matches the 2f+1-bound value.
+    pub fn compute_manifest_hash(manifest: &SnapshotManifest) -> [u8; 32] {
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"QNET_SNAPSHOT_MANIFEST_V1:");
+        hasher.update(&manifest.height.to_le_bytes());
+        hasher.update(&manifest.total_size.to_le_bytes());
+        hasher.update(&manifest.chunk_size.to_le_bytes());
+        hasher.update(&manifest.chunk_count.to_le_bytes());
+        hasher.update(&(manifest.chunk_hashes.len() as u64).to_le_bytes());
+        for h in &manifest.chunk_hashes {
+            hasher.update(&(h.len() as u32).to_le_bytes());
+            hasher.update(h.as_bytes());
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hasher.finalize());
+        out
+    }
 
     /// Get snapshot manifest (chunk count + per-chunk SHA3 hashes)
     /// Used by peers to request individual chunks for parallel download
@@ -9047,11 +9064,21 @@ impl Storage {
 
     /// Download snapshot using chunked parallel protocol from multiple peers
     /// Falls back to legacy single-request download if chunked protocol unavailable
-    pub async fn download_snapshot_chunked(&self, peer_addrs: &[String], height: u64) -> IntegrationResult<()> {
+    pub async fn download_snapshot_chunked(
+        &self,
+        p2p: &crate::unified_p2p::SimplifiedP2P,
+        peer_addrs: &[String],
+        height: u64,
+    ) -> IntegrationResult<()> {
         if peer_addrs.is_empty() {
             return Err(IntegrationError::Other("No peers for chunked download".to_string()));
         }
         let start_time = std::time::Instant::now();
+
+        // v32.10: pre-fetch macroblock to read snapshot_manifest_hash for early
+        // verification. None → graceful (no early reject, Pattern C catches at end).
+        let expected_manifest_hash: Option<[u8; 32]> =
+            self.fetch_expected_manifest_hash(p2p, height).await;
 
         // Step 1: Fetch manifest from first responsive peer
         let mut manifest: Option<SnapshotManifest> = None;
@@ -9075,9 +9102,87 @@ impl Storage {
                 if crate::node::is_info() {
                     println!("[INFO][SYNC] chunked_manifest_unavailable fallback=legacy");
                 }
-                return self.download_snapshot_legacy(&peer_addrs[0], height).await;
+                return self.download_snapshot_legacy(p2p, &peer_addrs[0], height).await;
             }
         };
+
+        // v32.10: untrusted-input bounds. Reject before allocation.
+        if manifest.total_size > Self::MAX_SNAPSHOT_SIZE {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] manifest_rejected reason=total_size_overflow h={} got={} max={}",
+                         height, manifest.total_size, Self::MAX_SNAPSHOT_SIZE);
+            }
+            return Err(IntegrationError::Other(format!(
+                "manifest_total_size_exceeds_max h={} got={} max={}",
+                height, manifest.total_size, Self::MAX_SNAPSHOT_SIZE
+            )));
+        }
+        if manifest.chunk_count == 0 || manifest.chunk_count > Self::MAX_CHUNK_COUNT {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] manifest_rejected reason=chunk_count_invalid h={} got={} max={}",
+                         height, manifest.chunk_count, Self::MAX_CHUNK_COUNT);
+            }
+            return Err(IntegrationError::Other(format!(
+                "manifest_chunk_count_invalid h={} got={}", height, manifest.chunk_count
+            )));
+        }
+        if manifest.chunk_size != Self::SNAPSHOT_CHUNK_SIZE as u64 {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] manifest_rejected reason=chunk_size_mismatch h={} got={} expected={}",
+                         height, manifest.chunk_size, Self::SNAPSHOT_CHUNK_SIZE);
+            }
+            return Err(IntegrationError::Other(format!(
+                "manifest_chunk_size_mismatch h={} got={} expected={}",
+                height, manifest.chunk_size, Self::SNAPSHOT_CHUNK_SIZE
+            )));
+        }
+        if manifest.chunk_hashes.len() as u64 != manifest.chunk_count {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] manifest_rejected reason=hashes_len_mismatch h={} hashes={} count={}",
+                         height, manifest.chunk_hashes.len(), manifest.chunk_count);
+            }
+            return Err(IntegrationError::Other(format!(
+                "manifest_hashes_count_mismatch h={} hashes={} count={}",
+                height, manifest.chunk_hashes.len(), manifest.chunk_count
+            )));
+        }
+        // Consistency: total_size must fit exactly in chunk_count × chunk_size.
+        let expected_chunks = (manifest.total_size + manifest.chunk_size - 1) / manifest.chunk_size;
+        if expected_chunks != manifest.chunk_count {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] manifest_rejected reason=size_count_inconsistent h={} expected_chunks={} got={}",
+                         height, expected_chunks, manifest.chunk_count);
+            }
+            return Err(IntegrationError::Other(format!(
+                "manifest_size_count_inconsistent h={} expected_chunks={} got={}",
+                height, expected_chunks, manifest.chunk_count
+            )));
+        }
+
+        // v32.10: early manifest binding — verify SHA3 matches macroblock's
+        // 2f+1-bound snapshot_manifest_hash BEFORE downloading any chunks.
+        // Saves bandwidth against byzantine peers serving forged manifests.
+        if let Some(expected) = expected_manifest_hash {
+            let computed = Self::compute_manifest_hash(&manifest);
+            if computed != expected {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][SYNC] manifest_hash_mismatch h={} expected={} got={} action=reject",
+                        height, hex::encode(&expected[..8]), hex::encode(&computed[..8]),
+                    );
+                }
+                return Err(IntegrationError::Other(format!(
+                    "manifest_hash_mismatch h={} expected={} got={}",
+                    height, hex::encode(&expected[..8]), hex::encode(&computed[..8]),
+                )));
+            }
+            if crate::node::is_info() {
+                println!(
+                    "[INFO][SYNC] manifest_hash_verified h={} hash={}",
+                    height, hex::encode(&computed[..8]),
+                );
+            }
+        }
 
         println!("[INFO][SYNC] chunked_download_start h={} chunks={} total={}MB",
                  height, manifest.chunk_count, manifest.total_size / (1024 * 1024));
@@ -9156,7 +9261,15 @@ impl Storage {
     }
 
     /// Legacy single-request snapshot download (backward compatibility)
-    async fn download_snapshot_legacy(&self, peer_addr: &str, height: u64) -> IntegrationResult<()> {
+    async fn download_snapshot_legacy(
+        &self,
+        _p2p: &crate::unified_p2p::SimplifiedP2P,
+        peer_addr: &str,
+        height: u64,
+    ) -> IntegrationResult<()> {
+        // v32.10: legacy path serves single blob (no manifest). Total_size DoS
+        // not applicable — reqwest body has its own decode limits. Pattern C
+        // verification at caller catches forged state regardless.
         let url = format!("http://{}/api/v1/snapshot/{}", peer_addr, height);
         let response = reqwest::get(&url).await
             .map_err(|e| IntegrationError::Other(format!("Download error: {}", e)))?;
@@ -9165,6 +9278,13 @@ impl Storage {
         }
         let data = response.bytes().await
             .map_err(|e| IntegrationError::Other(format!("Download error: {}", e)))?;
+        // Defense: cap legacy blob size at MAX_SNAPSHOT_SIZE.
+        if data.len() as u64 > Self::MAX_SNAPSHOT_SIZE {
+            return Err(IntegrationError::Other(format!(
+                "legacy_snapshot_oversize h={} got={} max={}",
+                height, data.len(), Self::MAX_SNAPSHOT_SIZE
+            )));
+        }
         {
             let snapshots_cf = self.persistent.db.cf_handle("snapshots")
                 .ok_or_else(|| IntegrationError::StorageError("snapshots CF not found".to_string()))?;
@@ -9178,10 +9298,40 @@ impl Storage {
         Ok(())
     }
 
+    /// v32.10: fetch the macroblock-bound manifest hash for `height`. Returns
+    /// None if macroblock unavailable, has no commitment, or below mb_idx=1
+    /// (genesis window). None is safe — Pattern C verifies state at the end.
+    async fn fetch_expected_manifest_hash(
+        &self,
+        p2p: &crate::unified_p2p::SimplifiedP2P,
+        height: u64,
+    ) -> Option<[u8; 32]> {
+        let mb_idx = height / 90;
+        if mb_idx == 0 {
+            return None;
+        }
+        let mb_bytes = match self.get_macroblock_by_height(mb_idx).ok().flatten() {
+            Some(b) => b,
+            None => {
+                if p2p.sync_macroblocks(mb_idx, mb_idx).await.is_err() {
+                    return None;
+                }
+                self.get_macroblock_by_height(mb_idx).ok().flatten()?
+            }
+        };
+        let mb: qnet_state::MacroBlock = bincode::deserialize(&mb_bytes).ok()?;
+        mb.consensus_data.snapshot_manifest_hash
+    }
+
     /// Download snapshot — tries chunked first, falls back to legacy
     #[allow(dead_code)]
-    async fn download_snapshot_from_peer(&self, peer_addr: &str, height: u64) -> IntegrationResult<()> {
-        self.download_snapshot_chunked(&[peer_addr.to_string()], height).await
+    async fn download_snapshot_from_peer(
+        &self,
+        p2p: &crate::unified_p2p::SimplifiedP2P,
+        peer_addr: &str,
+        height: u64,
+    ) -> IntegrationResult<()> {
+        self.download_snapshot_chunked(p2p, &[peer_addr.to_string()], height).await
     }
 
     /// Fast sync with snapshot for new nodes

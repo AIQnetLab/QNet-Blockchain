@@ -105,6 +105,14 @@ pub static RECENT_BLOCK_HASHES: once_cell::sync::Lazy<
     dashmap::DashMap<u64, [u8; 32]>
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
+// v32.10: cooldown for macroblock-anchored fork-recovery trigger.
+// Height → wall-clock secs of last trigger. 60s/height prevents thrashing
+// when the same break repeats during resync.
+static FORK_RECOVERY_TRIGGER_TIMES: once_cell::sync::Lazy<
+    dashmap::DashMap<u64, u64>
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
+const FORK_RECOVERY_COOLDOWN_SECS: u64 = 60;
+
 /// Cache parent hash after apply commit / verify success / self-save.
 #[inline]
 pub fn cache_block_hash(height: u64, hash: [u8; 32]) {
@@ -286,6 +294,7 @@ pub fn cleanup_forked_peer_cooldown() {
 /// Called by unified_p2p cleanup tasks.
 pub fn cleanup_break_tracker(min_height: u64) {
     HASH_CHAIN_BREAK_WITNESSES.retain(|h, _| *h >= min_height);
+    FORK_RECOVERY_TRIGGER_TIMES.retain(|h, _| *h >= min_height);
 }
 
 // v18: missing-parent active sync. When verify finds parent_h absent
@@ -1643,6 +1652,53 @@ impl BlockPipeline {
                             local_tip.saturating_add(1),
                             mb.height,
                         );
+                    }
+
+                    // v32.10: macroblock-anchored fork recovery for minority
+                    // observers. When local hash_chain_break is real (our
+                    // chain diverged) but BlockRejection 2f+1 aggregation is
+                    // unreachable (we are alone), use the 2f+1-certified
+                    // macroblock at last_finalized as trust anchor. Bounded
+                    // by begin_finality_guarded_rollback — cannot cross
+                    // finality. Genesis bootstrap excluded.
+                    if mb.height > 0 {
+                        let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID").is_ok()
+                            && std::env::var("DOCKER_ENV").is_ok();
+                        if !is_genesis_bootstrap {
+                            let finalized_h = crate::node::LAST_FINALIZED_HEIGHT
+                                .load(std::sync::atomic::Ordering::SeqCst);
+                            let disputed_h = mb.height;
+                            if finalized_h > 0 && finalized_h < disputed_h {
+                                let now_secs = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                let cooldown_ok = match FORK_RECOVERY_TRIGGER_TIMES
+                                    .get(&disputed_h)
+                                {
+                                    Some(t) => now_secs.saturating_sub(*t) >= FORK_RECOVERY_COOLDOWN_SECS,
+                                    None => true,
+                                };
+                                if cooldown_ok {
+                                    let prev = FORK_RECOVERY_HEIGHT
+                                        .load(std::sync::atomic::Ordering::SeqCst);
+                                    let target = finalized_h.saturating_add(1);
+                                    if target > prev {
+                                        FORK_RECOVERY_HEIGHT.store(
+                                            target,
+                                            std::sync::atomic::Ordering::SeqCst,
+                                        );
+                                        FORK_RECOVERY_TRIGGER_TIMES.insert(disputed_h, now_secs);
+                                        if is_warn() {
+                                            println!(
+                                                "[WARN][FORK] anchor_recovery disputed_h={} finalized_h={} rollback_target={} reason=minority_observer",
+                                                disputed_h, finalized_h, target,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     continue;

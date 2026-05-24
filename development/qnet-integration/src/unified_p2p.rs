@@ -21503,8 +21503,11 @@ impl SimplifiedP2P {
             }
             Ok(response) => Err(format!("HTTP error: {}", response.status())),
             Err(e) => {
-                if crate::node::is_info() {
-                    println!("[ERR][P2P] Request failed to {}: {}", get_privacy_id_for_addr(node_addr), e);
+                // HTTP fallback failure after QUIC fallback path; transient
+                // peer-side throttle/restart, not a node-level error.
+                if crate::node::is_warn() {
+                    println!("[WARN][P2P] http_fallback_failed peer={} err={}",
+                             get_privacy_id_for_addr(node_addr), e);
                 }
                 Err(format!("Request failed: {}", e))
             }

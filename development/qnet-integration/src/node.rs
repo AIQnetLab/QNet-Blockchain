@@ -8000,25 +8000,20 @@ impl BlockchainNode {
         // Generate unique node_id for Byzantine consensus
         let node_id = Self::generate_unique_node_id(node_type).await;
         
-        // CRITICAL VALIDATION: Ensure Genesis nodes have proper IDs, not fallbacks
-        if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || std::env::var("DOCKER_ENV").is_ok() {
-            // This is a Genesis node - MUST have proper genesis_node_XXX ID
+        // Genesis-ID validation: gate on BOTH BOOTSTRAP_ID and DOCKER_ENV
+        // (genesis compose always sets both). Super-nodes have DOCKER_ENV only
+        // and must NOT trigger this validation.
+        if std::env::var("QNET_BOOTSTRAP_ID").is_ok() && std::env::var("DOCKER_ENV").is_ok() {
             if !node_id.starts_with("genesis_node_") {
-                eprintln!("[ERR][NODE] genesis_invalid_id id={}", node_id);
-                eprintln!("[ERR][NODE] expected=genesis_node_XXX got=fallback");
-                eprintln!("[ERR][NODE] check_env QNET_BOOTSTRAP_ID={:?} DOCKER_ENV={:?}", 
-                         std::env::var("QNET_BOOTSTRAP_ID"), std::env::var("DOCKER_ENV"));
-                
-                // For Docker Genesis nodes, this is a critical error
-                if std::env::var("DOCKER_ENV").is_ok() && std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
-                    // STATE MACHINE: Fatal configuration error
-                    set_node_state(NodeState::Error {
-                        reason: "Genesis node cannot start with fallback ID".to_string(),
-                        recoverable: false,
-                    });
-                    eprintln!("[CRIT][GEN] genesis_fallback_id_fatal msg=check_QNET_BOOTSTRAP_ID");
-                    std::process::exit(1);
-                }
+                eprintln!("[ERR][NODE] genesis_invalid_id id={} expected=genesis_node_XXX", node_id);
+                eprintln!("[ERR][NODE] check_env QNET_BOOTSTRAP_ID={:?}",
+                         std::env::var("QNET_BOOTSTRAP_ID"));
+                set_node_state(NodeState::Error {
+                    reason: "Genesis node cannot start with fallback ID".to_string(),
+                    recoverable: false,
+                });
+                eprintln!("[CRIT][GEN] genesis_fallback_id_fatal msg=check_QNET_BOOTSTRAP_ID");
+                std::process::exit(1);
             } else {
                 if is_info() { println!("[INFO][NODE] genesis_id_validated id={}", node_id); }
             }
@@ -29184,6 +29179,34 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 }
                                 None
                             }
+                        }
+                    } else {
+                        None
+                    }
+                },
+                // v32.10: bind manifest hash so joiners reject byzantine manifests
+                // before chunk download. None when snapshot bytes not yet present
+                // (graceful — next interval's macroblock binds correctly).
+                snapshot_manifest_hash: {
+                    const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
+                    const EARLY_ANCHOR_HEIGHT: u64 = 90;
+                    let mb_end_height = consensus_data.round_number * 90;
+                    let is_anchor = mb_end_height > 0
+                        && (mb_end_height == EARLY_ANCHOR_HEIGHT
+                            || mb_end_height % SNAPSHOT_INCREMENTAL_INTERVAL == 0);
+                    if is_anchor {
+                        match storage.get_snapshot_manifest(mb_end_height) {
+                            Ok(Some(manifest)) => {
+                                let h = crate::storage::Storage::compute_manifest_hash(&manifest);
+                                if is_info() {
+                                    println!(
+                                        "[INFO][MB] manifest_hash_bound h={} hash={} chunks={}",
+                                        mb_end_height, hex::encode(&h[..8]), manifest.chunk_count,
+                                    );
+                                }
+                                Some(h)
+                            }
+                            _ => None,
                         }
                     } else {
                         None

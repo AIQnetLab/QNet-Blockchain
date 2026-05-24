@@ -317,6 +317,13 @@ pub struct ConsensusData {
     /// interval boundary AND the local snapshot was successfully created.
     #[serde(default)]
     pub snapshot_root: Option<[u8; 32]>,
+
+    /// v32.10: SHA3-256 of the canonical SnapshotManifest bytes at the same
+    /// boundary. Bound by the same 2f+1 commit-reveal as snapshot_root.
+    /// Joiner verifies downloaded manifest matches this BEFORE chunk fetch —
+    /// rejects byzantine manifest early, saves bandwidth.
+    #[serde(default)]
+    pub snapshot_manifest_hash: Option<[u8; 32]>,
 }
 
 /// Eligible producer entry for epoch-based validator set
