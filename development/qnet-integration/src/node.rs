@@ -14359,25 +14359,36 @@ impl BlockchainNode {
                                 static EARLY_ACTIVATION_DONE: std::sync::atomic::AtomicBool =
                                     std::sync::atomic::AtomicBool::new(false);
 
-                                if !EARLY_ACTIVATION_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+                                // v32.13: atomic claim before await — closes
+                                // check-then-act race that allowed concurrent
+                                // loop iterations to both enter the branch
+                                // during the 5-15s save_activation_code await
+                                // (root cause of duplicate NodeRegistration
+                                // broadcast → CPU spike → cascade).
+                                let claimed = EARLY_ACTIVATION_DONE.compare_exchange(
+                                    false, true,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                ).is_ok();
+                                if claimed {
                                     let activation_code = std::env::var("QNET_ACTIVATION_CODE").unwrap_or_default();
-                                    if !activation_code.is_empty() {
-                                        // v9.7: Check if node is synchronized before sending activation TX.
-                                        // If not synced yet, defer — will be sent after sync completes.
-                                        let node_synced = coordinator_is_synchronized();
-                                        if node_synced {
-                                            println!("[INFO][ACTIVATION] node_synced broadcasting=NodeRegistration");
-                                            match self.save_activation_code(&activation_code, self.node_type).await {
-                                                Ok(_) => {
-                                                    println!("[INFO][ACTIVATION] activation_complete tx_broadcast=true");
-                                                    EARLY_ACTIVATION_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
-                                                }
-                                                Err(e) => {
-                                                    println!("[WARN][ACTIVATION] activation_fail err={} — will retry", e);
-                                                }
+                                    if !activation_code.is_empty() && coordinator_is_synchronized() {
+                                        println!("[INFO][ACTIVATION] node_synced broadcasting=NodeRegistration");
+                                        match self.save_activation_code(&activation_code, self.node_type).await {
+                                            Ok(_) => {
+                                                println!("[INFO][ACTIVATION] activation_complete tx_broadcast=true");
                                             }
-                                        } else {
-                                            println!("[INFO][ACTIVATION] deferred — node not yet synced (will activate after sync)");
+                                            Err(e) => {
+                                                println!("[WARN][ACTIVATION] activation_fail err={} — will retry", e);
+                                                // Release claim so next iteration can retry.
+                                                EARLY_ACTIVATION_DONE.store(false, std::sync::atomic::Ordering::SeqCst);
+                                            }
+                                        }
+                                    } else {
+                                        // Not ready — release claim for next iteration.
+                                        EARLY_ACTIVATION_DONE.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        if !activation_code.is_empty() {
+                                            println!("[INFO][ACTIVATION] deferred — node not yet synced");
                                         }
                                     }
                                 }
@@ -28042,9 +28053,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Guarantees convergence once timeout > real network delay
         // (partial-synchrony liveness); fixed timeout caused the
         // unbounded view-change storm (h=144000 freeze).
-        let base_timeout_secs = 10u64
-            .saturating_add(committee_len / 40)
-            .clamp(10, 45);
+        // v32.13: top-L1 calibrated from v14.8.3 empirical 5-node measurement
+        // (macroblock formation 24.10s ± 0.30s). 30s base = 24s + 25% safety;
+        // /25 scale covers commit/reveal growth at larger committees; cap 80s
+        // leaves 10s buffer under 90s macroblock window (no overlap).
+        let base_timeout_secs = 30u64
+            .saturating_add(committee_len / 25)
+            .clamp(30, 80);
         const D3_BACKOFF_SHIFT_CAP: u64 = 5;      // ≤ 32× base
         const D3_TIMEOUT_CAP_SECS: u64 = 600;     // per-round hard ceiling
 

@@ -120,6 +120,18 @@ pub struct StateMerkleTree {
     pub(crate) dirty: bool,
     /// v3.39: Pending updates count for logging
     pub(crate) pending_updates: usize,
+    /// v32.14: cached non-default internal nodes keyed by (depth, parent_key).
+    /// Persistent across finalize calls — enables O(k log N) incremental path
+    /// updates instead of O(N log N) full rebuild. Default subtrees stay
+    /// implicit (default_hashes[depth]); only branches with ≥1 populated leaf
+    /// occupy this map. Bounded by 2N entries.
+    pub(crate) intermediate_nodes: HashMap<(u32, [u8; HASH_SIZE]), [u8; HASH_SIZE]>,
+    /// v32.14: leaf addresses changed since last finalize. Each one triggers
+    /// a single path-walk in finalize. Cleared after recomputation.
+    pub(crate) dirty_paths: HashSet<[u8; HASH_SIZE]>,
+    /// v32.14: switch between full-rebuild and incremental. Default true.
+    /// Full-rebuild kept for migration / verification of intermediate cache.
+    pub(crate) incremental_enabled: bool,
 }
 
 impl StateMerkleTree {
@@ -147,6 +159,9 @@ impl StateMerkleTree {
             default_hashes,
             dirty: false,
             pending_updates: 0,
+            intermediate_nodes: HashMap::new(),
+            dirty_paths: HashSet::new(),
+            incremental_enabled: true,
         }
     }
     
@@ -173,19 +188,20 @@ impl StateMerkleTree {
     pub fn insert_lazy(&mut self, address: &str, account: &Account) {
         let addr_hash = Self::hash_address(address);
         let account_hash = Self::hash_account(account);
-        
+
         // v3.40: Diagnostic log for first account (to debug state_root mismatch)
         if self.leaves.is_empty() {
             println!("[DBG][MERKLE] first_account addr={} bal={} nonce={} addr_hash={} acct_hash={}",
                      &address[..20.min(address.len())], account.balance, account.nonce,
                      hex::encode(&addr_hash[..8]), hex::encode(&account_hash[..8]));
         }
-        
+
         self.leaves.insert(addr_hash, account_hash);
         self.dirty = true;
         self.pending_updates += 1;
+        self.dirty_paths.insert(addr_hash); // v32.14: incremental path tracking
     }
-    
+
     /// v3.22: Batch insert multiple accounts WITHOUT root recomputation
     /// Use for Genesis block or large batch operations
     /// O(m) where m = number of updates, no tree traversal
@@ -194,23 +210,42 @@ impl StateMerkleTree {
             let addr_hash = Self::hash_address(address);
             let account_hash = Self::hash_account(account);
             self.leaves.insert(addr_hash, account_hash);
+            self.dirty_paths.insert(addr_hash); // v32.14
         }
         self.dirty = true;
         self.pending_updates += updates.len();
     }
-    
+
     /// v3.22: Finalize tree - recompute root if dirty
     /// Call once after all block transactions applied
-    /// O(n) where n = total leaves, but called only ONCE per block
+    /// v32.14: O(k × log N) incremental — k = changed leaves since last finalize.
+    /// Falls back to full recompute only on first call (cold start) or if
+    /// incremental_enabled=false.
     pub fn finalize(&mut self) -> [u8; HASH_SIZE] {
         if self.dirty {
             let updates = self.pending_updates;
-            self.recompute_root();
+            let k = self.dirty_paths.len();
+            let use_incremental = self.incremental_enabled
+                && !self.intermediate_nodes.is_empty()
+                && k > 0;
+            if use_incremental {
+                let dirty: Vec<[u8; HASH_SIZE]> = self.dirty_paths.drain().collect();
+                for leaf_addr in &dirty {
+                    self.recompute_path(leaf_addr);
+                }
+            } else {
+                self.recompute_root();
+                self.dirty_paths.clear();
+            }
             self.dirty = false;
             self.pending_updates = 0;
             if updates > 0 {
-                println!("[INF][MERKLE] state_root_finalized updates={} leaves={} root={}", 
-                         updates, self.leaves.len(), hex::encode(&self.root[..8]));
+                println!(
+                    "[INFO][MERKLE] state_root_finalized updates={} leaves={} dirty={} mode={} root={}",
+                    updates, self.leaves.len(), k,
+                    if use_incremental { "incremental" } else { "full" },
+                    hex::encode(&self.root[..8]),
+                );
             }
         }
         self.root
@@ -243,6 +278,7 @@ impl StateMerkleTree {
         self.leaves.remove(&addr_hash);
         self.dirty = true;
         self.pending_updates += 1;
+        self.dirty_paths.insert(addr_hash); // v32.14: path-walk needed for default-fill
     }
     
     /// Get current root (with lazy recomputation if dirty)
@@ -389,36 +425,31 @@ impl StateMerkleTree {
     fn recompute_root(&mut self) {
         if self.leaves.is_empty() {
             self.root = self.default_hashes[TREE_DEPTH];
+            self.intermediate_nodes.clear();
             return;
         }
-        
-        // For sparse tree, compute path from each leaf to root
-        // Then combine at common ancestors
+
+        // v32.14: full rebuild also populates intermediate_nodes cache so
+        // subsequent finalize calls use the incremental path-walk.
+        self.intermediate_nodes.clear();
         let mut current_level = self.leaves.clone();
         let mut buffer = [0u8; HASH_SIZE * 2];
-        
+
         for depth in 0..TREE_DEPTH {
             let default = self.default_hashes[depth];
-            // v3.40: BTreeMap for deterministic iteration order
             let mut next_level: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> = BTreeMap::new();
             let mut processed: std::collections::HashSet<[u8; HASH_SIZE]> = std::collections::HashSet::new();
-            
+
             for (key, value) in current_level.iter() {
                 if processed.contains(key) {
                     continue;
                 }
-                
-                // Get parent key
-                let mut parent_key = *key;
-                Self::flip_bit(&mut parent_key, depth);
+
                 let is_right = Self::get_bit(key, depth);
-                
-                // Get sibling
                 let mut sibling_key = *key;
                 Self::flip_bit(&mut sibling_key, depth);
                 let sibling = current_level.get(&sibling_key).copied().unwrap_or(default);
-                
-                // Compute parent hash
+
                 if is_right {
                     buffer[..HASH_SIZE].copy_from_slice(&sibling);
                     buffer[HASH_SIZE..].copy_from_slice(value);
@@ -426,36 +457,100 @@ impl StateMerkleTree {
                     buffer[..HASH_SIZE].copy_from_slice(value);
                     buffer[HASH_SIZE..].copy_from_slice(&sibling);
                 }
-                
+
                 let mut hasher = Sha3_256::new();
                 hasher.update(&buffer);
                 let result = hasher.finalize();
                 let mut parent_hash = [0u8; HASH_SIZE];
                 parent_hash.copy_from_slice(&result);
-                
-                // v3.40: CRITICAL FIX - Parent key must have bit CLEARED (set to 0)
-                // NOT flipped! Both siblings must map to SAME parent.
-                // Old code: only flipped for is_right, causing inconsistent parent keys
+
+                // v3.40: parent key has bit at depth CLEARED (both siblings → same parent).
                 let mut actual_parent = *key;
                 let byte_idx = depth / 8;
                 let bit_idx = 7 - (depth % 8);
                 if byte_idx < HASH_SIZE {
-                    actual_parent[byte_idx] &= !(1 << bit_idx);  // CLEAR bit, not flip!
+                    actual_parent[byte_idx] &= !(1 << bit_idx);
                 }
-                
+
                 next_level.insert(actual_parent, parent_hash);
+                // v32.14: cache parent in intermediate_nodes (keyed by level depth+1).
+                // Skip storing default values to keep the map sparse.
+                let parent_level = (depth + 1) as u32;
+                if parent_hash != self.default_hashes[depth + 1] {
+                    self.intermediate_nodes.insert((parent_level, actual_parent), parent_hash);
+                }
                 processed.insert(*key);
                 processed.insert(sibling_key);
             }
-            
+
             current_level = next_level;
             if current_level.len() <= 1 {
                 break;
             }
         }
-        
+
         self.root = current_level.values().next().copied()
             .unwrap_or(self.default_hashes[TREE_DEPTH]);
+    }
+
+    /// v32.14: incremental path recomputation. Walks from a single changed
+    /// leaf up to the root, recomputing only nodes on this path. Reads
+    /// siblings from leaves (depth 0) or intermediate_nodes (depth ≥ 1).
+    /// Updates intermediate_nodes and root in place. O(log N) per call.
+    fn recompute_path(&mut self, leaf_addr: &[u8; HASH_SIZE]) {
+        let mut current_hash = self.leaves.get(leaf_addr).copied()
+            .unwrap_or(self.default_hashes[0]);
+        let mut current_key = *leaf_addr;
+        let mut buffer = [0u8; HASH_SIZE * 2];
+
+        for depth in 0..TREE_DEPTH {
+            let mut sibling_key = current_key;
+            Self::flip_bit(&mut sibling_key, depth);
+
+            let sibling_hash = if depth == 0 {
+                self.leaves.get(&sibling_key).copied()
+                    .unwrap_or(self.default_hashes[0])
+            } else {
+                self.intermediate_nodes
+                    .get(&(depth as u32, sibling_key))
+                    .copied()
+                    .unwrap_or(self.default_hashes[depth])
+            };
+
+            let is_right = Self::get_bit(&current_key, depth);
+            if is_right {
+                buffer[..HASH_SIZE].copy_from_slice(&sibling_hash);
+                buffer[HASH_SIZE..].copy_from_slice(&current_hash);
+            } else {
+                buffer[..HASH_SIZE].copy_from_slice(&current_hash);
+                buffer[HASH_SIZE..].copy_from_slice(&sibling_hash);
+            }
+
+            let mut hasher = Sha3_256::new();
+            hasher.update(&buffer);
+            let result = hasher.finalize();
+            let mut parent_hash = [0u8; HASH_SIZE];
+            parent_hash.copy_from_slice(&result);
+
+            let mut parent_key = current_key;
+            let byte_idx = depth / 8;
+            let bit_idx = 7 - (depth % 8);
+            if byte_idx < HASH_SIZE {
+                parent_key[byte_idx] &= !(1 << bit_idx);
+            }
+
+            let parent_level = (depth + 1) as u32;
+            if parent_hash == self.default_hashes[depth + 1] {
+                self.intermediate_nodes.remove(&(parent_level, parent_key));
+            } else {
+                self.intermediate_nodes.insert((parent_level, parent_key), parent_hash);
+            }
+
+            current_hash = parent_hash;
+            current_key = parent_key;
+        }
+
+        self.root = current_hash;
     }
 }
 

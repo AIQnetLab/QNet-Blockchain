@@ -876,6 +876,15 @@ impl Transaction {
             TransactionType::NodeReactivation { node_id, last_macroblock_index, .. } => {
                 Some((node_id.clone(), *last_macroblock_index, 5))
             }
+            // v32.13: NodeActivation one-shot per (wallet, phase).
+            // One sender cannot activate twice in same phase.
+            TransactionType::NodeActivation { phase, .. } => {
+                let phase_id: u64 = match phase {
+                    crate::account::ActivationPhase::Phase1 => 1,
+                    crate::account::ActivationPhase::Phase2 => 2,
+                };
+                Some((self.from.clone(), phase_id, 6))
+            }
             _ => None,
         }
     }

@@ -8848,48 +8848,51 @@ impl Storage {
             return Ok(());
         }
 
-        // Step 1: load the macroblock binding the snapshot. Try local
-        // storage first; on miss, request a single-macroblock sync.
-        let macroblock_bytes = match self.get_macroblock_by_height(mb_idx)
-            .map_err(|e| IntegrationError::Other(format!("mb_load_err mb={} err={:?}", mb_idx, e)))?
-        {
-            Some(b) => b,
-            None => {
-                if crate::node::is_info() {
+        // v32.13: macroblock fetch with bounded retry. Single-shot fetch
+        // failed under network/peer cascade load; joiners then fell back to
+        // slow block-by-block. Retry with exponential backoff covers
+        // transient peer unavailability (peers busy with their own view-change).
+        const MB_FETCH_MAX_ATTEMPTS: u32 = 5;
+        const MB_FETCH_BASE_DELAY_MS: u64 = 2_000;
+        let mut macroblock_bytes_opt: Option<Vec<u8>> = self.get_macroblock_by_height(mb_idx)
+            .map_err(|e| IntegrationError::Other(format!("mb_load_err mb={} err={:?}", mb_idx, e)))?;
+        let mut attempt = 0u32;
+        while macroblock_bytes_opt.is_none() && attempt < MB_FETCH_MAX_ATTEMPTS {
+            attempt += 1;
+            if crate::node::is_info() {
+                println!(
+                    "[INFO][SYNC] verifier_fetching_macroblock mb={} attempt={}/{} for_snapshot_h={}",
+                    mb_idx, attempt, MB_FETCH_MAX_ATTEMPTS, snapshot_height,
+                );
+            }
+            if let Err(e) = p2p.sync_macroblocks(mb_idx, mb_idx).await {
+                if crate::node::is_warn() {
                     println!(
-                        "[INFO][SYNC] verifier_fetching_macroblock mb={} for_snapshot_h={}",
-                        mb_idx, snapshot_height,
+                        "[WARN][SYNC] verifier_macroblock_fetch_retry mb={} attempt={}/{} err={}",
+                        mb_idx, attempt, MB_FETCH_MAX_ATTEMPTS, e,
                     );
                 }
-                if let Err(e) = p2p.sync_macroblocks(mb_idx, mb_idx).await {
-                    if crate::node::is_warn() {
-                        println!(
-                            "[WARN][SYNC] verifier_macroblock_fetch_failed mb={} err={} action=reject_snapshot",
-                            mb_idx, e,
-                        );
-                    }
-                    return Err(IntegrationError::Other(format!(
-                        "snapshot_binding_unavailable mb={} reason=mb_fetch_failed",
-                        mb_idx
-                    )));
+            }
+            macroblock_bytes_opt = self.get_macroblock_by_height(mb_idx)
+                .map_err(|e| IntegrationError::Other(format!("mb_reload_err mb={} err={:?}", mb_idx, e)))?;
+            if macroblock_bytes_opt.is_none() && attempt < MB_FETCH_MAX_ATTEMPTS {
+                let backoff_ms = MB_FETCH_BASE_DELAY_MS.saturating_mul(1u64 << (attempt - 1).min(4));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+        let macroblock_bytes = match macroblock_bytes_opt {
+            Some(b) => b,
+            None => {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][SYNC] verifier_macroblock_unavailable mb={} attempts={} action=reject_snapshot",
+                        mb_idx, MB_FETCH_MAX_ATTEMPTS,
+                    );
                 }
-                match self.get_macroblock_by_height(mb_idx)
-                    .map_err(|e| IntegrationError::Other(format!("mb_reload_err mb={} err={:?}", mb_idx, e)))?
-                {
-                    Some(b) => b,
-                    None => {
-                        if crate::node::is_warn() {
-                            println!(
-                                "[WARN][SYNC] verifier_macroblock_unavailable mb={} action=reject_snapshot",
-                                mb_idx,
-                            );
-                        }
-                        return Err(IntegrationError::Other(format!(
-                            "snapshot_binding_unavailable mb={} reason=mb_post_fetch_miss",
-                            mb_idx
-                        )));
-                    }
-                }
+                return Err(IntegrationError::Other(format!(
+                    "snapshot_binding_unavailable mb={} reason=mb_fetch_exhausted attempts={}",
+                    mb_idx, MB_FETCH_MAX_ATTEMPTS
+                )));
             }
         };
 
