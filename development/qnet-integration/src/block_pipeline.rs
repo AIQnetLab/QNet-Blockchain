@@ -1655,16 +1655,20 @@ impl BlockPipeline {
                     }
 
                     // v32.10: macroblock-anchored fork recovery for minority
-                    // observers. When local hash_chain_break is real (our
-                    // chain diverged) but BlockRejection 2f+1 aggregation is
-                    // unreachable (we are alone), use the 2f+1-certified
-                    // macroblock at last_finalized as trust anchor. Bounded
-                    // by begin_finality_guarded_rollback — cannot cross
-                    // finality. Genesis bootstrap excluded.
+                    // observers. Uses 2f+1-certified macroblock as trust anchor;
+                    // bounded by begin_finality_guarded_rollback (cannot cross
+                    // finality). Genesis bootstrap excluded ONLY during fresh-
+                    // bootstrap phase (h < BOOTSTRAP_GRACE_HEIGHT); after that
+                    // genesis functions as a regular validator and needs the
+                    // same recovery path.
+                    const BOOTSTRAP_GRACE_HEIGHT: u64 = 1_000;
                     if mb.height > 0 {
-                        let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID").is_ok()
-                            && std::env::var("DOCKER_ENV").is_ok();
-                        if !is_genesis_bootstrap {
+                        let local_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let is_genesis_in_bootstrap = std::env::var("QNET_BOOTSTRAP_ID").is_ok()
+                            && std::env::var("DOCKER_ENV").is_ok()
+                            && local_h < BOOTSTRAP_GRACE_HEIGHT;
+                        if !is_genesis_in_bootstrap {
                             let finalized_h = crate::node::LAST_FINALIZED_HEIGHT
                                 .load(std::sync::atomic::Ordering::SeqCst);
                             let disputed_h = mb.height;

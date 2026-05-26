@@ -2899,13 +2899,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     
-    // Save activation code to persistent storage for future restarts
-    // v6.5: Early activation may have already been called inside readiness loop
-    //   (when genesis block became available). This is a fallback for cases where
-    //   early activation didn't trigger (e.g., genesis nodes, or early activation failed).
-    //   Mempool deduplicates TX by hash, so double-call is safe.
+    // v32.11: idempotency — save_activation_code emits a fresh-timestamped
+    // NodeRegistration+Activation TX pair on every call. The previous "double
+    // call is safe" assumption was wrong: timestamps differ → tx hashes
+    // differ → mempool admits both → 2 broadcasts in 6s → CPU spike on
+    // genesis verify path → producer misses 1-sec deadline → view-change
+    // cascade → minority fork. Skip the fallback if early activation already
+    // persisted the code locally.
     if !activation_code.is_empty() {
-        if let Err(e) = node.save_activation_code(&activation_code, node_type).await {
+        let already_persisted = node.get_storage().load_activation_code()
+            .map(|opt| opt.is_some())
+            .unwrap_or(false);
+        if already_persisted {
+            if is_info() { println!("[INFO][NODE] activation_already_persisted skip=fallback_call"); }
+        } else if let Err(e) = node.save_activation_code(&activation_code, node_type).await {
             if is_warn() { println!("[WARN][NODE] activation_code_save_failed err={}", e); }
         }
     }

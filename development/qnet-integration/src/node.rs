@@ -14310,6 +14310,37 @@ impl BlockchainNode {
                                 continue;
                             }
 
+                            // v32.11+v32.12: joiner deterministic stagger. Each
+                            // joiner's wait = sha3(node_id)[0] mod RANGE + BASE,
+                            // distributing N simultaneous starts across [BASE,
+                            // BASE+RANGE] window. Prevents synchronized burst
+                            // of activation TX broadcasts (1000 joiners at t+10s)
+                            // that fixed-delay ramp-up would not solve.
+                            const JOINER_RAMP_UP_BASE_SECS: u64 = 5;
+                            const JOINER_RAMP_UP_RANGE_SECS: u64 = 30;
+                            if !is_bootstrap_node {
+                                use sha3::{Sha3_256, Digest};
+                                let mut h = Sha3_256::new();
+                                h.update(self.node_id.as_bytes());
+                                let stagger_bytes = h.finalize();
+                                let stagger = JOINER_RAMP_UP_BASE_SECS
+                                    + ((u64::from_le_bytes(
+                                        stagger_bytes[..8].try_into().unwrap_or([0u8; 8])
+                                    )) % JOINER_RAMP_UP_RANGE_SECS);
+                                if stabilization_time < stagger {
+                                    let remaining = stagger - stabilization_time;
+                                    if is_info() {
+                                        println!(
+                                            "[INFO][NODE] joiner_ramp_up remaining={}s stagger={}s peers={}",
+                                            remaining, stagger, real_peer_count,
+                                        );
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                    wait_time += 2;
+                                    continue;
+                                }
+                            }
+
                             // ══════════════════════════════════════════════════════════════
                             // v6.5 FIX: Early activation for non-bootstrap nodes
                             // v9.7: DEFERRED until sync completes — unsynced nodes MUST NOT
@@ -20246,14 +20277,53 @@ impl BlockchainNode {
                     
                     // v2.99: Prepend emission TX if this is an emission block
                     let mut tx_bytes_list: Vec<(String, Vec<u8>)> = Vec::new();
-                    
+
                     // Add emission TX FIRST (if present)
                     if let Some(emission_tx) = emission_tx_opt {
                         tx_bytes_list.push(emission_tx);
                     }
-                    
-                    // Add mempool TXs
-                    tx_bytes_list.extend(mempool_txs);
+
+                    // v32.12: per-block activation TX cap. NodeRegistration/Activation
+                    // hit registry+state-apply (deterministic but heavy). Bounding per
+                    // block keeps the producer's 1-sec deadline achievable under mass-
+                    // onboarding burst. Excess returns to mempool — included over next
+                    // blocks. Decode probes only tx_type discriminant (~5µs/tx); other
+                    // TX types pass through unchanged.
+                    const MAX_ACTIVATIONS_PER_MICROBLOCK: usize = 10;
+                    let mut activation_count = 0usize;
+                    let mut deferred_activations: Vec<(String, Vec<u8>)> = Vec::new();
+                    let capped_mempool_txs: Vec<(String, Vec<u8>)> = mempool_txs
+                        .into_iter()
+                        .filter(|(_hash, tx_bytes)| {
+                            let is_activation = bincode::deserialize::<qnet_state::Transaction>(tx_bytes)
+                                .map(|tx| matches!(tx.tx_type,
+                                    qnet_state::TransactionType::NodeRegistration { .. }
+                                    | qnet_state::TransactionType::NodeActivation { .. }
+                                ))
+                                .unwrap_or(false);
+                            if is_activation {
+                                if activation_count < MAX_ACTIVATIONS_PER_MICROBLOCK {
+                                    activation_count += 1;
+                                    true
+                                } else {
+                                    deferred_activations.push((_hash.clone(), tx_bytes.clone()));
+                                    false
+                                }
+                            } else {
+                                true
+                            }
+                        })
+                        .collect();
+                    if !deferred_activations.is_empty() && is_info() {
+                        println!(
+                            "[INFO][MB] activation_cap_applied admitted={}/{} deferred={} h={}",
+                            activation_count, MAX_ACTIVATIONS_PER_MICROBLOCK,
+                            deferred_activations.len(), next_block_height,
+                        );
+                    }
+
+                    // Add mempool TXs (capped on activations)
+                    tx_bytes_list.extend(capped_mempool_txs);
                     
                     // ═══════════════════════════════════════════════════════════════════════════
                     // PRODUCTION v2.63: Block size limit to prevent ShredProtocol overflow
@@ -30513,6 +30583,44 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // PRODUCTION VALIDATION - same as submit_transaction
         if let Err(validation_error) = tx.validate() {
             return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
+        }
+
+        // v32.12: gossip-side activation admission rate limit. NodeRegistration
+        // and NodeActivation TXs trigger heavy block-include + state-apply paths.
+        // Under mass-onboarding burst (N joiners simultaneously) admission must
+        // be bounded so producer's 1-sec deadline stays achievable. Excess TXs
+        // get rejected; gossip will re-deliver from peers when window reopens.
+        // Window = 1 sec rolling; cap = 20 admissions/sec/node (covers 1200
+        // activations/minute — far above realistic mass-onboarding rate).
+        if matches!(tx.tx_type,
+            qnet_state::TransactionType::NodeRegistration { .. }
+            | qnet_state::TransactionType::NodeActivation { .. }
+        ) {
+            const ACTIVATION_ADMIT_RATE_PER_SEC: u32 = 20;
+            static ACTIVATION_ADMIT_COUNTER: once_cell::sync::Lazy<
+                std::sync::Mutex<(u64, u32)>
+            > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new((0, 0)));
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            let mut g = ACTIVATION_ADMIT_COUNTER.lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if g.0 != now_secs {
+                g.0 = now_secs;
+                g.1 = 0;
+            }
+            if g.1 >= ACTIVATION_ADMIT_RATE_PER_SEC {
+                if crate::node::is_warn() {
+                    println!(
+                        "[WARN][TX-GOSSIP] activation_rate_exceeded count={}/{} action=defer",
+                        g.1, ACTIVATION_ADMIT_RATE_PER_SEC,
+                    );
+                }
+                return Err(QNetError::ValidationError(
+                    "activation_admit_rate_exceeded — retry next window".to_string()
+                ));
+            }
+            g.1 += 1;
         }
 
         // ═══════════════════════════════════════════════════════════════════════
