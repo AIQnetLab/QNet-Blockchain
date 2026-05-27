@@ -95,7 +95,7 @@ pub const MAX_QNC_SUPPLY_NANO: u64 = MAX_QNC_SUPPLY * 1_000_000_000;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const HASH_SIZE: usize = 32;
-const TREE_DEPTH: usize = 160; // Use 160-bit depth (enough for billions of accounts)
+const TREE_DEPTH: usize = 256; // v32.14: full address bit-width — guarantees ALL leaves converge to ONE root
 
 /// State Merkle Tree for account proofs
 /// Optimized for QNet's account structure with batch operations for 100K+ TPS
@@ -218,9 +218,10 @@ impl StateMerkleTree {
 
     /// v3.22: Finalize tree - recompute root if dirty
     /// Call once after all block transactions applied
-    /// v32.14: O(k × log N) incremental — k = changed leaves since last finalize.
-    /// Falls back to full recompute only on first call (cold start) or if
-    /// incremental_enabled=false.
+    /// v32.14: O(k × log N) level-synchronous BFS — deterministic across nodes.
+    /// Each level processes parents whose children changed; reads both children
+    /// from final storage state (no cross-path stale reads). Falls back to full
+    /// recompute on cold start (empty intermediate_nodes cache).
     pub fn finalize(&mut self) -> [u8; HASH_SIZE] {
         if self.dirty {
             let updates = self.pending_updates;
@@ -229,10 +230,7 @@ impl StateMerkleTree {
                 && !self.intermediate_nodes.is_empty()
                 && k > 0;
             if use_incremental {
-                let dirty: Vec<[u8; HASH_SIZE]> = self.dirty_paths.drain().collect();
-                for leaf_addr in &dirty {
-                    self.recompute_path(leaf_addr);
-                }
+                self.recompute_levels();
             } else {
                 self.recompute_root();
                 self.dirty_paths.clear();
@@ -296,23 +294,41 @@ impl StateMerkleTree {
         self.root
     }
     
-    /// Generate proof for address
+    /// v32.14: SMT inclusion proof. At each depth D the sibling is read from
+    /// `leaves` (D=0) or `intermediate_nodes` (D≥1) keyed by the canonical
+    /// level-D key (bits 0..D-1 of leaf address cleared, bit D flipped).
+    /// Empty subtree → `default_hashes[D]`. Proof verifies against the root
+    /// produced by recompute_root / recompute_levels.
     pub fn generate_proof(&self, address: &str) -> Vec<([u8; HASH_SIZE], bool)> {
         let addr_hash = Self::hash_address(address);
         let mut proof = Vec::with_capacity(TREE_DEPTH);
-        
+        let mut key = addr_hash;
+
         for depth in 0..TREE_DEPTH {
-            let bit = Self::get_bit(&addr_hash, depth);
-            let mut sibling_key = addr_hash;
+            let mut sibling_key = key;
             Self::flip_bit(&mut sibling_key, depth);
-            
-            let sibling_hash = self.leaves.get(&sibling_key)
-                .copied()
-                .unwrap_or(self.default_hashes[0]);
-            
-            proof.push((sibling_hash, bit));
+
+            let sibling_hash = if depth == 0 {
+                self.leaves.get(&sibling_key).copied()
+                    .unwrap_or(self.default_hashes[0])
+            } else {
+                self.intermediate_nodes
+                    .get(&(depth as u32, sibling_key))
+                    .copied()
+                    .unwrap_or(self.default_hashes[depth])
+            };
+
+            let is_right = Self::get_bit(&addr_hash, depth);
+            proof.push((sibling_hash, is_right));
+
+            // ascend: clear bit at depth to reach parent's level-(D+1) key
+            let byte_idx = depth / 8;
+            let bit_idx = 7 - (depth % 8);
+            if byte_idx < HASH_SIZE {
+                key[byte_idx] &= !(1 << bit_idx);
+            }
         }
-        
+
         proof
     }
     
@@ -484,73 +500,99 @@ impl StateMerkleTree {
             }
 
             current_level = next_level;
-            if current_level.len() <= 1 {
-                break;
-            }
+            // v32.14: true SMT semantics — always walk to TREE_DEPTH so root
+            // sits at a fixed depth. Prior early-exit at len<=1 produced a
+            // shallower root for sparse states and broke incremental↔full
+            // equivalence on edge cases. Cost is O(TREE_DEPTH × k) regardless,
+            // since k = leaves typically keeps len > 1 anyway.
         }
 
+        // TREE_DEPTH=HASH bits → all leaves converge to ONE entry at level TREE_DEPTH.
+        // unwrap fallback only fires for an empty tree (already short-circuited above).
         self.root = current_level.values().next().copied()
             .unwrap_or(self.default_hashes[TREE_DEPTH]);
     }
 
-    /// v32.14: incremental path recomputation. Walks from a single changed
-    /// leaf up to the root, recomputing only nodes on this path. Reads
-    /// siblings from leaves (depth 0) or intermediate_nodes (depth ≥ 1).
-    /// Updates intermediate_nodes and root in place. O(log N) per call.
-    fn recompute_path(&mut self, leaf_addr: &[u8; HASH_SIZE]) {
-        let mut current_hash = self.leaves.get(leaf_addr).copied()
-            .unwrap_or(self.default_hashes[0]);
-        let mut current_key = *leaf_addr;
+    /// v32.14: level-synchronous BFS incremental update. Each level d reads
+    /// BOTH children from final storage (leaves at d=0, intermediate_nodes
+    /// at d≥1) and writes parent at d+1. Order-independent within a level
+    /// via BTreeSet sorted iteration. Sibling dedup avoids double-computing
+    /// shared parents. Produces identical root to recompute_root() for the
+    /// same leaf set. O(k × log N) per finalize where k = changed leaves.
+    fn recompute_levels(&mut self) {
+        use std::collections::BTreeSet;
+        let mut current_dirty: BTreeSet<[u8; HASH_SIZE]> =
+            self.dirty_paths.drain().collect();
+
         let mut buffer = [0u8; HASH_SIZE * 2];
 
         for depth in 0..TREE_DEPTH {
-            let mut sibling_key = current_key;
-            Self::flip_bit(&mut sibling_key, depth);
-
-            let sibling_hash = if depth == 0 {
-                self.leaves.get(&sibling_key).copied()
-                    .unwrap_or(self.default_hashes[0])
-            } else {
-                self.intermediate_nodes
-                    .get(&(depth as u32, sibling_key))
-                    .copied()
-                    .unwrap_or(self.default_hashes[depth])
-            };
-
-            let is_right = Self::get_bit(&current_key, depth);
-            if is_right {
-                buffer[..HASH_SIZE].copy_from_slice(&sibling_hash);
-                buffer[HASH_SIZE..].copy_from_slice(&current_hash);
-            } else {
-                buffer[..HASH_SIZE].copy_from_slice(&current_hash);
-                buffer[HASH_SIZE..].copy_from_slice(&sibling_hash);
-            }
-
-            let mut hasher = Sha3_256::new();
-            hasher.update(&buffer);
-            let result = hasher.finalize();
-            let mut parent_hash = [0u8; HASH_SIZE];
-            parent_hash.copy_from_slice(&result);
-
-            let mut parent_key = current_key;
+            let mut next_dirty: BTreeSet<[u8; HASH_SIZE]> = BTreeSet::new();
             let byte_idx = depth / 8;
             let bit_idx = 7 - (depth % 8);
-            if byte_idx < HASH_SIZE {
-                parent_key[byte_idx] &= !(1 << bit_idx);
+
+            for key in &current_dirty {
+                // Parent key at depth+1: clear bit at depth (left child of pair).
+                let mut parent_key = *key;
+                if byte_idx < HASH_SIZE {
+                    parent_key[byte_idx] &= !(1 << bit_idx);
+                }
+                if !next_dirty.insert(parent_key) {
+                    // sibling already triggered this parent — skip duplicate work
+                    continue;
+                }
+
+                // Both children at depth d: left = bit_d=0, right = bit_d=1.
+                let left_key = parent_key;
+                let mut right_key = parent_key;
+                if byte_idx < HASH_SIZE {
+                    right_key[byte_idx] |= 1 << bit_idx;
+                }
+
+                let left_hash = if depth == 0 {
+                    self.leaves.get(&left_key).copied()
+                        .unwrap_or(self.default_hashes[0])
+                } else {
+                    self.intermediate_nodes
+                        .get(&(depth as u32, left_key))
+                        .copied()
+                        .unwrap_or(self.default_hashes[depth])
+                };
+                let right_hash = if depth == 0 {
+                    self.leaves.get(&right_key).copied()
+                        .unwrap_or(self.default_hashes[0])
+                } else {
+                    self.intermediate_nodes
+                        .get(&(depth as u32, right_key))
+                        .copied()
+                        .unwrap_or(self.default_hashes[depth])
+                };
+
+                buffer[..HASH_SIZE].copy_from_slice(&left_hash);
+                buffer[HASH_SIZE..].copy_from_slice(&right_hash);
+                let mut hasher = Sha3_256::new();
+                hasher.update(&buffer);
+                let result = hasher.finalize();
+                let mut parent_hash = [0u8; HASH_SIZE];
+                parent_hash.copy_from_slice(&result);
+
+                let parent_level = (depth + 1) as u32;
+                if parent_hash == self.default_hashes[depth + 1] {
+                    self.intermediate_nodes.remove(&(parent_level, parent_key));
+                } else {
+                    self.intermediate_nodes.insert((parent_level, parent_key), parent_hash);
+                }
             }
 
-            let parent_level = (depth + 1) as u32;
-            if parent_hash == self.default_hashes[depth + 1] {
-                self.intermediate_nodes.remove(&(parent_level, parent_key));
-            } else {
-                self.intermediate_nodes.insert((parent_level, parent_key), parent_hash);
-            }
-
-            current_hash = parent_hash;
-            current_key = parent_key;
+            current_dirty = next_dirty;
         }
 
-        self.root = current_hash;
+        // TREE_DEPTH = address bit-width → all paths converge to the all-zero
+        // canonical key at the top level. Empty/default subtree → default root.
+        self.root = self.intermediate_nodes
+            .get(&(TREE_DEPTH as u32, [0u8; HASH_SIZE]))
+            .copied()
+            .unwrap_or(self.default_hashes[TREE_DEPTH]);
     }
 }
 
@@ -2595,6 +2637,352 @@ mod cache_tests {
         assert_eq!(misses, (WORKERS * PER_WORKER) as u64);
         assert_eq!(dh, misses); // all addresses existed on disk
         assert_eq!(dm, 0);
+    }
+}
+
+// =========================================================================
+// v32.14: level-synchronous SMT tests — verify incremental matches full rebuild
+// =========================================================================
+#[cfg(test)]
+mod level_sync_tests {
+    use super::*;
+    use crate::Account;
+
+    fn acct(balance: u64, nonce: u64, addr: &str) -> Account {
+        let mut a = Account::default();
+        a.balance = balance;
+        a.nonce = nonce;
+        a.address = addr.to_string();
+        a
+    }
+
+    /// Full-rebuild reference: build a fresh tree with the given accounts via
+    /// the cold-start path (recompute_root only).
+    fn full_rebuild_root(accounts: &[(String, Account)]) -> [u8; 32] {
+        let mut tree = StateMerkleTree::new();
+        for (addr, acc) in accounts {
+            tree.insert_lazy(addr, acc);
+        }
+        // Force full rebuild path by disabling incremental for this call.
+        tree.incremental_enabled = false;
+        let root = tree.finalize();
+        tree.incremental_enabled = true;
+        root
+    }
+
+    #[test]
+    fn level_sync_matches_full_rebuild_two_steps() {
+        let initial: Vec<(String, Account)> = (0..10)
+            .map(|i| (format!("addr_{}", i), acct(100 * i, i, &format!("addr_{}", i))))
+            .collect();
+        let added: Vec<(String, Account)> = (10..15)
+            .map(|i| (format!("addr_{}", i), acct(100 * i, i, &format!("addr_{}", i))))
+            .collect();
+
+        // Incremental path: cold start with initial → finalize (full rebuild populates
+        // intermediate); then insert `added` → finalize uses level-sync incremental.
+        let mut tree = StateMerkleTree::new();
+        for (a, c) in &initial { tree.insert_lazy(a, c); }
+        let _ = tree.finalize(); // cold-start full rebuild
+        for (a, c) in &added { tree.insert_lazy(a, c); }
+        let incremental_root = tree.finalize(); // level-sync path
+
+        // Reference: full rebuild over the combined set.
+        let mut combined = initial.clone();
+        combined.extend(added.iter().cloned());
+        let reference_root = full_rebuild_root(&combined);
+
+        assert_eq!(incremental_root, reference_root,
+            "level-sync incremental root must match full rebuild over combined leaves");
+    }
+
+    #[test]
+    fn level_sync_matches_full_rebuild_many_steps() {
+        let total = 50;
+        let chunk = 5;
+        let all: Vec<(String, Account)> = (0..total)
+            .map(|i| (format!("acc_{:03}", i), acct(1_000 + i as u64, i as u64, &format!("acc_{:03}", i))))
+            .collect();
+
+        // Incremental: insert in `chunk`-sized batches with finalize between each.
+        let mut tree = StateMerkleTree::new();
+        for batch in all.chunks(chunk) {
+            for (a, c) in batch { tree.insert_lazy(a, c); }
+            let _ = tree.finalize();
+        }
+        let incremental_root = tree.finalize();
+
+        let reference_root = full_rebuild_root(&all);
+        assert_eq!(incremental_root, reference_root,
+            "level-sync after many incremental finalize calls must match full rebuild");
+    }
+
+    #[test]
+    fn level_sync_handles_remove_lazy() {
+        let initial: Vec<(String, Account)> = (0..20)
+            .map(|i| (format!("k_{:02}", i), acct(50 + i as u64, i as u64, &format!("k_{:02}", i))))
+            .collect();
+
+        // Build then remove a subset incrementally.
+        let mut tree = StateMerkleTree::new();
+        for (a, c) in &initial { tree.insert_lazy(a, c); }
+        let _ = tree.finalize();
+        for i in [3usize, 7, 11, 19] {
+            tree.remove_lazy(&format!("k_{:02}", i));
+        }
+        let incremental_root = tree.finalize();
+
+        // Reference: full rebuild with the removed entries omitted.
+        let kept: Vec<(String, Account)> = initial.into_iter()
+            .filter(|(a, _)| ![3usize, 7, 11, 19].iter().any(|i| a == &format!("k_{:02}", i)))
+            .collect();
+        let reference_root = full_rebuild_root(&kept);
+
+        assert_eq!(incremental_root, reference_root,
+            "level-sync after remove_lazy must match full rebuild over remaining leaves");
+    }
+
+    #[test]
+    fn level_sync_update_existing() {
+        let alice = acct(100, 0, "alice");
+        let bob = acct(200, 0, "bob");
+        let mut tree = StateMerkleTree::new();
+        tree.insert_lazy("alice", &alice);
+        tree.insert_lazy("bob", &bob);
+        let _ = tree.finalize();
+
+        // Update Alice's balance — incremental path
+        let alice2 = acct(999, 1, "alice");
+        tree.insert_lazy("alice", &alice2);
+        let incremental_root = tree.finalize();
+
+        // Reference: fresh build with final values
+        let reference_root = full_rebuild_root(&[
+            ("alice".to_string(), alice2),
+            ("bob".to_string(), bob),
+        ]);
+        assert_eq!(incremental_root, reference_root,
+            "update via incremental must match full rebuild");
+    }
+
+    #[test]
+    fn level_sync_insertion_order_independent() {
+        let pairs: Vec<(String, Account)> = (0..15)
+            .map(|i| (format!("p_{}", i), acct(7 * i as u64, i as u64, &format!("p_{}", i))))
+            .collect();
+
+        // Order A: ascending
+        let mut tree_a = StateMerkleTree::new();
+        for (a, c) in &pairs { tree_a.insert_lazy(a, c); }
+        let _ = tree_a.finalize();
+        let root_a = tree_a.finalize();
+
+        // Order B: reversed
+        let mut tree_b = StateMerkleTree::new();
+        for (a, c) in pairs.iter().rev() { tree_b.insert_lazy(a, c); }
+        let _ = tree_b.finalize();
+        let root_b = tree_b.finalize();
+
+        // Order C: shuffled deterministically (rotate)
+        let mut shuffled = pairs.clone();
+        shuffled.rotate_left(7);
+        let mut tree_c = StateMerkleTree::new();
+        for (a, c) in &shuffled { tree_c.insert_lazy(a, c); }
+        let _ = tree_c.finalize();
+        let root_c = tree_c.finalize();
+
+        assert_eq!(root_a, root_b, "root must be insertion-order-independent (asc vs desc)");
+        assert_eq!(root_a, root_c, "root must be insertion-order-independent (rotate)");
+    }
+
+    #[test]
+    fn level_sync_empty_after_remove_all() {
+        let one = acct(1, 0, "only");
+        let mut tree = StateMerkleTree::new();
+        tree.insert_lazy("only", &one);
+        let _ = tree.finalize();
+        let default_root = StateMerkleTree::new().root_unchecked();
+        tree.remove_lazy("only");
+        let after_root = tree.finalize();
+        assert_eq!(after_root, default_root,
+            "tree drained of all leaves must collapse to the empty-tree default root");
+    }
+
+    #[test]
+    fn level_sync_single_account_incremental() {
+        let acc = acct(42, 0, "single");
+        // Step 1: cold-start with one account
+        let mut tree = StateMerkleTree::new();
+        tree.insert_lazy("single", &acc);
+        let cold_root = tree.finalize();
+
+        // Step 2: incremental update on same single account
+        let acc2 = acct(43, 1, "single");
+        tree.insert_lazy("single", &acc2);
+        let incremental_root = tree.finalize();
+
+        // Reference: fresh tree with updated value
+        let reference_root = full_rebuild_root(&[("single".to_string(), acc2)]);
+        assert_eq!(incremental_root, reference_root,
+            "single-account incremental update must match full rebuild");
+        assert_ne!(cold_root, incremental_root,
+            "value change must produce different root");
+    }
+}
+
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+    use crate::Account;
+
+    fn acct(balance: u64, nonce: u64, addr: &str) -> Account {
+        let mut a = Account::default();
+        a.balance = balance;
+        a.nonce = nonce;
+        a.address = addr.to_string();
+        a
+    }
+
+    /// Single-account inclusion proof must verify against the real state_root.
+    #[test]
+    fn proof_round_trip_single_account() {
+        let alice = acct(1_000, 0, "alice");
+        let mut tree = StateMerkleTree::new();
+        tree.insert_lazy("alice", &alice);
+        let root = tree.finalize();
+
+        let proof = tree.generate_proof("alice");
+        assert_eq!(proof.len(), TREE_DEPTH, "proof length must equal TREE_DEPTH");
+        assert!(
+            StateMerkleTree::verify_proof("alice", &alice, &proof, &root),
+            "single-account proof must verify against real state_root"
+        );
+    }
+
+    /// Multi-account inclusion proof must verify for each leaf independently.
+    #[test]
+    fn proof_round_trip_multi_account() {
+        let pairs: Vec<(String, Account)> = (0..20)
+            .map(|i| (format!("user_{:02}", i), acct(100 * i as u64, i as u64, &format!("user_{:02}", i))))
+            .collect();
+
+        let mut tree = StateMerkleTree::new();
+        for (a, c) in &pairs { tree.insert_lazy(a, c); }
+        let root = tree.finalize();
+
+        for (addr, acc) in &pairs {
+            let proof = tree.generate_proof(addr);
+            assert!(
+                StateMerkleTree::verify_proof(addr, acc, &proof, &root),
+                "proof for {} must verify against multi-account state_root", addr
+            );
+        }
+    }
+
+    /// Wrong account data must NOT verify (forgery resistance).
+    #[test]
+    fn proof_rejects_wrong_data() {
+        let alice = acct(100, 0, "alice");
+        let mut tree = StateMerkleTree::new();
+        tree.insert_lazy("alice", &alice);
+        let _ = tree.finalize();
+        let proof = tree.generate_proof("alice");
+        let root = tree.root_unchecked();
+
+        let forged = acct(9_999_999, 0, "alice");
+        assert!(
+            !StateMerkleTree::verify_proof("alice", &forged, &proof, &root),
+            "proof must reject forged balance"
+        );
+    }
+
+    /// Proof generated after incremental update must verify against the new root.
+    #[test]
+    fn proof_after_incremental_update() {
+        let alice = acct(100, 0, "alice");
+        let bob = acct(200, 0, "bob");
+        let mut tree = StateMerkleTree::new();
+        tree.insert_lazy("alice", &alice);
+        tree.insert_lazy("bob", &bob);
+        let _ = tree.finalize();
+
+        let alice_v2 = acct(555, 1, "alice");
+        tree.insert_lazy("alice", &alice_v2);
+        let new_root = tree.finalize();
+
+        let proof_alice = tree.generate_proof("alice");
+        let proof_bob = tree.generate_proof("bob");
+
+        assert!(
+            StateMerkleTree::verify_proof("alice", &alice_v2, &proof_alice, &new_root),
+            "post-update proof for updated leaf must verify"
+        );
+        assert!(
+            StateMerkleTree::verify_proof("bob", &bob, &proof_bob, &new_root),
+            "post-update proof for unchanged leaf must verify"
+        );
+    }
+
+    /// Proof must reject the old account value after an incremental update.
+    #[test]
+    fn proof_rejects_stale_value_after_update() {
+        let alice_v1 = acct(100, 0, "alice");
+        let mut tree = StateMerkleTree::new();
+        tree.insert_lazy("alice", &alice_v1);
+        let _ = tree.finalize();
+
+        let alice_v2 = acct(555, 1, "alice");
+        tree.insert_lazy("alice", &alice_v2);
+        let new_root = tree.finalize();
+
+        let proof = tree.generate_proof("alice");
+        assert!(
+            !StateMerkleTree::verify_proof("alice", &alice_v1, &proof, &new_root),
+            "proof must not verify against the pre-update account value"
+        );
+    }
+
+    /// Production-scale shape: many accounts, prove a randomly-chosen subset.
+    #[test]
+    fn proof_round_trip_at_scale() {
+        let n = 500;
+        let accounts: Vec<(String, Account)> = (0..n)
+            .map(|i| (format!("acc_{:05}", i), acct(1_000 + i as u64, i as u64, &format!("acc_{:05}", i))))
+            .collect();
+
+        let mut tree = StateMerkleTree::new();
+        for (a, c) in &accounts { tree.insert_lazy(a, c); }
+        let root = tree.finalize();
+
+        // sample every 37th — covers spread without N² blowup
+        for i in (0..n).step_by(37) {
+            let (addr, acc) = &accounts[i];
+            let proof = tree.generate_proof(addr);
+            assert!(
+                StateMerkleTree::verify_proof(addr, acc, &proof, &root),
+                "proof for {} (i={}) must verify in 500-account tree", addr, i
+            );
+        }
+    }
+
+    /// Proof for address A must NOT verify against address B's leaf hash.
+    #[test]
+    fn proof_address_binding() {
+        let alice = acct(100, 0, "alice");
+        let bob = acct(200, 0, "bob");
+        let mut tree = StateMerkleTree::new();
+        tree.insert_lazy("alice", &alice);
+        tree.insert_lazy("bob", &bob);
+        let root = tree.finalize();
+
+        let alice_proof = tree.generate_proof("alice");
+        // Using alice's proof + bob's account = address-mismatched verify
+        // must fail because verify_proof reconstructs the path from
+        // bob's address but uses alice's siblings.
+        assert!(
+            !StateMerkleTree::verify_proof("bob", &bob, &alice_proof, &root),
+            "alice's proof must not verify bob's account"
+        );
     }
 }
 
