@@ -7683,7 +7683,6 @@ impl Storage {
         &self,
         target_height: u64,
     ) -> IntegrationResult<Option<(u64, Vec<u8>)>> {
-        const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
 
@@ -7691,20 +7690,51 @@ impl Storage {
             return Ok(None);
         }
 
-        let mut probe_height = (target_height / SNAPSHOT_INCREMENTAL_INTERVAL) * SNAPSHOT_INCREMENTAL_INTERVAL;
-        loop {
-            if probe_height == 0 {
-                return Ok(None);
+        // v32.15: scan actual stored snapshot keys for the freshest height ≤ target.
+        // Prior fixed-3600-stride probing missed snapshots stored at macroblock
+        // boundaries (multiples of 90, not 3600) and any non-stride heights left
+        // after pruning → forced the fragile full-replay-from-0 recovery path.
+        // Retained-snapshot count is bounded by the pruning policy, so this full
+        // scan is O(retained) — tens of entries even at production scale.
+        use rocksdb::IteratorMode;
+        let mut best_height: Option<u64> = None;
+        let iter = self.persistent.db.iterator_cf(&snapshots_cf, IteratorMode::Start);
+        for item in iter {
+            let (key, value) = match item {
+                Ok(kv) => kv,
+                Err(_) => continue,
+            };
+            if value.is_empty() {
+                continue;
             }
-            for prefix in &["full_snap_", "state_snap_"] {
-                let key = format!("{}{}", prefix, probe_height);
-                if let Some(data) = self.persistent.db.get_cf(&snapshots_cf, key.as_bytes())? {
-                    if !data.is_empty() {
-                        return Ok(Some((probe_height, data)));
+            let key_str = match std::str::from_utf8(&key) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let height_str = key_str.strip_prefix("full_snap_")
+                .or_else(|| key_str.strip_prefix("state_snap_"));
+            if let Some(hs) = height_str {
+                if let Ok(h) = hs.parse::<u64>() {
+                    if h <= target_height && best_height.map_or(true, |b| h > b) {
+                        best_height = Some(h);
                     }
                 }
             }
-            probe_height = probe_height.saturating_sub(SNAPSHOT_INCREMENTAL_INTERVAL);
+        }
+
+        match best_height {
+            Some(h) => {
+                for prefix in &["full_snap_", "state_snap_"] {
+                    let key = format!("{}{}", prefix, h);
+                    if let Some(data) = self.persistent.db.get_cf(&snapshots_cf, key.as_bytes())? {
+                        if !data.is_empty() {
+                            return Ok(Some((h, data)));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            None => Ok(None),
         }
     }
 

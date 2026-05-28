@@ -470,6 +470,19 @@ pub fn get_pending_sync_count() -> usize {
 pub static SYNC_PEER_COOLDOWN: Lazy<DashMap<String, (u64, u32)>> =
     Lazy::new(|| DashMap::new());
 
+// v32.15: pre-activation P2P sync gate. Holds super-node ids whose on-chain
+// NodeActivation has been applied. Populated from state at boot + on each
+// block apply. Drives admission in handle_block_request / handle_macroblock_sync_request.
+pub static REGISTERED_SUPER_NODES: Lazy<DashMap<String, ()>> = Lazy::new(DashMap::new);
+
+pub fn add_registered_super_node(node_id: String) {
+    REGISTERED_SUPER_NODES.insert(node_id, ());
+}
+
+pub fn is_super_node_registered(node_id: &str) -> bool {
+    REGISTERED_SUPER_NODES.contains_key(node_id)
+}
+
 /// Cool-down window for a peer based on consecutive failure count (seconds).
 /// Failure 1 → 5s, 2 → 15s, 3+ → 45s (capped).
 pub fn sync_peer_cooldown_secs(failures: u32) -> u64 {
@@ -19641,6 +19654,34 @@ impl SimplifiedP2P {
         // Update last_seen for requesting peer
         self.update_peer_last_seen(from_peer);
 
+        // v32.15: pre-activation gate. Genesis IPs always pass. Bootstrap grace
+        // window (chain ≤ 90) allows all peers to solve chicken-and-egg. Past
+        // that, super_node_* requester_ids must be on-chain registered. Reply
+        // with an empty batch so the requester doesn't timeout; they need to
+        // complete activation before bulk-sync is served.
+        let from_ip = from_peer.split(':').next().unwrap_or(from_peer);
+        let is_genesis_peer = is_genesis_node_ip(from_ip);
+        if !is_genesis_peer && requester_id.starts_with("super_node_") {
+            let chain_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            if chain_h > 90 && !is_super_node_registered(&requester_id) {
+                if crate::node::is_warn() {
+                    let id_short: String = requester_id.chars().take(20).collect();
+                    println!("[WARN][SYNC] gate_unregistered peer={} id={} chain_h={} require_activation",
+                             from_peer, id_short, chain_h);
+                }
+                let response = NetworkMessage::BlocksBatch {
+                    blocks: Vec::new(),
+                    from_height,
+                    to_height: from_height,
+                    sender_id: self.node_id.clone(),
+                };
+                if let Some(peer_addr) = self.peer_id_to_addr.get(&requester_id) {
+                    self.send_network_message(&peer_addr.clone(), response);
+                }
+                return;
+            }
+        }
+
         // v31.2: if I'm the next-slot producer, shed sync serving with an
         // empty batch so my production loop keeps its RocksDB I/O budget.
         // Requester retries another peer via existing empty_batch handling.
@@ -19975,6 +20016,24 @@ impl SimplifiedP2P {
     pub fn handle_macroblock_request(&self, from_peer: &str, from_index: u64, to_index: u64, requester_id: String) {
         // Update last_seen for requesting peer
         self.update_peer_last_seen(from_peer);
+
+        // v32.15: pre-activation gate — same policy as handle_block_request.
+        // Bootstrap grace (chain ≤ 90), genesis IP, or on-chain registered id.
+        {
+            let from_ip = from_peer.split(':').next().unwrap_or(from_peer);
+            let is_genesis_peer = is_genesis_node_ip(from_ip);
+            if !is_genesis_peer && requester_id.starts_with("super_node_") {
+                let chain_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                if chain_h > 90 && !is_super_node_registered(&requester_id) {
+                    if crate::node::is_warn() {
+                        let id_short: String = requester_id.chars().take(20).collect();
+                        println!("[WARN][MB_SYNC] gate_unregistered peer={} id={} chain_h={} require_activation",
+                                 from_peer, id_short, chain_h);
+                    }
+                    return;
+                }
+            }
+        }
         
         // v3.0: CRITICAL FIX - Genesis nodes bypass rate limiting to prevent network isolation
         let is_genesis_requester = requester_id.starts_with("genesis_node_");

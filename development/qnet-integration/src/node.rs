@@ -3110,6 +3110,11 @@ impl BlockchainNode {
                         };
                         let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
                         result.deferred_registrations.push((activation_id, type_str.to_string(), tx.from.clone()));
+                        // v32.15: feed pre-activation P2P gate registry
+                        if matches!(node_type, qnet_state::account::NodeType::Super) {
+                            let pseudonym = crate::rpc::generate_super_node_pseudonym(&tx.from);
+                            crate::unified_p2p::add_registered_super_node(pseudonym);
+                        }
                     }
                     _ => {}
                 }
@@ -3415,6 +3420,40 @@ impl BlockchainNode {
                 "reconcile_no_blocks_replayed replay_from={} target={} errors={}",
                 replay_from, replay_to, load_errs,
             ));
+        }
+
+        // v32.15: fail-closed gate. Verify the reconciled state against the
+        // 2f+1-bound snapshot_root in the finalized macroblock at the boundary
+        // (Pattern C, v32.9). Mismatch ⇒ recovery produced divergent state ⇒
+        // reject so the caller re-syncs from canonical instead of forking.
+        // No binding at this boundary ⇒ cannot verify, accept with warning
+        // (legitimate at pre-binding/early heights).
+        let mb_idx = target_height / 90;
+        if mb_idx > 0 {
+            if let Ok(Some(mb_bytes)) = storage.get_macroblock_by_height(mb_idx) {
+                if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
+                    if let Some(expected_root) = mb.consensus_data.snapshot_root {
+                        match storage.compute_canonical_state_root(target_height) {
+                            Ok(computed) if computed == expected_root => {
+                                println!("[INFO][STATE] reconcile_verified mb={} target={} root={} pattern=C",
+                                         mb_idx, target_height, hex::encode(&computed[..8]));
+                            }
+                            Ok(computed) => {
+                                return Err(format!(
+                                    "reconcile_root_mismatch target={} mb={} expected={} computed={} action=resync",
+                                    target_height, mb_idx,
+                                    hex::encode(&expected_root[..8]), hex::encode(&computed[..8]),
+                                ));
+                            }
+                            Err(e) => {
+                                println!("[WARN][STATE] reconcile_verify_compute_err target={} err={:?}", target_height, e);
+                            }
+                        }
+                    } else {
+                        println!("[WARN][STATE] reconcile_unverified mb={} reason=no_snapshot_root_binding", mb_idx);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -8986,7 +9025,25 @@ impl BlockchainNode {
             // (restore_light_nodes_from_storage defaults to Polling for privacy.)
             p2p.update_device_tokens_from_storage(&*blockchain.storage);
         }
-        
+
+        // v32.15: populate REGISTERED_SUPER_NODES from on-chain state. Drives
+        // the pre-activation P2P sync gate. Scales linearly with super-node
+        // count — fine for 100k+ since this runs once at boot.
+        {
+            let state_guard = blockchain.state.read().await;
+            let accounts = state_guard.get_all_accounts();
+            drop(state_guard);
+            let mut registered = 0usize;
+            for (wallet, account) in accounts.iter() {
+                if account.is_node && account.node_type.as_deref().map(|s| s.eq_ignore_ascii_case("super")).unwrap_or(false) {
+                    let id = crate::rpc::generate_super_node_pseudonym(wallet);
+                    crate::unified_p2p::add_registered_super_node(id);
+                    registered += 1;
+                }
+            }
+            println!("[INFO][P2P] registered_super_nodes_loaded count={}", registered);
+        }
+
         // CRITICAL: Link deterministic reputation to P2P for unified access
         // This allows deterministic producer selection to use blockchain-based reputation
         if let Some(ref p2p) = blockchain.unified_p2p {
@@ -9462,14 +9519,24 @@ impl BlockchainNode {
                             // SYNC_PEER_COOLDOWN cadence internally.
                             crate::unified_p2p::record_sync_peer_failure(&from_peer_hint);
 
-                            // Kick off async sync of the missing N-2. When it
-                            // lands, re-broadcast of the original macroblock
-                            // (or a fresh sync_macroblocks(index,index) call)
-                            // will find N-2 on disk and validate cleanly.
+                            // v32.15: batched range fetch on cold-sync. When the local
+                            // macroblock store is empty (fresh node), single-step N-2
+                            // backtracking produces O(N) round-trips. Detect and fetch
+                            // the whole prefix [0..missing_idx] in one request.
                             let p2p_for_rotation = blockchain_for_macroblocks.unified_p2p.clone();
+                            let storage_for_check = blockchain_for_macroblocks.storage.clone();
                             tokio::spawn(async move {
                                 if let Some(p2p) = p2p_for_rotation {
-                                    let _ = p2p.sync_macroblocks(missing_idx, missing_idx).await;
+                                    let local_top = storage_for_check
+                                        .get_latest_macroblock_index()
+                                        .unwrap_or(0);
+                                    let from = if local_top == 0 { 0 } else { local_top + 1 };
+                                    let to = missing_idx;
+                                    if to > from && (to - from) > 1 {
+                                        let _ = p2p.sync_macroblocks(from, to).await;
+                                    } else {
+                                        let _ = p2p.sync_macroblocks(missing_idx, missing_idx).await;
+                                    }
                                 }
                             });
                             // Not an error for logging purposes — this is the
@@ -16977,63 +17044,58 @@ impl BlockchainNode {
                     }
 
                     if canonical_height > microblock_height {
-                        // v15.11: Bound the scan window AND move it to spawn_blocking.
-                        //
-                        // Scan rationale: verify all blocks between current state-machine
-                        // height and canonical height exist in RocksDB before fast-forwarding
-                        // the in-memory height pointer.
-                        //
-                        // Two issues with the prior implementation:
-                        //   1. Unbounded loop: catch-up scenarios with gap > 1000 blocks
-                        //      issued thousands of synchronous load_microblock() calls
-                        //      on the producer task, freezing the runtime under any
-                        //      RocksDB read amplification.
-                        //   2. Sync I/O on async runtime: each load_microblock is a sync
-                        //      RocksDB get; under compaction these can each take 50-200ms,
-                        //      compounding to multi-second stalls (root cause of the
-                        //      production node 002 silent-for-85s incident).
-                        //
-                        // v15.11 fix:
-                        //   * Cap the scan at SCAN_WINDOW_BLOCKS (1 macroblock = 90 blocks).
-                        //     If the gap is larger, fall back to incremental progress
-                        //     (one macroblock per loop iteration) — guaranteed bounded
-                        //     wall-clock per iteration regardless of catch-up gap.
-                        //   * Whole scan executes inside one spawn_blocking call so
-                        //     RocksDB compaction stalls land on the blocking pool, not
-                        //     the runtime.
+                        // v15.11: scan window bounded + spawn_blocking. Verify blocks
+                        // between state-machine height and canonical exist in RocksDB
+                        // before fast-forwarding. Scan capped at 1 macroblock (90)
+                        // to keep the producer loop bounded under any catch-up gap.
                         const SCAN_WINDOW_BLOCKS: u64 = 90;
-                        let scan_target = std::cmp::min(
-                            canonical_height,
-                            microblock_height.saturating_add(SCAN_WINDOW_BLOCKS),
-                        );
-                        let scan_from = microblock_height + 1;
-                        let storage_for_scan = storage.clone();
-                        let scan_result: (bool, Option<u64>) = match tokio::task::spawn_blocking(move || {
-                            for h in scan_from..=scan_target {
-                                if storage_for_scan.load_microblock(h).unwrap_or(None).is_none() {
-                                    return (false, Some(h));
+
+                        // v32.15: snapshot fast-path. State CF advanced via state-sync
+                        // snapshot means blocks 1..N are intentionally absent (snapshot
+                        // replaces sequential replay). Per-block scan would deadlock here
+                        // forever. Detect by `microblock_height==0` + gap ≥ scan window
+                        // and advance state-machine directly to canonical_height.
+                        let snapshot_jump = microblock_height == 0
+                            && canonical_height >= SCAN_WINDOW_BLOCKS;
+
+                        let (can_sync, scan_target) = if snapshot_jump {
+                            println!(
+                                "[INFO][SYNC] state_machine_snapshot_fastforward 0→{} (state-sync apply, no per-block scan)",
+                                canonical_height
+                            );
+                            (true, canonical_height)
+                        } else {
+                            let st = std::cmp::min(
+                                canonical_height,
+                                microblock_height.saturating_add(SCAN_WINDOW_BLOCKS),
+                            );
+                            let scan_from = microblock_height + 1;
+                            let storage_for_scan = storage.clone();
+                            let scan_result: (bool, Option<u64>) = match tokio::task::spawn_blocking(move || {
+                                for h in scan_from..=st {
+                                    if storage_for_scan.load_microblock(h).unwrap_or(None).is_none() {
+                                        return (false, Some(h));
+                                    }
+                                }
+                                (true, None)
+                            }).await {
+                                Ok(res) => res,
+                                Err(join_err) => {
+                                    println!("[WARN][SYNC] scan_join_err range={}..={} err={}", scan_from, st, join_err);
+                                    (false, None)
+                                }
+                            };
+                            if !scan_result.0 {
+                                if let Some(missing_h) = scan_result.1 {
+                                    println!("[WARN][SYNC] Cannot sync state machine to {} - missing block #{} (window={}..={})",
+                                            canonical_height, missing_h, scan_from, st);
                                 }
                             }
-                            (true, None)
-                        }).await {
-                            Ok(res) => res,
-                            Err(join_err) => {
-                                println!("[WARN][SYNC] scan_join_err range={}..={} err={}", scan_from, scan_target, join_err);
-                                (false, None)
-                            }
+                            (scan_result.0, st)
                         };
-                        let can_sync = scan_result.0;
-                        if !can_sync {
-                            if let Some(missing_h) = scan_result.1 {
-                                println!("[WARN][SYNC] Cannot sync state machine to {} - missing block #{} (window={}..={})",
-                                        canonical_height, missing_h, scan_from, scan_target);
-                            }
-                        }
-                        // Fast-forward only as far as we verified — the next loop iteration
-                        // will pick up the next window. This keeps catch-up bounded and
-                        // responsive to view-change events.
+                        // Fast-forward only as far as verified. Next iteration picks up
+                        // the following window. Catch-up bounded, view-change responsive.
                         let effective_canonical = if can_sync { scan_target } else { microblock_height };
-                        // Override `canonical_height` for the rest of this block only.
                         let canonical_height = effective_canonical;
 
                         if can_sync {

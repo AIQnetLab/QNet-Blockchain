@@ -405,12 +405,12 @@ impl StateMerkleTree {
                 hasher.update(account.contract_storage[key].as_bytes());
             }
         }
-        // v7.0: pending_rewards included in hash AFTER fork activation.
-        // Gated by AtomicBool to preserve backward compat with pre-v7.0 state_roots.
-        // Activated when the first v7.0 emission accrual is applied to state.
-        if PENDING_REWARDS_IN_MERKLE.load(Ordering::Acquire) {
-            hasher.update(&account.pending_rewards.to_le_bytes());
-        }
+        // v32.15: pending_rewards ALWAYS in leaf hash — fixed schema for chain
+        // lifetime. A runtime flag here made hash_account non-deterministic:
+        // accounts hashed before the flip kept a no-pending hash, so any full
+        // rebuild (rollback/snapshot/restart) re-hashed them with-pending and
+        // diverged from the running incremental state → consensus split.
+        hasher.update(&account.pending_rewards.to_le_bytes());
         // EXCLUDED from hash (non-deterministic or metadata-only):
         //   - reputation: f64 is non-deterministic across platforms
         //   - is_node, node_type, created_at, updated_at: metadata only
@@ -2983,6 +2983,72 @@ mod proof_tests {
             !StateMerkleTree::verify_proof("bob", &bob, &alice_proof, &root),
             "alice's proof must not verify bob's account"
         );
+    }
+}
+
+#[cfg(test)]
+mod fork_flag_determinism_tests {
+    use super::*;
+    use crate::Account;
+
+    fn acct_pr(balance: u64, pending: u64, addr: &str) -> Account {
+        let mut a = Account::default();
+        a.balance = balance;
+        a.address = addr.to_string();
+        a.pending_rewards = pending;
+        a
+    }
+
+    /// Reproduces production consensus split: a zero-pending account hashes
+    /// DIFFERENTLY depending on the runtime PENDING_REWARDS_IN_MERKLE flag.
+    /// This non-determinism is the root cause — any full rebuild after the flag
+    /// flips re-hashes genesis accounts differently from the running incremental
+    /// state. Must run single-threaded (global flag).
+    #[test]
+    fn hash_account_must_be_flag_independent() {
+        reset_pending_rewards_in_merkle();
+        let a = acct_pr(1000, 0, "genesis_acct"); // pending=0
+        let h_off = StateMerkleTree::hash_account(&a);
+        activate_pending_rewards_in_merkle();
+        let h_on = StateMerkleTree::hash_account(&a);
+        reset_pending_rewards_in_merkle();
+        assert_eq!(h_off, h_on,
+            "zero-pending account must hash identically regardless of flag — \
+             a flag-dependent hash makes merkle non-deterministic across \
+             running vs rebuilt nodes");
+    }
+
+    /// End-to-end: genesis hashed flag=false, flip flag, accrue, then full
+    /// rebuild with flag=true → incremental root must equal full rebuild root.
+    #[test]
+    fn incremental_must_equal_full_across_flag_flip() {
+        reset_pending_rewards_in_merkle();
+        let genesis: Vec<(String, Account)> = (0..10)
+            .map(|i| (format!("g_{}", i), acct_pr(1000 + i as u64, 0, &format!("g_{}", i))))
+            .collect();
+        let mut tree = StateMerkleTree::new();
+        for (a, c) in &genesis { tree.insert_lazy(a, c); }
+        let _ = tree.finalize(); // full rebuild, flag=false
+
+        activate_pending_rewards_in_merkle(); // emission flips flag
+        let r1 = acct_pr(0, 50286, "reward_1");
+        let r2 = acct_pr(0, 50286, "reward_2");
+        tree.insert_lazy("reward_1", &r1);
+        tree.insert_lazy("reward_2", &r2);
+        let incremental_root = tree.finalize(); // incremental; 10 genesis kept flag=false hashes
+
+        // Rollback/snapshot path: rebuild from scratch with flag=true.
+        let mut combined = genesis.clone();
+        combined.push(("reward_1".to_string(), r1));
+        combined.push(("reward_2".to_string(), r2));
+        let mut tree2 = StateMerkleTree::new();
+        for (a, c) in &combined { tree2.insert_lazy(a, c); }
+        tree2.incremental_enabled = false;
+        let full_root = tree2.finalize(); // full rebuild, flag=true → all re-hashed
+
+        reset_pending_rewards_in_merkle();
+        assert_eq!(incremental_root, full_root,
+            "running incremental root must equal post-rollback full rebuild root");
     }
 }
 

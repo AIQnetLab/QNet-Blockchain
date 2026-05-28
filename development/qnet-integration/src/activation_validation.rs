@@ -1950,12 +1950,14 @@ impl BlockchainActivationRegistry {
             "activation_amount": record.activation_amount, // Phase 1: 1DEV amount, Phase 2: QNC amount
         }).to_string();
         
-        // Create blockchain transaction
-        // SECURITY: Unique nonce to prevent collision and replay attacks
-        let nonce_data = format!("{}:{}:{}", record.wallet_address, record.activated_at, record.code_hash);
-        use sha3::{Sha3_256, Digest};
-        let nonce_hash = Sha3_256::digest(nonce_data.as_bytes());
-        let nonce = u64::from_le_bytes(nonce_hash[0..8].try_into().expect("SHA3-256 hash is 32 bytes"));
+        // v32.15: sequential nonce per L1 standard (state-apply expects sender.nonce+1).
+        // Anti-replay enforced independently by:
+        //   1) Solana burn-tx hash (Phase 1) / on-chain Pool3 transfer hash (Phase 2),
+        //   2) canonical TX hash (SHA3 of canonical bytes),
+        //   3) mempool commitment_dedup_key (wallet, phase, type=6),
+        //   4) on-chain registered_nodes registry rejects double-activation.
+        // First TX from a fresh wallet → nonce=1.
+        let nonce: u64 = 1;
         
         // CRITICAL: Use NodeActivation transaction type for proper Pool 3 integration
         // Phase 1: amount = 0 (1DEV burned externally on Solana, FREE gas)
