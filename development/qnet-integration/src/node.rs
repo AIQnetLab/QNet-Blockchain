@@ -13809,7 +13809,41 @@ impl BlockchainNode {
                 committee_size
             ));
         }
-        
+
+        // п.3: finality-cert integrity. Count alone lets a peer fake the
+        // reveals map. Each reveal must hash to its commit
+        // (commit_hash = SHA3(reveal_data||nonce||salt)); a fabricated map
+        // cannot satisfy this. Beacon + content are already bound by signed
+        // microblocks, so this is the trustless-finality check for syncing /
+        // light nodes. SHADOW until the stand confirms zero false-positives on
+        // real macroblocks, then set MB_FINALITY_ENFORCE=true (per-commit
+        // signature verify against the committee registry lands on the stand).
+        const MB_FINALITY_ENFORCE: bool = false;
+        {
+            let mut bad = 0u32;
+            for (node_id, reveal_bytes) in macroblock.consensus_data.reveals.iter() {
+                let reveal: qnet_consensus::commit_reveal::Reveal =
+                    match bincode::deserialize(reveal_bytes) { Ok(r) => r, Err(_) => { bad += 1; continue; } };
+                let commit: qnet_consensus::commit_reveal::Commit =
+                    match macroblock.consensus_data.commits.get(node_id)
+                        .and_then(|b| bincode::deserialize(b).ok()) { Some(c) => c, None => { bad += 1; continue; } };
+                let mut h = Sha3_256::new();
+                h.update(&reveal.reveal_data);
+                h.update(&reveal.nonce);
+                h.update(b"qnet-commit-hash-v1");
+                if hex::encode(h.finalize()) != commit.commit_hash { bad += 1; }
+            }
+            if bad > 0 {
+                println!("[WARN][MB] finality_binding h={} bad={}/{} enforce={}",
+                         macroblock.height, bad, reveal_count, MB_FINALITY_ENFORCE);
+                if MB_FINALITY_ENFORCE {
+                    return Err(format!("MB_FINALITY:binding_fail h={} bad={}", macroblock.height, bad));
+                }
+            } else if is_debug() {
+                println!("[DBG][MB] finality_binding_ok h={} reveals={}", macroblock.height, reveal_count);
+            }
+        }
+
         // 5. CRITICAL: Detect database substitution
         // Check if we already have a macroblock at this height
         if macroblock.height > 0 {
@@ -18834,42 +18868,14 @@ impl BlockchainNode {
                     }
                 }
 
-                // v16.2: round-change ready handshake (anti cold-boot rotation fork
-                // h=154). At timeout_round>0 the producer converged on the round
-                // LOCALLY; peers may have seen votes in other orders, so without a
-                // barrier two honest producers emit blocks at different rounds for the
-                // same height. (1) producer broadcasts Dilithium3-signed ProducerReady;
-                // (2) peers with local certified>=round sign ReadyAck back; (3) producer
-                // waits 2f+1 distinct acks before building (>=f+1 honest converged →
-                // deterministic); (4) timeout → YIELD slot (pacemaker advances next
-                // stall = same liveness as a missing block). round=0: no handshake.
-                // Safety: signal-only (doesn't mutate HIGHEST_CERTIFIED_ROUND); a
-                // Byzantine skip is still caught by the receiver cert-presence check.
-                if is_my_turn_to_produce && timeout_round > 0 {
-                    if let Some(ref p2p) = unified_p2p {
-                        // Compute mb_idx from the height we are about to produce,
-                        // matching the keying convention used by the pacemaker
-                        // (`HIGHEST_CERTIFIED_ROUND[mb_idx]`) and the cert
-                        // presence check in the verify stage.
-                        let handshake_mb_idx = next_block_height / 90;
-                        let ready_ok = Self::wait_for_round_change_ready_quorum(
-                            p2p,
-                            &node_id,
-                            handshake_mb_idx,
-                            timeout_round,
-                            next_block_height,
-                        ).await;
-                        if !ready_ok {
-                            if is_warn() {
-                                println!(
-                                    "[WARN][READY] handshake_timeout h={} mb_idx={} round={} action=yield_slot",
-                                    next_block_height, handshake_mb_idx, timeout_round
-                                );
-                            }
-                            is_my_turn_to_produce = false;
-                        }
-                    }
-                }
+                // No pre-production barrier on rotation. The producer is the
+                // unique VRF leader for the 2f+1-certified round (identical on
+                // every honest node), so a synchronous ack handshake adds no
+                // safety: transient cert-propagation divergence is soft-accepted
+                // on ingest (Category A) and a split-brain microblock can never
+                // reach 2f+1 macroblock commit/reveal finality. The old barrier
+                // only cost liveness — it could not gather 2f+1 acks within the
+                // 800ms slot even with every validator healthy (acks=3/4 stall).
 
                 // ═══════════════════════════════════════════════════════════════════════════
                 // v3.10 BUG 3 FIX: Check if we're excluded (e.g., after fork detection)
@@ -22919,97 +22925,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         println!("[INFO][NODE] genesis_reputation_init_complete");
     }
     
-    /// Round-change ready handshake (v16.2). A producer at round > 0 calls
-    /// this BEFORE constructing the block: sign+broadcast ProducerReady,
-    /// self-record its own ack, poll count_ready_acks() every 50 ms until
-    /// 2f+1 of the active validators ack or the 800 ms timeout
-    /// (QNET_READY_HANDSHAKE_TIMEOUT_MS) elapses. Returns true on quorum;
-    /// on timeout the caller yields the slot — a NO-OP for safety (the
-    /// pacemaker advances on the next stall, same path as a missing block).
-    /// Never called at round 0 (no rotation event → zero steady-state cost).
-    async fn wait_for_round_change_ready_quorum(
-        p2p: &std::sync::Arc<crate::unified_p2p::SimplifiedP2P>,
-        node_id: &str,
-        mb_idx: u64,
-        round: u64,
-        height: u64,
-    ) -> bool {
-        // Round-0 has no handshake (no rotation event).
-        if round == 0 {
-            return true;
-        }
-
-        // Build canonical signed payload identical to the receiver-side
-        // verification format so peers can verify deterministically.
-        let msg_to_sign = format!(
-            "QNET_PRODUCER_READY_V1:{}:{}:{}:{}",
-            node_id, mb_idx, round, height
-        );
-        let sig_bytes = match try_get_quantum_crypto() {
-            Some(crypto) => match crypto.create_consensus_signature(node_id, &msg_to_sign).await {
-                Ok(sig) => sig.signature.as_bytes().to_vec(),
-                Err(e) => {
-                    if is_warn() {
-                        println!("[WARN][READY] producer_ready_sign_failed err={}", e);
-                    }
-                    return false;
-                }
-            },
-            None => return false,
-        };
-
-        // Self-record before broadcast — producer's own ack counts toward
-        // the 2f+1 quorum (the producer is part of the committee).
-        crate::unified_p2p::READY_ACKS
-            .entry((mb_idx, round, height, node_id.to_string()))
-            .or_insert_with(dashmap::DashSet::new)
-            .insert(node_id.to_string());
-
-        // Broadcast ProducerReady to all validator peers.
-        p2p.broadcast_producer_ready(
-            mb_idx,
-            round,
-            height,
-            node_id.to_string(),
-            sig_bytes,
-        );
-
-        // Poll for 2f+1 ack quorum. Compute target from current active
-        // validator count — same source the rest of consensus uses.
-        let total_validators = p2p.get_active_validator_count();
-        let two_f_plus_1 = ((2 * total_validators + 2) / 3).max(1);
-
-        let timeout_ms: u64 = std::env::var("QNET_READY_HANDSHAKE_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(800);
-        let poll_interval_ms = 50u64;
-        let max_polls = (timeout_ms / poll_interval_ms).max(1);
-
-        for _ in 0..max_polls {
-            let count = crate::unified_p2p::count_ready_acks(mb_idx, round, height, node_id);
-            if count >= two_f_plus_1 {
-                if is_info() {
-                    println!(
-                        "[INFO][READY] handshake_quorum mb_idx={} round={} h={} acks={}/{}",
-                        mb_idx, round, height, count, two_f_plus_1
-                    );
-                }
-                return true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
-        }
-
-        // Timeout — return false so caller yields the slot.
-        let final_count = crate::unified_p2p::count_ready_acks(mb_idx, round, height, node_id);
-        if is_info() {
-            println!(
-                "[INFO][READY] handshake_timeout mb_idx={} round={} h={} acks={}/{} timeout_ms={}",
-                mb_idx, round, height, final_count, two_f_plus_1, timeout_ms
-            );
-        }
-        false
-    }
+    // wait_for_round_change_ready_quorum (v16.2 pre-production ack handshake)
+    // removed: redundant with VRF-unique certified-round producer + 2f+1
+    // macroblock finality, and its 2f+1/800ms barrier was the liveness stall.
+    // Dormant ProducerReady/ReadyAck receive plumbing remains (no sender now).
 
     pub async fn select_microblock_producer(
         current_height: u64,
