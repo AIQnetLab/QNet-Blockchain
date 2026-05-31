@@ -12297,7 +12297,13 @@ pub enum NetworkMessage {
         data: Vec<u8>,  // bincode handles Vec<u8> natively
         block_type: String,  // "micro" or "macro"
     },
-    
+
+    /// Consensus v2 (Checkpoint-BFT): bincode of consensus_v2_driver::ConsensusMsg.
+    /// Gated by QNET_CONSENSUS_V2; routed to the v2 runtime, ignored when off.
+    ConsensusV2 {
+        data: Vec<u8>,
+    },
+
     /// Transaction data
     /// OPTIMIZED: Direct binary serialization via bincode
     Transaction {
@@ -13128,6 +13134,10 @@ impl SimplifiedP2P {
         }
         
         match message {
+            NetworkMessage::ConsensusV2 { data } => {
+                // Consensus v2 (Checkpoint-BFT): route raw bytes to the v2 runtime task.
+                crate::consensus_v2_node::route_inbound(data);
+            }
             NetworkMessage::Block { height, data, block_type } => {
                 // CRITICAL FIX: Update last_seen AND height for the peer who sent the block
                 self.update_peer_last_seen_with_height(from_peer, Some(height));
@@ -16811,7 +16821,7 @@ impl SimplifiedP2P {
     
     /// v2.48: Verify consensus signature (commit/reveal) using Dilithium
     /// Wrapper around verify_dilithium_heartbeat_signature for consistent API
-    fn verify_consensus_signature(&self, node_id: &str, message: &str, signature: &str) -> bool {
+    pub fn verify_consensus_signature(&self, node_id: &str, message: &str, signature: &str) -> bool {
         // Use the same verification logic as heartbeat (supports all formats)
         self.verify_dilithium_heartbeat_signature(message, signature, node_id)
     }

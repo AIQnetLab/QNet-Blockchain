@@ -23,6 +23,8 @@ pub mod archive_manager;
 pub mod genesis_constants;
 pub mod reward_sharding;
 pub mod consensus_state;   // L1 consensus state machine (single coordinator)
+pub mod consensus_v2_driver; // Consensus v2 — Checkpoint-BFT driver (engine ↔ node bridge)
+pub mod consensus_v2_node;   // Consensus v2 — node runtime (verify + async effect executor + task)
 pub mod block_pipeline;    // Staged block processing pipeline (ingest → decode → verify → apply)
 pub mod attestation_committee;  // Deterministic attestation committee selection (per-microblock BFT layer)
 pub mod chain_weight;            // Weighted fork choice (cumulative attestation weight, fork resolution)

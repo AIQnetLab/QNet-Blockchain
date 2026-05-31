@@ -25475,11 +25475,38 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     let cons_start = std::time::Instant::now();
                                     let role = if should_initiate { "INITIATOR" } else { "PARTICIPANT" };
                                     
-                                    if is_info() { 
-                                        println!("[INFO][ASYNC-CONS] mb={} role={} start_h={} end_h={} async=true", 
-                                                 mb_idx, role, start_height, end_height); 
+                                    if is_info() {
+                                        println!("[INFO][ASYNC-CONS] mb={} role={} start_h={} end_h={} async=true",
+                                                 mb_idx, role, start_height, end_height);
                                     }
-                                    
+
+                                    // Consensus v2 (Checkpoint-BFT): QNET_CONSENSUS_V2=1 replaces the old
+                                    // commit/reveal macroblock with one 2f+1 checkpoint per window. Flag
+                                    // off ⇒ old path below runs unchanged. Genesis committee for testnet;
+                                    // scale swaps in select_consensus_committee(N-2).
+                                    if crate::consensus_v2_node::v2_enabled() {
+                                        use std::sync::atomic::{AtomicBool, Ordering};
+                                        static V2_SPAWNED: AtomicBool = AtomicBool::new(false);
+                                        if !V2_SPAWNED.swap(true, Ordering::SeqCst) {
+                                            let committee: Vec<String> = (1..=5).map(|i| format!("genesis_node_{:03}", i)).collect();
+                                            tokio::spawn(crate::consensus_v2_node::run(
+                                                node_id_cons.clone(), committee, [0u8; 32],
+                                                p2p_cons.clone(), storage_cons.clone(),
+                                            ));
+                                        }
+                                        let mut mb_hashes: Vec<[u8; 32]> = Vec::new();
+                                        let mut state_root = [0u8; 32];
+                                        for h in start_height..=end_height {
+                                            if let Ok(Some(hash)) = storage_cons.load_microblock_hash(h) {
+                                                for i in 0..32 { state_root[i] ^= hash[i]; }
+                                                mb_hashes.push(hash);
+                                            }
+                                        }
+                                        let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&mb_hashes);
+                                        crate::consensus_v2_node::signal_window_end(mb_idx, end_height, mb_hashes, state_root, beacon);
+                                        return;
+                                    }
+
                                     let result = if should_initiate {
                                         Self::trigger_macroblock_consensus(
                                             storage_cons.clone(),

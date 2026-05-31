@@ -65,6 +65,17 @@ Explorer → Node RPC (RocksDB)
     - 100% data coverage
 ```
 
+### 🔭 **Consensus v2 — "Checkpoint-BFT" (in progress, flag `QNET_CONSENSUS_V2`)**
+
+The commit/reveal macroblock + microblock-rotation handshake are being unified into
+ONE pipelined post-quantum BFT: a single leader streams microblocks (1/s), the
+committee finalizes each window with ONE 2f+1 QC per checkpoint (2-chain commit).
+This removes the three recurring failure classes (determinism forks, liveness
+freezes, finality-coupling stalls) by construction; randomness is VRF-only (RANDAO
+commit/reveal removed). Engine + driver + node runtime implemented behind the flag;
+170 unit tests green; pending fault-injection stand validation. **Flag OFF ⇒ the
+v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
+
 ### 🛡️ **Previous Updates (v2.62.0 - December 30, 2025)**
 
 **🏛️ Per-Round Consensus Storage (Production L1 Architecture):**

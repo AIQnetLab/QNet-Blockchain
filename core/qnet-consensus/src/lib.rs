@@ -12,6 +12,10 @@ pub mod lazy_rewards;
 pub mod reward_integration;
 pub mod batch_operations;
 pub mod commit_reveal;
+// Consensus v2 — Checkpoint-BFT types (spec: docs/CONSENSUS_V2_SPEC.md)
+pub mod checkpoint_bft;
+// Consensus v2 — Checkpoint-BFT state machine (propose/vote/QC/commit + pacemaker)
+pub mod checkpoint_consensus;
 pub mod consensus_crypto;
 pub mod dynamic_timing;
 pub mod errors;

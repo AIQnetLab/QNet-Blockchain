@@ -40,6 +40,28 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 - **Microblocks**: Created every second (transaction processing)
 - **Macroblocks**: Created every 90 seconds (consensus finalization)
 
+> 🔭 **CONSENSUS v2 — "Checkpoint-BFT" (target architecture, gated by `QNET_CONSENSUS_V2`)**
+> The commit/reveal macroblock + the microblock-rotation READY-handshake described
+> below are being replaced by ONE pipelined BFT: a single leader streams microblocks
+> (1/s, soft), and the committee finalizes each window with ONE 2f+1 QC per
+> checkpoint (2-chain commit, finality ≈ 2 checkpoints). This unifies two fragile
+> subsystems into one and makes the three recurring failure classes impossible by
+> construction:
+>
+> | Class (past incidents) | v2 mechanism |
+> |---|---|
+> | Determinism fork (h=154/339/556) | leader = pure fn of ONE committed input; fail-closed catch-up |
+> | Liveness freeze (h=1261/17664) | no pre-production barrier; view-change by TimeoutCertificate + f+1 Bracha jump |
+> | Finality-coupling stall (h=16209/23408) | streaming ≠ finality; the checkpoint is the only consensus object |
+>
+> Randomness is VRF-only (RANDAO commit/reveal removed — no last-revealer bias).
+> Leader rotates per checkpoint window; committee ≤100 (2f+1=67), 100k nodes rotate
+> in over epochs. Implemented behind the flag: `core/qnet-consensus/src/{checkpoint_bft,
+> checkpoint_consensus}.rs` (engine), `development/qnet-integration/src/consensus_v2_{driver,
+> node}.rs` (node runtime). 170 unit tests green (engine safety/liveness + multi-node
+> sim). Pending fault-injection stand validation; after it the v1 path below is removed.
+> **Flag OFF ⇒ the v1 commit/reveal design documented below is the active path.**
+
 ### Key Innovations
 - **Per-Round Consensus Storage v2.62.0**: Independent HashMap for each round (no data loss!)
 - **100% First-Attempt Consensus v2.62.0**: Eliminates "Reveal doesn't match commit" errors
