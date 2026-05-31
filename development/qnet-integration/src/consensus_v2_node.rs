@@ -52,6 +52,18 @@ fn verify_qc(p2p: &SimplifiedP2P, committee: &[String], qc: &QuorumCertificate) 
     qc.verify(committee, |voter, body, sig| sig_ok(p2p, voter, &sign_str("VOTE", body), sig)).is_ok()
 }
 
+/// Checkpoint index a wire message pertains to — used to gate handling until this
+/// node has adopted that index's committee (avoids a vote-less race at the boundary).
+fn msg_index(m: &ConsensusMsg) -> u64 {
+    match m {
+        ConsensusMsg::Proposal(cp) => cp.index,
+        ConsensusMsg::Vote(v) => v.index,
+        ConsensusMsg::Qc(qc) => qc.index,
+        ConsensusMsg::Timeout(tm) => tm.index,
+        ConsensusMsg::Tc(tc) => tc.index,
+    }
+}
+
 /// Sign a payload with this node's consensus key; returns the hex sig as bytes.
 async fn sign_payload(node_id: &str, domain: &str, body: &[u8]) -> Option<Vec<u8>> {
     let crypto = crate::node::try_get_quantum_crypto()?;
@@ -65,6 +77,28 @@ async fn broadcast(p2p: &Arc<SimplifiedP2P>, msg: &ConsensusMsg) {
     if let Ok(data) = bincode::serialize(msg) {
         let _ = p2p.broadcast_quic(&NetworkMessage::ConsensusV2 { data }).await;
     }
+}
+
+/// Failover exclusions for the next epoch (≥2 failovers in this epoch ⇒ skip).
+/// Deterministic from on-chain failover history, so every node reads the same
+/// set from macroblock N-2; bincode of Vec<ExcludedProducerEntry>.
+fn excluded_producers(storage: &Storage, mb_index: u64) -> Option<Vec<u8>> {
+    const FAILOVER_THRESHOLD: u32 = 2;
+    let epoch_start = mb_index.saturating_sub(1) * 90;
+    let epoch_end = mb_index * 90;
+    let events = storage.get_failover_history(epoch_start, 100).ok()?;
+    let mut counts: std::collections::HashMap<String, (u32, Vec<u64>)> = std::collections::HashMap::new();
+    for e in events.iter().filter(|e| e.height >= epoch_start && e.height <= epoch_end) {
+        let c = counts.entry(e.failed_producer.clone()).or_insert((0, Vec::new()));
+        c.0 += 1; c.1.push(e.height);
+    }
+    let excluded: Vec<qnet_state::ExcludedProducerEntry> = counts.into_iter()
+        .filter(|(_, (n, _))| *n >= FAILOVER_THRESHOLD)
+        .map(|(node_id, (n, heights))| qnet_state::ExcludedProducerEntry {
+            node_id, failover_count: n, failover_heights: heights,
+            exclusion_blocks: 90, reason: format!("failover_{}_epoch_{}", n, mb_index),
+        }).collect();
+    if excluded.is_empty() { None } else { bincode::serialize(&excluded).ok() }
 }
 
 /// Execute driver Effects: sign+broadcast outbound, persist QCs, record finality.
@@ -89,17 +123,17 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 }
             }
             Effect::Relay(m) => broadcast(p2p, &m).await,
-            Effect::Persist { checkpoint, qc } => {
-                // v2: the certified checkpoint IS the canonical MacroBlock. Only the PROPOSER
-                // seals + broadcasts it — a different node may reach 2f+1 with a different signer
-                // subset, so sealing on ONE producer (its QC) keeps the block byte-identical
-                // network-wide. Followers receive it via broadcast → validate_received_macroblock
-                // (QC-checked) → save. Finality is recorded for ALL nodes in Effect::Finalize.
-                // Content is deterministic: timestamp rides in the QC-agreed checkpoint, prev
-                // from chain, mb_hashes/state_root from the checkpoint.
+            Effect::Persist { checkpoint, qc, eligible_producers, committee } => {
+                // v2: only the PROPOSER seals the macroblock (its canonical QC) so the block
+                // is byte-identical network-wide; followers receive + validate it. The
+                // macroblock IS the epoch-transition object — it carries the QC (finality)
+                // AND the next-epoch eligible-producer snapshot + VRF beacon + failover
+                // exclusions that N-2 producer/committee selection reads. Deterministic:
+                // timestamp/mb_hashes/state_root/beacon ride in the QC-agreed checkpoint.
                 if checkpoint.proposer != node_id { continue; }
                 let previous_hash = storage.get_latest_macroblock_hash().unwrap_or([0u8; 32]);
                 let qc_bytes = bincode::serialize(&qc).unwrap_or_default();
+                let excluded = excluded_producers(storage, checkpoint.index);
                 let mb = qnet_state::MacroBlock {
                     height: checkpoint.index,
                     timestamp: checkpoint.timestamp,
@@ -107,6 +141,10 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                     state_root: checkpoint.state_root,
                     consensus_data: qnet_state::ConsensusData {
                         checkpoint_qc: Some(qc_bytes),
+                        eligible_producers: if eligible_producers.is_empty() { None } else { Some(eligible_producers) },
+                        randomness_beacon: Some(checkpoint.beacon),
+                        excluded_producers_for_next_epoch: excluded,
+                        consensus_committee: Some(committee),
                         ..Default::default()
                     },
                     previous_hash,
@@ -147,7 +185,11 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
 /// Events fed to the v2 runtime task.
 pub enum V2Event {
     Inbound(Vec<u8>),  // raw ConsensusMsg bytes from P2P
-    WindowEnd { index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash },
+    WindowEnd {
+        index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
+        committee: Vec<String>,        // epoch committee (N-2 VRF sample) for this index
+        eligible_producers: Vec<u8>,   // bincode Vec<EligibleProducer> for the macroblock body
+    },
 }
 
 static V2_TX: OnceCell<mpsc::UnboundedSender<V2Event>> = OnceCell::new();
@@ -158,9 +200,12 @@ pub fn route_inbound(data: Vec<u8>) {
 }
 
 /// Production loop calls this at each checkpoint-window boundary.
-pub fn signal_window_end(index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash) {
+pub fn signal_window_end(
+    index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
+    committee: Vec<String>, eligible_producers: Vec<u8>,
+) {
     if let Some(tx) = V2_TX.get() {
-        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon });
+        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers });
     }
 }
 
@@ -176,16 +221,21 @@ pub fn init_runtime() -> Option<mpsc::UnboundedReceiver<V2Event>> {
 /// The single v2 consensus task. Owns the driver; verifies inbound, drives the
 /// engine, executes effects, and runs a progress-gated view timer.
 pub async fn run(
-    node_id: String, committee: Vec<String>, genesis_hash: Hash,
+    node_id: String, mut committee: Vec<String>, genesis_hash: Hash,
     p2p: Arc<SimplifiedP2P>, storage: Arc<Storage>,
     mut rx: mpsc::UnboundedReceiver<V2Event>,
 ) {
+    // committee rotates each epoch (N-2 VRF sample); kept here for verify_msg and
+    // mirrored into the driver/engine via build_proposal.
     let mut driver = ConsensusDriver::new(node_id.clone(), committee.clone(), genesis_hash);
     let timeout_ms: u64 = std::env::var("QNET_BFT2_VIEW_TIMEOUT_MS").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(4000);
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(timeout_ms));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_index = driver.current_index();
+    let mut last_signaled: u64 = 0; // highest window index we hold data for (gates idle timeouts)
+    let mut pending: Vec<Vec<u8>> = Vec::new(); // inbound ahead of our committee; replayed at its window
+    const MAX_PENDING: usize = 256; // DoS bound on the replay buffer
     if crate::node::is_info() {
         println!("[INFO][BFT2] runtime_started committee={} view_timeout_ms={}", committee.len(), timeout_ms);
     }
@@ -194,25 +244,52 @@ pub async fn run(
             Some(ev) = rx.recv() => {
                 let effects = match ev {
                     V2Event::Inbound(data) => match bincode::deserialize::<ConsensusMsg>(&data) {
-                        Ok(msg) if verify_msg(&p2p, &committee, &msg) => driver.handle(&msg),
-                        Ok(_) => { if crate::node::is_warn() { println!("[WARN][BFT2] msg_verify_failed"); } Vec::new() }
+                        Ok(msg) => {
+                            if msg_index(&msg) > last_signaled {
+                                // Committee for this index not adopted yet ⇒ buffer (bounded),
+                                // replayed when its window signal arrives. Prevents a vote-less
+                                // race when a proposal beats our boundary.
+                                if pending.len() < MAX_PENDING { pending.push(data); }
+                                Vec::new()
+                            } else if verify_msg(&p2p, &committee, &msg) {
+                                driver.handle(&msg)
+                            } else {
+                                if crate::node::is_warn() { println!("[WARN][BFT2] msg_verify_failed idx={}", msg_index(&msg)); }
+                                Vec::new()
+                            }
+                        }
                         Err(_) => Vec::new(),
                     },
-                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon } => {
-                        // Proposer sources the head microblock's real timestamp (it has the
-                        // block at the window boundary); it rides in the QC-signed checkpoint
-                        // so every node seals an identical MacroBlock.
+                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers } => {
+                        // Adopt this epoch's committee (verify + leader election), then
+                        // propose if we lead. head_ts = head microblock's real timestamp
+                        // (we have it at the boundary); rides in the QC-agreed checkpoint.
+                        last_signaled = last_signaled.max(index);
+                        committee = cmt.clone();
                         let head_ts = storage.load_microblock_auto_format(head_height)
                             .ok().flatten().map(|m| m.timestamp).unwrap_or(0);
-                        driver.build_proposal(index, head_height, mb_hashes, state_root, beacon, head_ts)
+                        let mut effs = driver.build_proposal(index, head_height, mb_hashes, state_root, beacon, head_ts, cmt, eligible_producers);
+                        // Replay buffered inbound now covered by the adopted committee.
+                        for data in std::mem::take(&mut pending) {
+                            match bincode::deserialize::<ConsensusMsg>(&data) {
+                                Ok(m) if msg_index(&m) <= last_signaled => {
+                                    if verify_msg(&p2p, &committee, &m) { effs.extend(driver.handle(&m)); }
+                                }
+                                Ok(_) if pending.len() < MAX_PENDING => pending.push(data), // still ahead
+                                _ => {}
+                            }
+                        }
+                        effs
                     }
                 };
                 execute(effects, &node_id, &p2p, &storage).await;
                 last_index = driver.current_index();
             }
             _ = timer.tick() => {
-                // Progress-gated: time out only if the view did not advance this interval.
-                if driver.current_index() == last_index {
+                // Time out only a checkpoint we are actively committing (window data in
+                // hand). Between windows the view idles ~90s — never time out then, else
+                // the idle gap would be misread as a stall and skip the next window.
+                if driver.current_index() == last_index && driver.current_index() <= last_signaled {
                     let effects = driver.on_timeout();
                     execute(effects, &node_id, &p2p, &storage).await;
                 }

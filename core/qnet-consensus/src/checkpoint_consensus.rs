@@ -50,6 +50,14 @@ impl CheckpointConsensus {
         self.committee.get(li).map(|n| n == proposer).unwrap_or(false)
     }
 
+    /// Replace the committee for the upcoming epoch (deterministic N-2 set).
+    /// Set before driving the matching checkpoint index; scales to rotating
+    /// committees sampled from up to MAX_VALIDATORS eligible producers.
+    pub fn set_committee(&mut self, mut committee: Vec<NodeId>) {
+        committee.sort();
+        self.committee = committee;
+    }
+
     /// Proposed checkpoint (authenticated). Emits a Vote iff leader-correct and
     /// it extends our lock (safety). `parent_hash` = hash(C_{index-1}).
     pub fn on_proposal(&mut self, cp: &Checkpoint, parent_hash: &Hash) -> Vec<Action> {

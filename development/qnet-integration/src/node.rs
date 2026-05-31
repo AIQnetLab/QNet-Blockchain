@@ -13787,17 +13787,22 @@ impl BlockchainNode {
             let qc: qnet_consensus::checkpoint_bft::QuorumCertificate =
                 bincode::deserialize(qc_bytes)
                     .map_err(|e| format!("[ERR][MB] v2_qc_decode h={} err={}", macroblock.height, e))?;
-            // 2f+1 DISTINCT signers. Per-signature verification against the committee
-            // registry runs in the ConsensusV2 receive path (verify_qc) before a QC is
-            // ever sealed into a block; here we bound the finality proof structurally.
-            let min_q = if macroblock.height <= 5 { 3 } else { 5 };
-            let distinct = qc.signers.iter().collect::<std::collections::HashSet<_>>().len();
-            if distinct < min_q {
-                return Err(format!("[ERR][MB] v2_qc_below_quorum signers={} min={} h={}",
-                                   distinct, min_q, macroblock.height));
+            // Quorum = 2f+1 of the committee the macroblock carries; signers must be
+            // distinct members of it. Per-signature verification runs in the ConsensusV2
+            // receive path (verify_qc); here we bound the finality proof structurally.
+            let committee: Vec<String> = macroblock.consensus_data.consensus_committee.clone().unwrap_or_default();
+            let min_q = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+            let signers: std::collections::HashSet<&String> = qc.signers.iter().collect();
+            if min_q == 0 || signers.len() < min_q {
+                return Err(format!("[ERR][MB] v2_qc_below_quorum signers={} min={} committee={} h={}",
+                                   signers.len(), min_q, committee.len(), macroblock.height));
             }
-            println!("[INFO][VALIDATION] macroblock_validated_v2 h={} qc_signers={}",
-                     macroblock.height, distinct);
+            let cset: std::collections::HashSet<&String> = committee.iter().collect();
+            if !signers.iter().all(|s| cset.contains(*s)) {
+                return Err(format!("[ERR][MB] v2_qc_nonmember h={}", macroblock.height));
+            }
+            println!("[INFO][VALIDATION] macroblock_validated_v2 h={} signers={} quorum={}",
+                     macroblock.height, signers.len(), min_q);
             return Ok(());
         }
 
@@ -14634,6 +14639,19 @@ impl BlockchainNode {
                 }
             }
             
+        // Consensus v2: start the always-on Checkpoint-BFT runtime at BOOT (not at the
+        // first window) so the inbound channel is live before any proposal — removes the
+        // startup drop that stalled checkpoint 1. Committee starts empty; each window's
+        // signal supplies the epoch (N-2) committee before that index is driven.
+        if crate::consensus_v2_node::v2_enabled() {
+            if let (Some(p2p), Some(rx)) = (self.unified_p2p.clone(), crate::consensus_v2_node::init_runtime()) {
+                tokio::spawn(crate::consensus_v2_node::run(
+                    self.node_id.clone(), Vec::new(), [0u8; 32], p2p, self.storage.clone(), rx,
+                ));
+                if is_info() { println!("[INFO][BFT2] runtime_boot node={}", self.node_id); }
+            }
+        }
+
         if is_info() { println!("[INFO][NODE] microblock_production_start interval=1s"); }
         self.start_microblock_production().await;
         } else {
@@ -25501,41 +25519,42 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     }
 
                                     // Consensus v2 (Checkpoint-BFT): QNET_CONSENSUS_V2=1 replaces the old
-                                    // commit/reveal macroblock with one 2f+1 checkpoint per window. Flag
-                                    // off ⇒ old path below runs unchanged. Genesis committee for testnet;
-                                    // scale swaps in select_consensus_committee(N-2).
+                                    // commit/reveal macroblock with one 2f+1 checkpoint per window. The v2
+                                    // runtime runs since boot; here we only assemble this window and hand it
+                                    // off. Flag off ⇒ old path below runs unchanged.
                                     if crate::consensus_v2_node::v2_enabled() {
-                                        use std::sync::atomic::{AtomicBool, Ordering};
-                                        static V2_SPAWNED: AtomicBool = AtomicBool::new(false);
-                                        if !V2_SPAWNED.swap(true, Ordering::SeqCst) {
-                                            // init_runtime() registers V2_TX SYNCHRONOUSLY before spawn ⇒
-                                            // the first signal_window_end is buffered, not lost to a race.
-                                            if let Some(rx) = crate::consensus_v2_node::init_runtime() {
-                                                // Real deterministic committee — SAME VRF selection as v1:
-                                                // qualified candidates (N-2) → select_consensus_committee.
-                                                // ≤COMMITTEE_THRESHOLD ⇒ all; else VRF top-N (scales to 100k).
-                                                let qualified = Self::calculate_qualified_candidates(
-                                                    &p2p_cons, &node_id_cons, node_type, end_height,
-                                                ).await;
-                                                let mut ids: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
-                                                ids.sort();
-                                                let committee = Self::select_consensus_committee(&ids, mb_idx, &storage_cons);
-                                                tokio::spawn(crate::consensus_v2_node::run(
-                                                    node_id_cons.clone(), committee, [0u8; 32],
-                                                    p2p_cons.clone(), storage_cons.clone(), rx,
-                                                ));
-                                            }
-                                        }
+                                        // Deterministic epoch committee (N-2 VRF sample, ≤100) for signing,
+                                        // and the next-epoch eligible-producer snapshot (≤MAX_VALIDATORS)
+                                        // the macroblock body publishes for N-2 selection — same selection
+                                        // path as v1, scales to 100k.
+                                        let qualified = Self::calculate_qualified_candidates(
+                                            &p2p_cons, &node_id_cons, node_type, end_height,
+                                        ).await;
+                                        let mut ids: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
+                                        ids.sort();
+                                        let committee = Self::select_consensus_committee(&ids, mb_idx, &storage_cons);
+                                        let eligible = Self::create_eligible_producers_snapshot(
+                                            &p2p_cons, &ids, &node_id_cons, node_type, mb_idx, &storage_cons,
+                                        ).await;
+                                        let eligible_bytes = bincode::serialize(&eligible).unwrap_or_default();
+                                        // Window hashes + XOR state-root, and the VRF beacon = XOR of signed
+                                        // microblock vrf_outputs (unbiasable randomness for next-epoch VRF).
                                         let mut mb_hashes: Vec<[u8; 32]> = Vec::new();
                                         let mut state_root = [0u8; 32];
+                                        let mut vrf_outputs: Vec<[u8; 32]> = Vec::new();
                                         for h in start_height..=end_height {
                                             if let Ok(Some(hash)) = storage_cons.load_microblock_hash(h) {
                                                 for i in 0..32 { state_root[i] ^= hash[i]; }
                                                 mb_hashes.push(hash);
                                             }
+                                            if let Ok(Some(mb)) = storage_cons.load_microblock_auto_format(h) {
+                                                if let Some(v) = mb.vrf_output { vrf_outputs.push(v); }
+                                            }
                                         }
-                                        let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&mb_hashes);
-                                        crate::consensus_v2_node::signal_window_end(mb_idx, end_height, mb_hashes, state_root, beacon);
+                                        let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&vrf_outputs);
+                                        crate::consensus_v2_node::signal_window_end(
+                                            mb_idx, end_height, mb_hashes, state_root, beacon, committee, eligible_bytes,
+                                        );
                                         return;
                                     }
 

@@ -25,7 +25,8 @@ pub enum Effect {
     Vote { index: u64, checkpoint_hash: Hash }, // sign hash → Vote → broadcast
     Timeout { index: u64, high_qc_index: u64 }, // sign timeout_bytes → Timeout → broadcast
     Relay(ConsensusMsg),                        // Qc / Tc: already complete, just broadcast
-    Persist { checkpoint: Checkpoint, qc: QuorumCertificate },
+    // Proposer seals the macroblock: QC (finality) + next-epoch eligible producers + committee.
+    Persist { checkpoint: Checkpoint, qc: QuorumCertificate, eligible_producers: Vec<u8>, committee: Vec<NodeId> },
     Finalize { index: u64, head_height: u64 },  // checkpoint final ⇒ microblocks ≤ head_height irreversible
 }
 
@@ -44,6 +45,7 @@ pub struct ConsensusDriver {
     node_id: NodeId,
     proposals: HashMap<(u64, Hash), Checkpoint>,
     heads: HashMap<u64, u64>, // checkpoint index → window_head_height (for Finalize)
+    seal_data: HashMap<u64, (Vec<u8>, Vec<NodeId>)>, // index → (eligible_producers, committee)
 }
 
 impl ConsensusDriver {
@@ -51,7 +53,7 @@ impl ConsensusDriver {
         Self {
             eng: CheckpointConsensus::new(node_id.clone(), committee.clone()),
             committee, genesis_hash, node_id,
-            proposals: HashMap::new(), heads: HashMap::new(),
+            proposals: HashMap::new(), heads: HashMap::new(), seal_data: HashMap::new(),
         }
     }
 
@@ -71,10 +73,14 @@ impl ConsensusDriver {
     }
 
     /// Window of K microblocks ended and we lead ⇒ emit an (unsigned) proposal.
+    /// Window boundary: adopt this epoch's committee, then (if we lead) emit a
+    /// proposal and buffer the seal inputs the macroblock body needs.
     pub fn build_proposal(
         &mut self, index: u64, head_height: u64, mb_hashes: Vec<Hash>,
         state_root: Hash, beacon: Hash, head_ts: u64,
+        committee: Vec<NodeId>, eligible_producers: Vec<u8>,
     ) -> Vec<Effect> {
+        self.set_committee(committee.clone());
         if !self.is_my_window(index) { return Vec::new(); }
         let cp = Checkpoint {
             index, parent_qc: self.eng.high_qc.clone(), window_head_height: head_height,
@@ -82,8 +88,17 @@ impl ConsensusDriver {
             proposer: self.node_id.clone(), proposer_sig: Vec::new(),
         };
         self.heads.insert(index, head_height);
+        self.seal_data.insert(index, (eligible_producers, committee));
         self.proposals.insert((cp.index, cp.hash()), cp.clone());
         vec![Effect::Propose(cp)]
+    }
+
+    /// Rotate the committee for the upcoming epoch (driver + engine in lockstep).
+    /// Deterministic N-2 VRF sample → all nodes agree; scales to 100k eligible.
+    pub fn set_committee(&mut self, mut committee: Vec<NodeId>) {
+        committee.sort();
+        self.eng.set_committee(committee.clone());
+        self.committee = committee;
     }
 
     /// Local view timer fired.
@@ -125,7 +140,8 @@ impl ConsensusDriver {
                 Action::Vote(v) => out.push(Effect::Vote { index: v.index, checkpoint_hash: v.checkpoint_hash }),
                 Action::FormedQc(qc) => {
                     if let Some(cp) = self.proposals.get(&(qc.index, qc.checkpoint_hash)) {
-                        out.push(Effect::Persist { checkpoint: cp.clone(), qc: qc.clone() });
+                        let (eligible_producers, committee) = self.seal_data.get(&qc.index).cloned().unwrap_or_default();
+                        out.push(Effect::Persist { checkpoint: cp.clone(), qc: qc.clone(), eligible_producers, committee });
                     }
                     out.push(Effect::Relay(ConsensusMsg::Qc(qc)));
                 }
@@ -208,7 +224,7 @@ mod tests {
         for index in 1..=8u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, index * 10, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000);
+                let effs = nodes[k].d.build_proposal(index, index * 10, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new());
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
