@@ -139,7 +139,12 @@ pub struct ConsensusData {
     pub reveals: HashMap<String, Vec<u8>>,
     /// Selected leader for next round
     pub next_leader: String,
-    
+
+    /// Consensus v2: bincode of the checkpoint QuorumCertificate (2f+1 sigs over
+    /// the checkpoint). Present ⇒ v2 finality; absent ⇒ legacy commit/reveal.
+    #[serde(default)]
+    pub checkpoint_qc: Option<Vec<u8>>,
+
     // ═══════════════════════════════════════════════════════════════════
     // DETERMINISTIC REPUTATION DATA (v2.21.5)
     // Stored in blockchain for all nodes to compute identical reputation

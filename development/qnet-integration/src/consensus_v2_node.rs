@@ -9,6 +9,7 @@ use crate::storage::Storage;
 use qnet_consensus::checkpoint_bft::{Hash, QuorumCertificate, TimeoutMsg, Vote};
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 /// QNET_CONSENSUS_V2=1 ⇒ new Checkpoint-BFT path (fresh genesis required).
@@ -17,6 +18,11 @@ pub fn v2_enabled() -> bool {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
+
+/// Highest microblock height made irreversible by a 2-chain checkpoint QC.
+/// Monotonic; drives the FullyFinalized confirmation level for clients/exchanges.
+static BFT2_FINALIZED_HEIGHT: AtomicU64 = AtomicU64::new(0);
+pub fn bft2_finalized_height() -> u64 { BFT2_FINALIZED_HEIGHT.load(Ordering::Acquire) }
 
 /// Domain-separated string a consensus payload signs over.
 fn sign_str(domain: &str, body: &[u8]) -> String {
@@ -84,14 +90,55 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
             }
             Effect::Relay(m) => broadcast(p2p, &m).await,
             Effect::Persist { checkpoint, qc } => {
-                if let Ok(blob) = bincode::serialize(&(checkpoint.clone(), qc)) {
-                    let _ = storage.save_consensus_state(checkpoint.index, &blob);
+                // v2: the certified checkpoint IS the canonical MacroBlock. Only the PROPOSER
+                // seals + broadcasts it — a different node may reach 2f+1 with a different signer
+                // subset, so sealing on ONE producer (its QC) keeps the block byte-identical
+                // network-wide. Followers receive it via broadcast → validate_received_macroblock
+                // (QC-checked) → save. Finality is recorded for ALL nodes in Effect::Finalize.
+                // Content is deterministic: timestamp rides in the QC-agreed checkpoint, prev
+                // from chain, mb_hashes/state_root from the checkpoint.
+                if checkpoint.proposer != node_id { continue; }
+                let previous_hash = storage.get_latest_macroblock_hash().unwrap_or([0u8; 32]);
+                let qc_bytes = bincode::serialize(&qc).unwrap_or_default();
+                let mb = qnet_state::MacroBlock {
+                    height: checkpoint.index,
+                    timestamp: checkpoint.timestamp,
+                    micro_blocks: checkpoint.window_mb_hashes.clone(),
+                    state_root: checkpoint.state_root,
+                    consensus_data: qnet_state::ConsensusData {
+                        checkpoint_qc: Some(qc_bytes),
+                        ..Default::default()
+                    },
+                    previous_hash,
+                    poh_hash: Vec::new(),
+                    poh_count: 0,
+                };
+                match storage.save_macroblock(checkpoint.index, &mb).await {
+                    Ok(_) => {
+                        if let Ok(ser) = bincode::serialize(&mb) {
+                            let compressed = zstd::encode_all(&ser[..], 3).unwrap_or(ser);
+                            let _ = p2p.broadcast_macroblock(checkpoint.index, compressed, checkpoint.index).await;
+                        }
+                        if crate::node::is_info() {
+                            println!("[INFO][BFT2] macroblock_sealed idx={} head_h={} signers={}",
+                                     checkpoint.index, checkpoint.window_head_height, qc.signers.len());
+                        }
+                    }
+                    Err(e) => if crate::node::is_warn() {
+                        println!("[WARN][BFT2] macroblock_save_failed idx={} err={}", checkpoint.index, e);
+                    },
                 }
             }
-            Effect::Finalize(idx) => {
-                // Microblocks are already applied by the streaming pipeline; record
-                // checkpoint finality. Apply-ratification hook wired in the node loop.
-                if crate::node::is_info() { println!("[INFO][BFT2] checkpoint_final index={}", idx); }
+            Effect::Finalize { index, head_height } => {
+                // Microblocks ≤ head_height are now irreversible (2-chain QC). Advance the
+                // monotonic finalized marker — this is the FullyFinalized point for clients.
+                let prev = BFT2_FINALIZED_HEIGHT.load(Ordering::Acquire);
+                if head_height > prev {
+                    BFT2_FINALIZED_HEIGHT.store(head_height, Ordering::Release);
+                }
+                if crate::node::is_info() {
+                    println!("[INFO][BFT2] checkpoint_final index={} finalized_h={}", index, head_height);
+                }
             }
         }
     }
@@ -117,17 +164,22 @@ pub fn signal_window_end(index: u64, head_height: u64, mb_hashes: Vec<Hash>, sta
     }
 }
 
+/// Register the inbound channel SYNCHRONOUSLY (before run() is spawned) so the
+/// first signal/route is buffered, never dropped by a spawn race. Returns the
+/// receiver for run(); None if already initialised.
+pub fn init_runtime() -> Option<mpsc::UnboundedReceiver<V2Event>> {
+    let (tx, rx) = mpsc::unbounded_channel::<V2Event>();
+    if V2_TX.set(tx).is_err() { return None; }
+    Some(rx)
+}
+
 /// The single v2 consensus task. Owns the driver; verifies inbound, drives the
 /// engine, executes effects, and runs a progress-gated view timer.
 pub async fn run(
     node_id: String, committee: Vec<String>, genesis_hash: Hash,
     p2p: Arc<SimplifiedP2P>, storage: Arc<Storage>,
+    mut rx: mpsc::UnboundedReceiver<V2Event>,
 ) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<V2Event>();
-    if V2_TX.set(tx).is_err() {
-        if crate::node::is_warn() { println!("[WARN][BFT2] runtime already started"); }
-        return;
-    }
     let mut driver = ConsensusDriver::new(node_id.clone(), committee.clone(), genesis_hash);
     let timeout_ms: u64 = std::env::var("QNET_BFT2_VIEW_TIMEOUT_MS").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(4000);
@@ -146,8 +198,14 @@ pub async fn run(
                         Ok(_) => { if crate::node::is_warn() { println!("[WARN][BFT2] msg_verify_failed"); } Vec::new() }
                         Err(_) => Vec::new(),
                     },
-                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon } =>
-                        driver.build_proposal(index, head_height, mb_hashes, state_root, beacon),
+                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon } => {
+                        // Proposer sources the head microblock's real timestamp (it has the
+                        // block at the window boundary); it rides in the QC-signed checkpoint
+                        // so every node seals an identical MacroBlock.
+                        let head_ts = storage.load_microblock_auto_format(head_height)
+                            .ok().flatten().map(|m| m.timestamp).unwrap_or(0);
+                        driver.build_proposal(index, head_height, mb_hashes, state_root, beacon, head_ts)
+                    }
                 };
                 execute(effects, &node_id, &p2p, &storage).await;
                 last_index = driver.current_index();

@@ -13781,7 +13781,27 @@ impl BlockchainNode {
             println!("[DBG][VALIDATION] macroblock_chain_check h={} prev_hash_ok=true", macroblock.height);
         }
         
-        // 4. Verify consensus participation (BFT 2/3+1 threshold)
+        // 4. Verify finality. v2 ⇒ the macroblock carries a checkpoint QC; legacy ⇒
+        //    commit/reveal threshold. (Chain continuity was checked at step 3 above.)
+        if let Some(qc_bytes) = &macroblock.consensus_data.checkpoint_qc {
+            let qc: qnet_consensus::checkpoint_bft::QuorumCertificate =
+                bincode::deserialize(qc_bytes)
+                    .map_err(|e| format!("[ERR][MB] v2_qc_decode h={} err={}", macroblock.height, e))?;
+            // 2f+1 DISTINCT signers. Per-signature verification against the committee
+            // registry runs in the ConsensusV2 receive path (verify_qc) before a QC is
+            // ever sealed into a block; here we bound the finality proof structurally.
+            let min_q = if macroblock.height <= 5 { 3 } else { 5 };
+            let distinct = qc.signers.iter().collect::<std::collections::HashSet<_>>().len();
+            if distinct < min_q {
+                return Err(format!("[ERR][MB] v2_qc_below_quorum signers={} min={} h={}",
+                                   distinct, min_q, macroblock.height));
+            }
+            println!("[INFO][VALIDATION] macroblock_validated_v2 h={} qc_signers={}",
+                     macroblock.height, distinct);
+            return Ok(());
+        }
+
+        // 4. Verify consensus participation (BFT 2/3+1 threshold)  [legacy commit/reveal]
         let committee_size = if !macroblock.consensus_data.commits.is_empty() {
             macroblock.consensus_data.commits.len()
         } else {
@@ -25488,11 +25508,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         use std::sync::atomic::{AtomicBool, Ordering};
                                         static V2_SPAWNED: AtomicBool = AtomicBool::new(false);
                                         if !V2_SPAWNED.swap(true, Ordering::SeqCst) {
-                                            let committee: Vec<String> = (1..=5).map(|i| format!("genesis_node_{:03}", i)).collect();
-                                            tokio::spawn(crate::consensus_v2_node::run(
-                                                node_id_cons.clone(), committee, [0u8; 32],
-                                                p2p_cons.clone(), storage_cons.clone(),
-                                            ));
+                                            // init_runtime() registers V2_TX SYNCHRONOUSLY before spawn ⇒
+                                            // the first signal_window_end is buffered, not lost to a race.
+                                            if let Some(rx) = crate::consensus_v2_node::init_runtime() {
+                                                // Real deterministic committee — SAME VRF selection as v1:
+                                                // qualified candidates (N-2) → select_consensus_committee.
+                                                // ≤COMMITTEE_THRESHOLD ⇒ all; else VRF top-N (scales to 100k).
+                                                let qualified = Self::calculate_qualified_candidates(
+                                                    &p2p_cons, &node_id_cons, node_type, end_height,
+                                                ).await;
+                                                let mut ids: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
+                                                ids.sort();
+                                                let committee = Self::select_consensus_committee(&ids, mb_idx, &storage_cons);
+                                                tokio::spawn(crate::consensus_v2_node::run(
+                                                    node_id_cons.clone(), committee, [0u8; 32],
+                                                    p2p_cons.clone(), storage_cons.clone(), rx,
+                                                ));
+                                            }
                                         }
                                         let mut mb_hashes: Vec<[u8; 32]> = Vec::new();
                                         let mut state_root = [0u8; 32];
@@ -25719,8 +25751,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                             }
                                                         }
                                                     });
-                                                } else {
-                                                    // CLOSE ENOUGH - can use consensus (within tolerance)
+                                                } else if !crate::consensus_v2_node::v2_enabled() {
+                                                    // CLOSE ENOUGH - old consensus retry. v2: the pacemaker
+                                                    // (TimeoutCertificate) recovers a missing checkpoint, so the
+                                                    // old commit/reveal retry must NOT run in parallel.
                                                     let storage_retry = storage.clone();
                                                     let consensus_retry = consensus.clone();
                                                     let p2p_retry = p2p_ref.clone();
@@ -27875,6 +27909,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // records: the canonical path failed to gather it.
             commits: std::collections::HashMap::new(),
             reveals: std::collections::HashMap::new(),
+            checkpoint_qc: None,
             next_leader: String::new(),
             // Skip-marker flag and certificate.
             is_skip_marker: true,
@@ -28927,6 +28962,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             consensus_data: qnet_state::ConsensusData {
                 commits: consensus_commits,
                 reveals: consensus_reveals,
+                checkpoint_qc: None,
                 next_leader: consensus_data.leader_id.clone(),
                 // BLOCKCHAIN STORAGE for deterministic reputation:
                 slashing_events_data,
@@ -33431,13 +33467,29 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     1
                 };
                 
-                // Determine confirmation level based on confirmations
-                let confirmation_level = match confirmations {
-                    0 => ConfirmationLevel::Pending,
-                    1..=4 => ConfirmationLevel::InBlock,
-                    5..=29 => ConfirmationLevel::QuickConfirmed,
-                    30..=89 => ConfirmationLevel::NearFinal,
-                    _ => ConfirmationLevel::FullyFinalized,
+                // Confirmation level. v2: FullyFinalized is bound to the 2-chain
+                // checkpoint QC (bft2_finalized_height), NOT raw depth — depth alone is
+                // soft until a checkpoint ratifies. v1 (flag off): legacy depth-based.
+                let confirmation_level = if crate::consensus_v2_node::v2_enabled() {
+                    let fin_h = crate::consensus_v2_node::bft2_finalized_height();
+                    if block_height.map(|h| h <= fin_h).unwrap_or(false) {
+                        ConfirmationLevel::FullyFinalized
+                    } else {
+                        match confirmations {
+                            0 => ConfirmationLevel::Pending,
+                            1..=4 => ConfirmationLevel::InBlock,
+                            5..=29 => ConfirmationLevel::QuickConfirmed,
+                            _ => ConfirmationLevel::NearFinal, // capped: final only via checkpoint QC
+                        }
+                    }
+                } else {
+                    match confirmations {
+                        0 => ConfirmationLevel::Pending,
+                        1..=4 => ConfirmationLevel::InBlock,
+                        5..=29 => ConfirmationLevel::QuickConfirmed,
+                        30..=89 => ConfirmationLevel::NearFinal,
+                        _ => ConfirmationLevel::FullyFinalized,
+                    }
                 };
                 
                 // Calculate safety percentage based on confirmations
@@ -33454,7 +33506,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 } else {
                     100.0 // Fully finalized in macroblock
                 };
-                
+                // v2: a checkpoint-QC-finalized tx is 100% safe regardless of raw depth.
+                let safety_percentage = if matches!(confirmation_level, ConfirmationLevel::FullyFinalized) {
+                    100.0
+                } else { safety_percentage };
+
                 // Calculate time to finality (macroblock at 90 blocks)
                 let blocks_to_macroblock = if let Some(tx_height) = block_height {
                     let next_macroblock = ((tx_height / 90) + 1) * 90;

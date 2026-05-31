@@ -90,6 +90,10 @@ pub struct Checkpoint {
     pub window_mb_hashes: Vec<Hash>,
     pub state_root: Hash,
     pub beacon: Hash,
+    /// Proposer's wall-clock for this window (the head microblock's timestamp).
+    /// In the QC-signed hash ⇒ agreed by the committee ⇒ every node seals an
+    /// identical MacroBlock from the checkpoint (no producer dependency, no fork).
+    pub timestamp: u64,
     pub proposer: NodeId,
     pub proposer_sig: Vec<u8>,
 }
@@ -108,6 +112,7 @@ impl Checkpoint {
         for mh in &self.window_mb_hashes { h.update(mh); }
         h.update(self.state_root);
         h.update(self.beacon);
+        h.update(self.timestamp.to_le_bytes());
         h.update(self.proposer.as_bytes());
         h.finalize().into()
     }
@@ -211,7 +216,7 @@ mod tests {
         let mut c = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 90,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3),
-            beacon: h(4), proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            beacon: h(4), timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let x = c.hash();
         c.proposer_sig = vec![9, 9, 9];   // sig change must NOT change hash
@@ -271,7 +276,7 @@ mod tests {
         let child = Checkpoint {
             index: 5, parent_qc: Some(parent_qc), window_head_height: 450,
             window_mb_hashes: vec![h(1)], state_root: h(2), beacon: h(3),
-            proposer: "n0".into(), proposer_sig: vec![],
+            timestamp: 0, proposer: "n0".into(), proposer_sig: vec![],
         };
         let child_qc = mk_qc(&committee, child.hash(), 5, 3);
         assert_eq!(commits_parent(&child, &child_qc), Some(4)); // C4 final
@@ -287,7 +292,7 @@ mod tests {
         let c = Checkpoint {
             index: 7, parent_qc: Some(qc.clone()), window_head_height: 630,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3), beacon: h(4),
-            proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let bytes = bincode::serialize(&c).unwrap();
         let back: Checkpoint = bincode::deserialize(&bytes).unwrap();

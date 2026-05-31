@@ -26,7 +26,7 @@ pub enum Effect {
     Timeout { index: u64, high_qc_index: u64 }, // sign timeout_bytes → Timeout → broadcast
     Relay(ConsensusMsg),                        // Qc / Tc: already complete, just broadcast
     Persist { checkpoint: Checkpoint, qc: QuorumCertificate },
-    Finalize(u64),                              // checkpoint index now final ⇒ apply its window
+    Finalize { index: u64, head_height: u64 },  // checkpoint final ⇒ microblocks ≤ head_height irreversible
 }
 
 /// Canonical bytes a TimeoutMsg signs over (node and driver MUST agree).
@@ -43,13 +43,15 @@ pub struct ConsensusDriver {
     genesis_hash: Hash,
     node_id: NodeId,
     proposals: HashMap<(u64, Hash), Checkpoint>,
+    heads: HashMap<u64, u64>, // checkpoint index → window_head_height (for Finalize)
 }
 
 impl ConsensusDriver {
     pub fn new(node_id: NodeId, committee: Vec<NodeId>, genesis_hash: Hash) -> Self {
         Self {
             eng: CheckpointConsensus::new(node_id.clone(), committee.clone()),
-            committee, genesis_hash, node_id, proposals: HashMap::new(),
+            committee, genesis_hash, node_id,
+            proposals: HashMap::new(), heads: HashMap::new(),
         }
     }
 
@@ -71,14 +73,15 @@ impl ConsensusDriver {
     /// Window of K microblocks ended and we lead ⇒ emit an (unsigned) proposal.
     pub fn build_proposal(
         &mut self, index: u64, head_height: u64, mb_hashes: Vec<Hash>,
-        state_root: Hash, beacon: Hash,
+        state_root: Hash, beacon: Hash, head_ts: u64,
     ) -> Vec<Effect> {
         if !self.is_my_window(index) { return Vec::new(); }
         let cp = Checkpoint {
             index, parent_qc: self.eng.high_qc.clone(), window_head_height: head_height,
-            window_mb_hashes: mb_hashes, state_root, beacon,
+            window_mb_hashes: mb_hashes, state_root, beacon, timestamp: head_ts,
             proposer: self.node_id.clone(), proposer_sig: Vec::new(),
         };
+        self.heads.insert(index, head_height);
         self.proposals.insert((cp.index, cp.hash()), cp.clone());
         vec![Effect::Propose(cp)]
     }
@@ -92,6 +95,7 @@ impl ConsensusDriver {
     /// Catch-up: ingest a VERIFIED committed checkpoint + QC.
     pub fn sync(&mut self, cp: &Checkpoint, qc: &QuorumCertificate) -> Vec<Effect> {
         if cp.index != qc.index || cp.hash() != qc.checkpoint_hash { return Vec::new(); }
+        self.heads.insert(cp.index, cp.window_head_height);
         self.proposals.insert((cp.index, cp.hash()), cp.clone());
         let acts = self.eng.sync_checkpoint(cp, qc);
         self.translate(acts)
@@ -102,6 +106,7 @@ impl ConsensusDriver {
         let acts = match msg {
             ConsensusMsg::Proposal(cp) => {
                 let ph = cp.parent_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash);
+                self.heads.insert(cp.index, cp.window_head_height);
                 self.proposals.insert((cp.index, cp.hash()), cp.clone());
                 self.eng.on_proposal(cp, &ph)
             }
@@ -124,7 +129,9 @@ impl ConsensusDriver {
                     }
                     out.push(Effect::Relay(ConsensusMsg::Qc(qc)));
                 }
-                Action::Commit(idx) => out.push(Effect::Finalize(idx)),
+                Action::Commit(idx) => out.push(Effect::Finalize {
+                    index: idx, head_height: self.heads.get(&idx).copied().unwrap_or(0),
+                }),
                 Action::EnterView(_) => {}
                 Action::BroadcastTimeout(tm) => out.push(Effect::Timeout { index: tm.index, high_qc_index: tm.high_qc_index }),
                 Action::FormedTc(tc) => out.push(Effect::Relay(ConsensusMsg::Tc(tc))),
@@ -159,7 +166,7 @@ mod tests {
             })],
             Effect::Relay(m) => vec![m],
             Effect::Persist { .. } => vec![],
-            Effect::Finalize(i) => { if i > n.committed { n.committed = i; } vec![] }
+            Effect::Finalize { index, .. } => { if index > n.committed { n.committed = index; } vec![] }
         }
     }
 
@@ -201,7 +208,7 @@ mod tests {
         for index in 1..=8u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, index * 10, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32]);
+                let effs = nodes[k].d.build_proposal(index, index * 10, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
@@ -218,7 +225,7 @@ mod tests {
         let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
         let cp = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 10, window_mb_hashes: vec![[1u8; 32]],
-            state_root: [1u8; 32], beacon: [0u8; 32], proposer: "n1".into(), proposer_sig: vec![9, 9],
+            state_root: [1u8; 32], beacon: [0u8; 32], timestamp: 0, proposer: "n1".into(), proposer_sig: vec![9, 9],
         };
         // forged proposer_sig fails node verify ⇒ never reaches the driver
         assert!(!verify_msg(&c, &ConsensusMsg::Proposal(cp)));
