@@ -75,6 +75,10 @@ async fn sign_payload(node_id: &str, domain: &str, body: &[u8]) -> Option<Vec<u8
 
 async fn broadcast(p2p: &Arc<SimplifiedP2P>, msg: &ConsensusMsg) {
     if let Ok(data) = bincode::serialize(msg) {
+        // Self-route: a node is part of its own quorum (counts its own vote/timeout,
+        // and the proposer votes on its own proposal). Without this, quorum n−f cannot
+        // be met when one peer is down (the node's own vote would never be counted).
+        route_inbound(data.clone());
         let _ = p2p.broadcast_quic(&NetworkMessage::ConsensusV2 { data }).await;
     }
 }
@@ -132,7 +136,9 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 // timestamp/mb_hashes/state_root/beacon ride in the QC-agreed checkpoint.
                 if checkpoint.proposer != node_id { continue; }
                 let previous_hash = storage.get_latest_macroblock_hash().unwrap_or([0u8; 32]);
-                let qc_bytes = bincode::serialize(&qc).unwrap_or_default();
+                // Store (checkpoint, QC) so receivers reconstruct checkpoint.hash(), confirm
+                // it == qc.checkpoint_hash (binds this exact block), and full-verify the QC.
+                let qc_bytes = bincode::serialize(&(checkpoint.clone(), qc.clone())).unwrap_or_default();
                 let excluded = excluded_producers(storage, checkpoint.index);
                 let mb = qnet_state::MacroBlock {
                     height: checkpoint.index,

@@ -10,11 +10,13 @@ use std::collections::HashSet;
 pub type NodeId = String;
 pub type Hash = [u8; 32];
 
-/// 2f+1 for a committee of n, f = floor((n-1)/3). 0 for empty set.
+/// BFT quorum = n−f, f = floor((n-1)/3). 0 for empty set. n−f (not 2f+1) is the
+/// safe threshold when n>3f+1: any two quorums then share ≥f+1 nodes ⇒ ≥1 honest ⇒
+/// no two conflicting QCs. (n−f == 2f+1 exactly when n=3f+1.) E.g. n=5⇒4, n=100⇒67.
 pub fn quorum_size(committee_len: usize) -> usize {
     if committee_len == 0 { return 0; }
     let f = (committee_len - 1) / 3;
-    2 * f + 1
+    committee_len - f
 }
 
 /// Deterministic leader for checkpoint `index`, seeded ONLY by the committed
@@ -183,8 +185,8 @@ mod tests {
     fn quorum_math() {
         assert_eq!(quorum_size(0), 0);
         assert_eq!(quorum_size(1), 1);
-        assert_eq!(quorum_size(4), 3);   // f=1
-        assert_eq!(quorum_size(5), 3);   // f=1
+        assert_eq!(quorum_size(4), 3);   // f=1, n=3f+1 ⇒ n−f=2f+1
+        assert_eq!(quorum_size(5), 4);   // f=1, n>3f+1 ⇒ n−f=4 (2f+1=3 would be unsafe)
         assert_eq!(quorum_size(7), 5);   // f=2
         assert_eq!(quorum_size(100), 67);// f=33
         assert_eq!(quorum_size(1000), 667);
@@ -244,27 +246,27 @@ mod tests {
     fn qc_verify_paths() {
         let committee: Vec<NodeId> = (0..5).map(|i| format!("n{}", i)).collect();
         let ok = |_v: &str, _m: &[u8], _s: &[u8]| true;
-        // valid: 3 of 5 (quorum)
-        let qc = mk_qc(&committee, h(1), 7, 3);
+        // valid: 4 of 5 (quorum = n−f = 4)
+        let qc = mk_qc(&committee, h(1), 7, 4);
         assert!(qc.verify(&committee, ok).is_ok());
         // below quorum
-        let qc2 = mk_qc(&committee, h(1), 7, 2);
+        let qc2 = mk_qc(&committee, h(1), 7, 3);
         assert_eq!(qc2.verify(&committee, ok), Err("qc_below_quorum"));
         // non-member
-        let mut qc3 = mk_qc(&committee, h(1), 7, 3);
+        let mut qc3 = mk_qc(&committee, h(1), 7, 4);
         qc3.signers[0] = "evil".into();
         qc3.sig_merkle_root = sig_merkle_root(&qc3.sigs);
         assert_eq!(qc3.verify(&committee, ok), Err("qc_non_member"));
         // duplicate signer
-        let mut qc4 = mk_qc(&committee, h(1), 7, 3);
+        let mut qc4 = mk_qc(&committee, h(1), 7, 4);
         qc4.signers[1] = qc4.signers[0].clone();
         assert_eq!(qc4.verify(&committee, ok), Err("qc_duplicate_signer"));
         // merkle mismatch
-        let mut qc5 = mk_qc(&committee, h(1), 7, 3);
+        let mut qc5 = mk_qc(&committee, h(1), 7, 4);
         qc5.sig_merkle_root = h(99);
         assert_eq!(qc5.verify(&committee, ok), Err("qc_merkle_mismatch"));
         // bad sig
-        let qc6 = mk_qc(&committee, h(1), 7, 3);
+        let qc6 = mk_qc(&committee, h(1), 7, 4);
         let bad = |_v: &str, _m: &[u8], _s: &[u8]| false;
         assert_eq!(qc6.verify(&committee, bad), Err("qc_bad_sig"));
     }

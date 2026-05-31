@@ -13783,26 +13783,24 @@ impl BlockchainNode {
         
         // 4. Verify finality. v2 ⇒ the macroblock carries a checkpoint QC; legacy ⇒
         //    commit/reveal threshold. (Chain continuity was checked at step 3 above.)
-        if let Some(qc_bytes) = &macroblock.consensus_data.checkpoint_qc {
-            let qc: qnet_consensus::checkpoint_bft::QuorumCertificate =
-                bincode::deserialize(qc_bytes)
+        if let Some(cp_qc) = &macroblock.consensus_data.checkpoint_qc {
+            // Secondary (non-broadcast) path: binding + structural quorum only. The
+            // canonical FULL Dilithium verify runs in process_received_macroblock (it
+            // holds the PK registry). checkpoint_qc holds (Checkpoint, QC).
+            let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
+                bincode::deserialize(cp_qc)
                     .map_err(|e| format!("[ERR][MB] v2_qc_decode h={} err={}", macroblock.height, e))?;
-            // Quorum = 2f+1 of the committee the macroblock carries; signers must be
-            // distinct members of it. Per-signature verification runs in the ConsensusV2
-            // receive path (verify_qc); here we bound the finality proof structurally.
+            if cp.index != macroblock.height || cp.hash() != qc.checkpoint_hash {
+                return Err(format!("[ERR][MB] v2_qc_unbound h={}", macroblock.height));
+            }
             let committee: Vec<String> = macroblock.consensus_data.consensus_committee.clone().unwrap_or_default();
             let min_q = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
-            let signers: std::collections::HashSet<&String> = qc.signers.iter().collect();
-            if min_q == 0 || signers.len() < min_q {
-                return Err(format!("[ERR][MB] v2_qc_below_quorum signers={} min={} committee={} h={}",
-                                   signers.len(), min_q, committee.len(), macroblock.height));
-            }
             let cset: std::collections::HashSet<&String> = committee.iter().collect();
-            if !signers.iter().all(|s| cset.contains(*s)) {
-                return Err(format!("[ERR][MB] v2_qc_nonmember h={}", macroblock.height));
+            let signers: std::collections::HashSet<&String> = qc.signers.iter().collect();
+            if min_q == 0 || signers.len() < min_q || !signers.iter().all(|s| cset.contains(*s)) {
+                return Err(format!("[ERR][MB] v2_qc_quorum h={} signers={} min={}", macroblock.height, signers.len(), min_q));
             }
-            println!("[INFO][VALIDATION] macroblock_validated_v2 h={} signers={} quorum={}",
-                     macroblock.height, signers.len(), min_q);
+            println!("[INFO][VALIDATION] macroblock_validated_v2 h={} signers={}", macroblock.height, signers.len());
             return Ok(());
         }
 
@@ -31785,6 +31783,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     
     /// Process received macroblock from network sync
     /// PRODUCTION: Validates and saves macroblock to storage
+    /// Consensus committee for a v2 checkpoint index, derived EXACTLY as the proposer
+    /// did: candidates from the N-2 snapshot (genesis list for epochs ≤2) →
+    /// select_consensus_committee VRF-sample ≤CONSENSUS_COMMITTEE_SIZE. Used to verify a
+    /// received QC against the real committee, not the self-declared one.
+    async fn derive_v2_committee(&self, index: u64, head_height: u64) -> Vec<String> {
+        let p2p = match self.unified_p2p.as_ref() { Some(p) => p, None => return Vec::new() };
+        let qualified = Self::calculate_qualified_candidates(p2p, &self.node_id, self.node_type, head_height).await;
+        let mut ids: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
+        ids.sort();
+        Self::select_consensus_committee(&ids, index, &self.storage)
+    }
+
     pub async fn process_received_macroblock(&self, received: crate::unified_p2p::ReceivedBlock) -> Result<(), QNetError> {
         let index = received.height;  // For macroblocks, height = index
         
@@ -31863,6 +31873,41 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Fall through to the regular save path below.
         }
 
+        // v2 (Checkpoint-BFT): finality is a 2f+1 QC over the checkpoint. checkpoint_qc
+        // holds (Checkpoint, QC). Bind the block to the QC (hash + body match), derive the
+        // committee deterministically (N-2 / genesis — NOT self-declared), and verify every
+        // committee Dilithium signature. A forged committee or QC cannot pass. Bypass
+        // commit/reveal (v2 has none).
+        if let Some(cp_qc) = macroblock.consensus_data.checkpoint_qc.as_ref() {
+            let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
+                bincode::deserialize(cp_qc)
+                    .map_err(|e| QNetError::ValidationError(format!("v2_qc_decode mb={} err={}", index, e)))?;
+            if cp.index != index || cp.hash() != qc.checkpoint_hash {
+                return Err(QNetError::ValidationError(format!("v2_qc_unbound mb={}", index)));
+            }
+            if cp.window_mb_hashes != macroblock.micro_blocks || cp.state_root != macroblock.state_root {
+                return Err(QNetError::ValidationError(format!("v2_body_mismatch mb={}", index)));
+            }
+            let committee = self.derive_v2_committee(cp.index, cp.window_head_height).await;
+            let q = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+            let verified = if q == 0 {
+                false
+            } else if let Some(p2p) = self.unified_p2p.as_ref() {
+                qc.verify(&committee, |voter, body, sig| match std::str::from_utf8(sig) {
+                    Ok(s) => p2p.verify_consensus_signature(voter, &format!("QNET_BFT2_VOTE:{}", hex::encode(body)), s),
+                    Err(_) => false,
+                }).is_ok()
+            } else { false };
+            if !verified {
+                return Err(QNetError::ValidationError(format!(
+                    "v2_qc_invalid mb={} signers={} committee={}", index, qc.signers.len(), committee.len())));
+            }
+            if is_info() {
+                println!("[INFO][MB] v2_qc_ok mb={} signers={} committee={}", index, qc.signers.len(), committee.len());
+            }
+            // Verified v2 finality — fall through to save (commit/reveal gate skips below).
+        }
+
         // v14.8: Structural validation of consensus_data.commits / reveals.
         //
         // The on-wire representation of commits/reveals is a bare byte blob keyed by
@@ -31894,7 +31939,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // skip marker carries was already verified above (2f+1 Dilithium3
         // signatures over view-change votes), which is the equivalent
         // BFT-supermajority gate.
-        if !macroblock.consensus_data.is_skip_marker {
+        if !macroblock.consensus_data.is_skip_marker && macroblock.consensus_data.checkpoint_qc.is_none() {
             let commits = &macroblock.consensus_data.commits;
             let reveals = &macroblock.consensus_data.reveals;
 
