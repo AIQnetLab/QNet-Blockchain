@@ -47,6 +47,21 @@ pub fn accumulate_beacon(vrf_outputs: &[Hash]) -> Hash {
     h.finalize().into()
 }
 
+/// Commitment over a checkpoint's epoch-transition data: the next-epoch eligible-producer
+/// snapshot (opaque bytes) + the committee (order-independent). Bound into the checkpoint
+/// hash ⇒ the QC certifies the validator set; syncing nodes verify the macroblock's
+/// published set against it instead of re-running the full epoch scan.
+pub fn epoch_commitment(eligible_producers: &[u8], committee: &[NodeId]) -> Hash {
+    let mut cs: Vec<&NodeId> = committee.iter().collect();
+    cs.sort();
+    let mut h = Sha3_256::new();
+    h.update(b"qnet-epoch-v2");
+    h.update((eligible_producers.len() as u64).to_le_bytes());
+    h.update(eligible_producers);
+    for c in cs { h.update(c.as_bytes()); h.update([0u8]); }
+    h.finalize().into()
+}
+
 /// A committee member's vote on a checkpoint hash (Dilithium sig over the hash).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Vote {
@@ -92,6 +107,10 @@ pub struct Checkpoint {
     pub window_mb_hashes: Vec<Hash>,
     pub state_root: Hash,
     pub beacon: Hash,
+    /// Commitment to the epoch-transition data this checkpoint publishes (next-epoch
+    /// eligible producers + committee). In the QC-signed hash ⇒ 2f+1 certify the
+    /// validator set, so syncing (non-committee) nodes trust it without re-deriving.
+    pub epoch_commitment: Hash,
     /// Proposer's wall-clock for this window (the head microblock's timestamp).
     /// In the QC-signed hash ⇒ agreed by the committee ⇒ every node seals an
     /// identical MacroBlock from the checkpoint (no producer dependency, no fork).
@@ -114,6 +133,7 @@ impl Checkpoint {
         for mh in &self.window_mb_hashes { h.update(mh); }
         h.update(self.state_root);
         h.update(self.beacon);
+        h.update(self.epoch_commitment);
         h.update(self.timestamp.to_le_bytes());
         h.update(self.proposer.as_bytes());
         h.finalize().into()
@@ -218,7 +238,7 @@ mod tests {
         let mut c = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 90,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3),
-            beacon: h(4), timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            beacon: h(4), epoch_commitment: h(0), timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let x = c.hash();
         c.proposer_sig = vec![9, 9, 9];   // sig change must NOT change hash
@@ -278,7 +298,7 @@ mod tests {
         let child = Checkpoint {
             index: 5, parent_qc: Some(parent_qc), window_head_height: 450,
             window_mb_hashes: vec![h(1)], state_root: h(2), beacon: h(3),
-            timestamp: 0, proposer: "n0".into(), proposer_sig: vec![],
+            epoch_commitment: h(0), timestamp: 0, proposer: "n0".into(), proposer_sig: vec![],
         };
         let child_qc = mk_qc(&committee, child.hash(), 5, 3);
         assert_eq!(commits_parent(&child, &child_qc), Some(4)); // C4 final
@@ -294,7 +314,7 @@ mod tests {
         let c = Checkpoint {
             index: 7, parent_qc: Some(qc.clone()), window_head_height: 630,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3), beacon: h(4),
-            timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            epoch_commitment: h(0), timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let bytes = bincode::serialize(&c).unwrap();
         let back: Checkpoint = bincode::deserialize(&bytes).unwrap();

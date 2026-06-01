@@ -3751,13 +3751,19 @@ impl BlockchainNode {
         storage: &Storage,
     ) -> Vec<qnet_state::EligibleProducer> {
         const MIN_REPUTATION: f64 = 0.70;
-        
-        let current_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-          
-        let reputation_map: std::collections::HashMap<String, f64> = 
+
+        // Deterministic "as-of" time = the window head microblock's on-chain timestamp
+        // (signed, seconds; identical on every node) — NOT wall-clock. The reputation
+        // jail check (current < jail_end) must yield the same eligible set everywhere,
+        // else two nodes near a jail boundary derive different macroblock bodies. Falls
+        // back to wall-clock only if the head block is somehow absent locally.
+        let current_timestamp = storage
+            .load_microblock_auto_format(macroblock_index.saturating_mul(90))
+            .ok().flatten().map(|m| m.timestamp)
+            .unwrap_or_else(|| std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
+
+        let reputation_map: std::collections::HashMap<String, f64> =
             if let Some(rep_arc) = p2p.get_deterministic_reputation() {
                 let rep_state = rep_arc.read();
                 rep_state.get_all_reputations(current_timestamp)
@@ -6306,7 +6312,7 @@ impl BlockchainNode {
     /// Returns: (Vec<HeartbeatSummary>, Vec<ShardHeartbeatSummary>)
     ///
     /// SECURITY: Full 2-layer verification (Dilithium + Merkle proofs)
-    async fn collect_heartbeat_commitments_from_blocks(
+    pub(crate) async fn collect_heartbeat_commitments_from_blocks(
         storage: &Arc<Storage>,
         p2p: &Arc<SimplifiedP2P>,
         window_start_height: u64,
@@ -6694,7 +6700,7 @@ impl BlockchainNode {
     /// v2.89 HYBRID APPROACH:
     /// 1. PRIMARY: Read LightNodeEligibilityBitmap TXs from blockchain (on-chain proof)
     /// 2. FALLBACK: If no bitmap TXs, use P2P RAM attestations (backward compat)
-    async fn collect_ping_commitments_from_blocks(
+    pub(crate) async fn collect_ping_commitments_from_blocks(
         storage: &Arc<Storage>,
         p2p: &Arc<SimplifiedP2P>,
         window_start_height: u64,
@@ -13790,10 +13796,21 @@ impl BlockchainNode {
             let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
                 bincode::deserialize(cp_qc)
                     .map_err(|e| format!("[ERR][MB] v2_qc_decode h={} err={}", macroblock.height, e))?;
-            if cp.index != macroblock.height || cp.hash() != qc.checkpoint_hash {
+            // A2: bind by WINDOW (head/90), not cp.index (round — may skip on timeout).
+            if cp.window_head_height / 90 != macroblock.height || cp.hash() != qc.checkpoint_hash {
                 return Err(format!("[ERR][MB] v2_qc_unbound h={}", macroblock.height));
             }
             let committee: Vec<String> = macroblock.consensus_data.consensus_committee.clone().unwrap_or_default();
+            // C: the published validator set must match the QC-certified epoch commitment.
+            // Staged: warn-only unless QNET_BFT2_ENFORCE_EPOCH=1 (avoids a determinism bug
+            // breaking sync before it's confirmed clean on a live run).
+            let elig = macroblock.consensus_data.eligible_producers.as_deref().unwrap_or(&[]);
+            if qnet_consensus::checkpoint_bft::epoch_commitment(elig, &committee) != cp.epoch_commitment {
+                println!("[WARN][MB] v2_epoch_mismatch h={} (staged)", macroblock.height);
+                if crate::consensus_v2_node::enforce_epoch() {
+                    return Err(format!("[ERR][MB] v2_epoch_uncertified h={}", macroblock.height));
+                }
+            }
             let min_q = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
             let cset: std::collections::HashSet<&String> = committee.iter().collect();
             let signers: std::collections::HashSet<&String> = qc.signers.iter().collect();
@@ -31882,13 +31899,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
                 bincode::deserialize(cp_qc)
                     .map_err(|e| QNetError::ValidationError(format!("v2_qc_decode mb={} err={}", index, e)))?;
-            if cp.index != index || cp.hash() != qc.checkpoint_hash {
+            // A2: macroblock height = WINDOW; cp.index = consensus round (may skip on timeout).
+            // Bind by window (head/90), not round, so a skipped-round checkpoint still validates.
+            if cp.window_head_height / 90 != index || cp.hash() != qc.checkpoint_hash {
                 return Err(QNetError::ValidationError(format!("v2_qc_unbound mb={}", index)));
             }
             if cp.window_mb_hashes != macroblock.micro_blocks || cp.state_root != macroblock.state_root {
                 return Err(QNetError::ValidationError(format!("v2_body_mismatch mb={}", index)));
             }
-            let committee = self.derive_v2_committee(cp.index, cp.window_head_height).await;
+            // Committee for the WINDOW's epoch (matches the sealer's N-2 selection), not the round.
+            let committee = self.derive_v2_committee(cp.window_head_height / 90, cp.window_head_height).await;
             let q = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
             let verified = if q == 0 {
                 false
@@ -31901,6 +31921,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if !verified {
                 return Err(QNetError::ValidationError(format!(
                     "v2_qc_invalid mb={} signers={} committee={}", index, qc.signers.len(), committee.len())));
+            }
+            // C: the QC certifies cp.epoch_commitment ⇒ the block's published validator set
+            // (eligible+committee, read by N-2 selection) must match it — reject a forged set.
+            let elig = macroblock.consensus_data.eligible_producers.as_deref().unwrap_or(&[]);
+            let cmt = macroblock.consensus_data.consensus_committee.clone().unwrap_or_default();
+            if qnet_consensus::checkpoint_bft::epoch_commitment(elig, &cmt) != cp.epoch_commitment {
+                if is_warn() { println!("[WARN][MB] v2_epoch_mismatch mb={} (staged)", index); }
+                if crate::consensus_v2_node::enforce_epoch() {
+                    return Err(QNetError::ValidationError(format!("v2_epoch_uncertified mb={}", index)));
+                }
             }
             if is_info() {
                 println!("[INFO][MB] v2_qc_ok mb={} signers={} committee={}", index, qc.signers.len(), committee.len());

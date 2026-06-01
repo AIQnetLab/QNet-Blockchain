@@ -44,8 +44,10 @@ pub struct ConsensusDriver {
     genesis_hash: Hash,
     node_id: NodeId,
     proposals: HashMap<(u64, Hash), Checkpoint>,
-    heads: HashMap<u64, u64>, // checkpoint index → window_head_height (for Finalize)
-    seal_data: HashMap<u64, (Vec<u8>, Vec<NodeId>)>, // index → (eligible_producers, committee)
+    heads: HashMap<u64, u64>, // round → window_head_height (Finalize + next_window mapping)
+    seal_data: HashMap<u64, (Vec<u8>, Vec<NodeId>)>, // round → (eligible_producers, committee)
+    sealed: std::collections::HashSet<u64>, // windows we already emitted Persist for (dedup)
+    last_proposed_round: u64,               // one proposal per round we lead
 }
 
 impl ConsensusDriver {
@@ -54,6 +56,7 @@ impl ConsensusDriver {
             eng: CheckpointConsensus::new(node_id.clone(), committee.clone()),
             committee, genesis_hash, node_id,
             proposals: HashMap::new(), heads: HashMap::new(), seal_data: HashMap::new(),
+            sealed: std::collections::HashSet::new(), last_proposed_round: 0,
         }
     }
 
@@ -65,30 +68,53 @@ impl ConsensusDriver {
         self.eng.high_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash)
     }
 
-    /// True if WE are the elected leader for checkpoint `index` right now.
-    pub fn is_my_window(&self, index: u64) -> bool {
-        if self.committee.is_empty() || index != self.eng.current_index { return false; }
-        let li = leader_index(index, &self.parent_hash(), self.committee.len());
-        self.committee[li] == self.node_id
+    /// True if WE lead the CURRENT round (the consensus view; may skip on timeout).
+    pub fn is_leader_now(&self) -> bool {
+        if self.committee.is_empty() { return false; }
+        let li = leader_index(self.eng.current_index, &self.parent_hash(), self.committee.len());
+        self.committee.get(li).map(|n| n == &self.node_id).unwrap_or(false)
     }
 
-    /// Window of K microblocks ended and we lead ⇒ emit an (unsigned) proposal.
-    /// Window boundary: adopt this epoch's committee, then (if we lead) emit a
-    /// proposal and buffer the seal inputs the macroblock body needs.
+    /// Next macroblock window to commit = the high-QC'd checkpoint's window + 1. Decoupled
+    /// from the round: a round skip (timeout) does NOT advance it, so the next round
+    /// re-proposes the same window (both extend the same high_qc) ⇒ contiguous macroblocks.
+    pub fn next_window(&self) -> u64 {
+        let hq_window = self.eng.high_qc.as_ref()
+            .and_then(|q| self.heads.get(&q.index))
+            .map(|h| h / 90)
+            .unwrap_or(0);
+        hq_window + 1
+    }
+
+    /// Propose `window` (the macroblock height) at the CURRENT round. The checkpoint
+    /// INDEX is the round (may skip on timeout); `window` is the contiguous chain
+    /// position (head/90). Every committee member buffers the window's seal inputs here
+    /// (all-seal); only the current leader proposes, once per round, and only the
+    /// contiguous next window — so a skipped round's window is re-proposed by the next.
     pub fn build_proposal(
-        &mut self, index: u64, head_height: u64, mb_hashes: Vec<Hash>,
+        &mut self, window: u64, mb_hashes: Vec<Hash>,
         state_root: Hash, beacon: Hash, head_ts: u64,
         committee: Vec<NodeId>, eligible_producers: Vec<u8>,
     ) -> Vec<Effect> {
         self.set_committee(committee.clone());
-        if !self.is_my_window(index) { return Vec::new(); }
+        let round = self.eng.current_index;
+        // QC-certified commitment to this window's epoch-transition data (compute before the
+        // move into seal_data); lets syncing nodes trust the published validator set.
+        let epoch_c = epoch_commitment(&eligible_producers, &committee);
+        // Seal inputs keyed by ROUND (seal_if_ready looks up by qc.index) and buffered on
+        // every member so any can seal the macroblock locally on QC (all-seal).
+        self.seal_data.insert(round, (eligible_producers, committee));
+        if round <= self.last_proposed_round || window != self.next_window() || !self.is_leader_now() {
+            return Vec::new();
+        }
+        let head_height = window.saturating_mul(90);
         let cp = Checkpoint {
-            index, parent_qc: self.eng.high_qc.clone(), window_head_height: head_height,
-            window_mb_hashes: mb_hashes, state_root, beacon, timestamp: head_ts,
+            index: round, parent_qc: self.eng.high_qc.clone(), window_head_height: head_height,
+            window_mb_hashes: mb_hashes, state_root, beacon, epoch_commitment: epoch_c, timestamp: head_ts,
             proposer: self.node_id.clone(), proposer_sig: Vec::new(),
         };
-        self.heads.insert(index, head_height);
-        self.seal_data.insert(index, (eligible_producers, committee));
+        self.last_proposed_round = round;
+        self.heads.insert(round, head_height);
         self.proposals.insert((cp.index, cp.hash()), cp.clone());
         vec![Effect::Propose(cp)]
     }
@@ -130,19 +156,34 @@ impl ConsensusDriver {
             ConsensusMsg::Timeout(tm) => self.eng.on_timeout_msg(tm),
             ConsensusMsg::Tc(tc) => self.eng.on_timeout_cert(tc),
         };
-        self.translate(acts)
+        let mut out = self.translate(acts);
+        // Seal also on a QC the node ADOPTED from a relay (didn't form locally): otherwise
+        // the macroblock body is never written whenever the QC forms on another node first.
+        if let ConsensusMsg::Qc(qc) = msg { out.extend(self.seal_if_ready(qc)); }
+        out
     }
 
-    fn translate(&self, actions: Vec<Action>) -> Vec<Effect> {
+    /// Emit Persist for `qc`'s checkpoint once (deduped). Every committee member seals
+    /// (all-seal); fires whether the node FORMED the QC locally or ADOPTED it via relay.
+    fn seal_if_ready(&mut self, qc: &QuorumCertificate) -> Vec<Effect> {
+        let cp = match self.proposals.get(&(qc.index, qc.checkpoint_hash)) {
+            Some(c) => c.clone(),
+            None => return Vec::new(),
+        };
+        let window = cp.window_head_height / 90; // dedup by WINDOW: a skipped round re-proposes
+        if self.sealed.contains(&window) { return Vec::new(); } // the same window at a new round.
+        self.sealed.insert(window);
+        let (eligible_producers, committee) = self.seal_data.get(&qc.index).cloned().unwrap_or_default();
+        vec![Effect::Persist { checkpoint: cp, qc: qc.clone(), eligible_producers, committee }]
+    }
+
+    fn translate(&mut self, actions: Vec<Action>) -> Vec<Effect> {
         let mut out = Vec::new();
         for a in actions {
             match a {
                 Action::Vote(v) => out.push(Effect::Vote { index: v.index, checkpoint_hash: v.checkpoint_hash }),
                 Action::FormedQc(qc) => {
-                    if let Some(cp) = self.proposals.get(&(qc.index, qc.checkpoint_hash)) {
-                        let (eligible_producers, committee) = self.seal_data.get(&qc.index).cloned().unwrap_or_default();
-                        out.push(Effect::Persist { checkpoint: cp.clone(), qc: qc.clone(), eligible_producers, committee });
-                    }
+                    out.extend(self.seal_if_ready(&qc));
                     out.push(Effect::Relay(ConsensusMsg::Qc(qc)));
                 }
                 Action::Commit(idx) => out.push(Effect::Finalize {
@@ -167,7 +208,7 @@ mod tests {
         let mut e = voter.as_bytes().to_vec(); e.extend_from_slice(msg); e == sig
     }
 
-    struct Node { d: ConsensusDriver, id: NodeId, committed: u64 }
+    struct Node { d: ConsensusDriver, id: NodeId, committed: u64, sealed: Vec<u64> }
 
     // Node executes one Effect ⇒ produces outbound wire messages (mock-signed).
     fn exec(n: &mut Node, e: Effect) -> Vec<ConsensusMsg> {
@@ -181,7 +222,7 @@ mod tests {
                 signature: sign(&n.id, &timeout_bytes(index, high_qc_index)),
             })],
             Effect::Relay(m) => vec![m],
-            Effect::Persist { .. } => vec![],
+            Effect::Persist { checkpoint, .. } => { n.sealed.push(checkpoint.window_head_height / 90); vec![] }
             Effect::Finalize { index, .. } => { if index > n.committed { n.committed = index; } vec![] }
         }
     }
@@ -219,12 +260,12 @@ mod tests {
         let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
         let genesis = [7u8; 32];
         let mut nodes: Vec<Node> = c.iter().map(|id| Node {
-            d: ConsensusDriver::new(id.clone(), c.clone(), genesis), id: id.clone(), committed: 0,
+            d: ConsensusDriver::new(id.clone(), c.clone(), genesis), id: id.clone(), committed: 0, sealed: Vec::new(),
         }).collect();
         for index in 1..=8u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, index * 10, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new());
+                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new());
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
@@ -241,9 +282,46 @@ mod tests {
         let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
         let cp = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 10, window_mb_hashes: vec![[1u8; 32]],
-            state_root: [1u8; 32], beacon: [0u8; 32], timestamp: 0, proposer: "n1".into(), proposer_sig: vec![9, 9],
+            state_root: [1u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], timestamp: 0, proposer: "n1".into(), proposer_sig: vec![9, 9],
         };
         // forged proposer_sig fails node verify ⇒ never reaches the driver
         assert!(!verify_msg(&c, &ConsensusMsg::Proposal(cp)));
+    }
+
+    // A round's leader stays silent ⇒ timeout ⇒ the next round re-proposes the SAME
+    // window (both extend the same high_qc). Macroblock windows stay CONTIGUOUS across
+    // the round skip — the old gap bug (macroblock height == round) cannot recur because
+    // height == window now. Every node seals the identical window set.
+    #[test]
+    fn round_skip_keeps_windows_contiguous() {
+        let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
+        let genesis = [7u8; 32];
+        let mut nodes: Vec<Node> = c.iter().map(|id| Node {
+            d: ConsensusDriver::new(id.clone(), c.clone(), genesis), id: id.clone(), committed: 0, sealed: Vec::new(),
+        }).collect();
+        // All members buffer window `w`'s seal inputs; the current leader proposes; settle.
+        fn step(nodes: &mut Vec<Node>, c: &[NodeId], w: u64) {
+            let mut seed = Vec::new();
+            for k in 0..nodes.len() {
+                let effs = nodes[k].d.build_proposal(w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(), Vec::new());
+                for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+            }
+            deliver(nodes, c, seed);
+        }
+        step(&mut nodes, &c, 1);
+        step(&mut nodes, &c, 2);
+        // Skip the current round: nobody proposes, every node times out ⇒ TC ⇒ round++.
+        let mut tmo = Vec::new();
+        for k in 0..nodes.len() {
+            for e in nodes[k].d.on_timeout() { tmo.extend(exec(&mut nodes[k], e)); }
+        }
+        deliver(&mut nodes, &c, tmo);
+        // The uncommitted window is re-proposed at the skipped-to round (no gap).
+        step(&mut nodes, &c, 3);
+        step(&mut nodes, &c, 4);
+        for k in 0..nodes.len() {
+            let mut s = nodes[k].sealed.clone(); s.sort(); s.dedup();
+            assert_eq!(s, vec![1, 2, 3, 4], "node {} windows not contiguous across skip: {:?}", k, s);
+        }
     }
 }

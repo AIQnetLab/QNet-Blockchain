@@ -19,6 +19,16 @@ pub fn v2_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Epoch-commitment enforcement is staged: mismatches are always logged, but only
+/// REJECTED when QNET_BFT2_ENFORCE_EPOCH=1. Default off so a cross-node determinism bug
+/// can't stall/break the chain at genesis; flip on for untrusted-supernode production
+/// once a live run shows zero mismatches.
+pub(crate) fn enforce_epoch() -> bool {
+    std::env::var("QNET_BFT2_ENFORCE_EPOCH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Highest microblock height made irreversible by a 2-chain checkpoint QC.
 /// Monotonic; drives the FullyFinalized confirmation level for clients/exchanges.
 static BFT2_FINALIZED_HEIGHT: AtomicU64 = AtomicU64::new(0);
@@ -96,12 +106,15 @@ fn excluded_producers(storage: &Storage, mb_index: u64) -> Option<Vec<u8>> {
         let c = counts.entry(e.failed_producer.clone()).or_insert((0, Vec::new()));
         c.0 += 1; c.1.push(e.height);
     }
-    let excluded: Vec<qnet_state::ExcludedProducerEntry> = counts.into_iter()
+    let mut excluded: Vec<qnet_state::ExcludedProducerEntry> = counts.into_iter()
         .filter(|(_, (n, _))| *n >= FAILOVER_THRESHOLD)
         .map(|(node_id, (n, heights))| qnet_state::ExcludedProducerEntry {
             node_id, failover_count: n, failover_heights: heights,
             exclusion_blocks: 90, reason: format!("failover_{}_epoch_{}", n, mb_index),
         }).collect();
+    // HashMap drains in arbitrary order; sort so the serialized body is byte-identical
+    // on every node that seals this window (required once all committee members seal).
+    excluded.sort_by(|a, b| a.node_id.cmp(&b.node_id));
     if excluded.is_empty() { None } else { bincode::serialize(&excluded).ok() }
 }
 
@@ -128,20 +141,44 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
             }
             Effect::Relay(m) => broadcast(p2p, &m).await,
             Effect::Persist { checkpoint, qc, eligible_producers, committee } => {
-                // v2: only the PROPOSER seals the macroblock (its canonical QC) so the block
-                // is byte-identical network-wide; followers receive + validate it. The
-                // macroblock IS the epoch-transition object — it carries the QC (finality)
-                // AND the next-epoch eligible-producer snapshot + VRF beacon + failover
-                // exclusions that N-2 producer/committee selection reads. Deterministic:
-                // timestamp/mb_hashes/state_root/beacon ride in the QC-agreed checkpoint.
-                if checkpoint.proposer != node_id { continue; }
+                // Every committee member seals locally: the body is a pure function of the
+                // committed window (deterministic), so all produce a byte-identical block —
+                // no single-producer SPOF, no seal race. Macroblock HEIGHT = window (head/90),
+                // decoupled from the consensus round (checkpoint.index, may skip on timeout)
+                // so a skipped round leaves NO gap. Broadcast is leader-only (peers hold it
+                // locally / serve on sync) to avoid N× traffic.
+                let window = checkpoint.window_head_height / 90;
+                // Idempotent: already sealed locally or received via broadcast/sync.
+                if storage.get_macroblock_by_height(window).ok().flatten().is_some() { continue; }
+                // Chain link: seal only when the parent macroblock is present, so previous_hash
+                // (= latest) chains it. Absent ⇒ defer; the leader's broadcast / sync provides it.
+                if window > 1 && storage.get_macroblock_by_height(window - 1).ok().flatten().is_none() {
+                    if crate::node::is_warn() { println!("[WARN][BFT2] seal_deferred window={} reason=parent_absent", window); }
+                    continue;
+                }
                 let previous_hash = storage.get_latest_macroblock_hash().unwrap_or([0u8; 32]);
                 // Store (checkpoint, QC) so receivers reconstruct checkpoint.hash(), confirm
                 // it == qc.checkpoint_hash (binds this exact block), and full-verify the QC.
                 let qc_bytes = bincode::serialize(&(checkpoint.clone(), qc.clone())).unwrap_or_default();
-                let excluded = excluded_producers(storage, checkpoint.index);
+                let excluded = excluded_producers(storage, window);
+                // Emission macroblock (every 160 windows ≈ 4h): record the PREVIOUS epoch's
+                // reward recipients on-chain (Super HBC + Light pings) so the emission TX and
+                // the deterministic crediting (both read these fields) work under v2. Determ-
+                // inistic ⇒ every sealer records the same set. pool2 (fees→producer since
+                // v3.18) / pool3 (Phase 2) stay None. Heavy epoch scan, but 1 window in 160.
+                let (reward_heartbeats, reward_light_nodes) = if window > 0 && window % 160 == 0 {
+                    let ws = (window / 160 - 1) * 14400;
+                    let we = ws + 14400;
+                    let hb = crate::node::BlockchainNode::collect_heartbeat_commitments_from_blocks(storage, p2p, ws, we, true)
+                        .await.ok().map(|(s, _)| s).filter(|s| !s.is_empty())
+                        .and_then(|s| bincode::serialize(&s).ok());
+                    let lt = crate::node::BlockchainNode::collect_ping_commitments_from_blocks(storage, p2p, ws, we)
+                        .await.ok().filter(|m| !m.is_empty())
+                        .and_then(|m| bincode::serialize(&m).ok());
+                    (hb, lt)
+                } else { (None, None) };
                 let mb = qnet_state::MacroBlock {
-                    height: checkpoint.index,
+                    height: window,
                     timestamp: checkpoint.timestamp,
                     micro_blocks: checkpoint.window_mb_hashes.clone(),
                     state_root: checkpoint.state_root,
@@ -151,37 +188,52 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                         randomness_beacon: Some(checkpoint.beacon),
                         excluded_producers_for_next_epoch: excluded,
                         consensus_committee: Some(committee),
+                        reward_heartbeats,
+                        reward_light_nodes,
                         ..Default::default()
                     },
                     previous_hash,
                     poh_hash: Vec::new(),
                     poh_count: 0,
                 };
-                match storage.save_macroblock(checkpoint.index, &mb).await {
+                match storage.save_macroblock(window, &mb).await {
                     Ok(_) => {
-                        if let Ok(ser) = bincode::serialize(&mb) {
-                            let compressed = zstd::encode_all(&ser[..], 3).unwrap_or(ser);
-                            let _ = p2p.broadcast_macroblock(checkpoint.index, compressed, checkpoint.index).await;
+                        if checkpoint.proposer == node_id {
+                            if let Ok(ser) = bincode::serialize(&mb) {
+                                let compressed = zstd::encode_all(&ser[..], 3).unwrap_or(ser);
+                                let _ = p2p.broadcast_macroblock(window, compressed, window).await;
+                            }
                         }
                         if crate::node::is_info() {
-                            println!("[INFO][BFT2] macroblock_sealed idx={} head_h={} signers={}",
-                                     checkpoint.index, checkpoint.window_head_height, qc.signers.len());
+                            println!("[INFO][BFT2] macroblock_sealed window={} round={} head_h={} signers={} role={}",
+                                     window, checkpoint.index, checkpoint.window_head_height, qc.signers.len(),
+                                     if checkpoint.proposer == node_id { "leader" } else { "replica" });
                         }
                     }
                     Err(e) => if crate::node::is_warn() {
-                        println!("[WARN][BFT2] macroblock_save_failed idx={} err={}", checkpoint.index, e);
+                        println!("[WARN][BFT2] macroblock_save_failed window={} err={}", window, e);
                     },
                 }
             }
             Effect::Finalize { index, head_height } => {
-                // Microblocks ≤ head_height are now irreversible (2-chain QC). Advance the
-                // monotonic finalized marker — this is the FullyFinalized point for clients.
-                let prev = BFT2_FINALIZED_HEIGHT.load(Ordering::Acquire);
-                if head_height > prev {
-                    BFT2_FINALIZED_HEIGHT.store(head_height, Ordering::Release);
-                }
-                if crate::node::is_info() {
-                    println!("[INFO][BFT2] checkpoint_final index={} finalized_h={}", index, head_height);
+                // Microblocks ≤ head_height are irreversible (2-chain QC). Advance the
+                // monotonic finalized marker ONLY if this node holds the macroblock body
+                // (keyed by window = head/90) — never mark a height final whose block is
+                // missing locally. Conservative: a late body defers to the next Finalize.
+                let window = head_height / 90;
+                let have_body = storage.get_macroblock_by_height(window).map(|o| o.is_some()).unwrap_or(false);
+                if !have_body {
+                    if crate::node::is_warn() {
+                        println!("[WARN][BFT2] finalize_deferred round={} window={} reason=body_missing", index, window);
+                    }
+                } else {
+                    let prev = BFT2_FINALIZED_HEIGHT.load(Ordering::Acquire);
+                    if head_height > prev {
+                        BFT2_FINALIZED_HEIGHT.store(head_height, Ordering::Release);
+                    }
+                    if crate::node::is_info() {
+                        println!("[INFO][BFT2] checkpoint_final round={} window={} finalized_h={}", index, window, head_height);
+                    }
                 }
             }
         }
@@ -193,9 +245,61 @@ pub enum V2Event {
     Inbound(Vec<u8>),  // raw ConsensusMsg bytes from P2P
     WindowEnd {
         index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
-        committee: Vec<String>,        // epoch committee (N-2 VRF sample) for this index
+        committee: Vec<String>,        // epoch committee (N-2 VRF sample) for this window
         eligible_producers: Vec<u8>,   // bincode Vec<EligibleProducer> for the macroblock body
     },
+}
+
+/// Buffered per-window proposal/seal inputs from the production window signal, so a leader
+/// can propose the contiguous next window at ANY round — including after a skip, when the
+/// round has advanced past the window number.
+#[derive(Clone)]
+struct WindowContent {
+    mb_hashes: Vec<Hash>,
+    state_root: Hash,
+    beacon: Hash,
+    head_ts: u64,
+    committee: Vec<String>,
+    eligible: Vec<u8>,
+}
+
+/// Adopt the in-flight window's committee and, if we lead the current round, propose the
+/// contiguous next window. No-op until that window's content has been buffered locally.
+fn try_propose(
+    driver: &mut ConsensusDriver,
+    buf: &std::collections::HashMap<u64, WindowContent>,
+    committee: &mut Vec<String>,
+) -> Vec<Effect> {
+    let w = driver.next_window();
+    match buf.get(&w) {
+        Some(c) => {
+            *committee = c.committee.clone(); // committee is per-window (epoch); QC/TC verify against it
+            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone())
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Re-handle buffered inbound now the round / in-flight committee may have advanced. One
+/// pass: messages still ahead of our round stay buffered (bounded), the rest verify+apply.
+/// No-op until we hold the in-flight window's committee.
+fn drain_pending(
+    driver: &mut ConsensusDriver, buf: &std::collections::HashMap<u64, WindowContent>,
+    p2p: &SimplifiedP2P, committee: &[String], pending: &mut Vec<Vec<u8>>, max: usize,
+) -> Vec<Effect> {
+    if pending.is_empty() || !buf.contains_key(&driver.next_window()) { return Vec::new(); }
+    let cur = driver.current_index();
+    let mut effs = Vec::new();
+    let mut still = Vec::new();
+    for data in std::mem::take(pending) {
+        match bincode::deserialize::<ConsensusMsg>(&data) {
+            Ok(m) if msg_index(&m) <= cur => { if verify_msg(p2p, committee, &m) { effs.extend(driver.handle(&m)); } }
+            Ok(_) if still.len() < max => still.push(data),
+            _ => {}
+        }
+    }
+    *pending = still;
+    effs
 }
 
 static V2_TX: OnceCell<mpsc::UnboundedSender<V2Event>> = OnceCell::new();
@@ -240,8 +344,12 @@ pub async fn run(
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_index = driver.current_index();
     let mut last_signaled: u64 = 0; // highest window index we hold data for (gates idle timeouts)
-    let mut pending: Vec<Vec<u8>> = Vec::new(); // inbound ahead of our committee; replayed at its window
+    let mut pending: Vec<Vec<u8>> = Vec::new(); // inbound ahead of our round; replayed as we advance
     const MAX_PENDING: usize = 256; // DoS bound on the replay buffer
+    // Per-window proposal/seal inputs (bounded). The leader proposes the contiguous next
+    // window from here at the current round — decoupling the window from a skippable round.
+    let mut window_buf: std::collections::HashMap<u64, WindowContent> = std::collections::HashMap::new();
+    const MAX_WINDOW_BUF: usize = 256;
     if crate::node::is_info() {
         println!("[INFO][BFT2] runtime_started committee={} view_timeout_ms={}", committee.len(), timeout_ms);
     }
@@ -251,14 +359,37 @@ pub async fn run(
                 let effects = match ev {
                     V2Event::Inbound(data) => match bincode::deserialize::<ConsensusMsg>(&data) {
                         Ok(msg) => {
-                            if msg_index(&msg) > last_signaled {
-                                // Committee for this index not adopted yet ⇒ buffer (bounded),
-                                // replayed when its window signal arrives. Prevents a vote-less
-                                // race when a proposal beats our boundary.
+                            // Adopt the in-flight window's committee (QC/TC verify + leader/quorum).
+                            if let Some(c) = window_buf.get(&driver.next_window()) { committee = c.committee.clone(); }
+                            // Buffer until we hold that committee, or for a round ahead of us (rounds
+                            // skip on timeout) — replayed as we advance. Bounded against DoS.
+                            if !window_buf.contains_key(&driver.next_window()) || msg_index(&msg) > driver.current_index() {
                                 if pending.len() < MAX_PENDING { pending.push(data); }
                                 Vec::new()
                             } else if verify_msg(&p2p, &committee, &msg) {
-                                driver.handle(&msg)
+                                // C: a proposal's epoch_commitment must match our OWN independently
+                                // derived epoch data (eligible+committee) — anti-forge of the
+                                // published validator set. No local data ⇒ can't check here (the
+                                // QC-bound commitment is re-checked on macroblock sync regardless).
+                                let epoch_ok = match &msg {
+                                    ConsensusMsg::Proposal(cp) => window_buf.get(&(cp.window_head_height / 90))
+                                        .map(|c| qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee) == cp.epoch_commitment)
+                                        .unwrap_or(true),
+                                    _ => true,
+                                };
+                                if !epoch_ok && crate::node::is_warn() {
+                                    println!("[WARN][BFT2] proposal_epoch_mismatch idx={} (staged)", msg_index(&msg));
+                                }
+                                if !epoch_ok && enforce_epoch() {
+                                    Vec::new()
+                                } else {
+                                    let mut effs = driver.handle(&msg);
+                                    // Handling may advance the round/high_qc ⇒ propose the next window,
+                                    // then replay buffered inbound now in range.
+                                    effs.extend(try_propose(&mut driver, &window_buf, &mut committee));
+                                    effs.extend(drain_pending(&mut driver, &window_buf, &p2p, &committee, &mut pending, MAX_PENDING));
+                                    effs
+                                }
                             } else {
                                 if crate::node::is_warn() { println!("[WARN][BFT2] msg_verify_failed idx={}", msg_index(&msg)); }
                                 Vec::new()
@@ -267,24 +398,20 @@ pub async fn run(
                         Err(_) => Vec::new(),
                     },
                     V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers } => {
-                        // Adopt this epoch's committee (verify + leader election), then
-                        // propose if we lead. head_ts = head microblock's real timestamp
-                        // (we have it at the boundary); rides in the QC-agreed checkpoint.
+                        // Buffer this window's content (head microblock's real timestamp rides in
+                        // the QC-agreed checkpoint). Then propose the contiguous next window if we
+                        // lead, and replay buffered inbound.
                         last_signaled = last_signaled.max(index);
-                        committee = cmt.clone();
                         let head_ts = storage.load_microblock_auto_format(head_height)
                             .ok().flatten().map(|m| m.timestamp).unwrap_or(0);
-                        let mut effs = driver.build_proposal(index, head_height, mb_hashes, state_root, beacon, head_ts, cmt, eligible_producers);
-                        // Replay buffered inbound now covered by the adopted committee.
-                        for data in std::mem::take(&mut pending) {
-                            match bincode::deserialize::<ConsensusMsg>(&data) {
-                                Ok(m) if msg_index(&m) <= last_signaled => {
-                                    if verify_msg(&p2p, &committee, &m) { effs.extend(driver.handle(&m)); }
-                                }
-                                Ok(_) if pending.len() < MAX_PENDING => pending.push(data), // still ahead
-                                _ => {}
-                            }
+                        window_buf.insert(index, WindowContent {
+                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers,
+                        });
+                        if window_buf.len() > MAX_WINDOW_BUF {
+                            if let Some(&lo) = window_buf.keys().min() { window_buf.remove(&lo); }
                         }
+                        let mut effs = try_propose(&mut driver, &window_buf, &mut committee);
+                        effs.extend(drain_pending(&mut driver, &window_buf, &p2p, &committee, &mut pending, MAX_PENDING));
                         effs
                     }
                 };
@@ -292,10 +419,9 @@ pub async fn run(
                 last_index = driver.current_index();
             }
             _ = timer.tick() => {
-                // Time out only a checkpoint we are actively committing (window data in
-                // hand). Between windows the view idles ~90s — never time out then, else
-                // the idle gap would be misread as a stall and skip the next window.
-                if driver.current_index() == last_index && driver.current_index() <= last_signaled {
+                // Time out only a window we have data for and are actively committing. Between
+                // windows the view idles ~90s — never time out then (would skip the next window).
+                if driver.current_index() == last_index && driver.next_window() <= last_signaled {
                     let effects = driver.on_timeout();
                     execute(effects, &node_id, &p2p, &storage).await;
                 }
