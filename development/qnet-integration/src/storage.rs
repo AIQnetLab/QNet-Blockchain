@@ -4338,19 +4338,19 @@ impl Storage {
         // Save the macroblock
         self.persistent.save_macroblock(height, macroblock).await?;
         
-        // SECURITY: Verify macroblock state_root = XOR of all microblock hashes
+        // SECURITY: macroblock state_root = real account-state Merkle root at the window
+        // head (head microblock's state_root). Cross-checks the 2f+1-signed checkpoint root
+        // against this node's own computed state. Skip if the head microblock isn't local yet
+        // (out-of-order sync) — microblock apply verifies its own state_root independently.
         {
-            let mut computed_state_root = [0u8; 32];
-            for microblock_hash in &macroblock.micro_blocks {
-                for (i, &byte) in microblock_hash.iter().enumerate() {
-                    computed_state_root[i] ^= byte;
+            let head_h = height * 90;
+            if let Ok(Some(head_mb)) = self.load_microblock_auto_format(head_h) {
+                if head_mb.state_root != macroblock.state_root {
+                    return Err(IntegrationError::StorageError(
+                        format!("macroblock state_root mismatch at window {}: macroblock {:?} vs window-head h={} {:?}",
+                                height, macroblock.state_root, head_h, head_mb.state_root)
+                    ));
                 }
-            }
-            if computed_state_root != macroblock.state_root {
-                return Err(IntegrationError::StorageError(
-                    format!("State root verification failed at height {}: expected {:?}, computed {:?}",
-                            height, macroblock.state_root, computed_state_root)
-                ));
             }
         }
         // NOTE: Account state snapshots are saved separately by emission/rewards processing

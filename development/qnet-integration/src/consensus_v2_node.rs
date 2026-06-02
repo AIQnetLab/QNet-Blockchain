@@ -9,20 +9,20 @@ use crate::storage::Storage;
 use qnet_consensus::checkpoint_bft::{Hash, QuorumCertificate, TimeoutMsg, Vote};
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 
-/// QNET_CONSENSUS_V2=1 ⇒ new Checkpoint-BFT path (fresh genesis required).
+/// Checkpoint-BFT (v2) is the ONLY macroblock consensus since the legacy commit/reveal
+/// path was removed (plan step E). Always on; kept as a predicate for the few v2-specific
+/// call sites (e.g. the RPC FullyFinalized confirmation level) that still branch on it.
 pub fn v2_enabled() -> bool {
-    std::env::var("QNET_CONSENSUS_V2")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    true
 }
 
-/// Epoch-commitment enforcement is staged: mismatches are always logged, but only
-/// REJECTED when QNET_BFT2_ENFORCE_EPOCH=1. Default off so a cross-node determinism bug
-/// can't stall/break the chain at genesis; flip on for untrusted-supernode production
-/// once a live run shows zero mismatches.
+/// Checkpoint-content enforcement (state_root, mb_hashes, beacon, epoch_commitment) is
+/// staged: mismatches are always logged, but only REJECTED when QNET_BFT2_ENFORCE_EPOCH=1.
+/// Default off so a cross-node determinism bug can't stall the chain at genesis; flip on
+/// for untrusted-supernode production once a live run shows zero mismatches.
 pub(crate) fn enforce_epoch() -> bool {
     std::env::var("QNET_BFT2_ENFORCE_EPOCH")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -30,9 +30,11 @@ pub(crate) fn enforce_epoch() -> bool {
 }
 
 /// Highest microblock height made irreversible by a 2-chain checkpoint QC.
-/// Monotonic; drives the FullyFinalized confirmation level for clients/exchanges.
-static BFT2_FINALIZED_HEIGHT: AtomicU64 = AtomicU64::new(0);
-pub fn bft2_finalized_height() -> u64 { BFT2_FINALIZED_HEIGHT.load(Ordering::Acquire) }
+/// Single source of truth = the canonical finality marker (node::LAST_FINALIZED_HEIGHT),
+/// advanced by the v2 Finalize effect; drives the FullyFinalized confirmation level.
+pub fn bft2_finalized_height() -> u64 {
+    crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::Acquire)
+}
 
 /// Domain-separated string a consensus payload signs over.
 fn sign_str(domain: &str, body: &[u8]) -> String {
@@ -227,12 +229,17 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                         println!("[WARN][BFT2] finalize_deferred round={} window={} reason=body_missing", index, window);
                     }
                 } else {
-                    let prev = BFT2_FINALIZED_HEIGHT.load(Ordering::Acquire);
+                    // v2 is the single finality authority: advance the canonical monotonic marker
+                    // (node::LAST_FINALIZED_HEIGHT / LAST_FINALIZED_CONSENSUS_ROUND) that the microblock
+                    // production_gate, sync, recovery and RPC all read. One source of truth, fed by the
+                    // active consensus — no separate v2 marker. try_advance_finality is monotonic, so a
+                    // stale or replayed Finalize can never regress what a later checkpoint finalized.
+                    let prev = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::Acquire);
                     if head_height > prev {
-                        BFT2_FINALIZED_HEIGHT.store(head_height, Ordering::Release);
-                    }
-                    if crate::node::is_info() {
-                        println!("[INFO][BFT2] checkpoint_final round={} window={} finalized_h={}", index, window, head_height);
+                        crate::node::try_advance_finality(head_height, "BFT2");
+                        if crate::node::is_info() {
+                            println!("[INFO][BFT2] checkpoint_final round={} window={} finalized_h={}", index, window, head_height);
+                        }
                     }
                 }
             }
@@ -371,16 +378,24 @@ pub async fn run(
                                 // derived epoch data (eligible+committee) — anti-forge of the
                                 // published validator set. No local data ⇒ can't check here (the
                                 // QC-bound commitment is re-checked on macroblock sync regardless).
-                                let epoch_ok = match &msg {
+                                // A proposal must match our OWN independently-derived window content
+                                // before we vote: real account state_root, window_mb_hashes, beacon and
+                                // epoch_commitment (eligible+committee). Honest 2f+1 reject any forged
+                                // checkpoint ⇒ a malicious leader cannot finalize fake state. No local
+                                // content ⇒ can't check here (re-verified on macroblock sync).
+                                let content_ok = match &msg {
                                     ConsensusMsg::Proposal(cp) => window_buf.get(&(cp.window_head_height / 90))
-                                        .map(|c| qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee) == cp.epoch_commitment)
+                                        .map(|c| cp.state_root == c.state_root
+                                            && cp.window_mb_hashes == c.mb_hashes
+                                            && cp.beacon == c.beacon
+                                            && qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee) == cp.epoch_commitment)
                                         .unwrap_or(true),
                                     _ => true,
                                 };
-                                if !epoch_ok && crate::node::is_warn() {
-                                    println!("[WARN][BFT2] proposal_epoch_mismatch idx={} (staged)", msg_index(&msg));
+                                if !content_ok && crate::node::is_warn() {
+                                    println!("[WARN][BFT2] proposal_content_mismatch idx={} (staged)", msg_index(&msg));
                                 }
-                                if !epoch_ok && enforce_epoch() {
+                                if !content_ok && enforce_epoch() {
                                     Vec::new()
                                 } else {
                                     let mut effs = driver.handle(&msg);
