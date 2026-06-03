@@ -136,6 +136,74 @@ pub fn lookup_block_hash(height: u64) -> Option<[u8; 32]> {
     RECENT_BLOCK_HASHES.get(&height).map(|e| *e.value())
 }
 
+/// Deterministic microblock fork-choice (failover race): a same-height block from
+/// a STRICTLY HIGHER 2f+1-certified rotation round supersedes the one we hold.
+/// Routes it to the finality-guarded reorg via FORK_RECOVERY_HEIGHT — the existing
+/// recovery rolls back (never below finality), reconciles state, and resyncs to the
+/// certified chain. Both timeout_round values share the per-height baseline, so the
+/// higher one is the failover winner. Safety: round must be 2f+1-certified (≤f
+/// Byzantine cannot forge a TC); height must be above finality; per-height cooldown
+/// bounds re-triggers; the resync re-verifies every block. One bounded decode, only
+/// for stored heights above finality.
+fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBlock) {
+    let h = block.height;
+    if h == 0 { return; }
+    let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
+    if h <= finalized { return; } // never reorg finalized history
+
+    let our_round = match storage.load_microblock_auto_format(h) {
+        Ok(Some(mb)) => mb.timeout_round,
+        _ => return,
+    };
+
+    // Fast path: if no round higher than ours is 2f+1-certified, no competitor can
+    // win — skip the decode entirely (the common no-failover case). Absolute units.
+    let mb_idx = h / 90;
+    let baseline = crate::unified_p2p::get_baseline_round(mb_idx);
+    let certified_abs = crate::unified_p2p::highest_certified_round_for(mb_idx);
+    if our_round.saturating_add(baseline) >= certified_abs { return; }
+
+    // Bounded decode (zstd|raw → MicroBlock) just to read the incoming round.
+    const MAX_DECOMPRESSED: usize = 50 * 1024 * 1024;
+    let decompressed = match zstd::stream::Decoder::new(&block.data[..]) {
+        Ok(dec) => {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            match dec.take(MAX_DECOMPRESSED as u64 + 1).read_to_end(&mut buf) {
+                Ok(_) if buf.len() <= MAX_DECOMPRESSED => buf,
+                _ => return,
+            }
+        }
+        Err(_) => block.data.clone(),
+    };
+    let incoming = match bincode::deserialize::<qnet_state::MicroBlock>(&decompressed) {
+        Ok(mb) if mb.height == h && mb.timeout_round > our_round => mb,
+        _ => return, // decode failed, height mismatch, or not a higher round → keep ours
+    };
+
+    // The higher round must itself be 2f+1-certified (a forged round is ignored
+    // here and would also fail the v23.1 ingest gate on resync).
+    if incoming.timeout_round.saturating_add(baseline) > certified_abs { return; }
+
+    // Per-height cooldown (shared with macroblock-anchored recovery).
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    if let Some(t) = FORK_RECOVERY_TRIGGER_TIMES.get(&h) {
+        if now.saturating_sub(*t) < FORK_RECOVERY_COOLDOWN_SECS { return; }
+    }
+    FORK_RECOVERY_TRIGGER_TIMES.insert(h, now);
+
+    // Signal the lowest disputed height; the consumer rolls back to it - 1.
+    let prev = FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst);
+    if prev == 0 || h < prev {
+        FORK_RECOVERY_HEIGHT.store(h, Ordering::SeqCst);
+    }
+    if is_warn() {
+        println!("[WARN][FORK] round_supersede h={} our_round={} new_round={} action=reorg_to_certified",
+                 h, our_round, incoming.timeout_round);
+    }
+}
+
 /// Record that `peer_id` reported a hash_chain_break at `height`.
 ///
 /// v16.2: ADVISORY-ONLY MODEL. Witness count here measures how many
@@ -1289,11 +1357,14 @@ impl BlockPipeline {
                 continue;
             }
 
-            // Dedup: skip if already in storage
+            // Dedup: skip if already in storage. Exception — a same-height block from
+            // a higher 2f+1-certified rotation round (failover race) supersedes ours;
+            // route it to the finality-guarded reorg instead of silently dropping.
             if storage.load_microblock(block.height)
                 .map(|opt| opt.is_some())
                 .unwrap_or(false)
             {
+                maybe_supersede_by_certified_round(&storage, &block);
                 metrics.duplicates_skipped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }

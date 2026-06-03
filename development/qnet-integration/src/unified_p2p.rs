@@ -8993,8 +8993,26 @@ impl SimplifiedP2P {
             }
         }
 
-        // v30.A2: anti-single-source — refuse to start sync with one attesting peer.
+        // v30.A2: prefer ≥2 freshly-attested peers for the HEAD target (anti-poisoning).
+        // Escape hatch: a network-wide stall makes ALL heights stale → this branch would
+        // deadlock sync forever. Fall back to the max height across validated peers as a
+        // RECOVERY target — fetched blocks are crypto-verified on apply, so a stale/wrong
+        // claim fails verification and never corrupts state. Freshness gates the HEAD
+        // choice; verification gates safety; gap-fill must never be blocked by staleness.
         if peer_heights.len() < 2 {
+            let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            let recovery_target = validated_peers.iter()
+                .map(|p| p.last_block_height)
+                .filter(|&h| h > 0 && h < 2_000_000_000)
+                .max()
+                .unwrap_or(0);
+            if recovery_target > local_h {
+                if crate::node::is_warn() {
+                    println!("[WARN][SYNC] stall_recovery_target h={} attested={} reason=all_peers_stale",
+                             recovery_target, peer_heights.len());
+                }
+                return Ok(recovery_target);
+            }
             if crate::node::is_info() {
                 println!("[INFO][SYNC] insufficient_attested_peers count={} required=2 — staying at local height",
                          peer_heights.len());

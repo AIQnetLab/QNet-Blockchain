@@ -19,15 +19,10 @@ pub fn v2_enabled() -> bool {
     true
 }
 
-/// Checkpoint-content enforcement (state_root, mb_hashes, beacon, epoch_commitment) is
-/// staged: mismatches are always logged, but only REJECTED when QNET_BFT2_ENFORCE_EPOCH=1.
-/// Default off so a cross-node determinism bug can't stall the chain at genesis; flip on
-/// for untrusted-supernode production once a live run shows zero mismatches.
-pub(crate) fn enforce_epoch() -> bool {
-    std::env::var("QNET_BFT2_ENFORCE_EPOCH")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
+// Checkpoint-content verification (state_root, mb_hashes, beacon, epoch_commitment) is
+// ALWAYS enforced (fail-stop): a node never signs or finalizes a checkpoint whose content it
+// does not independently reproduce. With consensus state fully integer (no f64), divergence is
+// a bug to halt on, not to absorb. No env flag.
 
 /// Highest microblock height made irreversible by a 2-chain checkpoint QC.
 /// Single source of truth = the canonical finality marker (node::LAST_FINALIZED_HEIGHT),
@@ -218,22 +213,38 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 }
             }
             Effect::Finalize { index, head_height } => {
-                // Microblocks ≤ head_height are irreversible (2-chain QC). Advance the
-                // monotonic finalized marker ONLY if this node holds the macroblock body
-                // (keyed by window = head/90) — never mark a height final whose block is
-                // missing locally. Conservative: a late body defers to the next Finalize.
+                // Finalize only what we locally HOLD and AGREE with, so finality never outruns our own
+                // microblock tip (an ahead-of-chain marker wedges rollback recovery) and a forged root
+                // that slipped a QC can't be finalized by an honest node that applied real state.
                 let window = head_height / 90;
-                let have_body = storage.get_macroblock_by_height(window).map(|o| o.is_some()).unwrap_or(false);
-                if !have_body {
+                let macro_bytes = storage.get_macroblock_by_height(window).ok().flatten();
+                let chain_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+                // (1) macroblock body present AND (2) our microblock tip reached the window head
+                // (⇒ every microblock ≤ head_height is applied) — keeps finality ≤ local chain tip.
+                let have_window = macro_bytes.is_some() && chain_h >= head_height;
+                // (3) state agreement: the macroblock's state_root must equal our locally-applied
+                // window-head root, else defer (fail-stop) — never finalize state we didn't reproduce.
+                let state_ok = match (
+                    macro_bytes.as_ref().and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(b).ok()),
+                    storage.load_microblock_auto_format(head_height).ok().flatten(),
+                ) {
+                    (Some(mb), Some(head_mb)) if mb.state_root != head_mb.state_root => {
+                        if crate::node::is_warn() {
+                            println!("[WARN][BFT2] finalize_state_mismatch round={} window={} — defer", index, window);
+                        }
+                        false // fail-stop: never finalize a window whose state we don't locally reproduce
+                    }
+                    _ => true,
+                };
+                if !have_window || !state_ok {
                     if crate::node::is_warn() {
-                        println!("[WARN][BFT2] finalize_deferred round={} window={} reason=body_missing", index, window);
+                        println!("[WARN][BFT2] finalize_deferred round={} window={} body={} chain_h={} state_ok={}",
+                                 index, window, macro_bytes.is_some(), chain_h, state_ok);
                     }
                 } else {
                     // v2 is the single finality authority: advance the canonical monotonic marker
-                    // (node::LAST_FINALIZED_HEIGHT / LAST_FINALIZED_CONSENSUS_ROUND) that the microblock
-                    // production_gate, sync, recovery and RPC all read. One source of truth, fed by the
-                    // active consensus — no separate v2 marker. try_advance_finality is monotonic, so a
-                    // stale or replayed Finalize can never regress what a later checkpoint finalized.
+                    // (LAST_FINALIZED_HEIGHT / LAST_FINALIZED_CONSENSUS_ROUND) read by the production_gate,
+                    // sync, recovery and RPC. Monotonic ⇒ a stale/replayed Finalize never regresses it.
                     let prev = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::Acquire);
                     if head_height > prev {
                         crate::node::try_advance_finality(head_height, "BFT2");
@@ -389,13 +400,17 @@ pub async fn run(
                                             && cp.window_mb_hashes == c.mb_hashes
                                             && cp.beacon == c.beacon
                                             && qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee) == cp.epoch_commitment)
-                                        .unwrap_or(true),
+                                        // No locally-derived content for the proposer's claimed window ⇒
+                                        // we cannot verify it, so we never sign it (fail-stop).
+                                        .unwrap_or(false),
                                     _ => true,
                                 };
-                                if !content_ok && crate::node::is_warn() {
-                                    println!("[WARN][BFT2] proposal_content_mismatch idx={} (staged)", msg_index(&msg));
-                                }
-                                if !content_ok && enforce_epoch() {
+                                if !content_ok {
+                                    // fail-stop: a checkpoint whose content we don't independently reproduce
+                                    // is never voted — a forged state_root cannot get our signature.
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][BFT2] proposal_content_rejected idx={}", msg_index(&msg));
+                                    }
                                     Vec::new()
                                 } else {
                                     let mut effs = driver.handle(&msg);

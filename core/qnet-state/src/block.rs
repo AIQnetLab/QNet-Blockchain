@@ -337,8 +337,9 @@ pub struct ConsensusData {
 pub struct EligibleProducer {
     /// Node identifier (e.g., "genesis_node_001" or "node_abc123")
     pub node_id: String,
-    /// Reputation score at snapshot time (0.0 - 1.0)
-    pub reputation: f64,
+    /// Reputation at snapshot time as fixed-point centipercent (u32): 70.00% = 7000, max = 10000.
+    /// Integer (not f64) so this consensus-committed value is bit-identical on every node.
+    pub reputation: u32,
 }
 
 /// Slashing event data for blockchain storage (simplified for serialization)

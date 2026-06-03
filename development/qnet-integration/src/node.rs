@@ -3756,7 +3756,7 @@ impl BlockchainNode {
         macroblock_index: u64,
         storage: &Storage,
     ) -> Vec<qnet_state::EligibleProducer> {
-        const MIN_REPUTATION: f64 = 0.70;
+        const MIN_REPUTATION_BP: u32 = 7000; // 70.00% eligibility floor (fixed-point centipercent)
 
         // Deterministic "as-of" time = the window head microblock's on-chain timestamp
         // (signed, seconds; identical on every node) — NOT wall-clock. The reputation
@@ -3779,13 +3779,16 @@ impl BlockchainNode {
         
         let mut eligible: Vec<qnet_state::EligibleProducer> = consensus_participants.iter()
             .map(|node_id| {
-                let reputation = reputation_map.get(node_id).copied().unwrap_or(0.70);
+                // reputation_map is 0–100; commit as centipercent u32 (×100, rounded) so the
+                // macroblock body is bit-identical across nodes — no f64 in the consensus hash.
+                let rep = reputation_map.get(node_id).copied()
+                    .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION);
                 qnet_state::EligibleProducer {
                     node_id: node_id.clone(),
-                    reputation,
+                    reputation: (rep.clamp(0.0, 100.0) * 100.0).round() as u32,
                 }
             })
-            .filter(|p| p.reputation >= MIN_REPUTATION)
+            .filter(|p| p.reputation >= MIN_REPUTATION_BP)
             .collect();
 
         // Break the closed consensus loop. eligible_producers =
@@ -3915,9 +3918,10 @@ impl BlockchainNode {
                                 continue;
                             }
 
-                            let reputation = reputation_map.get(node_id).copied()
-                                .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION / 100.0);
-                            if reputation < MIN_REPUTATION {
+                            let reputation = (reputation_map.get(node_id).copied()
+                                .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION)
+                                .clamp(0.0, 100.0) * 100.0).round() as u32;
+                            if reputation < MIN_REPUTATION_BP {
                                 continue;
                             }
 
@@ -3993,8 +3997,9 @@ impl BlockchainNode {
                                     }
 
                                     let reputation = reputation_map.get(&p.node_id).copied()
+                                        .map(|r| (r.clamp(0.0, 100.0) * 100.0).round() as u32)
                                         .unwrap_or(p.reputation);
-                                    if reputation >= MIN_REPUTATION {
+                                    if reputation >= MIN_REPUTATION_BP {
                                         eligible.push(qnet_state::EligibleProducer {
                                             node_id: p.node_id.clone(),
                                             reputation,
@@ -4101,11 +4106,10 @@ impl BlockchainNode {
                 })
                 .collect();
 
-            // DETERMINISM: Use total_cmp instead of partial_cmp to prevent NaN poisoning
-            // total_cmp provides a total ordering (NaN sorts consistently) ensuring
-            // identical validator sets across all nodes regardless of platform
+            // DETERMINISM: reputation is u32 (centipercent) — a total order with no NaN, so
+            // the sorted validator set is identical across all nodes regardless of platform.
             eligible.sort_by(|a, b| {
-                b.reputation.total_cmp(&a.reputation)
+                b.reputation.cmp(&a.reputation)
                     .then_with(|| {
                         let ha = &vrf_scores[&a.node_id];
                         let hb = &vrf_scores[&b.node_id];
@@ -13762,15 +13766,11 @@ impl BlockchainNode {
                 return Err(format!("[ERR][MB] v2_qc_unbound h={}", macroblock.height));
             }
             let committee: Vec<String> = macroblock.consensus_data.consensus_committee.clone().unwrap_or_default();
-            // C: the published validator set must match the QC-certified epoch commitment.
-            // Staged: warn-only unless QNET_BFT2_ENFORCE_EPOCH=1 (avoids a determinism bug
-            // breaking sync before it's confirmed clean on a live run).
+            // C: the published validator set must match the QC-certified epoch commitment —
+            // reject a forged set (fail-stop; consensus state is integer, divergence = bug to halt on).
             let elig = macroblock.consensus_data.eligible_producers.as_deref().unwrap_or(&[]);
             if qnet_consensus::checkpoint_bft::epoch_commitment(elig, &committee) != cp.epoch_commitment {
-                println!("[WARN][MB] v2_epoch_mismatch h={} (staged)", macroblock.height);
-                if crate::consensus_v2_node::enforce_epoch() {
-                    return Err(format!("[ERR][MB] v2_epoch_uncertified h={}", macroblock.height));
-                }
+                return Err(format!("[ERR][MB] v2_epoch_uncertified h={}", macroblock.height));
             }
             let min_q = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
             let cset: std::collections::HashSet<&String> = committee.iter().collect();
@@ -17276,6 +17276,21 @@ impl BlockchainNode {
                         };
                         update_failover_metrics(local_delay, current_rotation_round);
 
+                        // Bound the failover round. >MAX consecutive elected producers failing
+                        // to produce in one window is not producer liveness (random VRF placement
+                        // makes 50 consecutive faults impossible) — it's a sync/partition issue.
+                        // Stop climbing the round (runaway: forensic cert_round=3663) and drive
+                        // the chronic-stall recovery path instead. Fixed cap → uniform across nodes.
+                        const MAX_FAILOVER_ROUND: u64 = 50;
+                        let failover_capped = current_rotation_round >= MAX_FAILOVER_ROUND;
+                        if failover_capped {
+                            if is_warn() {
+                                println!("[WARN][TIMEOUT] failover_round_capped round={} cap={} mb={} action=recovery_sync",
+                                         current_rotation_round, MAX_FAILOVER_ROUND, next_height / 90);
+                            }
+                            CHRONIC_STALL_REQUESTED.store(true, Ordering::Relaxed);
+                        }
+
                         // v23: on slot-leader silent > grace (local_delay > STALL_GRACE_SECS)
                         // emit a Dilithium3-signed TimeoutVote for the current macroblock at
                         // round=certified+1. After 2f+1 co-sign the same round the receiver
@@ -17301,7 +17316,7 @@ impl BlockchainNode {
                         // 1 msg/s from leader only, identical 5→100k.
                         const HEARTBEAT_SILENT_MS: u64 = 3_000;
 
-                        if local_delay > STALL_GRACE_SECS && production_unlocked {
+                        if local_delay > STALL_GRACE_SECS && production_unlocked && !failover_capped {
                             let mb_idx = next_height / 90;
                             let now_u64 = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -18293,7 +18308,18 @@ impl BlockchainNode {
 
                 // CRITICAL: Synchronization check before participating in consensus
                 let local_stored_height = storage.get_chain_height().unwrap_or(0);
-                
+
+                // Anchor production to the APPLIED tip. A working counter advanced ahead by
+                // gossip/scan (stored-but-unapplied, or a stale peer height claim) targets a
+                // block we cannot chain → self_exclude → failover runaway. Real gaps close via
+                // the sync path below; the pre-save precheck guards against duplicate produce.
+                if microblock_height > local_stored_height {
+                    if is_warn() {
+                        println!("[WARN][PROD] height_reanchor working={} applied={}", microblock_height, local_stored_height);
+                    }
+                    microblock_height = local_stored_height;
+                }
+
                 // FIX v2.28: Get expected height from NETWORK, not local variable!
                 // This prevents node from thinking it's synchronized when it's actually behind
                 let expected_height = if let Some(ref p2p) = unified_p2p {
@@ -18543,14 +18569,14 @@ impl BlockchainNode {
                     }
                 }
 
-                // v9.8: Production gate — don't produce if too far ahead of last finalized.
-                // Without this, producer advances height indefinitely without BFT confirmation,
-                // diverging from network. MAX_UNFINALIZED = 90 (one full epoch) — generous
-                // enough for normal BFT delays, but prevents runaway divergence.
+                // v9.8: Production gate — don't produce too far ahead of last finalized, else the
+                // producer diverges from BFT without confirmation. v2 2-chain finality trails the tip by
+                // ~1 in-progress window + 1 commit-lag window (~180); +270 (3 windows) absorbs one
+                // skipped/slow checkpoint round plus gossip propagation without throttling steady state.
                 {
-                    const MAX_UNFINALIZED_BLOCKS: u64 = 90;
+                    const MAX_UNFINALIZED_BLOCKS: u64 = 270;
                     let last_finalized = LAST_FINALIZED_CONSENSUS_ROUND.load(Ordering::SeqCst);
-                    if last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS + 90 {
+                    if last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS {
                         if is_info() {
                             println!("[WARN][PROD] production_gate: height={} finalized={} gap={} — waiting for BFT",
                                      next_block_height, last_finalized, next_block_height - last_finalized);
@@ -24287,7 +24313,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         let mut all_qualified: Vec<(String, f64)> = producers.iter()
                                             .filter(|p| !excluded_node_ids.contains(&p.node_id))
                                             .filter(|p| !crate::unified_p2p::is_validator_ejected(&p.node_id))
-                                            .map(|p| (p.node_id.clone(), p.reputation))
+                                            .map(|p| (p.node_id.clone(), p.reputation as f64 / 100.0))
                                             .collect();
 
                                         all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
@@ -24433,7 +24459,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     if let Ok(prods) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snap) {
                                         let mut fb: Vec<(String, f64)> = prods.iter()
                                             .filter(|p| !crate::unified_p2p::is_validator_ejected(&p.node_id))
-                                            .map(|p| (p.node_id.clone(), p.reputation))
+                                            .map(|p| (p.node_id.clone(), p.reputation as f64 / 100.0))
                                             .collect();
                                         if !fb.is_empty() {
                                             fb.sort_by(|a, b| a.0.cmp(&b.0));
@@ -28708,10 +28734,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let elig = macroblock.consensus_data.eligible_producers.as_deref().unwrap_or(&[]);
             let cmt = macroblock.consensus_data.consensus_committee.clone().unwrap_or_default();
             if qnet_consensus::checkpoint_bft::epoch_commitment(elig, &cmt) != cp.epoch_commitment {
-                if is_warn() { println!("[WARN][MB] v2_epoch_mismatch mb={} (staged)", index); }
-                if crate::consensus_v2_node::enforce_epoch() {
-                    return Err(QNetError::ValidationError(format!("v2_epoch_uncertified mb={}", index)));
-                }
+                return Err(QNetError::ValidationError(format!("v2_epoch_uncertified mb={}", index)));
             }
             if is_info() {
                 println!("[INFO][MB] v2_qc_ok mb={} signers={} committee={}", index, qc.signers.len(), committee.len());
