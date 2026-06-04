@@ -18807,85 +18807,22 @@ impl BlockchainNode {
                 let timeout_round: u64 =
                     crate::unified_p2p::get_certified_rotation_round(mb_idx);
 
-                // ═══════════════════════════════════════════════════════════════
-                // v23.1: STICKY LEADER WITHIN VIEW (no leader thrash)
-                // ═══════════════════════════════════════════════════════════════
-                // Compute the canonical `leadership_round` (30-block view
-                // window) and resolve the current producer through the
-                // sticky-leader cache.
-                //
-                //   * If a sticky leader exists for this view AND its locked
-                //     round is ≥ current certified round → use sticky leader
-                //     (the failed primary is NOT consulted again within view).
-                //   * If certified has advanced beyond the sticky's round
-                //     (the sticky also failed and 2f+1 re-voted) → invalidate
-                //     and re-derive from scratch at the new certified round.
-                //   * If no sticky exists yet → compute from
-                //     `select_microblock_producer_with_round` and, when the
-                //     selection is a fallback (`timeout_round > 0`), lock it
-                //     into the sticky cache for the rest of the view.
-                //
-                // See module-level v23.1 STICKY LEADER PER LEADERSHIP-ROUND
-                // VIEW block for safety + scalability rationale.
-                // ═══════════════════════════════════════════════════════════════
-                let leadership_round_view: u64 = if next_block_height == 0 {
-                    0
-                } else if next_block_height <= ROTATION_INTERVAL_BLOCKS {
-                    0
-                } else {
-                    (next_block_height - 1) / ROTATION_INTERVAL_BLOCKS
-                };
-
-                let sticky_hit: Option<(String, u64)> = STICKY_LEADER_PER_VIEW
-                    .get(&leadership_round_view)
-                    .map(|e| e.value().clone());
-
-                let current_producer = match sticky_hit {
-                    Some((sticky_id, sticky_round)) if sticky_round >= timeout_round => {
-                        // Sticky leader is current or future — honor lock.
-                        if is_info() && next_block_height % ROTATION_INTERVAL_BLOCKS == 1 {
-                            println!(
-                                "[INFO][ROTATION] sticky_leader h={} view={} producer={} locked_round={} cert_round={}",
-                                next_block_height, leadership_round_view,
-                                sticky_id, sticky_round, timeout_round,
-                            );
-                        }
-                        sticky_id
-                    }
-                    _ => {
-                        // No sticky OR certified advanced past sticky → fresh
-                        // VRF-deterministic resolution at current certified.
-                        let fresh = Self::select_microblock_producer_with_round(
-                            next_block_height,
-                            &unified_p2p,
-                            &node_id,
-                            node_type,
-                            Some(&storage),
-                            &poh,
-                            timeout_round,
-                        ).await;
-                        // Lock fallback selections (round > 0) into the view's
-                        // sticky cache. Round-0 (primary) is the natural
-                        // starting point of every view — no lock needed; if
-                        // primary succeeds the view runs normally; if it
-                        // fails, the next iteration will rotate and lock the
-                        // chosen fallback.
-                        if timeout_round > 0 && !fresh.is_empty() {
-                            STICKY_LEADER_PER_VIEW.insert(
-                                leadership_round_view,
-                                (fresh.clone(), timeout_round),
-                            );
-                            if is_info() {
-                                println!(
-                                    "[INFO][ROTATION] sticky_lock h={} view={} producer={} round={} reason=fallback_elected",
-                                    next_block_height, leadership_round_view,
-                                    fresh, timeout_round,
-                                );
-                            }
-                        }
-                        fresh
-                    }
-                };
+                // Producer = PURE function of the 2f+1-certified round (candidates+base from
+                // macroblock N-2, round from get_certified_rotation_round) → identical on every
+                // node once the round cert propagates. NO node-local sticky lock: it pinned a
+                // timing-dependent leader (whoever a node first saw on failover entry) that
+                // diverged across nodes at the SAME round → Category-B producer_unauthorised_reject
+                // storm → window divergence → macroblock finality stall. Transient round-lag is
+                // resolved by the certified-round fork-choice on ingest, not by local state.
+                let current_producer = Self::select_microblock_producer_with_round(
+                    next_block_height,
+                    &unified_p2p,
+                    &node_id,
+                    node_type,
+                    Some(&storage),
+                    &poh,
+                    timeout_round,
+                ).await;
 
                 if is_info() && timeout_round > 0 {
                     println!(
