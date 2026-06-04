@@ -69,6 +69,7 @@ const RESERVED_PROTOCOL_IDENTIFIERS: &[&str] = &[
     "system_emission",
     "system_rewards_pool",
     "system_ping_commitment",
+    "system_slashing", // EquivocationProof sender — block-construction only, never gossiped
 ];
 
 /// Validate whether the `tx.from` value matches one of the three accepted
@@ -242,6 +243,21 @@ pub mod gas_limits {
 /// Transaction hash type
 pub type TxHash = String;
 
+/// One side of an equivocation proof: the per-block signable header fields of a
+/// microblock (height + producer are shared across both sides, kept on the TX).
+/// Carries enough to reconstruct the exact `Block_Sig_v23.1` signing digest and
+/// re-verify the producer's Dilithium3 signature on-chain — no trust in the reporter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EquivocationHeader {
+    pub timestamp: u64,
+    pub merkle_root: [u8; 32],
+    pub previous_hash: [u8; 32],
+    pub state_root: [u8; 32],
+    pub vrf_output: Option<[u8; 32]>,
+    pub timeout_round: u64,
+    pub signature: Vec<u8>,
+}
+
 /// Transaction types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TransactionType {
@@ -251,7 +267,41 @@ pub enum TransactionType {
         to: String,
         amount: u64,
     },
-    
+
+    /// Cryptographic proof that `offender` signed two DIFFERENT microblocks at the
+    /// same `height` — provable equivocation. Both `EquivocationHeader.signature`s are
+    /// the offender's Dilithium3 sigs over the `Block_Sig_v23.1` digest of their fields;
+    /// unforgeable. Verified on-chain against the offender's registry PK and applied
+    /// deterministically in the reputation fold (offender → reputation 0 + ban). No
+    /// balance effect. Fail-safe: an invalid/forged proof simply fails verification.
+    EquivocationProof {
+        offender: String,
+        height: u64,
+        block_a: EquivocationHeader,
+        block_b: EquivocationHeader,
+    },
+
+    /// Cryptographic proof that `offender` signed two DIFFERENT checkpoint votes at the SAME
+    /// consensus round `index` — provable BFT vote equivocation (accountable safety: a
+    /// committee member double-voting is what an attacker would do to violate finality
+    /// safety). Both signatures are the offender's consensus-key sigs over the canonical
+    /// `QNET_BFT2_VOTE:<hex(checkpoint_hash)>` message; unforgeable. Verified on-chain against
+    /// the offender's registry PK and applied in the reputation fold (offender → ban). No
+    /// balance effect. Fail-safe: an invalid/forged proof simply fails verification.
+    VoteEquivocationProof {
+        offender: String,
+        /// bincode of BOTH conflicting checkpoints (qnet_consensus Checkpoint). SOUNDNESS:
+        /// the vote signature covers ONLY the checkpoint hash, NOT the round, so the full
+        /// preimages are REQUIRED — the fold re-derives each hash and reads each round `index`,
+        /// then bans ONLY if `index_a == index_b` (a same-round double-vote) and the hashes
+        /// differ and both sigs verify. Carrying only hashes would let a forger pair two honest
+        /// votes from DIFFERENT rounds and falsely slash an honest node.
+        checkpoint_a: Vec<u8>,
+        signature_a: Vec<u8>,
+        checkpoint_b: Vec<u8>,
+        signature_b: Vec<u8>,
+    },
+
     /// Token swap via DEX smart contract
     /// Fee: standard gas fee goes directly to block producer (v3.18: Pool 2 removed)
     Swap {
@@ -810,6 +860,8 @@ impl Transaction {
                 | TransactionType::LightNodeEligibilityBitmap { .. }
                 | TransactionType::RewardDistribution
                 | TransactionType::KeyRotation { .. }
+                | TransactionType::EquivocationProof { .. }
+                | TransactionType::VoteEquivocationProof { .. }
         )
     }
 
@@ -936,6 +988,9 @@ impl Transaction {
             // gas costs to deter quantum-readiness adoption. Rate-limited via
             // per-account nonce monotonicity (one upgrade per account, ever).
             TransactionType::SetPQRequirement {} => 0,
+            // Equivocation slashing proofs: system TX, free (no gas, no balance effect).
+            TransactionType::EquivocationProof { .. } => 0,
+            TransactionType::VoteEquivocationProof { .. } => 0,
         }
     }
 
@@ -1520,6 +1575,35 @@ impl Transaction {
                 // Validation of dual-signature presence happens in apply_to_state
                 // because it inspects fields on the parent Transaction struct.
                 // Empty sender is already caught at the top of `validate()`.
+            }
+            TransactionType::EquivocationProof { offender, block_a, block_b, .. } => {
+                // Structural check only — the cryptographic verification (Dilithium3 over
+                // the Block_Sig_v23.1 digest against the offender's registry PK) runs at the
+                // integration layer, which holds the consensus PK registry.
+                if offender.is_empty() {
+                    return Err("[REJECT][TX] equivocation_proof empty_offender".to_string());
+                }
+                if block_a == block_b {
+                    return Err("[REJECT][TX] equivocation_proof identical_blocks".to_string());
+                }
+                if block_a.signature.is_empty() || block_b.signature.is_empty() {
+                    return Err("[REJECT][TX] equivocation_proof missing_signature".to_string());
+                }
+            }
+            TransactionType::VoteEquivocationProof { offender, checkpoint_a, signature_a, checkpoint_b, signature_b } => {
+                // Structural check only — the cryptographic + same-round verification (deserialize
+                // both checkpoints, index_a == index_b, hashes differ, both consensus-key sigs over
+                // QNET_BFT2_VOTE:<hex(hash)> valid vs the offender's registry PK) runs at the
+                // integration layer, which holds the consensus PK registry + the Checkpoint type.
+                if offender.is_empty() {
+                    return Err("[REJECT][TX] vote_equivocation_proof empty_offender".to_string());
+                }
+                if checkpoint_a == checkpoint_b {
+                    return Err("[REJECT][TX] vote_equivocation_proof identical_checkpoints".to_string());
+                }
+                if signature_a.is_empty() || signature_b.is_empty() {
+                    return Err("[REJECT][TX] vote_equivocation_proof missing_signature".to_string());
+                }
             }
         }
 
@@ -2713,11 +2797,16 @@ impl Transaction {
                     }
                 }
             }
+            // Equivocation slashing proofs: no account-state effect. The penalty
+            // (offender → reputation 0 + ban) is applied deterministically in the
+            // reputation fold from the committed proof, not in account state.
+            TransactionType::EquivocationProof { .. } => {}
+            TransactionType::VoteEquivocationProof { .. } => {}
         }
 
         Ok(())
     }
-    
+
     /// Check if transaction qualifies for instant local finalization
     pub fn can_be_locally_finalized(&self, config: &LocalFinalizationConfig) -> bool {
         // Small amount transactions get instant finalization

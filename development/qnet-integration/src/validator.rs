@@ -561,6 +561,28 @@ impl BlockValidator {
                 // Reward distribution validation - only system can do this
                 // In production, would check system permissions
             }
+            TransactionType::EquivocationProof { offender, block_a, block_b, .. } => {
+                // Structural check only; the cryptographic proof (offender's two Dilithium3
+                // sigs over conflicting headers) is verified in the reputation fold /
+                // mempool admission, which hold the consensus PK registry.
+                if offender.is_empty() {
+                    return Err(IntegrationError::ValidationError("Equivocation proof: empty offender".to_string()));
+                }
+                if block_a == block_b {
+                    return Err(IntegrationError::ValidationError("Equivocation proof: identical blocks".to_string()));
+                }
+            }
+            TransactionType::VoteEquivocationProof { offender, checkpoint_a, checkpoint_b, .. } => {
+                // Structural check only; the cryptographic + same-round proof (offender's two
+                // consensus-key sigs over conflicting same-round checkpoints) is verified in the
+                // reputation fold, which holds the consensus PK registry + Checkpoint type.
+                if offender.is_empty() {
+                    return Err(IntegrationError::ValidationError("Vote equivocation proof: empty offender".to_string()));
+                }
+                if checkpoint_a == checkpoint_b {
+                    return Err(IntegrationError::ValidationError("Vote equivocation proof: identical checkpoints".to_string()));
+                }
+            }
             TransactionType::BatchRewardClaims { node_ids, .. } => {
                 if node_ids.is_empty() {
                     return Err(IntegrationError::ValidationError("Batch reward claims must have at least one node".to_string()));

@@ -154,7 +154,20 @@ pub struct ConsensusData {
     /// Format: bincode serialized Vec<SlashingEventData>
     #[serde(default)]
     pub slashing_events_data: Option<Vec<u8>>,
-    
+
+    /// v2 SCALE ANCHOR: cumulative equivocation ban-set as of THIS macroblock.
+    /// Format: bincode serialized Vec<String> (sorted node_ids).
+    ///
+    /// Lets the next epoch's reputation fold derive the ban-set in O(window) — prev
+    /// macroblock's set ∪ this window's verified proofs — instead of re-scanning every
+    /// microblock from genesis (pruning-safe; scales to 100k+ nodes). NOT included in
+    /// MacroBlock::hash(): each node self-computes it deterministically, and the ban
+    /// EFFECT is independently re-verified every epoch via epoch_commitment (eligible
+    /// excludes banned), so a stale/forged copy self-heals through content_ok fail-stop
+    /// instead of forking the chain.
+    #[serde(default)]
+    pub banned_validators: Option<Vec<u8>>,
+
     /// Serialized automatic jails (computed deterministically)
     /// Format: bincode serialized Vec<AutomaticJailData>
     #[serde(default)]

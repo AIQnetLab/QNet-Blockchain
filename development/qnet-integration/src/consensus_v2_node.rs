@@ -174,6 +174,19 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                         .and_then(|m| bincode::serialize(&m).ok());
                     (hb, lt)
                 } else { (None, None) };
+                // v2 SCALE ANCHOR: cumulative equivocation ban-set as of this window (prev
+                // macroblock's set ∪ this window's verified proofs), sorted for byte-stable
+                // bincode. Lets the next epoch's reputation fold derive bans in O(window)
+                // instead of re-scanning from genesis (pruning-safe, scales to 100k). Pure
+                // function of the committed chain ⇒ every sealer produces the same bytes.
+                let banned_validators = {
+                    let mut v: Vec<String> =
+                        crate::node::BlockchainNode::compute_cumulative_ban_set(&storage, window)
+                            .await
+                            .into_iter().collect();
+                    v.sort();
+                    Some(bincode::serialize(&v).unwrap_or_default())
+                };
                 let mb = qnet_state::MacroBlock {
                     height: window,
                     timestamp: checkpoint.timestamp,
@@ -185,6 +198,7 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                         randomness_beacon: Some(checkpoint.beacon),
                         excluded_producers_for_next_epoch: excluded,
                         consensus_committee: Some(committee),
+                        banned_validators,
                         reward_heartbeats,
                         reward_light_nodes,
                         ..Default::default()
@@ -394,6 +408,18 @@ pub async fn run(
                                 // epoch_commitment (eligible+committee). Honest 2f+1 reject any forged
                                 // checkpoint ⇒ a malicious leader cannot finalize fake state. No local
                                 // content ⇒ can't check here (re-verified on macroblock sync).
+                                // ACCOUNTABLE SAFETY (pure side effect — never alters handling below):
+                                // cache authentic checkpoints + detect a committee member signing two
+                                // DIFFERENT checkpoints at the SAME round → records sound on-chain
+                                // vote-equivocation evidence (drained into a VoteEquivocationProof TX,
+                                // verified + banned in the deterministic reputation fold).
+                                match &msg {
+                                    ConsensusMsg::Proposal(cp) => crate::node::observe_checkpoint_proposal(
+                                        cp.index, cp.hash(), bincode::serialize(cp).unwrap_or_default()),
+                                    ConsensusMsg::Vote(v) => crate::node::observe_checkpoint_vote(
+                                        v.index, &v.voter, v.checkpoint_hash, v.signature.clone()),
+                                    _ => {}
+                                }
                                 let content_ok = match &msg {
                                     ConsensusMsg::Proposal(cp) => window_buf.get(&(cp.window_head_height / 90))
                                         .map(|c| cp.state_root == c.state_root

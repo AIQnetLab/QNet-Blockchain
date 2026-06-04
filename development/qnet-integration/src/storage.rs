@@ -3686,24 +3686,12 @@ impl Storage {
                     return Ok(());
                 }
                 Some(new_hash) => {
-                    // EQUIVOCATION — different block at the same height. Record
-                    // unforgeable evidence for the slashing pipeline and reject.
+                    // EQUIVOCATION — different block at the same height. Capture unforgeable
+                    // proof headers from BOTH blocks (the incoming one is rejected here and
+                    // never reaches storage) for the on-chain slashing TX, then reject.
                     let new_producer = incoming_block.as_ref()
                         .map(|mb| mb.producer.clone())
                         .unwrap_or_else(|| "unknown".to_string());
-                    let new_signature = incoming_block.as_ref()
-                        .map(|mb| mb.signature.clone())
-                        .unwrap_or_default();
-
-                    // Recover existing block's signature for the slashing proof.
-                    // Best-effort: if the existing block can't be re-loaded, we
-                    // still record what we have (incoming side fully proven).
-                    let existing_signature: Vec<u8> = self.load_microblock(height)
-                        .ok()
-                        .flatten()
-                        .and_then(|raw| bincode::deserialize::<qnet_state::MicroBlock>(&raw).ok())
-                        .map(|mb| mb.signature)
-                        .unwrap_or_default();
 
                     if crate::node::is_warn() {
                         println!(
@@ -3714,14 +3702,35 @@ impl Storage {
                             new_producer,
                         );
                     }
-                    crate::node::record_block_equivocation(
-                        height,
-                        &new_producer,
-                        existing_hash,
-                        new_hash,
-                        existing_signature,
-                        new_signature,
-                    );
+
+                    // Record only when BOTH full blocks are in hand (they are at L4 — incoming
+                    // in hand, existing re-loaded). The proof is self-validating (offender's sigs).
+                    let existing_mb = self.load_microblock(height).ok().flatten()
+                        .and_then(|raw| bincode::deserialize::<qnet_state::MicroBlock>(&raw).ok());
+                    if let (Some(inc), Some(exist)) = (incoming_block.as_ref(), existing_mb.as_ref()) {
+                        // Slashable equivocation requires the SAME producer to have signed BOTH
+                        // blocks. Two DIFFERENT producers at one height is a failover/rotation
+                        // race (honest liveness, resolved by round-based fork-choice) — rejected
+                        // here but NEVER slashed.
+                        if inc.producer == exist.producer {
+                            let to_header = |mb: &qnet_state::MicroBlock| qnet_state::EquivocationHeader {
+                                timestamp: mb.timestamp,
+                                merkle_root: mb.merkle_root,
+                                previous_hash: mb.previous_hash,
+                                state_root: mb.state_root,
+                                vrf_output: mb.vrf_output,
+                                timeout_round: mb.timeout_round,
+                                signature: mb.signature.clone(),
+                            };
+                            crate::node::record_block_equivocation(height, &new_producer, to_header(exist), to_header(inc));
+                        } else if crate::node::is_warn() {
+                            println!(
+                                "[WARN][FORK] same_height_distinct_producers h={} existing={} incoming={} action=reject_no_slash(failover_race)",
+                                height, exist.producer, inc.producer,
+                            );
+                        }
+                    }
+
                     return Err(IntegrationError::StorageError(format!(
                         "fork_conflict h={} existing_hash={:x?} new_hash={:x?} producer={}",
                         height,

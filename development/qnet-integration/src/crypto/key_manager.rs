@@ -45,6 +45,15 @@ fn keypair_init_locks() -> &'static DashMap<PathBuf, Arc<Mutex<()>>> {
     GLOBAL_KEYPAIR_INIT_LOCKS.get_or_init(DashMap::new)
 }
 
+/// Serializes identity/keypair tests across modules. They all mutate process-wide global
+/// state — the keypair cache, the `CACHED_KEY_DIR` OnceLock, and `canonicalize()` over
+/// transient `tempdir()`s — which races under parallel `cargo test` (one test's temp dir
+/// is cleaned while another canonicalizes the cached path → key mismatch → spurious
+/// `identity_not_installed`). Production installs identity once at boot, so this guard is
+/// strictly test-only. Poison-tolerant: a panicking test must not wedge the rest.
+#[cfg(test)]
+pub(crate) static IDENTITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Compute the canonical cache key for a given key directory.
 /// Uses canonicalized parent dir to ensure two managers pointing to the same on-disk
 /// file (even via different relative paths) share the same global cache entry.
@@ -901,6 +910,7 @@ mod tests {
 
     #[test]
     fn test_singleton_same_dir_returns_same_keypair() {
+        let _identity_guard = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("tempdir");
         let key_dir = temp.path().join("keys_singleton_a");
 
@@ -940,6 +950,7 @@ mod tests {
     /// producing two different on-disk and in-memory identities.
     #[test]
     fn test_singleton_concurrent_init_no_divergence() {
+        let _identity_guard = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::thread;
         use std::sync::Arc as StdArc;
         use std::sync::Barrier;
@@ -998,6 +1009,7 @@ mod tests {
     /// paths (e.g., trailing slash, current-dir prefix) still share state.
     #[test]
     fn test_singleton_canonical_path_keying() {
+        let _identity_guard = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("tempdir");
         let key_dir = temp.path().join("keys_canon_c");
         fs::create_dir_all(&key_dir).expect("mkdir");
@@ -1024,6 +1036,7 @@ mod tests {
     /// accidental cross-contamination via the global cache).
     #[test]
     fn test_singleton_distinct_dirs_distinct_keypairs() {
+        let _identity_guard = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("tempdir");
         let dir_a = temp.path().join("keys_distinct_a_d");
         let dir_b = temp.path().join("keys_distinct_b_d");

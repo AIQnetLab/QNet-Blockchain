@@ -1637,6 +1637,10 @@ pub struct BlockEquivocationEvidence {
     pub sig_a: Vec<u8>,
     pub sig_b: Vec<u8>,
     pub detected_ts: u64,
+    // Full signable headers of both conflicting blocks — used to build the on-chain
+    // EquivocationProof TX (the rejected block is not in storage, so it is captured here).
+    pub header_a: qnet_state::EquivocationHeader,
+    pub header_b: qnet_state::EquivocationHeader,
 }
 
 pub static BLOCK_EQUIVOCATION_EVIDENCE: once_cell::sync::Lazy<DashMap<(u64, String), BlockEquivocationEvidence>> =
@@ -1654,14 +1658,27 @@ pub static BLOCK_EQUIVOCATION_EVIDENCE: once_cell::sync::Lazy<DashMap<(u64, Stri
 pub fn record_block_equivocation(
     height: u64,
     producer_id: &str,
-    hash_a: [u8; 32],
-    hash_b: [u8; 32],
-    sig_a: Vec<u8>,
-    sig_b: Vec<u8>,
+    header_a: qnet_state::EquivocationHeader,
+    header_b: qnet_state::EquivocationHeader,
 ) {
+    // MicroBlock::hash() format (height, ts, prev, merkle, producer, round) — for the
+    // legacy macroblock-slashing drain and as the equivocation key.
+    let block_hash = |h: &qnet_state::EquivocationHeader| -> [u8; 32] {
+        let mut hasher = Sha3_256::new();
+        hasher.update(&height.to_le_bytes());
+        hasher.update(&h.timestamp.to_le_bytes());
+        hasher.update(&h.previous_hash);
+        hasher.update(&h.merkle_root);
+        hasher.update(producer_id.as_bytes());
+        hasher.update(&h.timeout_round.to_le_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hasher.finalize());
+        out
+    };
+    let hash_a = block_hash(&header_a);
+    let hash_b = block_hash(&header_b);
     if hash_a == hash_b {
-        // Same hash — not equivocation, ignore.
-        return;
+        return; // Same block — not equivocation.
     }
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1669,24 +1686,242 @@ pub fn record_block_equivocation(
         .unwrap_or(0);
     let key = (height, producer_id.to_string());
     let already_recorded = BLOCK_EQUIVOCATION_EVIDENCE.contains_key(&key);
+    let sig_a = header_a.signature.clone();
+    let sig_b = header_b.signature.clone();
     BLOCK_EQUIVOCATION_EVIDENCE.entry(key)
         .or_insert(BlockEquivocationEvidence {
-            hash_a,
-            hash_b,
-            sig_a,
-            sig_b,
-            detected_ts: now_ts,
+            hash_a, hash_b, sig_a, sig_b, detected_ts: now_ts, header_a, header_b,
         });
     if !already_recorded && is_warn() {
-        println!(
-            "[WARN][SLASH] block_equivocation_recorded h={} producer={} hash_a={:x?} hash_b={:x?} ts={}",
-            height,
-            producer_id,
-            &hash_a[..8],
-            &hash_b[..8],
-            now_ts,
-        );
+        println!("[WARN][SLASH] block_equivocation_recorded h={} producer={} ts={}",
+                 height, producer_id, now_ts);
     }
+}
+
+/// Drains pending block-equivocation evidence into canonical `EquivocationProof`
+/// system TXs for the block this node is producing. BLOCK-LEVEL ONLY — never
+/// gossiped, exactly like emission: the proof rides inside a producer-signed
+/// block, applies as a no-op to state, and is re-verified cryptographically in
+/// the deterministic reputation fold (a forged/invalid proof fails there → no
+/// false ban). Returns `(tx_hash, bincode_bytes)` pairs; drained entries are
+/// removed (drain-once — multiple detectors give inclusion redundancy without
+/// re-spamming the chain).
+///
+/// Canonical construction (identical on every detector, so the chain dedups
+/// naturally and the fold is order-free): headers are ordered so the smaller
+/// block-hash is `block_a`, `from = "system_slashing"`, `timestamp` taken from
+/// the ordered `block_a` (NO wall-clock — keeps the TX hash reproducible).
+/// `max` caps the per-block drain so an evidence burst can't blow the 1-sec
+/// production deadline; the remainder is picked up by the next block produced.
+pub fn drain_equivocation_proof_txs(max: usize) -> Vec<(String, Vec<u8>)> {
+    if BLOCK_EQUIVOCATION_EVIDENCE.is_empty() {
+        return Vec::new();
+    }
+    let keys: Vec<(u64, String)> = BLOCK_EQUIVOCATION_EVIDENCE
+        .iter()
+        .take(max)
+        .map(|e| e.key().clone())
+        .collect();
+    let mut out: Vec<(String, Vec<u8>)> = Vec::with_capacity(keys.len());
+    for key in keys {
+        let ev = match BLOCK_EQUIVOCATION_EVIDENCE.get(&key) {
+            Some(v) => v.clone(),
+            None => continue,
+        };
+        let (height, offender) = (key.0, key.1.clone());
+        // Canonical header order — smaller block-hash is block_a (detection-order-free).
+        let (block_a, block_b) = if ev.hash_a <= ev.hash_b {
+            (ev.header_a.clone(), ev.header_b.clone())
+        } else {
+            (ev.header_b.clone(), ev.header_a.clone())
+        };
+        let mut tx = qnet_state::Transaction {
+            hash: String::new(),
+            from: "system_slashing".to_string(),
+            to: None,
+            amount: 0,
+            nonce: 0,
+            gas_price: 0,
+            gas_limit: 0,
+            timestamp: block_a.timestamp, // deterministic (no SystemTime)
+            signature: None,
+            public_key: None,
+            tx_type: qnet_state::TransactionType::EquivocationProof {
+                offender: offender.clone(),
+                height,
+                block_a,
+                block_b,
+            },
+            data: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        match bincode::serialize(&tx) {
+            Ok(bytes) => {
+                let tx_hash = tx.hash.clone();
+                BLOCK_EQUIVOCATION_EVIDENCE.remove(&key);
+                if is_warn() {
+                    println!(
+                        "[WARN][SLASH] equivocation_proof_tx_built offender={} h={} tx={}",
+                        offender, height, &tx_hash[..16.min(tx_hash.len())],
+                    );
+                }
+                out.push((tx_hash, bytes));
+            }
+            Err(e) => {
+                if is_warn() {
+                    println!("[WARN][SLASH] equivocation_proof_serialize_fail h={} err={}", height, e);
+                }
+            }
+        }
+    }
+    out
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHECKPOINT-VOTE EQUIVOCATION (accountable safety) — a committee member signing two
+// DIFFERENT checkpoints at the SAME consensus round. Mirrors block equivocation but for
+// BFT votes. Detection is purely OBSERVATIONAL on the inbound consensus path (never alters
+// vote handling / QC formation). The proof carries BOTH full checkpoint preimages because a
+// vote signature covers only the checkpoint hash — the round must be proven from the
+// checkpoint content (its hash includes the index), else two honest votes from different
+// rounds could be falsely paired into a forged "equivocation".
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Recorded vote-equivocation offence: both full conflicting checkpoints (bincode) + the
+/// offender's two consensus-key signatures. Self-validating in the fold.
+#[derive(Debug, Clone)]
+pub struct VoteEquivocationEvidence {
+    pub checkpoint_a: Vec<u8>,
+    pub sig_a: Vec<u8>,
+    pub checkpoint_b: Vec<u8>,
+    pub sig_b: Vec<u8>,
+    pub detected_ts: u64,
+}
+
+/// (round index, voter) → recorded offence. Drained into VoteEquivocationProof TXs and removed.
+pub static VOTE_EQUIVOCATION_EVIDENCE: once_cell::sync::Lazy<DashMap<(u64, String), VoteEquivocationEvidence>> =
+    once_cell::sync::Lazy::new(|| DashMap::new());
+
+/// (round index, checkpoint_hash) → bincode of the full Checkpoint proposed at that round —
+/// lets the vote observer recover the preimage for a voted hash to build a SOUND proof.
+static VOTE_PROPOSAL_CACHE: once_cell::sync::Lazy<DashMap<(u64, [u8; 32]), Vec<u8>>> =
+    once_cell::sync::Lazy::new(|| DashMap::new());
+
+/// (round index, voter) → the FIRST (checkpoint_hash, signature) seen from that voter at that
+/// round. A second, DIFFERENT hash at the same (round, voter) is equivocation.
+static VOTE_FIRST_SEEN: once_cell::sync::Lazy<DashMap<(u64, String), ([u8; 32], Vec<u8>)>> =
+    once_cell::sync::Lazy::new(|| DashMap::new());
+
+/// Sliding retention window (rounds) for the vote detection caches — equivocation is detected
+/// within one round, so a tight window bounds memory at any committee size.
+const VOTE_DETECT_WINDOW: u64 = 256;
+
+/// Observe an authentic checkpoint PROPOSAL (call only AFTER its proposer sig verified): cache
+/// its preimage so a later equivocating vote on it can be proven.
+pub fn observe_checkpoint_proposal(index: u64, checkpoint_hash: [u8; 32], checkpoint_bytes: Vec<u8>) {
+    VOTE_PROPOSAL_CACHE.insert((index, checkpoint_hash), checkpoint_bytes);
+}
+
+/// Observe an authentic checkpoint VOTE (call only AFTER verify_msg passed). Detects a same-round
+/// double-vote and records sound evidence. Pure side effect — never influences vote handling.
+/// Idempotent per (round, voter). Records only when BOTH checkpoint preimages are locally known
+/// (best-effort, like the block L4 guard); a missing preimage simply yields no proof here.
+pub fn observe_checkpoint_vote(index: u64, voter: &str, checkpoint_hash: [u8; 32], signature: Vec<u8>) {
+    let key = (index, voter.to_string());
+    if VOTE_EQUIVOCATION_EVIDENCE.contains_key(&key) { return; }
+    let prior = VOTE_FIRST_SEEN.get(&key).map(|e| e.value().clone());
+    match prior {
+        Some((first_hash, first_sig)) => {
+            if first_hash == checkpoint_hash { return; } // same vote re-seen — not equivocation
+            let cp_first = VOTE_PROPOSAL_CACHE.get(&(index, first_hash)).map(|e| e.value().clone());
+            let cp_new = VOTE_PROPOSAL_CACHE.get(&(index, checkpoint_hash)).map(|e| e.value().clone());
+            if let (Some(cp_first), Some(cp_new)) = (cp_first, cp_new) {
+                // Canonical order (smaller hash = a) so every detector builds an identical TX.
+                let (checkpoint_a, sig_a, checkpoint_b, sig_b) = if first_hash <= checkpoint_hash {
+                    (cp_first, first_sig, cp_new, signature)
+                } else {
+                    (cp_new, signature, cp_first, first_sig)
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                VOTE_EQUIVOCATION_EVIDENCE.insert(key, VoteEquivocationEvidence {
+                    checkpoint_a, sig_a, checkpoint_b, sig_b, detected_ts: now,
+                });
+                if is_warn() {
+                    println!("[WARN][SLASH] vote_equivocation_recorded index={} voter={}", index, voter);
+                }
+            }
+        }
+        None => {
+            VOTE_FIRST_SEEN.insert(key, (checkpoint_hash, signature));
+            if index % 64 == 0 && index > VOTE_DETECT_WINDOW {
+                let min_keep = index - VOTE_DETECT_WINDOW;
+                VOTE_FIRST_SEEN.retain(|k, _| k.0 >= min_keep);
+                VOTE_PROPOSAL_CACHE.retain(|k, _| k.0 >= min_keep);
+            }
+        }
+    }
+}
+
+/// Drains pending vote-equivocation evidence into canonical `VoteEquivocationProof` system TXs
+/// for the block this node is producing (block-level, never gossiped — same model as block
+/// equivocation). Deterministic TX bytes (canonical checkpoint order + checkpoint_a.timestamp,
+/// no wall-clock) ⇒ detectors dedup. Returns (tx_hash, bytes); drained entries are removed.
+pub fn drain_vote_equivocation_proof_txs(max: usize) -> Vec<(String, Vec<u8>)> {
+    if VOTE_EQUIVOCATION_EVIDENCE.is_empty() {
+        return Vec::new();
+    }
+    let keys: Vec<(u64, String)> = VOTE_EQUIVOCATION_EVIDENCE.iter().take(max).map(|e| e.key().clone()).collect();
+    let mut out: Vec<(String, Vec<u8>)> = Vec::with_capacity(keys.len());
+    for key in keys {
+        let ev = match VOTE_EQUIVOCATION_EVIDENCE.get(&key) { Some(v) => v.clone(), None => continue };
+        let offender = key.1.clone();
+        // Deterministic timestamp from the canonical first checkpoint (the round-agreed head ts).
+        let ts = bincode::deserialize::<qnet_consensus::checkpoint_bft::Checkpoint>(&ev.checkpoint_a)
+            .map(|c| c.timestamp).unwrap_or(0);
+        let mut tx = qnet_state::Transaction {
+            hash: String::new(),
+            from: "system_slashing".to_string(),
+            to: None,
+            amount: 0,
+            nonce: 0,
+            gas_price: 0,
+            gas_limit: 0,
+            timestamp: ts,
+            signature: None,
+            public_key: None,
+            tx_type: qnet_state::TransactionType::VoteEquivocationProof {
+                offender: offender.clone(),
+                checkpoint_a: ev.checkpoint_a,
+                signature_a: ev.sig_a,
+                checkpoint_b: ev.checkpoint_b,
+                signature_b: ev.sig_b,
+            },
+            data: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        match bincode::serialize(&tx) {
+            Ok(bytes) => {
+                let tx_hash = tx.hash.clone();
+                VOTE_EQUIVOCATION_EVIDENCE.remove(&key);
+                if is_warn() {
+                    println!("[WARN][SLASH] vote_equivocation_proof_tx_built offender={} index={} tx={}",
+                             offender, key.0, &tx_hash[..16.min(tx_hash.len())]);
+                }
+                out.push((tx_hash, bytes));
+            }
+            Err(e) => if is_warn() {
+                println!("[WARN][SLASH] vote_equivocation_serialize_fail index={} err={}", key.0, e);
+            },
+        }
+    }
+    out
 }
 
 /// v15.0: Consensus-stall registry for macroblock boundaries where the
@@ -2613,9 +2848,18 @@ pub struct BlockchainNode {
     // Sender broadcasts new block height to all subscribers
     block_event_tx: tokio::sync::broadcast::Sender<u64>,
     
-    // DETERMINISTIC REPUTATION: Reputation calculated from blockchain data only
-    // Replaces old P2P gossip-based reputation system (eliminated Sybil attacks)
-    // v2.96: Uses parking_lot::RwLock for 2-3x faster access (no poisoning)
+    // DISPLAY / TELEMETRY REPUTATION — NOT the consensus authority.
+    //
+    // COHERENCE (post uniform-VRF selection): consensus eligibility is decided ONLY by the
+    // deterministic chain fold `compute_consensus_reputation_map` ({70 floor | 0 if a verified
+    // equivocation proof is on-chain}) + the macroblock `eligible_producers` snapshot + the
+    // uniform-VRF sortition. Selection no longer ranks by reputation VALUE, so this live engine
+    // does NOT gate consensus and is never read on the eligibility/committee/leader path.
+    //
+    // It is a per-node RAM telemetry view (rotation rewards are self-credited by the producer;
+    // its penalty/jail/participation machinery is currently fed empty data under v2 and is
+    // dormant). Read only by RPC/explorer for an at-a-glance performance number — which is why
+    // it may differ across nodes and MUST NOT be used for any consensus decision.
     deterministic_reputation: Arc<ParkingRwLock<DeterministicReputationState>>,
     
     // v3.35: O(1) node registration cache — replaces O(N) blockchain scan
@@ -2949,9 +3193,11 @@ impl BlockchainNode {
         }
     }
     
-    /// Get deterministic reputation system (blockchain-based)
-    /// SECURITY: Replaces P2P gossip-based reputation (eliminated Sybil attacks)
-    /// v2.96: Uses parking_lot::RwLock for 2-3x faster access
+    /// Get the DISPLAY/TELEMETRY reputation engine — NOT the consensus authority.
+    /// Consensus eligibility is decided by `compute_consensus_reputation_map` + the macroblock
+    /// snapshot + uniform-VRF sortition (see the field doc). Callers here are RPC/explorer only;
+    /// never branch consensus on this value (it is per-node and may differ across the network).
+    /// v2.96: parking_lot::RwLock for fast, poison-free access.
     pub fn get_deterministic_reputation(&self) -> Arc<ParkingRwLock<DeterministicReputationState>> {
         self.deterministic_reputation.clone()
     }
@@ -3464,218 +3710,13 @@ impl BlockchainNode {
         Ok(())
     }
 
-    /// Analyze blockchain for cryptographically provable slashing offenses
-    ///
-    /// Currently detects:
-    /// - Double-sign: Same producer signed 2 different blocks at same height
-    /// - Invalid blocks: Signature or hash validation failures
-    ///
-    /// NOTE: Missed blocks are NOT slashed because:
-    /// - Cannot deterministically prove "who should have produced"
-    /// - Emergency producer overwrites block.producer field
-    /// - Network delays cause false positives
-    ///
-    /// Missed blocks → reputation decay (separate mechanism)
-    #[allow(unused_variables)]
-    async fn analyze_chain_for_slashing(
-        storage: &Arc<Storage>,
-        start_height: u64,
-        end_height: u64,
-        reporter_node_id: &str,
-    ) -> Vec<qnet_consensus::deterministic_reputation::SlashingEvent> {
-        use qnet_consensus::deterministic_reputation::SlashingEvent;
-        use std::collections::HashMap;
-        
-        let mut slashing_events = Vec::new();
-        
-        // Track blocks per height to detect double-signing
-        let mut blocks_at_height: HashMap<u64, Vec<(String, [u8; 32])>> = HashMap::new();
-        
-        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format and Zstd compression
-        for height in start_height..=end_height {
-            if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
-                let mut hasher = Sha3_256::new();
-                hasher.update(&block.signature);
-                let result = hasher.finalize();
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&result);
-                
-                blocks_at_height
-                    .entry(height)
-                    .or_insert_with(Vec::new)
-                    .push((block.producer.clone(), hash));
-            }
-        }
-        
-        // Detect double-signing: same height, same producer, different signatures
-        for (height, blocks) in &blocks_at_height {
-            if blocks.len() > 1 {
-                // Group by producer
-                let mut by_producer: HashMap<String, Vec<[u8; 32]>> = HashMap::new();
-                for (producer, sig_hash) in blocks {
-                    by_producer.entry(producer.clone()).or_insert_with(Vec::new).push(*sig_hash);
-                }
-                
-                // Check for double-signing
-                for (producer, sigs) in by_producer {
-                    if sigs.len() > 1 {
-                        // DOUBLE-SIGN DETECTED!
-                        use qnet_consensus::deterministic_reputation::SlashingType;
-                        
-                        let mut hasher = Sha3_512::new();
-                        hasher.update(producer.as_bytes());
-                        hasher.update(&height.to_le_bytes());
-                        for sig in &sigs {
-                            hasher.update(sig);
-                        }
-                        hasher.update(b"double_sign_proof_v2.38");
-                        let hash_result = hasher.finalize();
-                        let mut evidence_hash = [0u8; 32];
-                        evidence_hash.copy_from_slice(&hash_result[..32]);
-                        
-                        println!("[CRIT][SLASH] DOUBLE-SIGN producer={} h={} sigs={}", 
-                                 producer, height, sigs.len());
-                        
-                        slashing_events.push(SlashingEvent {
-                            offender: producer.clone(),
-                            offense: SlashingType::DoubleSign {
-                                height: *height,
-                                hash_a: sigs[0],
-                                hash_b: sigs[1],
-                                signature_a: sigs[0].to_vec(),
-                                signature_b: sigs[1].to_vec(),
-                            },
-                            penalty: 1.0, // 100% - permanent ban for double-signing
-                            detected_at_height: *height,
-                            reporter: reporter_node_id.to_string(),
-                            evidence_hash,
-                        });
-                    }
-                }
-            }
-        }
-        
-        // v9.0: Drain timeout vote equivocation evidence for this epoch
-        let equivocation_entries: Vec<_> = EQUIVOCATION_EVIDENCE.iter()
-            .filter(|e| {
-                let (h, _) = e.key();
-                *h >= start_height && *h <= end_height
-            })
-            .map(|e| {
-                let (h, voter) = e.key().clone();
-                let (round, _ts) = *e.value();
-                (h, voter, round)
-            })
-            .collect();
+    // analyze_chain_for_slashing (legacy in-memory SlashingEvent path) was removed:
+    // it had no caller under v2. Slashing is now fully on-chain — block equivocation
+    // via EquivocationProof TXs (drain_equivocation_proof_txs) verified+banned in the
+    // deterministic fold, with the cumulative ban-set anchored per macroblock
+    // (compute_cumulative_ban_set). Timeout/commit-vote equivocation detection
+    // (EQUIVOCATION_EVIDENCE) is retained but awaits its own on-chain proof path.
 
-        for (eq_height, eq_voter, eq_round) in &equivocation_entries {
-            use qnet_consensus::deterministic_reputation::SlashingType;
-
-            let mut hasher = Sha3_512::new();
-            hasher.update(eq_voter.as_bytes());
-            hasher.update(&eq_height.to_le_bytes());
-            hasher.update(&eq_round.to_le_bytes());
-            hasher.update(b"timeout_equivocation_v9.0");
-            let hash_result = hasher.finalize();
-            let mut evidence_hash = [0u8; 32];
-            evidence_hash.copy_from_slice(&hash_result[..32]);
-
-            println!("[CRIT][SLASH] TIMEOUT_EQUIVOCATION voter={} h={} round={}",
-                     eq_voter, eq_height, eq_round);
-
-            slashing_events.push(SlashingEvent {
-                offender: eq_voter.clone(),
-                offense: SlashingType::InvalidBlock {
-                    height: *eq_height,
-                    block_hash: evidence_hash,
-                    reason: format!("timeout_vote_equivocation:round={}", eq_round),
-                },
-                penalty: 0.5, // 50% penalty for equivocation
-                detected_at_height: *eq_height,
-                reporter: reporter_node_id.to_string(),
-                evidence_hash,
-            });
-
-            // Remove processed evidence
-            EQUIVOCATION_EVIDENCE.remove(&(*eq_height, eq_voter.clone()));
-        }
-
-        // L6 block-equivocation slashing: drain proof of double-production.
-        // Block equivocation = same producer signed two different microblocks
-        // at one height — strictly worse than timeout-vote equivocation (it
-        // forks honest storage if the L4 guard misses it). Penalty =
-        // PENALTY_DOUBLE_SIGN (max; permanent ban + stake forfeiture) mapped
-        // to SlashingType::DoubleSign. Idempotent drain (removed after
-        // inclusion, can't slash twice). Evidence carries both (hash,sig)
-        // pairs so any verifier re-checks Dilithium3 without trusting the
-        // reporter; evidence_hash is a SHA3-256 commitment (no replay/mutate).
-        // O(window) drain, bounded by the ~5-min cleanup sweep.
-        let block_equiv_entries: Vec<_> = BLOCK_EQUIVOCATION_EVIDENCE.iter()
-            .filter(|e| {
-                let (h, _) = e.key();
-                *h >= start_height && *h <= end_height
-            })
-            .map(|e| {
-                let (h, producer) = e.key().clone();
-                let ev = e.value().clone();
-                (h, producer, ev)
-            })
-            .collect();
-
-        for (eq_height, eq_producer, ev) in &block_equiv_entries {
-            use qnet_consensus::deterministic_reputation::SlashingType;
-
-            // Evidence hash: SHA3-256 over the canonical proof tuple.
-            // Stable across re-derivation; any honest verifier reaches the
-            // same digest given the same (height, producer, hashes, sigs).
-            let mut hasher = Sha3_512::new();
-            hasher.update(eq_producer.as_bytes());
-            hasher.update(&eq_height.to_le_bytes());
-            hasher.update(&ev.hash_a);
-            hasher.update(&ev.hash_b);
-            hasher.update(&ev.sig_a);
-            hasher.update(&ev.sig_b);
-            hasher.update(b"block_equivocation_v15.11");
-            let hash_result = hasher.finalize();
-            let mut evidence_hash = [0u8; 32];
-            evidence_hash.copy_from_slice(&hash_result[..32]);
-
-            println!(
-                "[CRIT][SLASH] BLOCK_EQUIVOCATION producer={} h={} hash_a={:x?} hash_b={:x?} ts={}",
-                eq_producer, eq_height, &ev.hash_a[..8], &ev.hash_b[..8], ev.detected_ts,
-            );
-
-            slashing_events.push(SlashingEvent {
-                offender: eq_producer.clone(),
-                offense: SlashingType::DoubleSign {
-                    height: *eq_height,
-                    hash_a: ev.hash_a,
-                    hash_b: ev.hash_b,
-                    signature_a: ev.sig_a.clone(),
-                    signature_b: ev.sig_b.clone(),
-                },
-                penalty: 1.0, // 100% — permanent ban for block double-signing
-                detected_at_height: *eq_height,
-                reporter: reporter_node_id.to_string(),
-                evidence_hash,
-            });
-
-            // Remove processed evidence so it is not re-slashed on the next mb.
-            BLOCK_EQUIVOCATION_EVIDENCE.remove(&(*eq_height, eq_producer.clone()));
-        }
-
-        // Log analysis result
-        if slashing_events.is_empty() {
-            println!("[INFO][SLASH] epoch={}-{} analyzed={} slashing=0 no_cryptographic_violations",
-                     start_height, end_height, end_height.saturating_sub(start_height).saturating_add(1));
-        } else {
-            println!("[WARN][SLASH] epoch={}-{} analyzed={} violations={}",
-                     start_height, end_height, end_height.saturating_sub(start_height).saturating_add(1), slashing_events.len());
-        }
-
-        slashing_events
-    }
-    
     // ═══════════════════════════════════════════════════════════════════════════
     // GENESIS CANDIDATES HELPER (v2.32)
     // Single source of truth for Genesis node candidates with real reputation
@@ -3748,6 +3789,174 @@ impl BlockchainNode {
     /// NO P2P registry lookups - all nodes compute IDENTICAL list from on-chain data!
     /// 
     /// Reputation is taken from DeterministicReputationState which is synchronized via blockchain.
+    /// Deterministic consensus reputation — a PURE function of the committed chain, identical
+    /// on every node (it feeds the eligible-set ≥70 gate + epoch_commitment).
+    ///
+    /// Under UNIFORM-VRF validator selection the reputation VALUE no longer ranks who is chosen
+    /// (sortition is equal-chance among all ≥70 nodes), so consensus reputation reduces to its
+    /// two load-bearing roles and nothing more:
+    ///   • ADMISSION — every participant starts at the 70 floor (eligible).
+    ///   • SLASHING  — a verified on-chain equivocation proof drops the offender to 0 → excluded.
+    /// Producer rotation rewards are an ECONOMIC signal (emission) + a live-engine display value;
+    /// they are deliberately NOT folded here. Keeping this map at {70 | 0} makes it trivially
+    /// divergence-free (no per-node rotation accounting can ever skew epoch_commitment) and
+    /// removes the rich-get-richer entrenchment vector at scale.
+    ///
+    /// Scans the committed window for proofs; bans are permanent so the first verified proof
+    /// wins. O(window_head) reads — a persisted/anchored ban-set is the scale follow-up.
+    async fn compute_consensus_reputation_map(
+        storage: &Storage,
+        consensus_participants: &[String],
+        macroblock_index: u64,
+    ) -> std::collections::HashMap<String, f64> {
+        use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
+        let mut rep: std::collections::HashMap<String, f64> = consensus_participants.iter()
+            .map(|id| (id.clone(), INITIAL_REPUTATION)).collect();
+        // Verified equivocation offenders (block double-sign OR same-round checkpoint-vote
+        // double-sign) → banned (0 → excluded by the ≥70 gate). The cumulative set is anchored
+        // on the previous macroblock (O(window), pruning-safe); a forged proof never verifies,
+        // so honest nodes are never banned.
+        for offender in Self::compute_cumulative_ban_set(storage, macroblock_index).await {
+            rep.insert(offender, 0.0);
+        }
+        rep
+    }
+
+    /// Loads the cumulative ban-set stored in macroblock `mb_index`'s body
+    /// (`consensus_data.banned_validators`). `None` ⇒ macroblock absent OR no anchor field
+    /// (pre-feature chain) — the caller then rebuilds via full scan. `Some(set)` ⇒ the
+    /// anchor (possibly empty = no bans through that macroblock). Macroblock bytes may be
+    /// zstd-compressed on disk.
+    fn load_macroblock_ban_set(storage: &Storage, mb_index: u64) -> Option<std::collections::HashSet<String>> {
+        if mb_index == 0 { return Some(std::collections::HashSet::new()); }
+        let raw = storage.get_macroblock_by_height(mb_index).ok().flatten()?;
+        let bytes = zstd::decode_all(&raw[..]).unwrap_or(raw);
+        let mb = bincode::deserialize::<qnet_state::MacroBlock>(&bytes).ok()?;
+        let ser = mb.consensus_data.banned_validators?;
+        bincode::deserialize::<Vec<String>>(&ser).ok().map(|v| v.into_iter().collect())
+    }
+
+    /// Cumulative equivocation ban-set as of macroblock `mb_index` — a PURE function of the
+    /// committed chain, identical on every node. ANCHORED on the previous macroblock's stored
+    /// set so it scans only THIS window's microblocks (O(90)) rather than re-scanning from
+    /// genesis: scales to 100k+ nodes and survives microblock pruning (needs only the prev
+    /// macroblock body + this window). Full-scan fallback only when the anchor is absent
+    /// (genesis window, or a pre-feature chain). Bans are permanent ⇒ the first verified proof
+    /// for an offender wins; a forged proof never verifies ⇒ honest nodes are never banned.
+    pub async fn compute_cumulative_ban_set(storage: &Storage, mb_index: u64) -> std::collections::HashSet<String> {
+        let window_head = mb_index.saturating_mul(90);
+        let (mut bans, scan_start) = if mb_index >= 2 {
+            match Self::load_macroblock_ban_set(storage, mb_index - 1) {
+                Some(anchor) => (anchor, (mb_index - 1) * 90 + 1), // fast path: anchor + this window
+                None => (std::collections::HashSet::new(), 1u64),  // pre-feature: rebuild fully
+            }
+        } else {
+            (std::collections::HashSet::new(), 1u64) // genesis window (mb_index 0/1)
+        };
+        let mut h = scan_start;
+        while h <= window_head {
+            if let Ok(Some(b)) = storage.load_microblock_auto_format(h) {
+                for tx in &b.transactions {
+                    match &tx.tx_type {
+                        qnet_state::TransactionType::EquivocationProof { offender, height, block_a, block_b } => {
+                            if !bans.contains(offender)
+                                && Self::verify_equivocation_proof(offender, *height, block_a, block_b) {
+                                bans.insert(offender.clone());
+                            }
+                        }
+                        qnet_state::TransactionType::VoteEquivocationProof { offender, checkpoint_a, signature_a, checkpoint_b, signature_b } => {
+                            if !bans.contains(offender)
+                                && Self::verify_vote_equivocation_proof(offender, checkpoint_a, signature_a, checkpoint_b, signature_b).await {
+                                bans.insert(offender.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            h += 1;
+        }
+        bans
+    }
+
+    /// Re-verify an on-chain checkpoint-vote-equivocation proof. SOUND double-vote ⇔ the two
+    /// checkpoints share the SAME round `index`, DIFFER, and the offender's consensus key signed
+    /// BOTH (over the canonical `QNET_BFT2_VOTE:<hex(hash)>` message). Carrying the full preimages
+    /// is what proves same-round (the vote sig covers only the hash). Verified via the canonical
+    /// async verifier vs the offender's registry PK; fail-safe (any mismatch → false → no ban).
+    /// Identical on every node.
+    async fn verify_vote_equivocation_proof(
+        offender: &str,
+        checkpoint_a: &[u8],
+        signature_a: &[u8],
+        checkpoint_b: &[u8],
+        signature_b: &[u8],
+    ) -> bool {
+        use qnet_consensus::checkpoint_bft::Checkpoint;
+        let ca: Checkpoint = match bincode::deserialize(checkpoint_a) { Ok(c) => c, Err(_) => return false };
+        let cb: Checkpoint = match bincode::deserialize(checkpoint_b) { Ok(c) => c, Err(_) => return false };
+        if ca.index != cb.index { return false; } // must be the SAME round
+        let ha = ca.hash();
+        let hb = cb.hash();
+        if ha == hb { return false; } // same checkpoint — not equivocation
+        let msg_a = format!("QNET_BFT2_VOTE:{}", hex::encode(ha));
+        let msg_b = format!("QNET_BFT2_VOTE:{}", hex::encode(hb));
+        let sa = match std::str::from_utf8(signature_a) { Ok(s) => s, Err(_) => return false };
+        let sb = match std::str::from_utf8(signature_b) { Ok(s) => s, Err(_) => return false };
+        qnet_consensus::consensus_crypto::verify_consensus_signature(offender, &msg_a, sa).await
+            && qnet_consensus::consensus_crypto::verify_consensus_signature(offender, &msg_b, sb).await
+    }
+
+    /// Re-verify an on-chain equivocation proof: both headers carry the offender's
+    /// Dilithium3 signature over the `Block_Sig_v23.1` digest of their fields. Returns
+    /// true iff both verify for the SAME (offender, height) and the headers differ —
+    /// unforgeable proof of double-signing. Deterministic (registry PK + Dilithium),
+    /// identical on every node; fail-safe (anything off → false → no ban).
+    fn verify_equivocation_proof(
+        offender: &str,
+        height: u64,
+        block_a: &qnet_state::EquivocationHeader,
+        block_b: &qnet_state::EquivocationHeader,
+    ) -> bool {
+        if block_a == block_b { return false; }
+        let pk_bytes = match qnet_consensus::consensus_crypto::get_consensus_pk(offender) {
+            Some(p) => p,
+            None => return false,
+        };
+        Self::verify_block_header_sig(offender, height, block_a, &pk_bytes)
+            && Self::verify_block_header_sig(offender, height, block_b, &pk_bytes)
+    }
+
+    /// Verify one equivocation header's signature against `pk_bytes`. Reconstructs the
+    /// EXACT `Block_Sig_v23.1` signing digest from `sign_microblock_with_dilithium`.
+    fn verify_block_header_sig(
+        producer: &str,
+        height: u64,
+        hdr: &qnet_state::EquivocationHeader,
+        pk_bytes: &[u8],
+    ) -> bool {
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"Block_Sig_v23.1");
+        hasher.update(&height.to_be_bytes());
+        hasher.update(&hdr.timestamp.to_be_bytes());
+        hasher.update(&hdr.merkle_root);
+        hasher.update(&hdr.previous_hash);
+        hasher.update(&hdr.state_root);
+        hasher.update(producer.as_bytes());
+        if let Some(ref vrf) = hdr.vrf_output { hasher.update(vrf); }
+        hasher.update(&hdr.timeout_round.to_be_bytes());
+        let digest = hasher.finalize();
+        // Wire format: "dilithium3_v4:" + hex(detached_sig).
+        let sig_str = match std::str::from_utf8(&hdr.signature) { Ok(s) => s, Err(_) => return false };
+        let sig_hex = match sig_str.strip_prefix("dilithium3_v4:") { Some(x) => x, None => return false };
+        let sig_bytes = match hex::decode(sig_hex) { Ok(b) => b, Err(_) => return false };
+        use pqcrypto_mldsa::mldsa65 as dilithium3;
+        use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
+        let pk = match <dilithium3::PublicKey as PkTrait>::from_bytes(pk_bytes) { Ok(p) => p, Err(_) => return false };
+        let sig = match <dilithium3::DetachedSignature as SigTrait>::from_bytes(&sig_bytes) { Ok(s) => s, Err(_) => return false };
+        dilithium3::verify_detached_signature(&sig, digest.as_ref(), &pk).is_ok()
+    }
+
     async fn create_eligible_producers_snapshot(
         p2p: &Arc<SimplifiedP2P>,
         consensus_participants: &[String],
@@ -3758,25 +3967,14 @@ impl BlockchainNode {
     ) -> Vec<qnet_state::EligibleProducer> {
         const MIN_REPUTATION_BP: u32 = 7000; // 70.00% eligibility floor (fixed-point centipercent)
 
-        // Deterministic "as-of" time = the window head microblock's on-chain timestamp
-        // (signed, seconds; identical on every node) — NOT wall-clock. The reputation
-        // jail check (current < jail_end) must yield the same eligible set everywhere,
-        // else two nodes near a jail boundary derive different macroblock bodies. Falls
-        // back to wall-clock only if the head block is somehow absent locally.
-        let current_timestamp = storage
-            .load_microblock_auto_format(macroblock_index.saturating_mul(90))
-            .ok().flatten().map(|m| m.timestamp)
-            .unwrap_or_else(|| std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
+        // Consensus reputation = pure function of the committed chain (identical on every node),
+        // NOT the per-node-divergent live engine. Forensic: the live engine self-credits the
+        // microblock rotation reward only on the producer and never replays it elsewhere → each
+        // node's map differs → eligible/epoch_commitment diverge → checkpoint never reaches 2f+1.
+        let reputation_map = Self::compute_consensus_reputation_map(
+            storage, consensus_participants, macroblock_index,
+        ).await;
 
-        let reputation_map: std::collections::HashMap<String, f64> =
-            if let Some(rep_arc) = p2p.get_deterministic_reputation() {
-                let rep_state = rep_arc.read();
-                rep_state.get_all_reputations(current_timestamp)
-            } else {
-                std::collections::HashMap::new()
-            };
-        
         let mut eligible: Vec<qnet_state::EligibleProducer> = consensus_participants.iter()
             .map(|node_id| {
                 // reputation_map is 0–100; commit as centipercent u32 (×100, rounded) so the
@@ -4106,15 +4304,21 @@ impl BlockchainNode {
                 })
                 .collect();
 
-            // DETERMINISM: reputation is u32 (centipercent) — a total order with no NaN, so
-            // the sorted validator set is identical across all nodes regardless of platform.
+            // SCALE FAIRNESS: select the validator set by UNIFORM VRF sortition among all
+            // eligible (≥70) nodes — NOT by accumulated-reputation rank. Ranking by reputation
+            // ENTRENCHES the set: producers climb above the 70 floor and then permanently hold
+            // every MAX_VALIDATORS slot, locking out all other nodes forever (fatal at 100k+
+            // nodes where the eligible pool ≫ MAX_VALIDATORS — 99% become permanent spectators
+            // and the active set freezes on whoever bootstrapped first). Uniform sortition
+            // re-rolls each epoch from the on-chain N-2 beacon, so every eligible node rotates
+            // in fairly. Reputation has already done its job at the ≥70 admission gate
+            // (slashed/jailed are excluded below the floor); Sybil resistance is the node-
+            // activation cost. Mirrors select_consensus_committee (same beacon-seeded VRF, one
+            // tier up). node_id is a total-order tiebreak for the (cryptographically
+            // unreachable) SHA3-collision case.
             eligible.sort_by(|a, b| {
-                b.reputation.cmp(&a.reputation)
-                    .then_with(|| {
-                        let ha = &vrf_scores[&a.node_id];
-                        let hb = &vrf_scores[&b.node_id];
-                        ha.cmp(hb)
-                    })
+                vrf_scores[&a.node_id].cmp(&vrf_scores[&b.node_id])
+                    .then_with(|| a.node_id.cmp(&b.node_id))
             });
             eligible.truncate(MAX_VALIDATORS);
             eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -20300,6 +20504,30 @@ impl BlockchainNode {
                         tx_bytes_list.push(emission_tx);
                     }
 
+                    // Block-level slashing: inject any equivocation-proof TXs this node has
+                    // detected into the block it is producing — same model as emission
+                    // (unsigned system TX, never gossiped, no-op state apply, crypto-verified
+                    // in the deterministic reputation fold). Capped per block so an evidence
+                    // burst cannot blow the 1-sec production deadline; remainder rides the
+                    // next block this node produces.
+                    let proof_txs = drain_equivocation_proof_txs(16);
+                    if !proof_txs.is_empty() {
+                        if is_warn() {
+                            println!("[WARN][SLASH] equivocation_proofs_injected count={} h={}",
+                                     proof_txs.len(), next_block_height);
+                        }
+                        tx_bytes_list.extend(proof_txs);
+                    }
+                    // Same model for checkpoint-vote equivocation proofs (accountable safety).
+                    let vote_proof_txs = drain_vote_equivocation_proof_txs(16);
+                    if !vote_proof_txs.is_empty() {
+                        if is_warn() {
+                            println!("[WARN][SLASH] vote_equivocation_proofs_injected count={} h={}",
+                                     vote_proof_txs.len(), next_block_height);
+                        }
+                        tx_bytes_list.extend(vote_proof_txs);
+                    }
+
                     // v32.12: per-block activation TX cap. NodeRegistration/Activation
                     // hit registry+state-apply (deterministic but heavy). Bounding per
                     // block keeps the producer's 1-sec deadline achievable under mass-
@@ -27178,11 +27406,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // - NodeRegistration: client-signed NodeReg HAS Ed25519+Dilithium → verify early
             // - NodeActivation: now signed with ephemeral Ed25519 (v6.1) → verify early
             // - LightNodeEligibilityBitmap: now signed with ephemeral Ed25519 (v6.1) → verify early
+            //
+            // EquivocationProof carries NO submitter Ed25519 sig — its authenticity is the
+            // offender's OWN Dilithium3 block signatures embedded in both headers. Those are
+            // re-verified deterministically in the reputation fold (verify_equivocation_proof);
+            // a forged proof simply fails there (no ban). Block-level only (never gossiped),
+            // exactly like emission — so exempting it here is safe.
             let is_unsigned_system_tx = matches!(tx.tx_type,
                 qnet_state::TransactionType::RewardDistribution { .. } |
                 qnet_state::TransactionType::CreateAccount { .. } |
                 qnet_state::TransactionType::BatchRewardClaims { .. } |
-                qnet_state::TransactionType::BatchNodeActivations { .. }
+                qnet_state::TransactionType::BatchNodeActivations { .. } |
+                qnet_state::TransactionType::EquivocationProof { .. } |
+                qnet_state::TransactionType::VoteEquivocationProof { .. }
             );
 
             if is_unsigned_system_tx {
@@ -31531,6 +31767,203 @@ mod tests {
         // Verify hex encoding works
         let hex = hex::encode(&encapsulated);
         assert_eq!(hex.len(), 144); // 72 * 2
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // EQUIVOCATION-SLASHING PROOF VERIFICATION — fail-safe + soundness.
+    // Pins the two load-bearing guarantees of the on-chain slashing path:
+    //   (1) a REAL same-height (block) / same-round (vote) double-sign IS detected
+    //       — the verifier is not vacuously-false; and
+    //   (2) NOTHING ELSE bans — forged sig, identical artefacts, unregistered key,
+    //       and (the false-slashing trap) two HONEST votes from DIFFERENT rounds.
+    // A false positive here would ban an honest node, so (2) is the critical set.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    fn eqv_gen_and_register(node_id: &str) -> (Vec<u8>, pqcrypto_mldsa::mldsa65::SecretKey) {
+        use pqcrypto_traits::sign::PublicKey as _;
+        let (pk, sk) = pqcrypto_mldsa::mldsa65::keypair();
+        let pk_bytes = pk.as_bytes().to_vec();
+        assert!(
+            qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, &pk_bytes),
+            "register consensus pk for {}", node_id
+        );
+        (pk_bytes, sk)
+    }
+
+    fn eqv_mk_header(ts: u64, merkle: u8, round: u64) -> qnet_state::EquivocationHeader {
+        qnet_state::EquivocationHeader {
+            timestamp: ts,
+            merkle_root: [merkle; 32],
+            previous_hash: [9u8; 32],
+            state_root: [0u8; 32],
+            vrf_output: None,
+            timeout_round: round,
+            signature: Vec::new(),
+        }
+    }
+
+    fn eqv_sign_block(
+        sk: &pqcrypto_mldsa::mldsa65::SecretKey,
+        height: u64,
+        producer: &str,
+        h: &qnet_state::EquivocationHeader,
+    ) -> Vec<u8> {
+        use pqcrypto_traits::sign::DetachedSignature as _;
+        // Reconstruct the EXACT Block_Sig_v23.1 digest verify_block_header_sig checks.
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"Block_Sig_v23.1");
+        hasher.update(&height.to_be_bytes());
+        hasher.update(&h.timestamp.to_be_bytes());
+        hasher.update(&h.merkle_root);
+        hasher.update(&h.previous_hash);
+        hasher.update(&h.state_root);
+        hasher.update(producer.as_bytes());
+        if let Some(ref vrf) = h.vrf_output { hasher.update(vrf); }
+        hasher.update(&h.timeout_round.to_be_bytes());
+        let digest = hasher.finalize();
+        let sig = pqcrypto_mldsa::mldsa65::detached_sign(digest.as_ref(), sk);
+        format!("dilithium3_v4:{}", hex::encode(sig.as_bytes())).into_bytes()
+    }
+
+    fn eqv_mk_checkpoint(node: &str, index: u64, mb: u8) -> qnet_consensus::checkpoint_bft::Checkpoint {
+        qnet_consensus::checkpoint_bft::Checkpoint {
+            index,
+            parent_qc: None,
+            window_head_height: index.saturating_mul(90),
+            window_mb_hashes: vec![[mb; 32]],
+            state_root: [0u8; 32],
+            beacon: [0u8; 32],
+            epoch_commitment: [0u8; 32],
+            timestamp: 1000,
+            proposer: node.to_string(),
+            proposer_sig: Vec::new(),
+        }
+    }
+
+    // Build a vote signature in the canonical consensus_crypto combined format
+    // ("dilithium_sig_<node>_<b64>" of [sig_len][SignedMessage][pk_len][pk]) over the
+    // exact QNET_BFT2_VOTE:<hex(hash)> message a real voter signs.
+    fn eqv_sign_vote(
+        node: &str,
+        pk_bytes: &[u8],
+        sk: &pqcrypto_mldsa::mldsa65::SecretKey,
+        checkpoint_hash: [u8; 32],
+    ) -> Vec<u8> {
+        use pqcrypto_traits::sign::SignedMessage as _;
+        use base64::{Engine as _, engine::general_purpose};
+        let message = format!("QNET_BFT2_VOTE:{}", hex::encode(checkpoint_hash));
+        let signed = pqcrypto_mldsa::mldsa65::sign(message.as_bytes(), sk);
+        let sm = signed.as_bytes();
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&(sm.len() as u32).to_le_bytes());
+        combined.extend_from_slice(sm);
+        combined.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
+        combined.extend_from_slice(pk_bytes);
+        format!("dilithium_sig_{}_{}", node, general_purpose::STANDARD.encode(&combined)).into_bytes()
+    }
+
+    #[test]
+    fn eqv_block_valid_double_sign_is_detected() {
+        let node = "eqv_test_blk_valid";
+        let (_pk, sk) = eqv_gen_and_register(node);
+        let h = 100u64;
+        let mut a = eqv_mk_header(1000, 1, 0);
+        let mut b = eqv_mk_header(1001, 2, 0); // same producer/height, different content
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        b.signature = eqv_sign_block(&sk, h, node, &b);
+        assert!(BlockchainNode::verify_equivocation_proof(node, h, &a, &b),
+                "a real same-height double-sign MUST verify (verifier non-vacuous)");
+    }
+
+    #[test]
+    fn eqv_block_forged_sig_does_not_ban() {
+        let node = "eqv_test_blk_forged";
+        let (_pk, sk) = eqv_gen_and_register(node);
+        let h = 100u64;
+        let mut a = eqv_mk_header(1000, 1, 0);
+        let mut b = eqv_mk_header(1001, 2, 0);
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        b.signature = eqv_sign_block(&sk, h, node, &b);
+        let n = b.signature.len() - 1;
+        b.signature[n] ^= 0xFF; // corrupt one hex char of b's sig
+        assert!(!BlockchainNode::verify_equivocation_proof(node, h, &a, &b),
+                "a forged signature MUST NOT ban (no false slashing)");
+    }
+
+    #[test]
+    fn eqv_block_identical_does_not_ban() {
+        let node = "eqv_test_blk_ident";
+        let (_pk, sk) = eqv_gen_and_register(node);
+        let h = 100u64;
+        let mut a = eqv_mk_header(1000, 1, 0);
+        a.signature = eqv_sign_block(&sk, h, node, &a);
+        let b = a.clone();
+        assert!(!BlockchainNode::verify_equivocation_proof(node, h, &a, &b),
+                "identical headers are not equivocation");
+    }
+
+    #[test]
+    fn eqv_block_unregistered_offender_does_not_ban() {
+        let node = "eqv_test_blk_unregistered_never";
+        let a = eqv_mk_header(1000, 1, 0);
+        let b = eqv_mk_header(1001, 2, 0);
+        assert!(!BlockchainNode::verify_equivocation_proof(node, 100, &a, &b),
+                "no registry PK ⇒ cannot ban");
+    }
+
+    #[tokio::test]
+    async fn eqv_vote_same_round_double_sign_is_detected() {
+        let node = "eqv_test_vote_same";
+        let (pk, sk) = eqv_gen_and_register(node);
+        let ca = eqv_mk_checkpoint(node, 5, 7);
+        let cb = eqv_mk_checkpoint(node, 5, 8); // SAME round, different content
+        let sa = eqv_sign_vote(node, &pk, &sk, ca.hash());
+        let sb = eqv_sign_vote(node, &pk, &sk, cb.hash());
+        let ba = bincode::serialize(&ca).unwrap();
+        let bb = bincode::serialize(&cb).unwrap();
+        assert!(BlockchainNode::verify_vote_equivocation_proof(node, &ba, &sa, &bb, &sb).await,
+                "a real same-round double-vote MUST verify (verifier non-vacuous)");
+    }
+
+    #[tokio::test]
+    async fn eqv_vote_different_round_does_not_ban() {
+        // THE false-slashing trap: identical VALID sigs, only the round differs →
+        // two honest votes in successive rounds, NOT equivocation.
+        let node = "eqv_test_vote_diffround";
+        let (pk, sk) = eqv_gen_and_register(node);
+        let ca = eqv_mk_checkpoint(node, 5, 7);
+        let cb = eqv_mk_checkpoint(node, 6, 7); // DIFFERENT round
+        let sa = eqv_sign_vote(node, &pk, &sk, ca.hash());
+        let sb = eqv_sign_vote(node, &pk, &sk, cb.hash());
+        let ba = bincode::serialize(&ca).unwrap();
+        let bb = bincode::serialize(&cb).unwrap();
+        assert!(!BlockchainNode::verify_vote_equivocation_proof(node, &ba, &sa, &bb, &sb).await,
+                "two honest votes from DIFFERENT rounds MUST NOT ban (false-slashing guard)");
+    }
+
+    #[tokio::test]
+    async fn eqv_vote_identical_does_not_ban() {
+        let node = "eqv_test_vote_ident";
+        let (pk, sk) = eqv_gen_and_register(node);
+        let ca = eqv_mk_checkpoint(node, 5, 7);
+        let sa = eqv_sign_vote(node, &pk, &sk, ca.hash());
+        let ba = bincode::serialize(&ca).unwrap();
+        assert!(!BlockchainNode::verify_vote_equivocation_proof(node, &ba, &sa, &ba, &sa).await,
+                "identical checkpoint is not equivocation");
+    }
+
+    #[tokio::test]
+    async fn eqv_vote_forged_sig_does_not_ban() {
+        let node = "eqv_test_vote_forged";
+        let (pk, sk) = eqv_gen_and_register(node);
+        let ca = eqv_mk_checkpoint(node, 5, 7);
+        let cb = eqv_mk_checkpoint(node, 5, 8);
+        let sa = eqv_sign_vote(node, &pk, &sk, ca.hash());
+        let ba = bincode::serialize(&ca).unwrap();
+        let bb = bincode::serialize(&cb).unwrap();
+        let forged = b"dilithium_sig_eqv_test_vote_forged_not_a_real_signature".to_vec();
+        assert!(!BlockchainNode::verify_vote_equivocation_proof(node, &ba, &sa, &bb, &forged).await,
+                "a forged vote signature MUST NOT ban");
     }
 }
 

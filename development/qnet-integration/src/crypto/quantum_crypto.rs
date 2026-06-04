@@ -1376,6 +1376,13 @@ mod tests {
     async fn test_dilithium_sign_and_verify() {
         println!("[TEST][QUANTUM_CRYPTO] test_dilithium_sign_and_verify start");
 
+        // Serialize against the key_manager identity tests: all share the process-wide
+        // keypair cache + CACHED_KEY_DIR OnceLock + canonicalize() over transient temp
+        // dirs. Without this, a parallel identity test cleans a dir mid-run and our
+        // install/sign resolve to different canonical keys → spurious identity_not_installed.
+        let _identity_guard = crate::crypto::key_manager::IDENTITY_TEST_LOCK
+            .lock().unwrap_or_else(|e| e.into_inner());
+
         // 1. Initialize crypto
         let mut crypto = QNetQuantumCrypto::new();
         let init_result = crypto.initialize().await;
