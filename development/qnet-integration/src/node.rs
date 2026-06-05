@@ -17864,199 +17864,23 @@ impl BlockchainNode {
                                         _ => 400,         // Large: tolerate more for propagation
                                     };
 
-                                    // v9.0: ADAPTIVE cooldown — escalates on repeated rollbacks.
-                                    // First rollback: 60s cooldown (react fast to stall).
-                                    // Second: 120s. Third+: 300s max (prevent infinite loop).
-                                    static LAST_ROLLBACK_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                                    static ROLLBACK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                                    let now_secs = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    let last_rollback = LAST_ROLLBACK_TIME.load(std::sync::atomic::Ordering::Relaxed);
-                                    let rb_count = ROLLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-                                    let rollback_cooldown = match rb_count {
-                                        0 => 60,    // First rollback: 1 min
-                                        1 => 120,   // Second: 2 min
-                                        2 => 180,   // Third: 3 min
-                                        _ => 300,   // 4th+: 5 min max
-                                    };
-
-                                    // v10.1: CRITICAL — never rollback while sync is in progress.
-                                    // A syncing node is ALWAYS behind the network (gap > threshold).
-                                    // Without this guard, fork detection triggers destructive rollback
-                                    // on every cooldown cycle, creating an infinite rollback→resync loop
-                                    // that prevents the node from ever catching up.
+                                    // v33 (Cycle 2): "behind" is NOT "forked". The old destructive rollback
+                                    // here deleted correct, leader-identical blocks and full-replayed from 0,
+                                    // then reset the sync flags — which perpetuated !sync_active and produced
+                                    // an infinite rollback↔resync thrash that prevented catch-up and starved
+                                    // the checkpoint window (mb_hashes/beacon diverged → finality stall).
+                                    // A node that is merely behind MUST forward-sync, never roll back. Genuine
+                                    // forks (a verified hash-conflicting block) are handled by the pipeline via
+                                    // take_fork_recovery_signal with real evidence. Forward catch-up itself is
+                                    // driven by the two-mode sync below; here we only surface the lag state.
                                     let sync_active = coordinator_is_syncing();
-
-                                    if height_gap > dynamic_threshold && (now_secs - last_rollback) > rollback_cooldown && !sync_active {
-                                        LAST_ROLLBACK_TIME.store(now_secs, std::sync::atomic::Ordering::Relaxed);
-                                        ROLLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                                        println!("[ERR][FORK] slot_delay={}s behind={} blocks threshold={}",
-                                                 local_delay, height_gap, dynamic_threshold);
-                                        println!("[INFO][FORK] force_resync local={} network={} nodes={}",
-                                                 microblock_height, network_height, network_size);
-                                        
-                                        // ═══════════════════════════════════════════════════════════════
-                                        // v14.2: BOUNDED ROLLBACK — do not remove more than we need to
-                                        // ═══════════════════════════════════════════════════════════════
-                                        // Previous formula always went back to (prev_macroblock_boundary)
-                                        // which was typically 90 blocks — regardless of actual gap. If we
-                                        // were only 29 blocks behind, that's 3× over-deletion and 120
-                                        // blocks to re-download instead of 29.
-                                        //
-                                        // New formula: rollback to just BELOW the fork boundary — the
-                                        // last macroblock boundary that's BEFORE the gap. This is still
-                                        // deterministic (anchored on macroblock boundaries) but minimally
-                                        // destructive. For small gaps on recently-synced chains it
-                                        // typically removes ≤ 90 blocks.
-                                        //
-                                        // Determinism: macroblock boundaries are at height multiples of 90.
-                                        // Every node reading the same microblock_height computes the same
-                                        // rollback_to — no divergence.
-                                        // ═══════════════════════════════════════════════════════════════
-                                        let cycle_start = (microblock_height / 90) * 90;
-                                        let rollback_to = cycle_start; // Go to START of current epoch, not previous
-                                        
-                                        // v14.8: Atomic claim + finality check.
-                                        // EXCEPTION preserved from legacy path: if finality is
-                                        // impossibly AHEAD of the actual chain (fast-sync window),
-                                        // reset it to chain tip so recovery can proceed.
-                                        {
-                                            let finalized_now = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-                                            if finalized_now > microblock_height {
-                                                let safe = (microblock_height / 90) * 90;
-                                                LAST_FINALIZED_HEIGHT.store(safe, std::sync::atomic::Ordering::SeqCst);
-                                                LAST_FINALIZED_CONSENSUS_ROUND.store(safe, std::sync::atomic::Ordering::SeqCst);
-                                                println!("[WARN][FORK] finality_ahead_of_chain finalized={} chain={} reset_to={}",
-                                                         finalized_now, microblock_height, safe);
-                                            }
+                                    if height_gap > dynamic_threshold && !sync_active {
+                                        if crate::node::is_warn() {
+                                            println!("[WARN][SYNC] behind_catchup local={} network={} gap={} nodes={} — forward sync (no rollback)",
+                                                     microblock_height, network_height, height_gap, network_size);
                                         }
-                                        let finalized_h = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-                                        if let Err(reason) = crate::storage::begin_finality_guarded_rollback(rollback_to, finalized_h) {
-                                            println!("[WARN][FORK] stall_recovery_skipped reason={}", reason);
-                                            continue;
-                                        }
-                                        
-                                        println!("[INFO][FORK] rollback from={} to={}", microblock_height, rollback_to);
-                                        
-                                        // Delete blocks from rollback_to+1 to current
-                                        let mut stall_delete_fails = 0u64;
-                                        for h in (rollback_to.saturating_add(1))..=microblock_height {
-                                            if let Err(e) = storage.delete_microblock(h) {
-                                                println!("[WARN][FORK] delete_block_failed h={} err={}", h, e);
-                                                stall_delete_fails += 1;
-                                            }
-                                        }
-                                        // v9.0 BUG-29: Verify critical blocks actually deleted
-                                        if stall_delete_fails > 0 {
-                                            let spot_check = rollback_to.saturating_add(1);
-                                            if storage.load_microblock_auto_format(spot_check).ok().flatten().is_some() {
-                                                println!("[ERR][FORK] block {} still in storage after delete!", spot_check);
-                                            }
-                                        }
-
-                                        // Delete macroblocks that might be corrupted
-                                        let mb_from = (rollback_to / 90) + 1;
-                                        let mb_to = microblock_height / 90;
-                                        for mb_idx in mb_from..=mb_to {
-                                            if let Err(e) = storage.delete_macroblock(mb_idx) {
-                                                println!("[WARN][FORK] delete_mb_failed idx={} err={}", mb_idx, e);
-                                            }
-                                        }
-                                        
-                                        // v9.0: Update all height sources atomically
-                                        microblock_height = rollback_to;
-                                        crate::node::update_all_heights(&height, &storage, rollback_to).await;
-
-                                        // End rollback protection
-                                        crate::storage::end_rollback_protection();
-                                        
-                                        println!("[INFO][FORK] rollback_complete new_h={}", rollback_to);
-
-                                        // v9.0: Reset adaptive cooldown counter on successful rollback
-                                        ROLLBACK_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-
-                                        // v3.31: Clear ALL stale state after rollback
-                                        // Without this, stale entries block re-queueing of blocks
-                                        // causing dup_pending on ALL sync responses → sync deadlock
-                                        complete_rollback_cleanup(rollback_to);
-
-                                        // v15.9: ATOMIC STATE RECONCILIATION
-                                        // ───────────────────────────────────────────────────────────
-                                        // The disk-side rollback above wiped microblocks and
-                                        // macroblocks at heights > rollback_to. The in-memory
-                                        // StateManager still carries the account mutations those
-                                        // blocks applied — without reconciliation the node would
-                                        // re-validate freshly synced blocks against a state that
-                                        // does not match the canonical chain at rollback_to.
-                                        //
-                                        // We rebuild the in-memory state from the freshest
-                                        // snapshot at or below rollback_to and replay the
-                                        // surviving microblocks deterministically through the
-                                        // same `apply_block_to_state` path used at normal apply
-                                        // time. After this returns, the in-memory state matches
-                                        // the chain tip exactly.
-                                        if let Err(e) = Self::reconcile_state_after_rollback(
-                                            &state,
-                                            &storage,
-                                            rollback_to,
-                                        ).await {
-                                            println!(
-                                                "[ERR][STATE] reconcile_after_rollback_failed target={} err={} action=resync_required",
-                                                rollback_to, e,
-                                            );
-                                        } else {
-                                            println!(
-                                                "[INFO][STATE] reconcile_after_rollback_ok target={}",
-                                                rollback_to,
-                                            );
-                                        }
-
-                                        FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                                        FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
-                                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
-                                        println!("[INFO][FORK] cleared_pending_sync_queues");
-                                        
-                                        // v5.5: After rollback, set LBPT to on-chain timestamp of rollback
-                                        // target block for deterministic timeout_round. Load block timestamp
-                                        // from storage; fallback to current_time only if block not found.
-                                        let rollback_lbpt = storage.load_microblock_auto_format(rollback_to)
-                                            .ok().flatten().map(|mb| mb.timestamp)
-                                            .unwrap_or(current_time);
-                                        LAST_BLOCK_PRODUCED_TIME.store(rollback_lbpt, Ordering::Relaxed);
-                                        LAST_BLOCK_PRODUCED_HEIGHT.store(rollback_to, Ordering::Relaxed);
-                                        
-                                        // Request fresh blocks and macroblocks from network
-                                        println!("[INFO][FORK] request_blocks from={} to={}", rollback_to.saturating_add(1), network_height);
-                                        
-                                        // Sync macroblocks first (they provide entropy for block validation)
-                                        let target_mb = network_height / 90;
-                                        if target_mb > mb_from {
-                                            if let Err(e) = p2p.sync_macroblocks(mb_from, target_mb).await {
-                                                println!("[WARN][FORK] mb_sync_failed err={}", e);
-                                            }
-                                        }
-                                        
-                                        // Then sync microblocks in batches
-                                        let mut sync_from = rollback_to.saturating_add(1);
-                                        while sync_from <= network_height {
-                                            let sync_to = std::cmp::min(sync_from.saturating_add(100), network_height);
-                                            if let Err(e) = p2p.sync_blocks(sync_from, sync_to).await {
-                                                println!("[WARN][FORK] block_sync_failed h={} err={}", sync_from, e);
-                                                break;
-                                            }
-                                            sync_from = sync_to.saturating_add(1);
-                                            // Small delay between batches
-                                            tokio::time::sleep(Duration::from_millis(100)).await;
-                                        }
-                                        
-                                        println!("[INFO][FORK] resync_initiated target={}", network_height);
-                                        
-                                        // Set state
                                         set_node_state(NodeState::Syncing {
-                                            local_height: rollback_to,
+                                            local_height: microblock_height,
                                             target_height: network_height,
                                             progress_percent: 0,
                                         });
