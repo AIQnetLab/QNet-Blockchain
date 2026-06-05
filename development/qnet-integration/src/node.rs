@@ -3731,15 +3731,10 @@ impl BlockchainNode {
     /// 
     /// All locations now use THIS function for consistency!
     fn get_genesis_candidates_with_real_reputation(
-        p2p: &Arc<SimplifiedP2P>,
+        _p2p: &Arc<SimplifiedP2P>,
     ) -> Vec<(String, f64)> {
         use crate::genesis_constants::GENESIS_NODE_IPS;
         use qnet_consensus::deterministic_reputation::{INITIAL_REPUTATION, MIN_CONSENSUS_REPUTATION};
-        
-        let current_ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
 
         // PRODUCTION: Deterministic conversion from 0-100 scale to 0.0-1.0
         // Uses integer truncation to basis points first, then single f64 division
@@ -3753,19 +3748,10 @@ impl BlockchainNode {
             clamped_bps as f64 / 10_000.0
         };
 
-        // Try to get REAL reputation from DeterministicReputationState
-        if let Some(rep_state) = p2p.get_deterministic_reputation() {
-            let rep_guard = rep_state.read();
-            return GENESIS_NODE_IPS.iter()
-                .map(|(_, id)| {
-                    let node_id = format!("genesis_node_{}", id);
-                    let real_rep = rep_guard.get_reputation(&node_id, current_ts);
-                    (node_id, to_normalized(real_rep))
-                })
-                .collect();
-        }
-
-        // Fallback: use INITIAL_REPUTATION (without P2P access)
+        // ONE deterministic model: genesis bootstrap nodes are admitted at the consensus
+        // floor (70). No live-engine read — the per-node display engine can diverge across
+        // the network and must never gate consensus. (Genesis epoch h≤180 predates any
+        // tombstone; for h>180 the authoritative eligible snapshot excludes tombstoned IDs.)
         let initial_norm = to_normalized(INITIAL_REPUTATION);
         GENESIS_NODE_IPS.iter()
             .map(|(_, id)| (format!("genesis_node_{}", id), initial_norm))
@@ -18279,6 +18265,14 @@ impl BlockchainNode {
                                         let target = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
                                         let target = std::cmp::max(target, network_height); // At least initial target
 
+                                        // Sync cursor SLAVED to the real applied chain height: always request
+                                        // from the first genuinely-missing block. A block downloaded but not
+                                        // yet applied (continuity gap) leaves chain height put, so we re-request
+                                        // exactly the hole until it applies — NEVER skip a gap forward (skipping
+                                        // strands the chain at a fixed height, which wedged genesis_node_001).
+                                        current_from = storage_clone.get_chain_height()
+                                            .unwrap_or(current_from);
+
                                         if current_from >= target {
                                             println!("[INFO][SYNC] caught_up h={}", current_from);
                                             break;
@@ -18348,19 +18342,21 @@ impl BlockchainNode {
                                                         }
                                                     }
                                                     Err(e) => {
+                                                        // Cursor is re-derived from the real chain height next
+                                                        // iteration — never skip forward on a repair error.
                                                         println!("[WARN][SYNC] repair_err: {}", e);
-                                                        // Force advance to prevent stall on persistent repair error
-                                                        current_from += 1;
                                                     }
                                                 }
 
-                                                // Stall detection: if current_from didn't advance, count it
+                                                // No-apply-progress detection. The cursor stays pinned to the real
+                                                // gap (re-derived each iteration) — we NEVER skip it forward. Back
+                                                // off so a persistently-missing block doesn't hot-loop the peer.
                                                 if current_from == prev_from {
                                                     stall_count += 1;
                                                     if stall_count >= 5 {
-                                                        println!("[WARN][SYNC] stalled {} times at {}, force advancing", stall_count, current_from);
-                                                        current_from += 1;
+                                                        println!("[WARN][SYNC] no_apply_progress at h={} stall={} — re-requesting gap (no skip)", current_from, stall_count);
                                                         stall_count = 0;
+                                                        tokio::time::sleep(Duration::from_secs(2)).await;
                                                     }
                                                 } else {
                                                     stall_count = 0;
@@ -18397,19 +18393,16 @@ impl BlockchainNode {
                                                     crate::unified_p2p::BEST_PEER_HEIGHT.store(new_target, Ordering::Release);
                                                 }
 
-                                                // Advance from for next batch
-                                                current_from += 1;
-                                                println!("[INFO][SYNC] batch_done batch={} next_from={}", batch_num, current_from);
+                                                // Cursor advances only via the real chain height (re-derived at
+                                                // loop top) — no blind +1 that could outrun unapplied blocks.
+                                                println!("[INFO][SYNC] batch_done batch={} applied_h={}", batch_num, current_from);
                                             },
                                             Err(_) => {
-                                                println!("[WARN][SYNC] batch {} timeout after {}s, retrying", batch_num, timeout_secs);
-                                                // Don't break — retry the same range
-                                                stall_count += 1;
-                                                if stall_count >= 5 {
-                                                    println!("[WARN][SYNC] {} consecutive timeouts, force advancing", stall_count);
-                                                    current_from += 1;
-                                                    stall_count = 0;
-                                                }
+                                                // Retry the SAME range — the cursor is re-derived from the real
+                                                // chain height next iteration. NEVER skip on timeout (skipping a
+                                                // still-missing block is exactly what stranded genesis_node_001).
+                                                println!("[WARN][SYNC] batch {} timeout after {}s, re-requesting same gap", batch_num, timeout_secs);
+                                                stall_count = stall_count.saturating_add(1);
                                                 tokio::time::sleep(Duration::from_secs(2)).await;
                                             }
                                         }
@@ -23802,39 +23795,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// - All nodes compute same reputation from on-chain data
     /// - Genesis nodes start at 70% (MIN_CONSENSUS_REPUTATION)
     /// ═══════════════════════════════════════════════════════════════════════════
-    pub async fn get_node_reputation_score(node_id: &str, p2p: &Arc<SimplifiedP2P>) -> f64 {
-        // PRODUCTION: Use P2P's DeterministicReputationState (blockchain-based)
-        // All nodes (including Genesis) get reputation from blockchain data
-        // FIX v2.21.5: Removed Genesis hardcode - they now earn/lose reputation like all nodes
-        match p2p.get_deterministic_reputation() {
-            Some(rep_state) => {
-                let state = rep_state.read();
-                let current_ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                // get_reputation returns 0-100, convert to 0.0-1.0
-                let score = state.get_reputation(node_id, current_ts);
-                // FIX v2.21.5: Proper conversion from 0-100 to 0.0-1.0
-                let raw_reputation = (score / 100.0).max(0.0).min(1.0);
-                
-                if raw_reputation < 0.70 {
-                    if is_debug() {
-                        // Guard: ensure rep is in valid 0-100 range for display
-                        let display_rep = (raw_reputation * 100.0).clamp(0.0, 100.0);
-                        println!("[DBG][REP] node={} below_threshold rep={:.1}%", 
-                            node_id, display_rep);
-                    }
-                }
-                
-                raw_reputation
-            }
-            None => {
-                // Use new blockchain-based method
-                let score = p2p.get_node_reputation_from_blockchain(node_id);
-                (score / 100.0).max(0.0).min(1.0)
+    pub async fn get_node_reputation_score(node_id: &str, _p2p: &Arc<SimplifiedP2P>) -> f64 {
+        // ONE deterministic consensus reputation model — a pure function of the finalized
+        // chain: {0.70 floor (eligible) | 0.0 if tombstoned}. A tombstone is a verified
+        // equivocation proof anchored in a finalized macroblock's ban-set; it is permanent.
+        // The per-node live engine (jail / passive-recovery / 0-100) is DISPLAY-only and is
+        // never read on a consensus-adjacent path — branching on it diverges across nodes.
+        use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
+        if let Some(storage) = try_get_storage() {
+            let head = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                .load(std::sync::atomic::Ordering::Acquire);
+            let mb_index = head / 90; // macroblock index covering the local head
+            if Self::compute_cumulative_ban_set(storage.as_ref(), mb_index)
+                .await
+                .contains(node_id)
+            {
+                return 0.0; // tombstoned → excluded
             }
         }
+        MIN_CONSENSUS_REPUTATION / 100.0
     }
     
     // REMOVED: is_light_node() function - now using REAL node type information

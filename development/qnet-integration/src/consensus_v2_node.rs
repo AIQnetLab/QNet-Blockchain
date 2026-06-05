@@ -435,7 +435,25 @@ pub async fn run(
                                     // fail-stop: a checkpoint whose content we don't independently reproduce
                                     // is never voted — a forged state_root cannot get our signature.
                                     if crate::node::is_warn() {
-                                        println!("[WARN][BFT2] proposal_content_rejected idx={}", msg_index(&msg));
+                                        // DIAG (cycle-1): pinpoint WHICH content field diverges, or a
+                                        // missing local window. No behaviour change — still fail-stop.
+                                        match &msg {
+                                            ConsensusMsg::Proposal(cp) => match window_buf.get(&(cp.window_head_height / 90)) {
+                                                Some(c) => println!(
+                                                    "[WARN][BFT2] proposal_content_rejected idx={} eq state_root={} mb_hashes={} beacon={} epoch_commit={}",
+                                                    msg_index(&msg),
+                                                    cp.state_root == c.state_root,
+                                                    cp.window_mb_hashes == c.mb_hashes,
+                                                    cp.beacon == c.beacon,
+                                                    qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee) == cp.epoch_commitment,
+                                                ),
+                                                None => println!(
+                                                    "[WARN][BFT2] proposal_content_rejected idx={} window_buf_MISS win={}",
+                                                    msg_index(&msg), cp.window_head_height / 90,
+                                                ),
+                                            },
+                                            _ => println!("[WARN][BFT2] proposal_content_rejected idx={}", msg_index(&msg)),
+                                        }
                                     }
                                     Vec::new()
                                 } else {
