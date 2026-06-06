@@ -1369,6 +1369,7 @@ impl QuicTransport {
                             p2p.update_peer_last_seen_with_height(
                                 &peer_handshake.node_id,
                                 Some(peer_handshake.block_height),
+                                true, // signed handshake = peer's own committed tip
                             );
                         }
                     }

@@ -1949,32 +1949,32 @@ impl BlockPipeline {
             // non-deterministic state and did fork.) Gated to !is_syncing() so
             // catch-up blocks aren't judged vs live cache. O(1) lookup.
             if !snap.is_syncing() && mb.height > 0 {
-                // v23.1: BFT-certified round authenticity gate. A block claims rotation
-                // round mb.timeout_round; verify it's plausible vs this node's local
-                // 2f+1-certified rounds for the macroblock, allowing a small forward
-                // drift (TIMEOUT_ROUND_DRIFT_WINDOW=3) for honest gossip latency. Past
-                // the window the claim is implausibly ahead of any cert → Byzantine
-                // signer. timeout_round is in hash+sig (immutable in transit) but a
-                // Byzantine producer can still SIGN an arbitrary round; without this,
-                // record_finalized_round at apply would advance LAST_FINALIZED_ROUND_
-                // PER_MB to the Byzantine value and lock out rotation until 2f+1 honest
-                // catches up — a bounded DoS. v15.0 rotation_backfill_request still
-                // fires as a soft signal. O(1)/ingest.
-                const TIMEOUT_ROUND_DRIFT_WINDOW: u64 = 3;
-                let mb_idx = mb.height / 90;
-                let local_certified =
-                    crate::unified_p2p::highest_certified_round_for(mb_idx);
-                if mb.timeout_round > local_certified.saturating_add(TIMEOUT_ROUND_DRIFT_WINDOW) {
-                    if is_warn() {
-                        println!(
-                            "[WARN][PIPELINE] timeout_round_implausible h={} mb={} claimed={} local_certified={} drift_window={} action=hard_reject from={}",
-                            mb.height, mb_idx, mb.timeout_round,
-                            local_certified, TIMEOUT_ROUND_DRIFT_WINDOW,
-                            decoded.from_peer,
-                        );
+                // v33: failover authority gate. A block claiming rotation round R (>0)
+                // is authentic ONLY if a 2f+1 TimeoutCertificate for (height, R) exists.
+                // The cert is self-contained (2f+1 Dilithium votes, verified before store
+                // in handle_timeout_proof_broadcast), so this check is IDENTICAL on every
+                // node — unlike the prior `highest_certified_round_for` drift window, whose
+                // local-certified term diverged across nodes (baseline skew) and let each
+                // node accept a DIFFERENT self-chosen round → competing forks → rollback
+                // storm. No cert yet (gossip race) → reject this ingest attempt; the block
+                // stays replayable and is re-accepted once the cert (re-broadcast by the
+                // producer at certification) arrives, or via sync (which skips this gate,
+                // trusting macroblock finality). Round 0 (happy path) needs no cert. O(1).
+                if mb.timeout_round > 0 {
+                    let round_certified = unified_p2p
+                        .as_ref()
+                        .map(|p2p| p2p.get_timeout_certificate(mb.height, mb.timeout_round).is_some())
+                        .unwrap_or(false);
+                    if !round_certified {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] failover_round_uncertified h={} round={} from={} action=reject_await_cert",
+                                mb.height, mb.timeout_round, decoded.from_peer,
+                            );
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
-                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                    continue;
                 }
 
                 if let Some((expected, expected_round)) = crate::node::get_expected_producer(mb.height) {

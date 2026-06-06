@@ -1523,12 +1523,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 .unwrap_or_default()
                 .as_secs();
             
-            // v3.19 FIX: Get reputation from blockchain, not P2P cache!
-            // PeerInfo.reputation is set ONCE at connection time and never updated.
-            // DeterministicReputationState is synced via macroblocks - all nodes have identical data.
-            let det_rep = blockchain.get_deterministic_reputation();
-            let rep_guard = det_rep.read();
-            
+            // Reputation display value — floor under the deterministic model (RAM engine removed).
             let mut peer_list: Vec<serde_json::Value> = peers.iter()
                 .filter(|peer| {
                     // API FIX: Filter out peers with invalid addresses
@@ -1538,8 +1533,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 })
                 .map(|peer| {
                     let last_seen_timestamp = peer.last_seen;
-                    // v3.19: Get REAL reputation from blockchain (DeterministicReputationState)
-                    let real_reputation = rep_guard.get_reputation(&peer.id, current_time);
+                    let real_reputation = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                     
                     json!({
                         "id": peer.id,
@@ -1564,18 +1558,13 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 let mut selected_genesis = Vec::new();
                 let max_genesis_to_return = std::cmp::min(2, genesis_ips.len());
                 
-                // Get deterministic reputation for real values
-                let det_rep = blockchain.get_deterministic_reputation();
-                let rep_guard = det_rep.read();
-                
                 for (idx, ip) in genesis_ips.iter().enumerate().take(max_genesis_to_return) {
                     let genesis_addr = format!("{}:8001", ip);
                     let genesis_id = format!("genesis_node_{:03}", idx + 1);
                     // Check if not already in list
                     let already_exists = peers.iter().any(|p| p.address == genesis_addr);
                     if !already_exists {
-                        // Get real reputation from deterministic system
-                        let real_reputation = rep_guard.get_reputation(&genesis_id, current_time);
+                        let real_reputation = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
                         selected_genesis.push(json!({
                             "id": genesis_id,
                             "address": genesis_addr,
@@ -2704,17 +2693,9 @@ async fn node_get_peers(blockchain: Arc<BlockchainNode>) -> Result<Value, RpcErr
     // Get real peer list from blockchain node
     let peers = blockchain.get_connected_peers().await.unwrap_or_default();
     
-    // v3.19: Get reputation from blockchain, not P2P cache!
-    let det_rep = blockchain.get_deterministic_reputation();
-    let rep_guard = det_rep.read();
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    
     // Format peers for RPC response
     let peer_list: Vec<Value> = peers.iter().map(|peer| {
-        let real_reputation = rep_guard.get_reputation(&peer.id, current_time);
+        let real_reputation = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         json!({
             "id": peer.id,
             "address": peer.address,
@@ -3776,16 +3757,13 @@ async fn handle_validators_with_proof(
     }
     
     // Source 2: Add Genesis nodes if not already present (fallback/bootstrap)
-    // v3.35: Get reputation from blockchain deterministic state
-    let rep_arc = blockchain.get_deterministic_reputation();
-    let rep_guard = rep_arc.read();
     for (genesis_ip, genesis_id) in GENESIS_NODE_IPS.iter() {
         let node_id = format!("genesis_node_{}", genesis_id);
         let already_exists = validators.iter().any(|v| 
             v["node_id"].as_str() == Some(node_id.as_str())
         );
         if !already_exists {
-            let real_rep = rep_guard.get_reputation(&node_id, current_time);
+            let real_rep = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
             let region = get_genesis_region_by_ip(genesis_ip).unwrap_or("Europe");
             validators.push(json!({
                 "node_id": node_id,
@@ -3799,8 +3777,7 @@ async fn handle_validators_with_proof(
             }));
         }
     }
-    drop(rep_guard);
-    
+
     // Sort validators by node_id for deterministic Merkle root
     validators.sort_by(|a, b| {
         a["node_id"].as_str().unwrap_or("").cmp(b["node_id"].as_str().unwrap_or(""))
@@ -5594,14 +5571,6 @@ async fn handle_node_discovery(
     }
     let peers = blockchain.get_connected_peers().await.unwrap_or_default();
     
-    // v3.19: Get reputation from blockchain, not P2P cache!
-    let det_rep = blockchain.get_deterministic_reputation();
-    let rep_guard = det_rep.read();
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    
     // FIX R20-M2: Mask peer IPs for external callers to prevent network topology mapping
     let caller_ip = remote_addr
         .map(|a| a.ip().to_string())
@@ -5609,7 +5578,7 @@ async fn handle_node_discovery(
     let caller_is_internal = is_internal_ip(&caller_ip);
 
     let peer_nodes: Vec<Value> = peers.iter().map(|peer| {
-        let real_reputation = rep_guard.get_reputation(&peer.id, current_time);
+        let real_reputation = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
         if caller_is_internal {
             // Internal nodes: full peer info for P2P synchronization
             json!({

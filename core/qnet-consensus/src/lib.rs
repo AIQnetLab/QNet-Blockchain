@@ -40,9 +40,9 @@ pub use errors::ConsensusError;
 pub use reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
 pub use kademlia::{KademliaDht, KademliaNode, generate_node_id};
 pub use deterministic_reputation::{
-    DeterministicReputationState, SlashingEvent, SlashingType, 
-    AutomaticJail, MacroBlockConsensus, BlockData, MacroBlockData,
-    ReputationStats,
+    // Slashing/jail primitives kept on-chain (part of MacroBlockConsensusData).
+    SlashingEvent, SlashingType, AutomaticJail,
+    // Reputation parameters (display/consensus thresholds + slashing economics).
     INITIAL_REPUTATION, MAX_REPUTATION, MIN_CONSENSUS_REPUTATION,
     REWARD_FULL_ROTATION, REWARD_CONSENSUS_PARTICIPATION,
     PENALTY_INVALID_BLOCK, PENALTY_DOUBLE_SIGN, PENALTY_MISSED_BLOCK,

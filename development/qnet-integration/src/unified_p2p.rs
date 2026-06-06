@@ -2246,10 +2246,6 @@ pub struct SimplifiedP2P {
     // DEPRECATED v2.38: slashing_collector removed
     // Slashing now determined on-chain via analyze_chain_for_slashing()
     
-    /// PRODUCTION: Deterministic reputation state (shared with BlockchainNode)
-    /// Set via set_deterministic_reputation() after BlockchainNode creation
-    deterministic_reputation: Arc<parking_lot::RwLock<Option<Arc<parking_lot::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>>>>,
-    
     /// Block processing channel - CRITICAL: Must be Arc for sharing between clones!
     block_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ReceivedBlock>>>>,
     
@@ -3187,7 +3183,6 @@ impl SimplifiedP2P {
                 
                 Arc::new(Mutex::new(reputation_sys))
             },
-            deterministic_reputation: Arc::new(parking_lot::RwLock::new(None)),
             block_tx: Arc::new(Mutex::new(None)),
             sync_request_tx: None,
             shred_protocol_assemblies: Arc::new(DashMap::new()),
@@ -3998,7 +3993,7 @@ impl SimplifiedP2P {
     
     /// Update peer last_seen timestamp when we receive data from them
     pub fn update_peer_last_seen(&self, peer_id_or_addr: &str) {
-        self.update_peer_last_seen_with_height(peer_id_or_addr, None);
+        self.update_peer_last_seen_with_height(peer_id_or_addr, None, false);
     }
     
     /// CRITICAL FIX v2.19.15: Auto-add peer to connected_peers when receiving messages
@@ -4169,7 +4164,13 @@ impl SimplifiedP2P {
 
     /// v2.24.3: Now stores height in PeerInfo for QUIC-only sync
     /// v2.24.4: Fixed port mismatch - find peer by IP when ports differ (QUIC vs HTTP)
-    pub fn update_peer_last_seen_with_height(&self, peer_id_or_addr: &str, height: Option<u64>) {
+    /// `authoritative` = height is the peer's own COMMITTED tip from a signed source
+    /// (HealthPing / verified handshake) and REPLACES the tracked value, so a stale
+    /// over-report (a relayed failover candidate above the committed tip, later
+    /// orphaned) self-heals on the next ping instead of poisoning network_height
+    /// permanently. Non-authoritative (block-relay) height only RAISES — keeps the
+    /// sync view fresh between pings without making a transient over-report permanent.
+    pub fn update_peer_last_seen_with_height(&self, peer_id_or_addr: &str, height: Option<u64>, authoritative: bool) {
         let current_time = self.current_timestamp();
         
         // CRITICAL FIX: Handle both peer ID (e.g., "genesis_node_003") and address (e.g., "161.97.86.81:8001")
@@ -4216,8 +4217,13 @@ impl SimplifiedP2P {
                 // current value (e.g., a steady-state peer at unchanged height
                 // is still attested by every signed HealthPing it emits).
                 peer.last_height_attested_at = current_time;
-                if h > peer.last_block_height {
+                let increased = h > peer.last_block_height;
+                // v33: authoritative (committed) REPLACES — heals a stale over-report;
+                // block-relay only RAISES — keeps the sync view fresh between pings.
+                if authoritative || increased {
                     peer.last_block_height = h;
+                }
+                if increased {
                     BEST_PEER_HEIGHT.fetch_max(h, std::sync::atomic::Ordering::Relaxed);
                     let our_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                     if h > our_h.saturating_add(20) {
@@ -4237,8 +4243,12 @@ impl SimplifiedP2P {
                     if let Some(h) = height {
                         // v30.A3: same attestation refresh as the primary branch
                         entry.last_height_attested_at = current_time;
-                        if h > entry.last_block_height {
+                        let increased = h > entry.last_block_height;
+                        // v33: authoritative REPLACES (heals), block-relay only RAISES.
+                        if authoritative || increased {
                             entry.last_block_height = h;
+                        }
+                        if increased {
                             BEST_PEER_HEIGHT.fetch_max(h, std::sync::atomic::Ordering::Relaxed);
                             let our_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                             if h > our_h.saturating_add(20) {
@@ -5948,7 +5958,6 @@ impl SimplifiedP2P {
         };
 
         let connected_peers = self.connected_peers_lockfree.clone();
-        let deterministic_rep = self.deterministic_reputation.clone();
         let genesis_ips: Vec<String> = vec![
             "154.38.160.39".to_string(), "62.171.157.44".to_string(),
             "161.97.86.81".to_string(), "5.189.130.160".to_string(),
@@ -6035,18 +6044,9 @@ impl SimplifiedP2P {
                     let peer = entry.value();
                     let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
 
-                    let reputation = {
-                        let outer = deterministic_rep.read();
-                        if let Some(ref inner_arc) = *outer {
-                            let state = inner_arc.read();
-                            state.get_reputation(&peer.id, std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs())
-                        } else { 
-                            qnet_consensus::deterministic_reputation::INITIAL_REPUTATION 
-                        }
-                    };
+                    // Engine removed; P2P no longer holds a per-node reputation view.
+                    // Floor value — consensus eligibility is gated by the chain fold elsewhere.
+                    let reputation = qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
 
                     if reputation < 10.0 && !is_genesis_peer {
                         to_remove.push(entry.key().clone());
@@ -8378,7 +8378,7 @@ impl SimplifiedP2P {
         // accidentally showed correct height via unwrap_or(local_height) fallback.
         let producer_id = if let Some(ref cert) = assembly.certificate {
             let pid = cert.node_id.clone();
-            self.update_peer_last_seen_with_height(&pid, Some(height));
+            self.update_peer_last_seen_with_height(&pid, Some(height), false);
             pid
         } else {
             "shred_protocol".to_string()
@@ -8472,7 +8472,7 @@ impl SimplifiedP2P {
             // must update peer heights for correct network_height tracking
             let producer_id = if let Some(ref cert) = assembly.certificate {
                 let pid = cert.node_id.clone();
-                self.update_peer_last_seen_with_height(&pid, Some(height));
+                self.update_peer_last_seen_with_height(&pid, Some(height), false);
                 pid
             } else {
                 "shred_protocol-rs".to_string()
@@ -13114,7 +13114,7 @@ impl SimplifiedP2P {
             NetworkMessage::ConsensusCommit { .. } | NetworkMessage::ConsensusReveal { .. } => {}
             NetworkMessage::Block { height, data, block_type } => {
                 // CRITICAL FIX: Update last_seen AND height for the peer who sent the block
-                self.update_peer_last_seen_with_height(from_peer, Some(height));
+                self.update_peer_last_seen_with_height(from_peer, Some(height), false);
                 
                 // Log only every 10th block
                 if height % 10 == 0 {
@@ -13421,12 +13421,12 @@ impl SimplifiedP2P {
                     // Signature proves sender identity — ALWAYS update height.
                     // Clock drift only means the message took a detour, not that
                     // the height is wrong. This is critical for syncing nodes.
-                    self.update_peer_last_seen_with_height(&from, Some(height));
+                    self.update_peer_last_seen_with_height(&from, Some(height), true);
                     if crate::node::is_debug() && height % 100 == 0 {
                         println!("[DBG][P2P] health_ping from={} h={} sig=verified age={}s", from, height, age_secs);
                     }
                 } else {
-                    self.update_peer_last_seen_with_height(&from, None);
+                    self.update_peer_last_seen_with_height(&from, None, false);
                     if crate::node::is_debug() {
                         println!("[DBG][P2P] health_ping from={} h={} sig=rejected age={}s", from, height, age_secs);
                     }
@@ -19831,7 +19831,7 @@ impl SimplifiedP2P {
         //     proof of peer height is a block the sender actually possesses;
         //   * empty batch → no height attestation, refresh liveness only.
         if let Some(max_block_h) = blocks.iter().map(|(h, _)| *h).max() {
-            self.update_peer_last_seen_with_height(&sender_id, Some(max_block_h));
+            self.update_peer_last_seen_with_height(&sender_id, Some(max_block_h), false);
         } else {
             self.update_peer_last_seen(&sender_id);
         }
@@ -21544,40 +21544,17 @@ impl SimplifiedP2P {
     
     /// Get node reputation from blockchain (DeterministicReputationState)
     /// Returns 0-100 range (same as old system for compatibility)
-    pub fn get_node_reputation_from_blockchain(&self, node_id: &str) -> f64 {
-        // 1. Try DeterministicReputationState first (primary source)
-        if let Some(rep_arc) = self.get_deterministic_reputation() {
-            let state = rep_arc.read();
-            let current_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            return state.get_reputation(node_id, current_ts);
-        }
-        
-        // 2. Fallback to INITIAL_REPUTATION if blockchain not ready
+    pub fn get_node_reputation_from_blockchain(&self, _node_id: &str) -> f64 {
+        // RAM reputation engine removed. The P2P layer no longer holds a per-node
+        // reputation view; consensus eligibility is decided by the deterministic chain
+        // fold ({70 floor | 0 if tombstoned}) + the macroblock eligible_producers snapshot.
+        // This helper returns the floor for connectivity/telemetry callers.
         qnet_consensus::deterministic_reputation::INITIAL_REPUTATION
     }
     
     /// Check if node can participate in consensus (reputation >= MIN_CONSENSUS_REPUTATION)
     pub fn can_node_participate_in_consensus(&self, node_id: &str) -> bool {
         self.get_node_reputation_from_blockchain(node_id) >= qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION
-    }
-    
-    /// PRODUCTION: Get deterministic reputation state (blockchain-based)
-    /// Shared with BlockchainNode for unified reputation access
-    pub fn get_deterministic_reputation(&self) -> Option<Arc<parking_lot::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>> {
-        let guard = self.deterministic_reputation.read();
-        guard.clone()
-    }
-    
-    /// PRODUCTION: Set deterministic reputation state (called by BlockchainNode after creation)
-    pub fn set_deterministic_reputation(&self, state: Arc<parking_lot::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>) {
-        let mut guard = self.deterministic_reputation.write();
-        *guard = Some(state);
-        if crate::node::is_info() {
-            println!("[INFO][P2P] Deterministic reputation state linked (blockchain-based)");
-        }
     }
     
     /// v2.76: Set storage reference for persistent heartbeat storage (scalability)
