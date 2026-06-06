@@ -11053,23 +11053,9 @@ impl SimplifiedP2P {
                                 return; // Height will arrive via HealthPing response
                             }
 
-                            // Fallback: HTTP query
-                            let url = format!("http://{}:8001/api/v1/node/health", ip);
-                            match HTTP_CLIENT.get(&url).send().await {
-                                Ok(resp) => {
-                                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                                        if let Some(h) = json.get("height").and_then(|v| v.as_u64()) {
-                                            if h > 0 {
-                                                BEST_PEER_HEIGHT.fetch_max(h, std::sync::atomic::Ordering::Relaxed);
-                                                if crate::node::is_info() {
-                                                    println!("[INFO][P2P] peer_height_query {}={} via HTTP", ip, h);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(_) => {}
-                            }
+                            // v33: inter-node HTTP fallback removed (top-L1: QUIC-only).
+                            // The peer's height arrives via its signed QUIC HealthPing
+                            // response; a transient QUIC miss self-heals on the next cycle.
                         }); } // end if should_query
                     }
                 }
@@ -19078,6 +19064,23 @@ impl SimplifiedP2P {
         let cutoff = now - (15 * 60);  // 15 minutes ago
         let network_height = self.get_max_peer_height();
 
+        // v33: snapshot the LIVE connected-peer height per node_id (refreshed every
+        // HealthPing, ~15s — the authoritative committed tip) BEFORE the retain, so we
+        // never nest DashMap locks. The height-based eviction below uses
+        // max(gossip_snapshot, live_height): active_full_super_nodes.block_height is a
+        // gossip snapshot that lags badly (observed: snap h=2160 while the node was
+        // really at the tip 3148) and false-evicted healthy nodes → active-set churn
+        // and a quorum risk at scale. A genuinely-behind node still evicts because its
+        // live height is also behind.
+        let mut live_heights: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for e in self.connected_peers_lockfree.iter() {
+            let p = e.value();
+            let slot = live_heights.entry(p.id.clone()).or_insert(0);
+            if p.last_block_height > *slot {
+                *slot = p.last_block_height;
+            }
+        }
+
         // v2.51: Lock-free cleanup — stale by time
         let before = self.active_full_super_nodes.len();
         self.active_full_super_nodes.retain(|node_id, v| {
@@ -19088,9 +19091,12 @@ impl SimplifiedP2P {
             // v9.3: Remove if >2 macroblocks behind network (severely desynced).
             // Don't apply during network bootstrap (network_height < 180).
             // Don't remove self (local height updates asynchronously).
-            if network_height > 180 && v.block_height + 180 < network_height && *node_id != self.node_id {
+            // v33: judge by the freshest known height, not just the lagging snapshot.
+            let live_h = live_heights.get(node_id).copied().unwrap_or(0);
+            let effective_h = v.block_height.max(live_h);
+            if network_height > 180 && effective_h + 180 < network_height && *node_id != self.node_id {
                 if crate::node::is_info() {
-                    println!("[INFO][P2P] evict_desynced node={} h={} net={}", node_id, v.block_height, network_height);
+                    println!("[INFO][P2P] evict_desynced node={} snap={} live={} net={}", node_id, v.block_height, live_h, network_height);
                 }
                 return false;
             }
@@ -21423,9 +21429,8 @@ impl SimplifiedP2P {
     }
     
     /// Request peer list from a connected node for decentralized discovery
-    /// v2.95: QUIC-first with HTTP fallback — works even when TCP ports are blocked
+    /// v33: QUIC-only (HTTP fallback removed) — UDP transport bypasses TCP blocks.
     async fn request_peer_list_from_node(node_addr: &str) -> Result<Vec<PeerInfo>, String> {
-        use std::time::Duration;
 
         let ip = node_addr.split(':').next().unwrap_or(node_addr);
 
@@ -21444,59 +21449,12 @@ impl SimplifiedP2P {
             }
         }
 
-        // === Phase 2: Fallback to HTTP (original behavior) ===
-        let endpoint = format!("http://{}:8001/api/v1/peers", ip);
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5))
-            .user_agent("QNet-Node/1.0")
-            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
-            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
-            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| format!("HTTP client error: {}", e))?;
-
-        match client.get(&endpoint).send().await {
-            Ok(response) if response.status().is_success() => {
-                match response.text().await {
-                    Ok(text) => {
-                        if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if let Some(peers_array) = json_value.get("peers").and_then(|p| p.as_array()) {
-                                let mut peer_list = Vec::new();
-                                for peer_json in peers_array {
-                                    if let Some(address) = peer_json.get("address").and_then(|a| a.as_str()) {
-                                        let peer_addr = if address.contains(':') { address.to_string() } else { format!("{}:8001", address) };
-                                        if let Ok(peer_info) = Self::parse_peer_address_static(&peer_addr) {
-                                            peer_list.push(peer_info);
-                                        }
-                                    }
-                                }
-                                if crate::node::is_info() {
-                                    println!("[INFO][P2P] Parsed {} peers from {} via HTTP", peer_list.len(), get_privacy_id_for_addr(node_addr));
-                                }
-                                Ok(peer_list)
-                            } else {
-                                Ok(Vec::new())
-                            }
-                        } else {
-                            Ok(Vec::new())
-                        }
-                    }
-                    Err(e) => Err(format!("Response read error: {}", e)),
-                }
-            }
-            Ok(response) => Err(format!("HTTP error: {}", response.status())),
-            Err(e) => {
-                // HTTP fallback failure after QUIC fallback path; transient
-                // peer-side throttle/restart, not a node-level error.
-                if crate::node::is_warn() {
-                    println!("[WARN][P2P] http_fallback_failed peer={} err={}",
-                             get_privacy_id_for_addr(node_addr), e);
-                }
-                Err(format!("Request failed: {}", e))
-            }
-        }
+        // === v33: QUIC-only (top-L1) — HTTP peer-list fallback removed. ===
+        // The QUIC peer exchange above is the sole inter-node discovery path; an
+        // empty/failed result self-heals on the next exchange cycle (and genesis
+        // nodes hold the bootstrap set), so discovery never depends on a single
+        // round. Removes the inter-VPS http_fallback_failed churn entirely.
+        quic_result
     }
 
     /// v2.95: Request peer list via QUIC transport (UDP-based, firewall-friendly)

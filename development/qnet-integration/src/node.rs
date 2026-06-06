@@ -24916,6 +24916,37 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         let eligible_bytes = bincode::serialize(&eligible).unwrap_or_default();
                                         // Window hashes + XOR state-root, and the VRF beacon = XOR of signed
                                         // microblock vrf_outputs (unbiasable randomness for next-epoch VRF).
+                                        //
+                                        // v33: DETERMINISTIC CONTENT — wait for the FULL window to be persisted
+                                        // before collecting. Previously mb_hashes/vrf_outputs were gathered with no
+                                        // wait (unlike state_root, which retried below), so a node whose window-end
+                                        // raced block persistence captured an INCOMPLETE set (load returned None for
+                                        // not-yet-flushed blocks) that never self-corrected → mb_hashes/beacon
+                                        // diverged from nodes with the full window → checkpoint content_ok=false →
+                                        // finality stall (observed mb_hashes=false beacon=false, state_root=true;
+                                        // window blocks proven byte-identical across nodes). Blocks are identical
+                                        // once present, so the full window yields identical content everywhere.
+                                        // Bounded (~30s); a node still missing blocks proceeds (no regression).
+                                        for _ in 0..120 {
+                                            let mut have_all = true;
+                                            for h in start_height..=end_height {
+                                                if !matches!(storage_cons.load_microblock_hash(h), Ok(Some(_))) {
+                                                    have_all = false;
+                                                    break;
+                                                }
+                                            }
+                                            let head_applied =
+                                                if let Ok(Some(hb)) = storage_cons.load_microblock_auto_format(end_height) {
+                                                    hb.state_root != [0u8; 32]
+                                                } else {
+                                                    false
+                                                };
+                                            if have_all && head_applied {
+                                                break;
+                                            }
+                                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                        }
+
                                         let mut mb_hashes: Vec<[u8; 32]> = Vec::new();
                                         // state_root = real account-state Merkle root at the window head
                                         // (head microblock's finalize_merkle output), not a hash-of-hashes:
