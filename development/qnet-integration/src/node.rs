@@ -24954,13 +24954,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // checkpoint and cross-checked on apply against each node's own state.
                                         let mut state_root = [0u8; 32];
                                         let mut vrf_outputs: Vec<[u8; 32]> = Vec::new();
+                                        let mut diag_hash_miss = 0u32; // v33-DIAG
+                                        let mut diag_data_miss = 0u32; // v33-DIAG
+                                        let mut diag_vrf_none = 0u32;  // v33-DIAG
                                         for h in start_height..=end_height {
                                             if let Ok(Some(hash)) = storage_cons.load_microblock_hash(h) {
                                                 mb_hashes.push(hash);
+                                            } else {
+                                                diag_hash_miss += 1;
                                             }
                                             if let Ok(Some(mb)) = storage_cons.load_microblock_auto_format(h) {
-                                                if let Some(v) = mb.vrf_output { vrf_outputs.push(v); }
+                                                match mb.vrf_output {
+                                                    Some(v) => vrf_outputs.push(v),
+                                                    None => diag_vrf_none += 1,
+                                                }
                                                 if h == end_height { state_root = mb.state_root; }
+                                            } else {
+                                                diag_data_miss += 1;
                                             }
                                         }
                                         // The head block's REAL account-state root (finalize_merkle) is written
@@ -24985,6 +24995,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             }
                                         }
                                         let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&vrf_outputs);
+                                        // v33-DIAG: pinpoint the mb_hashes/beacon finality-stall divergence.
+                                        // Compare this line across the 5 nodes for the same mb — differing
+                                        // len/digest/vrf_count/misses localizes the exact non-deterministic
+                                        // input. Remove once the root is fixed.
+                                        if is_warn() {
+                                            use sha3::Digest as _;
+                                            let mut hd = sha3::Sha3_256::new();
+                                            for x in &mb_hashes { hd.update(&x[..]); }
+                                            println!(
+                                                "[WARN][CONS-DIAG] mb={} start={} end={} mb_hashes_len={} digest={} vrf_count={} vrf_none={} hash_miss={} data_miss={} beacon={}",
+                                                mb_idx, start_height, end_height, mb_hashes.len(),
+                                                hex::encode(&hd.finalize()[..8]), vrf_outputs.len(), diag_vrf_none,
+                                                diag_hash_miss, diag_data_miss, hex::encode(&beacon[..8]),
+                                            );
+                                        }
                                         crate::consensus_v2_node::signal_window_end(
                                             mb_idx, end_height, mb_hashes, state_root, beacon, committee, eligible_bytes,
                                         );
