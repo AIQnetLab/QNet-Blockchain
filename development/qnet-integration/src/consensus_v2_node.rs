@@ -39,12 +39,31 @@ fn sign_str(domain: &str, body: &[u8]) -> String {
 /// Verify a wire message's signatures against the committee. Sync, registry-backed;
 /// the node calls this BEFORE handing the message to the (trusting) driver.
 pub fn verify_msg(p2p: &SimplifiedP2P, committee: &[String], msg: &ConsensusMsg) -> bool {
+    // H3: committee-MEMBERSHIP gate for Vote/Timeout. A valid signature from a REGISTERED
+    // validator is NOT sufficient — at scale the epoch committee is a ≤100 VRF sample of up
+    // to MAX_VALIDATORS registered keys, so a non-committee key's vote must not count toward
+    // quorum (else a set of non-committee validators forms a LOCAL QC that the rest of the
+    // network rejects via QuorumCertificate::verify's `qc_non_member` → that node commits a
+    // checkpoint nobody else accepts → local fork). Gated only when the committee is known
+    // (non-empty); empty = a pre-window/bootstrap state where no quorum can form anyway. At
+    // n=5 every genesis node IS the committee ⇒ no behaviour change.
+    let in_committee = |id: &str| committee.is_empty() || committee.iter().any(|c| c == id);
     match msg {
         ConsensusMsg::Proposal(cp) => sig_ok(p2p, &cp.proposer, &sign_str("CKPT", &cp.hash()), &cp.proposer_sig),
-        ConsensusMsg::Vote(v) => sig_ok(p2p, &v.voter, &sign_str("VOTE", &v.checkpoint_hash), &v.signature),
-        ConsensusMsg::Timeout(tm) => sig_ok(p2p, &tm.voter, &sign_str("TMO", &timeout_bytes(tm.index, tm.high_qc_index)), &tm.signature),
+        ConsensusMsg::Vote(v) => in_committee(&v.voter)
+            && sig_ok(p2p, &v.voter, &sign_str("VOTE", &v.checkpoint_hash), &v.signature),
+        ConsensusMsg::Timeout(tm) => in_committee(&tm.voter)
+            && sig_ok(p2p, &tm.voter, &sign_str("TMO", &timeout_bytes(tm.index, tm.high_qc_index)), &tm.signature),
         ConsensusMsg::Qc(qc) => verify_qc(p2p, committee, qc),
-        ConsensusMsg::Tc(tc) => tc.high_qc.as_ref().map(|q| verify_qc(p2p, committee, q)).unwrap_or(true),
+        // H4: a TC must carry ≥2f+1 DISTINCT committee timeouts (each signed) for its own
+        // view — not merely an optional high_qc. The old `unwrap_or(true)` accepted an
+        // EMPTY-timeouts TC and let on_timeout_cert advance the view (`current_index = tc.index+1`),
+        // which adopt_qc never rewinds ⇒ an unauthenticated, permanent view-desync DoS.
+        ConsensusMsg::Tc(tc) => tc.verify(
+            committee,
+            |t| sig_ok(p2p, &t.voter, &sign_str("TMO", &timeout_bytes(t.index, t.high_qc_index)), &t.signature),
+            |qc| verify_qc(p2p, committee, qc),
+        ).is_ok(),
     }
 }
 
@@ -279,7 +298,12 @@ pub enum V2Event {
         index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
         committee: Vec<String>,        // epoch committee (N-2 VRF sample) for this window
         eligible_producers: Vec<u8>,   // bincode Vec<EligibleProducer> for the macroblock body
+        banned: Vec<String>,           // QC-bound cumulative ban set (binds stored banned_validators)
     },
+    // A macroblock whose checkpoint QC the apply path already verified against the correct epoch
+    // committee — fed here so a driver too far behind for gossip fast-forwards from committed
+    // state (§4.5 catch-up). bincode of (Checkpoint, QuorumCertificate).
+    Synced(Vec<u8>),
 }
 
 /// Buffered per-window proposal/seal inputs from the production window signal, so a leader
@@ -293,6 +317,7 @@ struct WindowContent {
     head_ts: u64,
     committee: Vec<String>,
     eligible: Vec<u8>,
+    banned: Vec<String>,   // QC-bound cumulative ban set (folded into epoch_commitment)
 }
 
 /// Adopt the in-flight window's committee and, if we lead the current round, propose the
@@ -306,7 +331,7 @@ fn try_propose(
     match buf.get(&w) {
         Some(c) => {
             *committee = c.committee.clone(); // committee is per-window (epoch); QC/TC verify against it
-            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone())
+            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone())
         }
         None => Vec::new(),
     }
@@ -344,11 +369,19 @@ pub fn route_inbound(data: Vec<u8>) {
 /// Production loop calls this at each checkpoint-window boundary.
 pub fn signal_window_end(
     index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
-    committee: Vec<String>, eligible_producers: Vec<u8>,
+    committee: Vec<String>, eligible_producers: Vec<u8>, banned: Vec<String>,
 ) {
     if let Some(tx) = V2_TX.get() {
-        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers });
+        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned });
     }
+}
+
+/// The macroblock-apply path calls this AFTER it has verified the checkpoint QC against the
+/// correct epoch committee — handing the committed (Checkpoint, QC) bytes to the driver so a
+/// node whose consensus round fell behind the live quorum fast-forwards from committed state
+/// (§4.5 catch-up). Monotonic ⇒ a no-op for a node already at/ahead of this checkpoint.
+pub fn signal_synced_checkpoint(cp_qc: Vec<u8>) {
+    if let Some(tx) = V2_TX.get() { let _ = tx.send(V2Event::Synced(cp_qc)); }
 }
 
 /// Register the inbound channel SYNCHRONOUSLY (before run() is spawned) so the
@@ -382,6 +415,11 @@ pub async fn run(
     // window from here at the current round — decoupling the window from a skippable round.
     let mut window_buf: std::collections::HashMap<u64, WindowContent> = std::collections::HashMap::new();
     const MAX_WINDOW_BUF: usize = 256;
+    // LIVENESS WATCHDOG state: the consensus dropout that motivated this was SILENT (Docker
+    // reported "healthy" while the driver was frozen). Track sustained lag of the driver behind
+    // the applied chain tip and alarm LOUDLY once per episode — re-armed on recovery.
+    let mut stuck_ticks: u32 = 0;
+    let mut stuck_alarmed = false;
     if crate::node::is_info() {
         println!("[INFO][BFT2] runtime_started committee={} view_timeout_ms={}", committee.len(), timeout_ms);
     }
@@ -425,7 +463,7 @@ pub async fn run(
                                         .map(|c| cp.state_root == c.state_root
                                             && cp.window_mb_hashes == c.mb_hashes
                                             && cp.beacon == c.beacon
-                                            && qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee) == cp.epoch_commitment)
+                                            && qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee, &c.banned) == cp.epoch_commitment)
                                         // No locally-derived content for the proposer's claimed window ⇒
                                         // we cannot verify it, so we never sign it (fail-stop).
                                         .unwrap_or(false),
@@ -445,7 +483,7 @@ pub async fn run(
                                                     cp.state_root == c.state_root,
                                                     cp.window_mb_hashes == c.mb_hashes,
                                                     cp.beacon == c.beacon,
-                                                    qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee) == cp.epoch_commitment,
+                                                    qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee, &c.banned) == cp.epoch_commitment,
                                                 ),
                                                 None => println!(
                                                     "[WARN][BFT2] proposal_content_rejected idx={} window_buf_MISS win={}",
@@ -471,7 +509,7 @@ pub async fn run(
                         }
                         Err(_) => Vec::new(),
                     },
-                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers } => {
+                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned } => {
                         // Buffer this window's content (head microblock's real timestamp rides in
                         // the QC-agreed checkpoint). Then propose the contiguous next window if we
                         // lead, and replay buffered inbound.
@@ -479,7 +517,7 @@ pub async fn run(
                         let head_ts = storage.load_microblock_auto_format(head_height)
                             .ok().flatten().map(|m| m.timestamp).unwrap_or(0);
                         window_buf.insert(index, WindowContent {
-                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers,
+                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned,
                         });
                         if window_buf.len() > MAX_WINDOW_BUF {
                             if let Some(&lo) = window_buf.keys().min() { window_buf.remove(&lo); }
@@ -487,6 +525,25 @@ pub async fn run(
                         let mut effs = try_propose(&mut driver, &window_buf, &mut committee);
                         effs.extend(drain_pending(&mut driver, &window_buf, &p2p, &committee, &mut pending, MAX_PENDING));
                         effs
+                    }
+                    V2Event::Synced(cp_qc) => {
+                        // Safety-net catch-up (§4.5): the apply path verified this checkpoint QC against
+                        // the correct epoch committee, so fast-forward the driver from committed state —
+                        // for a node so far behind that live gossip for its stale round never arrives
+                        // (e.g. it was offline). Monotonic (adopt_qc) ⇒ a no-op once caught up. On a real
+                        // advance, re-adopt committee, propose if we now lead, and replay buffered inbound.
+                        match bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)>(&cp_qc) {
+                            Ok((cp, qc)) => {
+                                let mut effs = driver.sync(&cp, &qc);
+                                if !effs.is_empty() {
+                                    if let Some(c) = window_buf.get(&driver.next_window()) { committee = c.committee.clone(); }
+                                    effs.extend(try_propose(&mut driver, &window_buf, &mut committee));
+                                    effs.extend(drain_pending(&mut driver, &window_buf, &p2p, &committee, &mut pending, MAX_PENDING));
+                                }
+                                effs
+                            }
+                            Err(_) => Vec::new(),
+                        }
                     }
                 };
                 execute(effects, &node_id, &p2p, &storage).await;
@@ -500,6 +557,38 @@ pub async fn run(
                     execute(effects, &node_id, &p2p, &storage).await;
                 }
                 last_index = driver.current_index();
+                // LIVENESS WATCHDOG: the applied chain tip advances via macroblock sync even when the
+                // driver is frozen — so a large, sustained gap between the chain's window and the
+                // window the driver still wants to commit means the driver fell behind the live quorum
+                // and the §4.5 sync catch-up did NOT recover it. Surface it LOUDLY (this failure was
+                // previously invisible: the container stayed "healthy"). Re-armed once recovered.
+                const STUCK_WINDOWS: u64 = 3;   // beyond normal 2-chain finality lag
+                const STUCK_TICKS: u32 = 5;     // sustained (~20s at the 4s view timer) before alarming
+                let chain_window = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed) / 90;
+                if chain_window > driver.next_window().saturating_add(STUCK_WINDOWS) {
+                    stuck_ticks = stuck_ticks.saturating_add(1);
+                    if stuck_ticks >= STUCK_TICKS && !stuck_alarmed {
+                        stuck_alarmed = true;
+                        println!("[ERROR][BFT2] consensus_driver_behind round={} next_window={} chain_window={} — driver lagging the quorum; §4.5 sync did not recover it (previously a SILENT dropout)",
+                                 driver.current_index(), driver.next_window(), chain_window);
+                    }
+                } else {
+                    stuck_ticks = 0;
+                    stuck_alarmed = false;
+                }
+                // v34 (P1-E): re-emit a deferred finalize. The engine's Action::Commit is ONE-SHOT
+                // and Effect::Finalize defers when the local microblock tip was below the window head
+                // at commit time — so finality could stick behind the committed window until the NEXT
+                // window commits (slow / never if production then gates on the lagging finality). Re-
+                // attempt every tick while the committed head is ahead of finality. try_advance_finality
+                // is monotonic + guarded (chain_h ≥ head, state match) ⇒ a no-op once caught up and it
+                // NEVER advances finality past the applied tip.
+                if let Some(head) = driver.committed_head() {
+                    if head > crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::Acquire) {
+                        let idx = driver.committed_index();
+                        execute(vec![Effect::Finalize { index: idx, head_height: head }], &node_id, &p2p, &storage).await;
+                    }
+                }
             }
         }
     }

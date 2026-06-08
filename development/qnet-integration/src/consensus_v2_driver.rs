@@ -64,6 +64,18 @@ impl ConsensusDriver {
     pub fn current_index(&self) -> u64 { self.eng.current_index }
     pub fn committee(&self) -> &[NodeId] { &self.committee }
 
+    /// Window head height of the highest 2-chain-committed checkpoint, or None if nothing has
+    /// committed. The run loop uses this to RE-EMIT a deferred Finalize: `Action::Commit` is
+    /// one-shot, and `Effect::Finalize` defers when the local microblock tip is below the head
+    /// at commit time — so without a re-attempt, finality could stick behind the committed window
+    /// until the NEXT window commits. Re-emitting is safe: `try_advance_finality` is monotonic and
+    /// guarded (chain_h ≥ head, state match), so it is a no-op once caught up.
+    pub fn committed_head(&self) -> Option<u64> {
+        let ci = self.eng.committed_index;
+        if ci == 0 { return None; }
+        self.heads.get(&ci).copied().filter(|h| *h > 0)
+    }
+
     fn parent_hash(&self) -> Hash {
         self.eng.high_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash)
     }
@@ -94,13 +106,15 @@ impl ConsensusDriver {
     pub fn build_proposal(
         &mut self, window: u64, mb_hashes: Vec<Hash>,
         state_root: Hash, beacon: Hash, head_ts: u64,
-        committee: Vec<NodeId>, eligible_producers: Vec<u8>,
+        committee: Vec<NodeId>, eligible_producers: Vec<u8>, banned: Vec<NodeId>,
     ) -> Vec<Effect> {
         self.set_committee(committee.clone());
         let round = self.eng.current_index;
         // QC-certified commitment to this window's epoch-transition data (compute before the
-        // move into seal_data); lets syncing nodes trust the published validator set.
-        let epoch_c = epoch_commitment(&eligible_producers, &committee);
+        // move into seal_data); lets syncing nodes trust the published validator set AND ban
+        // set. `banned` is the deterministic cumulative ban set the macroblock body also stores;
+        // binding it here means a corrupted stored banned_validators can never match the QC.
+        let epoch_c = epoch_commitment(&eligible_producers, &committee, &banned);
         // Seal inputs keyed by ROUND (seal_if_ready looks up by qc.index) and buffered on
         // every member so any can seal the macroblock locally on QC (all-seal).
         self.seal_data.insert(round, (eligible_producers, committee));
@@ -265,7 +279,7 @@ mod tests {
         for index in 1..=8u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new());
+                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new());
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
@@ -303,7 +317,7 @@ mod tests {
         fn step(nodes: &mut Vec<Node>, c: &[NodeId], w: u64) {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(), Vec::new());
+                let effs = nodes[k].d.build_proposal(w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(), Vec::new(), Vec::new());
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(nodes, c, seed);
@@ -323,5 +337,57 @@ mod tests {
             let mut s = nodes[k].sealed.clone(); s.sort(); s.dedup();
             assert_eq!(s, vec![1, 2, 3, 4], "node {} windows not contiguous across skip: {:?}", k, s);
         }
+    }
+
+    // Wrapper-level catch-up (§4.5) — the liveness gap this driver hit in production: a node whose
+    // consensus round fell behind the live quorum, fed VERIFIED committed (checkpoint, QC) via
+    // sync(), must fast-forward BOTH its view AND next_window(). next_window() is derived from
+    // heads[high_qc.index]; sync() populates heads from the checkpoint's window_head_height, so a
+    // far-behind node re-joins pointing at the correct contiguous window (and the liveness watchdog,
+    // which compares next_window to the applied chain tip, then reads a correct value). A bare-QC
+    // adopt could NOT do this — it advances high_qc with no head, collapsing next_window to 1 — which
+    // is why the committed-macroblock sync, not gossip QC replay, is QNet's catch-up path.
+    #[test]
+    fn driver_catches_up_via_sync() {
+        let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
+        let genesis = [7u8; 32];
+        let mut d = ConsensusDriver::new("n9".into(), c.clone(), genesis); // far-behind, never participated
+        assert_eq!(d.current_index(), 1);
+        assert_eq!(d.next_window(), 1);
+        let mut parent_hash = genesis;
+        let mut prev_qc: Option<QuorumCertificate> = None;
+        for i in 1..=5u64 {
+            let cp = Checkpoint {
+                index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
+                window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], timestamp: 0,
+                proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
+            };
+            let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
+            let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
+            let qc = QuorumCertificate {
+                checkpoint_hash: cp.hash(), index: i, sig_merkle_root: sig_merkle_root(&sigs), signers, sigs,
+            };
+            let _ = d.sync(&cp, &qc); // store + adopt ⇒ commit + advance view AND heads
+            parent_hash = cp.hash();
+            prev_qc = Some(qc);
+        }
+        // Adopted QC(5) ⇒ view at 6; 2-chain finalized C1..C4; next window tracks the synced tip
+        // (high_qc head 450 / 90 + 1) — NOT collapsed to 1.
+        assert_eq!(d.current_index(), 6, "behind driver must fast-forward its round");
+        assert_eq!(d.committed_index(), 4, "2-chain must finalize the synced prefix");
+        assert_eq!(d.next_window(), 6, "next_window must track the synced tip via heads");
+        // P1-E: committed_head exposes the highest committed window head so the run loop can
+        // re-emit a deferred Finalize. C4's head_height = 4*90 = 360 (head = index*90 in this test).
+        assert_eq!(d.committed_head(), Some(360), "committed_head must track the highest committed window head");
+    }
+
+    // P1-E: a fresh driver has nothing committed → no head to re-finalize.
+    #[test]
+    fn committed_head_none_before_any_commit() {
+        let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
+        let d = ConsensusDriver::new("n0".into(), c.clone(), [7u8; 32]);
+        assert_eq!(d.committed_index(), 0);
+        assert_eq!(d.committed_head(), None, "no commit yet ⇒ no head to re-emit a finalize for");
     }
 }

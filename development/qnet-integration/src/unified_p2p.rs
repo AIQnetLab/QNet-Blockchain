@@ -174,6 +174,18 @@ pub static CACHED_NETWORK_HEIGHT: AtomicU64 = AtomicU64::new(0);
 pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> =
     Lazy::new(|| Arc::new(AtomicU64::new(0)));
 
+// v34: last KNOWN-CANONICAL validator count — from the consensus PK registry (genesis) or
+// the deterministic N-2 eligible set (normal epoch). When a node temporarily loses its
+// canonical source (N-2 macroblock not yet synced), get_active_validator_count() returns
+// THIS instead of a runtime live-peer count. Rationale: the live-peer count drifts ±1 as
+// peers connect/disconnect within the liveness window and counts self inconsistently across
+// nodes, so two nodes in the same fallback window computed DIFFERENT 2f+1 thresholds and a
+// timeout cert valid to one was rejected by another → view-change split. The last canonical
+// count changes only at epoch boundaries, so recently-synced nodes agree on it. 0 = never had
+// a canonical count (genuine cold boot) → fall through to the live-peer estimate.
+static LAST_CANONICAL_VALIDATOR_COUNT: Lazy<Arc<AtomicU64>> =
+    Lazy::new(|| Arc::new(AtomicU64::new(0)));
+
 // v9.5: Best known peer height — O(1) read for sync-gate checks.
 // Updated atomically when peer heartbeats arrive (update_peer_last_seen).
 // Replaces O(N) scan of active_full_super_nodes on every consensus tick.
@@ -1418,6 +1430,29 @@ pub fn get_certified_rotation_round(mb_index: u64) -> u64 {
     let baseline = get_baseline_round(mb_index);
     let certified = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
     certified.saturating_sub(baseline)
+}
+
+/// v34: ingest authority for a failover microblock — true iff a relative rotation round
+/// `block_round` (the block's `mb.timeout_round`, 0 on the happy path) is BFT-certified:
+/// 2f+1 of the committee certified a round ≥ its ABSOLUTE round (`block_round + baseline`).
+///
+/// This is the EXACT predicate the producer used to pick the round — both read the same
+/// `HIGHEST_CERTIFIED_ROUND[mb_idx]` (see `get_certified_rotation_round`) — so the ingest gate
+/// and the producer can never disagree on whether a round is authorised.
+///
+/// Why this replaces the old gate: `HIGHEST_CERTIFIED_ROUND` is advanced by BOTH 2f+1 paths —
+/// a same-round `TimeoutProof` AND a cross-round `AggregatedTimeoutCertificate` (the pacemaker
+/// that exists precisely for failover storms, where votes spread over rounds and no single round
+/// reaches 2f+1). The previous gate consulted only the same-round `TIMEOUT_CERTIFICATES` map and
+/// keyed it by microblock HEIGHT + the RELATIVE round — a key that is never populated (votes/certs
+/// key by mb_idx + absolute round). So it rejected EVERY failover block, splitting the chain
+/// whenever a round-storm produced one (producer advanced cross-round; receivers demanded a
+/// same-round proof the storm structurally prevents) → multi-hour stall. Same key + same
+/// authority = symmetric, storm-safe, O(1).
+pub fn failover_round_authorized(mb_index: u64, block_round: u64) -> bool {
+    if block_round == 0 { return true; } // happy path: no failover, no certificate required
+    let baseline = get_baseline_round(mb_index);
+    highest_certified_round_for(mb_index) >= block_round.saturating_add(baseline)
 }
 
 /// DEPRECATED in v23.1 — kept only for backward compatibility with
@@ -13590,7 +13625,7 @@ impl SimplifiedP2P {
                     let n = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
                     if n >= 3 { n } else { 5 }
                 };
-                let two_f_plus_1 = ((2 * total_validators + 2) / 3).max(3);
+                let two_f_plus_1 = qnet_consensus::checkpoint_bft::quorum_size(total_validators).max(3); // v34: n−f (was ceil(2n/3))
 
                 if count_after >= two_f_plus_1 {
                     // 2f+1 observers confirmed — destructive rollback is
@@ -20572,8 +20607,13 @@ impl SimplifiedP2P {
         }
 
         // v4.0: Also request timeout proofs for this range (BFT Timeout Protocol)
-        // This ensures syncing nodes get all necessary data for producer validation
-        self.request_timeout_proofs(from_height, to_height);
+        // This ensures syncing nodes get all necessary data for producer validation.
+        // v34: timeout certs are keyed by mb_idx (height/90), and the serve filters by
+        // that key — so the range MUST be converted to mb_idx space. Passing raw heights
+        // made the serve filter (`from <= mb_idx <= to`) never match for any height above
+        // ~a few hundred → syncing nodes got ZERO certs → stale HIGHEST_CERTIFIED_ROUND →
+        // they rejected legitimate failover blocks until the ingest backfill rescued them.
+        self.request_timeout_proofs(from_height / 90, to_height / 90);
         
         // v9.6: Use get_sync_peers_filtered_by_height() for L1-grade peer selection.
         // This replaces the old genesis-IP-only filter that forced ALL sync through 5 genesis nodes.
@@ -23068,7 +23108,12 @@ impl SimplifiedP2P {
         
         // Get total validator count for Byzantine threshold calculation
         let total_validators = self.get_active_validator_count();
-        let byzantine_threshold = (total_validators * 2 + 2) / 3; // 2/3+
+        // v34: canonical n−f quorum — the SAME fn the macroblock Checkpoint-BFT uses
+        // (checkpoint_bft::quorum_size). The old ceil(2n/3) was a STRICTLY SMALLER (unsafe)
+        // quorum whenever n ≡ 0 (mod 3) — 4-of-6 vs the safe 5-of-6 — so the two consensus
+        // layers disagreed on the failover threshold and a round certified at the weaker bar
+        // could split honest nodes once the committee grows past 5. At n=5 both give 4 (no-op).
+        let byzantine_threshold = qnet_consensus::checkpoint_bft::quorum_size(total_validators);
         
         // Add vote to collection
         let votes_count = {
@@ -23162,7 +23207,7 @@ impl SimplifiedP2P {
         // Cross-round resumes after the first macroblock; 2f+1 invariant intact.
         let cross_round_pacemaker_enabled = height > 0;
         if cross_round_pacemaker_enabled {
-            let two_f_plus_1 = (2 * total_validators + 2) / 3; // ceil(2n/3) = 2f+1
+            let two_f_plus_1 = qnet_consensus::checkpoint_bft::quorum_size(total_validators); // v34: n−f (was ceil(2n/3))
             if two_f_plus_1 > 0 && max_rounds.len() >= two_f_plus_1 {
                 let idx = two_f_plus_1 - 1;
                 max_rounds.select_nth_unstable_by(idx, |a, b| b.cmp(a));
@@ -24199,7 +24244,7 @@ impl SimplifiedP2P {
         }
 
         let total_validators = self.get_active_validator_count();
-        let two_f_plus_1 = (2 * total_validators + 2) / 3;
+        let two_f_plus_1 = qnet_consensus::checkpoint_bft::quorum_size(total_validators); // v34: n−f, matches macroblock BFT2
         if two_f_plus_1 == 0 {
             if crate::node::is_warn() {
                 println!("[WARN][TIMEOUT] agg_tc_no_quorum_target h={} committee=0", height);
@@ -24542,7 +24587,7 @@ impl SimplifiedP2P {
         };
 
         let total_validators = self.get_active_validator_count();
-        let two_f_plus_1 = (2 * total_validators + 2) / 3;
+        let two_f_plus_1 = qnet_consensus::checkpoint_bft::quorum_size(total_validators); // v34: n−f, matches macroblock BFT2
 
         // v15.9: Run structural checks via the static helper so unit tests
         // can exercise the same logic without spinning up a P2P stack.
@@ -24697,8 +24742,8 @@ impl SimplifiedP2P {
         
         // Verify Byzantine threshold
         let total_validators = self.get_active_validator_count();
-        let byzantine_threshold = (total_validators * 2 + 2) / 3;
-        
+        let byzantine_threshold = qnet_consensus::checkpoint_bft::quorum_size(total_validators); // v34: n−f, matches macroblock BFT2
+
         if votes.len() < byzantine_threshold {
             if crate::node::is_warn() {
                 println!("[WARN][TIMEOUT] proof_insufficient_votes h={} round={} votes={} need={}", 
@@ -24993,6 +25038,7 @@ impl SimplifiedP2P {
             let registry_size = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
             if registry_size >= GENESIS_MIN_VALIDATORS {
                 let total = registry_size.min(crate::node::MAX_VALIDATORS);
+                LAST_CANONICAL_VALIDATOR_COUNT.store(total as u64, std::sync::atomic::Ordering::Relaxed); // v34
                 if crate::node::is_info() {
                     println!("[INFO][BFT] validator_count={} source=consensus_pk_registry h={}",
                              total, local_h);
@@ -25018,6 +25064,7 @@ impl SimplifiedP2P {
         // — same set the quorum-vote gates use; numerator==denominator).
         if let Some(ids) = self.deterministic_eligible_ids() {
             let capped = ids.len().min(crate::node::MAX_VALIDATORS);
+            LAST_CANONICAL_VALIDATOR_COUNT.store(capped as u64, std::sync::atomic::Ordering::Relaxed); // v34
             if crate::node::is_info() {
                 println!("[INFO][BFT] validator_count={} source=macroblock_n2 epoch={} unique={}",
                          capped, (local_h - 1) / 90 + 1, ids.len());
@@ -25025,7 +25072,20 @@ impl SimplifiedP2P {
             return capped;
         }
 
-        // Fallback: macroblock snapshot unavailable → use live unique peers.
+        // v34: macroblock N-2 snapshot unavailable. Prefer the last KNOWN-CANONICAL count over
+        // the drifting live-peer estimate — a recently-synced node that briefly lost N-2 then keeps
+        // the network-agreed 2f+1 threshold instead of drifting to a per-node peer count (the split
+        // source). Only a never-synced cold-boot node (last_canonical==0) falls to live peers.
+        let last_canonical =
+            LAST_CANONICAL_VALIDATOR_COUNT.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        if last_canonical > 0 {
+            if crate::node::is_info() {
+                println!("[INFO][BFT] validator_count={} source=last_canonical epoch={} (N-2 absent)",
+                         last_canonical, (local_h - 1) / 90 + 1);
+            }
+            return last_canonical.min(crate::node::MAX_VALIDATORS);
+        }
+        // Cold-boot fallback: never had a canonical count → live unique peers.
         // v14.1: Dedupe by node_id + liveness filter prevents phantom inflation.
         let unique_live = self.count_unique_live_peers(BFT_LIVENESS_WINDOW_SECS);
         let total = std::cmp::max(GENESIS_MIN_VALIDATORS, unique_live + 1)
@@ -25072,17 +25132,39 @@ impl SimplifiedP2P {
                     // a REAL finalized macroblock (eligible_producers non-empty
                     // AND beacon present) → committee+beacon land on the SAME
                     // macroblock, leader selection stays consistent.
-                    if mb.consensus_data.randomness_beacon.is_none() { idx = idx.saturating_sub(1); continue; }
+                    let beacon = match mb.consensus_data.randomness_beacon {
+                        Some(b) => b,
+                        None => { idx = idx.saturating_sub(1); continue; }
+                    };
                     if let Some(snap) = mb.consensus_data.eligible_producers.as_ref() {
                         if let Ok(producers) =
                             bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snap)
                         {
-                            let set: std::collections::HashSet<String> = producers
+                            // v34: the failover / timeout consensus set is the VRF COMMITTEE (≤100),
+                            // NOT the full eligible set (≤1000). Derived by the SAME canonical fn the
+                            // macroblock sealer calls (checkpoint_bft::sample_committee) with the SAME
+                            // inputs — sorted-by-id eligible from THIS macroblock, window = current
+                            // epoch, this macroblock's beacon as seed — so every node gets a byte-
+                            // identical committee (no fork). At ≤120 nodes committee == eligible ⇒
+                            // behaviour-identical to today; this only bites at scale, moving failover
+                            // from a 667-of-1000 quorum to 67-of-100 (bounded gossip, churn-robust).
+                            // Microblock PRODUCTION still rotates over the full eligible set — only the
+                            // failover VOTING set narrows to the committee.
+                            let mut ids: Vec<String> = producers
                                 .into_iter()
                                 .map(|p| p.node_id)
                                 .filter(|id| !id.is_empty())
                                 .collect();
-                            if !set.is_empty() {
+                            if !ids.is_empty() {
+                                ids.sort(); // MUST match the sealer's sorted candidate order
+                                let committee = qnet_consensus::checkpoint_bft::sample_committee(
+                                    &ids,
+                                    current_epoch,
+                                    &beacon,
+                                    qnet_consensus::checkpoint_bft::COMMITTEE_THRESHOLD,
+                                    qnet_consensus::checkpoint_bft::COMMITTEE_SIZE,
+                                );
+                                let set: std::collections::HashSet<String> = committee.into_iter().collect();
                                 if idx != required_macroblock && crate::node::is_warn() {
                                     println!("[WARN][BFT] committee_fallback used_mb={} wanted_mb={} depth={} reason=n2_absent_self_heal",
                                              idx, required_macroblock, required_macroblock - idx);
@@ -26946,7 +27028,37 @@ impl SimplifiedP2P {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    /// v34: the ingest failover-round authority must accept a round reached via the CROSS-ROUND
+    /// pacemaker (HIGHEST_CERTIFIED_ROUND advanced with NO same-round TimeoutProof) — the exact
+    /// case the old cert-gate rejected (it keyed a same-round map by microblock height + relative
+    /// round, never populated), deadlocking the chain during a failover storm. The predicate must
+    /// mirror the producer's own round check: certified_abs >= block_round + baseline.
+    #[test]
+    fn failover_round_authorized_matches_producer_authority() {
+        // Unique mb_idx values so the global consensus DashMaps don't collide with other tests.
+        let mb = 9_100_001u64;
+        // Storm case: pacemaker certified ABSOLUTE round 12; no same-round proof was ever stored.
+        HIGHEST_CERTIFIED_ROUND.insert(mb, 12);
+        LAST_FINALIZED_ROUND_PER_MB.insert(mb, 0); // baseline 0
+        assert!(failover_round_authorized(mb, 0),  "round 0 (happy path) is always authorised");
+        assert!(failover_round_authorized(mb, 11), "round below certified is authorised");
+        assert!(failover_round_authorized(mb, 12), "round == certified is authorised (the storm case the old gate rejected)");
+        assert!(!failover_round_authorized(mb, 13), "round above certified is NOT authorised (uncertified/forged)");
+
+        // Non-zero baseline ⇒ the comparison is in ABSOLUTE units (block_round + baseline).
+        let mb2 = 9_100_002u64;
+        HIGHEST_CERTIFIED_ROUND.insert(mb2, 12);    // absolute certified round
+        LAST_FINALIZED_ROUND_PER_MB.insert(mb2, 5); // baseline 5
+        assert!(failover_round_authorized(mb2, 7),  "abs 7+5=12 <= 12 → authorised");
+        assert!(!failover_round_authorized(mb2, 8), "abs 8+5=13 > 12 → rejected");
+
+        // No certified round recorded ⇒ only the happy path (round 0) passes.
+        let mb3 = 9_100_003u64;
+        assert!(failover_round_authorized(mb3, 0),  "uninitialised mb: round 0 still ok");
+        assert!(!failover_round_authorized(mb3, 1), "uninitialised mb: any failover round rejected");
+    }
+
     /// Test rate limiter functionality
     #[test]
     fn test_rate_limiter() {
@@ -27475,12 +27587,16 @@ mod tests {
     /// `get_active_validator_count()`.
     #[test]
     fn test_skip_cert_two_f_plus_one_formula() {
-        // (N=4 → f=1 → 2f+1=3); (N=10 → f=3 → 2f+1=7); (N=100 → f=33 → 2f+1=67)
-        for (n, expected) in [(4usize, 3usize), (10, 7), (100, 67), (1_000, 667)] {
-            let two_f_plus_1 = (2 * n + 2) / 3;
-            assert_eq!(two_f_plus_1, expected,
-                "BFT 2f+1 mismatch for N={} expected={} got={}",
-                n, expected, two_f_plus_1);
+        // v34: the failover/timeout layer now uses the SAME quorum as the macroblock BFT —
+        // quorum_size(n) = n − f, f = ⌊(n−1)/3⌋ (the SAFE n−f, NOT the old ceil(2n/3) which is a
+        // strictly smaller, UNSAFE quorum at n ≡ 0 mod 3). Cases INCLUDE n ≡ 0 mod 3 (6, 9, 12),
+        // where the old (2n+2)/3 gave the wrong (smaller) value — so this test would have caught
+        // a regression to the old formula.
+        for (n, expected) in [
+            (4usize, 3usize), (5, 4), (6, 5), (9, 7), (10, 7), (12, 9), (100, 67), (1_000, 667),
+        ] {
+            assert_eq!(qnet_consensus::checkpoint_bft::quorum_size(n), expected,
+                "quorum_size mismatch for N={}", n);
         }
     }
 

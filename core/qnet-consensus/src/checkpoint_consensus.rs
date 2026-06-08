@@ -191,6 +191,38 @@ mod tests {
     fn committee(n: usize) -> Vec<NodeId> { (0..n).map(|i| format!("n{}", i)).collect() }
     fn hh(n: u8) -> Hash { [n; 32] }
 
+    // H4 regression: TimeoutCertificate::verify must REJECT a forged/empty/under-quorum/
+    // non-member/duplicate/wrong-view/bad-sig TC and ACCEPT a genuine 2f+1 one. Without this
+    // gate an empty TC advanced a node's view (unauthenticated permanent desync DoS).
+    #[test]
+    fn tc_verify_rejects_forged_accepts_valid() {
+        let c = committee(4); // quorum_size(4) = 3
+        let sig_of = |voter: &str| { let mut s = voter.as_bytes().to_vec(); s.extend_from_slice(b"tmo"); s };
+        let tmo = |voter: &str, index: u64| TimeoutMsg { index, voter: voter.into(), high_qc_index: 0, signature: sig_of(voter) };
+        let vsig = |t: &TimeoutMsg| t.signature == sig_of(&t.voter);
+        let vqc = |_: &QuorumCertificate| true;
+        let tc = |idx: u64, ts: Vec<TimeoutMsg>| TimeoutCertificate { index: idx, timeouts: ts, high_qc: None };
+        // valid: 3 distinct committee timeouts at view 5
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), tmo("n2", 5)]).verify(&c, vsig, vqc).is_ok());
+        // empty timeouts (the attack) → reject
+        assert!(tc(5, vec![]).verify(&c, vsig, vqc).is_err());
+        // below quorum (2 < 3) → reject
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5)]).verify(&c, vsig, vqc).is_err());
+        // non-committee voter → reject
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), tmo("n9", 5)]).verify(&c, vsig, vqc).is_err());
+        // duplicate voter → reject
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n0", 5), tmo("n1", 5)]).verify(&c, vsig, vqc).is_err());
+        // a timeout for a different view than the TC → reject
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), tmo("n2", 4)]).verify(&c, vsig, vqc).is_err());
+        // bad signature → reject
+        let mut bad = tmo("n2", 5); bad.signature = vec![0];
+        assert!(tc(5, vec![tmo("n0", 5), tmo("n1", 5), bad]).verify(&c, vsig, vqc).is_err());
+        // carried high_qc that fails verification → reject
+        let mut tc_hq = tc(5, vec![tmo("n0", 5), tmo("n1", 5), tmo("n2", 5)]);
+        tc_hq.high_qc = Some(QuorumCertificate { checkpoint_hash: hh(1), index: 4, signers: vec![], sig_merkle_root: hh(0), sigs: vec![] });
+        assert!(tc_hq.verify(&c, vsig, |_| false).is_err());
+    }
+
     // Build the proposal that `leader(index)` would make, extending `parent_qc`.
     fn propose(c: &[NodeId], index: u64, parent_qc: Option<QuorumCertificate>, parent_hash: Hash) -> Checkpoint {
         let li = leader_index(index, &parent_hash, c.len());

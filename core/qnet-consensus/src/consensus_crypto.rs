@@ -27,7 +27,7 @@
 //! - `dilithium_sig_` - Pure Dilithium fallback
 //!
 //! ### 1. Compact Signatures (Microblocks - ~2.6KB bincode)
-//! ```rust
+//! ```text
 //! CompactHybridSignature {
 //!   node_id: String,
 //!   cert_serial: String,
@@ -43,7 +43,7 @@
 //! - **Used for**: High-frequency microblocks (1/sec)
 //!
 //! ### 2. Full Hybrid Signatures (Macroblocks - ~5KB bincode)
-//! ```rust
+//! ```text
 //! HybridSignature {
 //!   certificate: HybridCertificate,
 //!   ephemeral_public_key: [u8; 32],

@@ -113,6 +113,16 @@ static FORK_RECOVERY_TRIGGER_TIMES: once_cell::sync::Lazy<
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 const FORK_RECOVERY_COOLDOWN_SECS: u64 = 60;
 
+// v34: cooldown for the failover-cert pull-on-reject. mb_idx → wall-clock secs of last request.
+// Bounds how often a node stuck on an uncertified failover block asks peers for that window's
+// timeout certificates (the request/serve already exists for sync and returns the cross-round
+// AggregatedTimeoutCertificate). 2s is fast enough to recover within a window, slow enough that
+// the repeated per-block reject loop can't flood peers.
+static FAILOVER_CERT_PULL_TIMES: once_cell::sync::Lazy<
+    dashmap::DashMap<u64, u64>
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
+const FAILOVER_CERT_PULL_COOLDOWN_SECS: u64 = 2;
+
 /// Cache parent hash after apply commit / verify success / self-save.
 #[inline]
 pub fn cache_block_hash(height: u64, hash: [u8; 32]) {
@@ -1961,11 +1971,48 @@ impl BlockPipeline {
                 // producer at certification) arrives, or via sync (which skips this gate,
                 // trusting macroblock finality). Round 0 (happy path) needs no cert. O(1).
                 if mb.timeout_round > 0 {
-                    let round_certified = unified_p2p
-                        .as_ref()
-                        .map(|p2p| p2p.get_timeout_certificate(mb.height, mb.timeout_round).is_some())
-                        .unwrap_or(false);
+                    // v34: authorise the failover round with the SAME predicate the producer used to
+                    // pick it — `highest_certified_round_for(mb_idx) >= round + baseline`, keyed by
+                    // mb_idx + ABSOLUTE round. HIGHEST_CERTIFIED_ROUND advances on BOTH a same-round
+                    // TimeoutProof AND a cross-round AggregatedTimeoutCertificate, so a round reached
+                    // via the storm pacemaker (no single round at 2f+1) is accepted. The prior gate
+                    // keyed get_timeout_certificate by microblock HEIGHT + RELATIVE round — a key
+                    // never populated — so it rejected every failover block: the producer advanced
+                    // cross-round while receivers demanded a same-round proof the storm structurally
+                    // prevents → split-brain, multi-hour stall. Still 2f+1-gated (a forged round
+                    // isn't certified ⇒ rejected); round 0 (happy path) needs no certificate.
+                    let round_certified =
+                        crate::unified_p2p::failover_round_authorized(mb.height / 90, mb.timeout_round);
                     if !round_certified {
+                        // v34 PULL-ON-REJECT: the round IS legitimate (a producer reached it via
+                        // 2f+1), but the proving certificate never arrived — the agg-TC broadcast is
+                        // one-shot (deduped) and vote gossip only re-fans on NEW votes, which stop once
+                        // the storm settles, so a node that missed the brief window would stay stuck
+                        // forever (the multi-hour split-brain). Actively request this window's timeout
+                        // certificates from peers (rate-limited per mb_idx); the existing serve returns
+                        // the cross-round AggregatedTimeoutCertificate, which advances our
+                        // HIGHEST_CERTIFIED_ROUND so this still-replayable block is accepted next pass.
+                        // Reuses the sync catch-up request/serve — no new wire type.
+                        let mb_idx = mb.height / 90;
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs()).unwrap_or(0);
+                        let due = FAILOVER_CERT_PULL_TIMES.get(&mb_idx)
+                            .map(|t| now_secs.saturating_sub(*t) >= FAILOVER_CERT_PULL_COOLDOWN_SECS)
+                            .unwrap_or(true);
+                        if due {
+                            FAILOVER_CERT_PULL_TIMES.insert(mb_idx, now_secs);
+                            // Bounded: failover-rejects are transient, so keep only recent windows.
+                            // Prune in mb_idx space (keys are mb_idx, NOT microblock height — pruning
+                            // by height would purge the whole map). Cheap opportunistic sweep.
+                            if FAILOVER_CERT_PULL_TIMES.len() > 64 {
+                                let keep_from = mb_idx.saturating_sub(16);
+                                FAILOVER_CERT_PULL_TIMES.retain(|k, _| *k >= keep_from);
+                            }
+                            if let Some(p2p) = unified_p2p.as_ref() {
+                                p2p.request_timeout_proofs(mb_idx, mb_idx);
+                            }
+                        }
                         if is_warn() {
                             println!(
                                 "[WARN][PIPELINE] failover_round_uncertified h={} round={} from={} action=reject_await_cert",
@@ -2502,6 +2549,8 @@ impl BlockPipeline {
                             height / 90,
                             block.microblock.timeout_round,
                         );
+                        // v33: feed the deterministic window-content accumulator at commit.
+                        crate::node::accumulate_window_block(height, &block.microblock);
 
                         // v27 HOLE3: warm read-through cache (verify h+1 hits
                         // memory, not cold RocksDB → kills 30s verify_stuck).
@@ -2909,7 +2958,13 @@ impl BlockPipeline {
             if block_timeout_round > 0 {
                 let mb_idx = height / 90;
                 let local_certified = crate::unified_p2p::highest_certified_round_for(mb_idx);
-                if block_timeout_round > local_certified {
+                // v34: mb.timeout_round is RELATIVE to the per-mb_idx baseline; local_certified is
+                // ABSOLUTE. Reconstruct the block's absolute round before comparing — else, when
+                // baseline>0 (a 2nd+ failover in the same window), the relative LHS is understated
+                // by `baseline` and this proactive backfill misfires (missed/slow cert catch-up).
+                let block_round_abs = block_timeout_round
+                    .saturating_add(crate::unified_p2p::get_baseline_round(mb_idx));
+                if block_round_abs > local_certified {
                     if let Some(ref p2p) = ctx.unified_p2p {
                         if is_info() {
                             println!(

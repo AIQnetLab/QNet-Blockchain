@@ -811,6 +811,68 @@ pub fn clear_expected_producer_cache_above(max_height: u64) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// v33: MACROBLOCK WINDOW CONTENT ACCUMULATOR — deterministic checkpoint content.
+//
+// The checkpoint content (mb_hashes + beacon vrf_outputs) was computed by
+// RE-READING the 90 window blocks from storage at window-end. That read is racy:
+// a block already applied to the chain but not yet flushed returns None, so a node
+// builds PARTIAL content (e.g. 89/90) that diverges from nodes with the full
+// window → the 2f+1 checkpoint can't form → finality stalls (the recurring stall).
+//
+// Fix: accumulate each block's (hash, vrf_output) at COMMIT time — when the block
+// is in hand — into a per-window buffer. At window-end the buffer is already
+// complete, in order, and IDENTICAL on every node (all apply the same canonical
+// blocks in the same order). No re-read, no race — deterministic by construction.
+// The head block's state_root (set only after TX apply) is still read separately
+// via the existing bounded head-wait.
+// ═══════════════════════════════════════════════════════════════════════════════
+lazy_static::lazy_static! {
+    /// Key: macroblock index. Value: per-position (block_hash, vrf_output) for the
+    /// 90-block window, indexed by (height - window_start).
+    static ref WINDOW_CONTENT_ACCUM: ParkingRwLock<std::collections::HashMap<u64, Vec<([u8; 32], Option<[u8; 32]>)>>> =
+        ParkingRwLock::new(std::collections::HashMap::new());
+}
+
+/// Append a committed block's (hash, vrf_output) to its macroblock window buffer.
+/// Called at the canonical commit point on EVERY apply path (production + pipeline),
+/// so every node accumulates the identical window from the identical canonical chain.
+/// Position-based with truncate-on-reapply: a re-applied block (after a rollback)
+/// overwrites its slot and drops later slots; an out-of-order gap clears the buffer
+/// so the consumer falls back to the storage re-read for that one window. O(1).
+pub fn accumulate_window_block(height: u64, mb: &qnet_state::MicroBlock) {
+    if height == 0 { return; } // genesis is not part of any 90-block window
+    let mb_idx = (height - 1) / 90 + 1;
+    let start_h = (mb_idx - 1) * 90 + 1;
+    let pos = (height - start_h) as usize;
+    if pos >= 90 { return; }
+    let entry = (mb.hash(), mb.vrf_output);
+    let mut map = WINDOW_CONTENT_ACCUM.write();
+    let buf = map.entry(mb_idx).or_insert_with(Vec::new);
+    if pos <= buf.len() {
+        buf.truncate(pos);   // re-apply (pos<len) or contiguous (pos==len)
+        buf.push(entry);
+    } else {
+        buf.clear();         // out-of-order gap → consumer falls back to re-read
+    }
+    // Bound memory: keep only recent windows (finality trails the tip by ≤3 windows).
+    if map.len() > 12 {
+        let keep_from = mb_idx.saturating_sub(8);
+        map.retain(|k, _| *k >= keep_from);
+    }
+}
+
+/// Returns the deterministic (mb_hashes, vrf_outputs) for a fully-accumulated 90-block
+/// window, or None if the buffer is incomplete (caller falls back to the re-read).
+pub fn window_content_from_accum(mb_idx: u64) -> Option<(Vec<[u8; 32]>, Vec<[u8; 32]>)> {
+    let map = WINDOW_CONTENT_ACCUM.read();
+    let buf = map.get(&mb_idx)?;
+    if buf.len() != 90 { return None; }
+    let mb_hashes: Vec<[u8; 32]> = buf.iter().map(|(h, _)| *h).collect();
+    let vrf_outputs: Vec<[u8; 32]> = buf.iter().filter_map(|(_, v)| *v).collect();
+    Some((mb_hashes, vrf_outputs))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCTION v2.50: Lock-free global storage with OnceCell + Arc
 // RocksDB does NOT support multiple connections - single instance shared immutably
 // 10x faster than Mutex-based approach for block writes
@@ -4298,8 +4360,10 @@ impl BlockchainNode {
     // using deterministic VRF derived from randomness_beacon of MacroBlock N-2.
     // All nodes compute IDENTICAL committee from same blockchain data.
     // ═══════════════════════════════════════════════════════════════════════════
-    const CONSENSUS_COMMITTEE_SIZE: usize = 100;
-    const COMMITTEE_THRESHOLD: usize = 120;
+    // v34: single source of truth in qnet_consensus — the failover voting set (unified_p2p)
+    // derives the SAME committee via the same const + sample_committee, so the two layers agree.
+    const CONSENSUS_COMMITTEE_SIZE: usize = qnet_consensus::checkpoint_bft::COMMITTEE_SIZE;
+    const COMMITTEE_THRESHOLD: usize = qnet_consensus::checkpoint_bft::COMMITTEE_THRESHOLD;
 
     /// v15.0: Strict N-2 beacon loader.
     ///
@@ -4427,21 +4491,17 @@ impl BlockchainNode {
         };
 
 
-        let mut scored: Vec<(usize, [u8; 32])> = all_candidates.iter().enumerate().map(|(i, _)| {
-            let mut hasher = Sha3_256::new();
-            hasher.update(b"COMMITTEE_VRF_v3.36");
-            hasher.update(&seed);
-            hasher.update(&macroblock_index.to_le_bytes());
-            hasher.update(&(i as u64).to_le_bytes());
-            let hash: [u8; 32] = hasher.finalize().into();
-            (i, hash)
-        }).collect();
-
-        scored.sort_by(|a, b| a.1.cmp(&b.1));
-        scored.truncate(Self::CONSENSUS_COMMITTEE_SIZE);
-        scored.sort_by_key(|&(idx, _)| idx);
-
-        let committee: Vec<String> = scored.iter().map(|(idx, _)| all_candidates[*idx].clone()).collect();
+        // v34: delegate the VRF subsample to the SINGLE canonical fn that the microblock-failover
+        // voting set (unified_p2p::deterministic_eligible_ids) also calls — both derive a
+        // byte-identical committee from the same (sorted candidates, window, seed) ⇒ the two
+        // consensus layers can never disagree on membership (a divergent copy would fork).
+        let committee = qnet_consensus::checkpoint_bft::sample_committee(
+            all_candidates,
+            macroblock_index,
+            &seed,
+            Self::COMMITTEE_THRESHOLD,
+            Self::CONSENSUS_COMMITTEE_SIZE,
+        );
 
         println!("[INFO][COMMITTEE] mb={} total={} committee={} seed={}",
             macroblock_index, all_candidates.len(), committee.len(),
@@ -11719,7 +11779,7 @@ impl BlockchainNode {
                 },
                 "macro" => {
                     // Validate macroblock consensus and finality
-                    if let Err(e) = Self::validate_received_macroblock(&received_block, &storage).await {
+                    if let Err(e) = Self::validate_received_macroblock(&received_block, &storage, unified_p2p.as_ref(), &node_id, node_type).await {
                         eprintln!("[ERR][BLOCK] invalid_macroblock h={} err={}", received_block.height, e);
                         continue;
                     }
@@ -13486,6 +13546,9 @@ impl BlockchainNode {
     async fn validate_received_macroblock(
         block: &crate::unified_p2p::ReceivedBlock,
         storage: &Arc<Storage>,
+        p2p: Option<&Arc<SimplifiedP2P>>,
+        node_id: &str,
+        node_type: NodeType,
     ) -> Result<(), String> {
         // CRITICAL: Full validation to prevent consensus manipulation
         
@@ -13567,31 +13630,16 @@ impl BlockchainNode {
         
         // 4. Verify finality. v2 ⇒ the macroblock carries a checkpoint QC; legacy ⇒
         //    commit/reveal threshold. (Chain continuity was checked at step 3 above.)
-        if let Some(cp_qc) = &macroblock.consensus_data.checkpoint_qc {
-            // Secondary (non-broadcast) path: binding + structural quorum only. The
-            // canonical FULL Dilithium verify runs in process_received_macroblock (it
-            // holds the PK registry). checkpoint_qc holds (Checkpoint, QC).
-            let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
-                bincode::deserialize(cp_qc)
-                    .map_err(|e| format!("[ERR][MB] v2_qc_decode h={} err={}", macroblock.height, e))?;
-            // A2: bind by WINDOW (head/90), not cp.index (round — may skip on timeout).
-            if cp.window_head_height / 90 != macroblock.height || cp.hash() != qc.checkpoint_hash {
-                return Err(format!("[ERR][MB] v2_qc_unbound h={}", macroblock.height));
-            }
-            let committee: Vec<String> = macroblock.consensus_data.consensus_committee.clone().unwrap_or_default();
-            // C: the published validator set must match the QC-certified epoch commitment —
-            // reject a forged set (fail-stop; consensus state is integer, divergence = bug to halt on).
-            let elig = macroblock.consensus_data.eligible_producers.as_deref().unwrap_or(&[]);
-            if qnet_consensus::checkpoint_bft::epoch_commitment(elig, &committee) != cp.epoch_commitment {
-                return Err(format!("[ERR][MB] v2_epoch_uncertified h={}", macroblock.height));
-            }
-            let min_q = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
-            let cset: std::collections::HashSet<&String> = committee.iter().collect();
-            let signers: std::collections::HashSet<&String> = qc.signers.iter().collect();
-            if min_q == 0 || signers.len() < min_q || !signers.iter().all(|s| cset.contains(*s)) {
-                return Err(format!("[ERR][MB] v2_qc_quorum h={} signers={} min={}", macroblock.height, signers.len(), min_q));
-            }
-            println!("[INFO][VALIDATION] macroblock_validated_v2 h={} signers={}", macroblock.height, signers.len());
+        if macroblock.consensus_data.checkpoint_qc.is_some() {
+            // v34/H1: FULL canonical verify — was structural-quorum-only over the SELF-DECLARED
+            // `consensus_committee`, which accepted a forged macroblock carrying ZERO valid
+            // signatures (an attacker set committee+signers to their own keys; epoch_commitment
+            // matched their own set; no Dilithium sig was ever checked). Now identical to the
+            // broadcast path: deterministic N-2 committee + every Dilithium signature + all body
+            // fields bound to the QC-certified checkpoint, deferring on a missing N-2 anchor.
+            let p2p = p2p.ok_or_else(|| format!("[ERR][MB] v2_no_p2p h={}", macroblock.height))?;
+            Self::verify_v2_macroblock(&macroblock, macroblock.height, p2p, node_id, node_type, storage).await?;
+            println!("[INFO][VALIDATION] macroblock_validated_v2 h={}", macroblock.height);
             return Ok(());
         }
 
@@ -21237,6 +21285,8 @@ impl BlockchainNode {
                             height_for_storage / 90,
                             microblock.timeout_round,
                         );
+                        // v33: feed the deterministic window-content accumulator at commit.
+                        accumulate_window_block(height_for_storage, &microblock);
 
                         // v14.9: WS broadcast for producer-path (own blocks).
                         // BlockPipeline emits NewBlock for received blocks; this
@@ -23770,28 +23820,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 Ok(Some(macroblock_data)) => {
                     match bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_data) {
                         Ok(macroblock) => {
-                            // ═══════════════════════════════════════════════════════════════
-                            // v3.10: EXCLUDED PRODUCERS - Read from blockchain (DETERMINISTIC!)
-                            // All nodes read SAME list from MacroBlock → NO FORK!
-                            // ═══════════════════════════════════════════════════════════════
-                            let excluded_node_ids: std::collections::HashSet<String> = 
-                                if let Some(ref excluded_data) = macroblock.consensus_data.excluded_producers_for_next_epoch {
-                                    if let Ok(excluded) = bincode::deserialize::<Vec<qnet_state::ExcludedProducerEntry>>(excluded_data) {
-                                        let excluded_set: std::collections::HashSet<String> = excluded
-                                            .iter()
-                                            .map(|e| e.node_id.clone())
-                                            .collect();
-                                        if !excluded_set.is_empty() {
-                                            println!("[INFO][CAND] v3.10_excluded mb={} nodes={:?}", 
-                                                     required_macroblock, excluded_set);
-                                        }
-                                        excluded_set
-                                    } else {
-                                        std::collections::HashSet::new()
-                                    }
-                                } else {
-                                    std::collections::HashSet::new()
-                                };
+                            // v34: the candidate set is the macroblock's eligible_producers snapshot
+                            // ONLY — the single canonical, QC-bound (via epoch_commitment) source, so
+                            // every honest node derives the SAME set → no fork. TWO non-canonical
+                            // filters are NEUTRALISED here (both no-ops today ⇒ behaviour-preserving):
+                            //  • excluded_producers_for_next_epoch — was derived from each node's LOCAL
+                            //    get_failover_history (NOT on-chain, NOT QC-bound), so a re-enabled
+                            //    failover writer would make nodes filter DIFFERENT producers →
+                            //    divergent N-2 candidate set two epochs later → honest split. Its writer
+                            //    (save_failover_event via select_emergency_producer) is dead ⇒ the set
+                            //    is always empty; we stop READING the un-bound field entirely. Liveness-
+                            //    based exclusion, if reintroduced, MUST be on-chain deterministic + QC-bound.
+                            //  • is_validator_ejected (filters removed below) — a per-node locally-observed
+                            //    set gated by QNET_LIVENESS_EJECTION; enabling it made selection node-
+                            //    dependent → split. Local liveness must NOT mutate the canonical set.
+                            let excluded_node_ids: std::collections::HashSet<String> =
+                                std::collections::HashSet::new();
                             
                             // PRIMARY: Use eligible_producers snapshot from macroblock
                             if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
@@ -23807,7 +23851,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // selection — the filter passes everyone through.
                                         let mut all_qualified: Vec<(String, f64)> = producers.iter()
                                             .filter(|p| !excluded_node_ids.contains(&p.node_id))
-                                            .filter(|p| !crate::unified_p2p::is_validator_ejected(&p.node_id))
                                             .map(|p| (p.node_id.clone(), p.reputation as f64 / 100.0))
                                             .collect();
 
@@ -23858,7 +23901,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 // happens to fire.
                                 let mut all_qualified: Vec<(String, f64)> = macroblock.consensus_data.commits.keys()
                                     .filter(|id| !excluded_node_ids.contains(*id))
-                                    .filter(|id| !crate::unified_p2p::is_validator_ejected(id))
                                     .map(|id| (id.clone(), det_rep))
                                     .collect();
                                 all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
@@ -23953,7 +23995,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 if let Some(ref snap) = fb_mb.consensus_data.eligible_producers {
                                     if let Ok(prods) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snap) {
                                         let mut fb: Vec<(String, f64)> = prods.iter()
-                                            .filter(|p| !crate::unified_p2p::is_validator_ejected(&p.node_id))
                                             .map(|p| (p.node_id.clone(), p.reputation as f64 / 100.0))
                                             .collect();
                                         if !fb.is_empty() {
@@ -24917,69 +24958,62 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // Window hashes + XOR state-root, and the VRF beacon = XOR of signed
                                         // microblock vrf_outputs (unbiasable randomness for next-epoch VRF).
                                         //
-                                        // v33: DETERMINISTIC CONTENT — wait for the FULL window to be persisted
-                                        // before collecting. Previously mb_hashes/vrf_outputs were gathered with no
-                                        // wait (unlike state_root, which retried below), so a node whose window-end
-                                        // raced block persistence captured an INCOMPLETE set (load returned None for
-                                        // not-yet-flushed blocks) that never self-corrected → mb_hashes/beacon
-                                        // diverged from nodes with the full window → checkpoint content_ok=false →
-                                        // finality stall (observed mb_hashes=false beacon=false, state_root=true;
-                                        // window blocks proven byte-identical across nodes). Blocks are identical
-                                        // once present, so the full window yields identical content everywhere.
-                                        // Bounded (~30s); a node still missing blocks proceeds (no regression).
-                                        for _ in 0..120 {
-                                            let mut have_all = true;
-                                            for h in start_height..=end_height {
-                                                if !matches!(storage_cons.load_microblock_hash(h), Ok(Some(_))) {
-                                                    have_all = false;
-                                                    break;
-                                                }
-                                            }
-                                            let head_applied =
-                                                if let Ok(Some(hb)) = storage_cons.load_microblock_auto_format(end_height) {
-                                                    hb.state_root != [0u8; 32]
-                                                } else {
-                                                    false
-                                                };
-                                            if have_all && head_applied {
-                                                break;
-                                            }
-                                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                        }
-
-                                        let mut mb_hashes: Vec<[u8; 32]> = Vec::new();
-                                        // state_root = real account-state Merkle root at the window head
-                                        // (head microblock's finalize_merkle output), not a hash-of-hashes:
-                                        // a verifiable per-macroblock account commitment, 2f+1-signed via the
-                                        // checkpoint and cross-checked on apply against each node's own state.
+                                        // v33: deterministic checkpoint content from the commit-time accumulator.
+                                        // Each block's (hash, vrf_output) was captured when it committed (in hand),
+                                        // so the window is complete + bit-identical on every node — NO storage
+                                        // re-read race (the old re-read returned None for applied-but-unflushed
+                                        // blocks → partial content → divergence → finality stall). Falls back to a
+                                        // bounded-wait re-read only if the accumulator is incomplete for this window
+                                        // (e.g. blocks that arrived via out-of-order bulk sync). state_root (the head
+                                        // block's real account root, written only after TX apply) is read below.
                                         let mut state_root = [0u8; 32];
-                                        let mut vrf_outputs: Vec<[u8; 32]> = Vec::new();
                                         let mut diag_hash_miss = 0u32; // v33-DIAG
                                         let mut diag_data_miss = 0u32; // v33-DIAG
                                         let mut diag_vrf_none = 0u32;  // v33-DIAG
-                                        for h in start_height..=end_height {
-                                            if let Ok(Some(hash)) = storage_cons.load_microblock_hash(h) {
-                                                mb_hashes.push(hash);
-                                            } else {
-                                                diag_hash_miss += 1;
-                                            }
-                                            if let Ok(Some(mb)) = storage_cons.load_microblock_auto_format(h) {
-                                                match mb.vrf_output {
-                                                    Some(v) => vrf_outputs.push(v),
-                                                    None => diag_vrf_none += 1,
+                                        let (mb_hashes, vrf_outputs, content_src) =
+                                            match crate::node::window_content_from_accum(mb_idx) {
+                                                Some((h, v)) => (h, v, "accum"),
+                                                None => {
+                                                    // Fallback: bounded-wait for the full window to persist, then re-read.
+                                                    for _ in 0..120 {
+                                                        let mut have_all = true;
+                                                        for h in start_height..=end_height {
+                                                            if !matches!(storage_cons.load_microblock_hash(h), Ok(Some(_))) {
+                                                                have_all = false;
+                                                                break;
+                                                            }
+                                                        }
+                                                        if have_all { break; }
+                                                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                                    }
+                                                    let mut h_vec: Vec<[u8; 32]> = Vec::new();
+                                                    let mut v_vec: Vec<[u8; 32]> = Vec::new();
+                                                    for h in start_height..=end_height {
+                                                        if let Ok(Some(hash)) = storage_cons.load_microblock_hash(h) {
+                                                            h_vec.push(hash);
+                                                        } else {
+                                                            diag_hash_miss += 1;
+                                                        }
+                                                        if let Ok(Some(mb)) = storage_cons.load_microblock_auto_format(h) {
+                                                            if let Some(v) = mb.vrf_output { v_vec.push(v); } else { diag_vrf_none += 1; }
+                                                        } else {
+                                                            diag_data_miss += 1;
+                                                        }
+                                                    }
+                                                    (h_vec, v_vec, "reread")
                                                 }
-                                                if h == end_height { state_root = mb.state_root; }
-                                            } else {
-                                                diag_data_miss += 1;
-                                            }
-                                        }
+                                            };
                                         // The head block's REAL account-state root (finalize_merkle) is written
                                         // only AFTER its TXs are applied; at the window boundary the stored block
                                         // can still carry the [0;32] placeholder. The macroblock MUST commit the
                                         // real root — else the checkpoint state-finality check defers every window
-                                        // and the body carries no valid state commitment. Wait (bounded) for the
-                                        // head to apply, then capture the real root: deterministic on every node
-                                        // (a node that times out simply abstains; 2f+1 applied nodes still seal).
+                                        // and the body carries no valid state commitment. Read it directly first
+                                        // (common case: head already applied), else wait (bounded) for the head to
+                                        // apply: deterministic on every node (a node that times out simply abstains;
+                                        // 2f+1 applied nodes still seal).
+                                        if let Ok(Some(head_mb)) = storage_cons.load_microblock_auto_format(end_height) {
+                                            state_root = head_mb.state_root;
+                                        }
                                         if state_root == [0u8; 32] {
                                             for _ in 0..120 {
                                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -25004,14 +25038,41 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             let mut hd = sha3::Sha3_256::new();
                                             for x in &mb_hashes { hd.update(&x[..]); }
                                             println!(
-                                                "[WARN][CONS-DIAG] mb={} start={} end={} mb_hashes_len={} digest={} vrf_count={} vrf_none={} hash_miss={} data_miss={} beacon={}",
-                                                mb_idx, start_height, end_height, mb_hashes.len(),
+                                                "[WARN][CONS-DIAG] mb={} src={} start={} end={} mb_hashes_len={} digest={} vrf_count={} vrf_none={} hash_miss={} data_miss={} beacon={}",
+                                                mb_idx, content_src, start_height, end_height, mb_hashes.len(),
                                                 hex::encode(&hd.finalize()[..8]), vrf_outputs.len(), diag_vrf_none,
                                                 diag_hash_miss, diag_data_miss, hex::encode(&beacon[..8]),
                                             );
                                         }
+                                        // P2-D: never signal PARTIAL window content. The accumulator path is
+                                        // always complete (window_content_from_accum returns None for an
+                                        // incomplete buffer); only the re-read fallback can come up short if a
+                                        // block is still unflushed after the bounded wait. A shorter mb_hashes
+                                        // than peers diverges content_ok → finality stalls for this window. Skip
+                                        // instead — this node applies the macroblock via the §4.5 sync wire once
+                                        // a quorum seals it. (Full window = 90 microblocks.)
+                                        let expected_len = (end_height - start_height + 1) as usize;
+                                        if mb_hashes.len() < expected_len {
+                                            if is_warn() {
+                                                println!("[WARN][CONS] window_content_incomplete mb={} src={} have={} need={} — not signalling (defer to §4.5 sync)",
+                                                         mb_idx, content_src, mb_hashes.len(), expected_len);
+                                            }
+                                            return;
+                                        }
+                                        // QC-bind the cumulative ban set: identical deterministic set the
+                                        // macroblock body stores at Persist (compute_cumulative_ban_set on the
+                                        // same committed window mb_idx), folded into epoch_commitment so a
+                                        // relayer cannot corrupt the stored banned_validators without breaking
+                                        // the checkpoint QC. Sorted for a byte-stable, order-independent commit.
+                                        let banned_for_epoch = {
+                                            let mut v: Vec<String> =
+                                                Self::compute_cumulative_ban_set(&storage_cons, mb_idx)
+                                                    .await.into_iter().collect();
+                                            v.sort();
+                                            v
+                                        };
                                         crate::consensus_v2_node::signal_window_end(
-                                            mb_idx, end_height, mb_hashes, state_root, beacon, committee, eligible_bytes,
+                                            mb_idx, end_height, mb_hashes, state_root, beacon, committee, eligible_bytes, banned_for_epoch,
                                         );
                                         return;
                                     }
@@ -28191,6 +28252,87 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// did: candidates from the N-2 snapshot (genesis list for epochs ≤2) →
     /// select_consensus_committee VRF-sample ≤CONSENSUS_COMMITTEE_SIZE. Used to verify a
     /// received QC against the real committee, not the self-declared one.
+    /// P1-D: the macroblock index (N-2) whose STORED macroblock anchors window `index`'s committee
+    /// derivation (calculate_qualified_candidates' eligible set + the VRF subsample seed). Returns
+    /// None for the bootstrap windows (index<3) that use the deterministic genesis anchor and need no
+    /// on-chain N-2. A node lacking this macroblock must DEFER QC verification rather than let
+    /// derive_v2_committee WALK BACK to a different anchor — a walked-back committee differs from the
+    /// sealer's → a spurious `v2_qc_invalid` that SPLITS honest nodes (a node with a storage gap
+    /// rejects a validly-finalized macroblock). Pure ⇒ unit-tested for the off-by-one genesis boundary.
+    fn v2_committee_anchor_index(index: u64) -> Option<u64> {
+        if index >= 3 { Some(index - 2) } else { None }
+    }
+
+    /// Canonical FULL verification of a v2 macroblock's checkpoint QC — the SINGLE authority used
+    /// by EVERY macroblock-accept path so none can be bypassed (H1). It:
+    ///  (1) binds the block to the QC: window == index AND cp.hash() == qc.checkpoint_hash;
+    ///  (2) binds EVERY consensus-critical BODY field to the QC-certified checkpoint — state_root,
+    ///      micro_blocks, randomness_beacon, timestamp — all of which live inside cp.hash() that the
+    ///      QC signs (H2: an un-bound `randomness_beacon` let a relayed body carry a different beacon
+    ///      than the QC-agreed one → poisoned the next epoch's committee/leader seed → split);
+    ///  (3) DEFERS (Err) if the canonical N-2 committee anchor is not local (P1-D anti-walk-back);
+    ///  (4) derives the committee DETERMINISTICALLY (N-2 / genesis) — NOT the self-declared
+    ///      `consensus_committee` an attacker could set to their own keys;
+    ///  (5) checks epoch_commitment (published validator set matches the QC commitment);
+    ///  (6) Dilithium-verifies EVERY committee signature. A forged committee or any invalid/zero
+    ///      signature cannot pass. Returns Ok(()) for a non-v2 (legacy) macroblock — the caller
+    ///      handles that path.
+    async fn verify_v2_macroblock(
+        macroblock: &qnet_state::MacroBlock,
+        index: u64,
+        p2p: &Arc<SimplifiedP2P>,
+        node_id: &str,
+        node_type: NodeType,
+        storage: &Storage,
+    ) -> Result<(), String> {
+        let cp_qc = match macroblock.consensus_data.checkpoint_qc.as_ref() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
+            bincode::deserialize(cp_qc).map_err(|e| format!("v2_qc_decode mb={} err={}", index, e))?;
+        if cp.window_head_height / 90 != index || cp.hash() != qc.checkpoint_hash {
+            return Err(format!("v2_qc_unbound mb={}", index));
+        }
+        if cp.window_mb_hashes != macroblock.micro_blocks
+            || cp.state_root != macroblock.state_root
+            || macroblock.consensus_data.randomness_beacon != Some(cp.beacon)
+            || macroblock.timestamp != cp.timestamp
+        {
+            return Err(format!("v2_body_mismatch mb={}", index));
+        }
+        if let Some(n2) = Self::v2_committee_anchor_index(index) {
+            if storage.get_macroblock_by_height(n2).ok().flatten().is_none() {
+                return Err(format!("v2_qc_defer_anchor mb={} need_mb_n2={}", index, n2));
+            }
+        }
+        let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type, cp.window_head_height).await;
+        let mut ids: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
+        ids.sort();
+        let committee = Self::select_consensus_committee(&ids, index, storage);
+        if qnet_consensus::checkpoint_bft::quorum_size(committee.len()) == 0 {
+            return Err(format!("v2_qc_no_committee mb={}", index));
+        }
+        let elig = macroblock.consensus_data.eligible_producers.as_deref().unwrap_or(&[]);
+        let cmt = macroblock.consensus_data.consensus_committee.clone().unwrap_or_default();
+        // The stored ban set is QC-bound via epoch_commitment: deserialize the body's bytes and
+        // reject if the recomputed commitment doesn't match the checkpoint's ⇒ a relayer-corrupted
+        // banned_validators can never pass, so load_macroblock_ban_set(N-1) can trust it as anchor.
+        let banned: Vec<String> = macroblock.consensus_data.banned_validators.as_deref()
+            .and_then(|b| bincode::deserialize::<Vec<String>>(b).ok()).unwrap_or_default();
+        if qnet_consensus::checkpoint_bft::epoch_commitment(elig, &cmt, &banned) != cp.epoch_commitment {
+            return Err(format!("v2_epoch_uncertified mb={}", index));
+        }
+        let verified = qc.verify(&committee, |voter, body, sig| match std::str::from_utf8(sig) {
+            Ok(s) => p2p.verify_consensus_signature(voter, &format!("QNET_BFT2_VOTE:{}", hex::encode(body)), s),
+            Err(_) => false,
+        }).is_ok();
+        if !verified {
+            return Err(format!("v2_qc_invalid mb={} signers={} committee={}", index, qc.signers.len(), committee.len()));
+        }
+        Ok(())
+    }
+
     async fn derive_v2_committee(&self, index: u64, head_height: u64) -> Vec<String> {
         let p2p = match self.unified_p2p.as_ref() { Some(p) => p, None => return Vec::new() };
         let qualified = Self::calculate_qualified_candidates(p2p, &self.node_id, self.node_type, head_height).await;
@@ -28283,43 +28425,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // committee Dilithium signature. A forged committee or QC cannot pass. Bypass
         // commit/reveal (v2 has none).
         if let Some(cp_qc) = macroblock.consensus_data.checkpoint_qc.as_ref() {
-            let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
-                bincode::deserialize(cp_qc)
-                    .map_err(|e| QNetError::ValidationError(format!("v2_qc_decode mb={} err={}", index, e)))?;
-            // A2: macroblock height = WINDOW; cp.index = consensus round (may skip on timeout).
-            // Bind by window (head/90), not round, so a skipped-round checkpoint still validates.
-            if cp.window_head_height / 90 != index || cp.hash() != qc.checkpoint_hash {
-                return Err(QNetError::ValidationError(format!("v2_qc_unbound mb={}", index)));
-            }
-            if cp.window_mb_hashes != macroblock.micro_blocks || cp.state_root != macroblock.state_root {
-                return Err(QNetError::ValidationError(format!("v2_body_mismatch mb={}", index)));
-            }
-            // Committee for the WINDOW's epoch (matches the sealer's N-2 selection), not the round.
-            let committee = self.derive_v2_committee(cp.window_head_height / 90, cp.window_head_height).await;
-            let q = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
-            let verified = if q == 0 {
-                false
-            } else if let Some(p2p) = self.unified_p2p.as_ref() {
-                qc.verify(&committee, |voter, body, sig| match std::str::from_utf8(sig) {
-                    Ok(s) => p2p.verify_consensus_signature(voter, &format!("QNET_BFT2_VOTE:{}", hex::encode(body)), s),
-                    Err(_) => false,
-                }).is_ok()
-            } else { false };
-            if !verified {
-                return Err(QNetError::ValidationError(format!(
-                    "v2_qc_invalid mb={} signers={} committee={}", index, qc.signers.len(), committee.len())));
-            }
-            // C: the QC certifies cp.epoch_commitment ⇒ the block's published validator set
-            // (eligible+committee, read by N-2 selection) must match it — reject a forged set.
-            let elig = macroblock.consensus_data.eligible_producers.as_deref().unwrap_or(&[]);
-            let cmt = macroblock.consensus_data.consensus_committee.clone().unwrap_or_default();
-            if qnet_consensus::checkpoint_bft::epoch_commitment(elig, &cmt) != cp.epoch_commitment {
-                return Err(QNetError::ValidationError(format!("v2_epoch_uncertified mb={}", index)));
-            }
+            // FULL canonical verify (the SINGLE shared authority — same fn the block-pipeline accept
+            // path uses, so neither can be bypassed). Binds every body field to the QC-certified
+            // checkpoint, defers on a missing N-2 anchor, derives the committee deterministically,
+            // and Dilithium-verifies every committee signature.
+            let p2p = self.unified_p2p.as_ref()
+                .ok_or_else(|| QNetError::ValidationError(format!("v2_no_p2p mb={}", index)))?;
+            Self::verify_v2_macroblock(&macroblock, index, p2p, &self.node_id, self.node_type, &self.storage)
+                .await
+                .map_err(QNetError::ValidationError)?;
             if is_info() {
-                println!("[INFO][MB] v2_qc_ok mb={} signers={} committee={}", index, qc.signers.len(), committee.len());
+                println!("[INFO][MB] v2_qc_ok mb={}", index);
             }
-            // Verified v2 finality — fall through to save (commit/reveal gate skips below).
+            // Catch-up safety-net (§4.5): hand the now-VERIFIED (checkpoint, QC) to the BFT2 driver so
+            // a node whose consensus round fell behind the live quorum fast-forwards from committed
+            // state. adopt_qc is monotonic ⇒ a no-op for a node already at/ahead of this checkpoint.
+            crate::consensus_v2_node::signal_synced_checkpoint(cp_qc.clone());
         }
 
         // v14.8: Structural validation of consensus_data.commits / reveals.
@@ -28523,8 +28644,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let round = index * 90;
             let prev_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
             if round > prev_round {
-                if try_advance_finality(round, "MB-SYNC-DEDUP") {
-                    println!("[INFO][MB-SYNC] finality_catchup mb={} round={} prev_round={}", index, round, prev_round);
+                // v34: same ALL-microblocks-present guard as the save path below. Previously this
+                // dedup branch advanced finality WITHOUT it, so a node that received the macroblock
+                // (via BFT seal / broadcast) before its 90 microblocks could push LAST_FINALIZED
+                // ahead of chain_height → stall-recovery rollback blocked by FINALITY_VIOLATION →
+                // deadlock. Finality must never outrun the locally-applied microblock tip.
+                let expected_start = if index == 1 { 1 } else { (index - 1) * 90 + 1 };
+                let mut all_present = true;
+                for h in expected_start..=index * 90 {
+                    if self.storage.load_microblock(h)?.is_none() { all_present = false; break; }
+                }
+                if all_present {
+                    if try_advance_finality(round, "MB-SYNC-DEDUP") {
+                        println!("[INFO][MB-SYNC] finality_catchup mb={} round={} prev_round={}", index, round, prev_round);
+                    }
+                } else if is_warn() {
+                    println!("[WARN][MB-SYNC] dedup_skip_finality mb={} round={} reason=missing_microblocks — finality stays at {}",
+                             index, round, prev_round);
                 }
             }
         } else {
@@ -30987,7 +31123,19 @@ impl Clone for BlockchainNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    // P1-D: the committee anchor (N-2) for v2 QC verification. The genesis boundary (index<3 → None)
+    // is the subtle part — an off-by-one there would defer the bootstrap macroblocks forever (mb=2's
+    // N-2 is mb=0, which is never created), or conversely walk back and split honest nodes.
+    #[test]
+    fn v2_committee_anchor_index_boundary() {
+        assert_eq!(BlockchainNode::v2_committee_anchor_index(0), None);
+        assert_eq!(BlockchainNode::v2_committee_anchor_index(1), None);
+        assert_eq!(BlockchainNode::v2_committee_anchor_index(2), None, "mb=2's N-2=0 is never created → bootstrap anchor, no defer");
+        assert_eq!(BlockchainNode::v2_committee_anchor_index(3), Some(1), "mb=3 anchors on mb=1 (first real on-chain N-2)");
+        assert_eq!(BlockchainNode::v2_committee_anchor_index(10), Some(8));
+    }
+
     /// Test CompactHybridSignature deserialization
     /// OPTIMIZED v2.23: RAW bytes format, dilithium_message_signature removed
     #[test]
