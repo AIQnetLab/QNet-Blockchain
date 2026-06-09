@@ -7,8 +7,8 @@
 ## Current Implementation (v2.19.4)
 
 ```
-1. Full/Super node determines it's time to ping a Light node (sharded assignment)
-2. Full/Super sends FCM push notification via Firebase Cloud Messaging V1 API
+1. Genesis node determines it's time to ping a Light node (sharded assignment)
+2. Genesis node sends FCM push notification via Firebase Cloud Messaging V1 API
 3. Light node receives push, wakes up, signs challenge with Ed25519
 4. Light node sends signed response back to pinger
 5. Pinger creates attestation (dual-signed: Light Ed25519 + Pinger Dilithium)
@@ -280,10 +280,11 @@ Light nodes trust the Full/Super nodes they connect to. For additional security,
 **How Network Pings Work - ARCHITECTURAL SEPARATION:**
 
 📱 **LIGHT NODES (Mobile Only)**:
-- 🎲 **Randomized slots**: Node assigned slot based on node_id hash
-- 📡 **Network initiates**: Network pings mobile device once per 4-hour reward window
+- 🎲 **Randomized slots**: Node assigned a deterministic slot based on node_id hash (one slot per node per window)
+- 📡 **Genesis initiates**: **Genesis** nodes ping the mobile device once per 4-hour reward window (not ordinary Super nodes)
 - ⏰ **60-second response window**: Mobile device has 60 seconds to respond
-- 🔄 **100% success rate**: Binary requirement (respond or no reward for current window)
+- 🔄 **100% success rate**: Binary requirement (respond or no reward for current window); eligibility = ≥1 valid ping per epoch
+- ⚠️ **Hardening pending**: the Light ping path is **not yet unforgeable**
 - 📱 **Multiple devices**: Max 3 mobile devices per Light node (includes tablets)
 - 📡 **Round-robin routing**: Automatic failover between devices
 - 🌐 **Network required**: WiFi or stable mobile internet connection
@@ -291,14 +292,14 @@ Light nodes trust the Full/Super nodes they connect to. For additional security,
 - 🧹 **Auto-cleanup**: Inactive devices removed after 24h to free slots
 - 🔒 **Privacy**: IP/tokens hashed - no personal data collection
 
-🖥️ **FULL/SUPER NODES (Server Only)**:
-- 🎯 **Direct server pings**: Network pings server HTTP endpoint every 24 minutes
-- ⚡ **30-second response window**: Server has 30 seconds to respond  
-- 🔄 **80%/90% success rate**: 8+/9+ out of 10 pings in current 4-hour window
-- 🖥️ **Server infrastructure**: Dedicated server with HTTP ping endpoint
+🖥️ **SUPER / GENESIS NODES (Server Only)**:
+- ⛓️ **Unforgeable on-chain Heartbeats (v34)**: liveness is proven by **on-chain `Heartbeat` TXs**, not self-attested server pings
+- 📊 **Heartbeat frequency**: ~10 Dilithium-signed `Heartbeat` TXs per 4-hour epoch (one per ~1440-block subwindow)
+- 🔒 **Anti-forgery**: each TX anchored to a recent canonical block hash (cannot be pre-signed) and must be included within ~90 blocks of its anchor (cannot be backfilled)
+- 🔄 **9/10 eligibility**: per-node subwindow bitmask in account-state (part of `state_root`); eligibility = `popcount(bitmask) >= 9` of 10, recomputed identically by every node — no central tallier
+- 🖥️ **Server infrastructure**: Dedicated server (emits the Heartbeat TXs)
 - 📱 **Mobile monitoring**: UNLIMITED mobile devices for monitoring only
-- 🚫 **No mobile pings**: Full/Super nodes NEVER pinged through mobile devices
-- 📊 **Ping frequency**: 10 times per 4-hour reward window (every 24 minutes)
+- 🚫 **No mobile pings**: Super/Genesis nodes NEVER proven live through mobile devices
 - 🧹 **Auto-cleanup**: Monitoring devices cleaned up automatically
 - 🔒 **Privacy**: All device data hashed for compliance
 

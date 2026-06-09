@@ -1671,15 +1671,15 @@ POST /api/v1/rewards/claim
 │  Light Node ID → SHA3-256 → First byte → Shard (0-255)     │
 │                                                              │
 │  Each shard:                                                │
-│  • Assigned to specific Full/Super nodes (deterministic)   │
+│  • Assigned to specific Genesis nodes (deterministic)      │
 │  • Pinger rotates every 4-hour window                      │
 │  • Max 100K Light nodes per shard (LRU eviction)           │
 │                                                              │
 │  Ping Flow:                                                 │
-│  1. Full/Super node sends FCM push to Light node           │
+│  1. Genesis node sends FCM push to Light node              │
 │  2. Light node wakes, signs challenge with Ed25519         │
 │  3. Light node returns signed response                     │
-│  4. Full/Super creates attestation (dual Dilithium sigs)   │
+│  4. Genesis creates attestation (dual Dilithium sigs)      │
 │  5. Attestation gossiped to network                        │
 │  6. Stored in RocksDB for reward calculation               │
 │                                                              │
@@ -1700,42 +1700,55 @@ struct LightNodeAttestation {
 
 **Eligibility**: Light node needs at least 1 successful attestation per 4-hour window.
 
-### Heartbeat System (Full/Super Nodes)
+### Heartbeat System (Super/Genesis Nodes) — v34 Unforgeable On-Chain
 
-**Architecture**: Self-attestation for Full/Super nodes
+**Architecture**: Liveness proven by unforgeable on-chain Heartbeat transactions (NOT gossip self-attestation)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ HEARTBEAT SYSTEM                                            │
+│ HEARTBEAT SYSTEM (v34 — UNFORGEABLE ON-CHAIN)              │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│  Full/Super nodes send 10 heartbeats per 4-hour window     │
+│  Super/Genesis nodes emit ~10 Heartbeat TXs per 4h epoch   │
+│  (one per ~1440-block subwindow)                            │
 │                                                              │
 │  Heartbeat Flow:                                            │
-│  1. Node creates heartbeat with current timestamp          │
+│  1. Node builds a tiny Heartbeat TX anchored to a RECENT    │
+│     canonical block hash (cannot be pre-signed)            │
 │  2. Signs with Dilithium (quantum-resistant)               │
-│  3. Broadcasts via P2P gossip                              │
-│  4. Other nodes verify and store                           │
-│  5. At reward time, count heartbeats per node              │
+│  3. Submits as a normal transaction                        │
+│  4. Validated at block validation vs registry public key;   │
+│     must land within ~90 blocks of its anchor (no backfill)│
+│  5. At APPLY: per-node subwindow bitmask (in state_root)    │
+│     is incremented — O(1), no end-of-epoch scan            │
 │                                                              │
-│  Eligibility:                                               │
-│  • Full: 8+ heartbeats (80% success rate)                  │
-│  • Super: 9+ heartbeats (90% success rate)                 │
+│  Eligibility (recomputed identically by every node):       │
+│  • Super: popcount(bitmask) ≥ 9 of 10 per epoch            │
+│    (SAME 9/10 threshold as before — now UNFORGEABLE)       │
 │  • Reputation >= 70% required                              │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Heartbeat Structure**:
+**Heartbeat TX Structure** (conceptual):
 ```rust
-struct FullNodeHeartbeat {
-    node_id: String,
-    node_type: String,  // "full" or "super"
-    heartbeat_index: u8, // 0-9 (10 per window)
-    timestamp: u64,
-    dilithium_signature: String,
+struct HeartbeatTx {
+    node_id: String,             // must match registry entry
+    subwindow_index: u8,         // 0-9 (10 per epoch)
+    anchor_block_hash: [u8; 32], // recent canonical block (freshness, no pre-sign)
+    dilithium_signature: Vec<u8>,// verified vs node's registry public key
 }
 ```
+
+> **HBC vs on-chain counter**: `HeartbeatCommitment` (HBC) is STILL sent once per epoch and
+> STILL drives node ONBOARDING / eligible-producer discovery. But its self-reported
+> `heartbeat_count` is NO LONGER trusted for reward eligibility — the unforgeable on-chain
+> bitmask in `state_root` overrides it.
+
+> **Cost/scale**: ~70 tiny heartbeat TXs/block at 100k nodes (pruned after macroblock
+> finalization); permanent footprint is just a small per-node counter in state. Dilithium
+> (post-quantum) signatures cannot be aggregated, so per-node liveness inherently costs
+> ~O(nodes×samples) transient TXs — the honest price of unforgeability.
 
 ### FCM Push Notifications (Light Nodes)
 
@@ -1773,15 +1786,23 @@ struct FullNodeHeartbeat {
 
 ### Reward Calculation
 
-**Deterministic Merkle + Sampling**:
+**Eligibility by node type (v34)**:
+- **Super/Genesis**: liveness read DIRECTLY from the unforgeable on-chain subwindow bitmask in
+  `state_root` — eligible ⇔ `popcount(bitmask) ≥ 9 of 10`. No tally, no Merkle sampling: every
+  node recomputes the same result from the canonical chain.
+- **Light**: still proven by Genesis-driven ping attestations, committed via the deterministic
+  Merkle + sampling path below (eligible ⇔ ≥ 1 valid ping per window). UNCHANGED in v34.
 
 ```rust
-// STEP 1: Collect all attestations/heartbeats for window
+// SUPER/GENESIS: eligibility from unforgeable on-chain counter (no scan)
+let super_eligible = state.heartbeat_bitmask(&node.id).count_ones() >= 9;
+
+// LIGHT: deterministic Merkle + sampling over ping attestations
+// STEP 1: Collect Light attestations for window
 let attestations = storage.get_attestations_for_window(window_start);
-let heartbeats = storage.get_heartbeats_for_window(window_start);
 
 // STEP 2: Build Merkle tree (parallel with rayon)
-let ping_hashes: Vec<String> = all_pings.par_iter()
+let ping_hashes: Vec<String> = attestations.par_iter()
     .map(|ping| ping.calculate_hash())  // blake3
     .collect();
 let merkle_root = build_merkle_tree(&ping_hashes);
@@ -1789,7 +1810,7 @@ let merkle_root = build_merkle_tree(&ping_hashes);
 // STEP 3: Deterministic sampling (SHA3-256 seed)
 let entropy_block = storage.load_microblock(current_height - FINALITY_WINDOW)?;
 let sample_seed = sha3_256(b"QNet_Ping_Sampling_v1" || entropy_block || window_start);
-let sampled_pings = deterministic_sample(&all_pings, sample_seed, SAMPLE_SIZE);
+let sampled_pings = deterministic_sample(&attestations, sample_seed, SAMPLE_SIZE);
 
 // STEP 4: Calculate rewards per node
 // v3.18: Pool 2 removed - fees go directly to block producer

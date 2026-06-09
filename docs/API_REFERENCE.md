@@ -641,8 +641,10 @@ GET /api/v1/node/status?activation_code={code}&node_id={id}
 **Eligibility Requirements:**
 | Node Type | Pings Required | Timing |
 |-----------|----------------|--------|
-| Light | 1/1 attestation | Once per 4h window (sharded) |
-| Super | 9/10 heartbeats | Every ~24 min (deterministic) |
+| Light | 1/1 attestation | Once per 4h window (sharded, pinged by Genesis) |
+| Super / Genesis | 9/10 on-chain Heartbeat TXs | One per ~1440-block subwindow |
+
+> **v34:** Super/Genesis reward eligibility is decided by an **on-chain Heartbeat counter**, not the self-reported `heartbeat_count`. Each node emits ~10 Dilithium-signed `Heartbeat` TXs per epoch, each anchored to a recent canonical block hash and included within ~90 blocks of its anchor. A per-node subwindow bitmask in account-state (part of `state_root`) is recomputed identically by every node; eligibility = `popcount(bitmask) >= 9` of 10. The `required_heartbeats` field is therefore **9** for Super/Genesis (Light = 1).
 
 **Ping Window Calculation:**
 ```
@@ -774,7 +776,7 @@ GET /api/v1/rewards/pending?node_id={node_id}
   },
   "ping_status": {
     "heartbeat_count": 10,
-    "required_heartbeats": 8,
+    "required_heartbeats": 9,
     "is_eligible": true
   },
   "current_phase": "Phase1",
@@ -783,6 +785,8 @@ GET /api/v1/rewards/pending?node_id={node_id}
   "needs_attention": false
 }
 ```
+
+> **v34:** For Super/Genesis nodes, `is_eligible` reflects the **on-chain Heartbeat counter** (subwindow bitmask `popcount >= 9` of 10), not the self-reported `heartbeat_count`. The `heartbeat_count`/`required_heartbeats` fields still exist (`required_heartbeats` = 9 for Super/Genesis, 1 for Light) but the on-chain counter is authoritative for eligibility.
 
 ---
 

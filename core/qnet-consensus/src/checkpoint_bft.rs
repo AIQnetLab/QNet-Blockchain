@@ -90,6 +90,27 @@ pub fn accumulate_beacon(vrf_outputs: &[Hash]) -> Hash {
     h.finalize().into()
 }
 
+/// Proof-of-Continuous-Availability challenge selector (v34). A node is "challenged" at a block
+/// iff `H3("QNET_POCA_v1" ‖ block_hash ‖ node_id)`'s first 8 bytes (LE u64) fall below
+/// `u64::MAX / rate_denominator` — i.e. each node is independently selected with probability
+/// ≈ `1/rate_denominator` per block. UNPREDICTABLE before the block exists (depends on its hash),
+/// yet deterministic + publicly verifiable once known ⇒ every node agrees who was challenged. A
+/// challenged node must answer in real time (the answer anchors to this `block_hash` and must be
+/// included on-chain within a short window — enforced at the integration layer), which an offline
+/// node cannot fake retroactively. This is what makes liveness UNFORGEABLE without a self-claim.
+/// Pure & deterministic.
+pub fn poca_challenged(block_hash: &Hash, node_id: &NodeId, rate_denominator: u64) -> bool {
+    if rate_denominator == 0 { return false; }
+    let mut h = Sha3_256::new();
+    h.update(b"QNET_POCA_v1");
+    h.update(&block_hash[..]);
+    h.update(node_id.as_bytes());
+    let d = h.finalize();
+    let mut x = [0u8; 8];
+    x.copy_from_slice(&d[..8]);
+    u64::from_le_bytes(x) < (u64::MAX / rate_denominator)
+}
+
 /// Commitment over a checkpoint's epoch-transition data: the next-epoch eligible-producer
 /// snapshot (opaque bytes), the committee (order-independent), and the cumulative ban set
 /// (order-independent). Bound into the checkpoint hash ⇒ the QC certifies the validator set
@@ -461,6 +482,34 @@ mod tests {
         let only_committee = epoch_commitment(elig, &vec!["X".into()], &[]);
         let only_banned = epoch_commitment(elig, &[], &vec!["X".into()]);
         assert_ne!(only_committee, only_banned, "committee vs ban are domain-separated");
+    }
+
+    #[test]
+    fn poca_challenged_deterministic_and_rate() {
+        let bh = h(7);
+        let id: NodeId = "node-x".into();
+        // Deterministic: same (block_hash, node_id, rate) ⇒ same verdict on every node.
+        assert_eq!(poca_challenged(&bh, &id, 100), poca_challenged(&bh, &id, 100));
+        // Degenerate rates.
+        assert!(!poca_challenged(&bh, &id, 0), "rate 0 ⇒ never challenged");
+        assert!(poca_challenged(&bh, &id, 1), "rate 1 ⇒ (almost) always challenged");
+        // Selection rate ≈ 1/denominator over many distinct block hashes (a fixed node).
+        let denom = 10u64;
+        let trials = 5000u64;
+        let mut hits = 0u64;
+        for i in 0..trials {
+            let mut bb = [0u8; 32];
+            bb[..8].copy_from_slice(&i.to_le_bytes());
+            if poca_challenged(&bb, &id, denom) { hits += 1; }
+        }
+        let expected = trials / denom; // ≈500
+        let diff = if hits > expected { hits - expected } else { expected - hits };
+        assert!(diff < 200, "poca selection rate off: hits={} expected≈{}", hits, expected);
+        // Distinct nodes get independent challenge patterns at the same blocks.
+        let id2: NodeId = "node-y".into();
+        let a: Vec<bool> = (0..32u8).map(|n| poca_challenged(&h(n), &id, 4)).collect();
+        let b: Vec<bool> = (0..32u8).map(|n| poca_challenged(&h(n), &id2, 4)).collect();
+        assert_ne!(a, b, "distinct nodes must not share an identical challenge pattern");
     }
 
     #[test]

@@ -431,7 +431,22 @@ pub enum TransactionType {
         sample_seed: String,                       // Deterministic sampling seed (hex)
         heartbeat_samples: Vec<HeartbeatSampleData>, // Samples with Merkle proofs
     },
-    
+
+    /// v34: UNFORGEABLE liveness heartbeat — replaces the self-attested HeartbeatCommitment.
+    /// One tiny TX per ~1440-block subwindow of the 14400-block epoch. Bound to a recent
+    /// canonical block hash (cannot be pre-signed) and included near its anchor (cannot be
+    /// backfilled into immutable past blocks); the sender's per-epoch subwindow bitmask in
+    /// account-state increments on apply. Reward eligibility = popcount(bitmask) >= 9.
+    /// `from` (Transaction.from) = node wallet (the account whose counter increments);
+    /// `node_id` = consensus pseudonym for PK lookup. The Dilithium `signature` is verified at
+    /// block validation against the node's registry PK (apply trusts validated blocks).
+    Heartbeat {
+        node_id: String,        // genesis_node_00X / super_xxx — consensus identity (PK lookup)
+        anchor_height: u64,     // recent block height: epoch = /14400, subwindow = (%14400)/1440
+        anchor_hash: String,    // canonical hash of block at anchor_height (hex) — anti-pre-sign
+        signature: String,      // Dilithium sig by node over node_id:anchor_height:anchor_hash
+    },
+
     /// PRODUCTION v2.89: Light Node Eligibility Bitmap
     /// Ultra-compact representation of eligible Light nodes using bitmap + zstd compression
     /// 
@@ -857,6 +872,7 @@ impl Transaction {
                 | TransactionType::PingAttestation { .. }
                 | TransactionType::PingCommitmentWithSampling { .. }
                 | TransactionType::HeartbeatCommitment { .. }
+                | TransactionType::Heartbeat { .. }
                 | TransactionType::LightNodeEligibilityBitmap { .. }
                 | TransactionType::RewardDistribution
                 | TransactionType::KeyRotation { .. }
@@ -883,6 +899,7 @@ impl Transaction {
         matches!(
             &self.tx_type,
             TransactionType::HeartbeatCommitment { .. }
+                | TransactionType::Heartbeat { .. }
                 | TransactionType::PingCommitmentWithSampling { .. }
                 | TransactionType::LightNodeEligibilityBitmap { .. }
                 | TransactionType::NodeRegistration { .. }
@@ -912,6 +929,14 @@ impl Transaction {
         match &self.tx_type {
             TransactionType::HeartbeatCommitment { node_id, window_start_height, .. } => {
                 Some((node_id.clone(), window_start_height / EPOCH_INTERVAL, 1))
+            }
+            TransactionType::Heartbeat { node_id, anchor_height, .. } => {
+                // Dedup per (node, epoch, subwindow): a flood of heartbeats in one subwindow
+                // collapses to a single mempool entry (apply is idempotent on the bitmask
+                // regardless). 10 subwindows/epoch ⇒ key = epoch*10 + subwindow.
+                let epoch = anchor_height / EPOCH_INTERVAL;
+                let subwindow = (anchor_height % EPOCH_INTERVAL) / 1440;
+                Some((node_id.clone(), epoch * 10 + subwindow, 7))
             }
             TransactionType::PingCommitmentWithSampling { window_start_height, .. } => {
                 Some((self.from.clone(), window_start_height / EPOCH_INTERVAL, 2))
@@ -967,6 +992,7 @@ impl Transaction {
             TransactionType::PingAttestation { .. } => 0,
             TransactionType::PingCommitmentWithSampling { .. } => 0,
             TransactionType::HeartbeatCommitment { .. } => 0,
+            TransactionType::Heartbeat { .. } => 0,
             TransactionType::LightNodeEligibilityBitmap { .. } => 0,
             TransactionType::NodeRegistration { .. } => 0,
             TransactionType::NodeReactivation { .. } => 0,
@@ -1327,6 +1353,21 @@ impl Transaction {
                     if sample.response_time_ms > 60000 {
                         return Err(format!("[REJECT][TX] ping_sample_response_time_exceeded value={}", sample.response_time_ms));
                     }
+                }
+            }
+            TransactionType::Heartbeat { node_id, anchor_hash, signature, .. } => {
+                // v34: structural checks only. The unforgeable part — anchor_hash == the
+                // canonical hash of block at anchor_height, inclusion recency, and the Dilithium
+                // signature verified against the node's registry PK — is enforced at block
+                // validation (Transaction::validate is pure: no storage / PK-registry access).
+                if node_id.is_empty() {
+                    return Err("[REJECT][TX] heartbeat_empty_node_id".to_string());
+                }
+                if anchor_hash.len() != 64 || !anchor_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err("[REJECT][TX] heartbeat_bad_anchor_hash".to_string());
+                }
+                if signature.is_empty() {
+                    return Err("[REJECT][TX] heartbeat_empty_signature".to_string());
                 }
             }
             TransactionType::HeartbeatCommitment {
@@ -2620,6 +2661,28 @@ impl Transaction {
                 }
                 // No state modification needed - commitment will be validated during emission check
             }
+            TransactionType::Heartbeat { anchor_height, .. } => {
+                // v34: unforgeable liveness — set the sender's subwindow bit for the anchor's
+                // epoch. Idempotent (re-applying a block sets an already-set bit → no double
+                // count), so no per-TX apply dedup is needed. On a new epoch, finalize the
+                // previous epoch's popcount (so the boundary reward snapshot can read it) then
+                // reset the bitmask. epoch/subwindow derive from anchor_height (in the TX), so
+                // apply needs no block-height context. Validity (anchor/sig) verified upstream.
+                const EPOCH_BLOCKS: u64 = 14400;
+                const SUBWINDOW_BLOCKS: u64 = 1440; // 10 subwindows per epoch
+                let epoch = anchor_height / EPOCH_BLOCKS;
+                let subwindow = ((anchor_height % EPOCH_BLOCKS) / SUBWINDOW_BLOCKS) as u16; // 0..9
+                let acct = accounts
+                    .entry(self.from.clone())
+                    .or_insert_with(|| Account::new(self.from.clone()));
+                if acct.heartbeat_epoch != epoch {
+                    acct.heartbeat_final_epoch = acct.heartbeat_epoch;
+                    acct.heartbeat_final_count = acct.heartbeat_slots.count_ones() as u8;
+                    acct.heartbeat_epoch = epoch;
+                    acct.heartbeat_slots = 0;
+                }
+                acct.heartbeat_slots |= 1u16 << subwindow.min(9);
+            }
             TransactionType::HeartbeatCommitment {
                 node_id,
                 window_start_height,
@@ -3268,6 +3331,105 @@ pub fn update_dynamic_gas_pricing(new_pricing: DynamicGasPricing) {
 //
 // Tests cover BOTH `validate()` (mempool / RPC ingest gate) and
 // `apply_to_state()` (defence-in-depth at state mutation time).
+#[cfg(test)]
+mod tests_v34_heartbeat {
+    use super::*;
+    use crate::account::Account;
+    use std::collections::HashMap;
+
+    // Build a v34 Heartbeat TX. `from` == node_id (the account whose subwindow bitmask
+    // increments). anchor_hash is a structurally-valid 64-hex placeholder (the real
+    // anchor/sig check is verify_heartbeat_tx at block validation, not apply).
+    fn hb(node_id: &str, anchor_height: u64) -> Transaction {
+        let mut tx = Transaction {
+            hash: String::new(),
+            from: node_id.to_string(),
+            to: None,
+            amount: 0,
+            nonce: 0,
+            gas_price: u64::MAX,
+            gas_limit: 0,
+            timestamp: 1_700_000_000,
+            signature: None,
+            public_key: None,
+            tx_type: TransactionType::Heartbeat {
+                node_id: node_id.to_string(),
+                anchor_height,
+                anchor_hash: "a".repeat(64),
+                signature: "deadbeef".to_string(),
+            },
+            data: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    // apply sets the bit for anchor's subwindow; same subwindow is idempotent (no double-count).
+    #[test]
+    fn apply_sets_subwindow_bit_and_is_idempotent() {
+        let mut accts: HashMap<String, Account> = HashMap::new();
+        hb("genesis_node_001", 100).apply_to_state(&mut accts).unwrap(); // epoch 0, subwindow 0
+        let a = accts.get("genesis_node_001").unwrap();
+        assert_eq!(a.heartbeat_epoch, 0);
+        assert_eq!(a.heartbeat_slots, 0b1);
+        // subwindow 3 (anchor 3*1440+5 = 4325)
+        hb("genesis_node_001", 3 * 1440 + 5).apply_to_state(&mut accts).unwrap();
+        assert_eq!(accts.get("genesis_node_001").unwrap().heartbeat_slots, 0b1001);
+        assert_eq!(accts.get("genesis_node_001").unwrap().heartbeat_slots.count_ones(), 2);
+        // re-hit subwindow 0 (anchor 200) → idempotent, still 2 bits (no inflation by spamming)
+        hb("genesis_node_001", 200).apply_to_state(&mut accts).unwrap();
+        assert_eq!(accts.get("genesis_node_001").unwrap().heartbeat_slots.count_ones(), 2);
+    }
+
+    // Crossing into a new epoch finalizes the previous epoch's popcount (for the reward
+    // snapshot) and resets the live bitmask. Determinism-critical: feeds state_root.
+    #[test]
+    fn apply_epoch_rollover_finalizes_previous() {
+        let mut accts: HashMap<String, Account> = HashMap::new();
+        for sw in 0..3u64 { hb("super_x", sw * 1440 + 10).apply_to_state(&mut accts).unwrap(); }
+        assert_eq!(accts.get("super_x").unwrap().heartbeat_slots.count_ones(), 3);
+        // epoch 1 (anchor 14400+50): rollover
+        hb("super_x", 14_400 + 50).apply_to_state(&mut accts).unwrap();
+        let a = accts.get("super_x").unwrap();
+        assert_eq!(a.heartbeat_epoch, 1);
+        assert_eq!(a.heartbeat_final_epoch, 0);
+        assert_eq!(a.heartbeat_final_count, 3, "prev epoch popcount finalized");
+        assert_eq!(a.heartbeat_slots, 0b1, "new epoch bitmask = subwindow 0 only");
+    }
+
+    // 9 of 10 subwindows hit ⇒ popcount 9 = the reward-eligibility threshold.
+    #[test]
+    fn apply_nine_of_ten_reaches_threshold() {
+        let mut accts: HashMap<String, Account> = HashMap::new();
+        for sw in 0..9u64 { hb("super_y", sw * 1440 + 10).apply_to_state(&mut accts).unwrap(); }
+        assert_eq!(accts.get("super_y").unwrap().heartbeat_slots.count_ones(), 9);
+    }
+
+    // Structural validation (the pure part; anchor/sig are checked at block validation).
+    #[test]
+    fn validate_structural_accepts_valid_rejects_malformed() {
+        assert!(hb("genesis_node_001", 100).validate().is_ok());
+        // empty node_id
+        let mut t = hb("genesis_node_001", 100);
+        if let TransactionType::Heartbeat { ref mut node_id, .. } = t.tx_type { *node_id = String::new(); }
+        t.hash = t.calculate_hash();
+        assert!(t.validate().is_err(), "empty node_id must reject");
+        // malformed anchor_hash (not 64 hex)
+        let mut t = hb("genesis_node_001", 100);
+        if let TransactionType::Heartbeat { ref mut anchor_hash, .. } = t.tx_type { *anchor_hash = "zz".to_string(); }
+        t.hash = t.calculate_hash();
+        assert!(t.validate().is_err(), "bad anchor_hash must reject");
+        // empty signature
+        let mut t = hb("genesis_node_001", 100);
+        if let TransactionType::Heartbeat { ref mut signature, .. } = t.tx_type { *signature = String::new(); }
+        t.hash = t.calculate_hash();
+        assert!(t.validate().is_err(), "empty signature must reject");
+    }
+}
+
 #[cfg(test)]
 mod tests_v17_swap_sender {
     use super::*;

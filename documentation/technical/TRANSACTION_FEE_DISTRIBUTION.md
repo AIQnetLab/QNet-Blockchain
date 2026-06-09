@@ -84,14 +84,14 @@ if block_is_new {
 ## Node Eligibility Requirements
 
 ### Super Nodes must maintain:
-- 9+ heartbeats per 4-hour window (90% success rate)
+- popcount(on-chain Heartbeat bitmask) ≥ 9 of 10 per 4-hour window (90%, v34: unforgeable on-chain heartbeats; self-reported HBC count no longer trusted)
 - Reputation score ≥ 70%
 - Full archival blockchain data
 - Public API endpoints
 - Block production capability
 
 ### Light Nodes:
-- 1+ attestation per 4-hour window (pinged by Super nodes)
+- 1+ valid attestation per 4-hour window (pinged by Genesis nodes)
 - Reputation fixed at 70 (immutable)
 - Receive Pool 1 only (0% of transaction fees)
 

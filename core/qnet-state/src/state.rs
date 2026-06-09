@@ -411,6 +411,14 @@ impl StateMerkleTree {
         // rebuild (rollback/snapshot/restart) re-hashed them with-pending and
         // diverged from the running incremental state → consensus split.
         hasher.update(&account.pending_rewards.to_le_bytes());
+        // v34: unforgeable liveness counter — ALWAYS in leaf hash (fixed schema, same rule as
+        // pending_rewards above). Reward eligibility reads popcount(heartbeat_slots), so the
+        // counter MUST be consensus-bound; conditional inclusion would split the chain.
+        hasher.update(b"HB:");
+        hasher.update(&account.heartbeat_epoch.to_le_bytes());
+        hasher.update(&account.heartbeat_slots.to_le_bytes());
+        hasher.update(&account.heartbeat_final_epoch.to_le_bytes());
+        hasher.update(&[account.heartbeat_final_count]);
         // EXCLUDED from hash (non-deterministic or metadata-only):
         //   - reputation: f64 is non-deterministic across platforms
         //   - is_node, node_type, created_at, updated_at: metadata only
@@ -1294,6 +1302,10 @@ impl StateManager {
             contract_storage: std::collections::HashMap::new(),
             require_pq_signature: false,
             dilithium_public_key: None,
+            heartbeat_epoch: 0,
+            heartbeat_slots: 0,
+            heartbeat_final_epoch: 0,
+            heartbeat_final_count: 0,
         };
         
         StateMerkleTree::verify_proof(
@@ -2086,6 +2098,70 @@ impl StateManager {
 //   * touch refreshes timestamp so a frequently-accessed account survives
 //   * warm_account is idempotent on cache hits and updates the timestamp
 // ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod merkle_equiv_tests {
+    use super::*;
+    use crate::Account;
+
+    // Deterministic pseudo-account at index i (no rand-crate dependency).
+    fn mk(i: u64) -> Account {
+        let mut a = Account::new(format!("acct{:060x}", i));
+        a.balance = i.wrapping_mul(1_000_003);
+        a.nonce = i % 7;
+        a.pending_rewards = i % 13;
+        a
+    }
+
+    // Audit F#6 — load-bearing invariant: the INCREMENTAL path-walk (`recompute_levels`, used by
+    // `finalize` on a warm cache — i.e. every running node each block) MUST produce the same root
+    // as a FULL rebuild (`recompute_root`, used on restart / snapshot-restore / rollback). If they
+    // ever diverged, a restarted node would compute a different state_root than a running peer →
+    // content_ok never agrees → finality stall. Exercises the incremental path over many rounds.
+    #[test]
+    fn incremental_root_equals_full_rebuild() {
+        let accts: Vec<Account> = (0..40u64).map(mk).collect();
+
+        // Incremental tree: 5 finalize rounds. Round 1 (cold cache) falls back to a full rebuild
+        // that warms intermediate_nodes; rounds 2-5 use the incremental recompute_levels.
+        let mut inc = StateMerkleTree::new();
+        for chunk in accts.chunks(8) {
+            for a in chunk { inc.insert_lazy(&a.address, a); }
+            inc.finalize();
+        }
+        let root_incremental = inc.finalize();
+
+        // Full rebuild over the SAME leaf set.
+        let mut full = StateMerkleTree::new();
+        for a in &accts { full.insert_lazy(&a.address, a); }
+        full.recompute_root();
+        assert_eq!(root_incremental, full.root,
+                   "incremental finalize must equal full recompute_root after batched inserts");
+
+        // Update existing leaves + add new ones incrementally, then compare to a fresh full rebuild.
+        let updated: Vec<Account> = (0..40u64).step_by(3).map(|i| {
+            let mut a = mk(i); a.balance = a.balance.wrapping_add(999); a.nonce += 1; a
+        }).collect();
+        let added: Vec<Account> = (40..50u64).map(mk).collect();
+        for a in updated.iter().chain(added.iter()) { inc.insert_lazy(&a.address, a); }
+        let root_inc2 = inc.finalize();
+
+        let mut full2 = StateMerkleTree::new();
+        for a in &accts { full2.insert_lazy(&a.address, a); }
+        for a in updated.iter().chain(added.iter()) { full2.insert_lazy(&a.address, a); }
+        full2.recompute_root();
+        assert_eq!(root_inc2, full2.root,
+                   "incremental update+insert must equal full rebuild of the final leaf set");
+    }
+
+    #[test]
+    fn empty_tree_root_is_canonical() {
+        let mut a = StateMerkleTree::new();
+        a.recompute_root();
+        let b = StateMerkleTree::new();
+        assert_eq!(a.root, b.root, "empty-tree root must be the canonical default-hash root");
+    }
+}
+
 #[cfg(test)]
 mod cache_tests {
     use super::*;

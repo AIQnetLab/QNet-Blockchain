@@ -122,6 +122,41 @@ pub struct KademliaRouting {
   - Piggyback heartbeats on transaction submissions
   - Use push notifications instead of polling
 
+### Reward-Gating Liveness: Unforgeable On-Chain Heartbeats (v34)
+
+Reward eligibility for Super/Genesis nodes is gated by liveness. As of v34 this
+liveness is proven by **unforgeable on-chain `Heartbeat` transactions** rather
+than a self-reported count, and the design is built to scale:
+
+- **No end-of-epoch mega-scan**: Each Super/Genesis node emits ~10 tiny
+  Dilithium-signed `Heartbeat` TXs per 4-hour epoch (one per ~1440-block
+  subwindow). A per-node subwindow bitmask lives in account-state (part of
+  `state_root`) and is incremented **at apply** — counting is incremental and
+  **O(1) per heartbeat**. This replaces the old end-of-epoch HBC sealer scan
+  (a full-window tally) entirely. Eligibility is simply
+  `popcount(bitmask) >= 9 of 10` (the SAME 9/10 threshold as before), and every
+  node recomputes it identically from the canonical chain — there is no central
+  tallier.
+- **Permanent footprint ≈ a small per-node counter**: The only state that
+  persists is the small per-node subwindow counter/bitmask in `state_root`.
+- **Transient cost ≈ pruned tiny TXs**: At 100k nodes this is ~70 tiny
+  heartbeat TXs/block; these are pruned after macroblock finalization. Each TX
+  is anchored to a recent canonical block hash (cannot be pre-signed) and must
+  be included within ~90 blocks of its anchor (cannot be backfilled into
+  immutable past blocks), then verified against the node's registry public key.
+- **Honest price of unforgeability**: Dilithium (post-quantum) signatures
+  cannot be aggregated, so per-node liveness inherently costs ~O(nodes ×
+  samples) transient TXs. This is the deliberate trade-off for unforgeable,
+  independently-verifiable liveness; the permanent on-chain cost stays O(nodes)
+  small counters.
+- **HBC unchanged for onboarding only**: `HeartbeatCommitment` is still sent
+  once per epoch and still drives node onboarding / eligible-producer
+  discovery, but its self-reported `heartbeat_count` is no longer trusted for
+  reward eligibility — the on-chain counter overrides it.
+- **Light nodes unchanged**: Light-node liveness is still a Genesis-node ping
+  (≥1 valid ping per epoch). It is NOT yet unforgeable on-chain — hardening
+  that path is a separate, pending follow-up.
+
 ## 📈 Scalability Metrics
 
 ### Network Load Comparison:

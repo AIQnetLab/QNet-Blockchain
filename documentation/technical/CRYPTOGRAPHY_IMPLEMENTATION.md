@@ -696,23 +696,43 @@ struct LightNodeAttestation {
 - ⚠️ **Mobile:** Ed25519 fallback (`light_hybrid_pending`) until Dilithium3 library added
 - 🎯 **Target:** Mobile app with Dilithium3 WASM for full HYBRID signatures
 
-### Full/Super Node Heartbeats
+### Super/Genesis Node Heartbeats (v34 — Unforgeable On-Chain)
 
-Full/Super nodes self-attest via heartbeats with HYBRID signatures:
+**ARCHITECTURE v34:** Super/Genesis node liveness — which gates per-epoch
+rewards — is now proven by **unforgeable on-chain `Heartbeat` transactions**,
+not by a self-reported count. Each node emits ~10 tiny Dilithium-signed
+`Heartbeat` TXs per 4-hour epoch (one per ~1440-block subwindow). Each TX is
+anchored to a recent canonical block hash (so it cannot be pre-signed) and must
+be included within ~90 blocks of that anchor (so it cannot be backfilled into
+immutable past blocks). It is verified at block validation against the node's
+registry public key.
 
 ```rust
-struct FullNodeHeartbeat {
+struct Heartbeat {
     node_id: String,
-    node_type: String,      // "full" or "super"
-    heartbeat_index: u8,    // 0-9 (10 per 4-hour window)
+    node_type: String,      // "super" or "genesis"
+    subwindow_index: u8,    // 0-9 (10 subwindows per 4-hour epoch, ~1440 blocks each)
+    anchor_block_hash: [u8; 32], // recent canonical block hash (prevents pre-signing)
+    anchor_height: u64,     // must be included within ~90 blocks of this height
     timestamp: u64,
-    signature: String,      // HYBRID (Ed25519 + Dilithium3, ~2.6KB bincode)
+    signature: String,      // Dilithium-signed, verified vs registry public key
 }
 ```
 
-**Eligibility Requirements**:
-- Super nodes: 9+ heartbeats (90% success rate)
+**Eligibility Requirements (v34)**:
+- Super/Genesis nodes: `popcount(subwindow_bitmask) ≥ 9 of 10` per epoch
+  (the SAME 90% / 9-of-10 threshold as before, but now **unforgeable**)
 - Reputation ≥ 70% required
+- The per-node subwindow bitmask lives in account-state (part of `state_root`)
+  and is incremented **at apply** — every node recomputes eligibility
+  identically from the canonical chain. There is no central tallier and no
+  end-of-epoch scan: counting is incremental, O(1) per heartbeat.
+
+> **HeartbeatCommitment (HBC) — unchanged role, no longer trusted for rewards**:
+> HBC is STILL sent once per epoch and STILL drives node onboarding /
+> eligible-producer discovery. However, its self-reported `heartbeat_count` is
+> NO LONGER trusted for reward eligibility — the on-chain subwindow counter
+> above overrides it.
 
 ### Hash Algorithm Selection
 

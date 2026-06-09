@@ -933,15 +933,16 @@ After 2 macroblocks with 2/3+ validator signatures = FINAL
 
 ```
 Response requirements:
-├── Light Nodes: 1+ attestation per window (pinged by Super via FCM push)
-└── Super Nodes: 90% (9+ out of 10 heartbeats in current window)
+├── Light Nodes: 1+ attestation per window (pinged by Genesis via FCM push)
+└── Super Nodes: 9 of 10 on-chain Heartbeat subwindows per epoch (unforgeable)
 (v3.18: Full Nodes removed)
 
 Architecture (v3.18+):
 ├── Light: 5 Genesis nodes ping mobile Light nodes (FCM V1 / UnifiedPush / Polling)
 │           → Light signs challenge with Dilithium3 ping-delegation key
 │           → pinger creates HYBRID Ed25519+Dilithium3 attestation
-├── Super: Self-attest via heartbeats (10 per 4h window, HYBRID signature, quantum-resistant)
+├── Super/Genesis: liveness proven by UNFORGEABLE on-chain Heartbeat TXs
+│           (~10 tiny Dilithium-signed TXs per 4h epoch, one per ~1440-block subwindow)
 ├── Linear sharding: each of 5 Genesis pings 20% of Light registry (sorted by node_id)
 ├── Light node reputation: Fixed at 70 (immutable, not affected by events)
 ├── Storage tiers (v3.18+ — only two roles exist):
@@ -950,13 +951,16 @@ Architecture (v3.18+):
 │     * Super → ~2 TB (full history, archival, no pruning)
 └── Mobile role: ping-response only — no block download, no broadcast, no relay
 
-Deterministic On-Chain Heartbeats (v2.41):
-├── Heartbeats collected via gossip → stored in heartbeat_history (RAM)
-├── ONLY recorded in EMISSION MacroBlocks (every 160th = 4 hours)
-├── HeartbeatSummary[] → ConsensusData.reward_heartbeats (BLOCKCHAIN)
-├── All nodes read SAME data from blockchain = deterministic rewards
-├── Strict node_id validation: light_, full_, super_, genesis_node_ only
-└── Invalid formats REJECTED (no default assignments)
+Unforgeable On-Chain Heartbeats (v34) — Super/Genesis liveness:
+├── Each Super/Genesis node emits ~10 tiny Heartbeat TXs per 4h epoch (one per ~1440-block subwindow)
+├── Each TX is Dilithium-signed, anchored to a RECENT canonical block hash (cannot be pre-signed)
+├── Must be included within ~90 blocks of its anchor (cannot be backfilled into immutable past blocks)
+├── Verified at block validation against the node's registry public key
+├── Per-node subwindow bitmask lives in account-state (part of state_root), incremented at apply
+├── Eligibility = popcount(bitmask) ≥ 9 of 10 per epoch (SAME 9/10 threshold, now UNFORGEABLE)
+├── Every node recomputes identically from canonical chain (no central tallier, no end-of-epoch scan; incremental, O(1) per heartbeat)
+└── HBC (HeartbeatCommitment) is STILL sent once per epoch for ONBOARDING / eligible-producer discovery,
+    but its self-reported heartbeat_count is NO LONGER trusted for rewards (the on-chain counter overrides it)
 
 > **Note (v2.19.10)**: Sharding is for parallel TX processing, NOT storage partitioning. All nodes receive all blocks via P2P.
 ```
@@ -1355,8 +1359,8 @@ Distribution: EQUALLY divided among ALL eligible nodes (Light + Full + Super)
 Current Rate: 251,432.34 QNC per 4-hour period (Years 0-4)
 Eligibility (NEW rewards): 
 ├── Light Nodes: 1+ attestation per window + reputation = 70 (fixed)
-├── Full Nodes: 8+ heartbeats (80%) + reputation ≥70
-└── Super Nodes: 9+ heartbeats (90%) + reputation ≥70
+└── Super Nodes: popcount(on-chain Heartbeat bitmask) ≥ 9 of 10 + reputation ≥70
+                 (unforgeable, recomputed from state_root; HBC count no longer trusted)
 Claim OLD rewards: No reputation requirement (only wallet ownership, even if banned)
 Next Halving: Year 4 (reduces to 125,716.17 QNC)
 Distribution Formula: Individual_Reward = Pool_Total / Eligible_Node_Count (EQUAL share)
@@ -1412,7 +1416,7 @@ Mechanism:
 Distribution: Equal share to all eligible nodes
 Eligibility (NEW rewards): 
 ├── Light Nodes: 1+ attestation per window + reputation = 70 (fixed)
-└── Super Nodes: 9+ heartbeats (90%) + reputation ≥70
+└── Super Nodes: popcount(on-chain Heartbeat bitmask) ≥ 9 of 10 + reputation ≥70 (unforgeable)
 Claim OLD rewards: No reputation requirement (only wallet ownership, even if banned)
 Innovation: Every new node activation benefits the entire network
 ```
@@ -1483,7 +1487,7 @@ Reputation Score Mechanics (v2.19.4):
 
 Economic Thresholds:
 ├── Light Nodes: Fixed 70 reputation, 1+ attestation = eligible for Pool 1
-├── Super Nodes: 70+ points + 9+ heartbeats (90%) = eligible for Pool 1
+├── Super Nodes: 70+ points + on-chain Heartbeat bitmask ≥ 9 of 10 = eligible for Pool 1 (unforgeable)
 ├── Super: 10-69 points - network access only, no new rewards
 └── Super: <10 points - complete network ban (can claim old rewards)
 (v3.18: Full Nodes removed, Pool 2 removed - fees go directly to producer)
@@ -1545,34 +1549,37 @@ Light Node Attestation Structure:
 └── timestamp: u64
 ```
 
-**Self-Attestation Architecture (Full/Super Nodes):**
+**Unforgeable On-Chain Heartbeats (Super/Genesis Nodes) - v34:**
 
 ```
-Heartbeat System (v2.23 - Quantum Protected):
-├── Frequency: 10 heartbeats per 4-hour window (~24 min apart)
-├── Self-attestation: Node broadcasts heartbeat with HYBRID signature (Ed25519 + Dilithium)
-├── Gossip: Heartbeats broadcast via Kademlia K-neighbors (K=3, DHT routing)
-├── Storage: Persisted in RocksDB for reward calculation
-├── Security: Quantum-resistant - Dilithium signs (ephemeral_key || message_hash || timestamp)
-├── Security: Timestamp validation (±5min) + active_full_super_nodes registry
+Heartbeat System (v34 - Unforgeable On-Chain):
+├── Frequency: ~10 tiny Heartbeat TXs per 4-hour epoch (one per ~1440-block subwindow)
+├── On-chain: Each heartbeat is a real Dilithium-signed transaction (NOT gossip self-attestation)
+├── Anchored: Bound to a RECENT canonical block hash → cannot be pre-signed
+├── Time-boxed: Must be included within ~90 blocks of its anchor → cannot be backfilled into immutable past blocks
+├── Verified: At block validation against the node's registry public key
+└── State: Per-node subwindow bitmask in account-state (part of state_root), incremented at apply
 
-Heartbeat Structure:
-├── node_id: String
-├── node_type: "full" or "super"
-├── heartbeat_index: u8 (0-9)
-├── timestamp: u64
-└── signature: String (placeholder, NOT verified - CPU optimization)
+Heartbeat TX (conceptual fields):
+├── node_id: String           // must match registry entry
+├── subwindow_index: u8 (0-9)
+├── anchor_block_hash: [u8; 32] // recent canonical block (freshness)
+└── dilithium_signature: Vec<u8> // verified against registry public key
 
-SECURITY NOTE (v2.19.19 - NIST FIPS 204 compliant):
-├── Heartbeats do NOT affect consensus - fake heartbeats give attacker nothing
-├── Blocks are ALWAYS verified with Dilithium (security preserved)
-├── Node must be in active_full_super_nodes registry (first registration uses Dilithium)
-├── Timestamp validation prevents replay attacks
-└── CPU savings: ~35ms per heartbeat × thousands = significant
+ELIGIBILITY (v34 - recomputed identically by every node):
+├── Reward eligible ⇔ popcount(bitmask) ≥ 9 of 10 per epoch (SAME 9/10 threshold)
+├── Now UNFORGEABLE: a node cannot fabricate liveness it did not have
+├── No central tallier, no end-of-epoch scan — incremental, O(1) per heartbeat
+├── HBC (HeartbeatCommitment) still sent once per epoch for ONBOARDING / eligible-producer
+│   discovery, but its self-reported heartbeat_count is NO LONGER trusted (on-chain counter overrides it)
+└── Cost/scale: ~70 tiny heartbeat TXs/block at 100k nodes (pruned after macroblock
+    finalization); permanent footprint is just a small per-node counter in state. Dilithium
+    signatures cannot be aggregated, so per-node liveness inherently costs ~O(nodes×samples)
+    transient TXs — the honest price of unforgeability.
 
 Response Requirements by Node Type:
-├── Light Nodes: 1+ attestation per window (not 100%)
-└── Super Nodes: 90% success rate (9+ out of 10 heartbeats)
+├── Light Nodes: 1+ valid ping per window (pinged by Genesis nodes; path UNCHANGED, not yet unforgeable)
+└── Super Nodes: bitmask ≥ 9 of 10 subwindows (unforgeable on-chain)
 (v3.18: Full Nodes removed)
 
 Light Node Reputation: Fixed at 70 (immutable by design)

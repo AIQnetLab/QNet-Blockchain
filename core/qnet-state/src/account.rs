@@ -107,6 +107,29 @@ pub struct Account {
     /// thereafter. `None` until the wallet opts into post-quantum enforcement.
     #[serde(default)]
     pub dilithium_public_key: Option<String>,
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v34: UNFORGEABLE LIVENESS COUNTER (replaces self-attested HeartbeatCommitment)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // The 14400-block epoch is split into 10 subwindows (1440 blocks each). Each valid
+    // on-chain Heartbeat TX from this node sets the bit of its subwindow. Reward
+    // eligibility = popcount(heartbeat_slots) >= 9 — but now UNFORGEABLE (the count is
+    // built from on-chain heartbeat TXs that cannot be backfilled, not a self-declared
+    // commitment). These fields are part of the state_root leaf hash (fixed schema,
+    // unconditional — see hash_account) so reward eligibility is consensus-bound.
+    /// Epoch (= anchor_height/14400) the current `heartbeat_slots` bitmask belongs to.
+    #[serde(default)]
+    pub heartbeat_epoch: u64,
+    /// Subwindow bitmask for `heartbeat_epoch`: bit i set ⇒ ≥1 valid heartbeat in subwindow i.
+    #[serde(default)]
+    pub heartbeat_slots: u16,
+    /// The most recently FINALIZED epoch (set on rollover) — lets the epoch-boundary reward
+    /// snapshot read the just-completed epoch's count even after the node rolled to the next.
+    #[serde(default)]
+    pub heartbeat_final_epoch: u64,
+    /// popcount of `heartbeat_slots` for `heartbeat_final_epoch` (the finalized liveness count).
+    #[serde(default)]
+    pub heartbeat_final_count: u8,
 }
 
 /// Account state (alias for compatibility)
@@ -161,6 +184,10 @@ impl Default for AccountState {
             contract_storage: HashMap::new(),
             require_pq_signature: false,
             dilithium_public_key: None,
+            heartbeat_epoch: 0,
+            heartbeat_slots: 0,
+            heartbeat_final_epoch: 0,
+            heartbeat_final_count: 0,
         }
     }
 }
@@ -231,6 +258,10 @@ impl Account {
             contract_storage: HashMap::new(),
             require_pq_signature: false,
             dilithium_public_key: None,
+            heartbeat_epoch: 0,
+            heartbeat_slots: 0,
+            heartbeat_final_epoch: 0,
+            heartbeat_final_count: 0,
         }
     }
 
@@ -252,6 +283,10 @@ impl Account {
             contract_storage: HashMap::new(),
             require_pq_signature: false,
             dilithium_public_key: None,
+            heartbeat_epoch: 0,
+            heartbeat_slots: 0,
+            heartbeat_final_epoch: 0,
+            heartbeat_final_count: 0,
         }
     }
 

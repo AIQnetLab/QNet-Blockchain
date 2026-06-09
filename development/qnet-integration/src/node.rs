@@ -5899,6 +5899,45 @@ impl BlockchainNode {
         Ok(existing_light_nodes.len() as u32)
     }
     
+    /// Select heartbeat sample indices for a HeartbeatCommitment.
+    ///
+    /// Slot 0 is ALWAYS the near-tip (max block-height) heartbeat: the Phase-2A eligibility
+    /// proximity gate requires a revealed sample within SYNC_PROXIMITY_BLOCKS of the chain tip
+    /// (only the commitment-window heartbeat qualifies), so forcing it makes a synced node's
+    /// admission DETERMINISTIC from the first epoch instead of ~1/n probabilistic. Remaining
+    /// slots stay seeded-random spot-checks (byte-identical to the prior derivation). Count is
+    /// unchanged (= sample_size) so the validator's [min,max] size gate still holds, and every
+    /// revealed sample is still a real, anchored, Dilithium-signed heartbeat (gate security
+    /// unchanged). Pure + deterministic ⇒ identical on every node.
+    fn select_heartbeat_sample_indices(block_heights: &[u64], sample_size: usize, sample_seed: &str) -> Vec<usize> {
+        use sha3::{Digest, Sha3_256};
+        if block_heights.is_empty() { return Vec::new(); }
+        let n = block_heights.len();
+        // First occurrence of the max height (the commitment-window heartbeat; heights distinct).
+        let mut near_tip_index = 0usize;
+        let mut near_tip_h = block_heights[0];
+        for (i, &h) in block_heights.iter().enumerate() {
+            if h > near_tip_h { near_tip_h = h; near_tip_index = i; }
+        }
+        let mut indices = Vec::with_capacity(sample_size);
+        for i in 0..sample_size {
+            if i == 0 {
+                indices.push(near_tip_index);
+                continue;
+            }
+            let mut index_hasher = Sha3_256::new();
+            index_hasher.update(sample_seed.as_bytes());
+            index_hasher.update(&(i as u32).to_le_bytes());
+            let hash = index_hasher.finalize();
+            let index = u64::from_le_bytes([
+                hash[0], hash[1], hash[2], hash[3],
+                hash[4], hash[5], hash[6], hash[7],
+            ]) as usize % n;
+            indices.push(index);
+        }
+        indices
+    }
+
     /// PRODUCTION v2.78: Static helper - Create HeartbeatCommitment TX
     /// Used by commitment TX loop (runs in parallel with block production)
     /// Returns Transaction ready to be added to mempool
@@ -5941,7 +5980,26 @@ impl BlockchainNode {
             }
             return Err(QNetError::ValidationError("No heartbeats to commit".to_string()));
         }
-        
+
+        // Onboarding determinism: the Phase-2A eligibility proximity gate admits a node only if
+        // its HBC reveals a heartbeat within SYNC_PROXIMITY_BLOCKS of the chain tip — satisfied
+        // ONLY by the commitment-window (near-tip) heartbeat. Heartbeats are produced in real time
+        // at their scheduled heights, so early in the emission window that near-tip one may not
+        // exist yet; an HBC built then can NEVER pass the gate and is wasted for the whole epoch.
+        // Defer (Err ⇒ the commitment loop retries next tick, tracker untouched) until a heartbeat
+        // inside the proximity window exists, so the emitted HBC always carries a gate-satisfying
+        // near-tip sample (which select_heartbeat_sample_indices then forces into the revealed set).
+        // SYNC_PROXIMITY_BLOCKS MUST match create_eligible_producers_snapshot (node.rs ~4040).
+        const SYNC_PROXIMITY_BLOCKS: u64 = 90;
+        let max_hb_height = my_heartbeats.iter().map(|(_, _, _, bh, _)| *bh).max().unwrap_or(0);
+        if max_hb_height + SYNC_PROXIMITY_BLOCKS < window_end_height {
+            if is_info() {
+                println!("[INFO][HB-COMMIT-CREATE] deferring node={} epoch={} max_hb={} need>={} (near-tip heartbeat not yet produced)",
+                         node_id, current_epoch, max_hb_height, window_end_height.saturating_sub(SYNC_PROXIMITY_BLOCKS));
+            }
+            return Err(QNetError::ValidationError("near-tip heartbeat not yet produced; deferring HBC".to_string()));
+        }
+
         // Create Merkle tree and samples (same logic as create_heartbeat_commitment_tx)
         use blake3::Hasher as Blake3Hasher;
         
@@ -5969,23 +6027,22 @@ impl BlockchainNode {
         // Previous bug: used 1% + MIN=10 which NEVER matched validation!
         let min_samples = ((heartbeat_count as usize * 20) / 100).max(1);
         let sample_size = min_samples; // Use minimum to reduce TX size
-        
+
+        // Eligibility (Phase-2A) requires a revealed sample within SYNC_PROXIMITY_BLOCKS of the
+        // chain tip to prove the node is synced to NOW; the only heartbeat that qualifies is the
+        // commitment-window one (forced near epoch end). select_heartbeat_sample_indices makes
+        // slot 0 the near-tip heartbeat so admission is deterministic from the first epoch (was
+        // ~1/heartbeat_count probabilistic). Count stays = sample_size (validator [min,max]).
+        let sample_block_heights: Vec<u64> = my_heartbeats.iter().map(|(_, _, _, bh, _)| *bh).collect();
+        let sample_indices = Self::select_heartbeat_sample_indices(&sample_block_heights, sample_size, &sample_seed);
+
         let mut heartbeat_samples = Vec::new();
-        for i in 0..sample_size {
-            let mut index_hasher = Sha3_256::new();
-            index_hasher.update(&sample_seed.as_bytes());
-            index_hasher.update(&(i as u32).to_le_bytes());
-            let hash = index_hasher.finalize();
-            let index = u64::from_le_bytes([
-                hash[0], hash[1], hash[2], hash[3],
-                hash[4], hash[5], hash[6], hash[7],
-            ]) as usize % (heartbeat_count as usize);
-            
+        for index in sample_indices {
             let merkle_proof = qnet_core::crypto::merkle::generate_merkle_proof(&heartbeat_hashes, index)
                 .map_err(|e| QNetError::SecurityError(format!("Merkle proof failed: {}", e)))?;
-            
+
             let (_, heartbeat_idx, timestamp, block_height, dilithium_signature) = &my_heartbeats[index];
-            
+
             // PRODUCTION v2.78: Use REAL Dilithium signature from storage
             heartbeat_samples.push(qnet_state::HeartbeatSampleData {
                 heartbeat_index: *heartbeat_idx,
@@ -6079,10 +6136,87 @@ impl BlockchainNode {
         // canonical_bytes() includes public_key/dilithium_public_key in hash calculation
         // Hash must be computed when all signature-related fields are set
         commitment_tx.hash = commitment_tx.calculate_hash();
-        
+
         Ok(commitment_tx)
     }
-    
+
+    /// v34: build ONE unforgeable Heartbeat TX anchored to a recent block (current_height-2).
+    /// `tx_type.signature` is the consensus Dilithium sig over the anchor (verified by
+    /// `verify_heartbeat_tx`: anchor must equal a real recent block hash + be timely + sig valid
+    /// vs the node's registry PK ⇒ an offline node cannot fabricate it). The envelope carries the
+    /// standard hybrid sig like every system TX. Returns None if the anchor hash is unavailable or
+    /// signing fails (caller skips this tick, retries next).
+    async fn create_heartbeat_tx_static(
+        storage: &Arc<Storage>,
+        node_id: &str,
+        current_height: u64,
+    ) -> Option<qnet_state::Transaction> {
+        if current_height < 2 { return None; }
+        let anchor_height = current_height - 2;
+        let anchor_hash = storage.get_block_hash(anchor_height).ok().flatten()?;
+        let crypto = try_get_quantum_crypto()?;
+        let hb_msg = format!("QNET_HEARTBEAT:{}:{}:{}", node_id, anchor_height, anchor_hash);
+        let hb_sig = crypto.create_consensus_signature(node_id, &hb_msg).await.ok()?;
+        let epoch = current_height / 14400;
+        let subwindow = (current_height % 14400) / 1440;
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut tx = qnet_state::Transaction {
+            from: node_id.to_string(),
+            to: None,
+            amount: 0,
+            tx_type: qnet_state::TransactionType::Heartbeat {
+                node_id: node_id.to_string(),
+                anchor_height,
+                anchor_hash,
+                signature: hb_sig.signature,
+            },
+            timestamp: current_time,
+            hash: String::new(),
+            signature: None,
+            public_key: None,
+            gas_price: u64::MAX,
+            gas_limit: 0,
+            nonce: epoch * 10 + subwindow + 1,
+            data: None,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: 0,
+        };
+        let canonical = format!("{}|{}|{}|{}|{}|{}|{}",
+            tx.from, "", tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp);
+        {
+            use ed25519_dalek::{SigningKey, Signer};
+            use rand::rngs::OsRng;
+            let mut csprng = OsRng{};
+            let ek = SigningKey::generate(&mut csprng);
+            let epk = ek.verifying_key();
+            let ed_sig = ek.sign(canonical.as_bytes());
+            tx.signature = Some(hex::encode(ed_sig.to_bytes()));
+            tx.public_key = Some(hex::encode(epk.as_bytes()));
+        }
+        if let Ok(dsig) = crypto.create_consensus_signature(node_id, &canonical).await {
+            tx.dilithium_signature = Some(dsig.signature);
+            tx.dilithium_public_key = Some(node_id.to_string());
+        }
+        tx.hash = tx.calculate_hash();
+        Some(tx)
+    }
+
+    /// v34: a node's UNFORGEABLE liveness count for `epoch`, read from its on-chain account tally
+    /// (popcount of the subwindow bitmask set by validated Heartbeat TXs). Uses the current bitmask
+    /// if it belongs to `epoch`, else the finalized previous-epoch count, else 0. Reward + producer
+    /// eligibility keys on THIS (not the self-attested HBC count) ⇒ liveness cannot be forged.
+    pub(crate) fn account_heartbeat_count(account: &qnet_state::Account, epoch: u64) -> u8 {
+        if account.heartbeat_epoch == epoch {
+            account.heartbeat_slots.count_ones() as u8
+        } else if account.heartbeat_final_epoch == epoch {
+            account.heartbeat_final_count
+        } else {
+            0
+        }
+    }
+
     /// Used by commitment TX loop (runs in parallel with block production)
     /// Returns Transaction ready to be added to mempool
     #[allow(dead_code)]
@@ -9509,46 +9643,52 @@ impl BlockchainNode {
                     // snapshot; a future retry of the original macroblock (from any
                     // peer) will then pass the strict committee-size check.
                     let err_str = e.to_string();
-                    if let Some(need) = err_str.strip_prefix("Sync error: need_mb_prev:")
-                                           .or_else(|| err_str.strip_prefix("need_mb_prev:"))
-                    {
-                        // Extract missing mb index from the `{X} for validating mb#{N}`
-                        // payload. Take everything before the first whitespace.
-                        let missing_idx_str = need.split_whitespace().next().unwrap_or("");
-                        if let Ok(missing_idx) = missing_idx_str.parse::<u64>() {
-                            if crate::node::is_warn() {
-                                println!("[WARN][MB-SYNC] need_n_minus_2 mb={} missing_n2={} peer={} — cooling peer + requesting N-2 from rotation",
-                                         index, missing_idx, from_peer_hint);
-                            }
-                            // Cool down the source peer so the next call picks
-                            // a different one. record_sync_peer_failure respects
-                            // SYNC_PEER_COOLDOWN cadence internally.
-                            crate::unified_p2p::record_sync_peer_failure(&from_peer_hint);
-
-                            // v32.15: batched range fetch on cold-sync. When the local
-                            // macroblock store is empty (fresh node), single-step N-2
-                            // backtracking produces O(N) round-trips. Detect and fetch
-                            // the whole prefix [0..missing_idx] in one request.
-                            let p2p_for_rotation = blockchain_for_macroblocks.unified_p2p.clone();
-                            let storage_for_check = blockchain_for_macroblocks.storage.clone();
-                            tokio::spawn(async move {
-                                if let Some(p2p) = p2p_for_rotation {
-                                    let local_top = storage_for_check
-                                        .get_latest_macroblock_index()
-                                        .unwrap_or(0);
-                                    let from = if local_top == 0 { 0 } else { local_top + 1 };
-                                    let to = missing_idx;
-                                    if to > from && (to - from) > 1 {
-                                        let _ = p2p.sync_macroblocks(from, to).await;
-                                    } else {
-                                        let _ = p2p.sync_macroblocks(missing_idx, missing_idx).await;
-                                    }
-                                }
-                            });
-                            // Not an error for logging purposes — this is the
-                            // expected rotation flow, not a failure.
-                            continue;
+                    // F6 fix (v34): recognise BOTH the legacy "need_mb_prev:{X}" error AND the v2
+                    // Checkpoint-BFT defer "v2_qc_defer_anchor … need_mb_n2={X}". Both mean "we lack
+                    // macroblock X needed to validate this one" → the SAME targeted N-2 backfill.
+                    // Previously only the legacy prefix matched (and it is no longer produced), so a
+                    // v2 anchor-miss fell through to a generic log and recovered only via coarse
+                    // periodic retries — same class as the microblock-window repair, one layer up.
+                    let missing_idx_opt: Option<u64> = err_str
+                        .strip_prefix("Sync error: need_mb_prev:")
+                        .or_else(|| err_str.strip_prefix("need_mb_prev:"))
+                        .and_then(|s| s.split_whitespace().next())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| {
+                            // v2 form: pull the digits right after "need_mb_n2="
+                            err_str.split("need_mb_n2=").nth(1).map(|s| {
+                                s.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect::<String>()
+                            }).filter(|s| !s.is_empty()).and_then(|s| s.parse::<u64>().ok())
+                        });
+                    if let Some(missing_idx) = missing_idx_opt {
+                        if crate::node::is_warn() {
+                            println!("[WARN][MB-SYNC] need_n_minus_2 mb={} missing_n2={} peer={} — cooling peer + requesting N-2 from rotation",
+                                     index, missing_idx, from_peer_hint);
                         }
+                        // Cool down the source peer so the next call picks a different one.
+                        crate::unified_p2p::record_sync_peer_failure(&from_peer_hint);
+
+                        // v32.15: batched range fetch on cold-sync. When the local macroblock store
+                        // is empty (fresh node), single-step N-2 backtracking produces O(N)
+                        // round-trips. Detect and fetch the whole prefix [0..missing_idx] in one go.
+                        let p2p_for_rotation = blockchain_for_macroblocks.unified_p2p.clone();
+                        let storage_for_check = blockchain_for_macroblocks.storage.clone();
+                        tokio::spawn(async move {
+                            if let Some(p2p) = p2p_for_rotation {
+                                let local_top = storage_for_check
+                                    .get_latest_macroblock_index()
+                                    .unwrap_or(0);
+                                let from = if local_top == 0 { 0 } else { local_top + 1 };
+                                let to = missing_idx;
+                                if to > from && (to - from) > 1 {
+                                    let _ = p2p.sync_macroblocks(from, to).await;
+                                } else {
+                                    let _ = p2p.sync_macroblocks(missing_idx, missing_idx).await;
+                                }
+                            }
+                        });
+                        // Expected rotation flow, not a failure.
+                        continue;
                     }
                     eprintln!("[ERR][MB-SYNC] process_failed idx={} err={}", index, e);
                 }
@@ -12810,6 +12950,43 @@ impl BlockchainNode {
     }
     
     /// Validate received microblock
+    /// v34: verify an unforgeable-liveness `Heartbeat` TX against the canonical chain.
+    /// A heartbeat is valid ONLY if (1) its `anchor_height` is a recent PAST block relative to the
+    /// block including it (≤ HB_ANCHOR_MAX_LAG) — so it cannot be backfilled into an immutable old
+    /// block; (2) `anchor_hash` equals the canonical hash of that block — so it could not be
+    /// pre-signed before the block existed; (3) the Dilithium `signature` over the canonical message
+    /// verifies against the node's consensus registry PK — so only the real node (a registered
+    /// super/genesis) can emit it, never an impersonator. Together these make an OFFLINE node unable
+    /// to fabricate liveness: it has neither a fresh anchor nor a way to insert the TX after the fact.
+    async fn verify_heartbeat_tx(
+        node_id: &str,
+        anchor_height: u64,
+        anchor_hash: &str,
+        signature: &str,
+        inclusion_height: u64,
+        storage: &Arc<Storage>,
+        p2p: &Arc<SimplifiedP2P>,
+    ) -> Result<(), String> {
+        const HB_ANCHOR_MAX_LAG: u64 = 90;
+        if anchor_height >= inclusion_height {
+            return Err(format!("anchor_not_past node={} anchor={} incl={}", node_id, anchor_height, inclusion_height));
+        }
+        if inclusion_height - anchor_height > HB_ANCHOR_MAX_LAG {
+            return Err(format!("anchor_stale node={} lag={}", node_id, inclusion_height - anchor_height));
+        }
+        match storage.get_block_hash(anchor_height) {
+            Ok(Some(h)) if h.eq_ignore_ascii_case(anchor_hash) => {}
+            Ok(Some(_)) => return Err(format!("anchor_hash_mismatch node={} anchor={}", node_id, anchor_height)),
+            Ok(None) => return Err(format!("anchor_block_missing node={} anchor={}", node_id, anchor_height)),
+            Err(e) => return Err(format!("anchor_lookup_err node={} anchor={} err={}", node_id, anchor_height, e)),
+        }
+        let msg = format!("QNET_HEARTBEAT:{}:{}:{}", node_id, anchor_height, anchor_hash);
+        if !p2p.verify_consensus_signature(node_id, &msg, signature) {
+            return Err(format!("bad_signature node={}", node_id));
+        }
+        Ok(())
+    }
+
     async fn validate_received_microblock(
         block: &crate::unified_p2p::ReceivedBlock,
         storage: &Arc<Storage>,
@@ -12964,7 +13141,31 @@ impl BlockchainNode {
                 }
             }
         }
-        
+
+        // v34: UNFORGEABLE-LIVENESS heartbeat verification. A Heartbeat TX in this block must
+        // anchor to a real recent block hash + be timely + carry a valid Dilithium sig (see
+        // verify_heartbeat_tx) — else an offline node could fabricate liveness for rewards. INERT
+        // until heartbeat production lands (no Heartbeat TXs exist yet). LIVE-mode only: during
+        // sync the block is already network-validated and its anchors may not be local.
+        {
+            let hb_local_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+            let hb_sync_target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
+            let hb_is_syncing = coordinator_is_syncing()
+                || (hb_sync_target > 0 && microblock.height <= hb_sync_target)
+                || hb_local_height + 50 < microblock.height;
+            if !hb_is_syncing {
+                if let Some(p2p) = p2p {
+                    for tx in &microblock.transactions {
+                        if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, anchor_hash, signature } = &tx.tx_type {
+                            Self::verify_heartbeat_tx(node_id, *anchor_height, anchor_hash, signature, microblock.height, storage, p2p)
+                                .await
+                                .map_err(|e| format!("invalid_heartbeat_tx: {}", e))?;
+                        }
+                    }
+                }
+            }
+        }
+
         // ═══════════════════════════════════════════════════════════════════════════
         // 3. CRITICAL: Verify chain continuity (previous_hash) for ALL blocks
         // v10.2: THREE-TIER VALIDATION (fastest first):
@@ -14623,11 +14824,41 @@ impl BlockchainNode {
             if is_info() {
                 println!("[INFO][HEARTBEAT-LOOP] HeartbeatCommitment TX loop started (independent task)");
             }
-            
+
+            // v34: last (epoch, subwindow) for which this node emitted a Heartbeat TX (dedup).
+            let mut last_hb_subwindow: Option<(u64, u64)> = None;
+
             while *is_running.read().await {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                
+
                 let current_height = *height.read().await;
+
+                // v34: emit ONE unforgeable Heartbeat TX per ~1440-block subwindow (10/epoch) for
+                // super/genesis nodes. Anchored to a recent block hash so it cannot be pre-signed or
+                // backfilled (verified in validate_received_microblock). Replaces self-attested
+                // liveness with on-chain liveness tallied in Account.heartbeat_slots (popcount ≥ 9).
+                if !matches!(node_type, NodeType::Light) && current_height >= 2 {
+                    let hb_epoch = current_height / EMISSION_BLOCK_INTERVAL;
+                    let hb_subwindow = (current_height % EMISSION_BLOCK_INTERVAL) / 1440;
+                    if last_hb_subwindow != Some((hb_epoch, hb_subwindow)) {
+                        if let Some(hb_tx) = Self::create_heartbeat_tx_static(&storage, &node_id, current_height).await {
+                            if let Ok(hb_bytes) = bincode::serialize(&hb_tx) {
+                                let hb_gp = hb_tx.gas_price;
+                                if mempool.add_binary_transaction(hb_bytes.clone(), hb_tx.hash.clone(), hb_gp) {
+                                    if let Some(ref p2p) = unified_p2p {
+                                        let _ = p2p.broadcast_transaction(hb_bytes);
+                                    }
+                                    last_hb_subwindow = Some((hb_epoch, hb_subwindow));
+                                    if is_info() {
+                                        println!("[INFO][HEARTBEAT] emitted node={} epoch={} subwindow={} at_h={}",
+                                                 node_id, hb_epoch, hb_subwindow, current_height);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let blocks_until_epoch_end = EMISSION_BLOCK_INTERVAL - (current_height % EMISSION_BLOCK_INTERVAL);
                 let should_create_commitments = blocks_until_epoch_end <= COMMITMENT_WINDOW_START && blocks_until_epoch_end > 0;
                 
@@ -15493,6 +15724,10 @@ impl BlockchainNode {
             println!("[DBG][GEN] load_microblock_auto_format h=0 result={:?}",
                      genesis_check.as_ref().map(|opt| opt.as_ref().map(|b| b.height)));
             
+            // Fork-safety: a persistently-unreadable block 0 is CORRUPTION, never a signal to
+            // re-genesis. If set, the create-fresh path below refuses to mint a new genesis
+            // (which would fork a previously-populated node) and halts for operator intervention.
+            let mut genesis_was_corrupt = false;
             let genesis_exists = match genesis_check {
                 Ok(Some(ref block)) => {
                     println!("[DBG][GEN] genesis_exists valid=true h={} producer={}",
@@ -15504,12 +15739,44 @@ impl BlockchainNode {
                     false
                 }
                 Err(e) => {
-                    println!("[WARN][GEN] DEBUG: Genesis block exists but corrupted/unreadable: {}", e);
-                    println!("[WARN][GEN] genesis_corrupted action=delete");
-                    if let Err(e) = storage.delete_microblock(0) {
-                        eprintln!("[ERR][STORAGE] genesis_delete_failed err={}", e);
+                    // Retry first — do NOT mistake a transient RocksDB read error for corruption
+                    // (the original code deleted block 0 on the very first Err, which under peer
+                    // isolation routed node_001 into minting a fresh-timestamp genesis → fork).
+                    println!("[WARN][GEN] genesis_block0_unreadable err={} — retrying before any action", e);
+                    let mut resolved: Option<bool> = None;
+                    for attempt in 1..=5u32 {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        match storage.load_microblock_auto_format(0) {
+                            Ok(Some(ref block)) => {
+                                println!("[INFO][GEN] genesis_block0_reread_ok attempt={} h={}", attempt, block.height);
+                                resolved = Some(true);
+                                break;
+                            }
+                            Ok(None) => {
+                                println!("[INFO][GEN] genesis_block0_absent attempt={} — genuinely empty", attempt);
+                                resolved = Some(false);
+                                break;
+                            }
+                            Err(e2) => {
+                                println!("[WARN][GEN] genesis_block0_reread_err attempt={}/5 err={}", attempt, e2);
+                            }
+                        }
                     }
-                    false
+                    match resolved {
+                        Some(exists) => exists,
+                        None => {
+                            // Real corruption. Clear block 0 so node_001 can resync a good genesis
+                            // from peers, but mark it so the create-fresh path REFUSES to mint a new
+                            // one if no peer serves a replacement (fork-safe). Nodes 002-005 never
+                            // create — they simply wait for peers.
+                            println!("[WARN][GEN] genesis_block0_corrupt persistent — clearing for peer-resync (will NOT mint fresh)");
+                            if let Err(e3) = storage.delete_microblock(0) {
+                                eprintln!("[ERR][STORAGE] genesis_delete_failed err={}", e3);
+                            }
+                            genesis_was_corrupt = true;
+                            false
+                        }
+                    }
                 }
             };
             
@@ -15599,6 +15866,13 @@ impl BlockchainNode {
                     if synced_from_network {
                         println!("[INFO][GEN] node_001 synced genesis from running network — skipping creation");
                         // Fall through to main loop (genesis exists in storage now)
+                    } else if genesis_was_corrupt {
+                        // Block 0 was corrupt AND no peer served a replacement within the poll
+                        // window. Minting a fresh genesis on a node that previously held a chain
+                        // would fork the network — refuse and halt (loud crash-loop under
+                        // --restart=always) so the operator restores storage or resyncs.
+                        eprintln!("[FATAL][GEN] block0 corrupt and no peer served a replacement — refusing to mint fresh genesis (fork-safe). Halting.");
+                        std::process::exit(1);
                     } else {
                     // First-ever network start: no peers have genesis yet
                     println!("[INFO][GEN] no existing genesis in network — creating new one");
@@ -24974,16 +25248,40 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             match crate::node::window_content_from_accum(mb_idx) {
                                                 Some((h, v)) => (h, v, "accum"),
                                                 None => {
-                                                    // Fallback: bounded-wait for the full window to persist, then re-read.
-                                                    for _ in 0..120 {
-                                                        let mut have_all = true;
+                                                    // Fallback: bounded-wait for the full window to persist, actively
+                                                    // REPAIRING any missing microblock heights from peers as we wait.
+                                                    // v34 DA-repair: the prior stall root was a node that lost a few
+                                                    // microblock shreds (hash_miss) and could NEVER reproduce the window
+                                                    // content → checkpoint never reached 2f+1 → the chain froze. The
+                                                    // missing blocks DO exist on peers that received them;
+                                                    // request_block_repair(H) fetches the EXACT missing heights (verified
+                                                    // on receipt by the producer's Dilithium sig + prev_hash linkage), so
+                                                    // the node completes the window and can sign. This is the targeted
+                                                    // microblock repair the recovery path lacked — it requested the
+                                                    // (unsealed, nonexistent) macroblock instead of the missing microblocks.
+                                                    for attempt in 0..120u32 {
+                                                        let mut missing: Vec<u64> = Vec::new();
                                                         for h in start_height..=end_height {
                                                             if !matches!(storage_cons.load_microblock_hash(h), Ok(Some(_))) {
-                                                                have_all = false;
-                                                                break;
+                                                                missing.push(h);
                                                             }
                                                         }
-                                                        if have_all { break; }
+                                                        if missing.is_empty() { break; }
+                                                        // Re-request the specific holes ~every 2s (8×250ms), bounded per
+                                                        // round so a wide gap cannot fan out into a peer-DoS. Idempotent:
+                                                        // a peer serves the stored block; an already-present block is
+                                                        // simply re-applied (dedup), never double-counted.
+                                                        if attempt % 8 == 0 {
+                                                            if is_warn() {
+                                                                println!("[WARN][CONS] window_repair mb={} missing={} first={} last={} — fetching microblocks from peers",
+                                                                         mb_idx, missing.len(),
+                                                                         missing.first().copied().unwrap_or(0),
+                                                                         missing.last().copied().unwrap_or(0));
+                                                            }
+                                                            for &h in missing.iter().take(32) {
+                                                                let _ = p2p_cons.request_block_repair(h).await;
+                                                            }
+                                                        }
                                                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                                                     }
                                                     let mut h_vec: Vec<[u8; 32]> = Vec::new();
@@ -25024,8 +25322,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                     }
                                                 }
                                             }
-                                            if state_root == [0u8; 32] && is_warn() {
-                                                println!("[WARN][ASYNC-CONS] head_state_unapplied end_h={} — placeholder root", end_height);
+                                            if state_root == [0u8; 32] {
+                                                // Defer (do NOT signal) when the head's real account root is still
+                                                // unapplied after the bounded wait. Signalling the [0;32] placeholder
+                                                // would diverge content_ok against peers that DID apply (this node
+                                                // abstains anyway), and if a quorum shared the placeholder it would
+                                                // seal a macroblock with NO real state commitment. Stepping aside lets
+                                                // a node with the applied root propose; this node applies the
+                                                // macroblock via the §4.5 sync wire once a quorum seals it — same
+                                                // fail-stop discipline as the partial-window (mb_hashes) guard below.
+                                                if is_warn() {
+                                                    println!("[WARN][CONS] head_state_unapplied mb={} end_h={} — placeholder root, not signalling (defer to §4.5 sync)", mb_idx, end_height);
+                                                }
+                                                return;
                                             }
                                         }
                                         let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&vrf_outputs);
@@ -31123,6 +31432,59 @@ impl Clone for BlockchainNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // v34: reward/producer eligibility reads the UNFORGEABLE on-chain liveness count (popcount
+    // of the subwindow bitmask set by validated Heartbeat TXs), NOT the self-attested HBC count.
+    // The reader picks the live bitmask for the current epoch, the finalized count for the
+    // just-previous epoch (so the boundary reward snapshot is race-free), else 0.
+    #[test]
+    fn account_heartbeat_count_reads_correct_epoch() {
+        let mut acct = qnet_state::Account::new("super_x".to_string());
+        acct.heartbeat_epoch = 5;
+        acct.heartbeat_slots = 0b1_1111_1111; // 9 subwindows set
+        acct.heartbeat_final_epoch = 4;
+        acct.heartbeat_final_count = 7;
+        assert_eq!(BlockchainNode::account_heartbeat_count(&acct, 5), 9, "current epoch → live popcount");
+        assert_eq!(BlockchainNode::account_heartbeat_count(&acct, 4), 7, "previous epoch → finalized count");
+        assert_eq!(BlockchainNode::account_heartbeat_count(&acct, 3), 0, "older epoch → 0 (not eligible)");
+        assert_eq!(BlockchainNode::account_heartbeat_count(&acct, 6), 0, "future epoch → 0");
+    }
+
+    // HBC onboarding fix: a new super-node enters the committee ONLY via Phase-2A, whose
+    // proximity gate requires a revealed heartbeat sample within SYNC_PROXIMITY_BLOCKS of the
+    // tip — i.e. the commitment-window (near-tip) heartbeat. Random sampling alone included it
+    // only ~1/n of the time → probabilistic ~per-epoch admission. select_heartbeat_sample_indices
+    // forces slot 0 to the near-tip so admission is deterministic from the first epoch, while
+    // keeping the sample COUNT (validator [min,max] gate) and the seeded-random spot-checks.
+    #[test]
+    fn heartbeat_sample_always_includes_near_tip() {
+        // 10 ascending heights ⇒ the near-tip (max) is index 9.
+        let heights: Vec<u64> = (0..10).map(|i| 1000 + i * 100).collect();
+        let seed = "deadbeefseed";
+        for size in 1..=3usize {
+            let idx = BlockchainNode::select_heartbeat_sample_indices(&heights, size, seed);
+            assert_eq!(idx.len(), size, "count stays = sample_size (validator size gate)");
+            assert_eq!(idx[0], 9, "slot 0 is ALWAYS the near-tip (max-height) heartbeat");
+            assert!(idx.iter().all(|&i| i < heights.len()), "indices in range");
+        }
+        // Near-tip = MAX height, independent of array order (not merely the last element).
+        let unsorted = vec![5000u64, 1000, 9000, 2000]; // max 9000 at index 2
+        assert_eq!(
+            BlockchainNode::select_heartbeat_sample_indices(&unsorted, 2, seed)[0], 2,
+            "near-tip is the max-height index regardless of order",
+        );
+        // Empty in ⇒ empty out (no panic).
+        assert!(BlockchainNode::select_heartbeat_sample_indices(&[], 2, seed).is_empty());
+        // Deterministic: same inputs ⇒ same indices on every node.
+        assert_eq!(
+            BlockchainNode::select_heartbeat_sample_indices(&heights, 3, seed),
+            BlockchainNode::select_heartbeat_sample_indices(&heights, 3, seed),
+        );
+        // Slot 0 (near-tip) is seed-independent — always the recency proof, whatever the seed.
+        let a = BlockchainNode::select_heartbeat_sample_indices(&heights, 3, "seed-A");
+        let b = BlockchainNode::select_heartbeat_sample_indices(&heights, 3, "seed-B");
+        assert_eq!(a[0], b[0], "near-tip slot is seed-independent");
+    }
 
     // P1-D: the committee anchor (N-2) for v2 QC verification. The genesis boundary (index<3 → None)
     // is the subtle part — an off-by-one there would defer the bootstrap macroblocks forever (mb=2's

@@ -260,16 +260,18 @@ Once at 70%, nodes can grow reputation through:
 
 ### Light Node Ping System (1 ping per 4 hours)
 
-Light nodes are **pinged by Full/Super nodes** once per 4-hour window:
+Light nodes are **pinged by Genesis nodes** once per 4-hour window:
 
 **How it works:**
-1. Full/Super nodes run `start_light_node_ping_service()` (see `rpc.rs:5557`)
+1. Genesis nodes run `start_light_node_ping_service()` (see `rpc.rs:5557`)
 2. Service checks every 60 seconds for Light nodes to ping
 3. Light nodes are assigned to **shards** (0-255) based on node_id hash
-4. Each Full/Super node only pings Light nodes in **its shard** (1/256 of total)
+4. Each Genesis node only pings Light nodes in **its shard** (1/256 of total)
 5. **Deterministic pinger selection:** Primary + 2 Backups per Light node
 6. Light node responds to ping → creates `LightNodeAttestation`
 7. Attestation is gossiped to all nodes
+
+> **Note:** The Light ping path is **not yet unforgeable** (hardening pending). Light eligibility = ≥1 valid attestation per epoch, scheduled in a deterministic slot per node per window as described above.
 
 **Timing:**
 - Slot duration: 1 minute (240 slots per 4h window)
@@ -300,6 +302,16 @@ match node_type {
 ---
 
 ## QNC Token Rewards (v2.21.1)
+
+### Liveness via Unforgeable On-Chain Heartbeats (v34)
+
+**Critical Change:** Super/Genesis node liveness (which gates per-epoch rewards) is now proven by **unforgeable on-chain `Heartbeat` transactions**, NOT by the self-attested `HeartbeatCommitment` (HBC) count.
+
+- Each Super/Genesis node emits **~10 tiny on-chain `Heartbeat` TXs per 4-hour epoch** (one per ~1440-block subwindow). Each TX is **Dilithium-signed**, **anchored to a recent canonical block hash** (cannot be pre-signed), and **must be included within ~90 blocks of its anchor** (cannot be backfilled). It is verified at block validation against the node's registry public key.
+- A per-node **subwindow bitmask** lives in account-state (part of `state_root`). Reward eligibility = `popcount(bitmask) >= 9` of 10 per epoch — the **same 9/10 threshold, now UNFORGEABLE**. Every node recomputes it identically from the chain; there is **no central tallier and no end-of-epoch scan**.
+- **HBC is still sent once per epoch** and still drives node **onboarding / eligible-producer discovery**, but its self-reported `heartbeat_count` is **no longer trusted for reward eligibility** — the on-chain counter overrides it.
+
+The RAM-based gossip heartbeat flow documented below predates this change. It still describes onboarding/discovery signaling, but reward eligibility for Super/Genesis is now decided by the on-chain subwindow bitmask, not by the gossiped/self-reported count.
 
 ### Full Heartbeat System Audit (A to Z)
 
@@ -442,6 +454,8 @@ pub fn get_heartbeats_for_window(&self, window_start: u64) -> Vec<(String, u8, u
 })
 ```
 
+> **v34:** For Super/Genesis nodes this gossip-derived `count` is **no longer authoritative**. Reward eligibility is decided by the on-chain subwindow bitmask (`popcount(bitmask) >= 9` of 10), recomputed identically by every node from the chain. This filter remains for onboarding/discovery only.
+
 #### Step 10: Process Rewards
 **Location:** `node.rs:622` - `process_reward_window()`
 
@@ -510,9 +524,11 @@ if is_emission_macroblock {
 
 | Node Type | Pings/4h | Required | Success Rate | Timeout | Reputation |
 |-----------|----------|----------|--------------|---------|------------|
-| Super | 10 heartbeats | 9+ | 90% | 30 sec | >= 70% |
+| Super | 10 on-chain Heartbeat TXs | 9+ | 90% | 30 sec | >= 70% |
 | Full | 10 heartbeats | 8+ | 80% | 30 sec | >= 70% |
-| Light | 1 ping (by server) | 1 | 100% | 60 sec | Fixed 70% |
+| Light | 1 ping (by Genesis) | 1 | 100% | 60 sec | Fixed 70% |
+
+> **v34:** Super/Genesis eligibility (the 9-of-10 requirement) is now proven by the **on-chain subwindow bitmask** (`popcount >= 9`), not by self-reported heartbeat counts. Light nodes are pinged by **Genesis** nodes; their path is not yet unforgeable.
 
 ### Scalability Analysis
 
@@ -530,9 +546,9 @@ if is_emission_macroblock {
 | 100,000 | 1,000,000 | 70/sec | 280 Kbit/s |
 
 **Light node sharding (256 shards):**
-- Each Full/Super pings only 1/256 of Light nodes
-- 1M Light nodes → each server pings ~3,906 nodes
-- 3,906 / 240 slots = ~16 pings/minute per server
+- Each Genesis node pings only 1/256 of Light nodes
+- 1M Light nodes → each Genesis node pings ~3,906 nodes
+- 3,906 / 240 slots = ~16 pings/minute per Genesis node
 
 ### 3-Layer Reputation Protection (v2.21.1)
 

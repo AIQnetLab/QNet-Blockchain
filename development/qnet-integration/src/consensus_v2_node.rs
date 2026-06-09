@@ -186,7 +186,23 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                     let ws = (window / 160 - 1) * 14400;
                     let we = ws + 14400;
                     let hb = crate::node::BlockchainNode::collect_heartbeat_commitments_from_blocks(storage, p2p, ws, we, true)
-                        .await.ok().map(|(s, _)| s).filter(|s| !s.is_empty())
+                        .await.ok().map(|(mut s, _)| {
+                            // v34: super/genesis reward eligibility now comes from the UNFORGEABLE
+                            // on-chain heartbeat tally (Account.heartbeat_slots popcount for this
+                            // epoch), NOT the self-attested HBC count — closing the reward forgery.
+                            // HBC still drives candidate discovery (the scan) until it is removed;
+                            // the on-chain tally is the authority for is_eligible.
+                            let hb_epoch = ws / 14400;
+                            for sm in &mut s {
+                                let cnt = storage.load_account(&sm.node_id).ok().flatten()
+                                    .map(|a| crate::node::BlockchainNode::account_heartbeat_count(&a, hb_epoch))
+                                    .unwrap_or(0);
+                                let required: u8 = match sm.node_type { 0 => 1, 2 => 9, _ => 10 };
+                                sm.heartbeat_count = cnt;
+                                sm.is_eligible = cnt >= required;
+                            }
+                            s
+                        }).filter(|s| !s.is_empty())
                         .and_then(|s| bincode::serialize(&s).ok());
                     let lt = crate::node::BlockchainNode::collect_ping_commitments_from_blocks(storage, p2p, ws, we)
                         .await.ok().filter(|m| !m.is_empty())

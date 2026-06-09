@@ -209,7 +209,7 @@ Handles out-of-order block arrival in gossip P2P network while preventing memory
 | Node Type | Ping Requirement | Reputation |
 |-----------|------------------|------------|
 | **Light** | 1+ attestation per window | Any (fixed 70) |
-| **Super** | 9+ heartbeats (90%) | ≥ 70% |
+| **Super** | 9/10 on-chain Heartbeat TXs (90%, unforgeable) | ≥ 70% |
 
 ### Halving Schedule
 - Years 0-20: Normal halving (÷2 every 4 years)

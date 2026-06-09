@@ -705,6 +705,21 @@ impl BlockValidator {
                 
                 // Ping commitments are FREE system operations
             }
+            TransactionType::Heartbeat { node_id, anchor_hash, signature, .. } => {
+                // v34: structural pre-checks. The unforgeable verification (anchor_hash == the
+                // canonical hash of block at anchor_height, inclusion recency, Dilithium sig vs
+                // the node's registry PK) runs at block validation, where storage + the PK
+                // registry are available — not in this pure type gate.
+                if node_id.is_empty() {
+                    return Err(IntegrationError::ValidationError("Heartbeat node_id empty".to_string()));
+                }
+                if anchor_hash.len() != 64 || !anchor_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(IntegrationError::ValidationError("Heartbeat anchor_hash must be 64 hex chars".to_string()));
+                }
+                if signature.is_empty() {
+                    return Err(IntegrationError::ValidationError("Heartbeat signature cannot be empty".to_string()));
+                }
+            }
             TransactionType::HeartbeatCommitment {
                 node_id,
                 window_start_height,

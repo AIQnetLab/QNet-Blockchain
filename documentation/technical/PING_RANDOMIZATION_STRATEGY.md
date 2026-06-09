@@ -10,15 +10,15 @@
 // Light node assignment to shard (deterministic)
 let shard_id = sha3_256(light_node_id)[0]; // First byte = 0-255
 
-// Each shard is assigned to specific Full/Super nodes
+// Each shard is assigned to specific Genesis nodes (Light pingers)
 // Pinger rotates every 4-hour window based on block entropy
 ```
 
 **Key differences from time-slot approach**:
 - **Sharding**: Nodes divided into 256 shards (not time slots)
-- **Push-based**: Full/Super nodes ping Light nodes via FCM (not Light nodes pinging)
-- **Attestations**: Dual-signed (Light Ed25519 + Pinger Dilithium)
-- **Heartbeats**: Full/Super nodes self-attest (10 per 4-hour window)
+- **Push-based**: **Genesis** nodes ping Light nodes via FCM (not Light nodes pinging, and not ordinary Super nodes)
+- **Attestations**: Dual-signed (Light Ed25519 + Pinger Dilithium). The Light path is **not yet unforgeable** (hardening pending); Light eligibility = ≥1 valid attestation per epoch.
+- **Heartbeats (v34)**: Super/Genesis liveness is proven by **unforgeable on-chain `Heartbeat` TXs** (~10 per 4-hour epoch, one per ~1440-block subwindow), not by self-attested counts. Eligibility = on-chain subwindow bitmask `popcount >= 9` of 10.
 
 ---
 
