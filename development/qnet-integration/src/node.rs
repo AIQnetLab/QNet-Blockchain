@@ -15765,15 +15765,26 @@ impl BlockchainNode {
                     match resolved {
                         Some(exists) => exists,
                         None => {
-                            // Real corruption. Clear block 0 so node_001 can resync a good genesis
-                            // from peers, but mark it so the create-fresh path REFUSES to mint a new
-                            // one if no peer serves a replacement (fork-safe). Nodes 002-005 never
-                            // create — they simply wait for peers.
-                            println!("[WARN][GEN] genesis_block0_corrupt persistent — clearing for peer-resync (will NOT mint fresh)");
-                            if let Err(e3) = storage.delete_microblock(0) {
-                                eprintln!("[ERR][STORAGE] genesis_delete_failed err={}", e3);
+                            // Persistent Err reading block 0. CRITICAL distinction: a FRESH empty DB
+                            // (first boot after a genesis_*_data wipe) returns Err here, NOT Ok(None)
+                            // — block 0 simply does not exist yet. That is NOT corruption and MUST
+                            // proceed to normal cold-start (node_001 mints genesis, others await it).
+                            // Only a block-0 Err on an ALREADY-POPULATED chain (chain_height > 0 or
+                            // block 1 present) is fork-dangerous corruption → clear + refuse-to-mint.
+                            // (The prior version flagged corruption unconditionally here, which
+                            // crash-looped EVERY node on a fresh launch: block-0 Err is the normal
+                            // first-boot state, no peer has genesis yet → the fork-safe HALT misfired.)
+                            let db_populated = storage.get_chain_height().unwrap_or(0) > 0
+                                || matches!(storage.load_microblock_auto_format(1), Ok(Some(_)));
+                            if db_populated {
+                                println!("[WARN][GEN] genesis_block0_corrupt persistent (chain populated) — clearing for peer-resync (will NOT mint fresh)");
+                                if let Err(e3) = storage.delete_microblock(0) {
+                                    eprintln!("[ERR][STORAGE] genesis_delete_failed err={}", e3);
+                                }
+                                genesis_was_corrupt = true;
+                            } else {
+                                println!("[INFO][GEN] genesis_block0_absent (fresh empty DB) — first boot, will create/await genesis");
                             }
-                            genesis_was_corrupt = true;
                             false
                         }
                     }
