@@ -2398,14 +2398,36 @@ impl PersistentStorage {
             Some(data) if data.len() == 32 => {
                 let mut hash = [0u8; 32];
                 hash.copy_from_slice(&data);
-                Ok(Some(hash))
+                return Ok(Some(hash));
             }
             Some(data) => {
-                eprintln!("[ERR][STORAGE] invalid_hash_index_len h={} len={}", height, data.len());
-                Ok(None)
+                eprintln!("[ERR][STORAGE] invalid_hash_index_len h={} len={} — rebuilding", height, data.len());
+                // fall through to backfill (corrupt index → rebuild from the stored block)
             }
-            None => Ok(None),
+            None => { /* fall through to backfill */ }
         }
+
+        // BACKFILL ON READ — the promise save_microblock makes ("will be backfilled
+        // on read") but never kept until now. The hash index can be absent for a block
+        // that IS fully stored: a save path whose wire format the save-time
+        // MicroBlock-only hash extractor couldn't decode (→ hash_index_skip), a
+        // delete+re-sync, or a DA-repaired microblock. Without backfill, load returns
+        // None for a present block, and the macroblock window-content check counts it
+        // "missing" → the proposer refuses to sign the checkpoint → 2f+1 unreachable →
+        // finality freezes the ENTIRE chain (observed: mb16 stuck, all nodes at
+        // finalized=mb15 while the blocks were on disk the whole time).
+        // build_microblock_hash_index decodes BOTH MicroBlock and EfficientMicroBlock
+        // and writes the index. A genuinely-absent block → false → None → DA-repair.
+        if self.build_microblock_hash_index(height).unwrap_or(false) {
+            if let Some(data) = self.db.get_cf(&metadata_cf, hash_key.as_bytes())? {
+                if data.len() == 32 {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&data);
+                    return Ok(Some(hash));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// v12.0: Build hash index entry for a single block (used by migration).
