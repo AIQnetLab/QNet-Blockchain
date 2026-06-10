@@ -59,6 +59,25 @@ const _: () = assert!(MACROBLOCK_INTERVAL % CHECKPOINT_INTERVAL == 0, "CHECKPOIN
 /// per-node values desync view-change timing and churn liveness (it is NOT a per-operator knob).
 pub const VIEW_TIMEOUT_MS: u64 = 4000;
 
+/// The next INTRA-window checkpoint boundary strictly after `from`, at or below `tip`, with the
+/// cursor stepped OVER any macroblock boundaries crossed. A multiple of `macro_i` is emitted by the
+/// macroblock-boundary path, NOT the intra path — but the cursor MUST step past it, or it stalls on
+/// the first one and no later intra checkpoint is ever signalled ⇒ the next window never reaches the
+/// driver ⇒ chain freeze. Returns `(next_intra, cursor)`: `next_intra` is the boundary to signal once
+/// its sub-window content is ready (None if none ≤ tip); `cursor` is the new value recording the
+/// boundaries stepped over (store unconditionally). At `k == macro_i` every boundary is a macroblock
+/// boundary ⇒ always None (intra path dormant). Pure & deterministic; terminates (`b` strictly rises).
+pub fn next_intra_checkpoint_boundary(from: u64, tip: u64, k: u64, macro_i: u64) -> (Option<u64>, u64) {
+    if k == 0 || macro_i == 0 { return (None, from); }
+    let mut cursor = from;
+    loop {
+        let b = (cursor / k + 1) * k;                 // next K-boundary strictly above the cursor
+        if b == 0 || b > tip { return (None, cursor); }
+        if b % macro_i == 0 { cursor = b; continue; } // boundary path emits it; step over, don't stall
+        return (Some(b), cursor);
+    }
+}
+
 /// Deterministic VRF committee subsample. `sorted_candidates` MUST be sorted by node_id by the
 /// caller, so the index→candidate mapping is identical on every node; `window` is the macroblock
 /// index the committee serves; `seed` is that window's N-2 randomness beacon. ≤ `threshold` ⇒ the
@@ -328,6 +347,32 @@ mod tests {
     use super::*;
 
     fn h(n: u8) -> Hash { [n; 32] }
+
+    // Regression: the intra-window cursor MUST step over macroblock boundaries instead of stalling
+    // on the first one. The stall (cursor never advances past 90) starved every checkpoint of the
+    // second window ⇒ the chain froze right after the first macroblock. Encodes that exact walk.
+    #[test]
+    fn intra_checkpoint_boundary_steps_over_macroblock_boundaries() {
+        let (k, m) = (30u64, 90u64);
+        assert_eq!(next_intra_checkpoint_boundary(0, 30, k, m), (Some(30), 0));
+        assert_eq!(next_intra_checkpoint_boundary(30, 60, k, m), (Some(60), 30));
+        // THE BUG: from 60 with the tip on/after the macroblock boundary 90 must NOT stall — 90 is
+        // stepped over (cursor→90) and nothing intra is due until the tip reaches 120.
+        assert_eq!(next_intra_checkpoint_boundary(60, 90, k, m), (None, 90));
+        assert_eq!(next_intra_checkpoint_boundary(60, 119, k, m), (None, 90));
+        assert_eq!(next_intra_checkpoint_boundary(60, 120, k, m), (Some(120), 90));
+        assert_eq!(next_intra_checkpoint_boundary(120, 150, k, m), (Some(150), 120));
+        // second macroblock boundary (180) also stepped, not stalled
+        assert_eq!(next_intra_checkpoint_boundary(150, 180, k, m), (None, 180));
+        assert_eq!(next_intra_checkpoint_boundary(150, 210, k, m), (Some(210), 180));
+        // other valid divisors of 90
+        assert_eq!(next_intra_checkpoint_boundary(0, 45, 15, 90), (Some(15), 0));
+        assert_eq!(next_intra_checkpoint_boundary(75, 105, 15, 90), (Some(105), 90)); // 90 stepped
+        // K == macro ⇒ EVERY boundary is a macroblock boundary ⇒ intra path dormant, never stalls
+        assert_eq!(next_intra_checkpoint_boundary(0, 10_000, 90, 90), (None, 9_990));
+        // degenerate guards
+        assert_eq!(next_intra_checkpoint_boundary(50, 1000, 0, 90), (None, 50));
+    }
 
     #[test]
     fn quorum_math() {

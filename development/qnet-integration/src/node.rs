@@ -23467,11 +23467,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         // Lazy init: on restart skip historical windows (the driver finalizes those
                         // from synced macroblocks) — only drive the live window's intra-checkpoints.
                         if last_intra_signalled == 0 { last_intra_signalled = (current_height / macro_i) * macro_i; }
-                        // Next un-signalled K-boundary, in order: the driver proposes checkpoints
-                        // contiguously, so a gap here would stall the window — emit one per event,
-                        // advancing only on confirmed-ready content (later events retry the same b).
-                        let b = ((last_intra_signalled / k) + 1) * k;
-                        if b > 0 && b <= current_height && b % macro_i != 0 {
+                        // Next intra boundary, stepping the cursor OVER macroblock boundaries (those
+                        // are emitted by the boundary path below). Without the step the cursor stalls
+                        // on the first macroblock boundary and no later intra checkpoint is ever
+                        // signalled ⇒ the next window never reaches the driver ⇒ the chain freezes.
+                        // Emit one per event; defer (retry same b) until the sub-window is ready.
+                        let (next_intra, stepped) = qnet_consensus::checkpoint_bft::next_intra_checkpoint_boundary(
+                            last_intra_signalled, current_height, k, macro_i);
+                        last_intra_signalled = stepped;
+                        if let Some(b) = next_intra {
                             if let Some(ref p2p_ref) = p2p {
                                 let start = b - k + 1;
                                 let missing: Vec<u64> = (start..=b)
