@@ -48,6 +48,8 @@ pub struct ConsensusDriver {
     seal_data: HashMap<u64, (Vec<u8>, Vec<NodeId>)>, // round → (eligible_producers, committee)
     sealed: std::collections::HashSet<u64>, // windows we already emitted Persist for (dedup)
     last_proposed_round: u64,               // one proposal per round we lead
+    cp_interval: u64,                       // finality-checkpoint cadence (blocks); divides macro_interval
+    macro_interval: u64,                    // macroblock/epoch cadence (blocks); Persist fires only at its boundary
 }
 
 impl ConsensusDriver {
@@ -57,8 +59,14 @@ impl ConsensusDriver {
             committee, genesis_hash, node_id,
             proposals: HashMap::new(), heads: HashMap::new(), seal_data: HashMap::new(),
             sealed: std::collections::HashSet::new(), last_proposed_round: 0,
+            cp_interval: CHECKPOINT_INTERVAL, macro_interval: MACROBLOCK_INTERVAL,
         }
     }
+
+    /// Test-only: override the checkpoint/macroblock cadence to exercise intra-window finality
+    /// (production sources both from the network consts in `new`).
+    #[cfg(test)]
+    pub(crate) fn set_intervals(&mut self, cp: u64, macro_: u64) { self.cp_interval = cp; self.macro_interval = macro_; }
 
     pub fn committed_index(&self) -> u64 { self.eng.committed_index }
     pub fn current_index(&self) -> u64 { self.eng.current_index }
@@ -87,15 +95,16 @@ impl ConsensusDriver {
         self.committee.get(li).map(|n| n == &self.node_id).unwrap_or(false)
     }
 
-    /// Next macroblock window to commit = the high-QC'd checkpoint's window + 1. Decoupled
-    /// from the round: a round skip (timeout) does NOT advance it, so the next round
-    /// re-proposes the same window (both extend the same high_qc) ⇒ contiguous macroblocks.
+    /// Next checkpoint index to commit = the high-QC'd checkpoint's index + 1 (a checkpoint
+    /// covers `cp_interval` blocks; at cp_interval == macro_interval this equals the macroblock
+    /// window). Decoupled from the round: a round skip (timeout) does NOT advance it, so the
+    /// next round re-proposes the same checkpoint (both extend the same high_qc) ⇒ contiguous heads.
     pub fn next_window(&self) -> u64 {
-        let hq_window = self.eng.high_qc.as_ref()
+        let hq_idx = self.eng.high_qc.as_ref()
             .and_then(|q| self.heads.get(&q.index))
-            .map(|h| h / 90)
+            .map(|h| h / self.cp_interval)
             .unwrap_or(0);
-        hq_window + 1
+        hq_idx + 1
     }
 
     /// Propose `window` (the macroblock height) at the CURRENT round. The checkpoint
@@ -121,7 +130,7 @@ impl ConsensusDriver {
         if round <= self.last_proposed_round || window != self.next_window() || !self.is_leader_now() {
             return Vec::new();
         }
-        let head_height = window.saturating_mul(90);
+        let head_height = window.saturating_mul(self.cp_interval);
         let cp = Checkpoint {
             index: round, parent_qc: self.eng.high_qc.clone(), window_head_height: head_height,
             window_mb_hashes: mb_hashes, state_root, beacon, epoch_commitment: epoch_c, timestamp: head_ts,
@@ -184,8 +193,13 @@ impl ConsensusDriver {
             Some(c) => c.clone(),
             None => return Vec::new(),
         };
-        let window = cp.window_head_height / 90; // dedup by WINDOW: a skipped round re-proposes
-        if self.sealed.contains(&window) { return Vec::new(); } // the same window at a new round.
+        // Persist (macroblock seal) fires ONLY at a macroblock boundary. Intra-window finality
+        // checkpoints (head % macro_interval != 0) still advance finality via Effect::Finalize
+        // (emitted on every Commit) but seal no macroblock — so the epoch/emission cadence stays
+        // at macro_interval while finality runs at the faster cp_interval.
+        if cp.window_head_height % self.macro_interval != 0 { return Vec::new(); }
+        let window = cp.window_head_height / self.macro_interval; // dedup by macroblock window
+        if self.sealed.contains(&window) { return Vec::new(); } // a skipped round re-proposes it.
         self.sealed.insert(window);
         let (eligible_producers, committee) = self.seal_data.get(&qc.index).cloned().unwrap_or_default();
         vec![Effect::Persist { checkpoint: cp, qc: qc.clone(), eligible_producers, committee }]
@@ -273,8 +287,10 @@ mod tests {
     fn driver_sim_4nodes_finalize_same_chain() {
         let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
         let genesis = [7u8; 32];
-        let mut nodes: Vec<Node> = c.iter().map(|id| Node {
-            d: ConsensusDriver::new(id.clone(), c.clone(), genesis), id: id.clone(), committed: 0, sealed: Vec::new(),
+        let mut nodes: Vec<Node> = c.iter().map(|id| {
+            let mut d = ConsensusDriver::new(id.clone(), c.clone(), genesis);
+            d.set_intervals(90, 90); // legacy 1:1 macroblock cadence (this test predates intra-window finality)
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
         }).collect();
         for index in 1..=8u64 {
             let mut seed = Vec::new();
@@ -288,6 +304,36 @@ mod tests {
         assert!(c0 >= 6, "drivers must finalize a chain, got {}", c0);
         for k in 1..nodes.len() {
             assert_eq!(nodes[k].committed, c0, "node {} finalized a different height", k);
+        }
+    }
+
+    // Intra-window finality (Option B): with cp_interval=30 < macro_interval=90 a checkpoint
+    // commits every 30 blocks (finality advances 3× faster), but a MACROBLOCK is sealed (Persist)
+    // ONLY at the 90-boundary. Proves the epoch/emission cadence stays at 90 while finality runs at 30.
+    #[test]
+    fn intra_window_finality_seals_macroblock_only_at_macro_boundary() {
+        let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
+        let genesis = [7u8; 32];
+        let mut nodes: Vec<Node> = c.iter().map(|id| {
+            let mut d = ConsensusDriver::new(id.clone(), c.clone(), genesis);
+            d.set_intervals(30, 90); // K=30 finality, 90 macroblock
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
+        }).collect();
+        // 6 checkpoints ⇒ heads 30,60,90,120,150,180.
+        for index in 1..=6u64 {
+            let mut seed = Vec::new();
+            for k in 0..nodes.len() {
+                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new());
+                for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+            }
+            deliver(&mut nodes, &c, seed);
+        }
+        for k in 0..nodes.len() {
+            // Finality advanced via the 2-chain across 30-block checkpoints (not stuck at 90).
+            assert!(nodes[k].committed >= 4, "node {} finality must advance per 30-block checkpoint, got {}", k, nodes[k].committed);
+            // Macroblocks sealed ONLY at the 90-boundaries: heads 90 (window 1) and 180 (window 2).
+            let mut s = nodes[k].sealed.clone(); s.sort(); s.dedup();
+            assert_eq!(s, vec![1, 2], "node {} must seal a macroblock only at 90-boundaries, got {:?}", k, s);
         }
     }
 
@@ -310,8 +356,10 @@ mod tests {
     fn round_skip_keeps_windows_contiguous() {
         let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
         let genesis = [7u8; 32];
-        let mut nodes: Vec<Node> = c.iter().map(|id| Node {
-            d: ConsensusDriver::new(id.clone(), c.clone(), genesis), id: id.clone(), committed: 0, sealed: Vec::new(),
+        let mut nodes: Vec<Node> = c.iter().map(|id| {
+            let mut d = ConsensusDriver::new(id.clone(), c.clone(), genesis);
+            d.set_intervals(90, 90); // legacy 1:1 macroblock cadence (this test predates intra-window finality)
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
         }).collect();
         // All members buffer window `w`'s seal inputs; the current leader proposes; settle.
         fn step(nodes: &mut Vec<Node>, c: &[NodeId], w: u64) {
@@ -352,6 +400,7 @@ mod tests {
         let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
         let genesis = [7u8; 32];
         let mut d = ConsensusDriver::new("n9".into(), c.clone(), genesis); // far-behind, never participated
+        d.set_intervals(90, 90); // this test asserts the 1:1 macroblock cadence (head = index*90, next_window via /90)
         assert_eq!(d.current_index(), 1);
         assert_eq!(d.next_window(), 1);
         let mut parent_hash = genesis;

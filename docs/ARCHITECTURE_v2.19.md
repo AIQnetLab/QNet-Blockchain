@@ -201,7 +201,7 @@ After high-TPS stress tests (100K+ TPS), nodes can desync:
 │                                                                          │
 │  1. ROUND TOLERANCE ±90:                                                │
 │     └── Accept consensus messages within 1 epoch difference            │
-│     └── commit_reveal.rs: diff ≤ 90 → ACCEPT with warning              │
+│     └── Checkpoint msgs: diff ≤ 90 → ACCEPT with warning              │
 │     └── diff > 90 → REJECT (too far = attack or severe desync)         │
 │                                                                          │
 │  2. AGGRESSIVE CATCH-UP (15s/5 blocks):                                 │
@@ -353,19 +353,19 @@ Deadlock Scenario (pre-v2.61):
 │  └── 256-bit quantum resistance (Grover's algorithm)                      │
 │  └── ALL nodes compute SAME leader (determinism!)                         │
 │                                                                             │
-│  STEP 2: BLOCK-BASED CONSENSUS PHASES (v2.40)                              │
-│  ├── Blocks 61-72: COMMIT PHASE (12 seconds)                              │
-│  │   └── All validators submit COMMIT (cryptographic commitment)          │
-│  │   └── Phase determined by get_phase_for_block(height)                  │
-│  ├── Blocks 73-84: REVEAL PHASE (12 seconds)                              │
-│  │   └── All validators submit REVEAL (open commitment)                   │
-│  │   └── Grace periods: accepts late commits (73-78), early reveals (69-72)│
-│  └── Blocks 85-90: FINALIZE PHASE (6 seconds)                             │
-│      └── Leader collects commits/reveals, prepares MacroBlock             │
+│  STEP 2: WINDOW & CHECKPOINT (Checkpoint-BFT v2)                              │
+│  ├── Window = 90 microblocks: N*90+1 .. (N+1)*90                              │
+│  │   └── Consensus triggers ONLY at the window boundary (N+1)*90          │
+│  │   └── No commit/reveal phases — single round, one 2f+1 QC                  │
+│  ├── Each committee node reproduces window content locally                              │
+│  │   └── 90 mb hashes + head state_root + VRF beacon + epoch                   │
+│  │   └── content_ok fail-stop: sign ONLY if local content matches│
+│  └── Checkpoint = hash(content); 2f+1 sigs = Quorum Cert (QC)                             │
+│      └── Leader assembles the MacroBlock once the QC is formed             │
 │                                                                             │
 │  STEP 3: LEADER CREATES MACROBLOCK                                         │
 │  └── ONLY Leader calls trigger_macroblock_consensus()                     │
-│  └── eligible_producers = ONLY consensus participants (commit+reveal)     │
+│  └── eligible_producers = VRF-sampled committee (no commit/reveal)     │
 │  └── NO automatic jails (v2.40) - timing issues are not offenses          │
 │                                                                             │
 │  STEP 4: BROADCAST (v2.37)                                                 │
@@ -381,9 +381,15 @@ Deadlock Scenario (pre-v2.61):
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Per-Round Consensus Storage (v2.62.0)
+### Per-Round Consensus Storage (HISTORICAL — removed)
 
-**Problem Solved**: Round transitions would destroy commits/reveals data, causing race conditions.
+> **Historical.** The commit/reveal round engine described in this subsection was
+> the pre-v2 macroblock mechanism and has been **removed**. Macroblock finality is
+> now **Checkpoint-BFT v2**: one checkpoint per 90-block window, finalized by a
+> single 2f+1 quorum certificate, with no commit/reveal phases (see STEP 2 above).
+> The structures below are kept only for historical reference.
+
+**Problem Solved (historical)**: Round transitions would destroy commits/reveals data, causing race conditions.
 
 ```
 OLD (v2.61 and earlier):
@@ -2174,7 +2180,7 @@ DELETE /api/v1/bundle/{bundle_id}
 ├─────────────────────────────────────────────────────────┤
 │  1. Structural re-validation (format, sizes)            │
 │  2. Byzantine consensus (2/3+ honest nodes required)    │
-│  3. Commit-Reveal protocol                              │
+│  3. Checkpoint-BFT (single 2f+1 QC per window)          │
 │  4. Verifiable Time Sequence entropy                            │
 │  → MALICIOUS BLOCKS CANNOT REACH CONSENSUS THRESHOLD    │
 └─────────────────────────────────────────────────────────┘
@@ -2452,15 +2458,22 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 
 ### Consensus Performance
 
-| Phase | Duration | Description |
-|-------|----------|-------------|
-| **Consensus Start** | Block 61/90 | 29 blocks before macroblock |
-| **Commit Phase** | 10 blocks | Nodes commit to block hash |
-| **Reveal Phase** | 10 blocks | Nodes reveal signatures |
-| **Finalization** | Block 90 | Macroblock created |
-| **Total Consensus Time** | 30 seconds | 29 blocks + finalization |
+| Stage | Trigger | Description |
+|-------|---------|-------------|
+| **Checkpoint** | Every CHECKPOINT_INTERVAL blocks (default 30) | Committee recomputes the sub-window (mb hashes + head state_root + beacon) |
+| **Quorum Certificate** | ≥ 2f+1 committee signatures | Single round, no commit/reveal phases |
+| **Finality** | 2-chain (next QC commits the prior) | Microblocks ≤ checkpoint head irreversible (~30–60 s) |
+| **Macroblock** | Every 90 blocks (the 90-boundary checkpoint) | Epoch transition, emission, committee rotation, full-window body |
+| **Background** | Continuous | Microblocks keep producing (zero downtime) |
 
 **Background Execution**: Microblocks continue during consensus (zero downtime)
+
+**Finality latency & cadence (`CHECKPOINT_INTERVAL`)**: by default a finality checkpoint is produced
+every **30** blocks, so 2-chain finality reaches irreversibility in ≈30–60 s, while the macroblock /
+epoch / emission cadence stays at 90. The cadence is a **consensus parameter** (`CHECKPOINT_INTERVAL`,
+must divide 90, identical on every node — a mismatch forks); set to 90 it reverts to one checkpoint per
+macroblock (≈90–180 s). The production gate scales with it (`MAX_UNFINALIZED_BLOCKS = 3 ×
+CHECKPOINT_INTERVAL`: 90 at the 30 default, 270 at 90).
 
 ### Certificate Broadcasting
 

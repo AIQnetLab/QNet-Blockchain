@@ -2548,7 +2548,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     println!("🔌 REST API available at: http://0.0.0.0:{}/api/v1/", port);
     println!("🔗 WebSocket available at: ws://0.0.0.0:{}/ws/subscribe", port);
     println!("📱 Light Node services: Registration, FCM Push, Reward Claims");
-    println!("🏛️ Macroblock Consensus: Commit-Reveal, Byzantine Fault Tolerance");
+    println!("🏛️ Macroblock Consensus: Checkpoint-BFT v2 (2f+1 Quorum Certificate)");
     println!("📜 Smart Contract API: Deploy, Call, Query");
     
     // Start Light node ping service for Super nodes  
@@ -2558,17 +2558,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         start_light_node_ping_service(blockchain.clone());
         println!("🕐 Light node randomized ping service started");
         
-        // CRITICAL: Start heartbeat service for Super nodes (required for rewards!)
-        // v3.18: Super nodes need 9/10 heartbeats per 4h window (Full nodes removed)
-        // v2.42.2: Now uses tokio::spawn with sync height access (no block_on!)
-        if let Some(p2p) = blockchain.get_unified_p2p() {
-            let blockchain_for_heartbeat = blockchain.clone();
-            // v2.42.2: Use sync height accessor to avoid block_on in async context
-            p2p.start_heartbeat_service(move || {
-                blockchain_for_heartbeat.get_height_sync()
-            });
-            println!("💓 Heartbeat service started (10 heartbeats per 4h window for rewards) [v2.42.2 tokio]");
-        }
+        // v35: legacy local heartbeat service removed. Liveness is now the spread on-chain
+        // Heartbeat-TX emitted by start_commitment_tx_loop (tallied in Account.heartbeat_slots).
+        // No local heartbeat_history, no per-tick storage scan, no HBC samples to feed.
     }
     
     warp::serve(routes).run(([0, 0, 0, 0], port)).await;
@@ -8388,13 +8380,11 @@ async fn handle_server_node_status(
                 .find(|(id, _, _)| id == target_id);
             
             if let Some((found_id, node_type, last_seen)) = node_info {
-                // Get heartbeat stats for current window
-                let heartbeats = p2p.get_heartbeats_for_window(current_window);
-                let node_heartbeats: Vec<_> = heartbeats.iter()
-                    .filter(|(id, _, _)| id == found_id)
-                    .collect();
-                
-                let heartbeat_count = node_heartbeats.len().min(255) as u8;
+                // v35: heartbeat count from the on-chain tally (Account.heartbeat_slots popcount).
+                let hb_epoch = blockchain.get_height().await / 14400;
+                let heartbeat_count = blockchain.get_account(found_id).await.ok().flatten()
+                    .map(|a| crate::node::BlockchainNode::account_heartbeat_count(&a, hb_epoch))
+                    .unwrap_or(0);
                 
                 // Determine required heartbeats based on node type (case-insensitive)
                 // v3.18: Only Super nodes (Full removed)
@@ -8956,7 +8946,6 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                 if current_slot % 60 == 0 {
                     // RAM cleanup
                     p2p.cleanup_old_attestations();
-                    p2p.cleanup_old_heartbeats();
 
                     // PRODUCTION v2.78: RocksDB cleanup (persistent storage)
                     blockchain_for_pings.cleanup_old_storage_data().await;
@@ -9730,21 +9719,13 @@ async fn handle_get_pending_rewards(
         "Unknown"
     };
     
-    // v2.64: Get REAL heartbeat count from P2P using block height filtering
-    let (heartbeat_count, last_heartbeat_time) = if let Some(p2p) = blockchain.get_unified_p2p() {
-        let heartbeats = p2p.get_heartbeats_for_block_range(epoch_start, current_height);
-        let node_heartbeats: Vec<_> = heartbeats.iter()
-            .filter(|(nid, _, _, _)| nid == &node_id)
-            .collect();
-        let count = node_heartbeats.len();
-        let last_time = node_heartbeats.iter()
-            .map(|(_, _, ts, _)| *ts)
-            .max()
-            .unwrap_or(0);
-        (count, last_time)
-    } else {
-        (0, 0)
-    };
+    // v35: heartbeat liveness reads the on-chain tally (Account.heartbeat_slots popcount) — the
+    // unforgeable source — not the removed local recorder. The bitmap records which subwindows were
+    // live this epoch, not per-heartbeat timestamps.
+    let hb_epoch = current_height / 14400;
+    let heartbeat_count = blockchain.get_account(&node_id).await.ok().flatten()
+        .map(|a| crate::node::BlockchainNode::account_heartbeat_count(&a, hb_epoch) as usize)
+        .unwrap_or(0);
     
     // Calculate eligibility based on REAL heartbeat count
     let required_heartbeats = match node_type {
@@ -9835,12 +9816,8 @@ async fn handle_get_pending_rewards(
             .unwrap_or(0)
     };
     
-    // Check if node is active (had heartbeat in current epoch)
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let is_active = last_heartbeat_time > 0 && (current_time - last_heartbeat_time) < 14400;
+    // v35: active = produced ≥1 on-chain heartbeat this epoch (Account.heartbeat_slots).
+    let is_active = heartbeat_count > 0;
     
     // Convert to QNC (from nanoQNC)
     let total_qnc = pending_amount as f64 / 1_000_000_000.0;
@@ -9863,7 +9840,7 @@ async fn handle_get_pending_rewards(
         "blocks_until_next_epoch": blocks_until_next,
         "seconds_until_next_epoch": blocks_until_next,
         "last_claim": last_claim,
-        "last_heartbeat": last_heartbeat_time,
+        "last_heartbeat": 0,
         "heartbeats": {
             "current": heartbeat_count,
             "required": required_heartbeats,

@@ -11,9 +11,9 @@
 //!     occurs every 30 slots; producer for each round is selected deterministically
 //!     via VRF over the macroblock-N-2 hash.
 //!
-//!   * Layer 2 — Macroblock finality (every 90 microblocks, 2f+1 commit-reveal
-//!     using Dilithium3-signed votes). Macroblock hash anchors the chain
-//!     cryptographically; finality is irreversible after 2f+1 supermajority.
+//!   * Layer 2 — Macroblock finality (every 90 microblocks, Checkpoint-BFT v2:
+//!     a 2f+1 quorum certificate over Dilithium3-signed votes). Macroblock hash
+//!     anchors the chain cryptographically; finality is irreversible after the QC.
 //!
 //! Between macroblock boundaries (90 seconds at nominal cadence), microblock
 //! production must remain safe under network partitions, partial gossip
@@ -97,7 +97,7 @@
 //! These bounds are matched against per-slot attacks. Over an epoch (90 slots),
 //! the per-slot attacks compound, but a single successful capture only affects
 //! that slot's attestation count — it does not break finality, which is
-//! anchored at the macroblock boundary by 2f+1 commit-reveal supermajority.
+//! anchored at the macroblock boundary by a 2f+1 Checkpoint-BFT quorum certificate.
 
 use sha3::{Digest, Sha3_256};
 

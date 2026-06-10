@@ -1385,17 +1385,9 @@ GET /api/v1/reputation/history?node_id={node_id}
 
 ## 🔒 Consensus Endpoints
 
-### Consensus Commit
-```http
-POST /api/v1/consensus/commit
-```
-
----
-
-### Consensus Reveal
-```http
-POST /api/v1/consensus/reveal
-```
+> Macroblock finality (Checkpoint-BFT v2) is reached over internal P2P consensus,
+> not via HTTP. There are no `consensus/commit` or `consensus/reveal` endpoints —
+> a VRF-sampled committee signs one checkpoint per 90-block window (2f+1 QC).
 
 ---
 

@@ -2920,9 +2920,14 @@ impl BlockchainActivationRegistry {
         // Phase 1: Active until 90% of 1DEV supply is burned (900M out of 1B) OR 5 years pass
         // Phase 2: Starts after Phase 1 completes (whichever condition comes first)
         
-        // Check environment variable for phase override (for testing)
-        if let Ok(phase) = std::env::var("QNET_ACTIVATION_PHASE") {
-            return phase.parse::<u8>().unwrap_or(2);
+        // Test-only phase override — honored ONLY off-mainnet. A mainnet node sets
+        // QNET_NETWORK=mainnet (disabling this); spoofing the network only isolates the node onto a
+        // different genesis/contracts, so it can never diverge mainnet's time/burn-derived phase.
+        let is_mainnet = std::env::var("QNET_NETWORK").map(|n| n.eq_ignore_ascii_case("mainnet")).unwrap_or(false);
+        if !is_mainnet {
+            if let Ok(phase) = std::env::var("QNET_ACTIVATION_PHASE") {
+                return phase.parse::<u8>().unwrap_or(2);
+            }
         }
         
         // Check time-based phase transition (5 years from launch: Nov 2024)
@@ -2954,9 +2959,14 @@ impl BlockchainActivationRegistry {
     
     /// Get cached burn percentage (updated periodically by background task)
     fn get_cached_burn_percentage(&self) -> f64 {
-        // Check environment variable for cached value
-        if let Ok(percentage) = std::env::var("QNET_BURN_PERCENTAGE") {
-            return percentage.parse::<f64>().unwrap_or(0.0);
+        // Off-mainnet only: no code writes this env (the "background task" note below is aspirational),
+        // so on mainnet it would be a pure operator override of the burn-derived phase. Gated to
+        // non-mainnet; mainnet derives the phase from time until the on-chain Solana burn read is wired.
+        let is_mainnet = std::env::var("QNET_NETWORK").map(|n| n.eq_ignore_ascii_case("mainnet")).unwrap_or(false);
+        if !is_mainnet {
+            if let Ok(percentage) = std::env::var("QNET_BURN_PERCENTAGE") {
+                return percentage.parse::<f64>().unwrap_or(0.0);
+            }
         }
         
         // Default: assume we're still early in Phase 1

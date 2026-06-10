@@ -28,7 +28,7 @@
 - **Post-quantum cryptography** using Dilithium and other NIST-approved algorithms (experimental implementation)
 - **Hybrid Python/Rust architecture** for balance between development speed and performance
 - **Optimized data storage** with both in-memory and RocksDB options
-- **Commit-reveal consensus mechanism** with protection against Sybil attacks (experimental)
+- **Checkpoint-BFT consensus** (2f+1 quorum certificate per 90-block window) with reputation-based Sybil protection
 - **Lightweight client support** for mobile devices (SPV) - experimental mobile optimization
 - **Performance**: 424,411 TPS blockchain + 8,859 TPS mobile achieved in experimental testing (June 2025)
 

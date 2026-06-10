@@ -13,7 +13,7 @@ pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 
 // v15.15: BFT scaling — single source of truth for committee size N.
 // Two-tier: microblocks (1s, single-producer Dilithium3, rotate every
-// ROTATION_INTERVAL_BLOCKS); macroblocks (every 90, 2f+1 commit-reveal =
+// ROTATION_INTERVAL_BLOCKS); macroblocks (every 90, 2f+1 Checkpoint-BFT QC =
 // finality). Threshold = (N*2+2)/3 on every path.
 // N per epoch: mb_idx<=2 -> genesis_node_count() (baked); mb_idx>=3 ->
 // eligible_producers.len() of macroblock (mb_idx-2) [N-2 snapshot, strict,
@@ -27,7 +27,7 @@ pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 // PRODUCTION CONSTANTS - No hardcoded magic numbers!
 /// Maximum eligible producers/validators per epoch AND per consensus round.
 /// Single source of truth — used in snapshot creation, candidate selection,
-/// emergency fallback, and CommitReveal consensus config.
+/// emergency fallback, and Checkpoint-BFT committee config.
 /// Scales BFT to millions of nodes: only 1000 participate in voting/production.
 /// See the BFT SCALING ARCHITECTURE block above for the full pipeline.
 pub const MAX_VALIDATORS: usize = 1000;
@@ -58,19 +58,6 @@ pub const FINALITY_WINDOW: u64 = 10; // 10 blocks = 10 seconds (safe for product
 // 4 hours * 60 minutes * 60 seconds = 14,400 seconds = 14,400 blocks (at 1 block/sec)
 const EMISSION_INTERVAL_BLOCKS: u64 = 14400; // 4 hours in blocks
 
-// PING SAMPLING: Production-ready scalability parameters
-// ADAPTIVE SAMPLING (v2.41.1):
-// - Small network (<10K nodes): verify ALL pings (100% - no sampling)
-// - Large network (10K+ nodes): 1% sampling for on-chain storage optimization
-// Formula: min_samples = max(total/100, min(10000, total))
-// Examples:
-//   10 nodes   → min_samples = max(0, min(10000, 10))    = 10     (all verified)
-//   1000 nodes → min_samples = max(10, min(10000, 1000)) = 1000   (all verified)
-//   100K nodes → min_samples = max(1000, min(10000, 100K)) = 10000 (1% sampling)
-//   1M nodes   → min_samples = max(10000, min(10000, 1M))  = 10000 (1% sampling)
-const PING_SAMPLE_PERCENTAGE: u32 = 1; // 1% of pings included as samples (for large networks)
-const MIN_PING_SAMPLES: usize = 10_000; // Target for large networks, adaptive for small
-
 /// Ping data for Merkle tree construction
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct PingData {
@@ -79,20 +66,6 @@ struct PingData {
     response_time_ms: u32,
     success: bool,
     timestamp: u64,
-}
-
-impl PingData {
-    /// Calculate deterministic hash for Merkle tree
-    fn calculate_hash(&self) -> String {
-        use blake3::Hasher;
-        let mut hasher = Hasher::new();
-        hasher.update(self.from_node.as_bytes());
-        hasher.update(self.to_node.as_bytes());
-        hasher.update(&self.response_time_ms.to_le_bytes());
-        hasher.update(&[if self.success { 1 } else { 0 }]);
-        hasher.update(&self.timestamp.to_le_bytes());
-        hasher.finalize().to_hex().to_string()
-    }
 }
 
 // CRITICAL: Module for shared producer cache to prevent duplicate static declarations
@@ -485,7 +458,7 @@ pub fn reset_timeout_round() {
 // leader on every honest node (no NTP-drift dual-production split; the
 // v22 clock-derived seed that caused it is gone). Liveness: silent
 // primary → 2f+1 TimeoutVote → certified round advances same on all →
-// bounded recovery ≈ grace + 1 RTT. O(1). Macroblock commit-reveal=final.
+// bounded recovery ≈ grace + 1 RTT. O(1). Macroblock Checkpoint-BFT QC = final.
 
 
 // Runtime clock-drift monitor. On each applied network block observe
@@ -1982,57 +1955,11 @@ pub fn drain_vote_equivocation_proof_txs(max: usize) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// v15.0: Consensus-stall registry for macroblock boundaries where the
-/// canonical commit-reveal finalization could not gather 2f+1 VALID reveals.
-///
-/// Key:   macroblock_index.
-/// Value: (fallback_kind, detected_timestamp_secs) — kind is a short tag:
-///        "reveal_shortage" / "phase_error" / etc. Enables RPC/metrics
-///        reporting and drives the next-macroblock production guard so the
-///        network degrades gracefully instead of halting when a subset of
-///        validators withholds reveals.
-///
-/// Retention: cleared by `cleanup_global_hashmaps` on the periodic sweep;
-/// bounded by CLEANUP_HEIGHT_WINDOW so memory is flat at any committee size.
-pub static CONSENSUS_STALLED: once_cell::sync::Lazy<DashMap<u64, (String, u64)>> =
-    once_cell::sync::Lazy::new(|| DashMap::new());
-
-/// v15.0: Set CONSENSUS_STALLED flag for a macroblock index.
-/// Idempotent — first observed fallback reason is kept, later observations
-/// are logged at WARN but do not overwrite (keeps the root cause visible).
-pub fn mark_consensus_stalled(mb_index: u64, reason: &str) {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let inserted = CONSENSUS_STALLED
-        .entry(mb_index)
-        .or_insert_with(|| (reason.to_string(), ts));
-    if inserted.0 != reason && is_warn() {
-        println!(
-            "[WARN][CONS] stall_reason_changed mb={} existing={} new={}",
-            mb_index, inserted.0, reason,
-        );
-    }
-    if is_warn() {
-        println!(
-            "[WARN][CONS] consensus_stalled_flag mb={} reason={}",
-            mb_index, reason,
-        );
-    }
-}
-
-/// v15.0: Query whether a macroblock index finalized via the deterministic
-/// fallback path (commit-reveal reveal-shortage or phase error, or N-2
-/// beacon missing locally at start of round).
-///
-/// Observability-only helper. Feeds RPC endpoints and operator dashboards
-/// so degraded finalizations are visible without trawling the logs. The
-/// macroblock itself is a regular on-chain artefact — this flag does not
-/// influence consensus decisions, only reporting.
-pub fn is_consensus_stalled(mb_index: u64) -> bool {
-    CONSENSUS_STALLED.contains_key(&mb_index)
-}
+// v15.0 consensus-stall registry (CONSENSUS_STALLED / mark_consensus_stalled /
+// is_consensus_stalled) REMOVED: it tracked the old commit-reveal fallback
+// (reveal_shortage / phase_error) and had zero writers and zero readers under
+// Checkpoint-BFT v2. v2 liveness is handled by the TimeoutCertificate view-change
+// (consensus_v2_node), not a stall flag.
 
 /// Out-of-turn producer tracking: producer_id -> (window_start_height, count)
 /// If a producer sends >3 blocks out of turn within 100 blocks, reject subsequent ones.
@@ -3182,20 +3109,6 @@ impl BlockchainNode {
             .unwrap_or_default()
             .as_secs() - (24 * 60 * 60);
         
-        // Cleanup heartbeats from RocksDB
-        match self.storage.cleanup_old_heartbeats(cutoff) {
-            Ok(removed) => {
-                if removed > 0 && is_info() {
-                    println!("[INFO][CLEANUP] rocksdb_heartbeats_removed count={} cutoff_age=24h", removed);
-                }
-            }
-            Err(e) => {
-                if is_warn() {
-                    println!("[WARN][CLEANUP] rocksdb_heartbeats_cleanup_failed err={}", e);
-                }
-            }
-        }
-        
         // Cleanup attestations from RocksDB
         match self.storage.cleanup_old_attestations(cutoff) {
             Ok(removed) => {
@@ -4166,6 +4079,38 @@ impl BlockchainNode {
                          added_heartbeat_count, skipped_unsynced_reg, skipped_forged_samples, skipped_bad_merkle, scan_start, scan_end, eligible.len());
             }
 
+            // v35: Phase-2A admits a registered Super node on UNFORGEABLE on-chain liveness —
+            // a Heartbeat-TX in the current or previous subwindow (Account.heartbeat_slots),
+            // proving it is synced to ~now — replacing the removed HBC sample proof. Sorted
+            // iteration keeps the eligible set deterministic; the reputation floor still applies.
+            {
+                let hb_epoch = scan_end / 14400;
+                let cur_sub = ((scan_end % 14400) / 1440) as u16;
+                let mut regs: Vec<&String> = registered_super_nodes.iter().collect();
+                regs.sort();
+                let mut added_tally = 0usize;
+                for reg in regs {
+                    if eligible.iter().any(|p| p.node_id == *reg) { continue; }
+                    let acct = match storage.load_account(reg).ok().flatten() {
+                        Some(a) if a.heartbeat_epoch == hb_epoch => a,
+                        _ => continue,
+                    };
+                    let mut recent = acct.heartbeat_slots & (1u16 << cur_sub.min(9));
+                    if cur_sub > 0 { recent |= acct.heartbeat_slots & (1u16 << (cur_sub - 1)); }
+                    if recent == 0 { continue; }
+                    let rep = (reputation_map.get(reg).copied()
+                        .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION)
+                        .clamp(0.0, 100.0) * 100.0).round() as u32;
+                    if rep < MIN_REPUTATION_BP { continue; }
+                    eligible.push(qnet_state::EligibleProducer { node_id: reg.clone(), reputation: rep });
+                    added_tally += 1;
+                }
+                if added_tally > 0 {
+                    println!("[INFO][SNAP] L1_TALLY added={} epoch={} subwin={} total={}",
+                             added_tally, hb_epoch, cur_sub, eligible.len());
+                }
+            }
+
             // ── LEVEL 2: Carry-over from recent macroblock eligible sets ──
             // Nodes that were in eligible_producers within the last 3 macroblocks
             // are carried over ONLY IF they also participated in at least one of
@@ -4278,7 +4223,7 @@ impl BlockchainNode {
             // candidate set here rather than improvise a different seed.
             // Skipping the truncation keeps the full candidate list; the
             // actual producer decision downstream relies on the seed set
-            // inside the commit-reveal engine (see trigger_macroblock_consensus),
+            // inside the v2 macroblock path (consensus_v2_node),
             // which applies the same N-2 requirement and triggers a sync
             // when the seed is unavailable. All honest nodes with the same
             // on-chain view reach the same truncation result.
@@ -4293,7 +4238,7 @@ impl BlockchainNode {
                         );
                     }
                     // Trigger async N-2 sync via P2P — downstream guard in
-                    // trigger_macroblock_consensus refuses to proceed until
+                    // the v2 committee guard refuses to proceed until
                     // the macroblock arrives. Keeping full candidate list
                     // here is harmless because the refusal blocks production.
                     let missing_mb = macroblock_index.saturating_sub(2);
@@ -4475,7 +4420,7 @@ impl BlockchainNode {
         // would put it on a different committee from the rest of the honest
         // validators). Signal by returning the full candidate list — every
         // similarly-behind honest node returns the same thing — and let the
-        // downstream commit-reveal guard in `trigger_macroblock_consensus`
+        // downstream v2 committee guard (consensus_v2_node)
         // refuse to proceed until sync catches up.
         let seed: [u8; 32] = match Self::try_load_macroblock_beacon(storage, macroblock_index) {
             Some(s) => s,
@@ -5206,612 +5151,6 @@ impl BlockchainNode {
         }
     }
     
-    /// DEPRECATED: Old implementation - keeping for reference during transition
-    #[allow(dead_code)]
-    async fn process_reward_window_legacy(&self, emission_block_height: u64) -> Result<bool, QNetError> {
-        if is_info() { println!("[INFO][REWARDS] processing_window emission_block={}", emission_block_height); }
-        
-        let mut reward_manager = self.reward_manager.write().await;
-        
-        // CRITICAL: Build Merkle commitment with sampling for scalable deterministic emission
-        // This approach scales to millions of nodes while maintaining Byzantine security
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let window_start = current_time - (current_time % (4 * 60 * 60)); // Start of current 4-hour window
-        
-        // PRODUCTION v2.43.1: Use explicit emission_block_height instead of get_height()
-        // This ensures window_end matches the actual emission block being created
-        // FIX: Previously used current_height which was 1 block behind (14399 vs 14400)
-        let window_end_height = emission_block_height;
-        let window_start_height = emission_block_height.saturating_sub(EMISSION_INTERVAL_BLOCKS);
-        
-        if is_debug() { println!("[DBG][REWARDS] merkle_build window={}-{}", 
-                 window_start_height, window_end_height); }
-        
-        // ================================================================
-        // PRODUCTION: Collect data from GOSSIP-SYNCED sources (not local!)
-        // This ensures ALL nodes have the SAME data for deterministic rewards
-        // ================================================================
-        
-        let mut all_pings: Vec<PingData> = Vec::new();
-        
-        // Get P2P for gossip-synced data
-        let p2p = match self.get_unified_p2p() {
-            Some(p2p) => p2p,
-            None => {
-                if is_warn() { println!("[WARN][REWARDS] p2p_unavailable fallback=local_storage"); }
-                // Fallback to local storage if P2P not available
-                // PRODUCTION v2.43.1: Use emission_block_height instead of current_height
-                self.process_reward_window_local(&mut reward_manager, window_start, emission_block_height).await?;
-                return Ok(true); // Fallback completed successfully
-            }
-        };
-        
-        // STEP 1A: Collect Light node attestations from gossip-synced registry
-        // OPTIMIZED: Parallel processing for 1M+ nodes
-        // v2.64: Use BLOCK HEIGHT filtering for deterministic emission
-        let light_attestations = p2p.get_attestations_for_block_range(window_start_height, window_end_height);
-        let attestation_count = light_attestations.len();
-        if is_debug() { println!("[DBG][REWARDS] light_attestations={} h={}-{}", 
-                                 attestation_count, window_start_height, window_end_height); }
-        
-        // PARALLEL: Process attestations in chunks for better CPU utilization
-        const CHUNK_SIZE: usize = 10_000;
-        let start_time = std::time::Instant::now();
-        
-        if attestation_count > CHUNK_SIZE {
-            // Large dataset: process in parallel chunks
-            use parking_lot::Mutex;
-            let all_pings_mutex = Mutex::new(&mut all_pings);
-            let reward_manager_mutex = Mutex::new(&mut reward_manager);
-
-            // PRODUCTION v2.43.1: Global dedupe set for Light nodes across all chunks
-            let processed_light_nodes: Mutex<std::collections::HashSet<String>> =
-                Mutex::new(std::collections::HashSet::with_capacity(attestation_count));
-            
-            // Process Light node attestations in parallel chunks
-            let chunks: Vec<_> = light_attestations.chunks(CHUNK_SIZE).collect();
-            
-            for chunk in chunks {
-                let mut chunk_pings: Vec<PingData> = Vec::with_capacity(chunk.len());
-                let mut chunk_registrations: Vec<(String, String)> = Vec::with_capacity(chunk.len());
-                
-                // Process chunk (can be parallelized with rayon if needed)
-                for (light_node_id, _slot, pinger_id, timestamp, _block_height) in chunk {
-                    // DEDUPE: Only process first attestation per Light node
-                    {
-                        let mut processed = processed_light_nodes.lock();
-                        if !processed.insert(light_node_id.clone()) {
-                            continue; // Already processed this node
-                        }
-                    }
-                    
-                    let wallet_address = p2p.get_light_node_wallet(&light_node_id)
-                        .unwrap_or_else(|| generate_eon_address_from_id(&light_node_id));
-                    
-                    chunk_registrations.push((light_node_id.clone(), wallet_address));
-                    
-                    chunk_pings.push(PingData {
-                        from_node: light_node_id.clone(),
-                        to_node: pinger_id.clone(),
-                        response_time_ms: 0,
-                        success: true,
-                        timestamp: *timestamp,
-                    });
-                }
-                
-                // Batch update reward manager (single lock acquisition)
-                {
-                    let mut rm = reward_manager_mutex.lock();
-                    for (node_id, wallet) in chunk_registrations {
-                        let _ = rm.register_node(node_id.clone(), RewardNodeType::Light, wallet);
-                        let _ = rm.record_ping_attempt(&node_id, true, 0);
-                    }
-                }
-                
-                // Batch add pings
-                {
-                    let mut pings = all_pings_mutex.lock();
-                    pings.extend(chunk_pings);
-                }
-            }
-            
-            if is_info() { println!("[INFO][REWARDS] attestations_processed n={} time={:?} mode=chunked", 
-                     attestation_count, start_time.elapsed()); }
-        } else {
-            // Small dataset: process sequentially (no overhead)
-            // PRODUCTION v2.43.1: Dedupe by node_id to ensure 1 ping credit per Light node
-            let mut processed_light_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
-            
-            for (light_node_id, _slot, pinger_id, timestamp, _block_height) in &light_attestations {
-                // DEDUPE: Only process first attestation per Light node
-                if !processed_light_nodes.insert(light_node_id.clone()) {
-                    continue; // Already processed this node
-                }
-                
-                let wallet_address = p2p.get_light_node_wallet(&light_node_id)
-                    .unwrap_or_else(|| generate_eon_address_from_id(&light_node_id));
-                
-                let _ = reward_manager.register_node(
-                    light_node_id.clone(), 
-                    RewardNodeType::Light, 
-                    wallet_address
-                );
-                let _ = reward_manager.record_ping_attempt(light_node_id, true, 0);
-                
-                all_pings.push(PingData {
-                    from_node: light_node_id.clone(),
-                    to_node: pinger_id.clone(),
-                    response_time_ms: 0,
-                    success: true,
-                    timestamp: *timestamp,
-                });
-            }
-        }
-        
-        // STEP 1B: Collect Super-node heartbeats from gossip-synced registry
-        //          (v3.18: the "Full" tier was removed; only Super nodes
-        //          self-attest via heartbeats.)
-        // v2.64: Use BLOCK HEIGHT filtering for deterministic emission (not UTC timestamp!)
-        // This ensures all nodes see the same heartbeats regardless of network start time
-        let heartbeats = p2p.get_heartbeats_for_block_range(window_start_height, window_end_height);
-        let heartbeat_count = heartbeats.len();
-        if is_info() { println!("[INFO][REWARDS] heartbeats_found n={} source=block_range h={}-{}", 
-                                 heartbeat_count, window_start_height, window_end_height); }
-        
-        // Count heartbeats per node (HashMap is efficient for this)
-        let mut heartbeat_counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
-        let our_node_id = self.get_node_id().clone();
-        
-        // OPTIMIZED: Single pass for counting and ping data creation
-        for (node_id, _, timestamp, _block_height) in &heartbeats {
-            *heartbeat_counts.entry(node_id.clone()).or_insert(0) += 1;
-            
-            all_pings.push(PingData {
-                from_node: node_id.clone(),
-                to_node: our_node_id.clone(),
-                response_time_ms: 0,
-                success: true,
-                timestamp: *timestamp,
-            });
-        }
-        
-        // Register eligible Super nodes
-        // v2.64: Use block height filtering for deterministic eligibility
-        let eligible_full_super = p2p.get_eligible_full_super_nodes_by_height(window_start_height, window_end_height);
-        let eligible_count = eligible_full_super.len();
-        
-        for (node_id, node_type, count) in eligible_full_super {
-            // Get wallet from storage (cached in most cases)
-            let wallet_address = self.storage.load_node_registration(&node_id)
-                .ok()
-                .flatten()
-                .map(|(_, wallet, _)| wallet)
-                .unwrap_or_else(|| generate_eon_address_from_id(&node_id));
-            
-            // BACKWARD COMPAT: "full" from pre-v3.18 mapped to Super
-            let reward_type = match node_type.to_lowercase().as_str() {
-                "super" | "full" => RewardNodeType::Super,
-                _ => RewardNodeType::Light,
-            };
-            
-            let _ = reward_manager.register_node(node_id.clone(), reward_type, wallet_address);
-            
-            // Record successful pings based on heartbeat count
-            for _ in 0..count {
-                let _ = reward_manager.record_ping_attempt(&node_id, true, 0);
-            }
-        }
-        
-        if eligible_count > 0 {
-            if is_debug() { println!("[DBG][REWARDS] eligible={}", eligible_count); }
-        }
-        
-        if is_debug() { println!("[DBG][REWARDS] pings={} time={}ms", 
-                 all_pings.len(), start_time.elapsed().as_millis()); }
-        
-        // STEP 2: Build Merkle Tree (if we have pings)
-        // OPTIMIZED: Parallel hash computation for 1M+ pings
-        let (merkle_root, ping_samples, total_pings, successful_pings, sample_seed_hex) = if !all_pings.is_empty() {
-            let hash_start = std::time::Instant::now();
-            let total_count = all_pings.len();
-            
-            // PARALLEL: Calculate hashes in parallel for large datasets
-            let ping_hashes: Vec<String> = if total_count > 100_000 {
-                // Use parallel iterator for 100K+ pings
-                // Note: If rayon is available, use par_iter() for true parallelism
-                // For now, use chunked processing to reduce memory pressure
-                let mut hashes = Vec::with_capacity(total_count);
-                for chunk in all_pings.chunks(100_000) {
-                    let chunk_hashes: Vec<String> = chunk.iter()
-                        .map(|ping| ping.calculate_hash())
-                        .collect();
-                    hashes.extend(chunk_hashes);
-                }
-                if is_info() { println!("[INFO][REWARDS] pings_hashed n={} time={:?} mode=chunked", 
-                         total_count, hash_start.elapsed()); }
-                hashes
-            } else {
-                all_pings.iter()
-                    .map(|ping| ping.calculate_hash())
-                    .collect()
-            };
-            
-            // Build Merkle root using EXISTING qnet-core implementation
-            use qnet_core::crypto::merkle::compute_merkle_root;
-            let merkle_start = std::time::Instant::now();
-            let merkle_root = compute_merkle_root(&ping_hashes)
-                .map_err(|e| QNetError::SecurityError(format!("Failed to compute Merkle root: {}", e)))?;
-            
-            if is_debug() { println!("[DBG][REWARDS] merkle_root={}... time={:?}", 
-                     &merkle_root[..16], merkle_start.elapsed()); }
-            
-            // STEP 3: Deterministic sampling using FINALITY_WINDOW entropy
-            // This ensures ALL nodes select the SAME samples
-            // PRODUCTION v2.43.1: Use emission_block_height for consistent entropy calculation
-            let entropy_height = emission_block_height.saturating_sub(FINALITY_WINDOW);
-            let entropy_block = self.storage.load_microblock(entropy_height)
-                .map_err(|e| QNetError::StorageError(format!("Failed to load entropy block: {}", e)))?
-                .ok_or_else(|| QNetError::StorageError("Entropy block not found".to_string()))?;
-            
-            // Create deterministic seed
-            // OPTIMIZED: SHA3-256 (32 bytes) instead of SHA3-512 (64 bytes)
-            // 20% faster, still quantum-resistant (128-bit security against Grover)
-            let mut seed_hasher = Sha3_256::new();
-            seed_hasher.update(b"QNet_Ping_Sampling_v1");
-            seed_hasher.update(&entropy_block);
-            seed_hasher.update(&window_start_height.to_le_bytes());
-            let sample_seed = seed_hasher.finalize();
-            let sample_seed_hex = hex::encode(&sample_seed[..]);
-            
-            // Calculate sample size: ADAPTIVE based on network size
-            // Small network (<10K): sample_size = total (all verified)
-            // Large network (10K+): sample_size = 1% (optimized)
-            let sample_size = ((total_count as u32 * PING_SAMPLE_PERCENTAGE) / 100)
-                .max(MIN_PING_SAMPLES.min(total_count) as u32) as usize;
-            
-            if is_info() { println!("[INFO][REWARDS] ping_sampling n={} total={} mode={}", 
-                     sample_size, total_count, 
-                     if sample_size == total_count { "ALL" } else { "1%" }); }
-            
-            // Deterministic sampling
-            let mut ping_samples = Vec::new();
-            for i in 0..sample_size {
-                // Deterministic index selection
-                let mut index_hasher = Sha3_256::new();
-                index_hasher.update(&sample_seed);
-                index_hasher.update(&(i as u32).to_le_bytes());
-                let hash = index_hasher.finalize();
-                let index = u64::from_le_bytes([
-                    hash[0], hash[1], hash[2], hash[3],
-                    hash[4], hash[5], hash[6], hash[7],
-                ]) as usize % total_count;
-                
-                // Generate Merkle proof for this ping
-                use qnet_core::crypto::merkle::generate_merkle_proof;
-                let merkle_proof = generate_merkle_proof(&ping_hashes, index)
-                    .map_err(|e| QNetError::SecurityError(format!("Failed to generate proof: {}", e)))?;
-                
-                let ping = &all_pings[index];
-                ping_samples.push(qnet_state::PingSampleData {
-                    from_node: ping.from_node.clone(),
-                    to_node: ping.to_node.clone(),
-                    response_time_ms: ping.response_time_ms,
-                    success: ping.success,
-                    timestamp: ping.timestamp,
-                    merkle_proof,
-                });
-            }
-            
-            // Count successful pings
-            let successful_count = all_pings.iter().filter(|p| p.success).count() as u32;
-            
-            (merkle_root, ping_samples, total_count as u32, successful_count, sample_seed_hex)
-        } else {
-            // No pings - create empty commitment
-            if is_warn() { println!("[WARN][REWARDS] no_pings_collected commitment=empty"); }
-            let empty_seed = String::from("0000000000000000000000000000000000000000000000000000000000000000");
-            (String::from("0000000000000000000000000000000000000000000000000000000000000000"), Vec::new(), 0, 0, empty_seed)
-        };
-        
-        // STEP 4: Create PingCommitmentWithSampling transaction
-        // v2.65: System TX get MAX priority to ensure inclusion
-        if total_pings > 0 {
-            let ping_epoch = window_start_height / EMISSION_INTERVAL_BLOCKS;
-            let commitment_tx = qnet_state::Transaction {
-                from: "system_ping_commitment".to_string(),
-                to: None,
-                amount: 0,
-                tx_type: qnet_state::TransactionType::PingCommitmentWithSampling {
-                    window_start_height,
-                    window_end_height,
-                    merkle_root: merkle_root.clone(),
-                    total_ping_count: total_pings,
-                    successful_ping_count: successful_pings,
-                    sample_seed: sample_seed_hex,
-                    ping_samples,
-                },
-                timestamp: current_time,
-                hash: String::new(),
-                signature: None, // No signature - system operation
-                public_key: None, // Not needed for system transactions
-                gas_price: u64::MAX, // MAX priority - system TX MUST be first in block
-                gas_limit: 0,
-                nonce: ping_epoch + 1, // PROTOCOL: Epoch-based nonce (deterministic unique per epoch)
-                data: Some(format!("Ping Commitment: {} total, {} successful, root: {}",
-                                 total_pings, successful_pings, &merkle_root[..16])),
-                dilithium_signature: None,   // System TX - no quantum sig
-                dilithium_public_key: None,
-                chain_id: 0,
-            };
-
-            // Calculate hash
-            let mut commitment_tx = commitment_tx;
-            commitment_tx.hash = commitment_tx.calculate_hash();
-
-            // Add to mempool
-            if let Err(e) = self.add_transaction_to_mempool(commitment_tx).await {
-                eprintln!("[WARN][REWARDS] ping_commitment_mempool_fail err={}", e);
-            } else {
-                if is_debug() { println!("[DBG][REWARDS] ping_commitment_added"); }
-            }
-        }
-        
-        if is_info() { println!("[INFO][REWARDS] merkle_committed"); }
-        
-        // Process the current window (calculates pending rewards based on ping history)
-        reward_manager.force_process_window()
-            .map_err(|e| QNetError::ConsensusError(format!("Failed to process reward window: {}", e)))?;
-        
-        // Get statistics
-        let pending_rewards = reward_manager.get_all_pending_rewards();
-        
-        if pending_rewards.is_empty() {
-            if is_warn() { println!("[WARN][REWARDS] no_eligible_nodes_in_window"); }
-            return Ok(false); // v2.53: No emission created
-        }
-        
-        // v2.84: CRITICAL FIX - Use epoch emission ONLY, not accumulated pending rewards!
-        // pending_rewards contains accumulated rewards across multiple epochs (for claiming)
-        // last_epoch_emission contains ONLY this epoch's emission (for total_supply update)
-        let total_emission: u64 = reward_manager.get_last_epoch_emission();
-        
-        // CRITICAL: Update total supply IMMEDIATELY when rewards are calculated
-        // Not when claimed! Emission happens every 4 hours regardless
-        // Note: StateManager's emit_rewards internally handles chain_state locking
-        let emission_result = {
-            let state = self.state.read().await;
-            (*state).emit_rewards(total_emission)
-        };
-        
-        match emission_result {
-            Ok(actual_emission) => {
-                if is_info() { println!("[INFO][REWARDS] EMISSION_COMPLETE amount={} eligible={}", 
-                         actual_emission / 1_000_000_000, pending_rewards.len()); }
-                let state = self.state.read().await;
-                let total_supply = (*state).get_total_supply();
-                if is_debug() { println!("[DBG][REWARDS] total_supply={}", total_supply / 1_000_000_000); }
-                
-                // CRITICAL: Create system emission transaction for blockchain record
-                if actual_emission > 0 {
-                    let current_time = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    
-                    // DECENTRALIZED: No signature needed - all nodes validate emission amount independently
-                    // validation through consensus rules, not cryptographic signature
-                    // v2.65: System TX get MAX priority (u64::MAX) to ensure inclusion in block
-                    // v7.0: Build wallet→delta accrual map for emission TX
-                    let accrual_wallet_map: std::collections::BTreeMap<String, u64> = {
-                        let accruals = reward_manager.get_last_epoch_accruals();
-                        let mut wmap = std::collections::BTreeMap::new();
-                        for (nid, &amt) in accruals.iter() {
-                            if let Ok(Some((_, wallet, _))) = self.storage.load_node_registration(nid) {
-                                if !wallet.is_empty() {
-                                    *wmap.entry(wallet).or_insert(0) += amt;
-                                }
-                            }
-                        }
-                        wmap
-                    };
-                    
-                    let mut emission_tx = qnet_state::Transaction {
-                        from: "system_emission".to_string(),
-                        to: Some("system_rewards_pool".to_string()),
-                        amount: actual_emission,
-                        tx_type: qnet_state::TransactionType::RewardDistribution,
-                        timestamp: current_time,
-                        hash: String::new(),
-                        signature: None,
-                        public_key: None,
-                        gas_price: u64::MAX,
-                        gas_limit: 0,
-                        nonce: 0,
-                        // v7.0: Per-wallet accruals for deterministic block execution
-                        data: Some(serde_json::json!({
-                            "v": 2,
-                            "accruals": accrual_wallet_map
-                        }).to_string()),
-                        dilithium_signature: None,
-                        dilithium_public_key: None,
-                        chain_id: 0,
-                    };
-
-                    emission_tx.hash = emission_tx.calculate_hash();
-
-                    // Add emission transaction to mempool for blockchain record
-                    // v2.65: CRITICAL - if TX fails to add, return error (not just warning)
-                    // This prevents "emission created" log when TX actually failed
-                    if let Err(e) = self.add_transaction_to_mempool(emission_tx).await {
-                        eprintln!("[ERR][REWARDS] emission_tx_mempool_fail err={}", e);
-                        return Err(QNetError::ConsensusError(format!(
-                            "Emission TX failed to add to mempool: {}", e
-                        )));
-                    } else {
-                        if is_info() { println!("[INFO][REWARDS] emission_tx_added_to_mempool"); }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[ERR][REWARDS] emission_failed err={}", e);
-                return Err(QNetError::ConsensusError(format!("Failed to emit rewards: {}", e)));
-            }
-        }
-        
-        // CRITICAL: Save pending rewards to storage (survive restarts)
-        for (node_id, _amount) in &pending_rewards {
-            if let Some(reward) = reward_manager.get_pending_reward(&node_id) {
-                if let Err(e) = self.storage.save_pending_reward(&node_id, reward) {
-                    eprintln!("[WARN][REWARDS] pending_reward_save_fail node={} err={}", node_id, e);
-                } else {
-                    if is_debug() { println!("[DBG][REWARDS] pending_reward_saved node={}", node_id); }
-                }
-            }
-        }
-        
-        // Rewards are now in pending_rewards - users can claim them anytime
-        if is_info() { println!("[INFO][REWARDS] available_for_claim"); }
-        Ok(true) // v2.53: Emission created successfully
-    }
-    
-    /// PRODUCTION v2.77: Create HeartbeatCommitment TX for this node
-    /// Called 50 blocks before epoch end (e.g., blocks 14350-14399)
-    /// 
-    /// Arguments:
-    /// - current_epoch: Epoch number (e.g., 1 for blocks 0-14399)
-    /// 
-    /// Returns: Ok(()) if TX created and added to mempool
-    #[allow(dead_code)]
-    async fn create_heartbeat_commitment_tx(&self, current_epoch: u64) -> Result<(), QNetError> {
-        const EMISSION_BLOCK_INTERVAL: u64 = 14400;
-        
-        // Calculate block window for this epoch (epochs start from 0)
-        let window_start_height = current_epoch * EMISSION_BLOCK_INTERVAL;
-        let window_end_height = (current_epoch + 1) * EMISSION_BLOCK_INTERVAL;
-        
-        // Get P2P instance
-        let p2p = match &self.unified_p2p {
-            Some(p2p) => p2p.clone(),
-            None => {
-                return Err(QNetError::NetworkError("P2P not available".to_string()));
-            }
-        };
-        
-        // Compute Merkle root and samples for this node's heartbeats
-        let (merkle_root, heartbeat_data, sample_indices) = p2p
-            .compute_heartbeat_merkle_root_for_commitment(
-                &self.node_id,
-                window_start_height,
-                window_end_height,
-            )
-            .map_err(|e| QNetError::ConsensusError(format!("Failed to compute Merkle root: {}", e)))?;
-        
-        let heartbeat_count = heartbeat_data.len().min(255) as u8;
-        
-        if heartbeat_count == 0 {
-            if is_warn() {
-                println!("[WARN][HEARTBEAT-COMMITMENT] no_heartbeats node={} epoch={}", 
-                         self.node_id, current_epoch);
-            }
-            // Still create TX with count=0 (node was offline)
-        }
-        
-        // Get first and last heartbeat times
-        let (first_heartbeat_time, last_heartbeat_time) = if heartbeat_count > 0 {
-            (heartbeat_data[0].1, heartbeat_data[heartbeat_data.len() - 1].1)
-        } else {
-            (0, 0)
-        };
-        
-        // Create deterministic sample seed
-        let mut seed_hasher = Sha3_256::new();
-        seed_hasher.update(b"QNet_Heartbeat_Sampling_v1");
-        seed_hasher.update(self.node_id.as_bytes());
-        seed_hasher.update(&window_start_height.to_le_bytes());
-        let sample_seed = seed_hasher.finalize();
-        let sample_seed_hex = hex::encode(&sample_seed[..]);
-        
-        // Create samples with Merkle proofs
-        let mut heartbeat_samples = Vec::new();
-        for &sample_idx in &sample_indices {
-            if sample_idx >= heartbeat_data.len() {
-                continue;
-            }
-            
-            let (index, timestamp, block_height, signature, _hash) = &heartbeat_data[sample_idx];
-            
-            // Generate Merkle proof
-            let hashes: Vec<String> = heartbeat_data.iter().map(|(_, _, _, _, h)| h.clone()).collect();
-            let merkle_proof = qnet_core::crypto::merkle::generate_merkle_proof(&hashes, sample_idx)
-                .map_err(|e| QNetError::SecurityError(format!("Failed to generate Merkle proof: {}", e)))?;
-            
-            heartbeat_samples.push(qnet_state::HeartbeatSampleData {
-                heartbeat_index: *index,
-                timestamp: *timestamp,
-                block_height: *block_height,
-                signature: signature.clone(),
-                merkle_proof,
-            });
-        }
-        
-        // Create HeartbeatCommitment transaction
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        let mut commitment_tx = qnet_state::Transaction {
-            from: self.node_id.clone(),
-            to: None,
-            amount: 0,
-            tx_type: qnet_state::TransactionType::HeartbeatCommitment {
-                node_id: self.node_id.clone(),
-                window_start_height,
-                window_end_height,
-                merkle_root: merkle_root.clone(),
-                heartbeat_count,
-                first_heartbeat_time,
-                last_heartbeat_time,
-                sample_seed: sample_seed_hex,
-                heartbeat_samples,
-            },
-            timestamp: current_time,
-            hash: String::new(),
-            signature: None, // System TX - no signature needed
-            public_key: None,
-            gas_price: u64::MAX, // MAX priority - must be included before emission
-            gas_limit: 0, // FREE system operation
-            nonce: current_epoch + 1, // PROTOCOL: Epoch-based nonce (deterministic unique per epoch)
-            data: Some(format!(
-                "Heartbeat Commitment: {} heartbeats, epoch {}, root: {}",
-                heartbeat_count, current_epoch, &merkle_root[..16]
-            )),
-            dilithium_signature: None,
-            dilithium_public_key: None,
-            chain_id: 0,
-        };
-
-        // Calculate hash
-        commitment_tx.hash = commitment_tx.calculate_hash();
-
-        // Add to mempool
-        if let Err(e) = self.add_transaction_to_mempool(commitment_tx).await {
-            eprintln!("[ERR][HEARTBEAT-COMMITMENT] mempool_add_failed node={} epoch={} err={}",
-                     self.node_id, current_epoch, e);
-            return Err(e);
-        }
-        
-        if is_info() {
-            println!("[INFO][HEARTBEAT-COMMITMENT] TX_created node={} epoch={} hb_count={} samples={} root={}",
-                     self.node_id, current_epoch, heartbeat_count, sample_indices.len(), &merkle_root[..16]);
-        }
-        
-        Ok(())
-    }
-    
     /// PRODUCTION v2.78: Ping ALL Light nodes and collect attestations.
     /// ARCHITECTURE: Each Super node pings 100% of registered Light nodes.
     /// (v3.18: the "Full" tier was removed; only Super nodes ping Light.)
@@ -5899,245 +5238,14 @@ impl BlockchainNode {
         Ok(existing_light_nodes.len() as u32)
     }
     
-    /// Select heartbeat sample indices for a HeartbeatCommitment.
-    ///
-    /// Slot 0 is ALWAYS the near-tip (max block-height) heartbeat: the Phase-2A eligibility
-    /// proximity gate requires a revealed sample within SYNC_PROXIMITY_BLOCKS of the chain tip
-    /// (only the commitment-window heartbeat qualifies), so forcing it makes a synced node's
-    /// admission DETERMINISTIC from the first epoch instead of ~1/n probabilistic. Remaining
-    /// slots stay seeded-random spot-checks (byte-identical to the prior derivation). Count is
-    /// unchanged (= sample_size) so the validator's [min,max] size gate still holds, and every
-    /// revealed sample is still a real, anchored, Dilithium-signed heartbeat (gate security
-    /// unchanged). Pure + deterministic ⇒ identical on every node.
-    fn select_heartbeat_sample_indices(block_heights: &[u64], sample_size: usize, sample_seed: &str) -> Vec<usize> {
-        use sha3::{Digest, Sha3_256};
-        if block_heights.is_empty() { return Vec::new(); }
-        let n = block_heights.len();
-        // First occurrence of the max height (the commitment-window heartbeat; heights distinct).
-        let mut near_tip_index = 0usize;
-        let mut near_tip_h = block_heights[0];
-        for (i, &h) in block_heights.iter().enumerate() {
-            if h > near_tip_h { near_tip_h = h; near_tip_index = i; }
-        }
-        let mut indices = Vec::with_capacity(sample_size);
-        for i in 0..sample_size {
-            if i == 0 {
-                indices.push(near_tip_index);
-                continue;
-            }
-            let mut index_hasher = Sha3_256::new();
-            index_hasher.update(sample_seed.as_bytes());
-            index_hasher.update(&(i as u32).to_le_bytes());
-            let hash = index_hasher.finalize();
-            let index = u64::from_le_bytes([
-                hash[0], hash[1], hash[2], hash[3],
-                hash[4], hash[5], hash[6], hash[7],
-            ]) as usize % n;
-            indices.push(index);
-        }
-        indices
-    }
-
-    /// PRODUCTION v2.78: Static helper - Create HeartbeatCommitment TX
-    /// Used by commitment TX loop (runs in parallel with block production)
-    /// Returns Transaction ready to be added to mempool
-    async fn create_heartbeat_commitment_tx_static(
-        storage: &Arc<Storage>,
-        _p2p: &Arc<SimplifiedP2P>,
-        node_id: &str,
-        current_epoch: u64,
-    ) -> Result<qnet_state::Transaction, QNetError> {
-        const EMISSION_BLOCK_INTERVAL: u64 = 14400;
-        let window_start_height = current_epoch * EMISSION_BLOCK_INTERVAL;
-        let window_end_height = (current_epoch + 1) * EMISSION_BLOCK_INTERVAL;
-        
-        if is_info() {
-            println!("[INFO][HB-COMMIT-CREATE] Starting creation node={} epoch={} window={}..{}", 
-                     node_id, current_epoch, window_start_height, window_end_height);
-        }
-        
-        // Get heartbeats from Storage (for this node only)
-        let all_heartbeats = storage.get_heartbeats_for_block_range(window_start_height, window_end_height)
-            .unwrap_or_default();
-        
-        if is_info() {
-            println!("[INFO][HB-COMMIT-CREATE] Retrieved {} total heartbeats from storage", all_heartbeats.len());
-        }
-        
-        let my_heartbeats: Vec<_> = all_heartbeats.into_iter()
-            .filter(|(sender_id, _, _, _, _)| sender_id == node_id)
-            .collect();
-        
-        let heartbeat_count = my_heartbeats.len().min(255) as u8;
-        
-        if is_info() {
-            println!("[INFO][HB-COMMIT-CREATE] Filtered to {} heartbeats for node={}", heartbeat_count, node_id);
-        }
-        
-        if heartbeat_count == 0 {
-            if is_warn() {
-                println!("[WARN][HB-COMMIT-CREATE] No heartbeats found! node={} epoch={}", node_id, current_epoch);
-            }
-            return Err(QNetError::ValidationError("No heartbeats to commit".to_string()));
-        }
-
-        // Onboarding determinism: the Phase-2A eligibility proximity gate admits a node only if
-        // its HBC reveals a heartbeat within SYNC_PROXIMITY_BLOCKS of the chain tip — satisfied
-        // ONLY by the commitment-window (near-tip) heartbeat. Heartbeats are produced in real time
-        // at their scheduled heights, so early in the emission window that near-tip one may not
-        // exist yet; an HBC built then can NEVER pass the gate and is wasted for the whole epoch.
-        // Defer (Err ⇒ the commitment loop retries next tick, tracker untouched) until a heartbeat
-        // inside the proximity window exists, so the emitted HBC always carries a gate-satisfying
-        // near-tip sample (which select_heartbeat_sample_indices then forces into the revealed set).
-        // SYNC_PROXIMITY_BLOCKS MUST match create_eligible_producers_snapshot (node.rs ~4040).
-        const SYNC_PROXIMITY_BLOCKS: u64 = 90;
-        let max_hb_height = my_heartbeats.iter().map(|(_, _, _, bh, _)| *bh).max().unwrap_or(0);
-        if max_hb_height + SYNC_PROXIMITY_BLOCKS < window_end_height {
-            if is_info() {
-                println!("[INFO][HB-COMMIT-CREATE] deferring node={} epoch={} max_hb={} need>={} (near-tip heartbeat not yet produced)",
-                         node_id, current_epoch, max_hb_height, window_end_height.saturating_sub(SYNC_PROXIMITY_BLOCKS));
-            }
-            return Err(QNetError::ValidationError("near-tip heartbeat not yet produced; deferring HBC".to_string()));
-        }
-
-        // Create Merkle tree and samples (same logic as create_heartbeat_commitment_tx)
-        use blake3::Hasher as Blake3Hasher;
-        
-        let heartbeat_hashes: Vec<String> = my_heartbeats.iter().map(|(_, heartbeat_idx, timestamp, block_height, dilithium_sig)| {
-            let mut hasher = Blake3Hasher::new();
-            hasher.update(node_id.as_bytes());
-            hasher.update(&[*heartbeat_idx]);
-            hasher.update(&timestamp.to_le_bytes());
-            hasher.update(&block_height.to_le_bytes());
-            hasher.update(dilithium_sig.as_bytes());
-            hasher.finalize().to_hex().to_string()
-        }).collect();
-        
-        let merkle_root = qnet_core::crypto::merkle::compute_merkle_root(&heartbeat_hashes)
-            .map_err(|e| QNetError::SecurityError(format!("Merkle root failed: {}", e)))?;
-        
-        let mut seed_hasher = Sha3_256::new();
-        seed_hasher.update(b"QNet_Heartbeat_Sampling_v2");
-        seed_hasher.update(node_id.as_bytes());
-        seed_hasher.update(&window_start_height.to_le_bytes());
-        seed_hasher.update(merkle_root.as_bytes());
-        let sample_seed = hex::encode(&seed_hasher.finalize()[..]);
-        
-        // FIXED v2.90: Match validation formula (20-30% of heartbeat_count)
-        // Previous bug: used 1% + MIN=10 which NEVER matched validation!
-        let min_samples = ((heartbeat_count as usize * 20) / 100).max(1);
-        let sample_size = min_samples; // Use minimum to reduce TX size
-
-        // Eligibility (Phase-2A) requires a revealed sample within SYNC_PROXIMITY_BLOCKS of the
-        // chain tip to prove the node is synced to NOW; the only heartbeat that qualifies is the
-        // commitment-window one (forced near epoch end). select_heartbeat_sample_indices makes
-        // slot 0 the near-tip heartbeat so admission is deterministic from the first epoch (was
-        // ~1/heartbeat_count probabilistic). Count stays = sample_size (validator [min,max]).
-        let sample_block_heights: Vec<u64> = my_heartbeats.iter().map(|(_, _, _, bh, _)| *bh).collect();
-        let sample_indices = Self::select_heartbeat_sample_indices(&sample_block_heights, sample_size, &sample_seed);
-
-        let mut heartbeat_samples = Vec::new();
-        for index in sample_indices {
-            let merkle_proof = qnet_core::crypto::merkle::generate_merkle_proof(&heartbeat_hashes, index)
-                .map_err(|e| QNetError::SecurityError(format!("Merkle proof failed: {}", e)))?;
-
-            let (_, heartbeat_idx, timestamp, block_height, dilithium_signature) = &my_heartbeats[index];
-
-            // PRODUCTION v2.78: Use REAL Dilithium signature from storage
-            heartbeat_samples.push(qnet_state::HeartbeatSampleData {
-                heartbeat_index: *heartbeat_idx,
-                timestamp: *timestamp,
-                block_height: *block_height,
-                signature: dilithium_signature.clone(),
-                merkle_proof,
-            });
-        }
-        
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        // Calculate first/last heartbeat times
-        let first_heartbeat_time = my_heartbeats.iter().map(|(_, _, ts, _, _)| *ts).min().unwrap_or(0);
-        let last_heartbeat_time = my_heartbeats.iter().map(|(_, _, ts, _, _)| *ts).max().unwrap_or(0);
-        
-        let mut commitment_tx = qnet_state::Transaction {
-            from: node_id.to_string(),
-            to: None,
-            amount: 0,
-            tx_type: qnet_state::TransactionType::HeartbeatCommitment {
-                node_id: node_id.to_string(),
-                window_start_height,
-                window_end_height,
-                merkle_root,
-                heartbeat_count,
-                first_heartbeat_time,
-                last_heartbeat_time,
-                sample_seed,
-                heartbeat_samples,
-            },
-            timestamp: current_time,
-            hash: String::new(),
-            signature: None,      // Will be filled with hybrid signature
-            public_key: None,     // Will be filled with ephemeral Ed25519 pubkey
-            gas_price: u64::MAX,
-            gas_limit: 0,
-            nonce: current_epoch + 1, // PROTOCOL: Epoch-based nonce (deterministic unique per epoch)
-            data: Some(format!("Heartbeat Commitment: {} heartbeats, epoch {}", heartbeat_count, current_epoch)),
-            dilithium_signature: None,   // Will be filled with Dilithium signature
-            dilithium_public_key: None,  // Node ID used for pubkey lookup
-            chain_id: 0,
-        };
-        
-        // PRODUCTION v2.82: Add HYBRID signature (Ed25519 + Dilithium) for L1 security
-        // CRITICAL: Use SAME format as verify functions expect!
-        // - Ed25519: verify_ed25519_tx_signature_async expects canonical message
-        // - Dilithium: verify_dilithium_tx_signature expects canonical message
-        
-        let to_str = commitment_tx.to.clone().unwrap_or_default();
-        let canonical_message = format!("{}|{}|{}|{}|{}|{}|{}",
-            commitment_tx.from, to_str, commitment_tx.amount, commitment_tx.nonce,
-            commitment_tx.gas_price, commitment_tx.gas_limit, commitment_tx.timestamp);
-        
-        // Step 1: Ed25519 signature with ephemeral key (forward secrecy)
-        use ed25519_dalek::{SigningKey, Signer};
-        use rand::rngs::OsRng;
-        
-        let mut csprng = OsRng{};
-        let ephemeral_signing_key = SigningKey::generate(&mut csprng);
-        let ephemeral_public_key = ephemeral_signing_key.verifying_key();
-        let ed25519_signature = ephemeral_signing_key.sign(canonical_message.as_bytes());
-        
-        commitment_tx.signature = Some(hex::encode(ed25519_signature.to_bytes()));
-        commitment_tx.public_key = Some(hex::encode(ephemeral_public_key.as_bytes()));
-        
-        // Step 2: Dilithium signature (quantum-resistant) using quantum_crypto
-        // CRITICAL v2.85: Dilithium is MANDATORY for commitment TX (L1 security requirement)
-        // This provides post-quantum security linked to node identity
-        let crypto = try_get_quantum_crypto()
-            .ok_or_else(|| QNetError::SecurityError("Quantum crypto not initialized - REQUIRED for commitment TX".to_string()))?;
-        
-        match crypto.create_consensus_signature(node_id, &canonical_message).await {
-            Ok(dilithium_sig) => {
-                commitment_tx.dilithium_signature = Some(dilithium_sig.signature);
-                commitment_tx.dilithium_public_key = Some(node_id.to_string());
-                
-                if is_info() {
-                    println!("[INFO][HB-COMMIT] TX signed with HYBRID crypto: Ed25519(ephemeral) + Dilithium(node) node={}", node_id);
-                }
-            }
-            Err(e) => {
-                return Err(QNetError::SecurityError(format!("Dilithium signing REQUIRED but failed: {}", e)));
-            }
-        }
-        
-        // CRITICAL FIX v2.85: Calculate hash AFTER adding signatures and public keys
-        // canonical_bytes() includes public_key/dilithium_public_key in hash calculation
-        // Hash must be computed when all signature-related fields are set
-        commitment_tx.hash = commitment_tx.calculate_hash();
-
-        Ok(commitment_tx)
+    /// Deterministic per-node block offset (0..1439) within a subwindow, so 100k+ super-nodes
+    /// spread heartbeat emission across the whole subwindow instead of bursting at its boundary.
+    fn heartbeat_offset(node_id: &str, subwindow: u64) -> u64 {
+        let mut h = Sha3_256::new();
+        h.update(node_id.as_bytes());
+        h.update(&subwindow.to_le_bytes());
+        let d = h.finalize();
+        (((u64::from(d[0]) << 8) | u64::from(d[1])) % 1440) as u64
     }
 
     /// v34: build ONE unforgeable Heartbeat TX anchored to a recent block (current_height-2).
@@ -6169,7 +5277,7 @@ impl BlockchainNode {
                 node_id: node_id.to_string(),
                 anchor_height,
                 anchor_hash,
-                signature: hb_sig.signature,
+                signature: String::new(),
             },
             timestamp: current_time,
             hash: String::new(),
@@ -6179,26 +5287,10 @@ impl BlockchainNode {
             gas_limit: 0,
             nonce: epoch * 10 + subwindow + 1,
             data: None,
-            dilithium_signature: None,
-            dilithium_public_key: None,
+            dilithium_signature: Some(hb_sig.signature),
+            dilithium_public_key: Some(node_id.to_string()),
             chain_id: 0,
         };
-        let canonical = format!("{}|{}|{}|{}|{}|{}|{}",
-            tx.from, "", tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp);
-        {
-            use ed25519_dalek::{SigningKey, Signer};
-            use rand::rngs::OsRng;
-            let mut csprng = OsRng{};
-            let ek = SigningKey::generate(&mut csprng);
-            let epk = ek.verifying_key();
-            let ed_sig = ek.sign(canonical.as_bytes());
-            tx.signature = Some(hex::encode(ed_sig.to_bytes()));
-            tx.public_key = Some(hex::encode(epk.as_bytes()));
-        }
-        if let Ok(dsig) = crypto.create_consensus_signature(node_id, &canonical).await {
-            tx.dilithium_signature = Some(dsig.signature);
-            tx.dilithium_public_key = Some(node_id.to_string());
-        }
         tx.hash = tx.calculate_hash();
         Some(tx)
     }
@@ -6215,6 +5307,43 @@ impl BlockchainNode {
         } else {
             0
         }
+    }
+
+    /// v35: build the reward-recipient HeartbeatSummary set for an epoch from on-chain Heartbeat
+    /// TXs. Scans the epoch's blocks for distinct emitters, then keys each one's eligibility on the
+    /// UNFORGEABLE per-epoch tally (heartbeat_slots popcount) — no HBC, no self-attested count.
+    /// Sorted by node_id so every sealer serializes a byte-identical macroblock body.
+    pub(crate) async fn collect_heartbeat_summaries_from_chain(
+        storage: &Arc<Storage>,
+        window_start: u64,
+        window_end: u64,
+    ) -> Result<Vec<qnet_state::HeartbeatSummary>, QNetError> {
+        let epoch = window_start / 14400;
+        let mut emitters: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for h in window_start..window_end {
+            if let Ok(Some(block)) = storage.load_microblock_auto_format(h) {
+                for tx in &block.transactions {
+                    if let qnet_state::TransactionType::Heartbeat { node_id, .. } = &tx.tx_type {
+                        emitters.insert(node_id.clone());
+                    }
+                }
+            }
+        }
+        let mut summaries: Vec<qnet_state::HeartbeatSummary> = Vec::with_capacity(emitters.len());
+        for node_id in emitters {
+            let node_type: u8 = if node_id.starts_with("light_") { 0 }
+                else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") { 2 }
+                else { continue };
+            let required: u8 = if node_type == 0 { 1 } else { 9 };
+            let cnt = storage.load_account(&node_id).ok().flatten()
+                .map(|a| Self::account_heartbeat_count(&a, epoch)).unwrap_or(0);
+            summaries.push(qnet_state::HeartbeatSummary {
+                node_id, node_type, heartbeat_count: cnt,
+                first_heartbeat: 0, last_heartbeat: 0, is_eligible: cnt >= required,
+            });
+        }
+        summaries.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        Ok(summaries)
     }
 
     /// Used by commitment TX loop (runs in parallel with block production)
@@ -6660,395 +5789,6 @@ impl BlockchainNode {
         Ok(tx)
     }
 
-    /// PRODUCTION v2.77: Collect HeartbeatCommitment TXs from blockchain with SHARD AGGREGATION
-    /// Reads all HeartbeatCommitment TXs from blocks and aggregates by 256 shards
-    /// 
-    /// SCALABILITY: For 10M nodes:
-    /// - Individual approach: 10M × 100 bytes = 1 GB MacroBlock ❌
-    /// - Shard approach: 256 × 5 KB = 1.3 MB MacroBlock ✅
-    /// PRODUCTION v2.77: Collect HeartbeatCommitment TXs from blockchain (SCALABLE!)
-    /// 
-    /// This method scans blocks for HeartbeatCommitment transactions and aggregates them.
-    /// Used for deterministic reward calculation in MacroBlocks.
-    /// 
-    /// Arguments:
-    /// - storage: Arc reference to blockchain storage
-    /// - p2p: Arc reference to P2P layer (for Dilithium signature verification)
-    /// - window_start_height: Start of epoch (e.g., 0)
-    /// - window_end_height: End of epoch (e.g., 14400)
-    /// - use_shards: If true, return shard summaries (scalable). If false, return individual summaries (legacy)
-    /// 
-    /// Returns: (Vec<HeartbeatSummary>, Vec<ShardHeartbeatSummary>)
-    ///
-    /// SECURITY: Full 2-layer verification (Dilithium + Merkle proofs)
-    pub(crate) async fn collect_heartbeat_commitments_from_blocks(
-        storage: &Arc<Storage>,
-        p2p: &Arc<SimplifiedP2P>,
-        window_start_height: u64,
-        window_end_height: u64,
-        use_shards: bool,
-    ) -> Result<(Vec<qnet_state::HeartbeatSummary>, Vec<qnet_state::ShardHeartbeatSummary>), QNetError> {
-        use std::collections::HashMap;
-        
-        if is_info() {
-            println!("[INFO][HEARTBEAT-COLLECTION] Reading HeartbeatCommitment TXs from blocks {}-{} shards={}",
-                     window_start_height, window_end_height, use_shards);
-        }
-        
-        // Collect all HeartbeatCommitment TXs from blocks
-        let mut commitments: HashMap<String, qnet_state::TransactionType> = HashMap::new();
-        let mut blocks_scanned = 0;
-        let mut txs_found = 0;
-        
-        // Scan blocks for HeartbeatCommitment TXs
-        // CRITICAL FIX v2.99: Use load_microblock_auto_format() instead of load_microblock()
-        // EfficientMicroBlock stores TX hashes only - full TXs are in separate CF
-        // load_microblock_auto_format() reconstructs full block WITH transactions
-        //
-        // SCALABILITY: HeartbeatCommitment TXs are submitted near epoch boundaries
-        // (within last ~500 blocks of each epoch). Skip early blocks that cannot contain them.
-        // This reduces scan from 14400 to ~500 blocks in typical case.
-        let optimized_start = if window_end_height > window_start_height + 500 {
-            // HeartbeatCommitments are submitted after heartbeats accumulate (late in epoch)
-            // Scan last 2000 blocks to be safe (covers late submissions + reorgs)
-            let skip_to = window_end_height.saturating_sub(2000);
-            if skip_to > window_start_height {
-                if is_info() {
-                    println!("[INFO][HEARTBEAT-COLLECTION] optimized_scan skipping_to={} saved_blocks={}",
-                             skip_to, skip_to - window_start_height);
-                }
-                skip_to
-            } else {
-                window_start_height
-            }
-        } else {
-            window_start_height
-        };
-        for height in optimized_start..=window_end_height {
-            // v2.99: Auto-format loader handles both EfficientMicroBlock and legacy MicroBlock
-            if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
-                    blocks_scanned += 1;
-                    
-                    for tx in &block.transactions {
-                        if let qnet_state::TransactionType::HeartbeatCommitment { 
-                            node_id, 
-                            heartbeat_samples,
-                            merkle_root,
-                            heartbeat_count: _heartbeat_count,
-                            window_start_height: tx_window_start,
-                            window_end_height: tx_window_end,
-                            ..
-                        } = &tx.tx_type {
-                            // CRITICAL FIX v2.95.3: Filter by EPOCH!
-                            // TX must belong to THIS epoch, not a late TX from previous epoch!
-                            // TX is valid only if recorded within its commitment window (last 50 blocks)
-                            let tx_commitment_window_start = tx_window_end.saturating_sub(50);
-                            
-                            // TX must be in block WITHIN its commitment window
-                            if height < tx_commitment_window_start || height > *tx_window_end {
-                                if is_debug() {
-                                    println!("[DBG][HEARTBEAT-COLLECTION] skipping_late_tx node={} block={} window={}-{}",
-                                             node_id, height, tx_commitment_window_start, tx_window_end);
-                                }
-                                continue;
-                            }
-                            
-                            // Also verify TX epoch matches scan epoch
-                            let scan_epoch = window_start_height / 14400;
-                            let tx_epoch = tx_window_start / 14400;
-                            if tx_epoch != scan_epoch {
-                                if is_debug() {
-                                    println!("[DBG][HEARTBEAT-COLLECTION] skipping_wrong_epoch node={} tx_epoch={} scan_epoch={}",
-                                             node_id, tx_epoch, scan_epoch);
-                                }
-                                continue;
-                            }
-                            
-                            // Only keep first valid commitment from each node (ignore duplicates within same epoch)
-                            if commitments.contains_key(node_id) {
-                                continue;
-                            }
-                            
-                            // SECURITY v2.77: Verify Dilithium signatures AND Merkle proofs for samples
-                            let mut valid_samples = 0;
-                            for sample in heartbeat_samples {
-                                let expected_msg = format!("{}:{}:{}:{}", 
-                                    node_id, sample.timestamp, sample.block_height, sample.heartbeat_index);
-                                
-                                // LAYER 1: Verify Dilithium signature
-                                let signature_valid = p2p.verify_dilithium_heartbeat_signature(&expected_msg, &sample.signature, node_id);
-                                
-                                if !signature_valid {
-                                    if is_warn() {
-                                        println!("[WARN][HEARTBEAT-COLLECTION] Invalid Dilithium signature for {} sample #{} - rejecting commitment",
-                                                 node_id, sample.heartbeat_index);
-                                    }
-                                    continue;
-                                }
-                                
-                                // LAYER 2: Verify Merkle proof
-                                use blake3::Hasher as Blake3Hasher;
-                                let mut hasher = Blake3Hasher::new();
-                                hasher.update(node_id.as_bytes());
-                                hasher.update(&[sample.heartbeat_index]);
-                                hasher.update(&sample.timestamp.to_le_bytes());
-                                hasher.update(&sample.block_height.to_le_bytes());
-                                hasher.update(sample.signature.as_bytes());
-                                let hash = hasher.finalize();
-                                let heartbeat_hash = hash.to_hex().to_string();
-                                
-                                let merkle_valid = qnet_core::crypto::merkle::verify_merkle_proof(
-                                    &heartbeat_hash,
-                                    merkle_root,
-                                    &sample.merkle_proof
-                                );
-                                
-                                if !merkle_valid {
-                                    if is_warn() {
-                                        println!("[WARN][HEARTBEAT-COLLECTION] Invalid Merkle proof for {} sample #{} - rejecting commitment",
-                                                 node_id, sample.heartbeat_index);
-                                    }
-                                    continue;
-                                }
-                                
-                                valid_samples += 1;
-                            }
-                            
-                            // Require ALL samples to have valid signatures
-                            if valid_samples == heartbeat_samples.len() || heartbeat_samples.is_empty() {
-                                commitments.insert(node_id.clone(), tx.tx_type.clone());
-                                txs_found += 1;
-                            } else {
-                                if is_warn() {
-                                    println!("[WARN][HEARTBEAT-COLLECTION] Commitment from {} rejected: {}/{} valid signatures",
-                                             node_id, valid_samples, heartbeat_samples.len());
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Progress logging every 1000 blocks
-            if blocks_scanned % 1000 == 0 && is_debug() {
-                println!("[DBG][HEARTBEAT-COLLECTION] progress blocks={}/{} txs={}",
-                         blocks_scanned, window_end_height - window_start_height + 1, txs_found);
-            }
-        }
-        
-        if is_info() {
-            println!("[INFO][HEARTBEAT-COLLECTION] scan_complete blocks={} txs={} unique_nodes={}",
-                     blocks_scanned, txs_found, commitments.len());
-        }
-        
-        if use_shards {
-            Self::aggregate_commitments_by_shards(commitments).await
-        } else {
-            Self::commitments_to_individual_summaries(commitments).await
-        }
-    }
-    
-    /// Convert HeartbeatCommitment TXs to individual HeartbeatSummary (legacy mode)
-    async fn commitments_to_individual_summaries(
-        commitments: HashMap<String, qnet_state::TransactionType>,
-    ) -> Result<(Vec<qnet_state::HeartbeatSummary>, Vec<qnet_state::ShardHeartbeatSummary>), QNetError> {
-        let mut summaries = Vec::new();
-        
-        for (node_id, tx_type) in commitments {
-            if let qnet_state::TransactionType::HeartbeatCommitment {
-                heartbeat_count,
-                first_heartbeat_time,
-                last_heartbeat_time,
-                ..
-            } = tx_type {
-                // v3.18: Super nodes removed
-                let node_type = if node_id.starts_with("light_") {
-                    0
-                } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
-                    2
-                } else {
-                    continue;
-                };
-                
-                let required = match node_type {
-                    0 => 1,
-                    1 => 8,
-                    2 => 9,
-                    _ => 10,
-                };
-                let is_eligible = heartbeat_count >= required;
-                
-                summaries.push(qnet_state::HeartbeatSummary {
-                    node_id,
-                    node_type,
-                    heartbeat_count,
-                    first_heartbeat: first_heartbeat_time,
-                    last_heartbeat: last_heartbeat_time,
-                    is_eligible,
-                });
-            }
-        }
-        
-        if is_info() {
-            println!("[INFO][HEARTBEAT-COLLECTION] individual_summaries count={} eligible={}",
-                     summaries.len(), summaries.iter().filter(|s| s.is_eligible).count());
-        }
-        
-        Ok((summaries, Vec::new()))
-    }
-    
-    /// PRODUCTION v2.95: Aggregate HeartbeatCommitment TXs by 256 shards (SCALABLE!)
-    /// Returns BOTH individual summaries (for reward distribution) AND shard summaries (for verification)
-    /// CRITICAL: Individual summaries needed for emission TX creation - cannot be empty!
-    async fn aggregate_commitments_by_shards(
-        commitments: HashMap<String, qnet_state::TransactionType>,
-    ) -> Result<(Vec<qnet_state::HeartbeatSummary>, Vec<qnet_state::ShardHeartbeatSummary>), QNetError> {
-        use std::collections::HashMap;
-        
-        // v2.95: Collect BOTH individual summaries AND shard aggregates
-        let mut individual_summaries = Vec::new();
-        let mut shards: HashMap<u8, Vec<(String, qnet_state::TransactionType)>> = HashMap::new();
-        
-        for (node_id, tx_type) in commitments {
-            let mut hasher = Sha3_256::new();
-            hasher.update(node_id.as_bytes());
-            let hash = hasher.finalize();
-            let shard_id = hash[0];
-            
-            // v2.95: Build individual summary for reward distribution
-            if let qnet_state::TransactionType::HeartbeatCommitment {
-                heartbeat_count,
-                first_heartbeat_time,
-                last_heartbeat_time,
-                ..
-            } = &tx_type {
-                // v3.18: Super nodes removed
-                let node_type = if node_id.starts_with("light_") {
-                    0
-                } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
-                    2
-                } else {
-                    // Unknown node type - still track for shards but skip individual
-                    shards.entry(shard_id).or_insert_with(Vec::new).push((node_id, tx_type));
-                    continue;
-                };
-                
-                let required = match node_type {
-                    0 => 1,   // Light: 1 heartbeat per 4h
-                    1 => 8,   // Full: 8 heartbeats per 4h
-                    2 => 9,   // Super/Genesis: 9 heartbeats per 4h
-                    _ => 10,
-                };
-                let is_eligible = *heartbeat_count >= required;
-                
-                individual_summaries.push(qnet_state::HeartbeatSummary {
-                    node_id: node_id.clone(),
-                    node_type,
-                    heartbeat_count: *heartbeat_count,
-                    first_heartbeat: *first_heartbeat_time,
-                    last_heartbeat: *last_heartbeat_time,
-                    is_eligible,
-                });
-            }
-            
-            shards.entry(shard_id).or_insert_with(Vec::new).push((node_id, tx_type));
-        }
-        
-        if is_info() {
-            println!("[INFO][HEARTBEAT-COLLECTION] shard_distribution shards={} avg_per_shard={}",
-                     shards.len(), 
-                     shards.values().map(|v| v.len()).sum::<usize>() / shards.len().max(1));
-        }
-        
-        // Build shard summaries for Merkle verification (scalability)
-        let mut shard_summaries = Vec::new();
-        
-        for shard_id in 0..=255u8 {
-            let shard_nodes = shards.get(&shard_id).cloned().unwrap_or_default();
-            
-            let mut total_nodes = 0;
-            let mut eligible_light = 0;
-            let mut eligible_super = 0;
-            let mut commitment_hashes = Vec::new();
-            
-            for (node_id, tx_type) in &shard_nodes {
-                if let qnet_state::TransactionType::HeartbeatCommitment {
-                    heartbeat_count,
-                    merkle_root,
-                    ..
-                } = tx_type {
-                    total_nodes += 1;
-                    
-                    // v3.18: Super nodes removed
-                    let node_type = if node_id.starts_with("light_") {
-                        0  // Mobile node (Light)
-                    } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
-                        2  // Server node (Super)
-                    } else if node_id.starts_with("full_") {
-                        // v3.18: Reject old Super node format
-                        continue;
-                    } else {
-                        continue;
-                    };
-                    
-                    // v3.18: Light=1, Super=9 heartbeats required
-                    let required = match node_type {
-                        0 => 1,   // Mobile: 1 heartbeat
-                        2 => 9,   // Server: 9 heartbeats
-                        _ => 10,
-                    };
-                    let is_eligible = *heartbeat_count >= required;
-                    
-                    if is_eligible {
-                        match node_type {
-                            0 => eligible_light += 1,
-                            2 => eligible_super += 1,
-                            _ => {}
-                        }
-                    }
-                    
-                    commitment_hashes.push(merkle_root.clone());
-                }
-            }
-            
-            if total_nodes > 0 {
-                // v3.18: eligible_full always 0 (struct compat)
-                let total_eligible = eligible_light + eligible_super;
-                
-                let sample_count = (commitment_hashes.len() * 10 / 100).max(1).min(commitment_hashes.len());
-                let sample_hashes: Vec<String> = commitment_hashes.iter().take(sample_count).cloned().collect();
-                
-                let mut hasher = Sha3_256::new();
-                for hash in &commitment_hashes {
-                    hasher.update(hash.as_bytes());
-                }
-                let commitments_root = hex::encode(hasher.finalize());
-                
-                // v3.18: eligible_full always 0 (Super nodes removed)
-                shard_summaries.push(qnet_state::ShardHeartbeatSummary {
-                    shard_id,
-                    total_nodes,
-                    eligible_light,
-                    eligible_full: 0, // v3.18: Super nodes removed, always 0
-                    eligible_super,
-                    total_eligible,
-                    commitments_merkle_root: commitments_root,
-                    sample_commitment_hashes: sample_hashes,
-                });
-            }
-        }
-        
-        let eligible_count = individual_summaries.iter().filter(|s| s.is_eligible).count();
-        if is_info() {
-            let total_nodes: u32 = shard_summaries.iter().map(|s| s.total_nodes).sum();
-            let total_eligible: u32 = shard_summaries.iter().map(|s| s.total_eligible).sum();
-            println!("[INFO][HEARTBEAT-COLLECTION] individual_summaries={} eligible={} shard_summaries={} shard_nodes={} shard_eligible={}",
-                     individual_summaries.len(), eligible_count, shard_summaries.len(), total_nodes, total_eligible);
-        }
-        
-        // v2.95: Return BOTH - individual for rewards, shards for verification
-        Ok((individual_summaries, shard_summaries))
-    }
-    
     /// PRODUCTION v2.78: Collect Light node attestations from P2P RAM storage
     /// Reads attestations created by continuous pinging system (rpc.rs)
     /// 
@@ -9111,7 +7851,12 @@ impl BlockchainNode {
         
         // MEV PROTECTION: Initialize optional private bundle mempool
         // ARCHITECTURE: Dynamic 0-20% allocation protects public TX throughput
-        let mev_mempool = if env::var("QNET_ENABLE_MEV_PROTECTION").unwrap_or_default() == "1" {
+        // MEV protection (private bundles) — ALWAYS ON, no flag. Idle cost is ZERO: dynamic
+        // allocation reserves 0% block space until a bundle is actually submitted, so it engages
+        // only under real demand and never penalises public TXs when unused. Per-node, not a
+        // consensus param (a node composes its own blocks; validators accept any valid block ⇒
+        // on/off could never fork) — so there is no reason to expose an operator toggle.
+        let mev_mempool = {
             let bundle_config = qnet_mempool::BundleAllocationConfig {
                 min_allocation: 0.0,     // 0% minimum (no reservation when no demand)
                 max_allocation: 0.20,    // 20% maximum (protects public TXs ≥80%)
@@ -9121,17 +7866,8 @@ impl BlockchainNode {
                 max_lifetime_sec: 60,    // 60 seconds max (prevents mempool bloat)
                 submission_fanout: 3,    // Submit to 3 producers (load distribution)
             };
-            
-            let mev_pool = Arc::new(qnet_mempool::MevProtectedMempool::new(
-                mempool.clone(),
-                bundle_config,
-            ));
-            
-            if is_info() { println!("[INFO][MEV] protection=enabled allocation=0-20%"); }
-            Some(mev_pool)
-        } else {
-            if is_info() { println!("[INFO][MEV] protection=disabled mode=public_mempool"); }
-            None
+            if is_info() { println!("[INFO][MEV] protection=on allocation=0-20%"); }
+            Some(Arc::new(qnet_mempool::MevProtectedMempool::new(mempool.clone(), bundle_config)))
         };
         
         let mut blockchain = Self {
@@ -13156,8 +11892,9 @@ impl BlockchainNode {
             if !hb_is_syncing {
                 if let Some(p2p) = p2p {
                     for tx in &microblock.transactions {
-                        if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, anchor_hash, signature } = &tx.tx_type {
-                            Self::verify_heartbeat_tx(node_id, *anchor_height, anchor_hash, signature, microblock.height, storage, p2p)
+                        if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, anchor_hash, .. } = &tx.tx_type {
+                            let hb_sig = tx.dilithium_signature.as_deref().unwrap_or("");
+                            Self::verify_heartbeat_tx(node_id, *anchor_height, anchor_hash, hb_sig, microblock.height, storage, p2p)
                                 .await
                                 .map_err(|e| format!("invalid_heartbeat_tx: {}", e))?;
                         }
@@ -14795,14 +13532,12 @@ impl BlockchainNode {
     }
     
     
-    /// PRODUCTION v8.0: Parallel commitment TX pipeline (L1-level architecture)
     /// Two independent tasks run in parallel:
-    /// - Task 1: HeartbeatCommitment (lightweight, ~100ms per iteration)
-    /// - Task 2: BitmapTX (heavyweight, ~500ms+, independent height read + 3-block Gulf Stream)
-    /// Submission window: last 50 blocks before epoch end (e.g., blocks 14350-14399)
+    /// - Task 1: per-subwindow Heartbeat emission (spread by per-node offset; v35)
+    /// - Task 2: BitmapTX (Light-node eligibility bitmap, genesis-only, epoch-end window)
     async fn start_commitment_tx_loop(&self) {
         // ═══════════════════════════════════════════════════════════════════════════
-        // Task 1: HeartbeatCommitment Loop (lightweight, fast ~100ms)
+        // Task 1: Heartbeat emission loop (spread, unforgeable; tallied in heartbeat_slots)
         // ═══════════════════════════════════════════════════════════════════════════
         {
         let storage = self.storage.clone();
@@ -14811,18 +13546,13 @@ impl BlockchainNode {
         let mempool = self.mempool.clone();
         let node_id = self.node_id.clone();
         let node_type = self.node_type.clone();
-        let poh = self.poh.clone();
-        let heartbeat_tracker = self.heartbeat_commitment_tracker.clone();
         let is_running = self.is_running.clone();
-        
+
         tokio::spawn(async move {
             const EMISSION_BLOCK_INTERVAL: u64 = 14400;
-            const COMMITMENT_WINDOW_START: u64 = 50;
-            const RETRY_AFTER_BLOCKS: u64 = 10;
-            const MAX_RETRIES: u8 = 3;
-            
+
             if is_info() {
-                println!("[INFO][HEARTBEAT-LOOP] HeartbeatCommitment TX loop started (independent task)");
+                println!("[INFO][HEARTBEAT-LOOP] heartbeat emission loop started (spread, unforgeable)");
             }
 
             // v34: last (epoch, subwindow) for which this node emitted a Heartbeat TX (dedup).
@@ -14837,10 +13567,17 @@ impl BlockchainNode {
                 // super/genesis nodes. Anchored to a recent block hash so it cannot be pre-signed or
                 // backfilled (verified in validate_received_microblock). Replaces self-attested
                 // liveness with on-chain liveness tallied in Account.heartbeat_slots (popcount ≥ 9).
-                if !matches!(node_type, NodeType::Light) && current_height >= 2 {
+                // Skip while syncing/behind: a heartbeat anchored to our lagging local height would
+                // be stale at the network tip, and a producer including it would reject the block.
+                if !matches!(node_type, NodeType::Light) && current_height >= 2 && !coordinator_is_syncing() {
                     let hb_epoch = current_height / EMISSION_BLOCK_INTERVAL;
-                    let hb_subwindow = (current_height % EMISSION_BLOCK_INTERVAL) / 1440;
-                    if last_hb_subwindow != Some((hb_epoch, hb_subwindow)) {
+                    let pos = current_height % EMISSION_BLOCK_INTERVAL;
+                    let hb_subwindow = pos / 1440;
+                    // Emit at a per-node offset inside the subwindow, not at its boundary, so
+                    // 100k+ nodes spread (~70/block) instead of bursting in one block. Dedup
+                    // makes a late wake (pos already past offset) still emit once in-window.
+                    let hb_offset = Self::heartbeat_offset(&node_id, hb_subwindow);
+                    if last_hb_subwindow != Some((hb_epoch, hb_subwindow)) && (pos % 1440) >= hb_offset {
                         if let Some(hb_tx) = Self::create_heartbeat_tx_static(&storage, &node_id, current_height).await {
                             if let Ok(hb_bytes) = bincode::serialize(&hb_tx) {
                                 let hb_gp = hb_tx.gas_price;
@@ -14859,320 +13596,6 @@ impl BlockchainNode {
                     }
                 }
 
-                let blocks_until_epoch_end = EMISSION_BLOCK_INTERVAL - (current_height % EMISSION_BLOCK_INTERVAL);
-                let should_create_commitments = blocks_until_epoch_end <= COMMITMENT_WINDOW_START && blocks_until_epoch_end > 0;
-                
-                if !should_create_commitments {
-                    continue;
-                }
-                
-                let current_epoch = current_height / EMISSION_BLOCK_INTERVAL;
-                
-                if is_info() {
-                    println!("[INFO][HEARTBEAT-LOOP] Commitment window height={} epoch={} blocks_until_end={}", 
-                             current_height, current_epoch, blocks_until_epoch_end);
-                }
-                
-                // HeartbeatCommitment TX with confirmation tracking + retry
-                {
-                    // v2.96: Check if already sent AND confirmed, or needs retry
-                    let should_send = if let Some(status) = heartbeat_tracker.get(&current_epoch) {
-                        if status.is_confirmed() {
-                            // Already confirmed - skip
-                            if is_info() {
-                                println!("[INFO][HEARTBEAT-COMMITMENT] Already confirmed for epoch={} at block={}", 
-                                         current_epoch, status.confirmed_at_height.unwrap_or(0));
-                            }
-                            false
-                        } else {
-                            // Pending - check if retry needed
-                            let blocks_since_sent = current_height.saturating_sub(status.sent_at_height);
-                            if blocks_since_sent >= RETRY_AFTER_BLOCKS && status.retry_count < MAX_RETRIES {
-                                println!("[WARN][HEARTBEAT-COMMITMENT] TX not confirmed after {} blocks, retry #{} epoch={}", 
-                                         blocks_since_sent, status.retry_count + 1, current_epoch);
-                                true // Need retry
-                            } else if status.retry_count >= MAX_RETRIES {
-                                println!("[ERR][HEARTBEAT-COMMITMENT] Max retries ({}) reached for epoch={}", MAX_RETRIES, current_epoch);
-                                false
-                            } else {
-                                // Still waiting for confirmation
-                                false
-                            }
-                        }
-                    } else {
-                        // Not sent yet - send now
-                        true
-                    };
-                    
-                    if !should_send {
-                        // Skip - already handled above
-                    } else {
-                        if is_info() {
-                            println!("[INFO][HEARTBEAT-COMMITMENT] Creating TX for epoch={}", current_epoch);
-                        }
-                        
-                        if unified_p2p.is_none() {
-                            if is_warn() {
-                                println!("[WARN][HEARTBEAT-COMMITMENT] unified_p2p is None! Cannot create TX");
-                            }
-                        } else if let Some(ref p2p) = unified_p2p {
-                            match Self::create_heartbeat_commitment_tx_static(
-                                &storage,
-                                p2p,
-                                &node_id,
-                                current_epoch,
-                            ).await {
-                                Ok(tx) => {
-                                    if is_info() {
-                                        println!("[INFO][HEARTBEAT-COMMITMENT] TX created successfully epoch={} hash={}", 
-                                                 current_epoch, &tx.hash[..16]);
-                                    }
-                                    
-                                    match bincode::serialize(&tx) {
-                                        Ok(tx_bytes) => {
-                                            let gas_price = tx.gas_price;
-                                            if is_info() {
-                                                println!("[INFO][HEARTBEAT-COMMITMENT] TX serialized size={} bytes", tx_bytes.len());
-                                            }
-
-                                            // CRITICAL FIX v2.81: Clone tx_bytes for broadcast BEFORE adding to mempool
-                                            let tx_bytes_for_broadcast = tx_bytes.clone();
-
-                                            // Retry mempool cleanup: each retry makes a NEW
-                                            // TX (changed timestamp → new hash) but left
-                                            // prior attempts in the local mempool, so the
-                                            // next producer pulled both into one block
-                                            // (state check_duplicate_commitment rejected the
-                                            // second, but the bytes still cost space/bandwidth
-                                            // and showed as explorer dups — h=29731). Affects
-                                            // only the local mempool; all_tx_hashes still
-                                            // records every attempt for confirmation.
-                                            // Idempotent, O(retry_count ≤ 3).
-                                            let stale_hashes: Vec<String> = heartbeat_tracker
-                                                .get(&current_epoch)
-                                                .map(|e| e.all_tx_hashes.clone())
-                                                .unwrap_or_default();
-                                            if !stale_hashes.is_empty() {
-                                                mempool.batch_remove_transactions(&stale_hashes);
-                                                if is_info() {
-                                                    println!("[INFO][HEARTBEAT-COMMITMENT] mempool_cleanup epoch={} removed={} (pre-retry)",
-                                                             current_epoch, stale_hashes.len());
-                                                }
-                                            }
-
-                                            if mempool.add_binary_transaction(tx_bytes, tx.hash.clone(), gas_price) {
-                                                // v2.96: Track with HeartbeatCommitmentStatus (pending until confirmed)
-                                                let tx_hash_clone = tx.hash.clone();
-                                                if let Some(mut existing) = heartbeat_tracker.get_mut(&current_epoch) {
-                                                    // Retry case - increment counter, keep ALL hashes for confirmation check
-                                                    existing.increment_retry();
-                                                    existing.value_mut().sent_at_height = current_height;
-                                                    existing.value_mut().tx_hash = tx_hash_clone.clone();
-                                                    existing.value_mut().all_tx_hashes.push(tx_hash_clone.clone());
-                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX retry #{} submitted epoch={} hash={} total_hashes={}",
-                                                             existing.retry_count, current_epoch, &tx_hash_clone[..16], existing.all_tx_hashes.len());
-                                                } else {
-                                                    // First send
-                                                    heartbeat_tracker.insert(
-                                                        current_epoch, 
-                                                        HeartbeatCommitmentStatus::new(tx_hash_clone.clone(), current_height)
-                                                    );
-                                                    if is_info() {
-                                                        println!("[INFO][HEARTBEAT-COMMITMENT] TX submitted to mempool epoch={} hash={}", 
-                                                                 current_epoch, &tx_hash_clone[..16]);
-                                                    }
-                                                }
-                                                
-                                                // ═══════════════════════════════════════════════════════════════════
-                                                // v3.0 FIX: Deterministic producer forwarding (scalable Gulf Stream)
-                                                // ═══════════════════════════════════════════════════════════════════
-                                                // PROBLEM: Old code used current_producer_info which was stale (race condition)
-                                                // SOLUTION: Calculate producers for NEXT blocks using same deterministic algorithm
-                                                // SCALABILITY: O(1) via CACHED_PRODUCER_SELECTION, works with thousands of producers
-                                                // 
-                                                // CRITICAL: TX will be included in block (current_height + 1) or later
-                                                // Must send to producer of NEXT block, not current!
-                                                // Also handle rotation boundary: if next block is new round, send to both!
-                                                // ═══════════════════════════════════════════════════════════════════
-                                                
-                                                // Step 1: Determine producer for NEXT block (current_height + 1)
-                                                let next_height = current_height + 1;
-                                                // v3.1: Deterministic producer selection for Gulf Stream
-                                                let producer_next = Self::select_microblock_producer(
-                                                    next_height,
-                                                    &unified_p2p,
-                                                    &node_id,
-                                                    node_type.clone(),
-                                                    Some(&storage),
-                                                    &poh,
-                                                ).await;
-                                                
-                                                // Step 2: Check if we're near rotation boundary (next 2 blocks may have different producers)
-                                                let producer_next_plus_one = Self::select_microblock_producer(
-                                                    next_height + 1,
-                                                    &unified_p2p,
-                                                    &node_id,
-                                                    node_type.clone(),
-                                                    Some(&storage),
-                                                    &poh,
-                                                ).await;
-                                                
-                                                if is_info() {
-                                                    println!("[INFO][GULF-STREAM] HeartbeatCommitment selecting producers: next_h={} prod_next={} prod_next+1={}", 
-                                                             next_height, producer_next, producer_next_plus_one);
-                                                }
-                                                
-                                                // Step 3: Forward TX to producer(s) - handle rotation boundary
-                                                let mut forwarded_to_producer = false;
-                                                let mut sent_to: Vec<String> = Vec::new();
-                                                
-                                                // Forward to producer of next block
-                                                if !producer_next.is_empty() && producer_next != node_id {
-                                                    if let Some(producer_addr) = p2p.get_peer_addr_by_id(&producer_next) {
-                                                        let tx_msg = NetworkMessage::Transaction { 
-                                                            data: tx_bytes_for_broadcast.clone() 
-                                                        };
-                                                        // v2.94: Use ACK for critical TX - guarantees delivery confirmation
-                                                        match p2p.send_critical_tx_with_ack(&producer_addr, tx_msg).await {
-                                                            Ok(()) => {
-                                                                forwarded_to_producer = true;
-                                                                sent_to.push(producer_next.clone());
-                                                                if is_info() {
-                                                                    println!("[INFO][GULF-STREAM] HeartbeatCommitment TX ACK_CONFIRMED producer={}", 
-                                                                             producer_next);
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                println!("[WARN][GULF-STREAM] HeartbeatCommitment TX ACK_FAILED producer={} error={}", 
-                                                                         producer_next, e);
-                                                                // Will fall through to gossip backup
-                                                            }
-                                                        }
-                                                    } else {
-                                                        // CRITICAL: Producer address not found - TX won't be forwarded directly!
-                                                        println!("[WARN][GULF-STREAM] producer_addr_not_found producer={} - relying on gossip only!", 
-                                                                 producer_next);
-                                                    }
-                                                } else if producer_next == node_id {
-                                                    // We ARE the producer - TX already in our mempool
-                                                    if is_info() {
-                                                        println!("[INFO][GULF-STREAM] HeartbeatCommitment TX - WE are the producer, no forwarding needed");
-                                                    }
-                                                }
-                                                
-                                                // If rotation boundary (different producer for +2), also forward to that producer
-                                                if producer_next_plus_one != producer_next && 
-                                                   !producer_next_plus_one.is_empty() && 
-                                                   producer_next_plus_one != node_id {
-                                                    if let Some(producer_addr) = p2p.get_peer_addr_by_id(&producer_next_plus_one) {
-                                                        let tx_msg = NetworkMessage::Transaction { 
-                                                            data: tx_bytes_for_broadcast.clone() 
-                                                        };
-                                                        // v2.94: Use ACK for rotation boundary producer too
-                                                        if let Ok(()) = p2p.send_critical_tx_with_ack(&producer_addr, tx_msg).await {
-                                                            forwarded_to_producer = true;
-                                                            sent_to.push(producer_next_plus_one.clone());
-                                                            if is_info() {
-                                                                println!("[INFO][GULF-STREAM] HeartbeatCommitment TX ACK_CONFIRMED rotation_producer={}", 
-                                                                         producer_next_plus_one);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                
-                                                // v4.0: Emergency producer removed - BFT Timeout Protocol handles failover
-                                                // Producer selection is deterministic via certified_timeout_round
-                                                
-                                                if is_info() && forwarded_to_producer {
-                                                    println!("[INFO][HEARTBEAT-COMMITMENT] TX forwarded to producers={:?} next_h={}", 
-                                                             sent_to, next_height);
-                                                }
-                                                
-                                                // Step 3: Backup gossip (reliability - if producer fails or network issues)
-                                                if let Err(e) = p2p.broadcast_transaction(tx_bytes_for_broadcast) {
-                                                    if is_warn() {
-                                                        println!("[WARN][HEARTBEAT-COMMITMENT] Broadcast failed epoch={} error={}", 
-                                                                 current_epoch, e);
-                                                    }
-                                                } else {
-                                                    if is_info() {
-                                                        println!("[INFO][HEARTBEAT-COMMITMENT] TX broadcast to network epoch={} hash={} direct_fwd={}", 
-                                                                 current_epoch, &tx.hash[..16], forwarded_to_producer);
-                                                    }
-                                                }
-                                            } else {
-                                                if is_warn() {
-                                                    println!("[WARN][HEARTBEAT-COMMITMENT] Mempool rejected TX epoch={} hash={}", 
-                                                             current_epoch, &tx.hash[..16]);
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            if is_warn() {
-                                                println!("[WARN][HEARTBEAT-COMMITMENT] Failed to serialize TX epoch={} error={}", 
-                                                         current_epoch, e);
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    if is_warn() {
-                                        println!("[WARN][HEARTBEAT-COMMITMENT] Failed to create TX epoch={} error={:?}", 
-                                                 current_epoch, e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // ═══════════════════════════════════════════════════════════════════════════
-                // v2.96: CONFIRMATION CHECK - scan recent blocks for our HeartbeatCommitment TX
-                // ═══════════════════════════════════════════════════════════════════════════
-                {
-                    // Check pending (unconfirmed) commitments
-                    let pending_epochs: Vec<u64> = heartbeat_tracker.iter()
-                        .filter(|entry| !entry.value().is_confirmed())
-                        .map(|entry| *entry.key())
-                        .collect();
-                    
-                    for epoch in pending_epochs {
-                        if let Some(mut status) = heartbeat_tracker.get_mut(&epoch) {
-                            // Scan blocks from sent_at_height to current_height
-                            let scan_start = status.sent_at_height;
-                            let scan_end = current_height.min(scan_start + 20); // Scan up to 20 blocks
-                            
-                            for check_height in scan_start..=scan_end {
-                                if let Ok(Some(block_data)) = storage.load_microblock_auto_format(check_height) {
-                                    // Check if ANY of our TX hashes is in this block
-                                    for tx in &block_data.transactions {
-                                        if let qnet_state::TransactionType::HeartbeatCommitment { node_id: tx_node_id, .. } = &tx.tx_type {
-                                            if tx_node_id == &node_id && status.all_tx_hashes.contains(&tx.hash) {
-                                                // Found our TX! Mark as confirmed
-                                                status.mark_confirmed(check_height);
-                                                println!("[INFO][HEARTBEAT-COMMITMENT] TX CONFIRMED epoch={} block={} hash={}",
-                                                         epoch, check_height, &tx.hash[..16]);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if status.is_confirmed() { break; }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // v3.1: CRITICAL - Cleanup old epochs to prevent memory leak at scale
-                    if current_epoch > 10 {
-                        let min_epoch = current_epoch.saturating_sub(10);
-                        let before_len = heartbeat_tracker.len();
-                        heartbeat_tracker.retain(|epoch, _| *epoch >= min_epoch);
-                        let removed = before_len.saturating_sub(heartbeat_tracker.len());
-                        if removed > 0 && is_info() {
-                            println!("[INFO][HEARTBEAT] cleanup removed={} epochs min_epoch={}", removed, min_epoch);
-                        }
-                    }
-                }
             }
         });
         }
@@ -18555,11 +16978,14 @@ impl BlockchainNode {
                 }
 
                 // v9.8: Production gate — don't produce too far ahead of last finalized, else the
-                // producer diverges from BFT without confirmation. v2 2-chain finality trails the tip by
-                // ~1 in-progress window + 1 commit-lag window (~180); +270 (3 windows) absorbs one
-                // skipped/slow checkpoint round plus gossip propagation without throttling steady state.
+                // producer diverges from BFT without confirmation. v2 2-chain finality trails the tip
+                // by ~2 checkpoints (the in-progress checkpoint + the 2-chain commit-lag); +1 checkpoint
+                // of headroom absorbs one skipped/slow round + gossip without throttling steady state.
+                // DERIVED from CHECKPOINT_INTERVAL so the gate auto-tracks the finality cadence: at the
+                // 90 default this is 270 (3 windows, unchanged); with intra-window finality (e.g. K=30)
+                // it tightens to 90 — matching the faster finality instead of a stale fixed 270-block gap.
                 {
-                    const MAX_UNFINALIZED_BLOCKS: u64 = 270;
+                    const MAX_UNFINALIZED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
                     let last_finalized = LAST_FINALIZED_CONSENSUS_ROUND.load(Ordering::SeqCst);
                     if last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS {
                         if is_info() {
@@ -18578,7 +17004,7 @@ impl BlockchainNode {
                 // timeout_round=HIGHEST_CERTIFIED_ROUND[mb_idx]-baseline).
                 // timeout_round is 2f+1-certified, NEVER clock-derived → honest nodes
                 // compute the same leader (no dual-production split). O(1), same cost
-                // at 5 or 10000 nodes. Macroblock 2f+1 commit-reveal = finality.
+                // at 5 or 10000 nodes. Macroblock 2f+1 Checkpoint-BFT QC = finality.
                 let mb_idx = next_block_height / 90;
                 // v23.1: STRICT 2f+1 CERTIFIED-ONLY for producer selection.
                 // Calling `get_certified_rotation_round` (not
@@ -20373,6 +18799,22 @@ impl BlockchainNode {
                         .into_par_iter()
                         .filter_map(|(hash, tx_opt)| tx_opt.map(|tx| (hash, tx)))
                         .map(|(hash, tx)| {
+                            // v35: Heartbeat is a system TX (skip nonce/balance) but MUST carry a
+                            // fresh, real anchor or receivers' verify_heartbeat_tx rejects the whole
+                            // block (freeze). Gate at the production height (== inclusion height):
+                            // exclude a stale/forged-anchor heartbeat, never block the microblock.
+                            // Sig is already verified at mempool admission / self-signed. Mirrors
+                            // verify_heartbeat_tx: anchor past, ≤90 lag, hash == canonical chain hash.
+                            if let qnet_state::TransactionType::Heartbeat { anchor_height, anchor_hash, .. } = &tx.tx_type {
+                                const HB_ANCHOR_MAX_LAG: u64 = 90;
+                                let ah = *anchor_height;
+                                let ahash = anchor_hash.clone();
+                                let ok = tx.validate().is_ok()
+                                    && ah < next_block_height
+                                    && next_block_height - ah <= HB_ANCHOR_MAX_LAG
+                                    && matches!(storage.get_block_hash(ah), Ok(Some(h)) if h.eq_ignore_ascii_case(&ahash));
+                                return (hash, tx, ok, if ok { None } else { Some("heartbeat_stale_or_bad_anchor".to_string()) });
+                            }
                             let is_benchmark = benchmark_mode_enabled && tx.from.starts_with("EON1benchmark");
                             
                             // v2.66: System TX bypass nonce/balance validation (like submit_transaction)
@@ -20624,8 +19066,10 @@ impl BlockchainNode {
                     }
                     
                     // PRODUCTION QNet Consensus Integration
-                    // QNet uses CommitRevealConsensus + ShardedConsensusManager for Byzantine Fault Tolerance
-                    
+                    // Macroblock finality = Checkpoint-BFT v2 (2f+1 QC over each 90-block window,
+                    // committee-signed). Microblocks = single-leader, Dilithium3-signed, VRF rotation.
+                    // (Commit/reveal is removed; sharded-consensus primitives stay dormant at single-shard.)
+
                     // ARCHITECTURE: Unified consensus for ALL blocks (no special phases)
                     // - Microblocks: Quantum signatures (Dilithium3) + deterministic producer selection
                     // - Macroblocks (every 90): Byzantine consensus (BFT) for finalization
@@ -21016,7 +19460,7 @@ impl BlockchainNode {
                     // leader is replaced by the producer-loop's deterministic local fallback
                     // (consecutive-empty-slot counter) to the next eligible identity for the
                     // rest of the window — no votes/certs/aggregation at the microblock layer.
-                    // Finality is ONE tier up: macroblock commit-reveal (every 90) = 2f+1 BFT
+                    // Finality is ONE tier up: macroblock Checkpoint-BFT QC (every 90) = 2f+1 BFT
                     // finality + view-change (the canonical safety anchor; microblocks ride
                     // optimistically). Supersedes the v15.11 effective-round snapshot and the
                     // v15–v21 round-scatter/split-brain failure modes. O(1)/slot.
@@ -22500,12 +20944,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // This prevents duplicate consensus attempts and ensures ALL validators participate
                 // The consensus listener runs independently and checks if this node is a validator
                 
-                // Log consensus window for monitoring
+                // Monitoring only: we are in the last 30 blocks before a macroblock boundary.
+                // The Checkpoint-BFT consensus itself runs ONCE, at the boundary, in
+                // start_macroblock_consensus_listener — not here and not spread across 61-90
+                // (that span was the old commit/reveal window, now removed).
                 if blocks_since_trigger >= 61 && blocks_since_trigger <= 90 && !consensus_started {
                     if !is_synchronized {
                         println!("[WARN][MB] Node not synchronized - consensus handled by listener");
-                            } else {
-                        println!("[INFO][MB] h={} consensus_window=61-90", microblock_height);
+                    } else {
+                        println!("[INFO][MB] h={} approaching_macroblock_boundary", microblock_height);
                         consensus_started = true;
                     }
                 }
@@ -22741,7 +21188,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         _poh: &Option<Arc<crate::poh::PoH>>,
         timeout_round: u64,
     ) -> String {
-        // PRODUCTION v4.0: Dilithium3-VRF Secret Leader Election
+        // PRODUCTION: deterministic PUBLIC leader election — leader = hash(N-2 macroblock seed ‖ round) % N.
+        // NOT secret: the leader is publicly computable ~2 windows ahead. Liveness under targeting is
+        // covered by TimeoutCertificate failover, not by hiding the leader (see consensus design notes).
         // Each 30-block period uses VRF to elect producer from qualified candidates
         
         if let Some(p2p) = unified_p2p {
@@ -22899,7 +21348,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // This is IDENTICAL to emergency selection (line 6841) and macroblock consensus (line 7595)
             candidates.sort_by(|a, b| a.0.cmp(&b.0));  // Sort by node_id alphabetically
             
-            // PRODUCTION v4.0: Dilithium3-VRF Secret Leader Election
+            // PRODUCTION: deterministic PUBLIC leader election — leader = hash(N-2 macroblock seed ‖ round) % N.
+        // NOT secret: the leader is publicly computable ~2 windows ahead. Liveness under targeting is
+        // covered by TimeoutCertificate failover, not by hiding the leader (see consensus design notes).
             // Uses macroblock N-2 hash + leadership_round as VRF slot seed
             
             // Calculate deterministic entropy that ALL nodes will have (no waiting for blocks!)
@@ -24872,7 +23323,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // node stepped out silently and NO replacement fired — the round-robin
             // rotation was broken by this very check. Now the node attempts
             // creation; if it genuinely cannot produce (e.g. missing blocks in
-            // local storage), `trigger_macroblock_consensus` returns an Err, a
+            // local storage), the v2 checkpoint sealer returns an Err, a
             // view-change vote is emitted, HIGHEST_CERTIFIED_ROUND advances, and
             // the next `should_initiate_consensus` invocation from the listener
             // picks `(base_idx + view_round + 1) % N` — the next candidate — who
@@ -24891,7 +23342,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // P2P state raced (node A sees primary down → creates; node B sees it
         // up → waits → fork). Only the deterministically-selected initiator
         // returns true here; fallback happens via TIMEOUT in
-        // participate_in_macroblock_consensus (all nodes share the timeout →
+        // the v2 TimeoutCertificate view-change (all nodes share the timeout →
         // deterministic).
         
         // I'm participant (not initiator) - wait for macroblock via timeout
@@ -24902,10 +23353,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// 
     /// ARCHITECTURE:
     /// - Listens for block events (height changes)
-    /// - At blocks 61, 151, 241... (30 blocks before epoch end) triggers consensus
-    /// - Uses should_initiate_consensus() to deterministically select ONE Leader
-    /// - Leader calls trigger_macroblock_consensus() → creates and broadcasts MacroBlock
-    /// - Participants call participate_in_macroblock_consensus() → wait for Leader's MacroBlock
+    /// - At each 90-block window boundary, signals the Checkpoint-BFT v2 runtime
+    /// - Uses should_initiate_consensus() to deterministically select ONE proposer
+    /// - Proposer builds the Checkpoint; the committee's 2f+1 votes form the QC;
+    ///   the macroblock is sealed from the QC'd checkpoint and broadcast
+    /// - A silent proposer is replaced via a 2f+1 TimeoutCertificate (view change)
     /// 
     /// CRITICAL: Only ONE node (Leader) creates MacroBlock, others just validate and store!
     fn start_macroblock_consensus_listener(
@@ -24955,6 +23407,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
             
+            // Option B (intra-window finality): the highest CHECKPOINT_INTERVAL boundary already
+            // signalled this run. Lazily initialised to the last completed macroblock boundary on
+            // the first event so a restart does not re-emit historical windows. Dormant (never
+            // advanced) when CHECKPOINT_INTERVAL == 90, since no boundary is intra-window then.
+            let mut last_intra_signalled: u64 = 0;
             loop {
                 // EVENT-BASED OPTIMIZATION: Wait for block events instead of polling
                 // This replaces the 1-second polling loop with reactive events
@@ -24979,12 +23436,99 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         break;
                     }
                 };
-                // Check if we're in consensus window (blocks 61-90 of each round)
-                // CRITICAL FIX v2.26.9: Include block 90 (180, 270...) in window
-                // blocks_in_round = 90 % 90 = 0, but block 90 IS part of macroblock #1
+                // v35: trigger the macroblock consensus ONLY on the COMPLETE window (the
+                // macroblock boundary). The old "blocks 61-90" window was a commit-reveal
+                // artifact: two phases (commit→reveal) each needed propagation + a wait
+                // (~29 blocks total), so consensus had to start at block 61 to finish by 90.
+                // Commit-reveal is removed; v2 Checkpoint-BFT is a single 2f+1 QC over the
+                // FULL 90-block window (mb_hashes + head state_root + beacon), so the proposer
+                // CANNOT build the checkpoint until block 90 anyway. Starting at 61 only made
+                // it spin DA-repair waiting for the not-yet-produced tail (62-90) — wasted
+                // peer requests + alarming "window_repair" logs, zero benefit. Boundary-only:
+                // the window is already complete → build + 2f+1 + finalize, no tail-wait. The
+                // async consensus is spawned (non-blocking) so the listener still consumes the
+                // boundary event reliably; genuine DA loss is still repaired here (now only for
+                // truly-missing blocks, never future ones), and a missed boundary is backstopped
+                // by the periodic macroblock-gap sync.
                 let blocks_in_round = current_height % 90;
                 let is_macroblock_boundary = blocks_in_round == 0 && current_height > 0;
-                let is_in_consensus_window = blocks_in_round >= 61 || is_macroblock_boundary;
+                let is_in_consensus_window = is_macroblock_boundary;
+
+                // ── Option B: intra-window finality checkpoint ───────────────────────────────
+                // When CHECKPOINT_INTERVAL < MACROBLOCK_INTERVAL, a 2f+1 QC finalizes every K-block
+                // sub-window so finality runs faster than the macroblock cadence, while epoch /
+                // emission / committee rotation stay per-macroblock. The macroblock-boundary
+                // checkpoint is emitted by `is_in_consensus_window` below; this handles ONLY the
+                // K-boundaries strictly inside a window. DORMANT at CHECKPOINT_INTERVAL == 90.
+                {
+                    let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+                    let macro_i = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                    if k < macro_i && current_height > 0 {
+                        // Lazy init: on restart skip historical windows (the driver finalizes those
+                        // from synced macroblocks) — only drive the live window's intra-checkpoints.
+                        if last_intra_signalled == 0 { last_intra_signalled = (current_height / macro_i) * macro_i; }
+                        // Next un-signalled K-boundary, in order: the driver proposes checkpoints
+                        // contiguously, so a gap here would stall the window — emit one per event,
+                        // advancing only on confirmed-ready content (later events retry the same b).
+                        let b = ((last_intra_signalled / k) + 1) * k;
+                        if b > 0 && b <= current_height && b % macro_i != 0 {
+                            if let Some(ref p2p_ref) = p2p {
+                                let start = b - k + 1;
+                                let missing: Vec<u64> = (start..=b)
+                                    .filter(|&h| !matches!(storage.load_microblock_hash(h), Ok(Some(_))))
+                                    .collect();
+                                let head_ready = storage.load_microblock_auto_format(b).ok().flatten()
+                                    .map(|mb| mb.state_root != [0u8; 32]).unwrap_or(false);
+                                if missing.is_empty() && head_ready {
+                                    last_intra_signalled = b; // advance ONLY on confirmed-ready content
+                                    let cp_index = b / k;
+                                    let macro_window = ((b - 1) / macro_i) + 1; // epoch committee of the host window
+                                    let storage_cp = storage.clone();
+                                    let p2p_cp = p2p_ref.clone();
+                                    let node_id_cp = node_id.clone();
+                                    tokio::spawn(async move {
+                                        // Epoch committee — the SAME N-2 sample the macroblock uses (must match
+                                        // peers, else content_ok diverges and the checkpoint never reaches 2f+1).
+                                        let qualified = Self::calculate_qualified_candidates(
+                                            &p2p_cp, &node_id_cp, node_type, b).await;
+                                        let mut ids: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
+                                        ids.sort();
+                                        let committee = Self::select_consensus_committee(&ids, macro_window, &storage_cp);
+                                        if !committee.iter().any(|id| id == &node_id_cp) { return; } // not voting ⇒ don't emit
+                                        let mut h_vec: Vec<[u8; 32]> = Vec::new();
+                                        let mut v_vec: Vec<[u8; 32]> = Vec::new();
+                                        for h in start..=b {
+                                            match storage_cp.load_microblock_hash(h) { Ok(Some(x)) => h_vec.push(x), _ => return }
+                                            if let Ok(Some(mb)) = storage_cp.load_microblock_auto_format(h) {
+                                                if let Some(v) = mb.vrf_output { v_vec.push(v); }
+                                            }
+                                        }
+                                        let state_root = match storage_cp.load_microblock_auto_format(b) {
+                                            Ok(Some(mb)) if mb.state_root != [0u8; 32] => mb.state_root,
+                                            _ => return,
+                                        };
+                                        let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&v_vec);
+                                        // Empty eligible/banned: an intra-window checkpoint publishes NO epoch
+                                        // transition (only the macroblock-boundary checkpoint does).
+                                        crate::consensus_v2_node::signal_window_end(
+                                            cp_index, b, h_vec, state_root, beacon, committee, Vec::new(), Vec::new(),
+                                        );
+                                        if crate::node::is_info() {
+                                            println!("[INFO][BFT2] intra_checkpoint_signalled cp_index={} head={} k={}", cp_index, b, k);
+                                        }
+                                    });
+                                } else if !missing.is_empty() {
+                                    // Not ready — repair the holes (bounded) and defer; a later event
+                                    // retries this same boundary (last_intra_signalled unchanged).
+                                    let p2p_rep = p2p_ref.clone();
+                                    tokio::spawn(async move {
+                                        for h in missing.into_iter().take(32) { let _ = p2p_rep.request_block_repair(h).await; }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 
                 if is_in_consensus_window {
                     // Calculate which macroblock we're creating consensus for
@@ -25396,8 +23940,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             v.sort();
                                             v
                                         };
+                                        // index = checkpoint index = head/CHECKPOINT_INTERVAL (at K=90 this == mb_idx).
+                                        // The macroblock-boundary checkpoint carries the FULL window + epoch data;
+                                        // intra-window checkpoints (signalled separately) carry K-block sub-windows.
                                         crate::consensus_v2_node::signal_window_end(
-                                            mb_idx, end_height, mb_hashes, state_root, beacon, committee, eligible_bytes, banned_for_epoch,
+                                            end_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL,
+                                            end_height, mb_hashes, state_root, beacon, committee, eligible_bytes, banned_for_epoch,
                                         );
                                         return;
                                     }
@@ -25600,7 +24148,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     }
     
     
-    // PRODUCTION: Byzantine consensus methods for commit-reveal protocol
+    // PRODUCTION: Byzantine consensus methods for Checkpoint-BFT v2 (macroblock QC)
 
     /// v14.8: CANONICAL MACROBLOCK VIEW CHANGE.
     ///
@@ -27352,6 +25900,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             qnet_state::TransactionType::NodeActivation { .. } => {
                 format!("{}|{}|{}|{}|{}|{}|{}",
                     tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp)
+            }
+
+            // v35: Heartbeat carries ONE Dilithium sig (in dilithium_signature) over the anchor.
+            // Ingest verifies authorship + anchor-binding here; block validation adds the stateful
+            // anchor==chain-hash + recency check (verify_heartbeat_tx). Same string in all three.
+            qnet_state::TransactionType::Heartbeat { node_id, anchor_height, anchor_hash, .. } => {
+                format!("QNET_HEARTBEAT:{}:{}:{}", node_id, anchor_height, anchor_hash)
             }
 
             // === NODE-SIGNED SYSTEM TRANSACTIONS (signed with ephemeral Ed25519 + Dilithium) ===
@@ -31464,42 +30019,6 @@ mod tests {
         assert_eq!(BlockchainNode::account_heartbeat_count(&acct, 4), 7, "previous epoch → finalized count");
         assert_eq!(BlockchainNode::account_heartbeat_count(&acct, 3), 0, "older epoch → 0 (not eligible)");
         assert_eq!(BlockchainNode::account_heartbeat_count(&acct, 6), 0, "future epoch → 0");
-    }
-
-    // HBC onboarding fix: a new super-node enters the committee ONLY via Phase-2A, whose
-    // proximity gate requires a revealed heartbeat sample within SYNC_PROXIMITY_BLOCKS of the
-    // tip — i.e. the commitment-window (near-tip) heartbeat. Random sampling alone included it
-    // only ~1/n of the time → probabilistic ~per-epoch admission. select_heartbeat_sample_indices
-    // forces slot 0 to the near-tip so admission is deterministic from the first epoch, while
-    // keeping the sample COUNT (validator [min,max] gate) and the seeded-random spot-checks.
-    #[test]
-    fn heartbeat_sample_always_includes_near_tip() {
-        // 10 ascending heights ⇒ the near-tip (max) is index 9.
-        let heights: Vec<u64> = (0..10).map(|i| 1000 + i * 100).collect();
-        let seed = "deadbeefseed";
-        for size in 1..=3usize {
-            let idx = BlockchainNode::select_heartbeat_sample_indices(&heights, size, seed);
-            assert_eq!(idx.len(), size, "count stays = sample_size (validator size gate)");
-            assert_eq!(idx[0], 9, "slot 0 is ALWAYS the near-tip (max-height) heartbeat");
-            assert!(idx.iter().all(|&i| i < heights.len()), "indices in range");
-        }
-        // Near-tip = MAX height, independent of array order (not merely the last element).
-        let unsorted = vec![5000u64, 1000, 9000, 2000]; // max 9000 at index 2
-        assert_eq!(
-            BlockchainNode::select_heartbeat_sample_indices(&unsorted, 2, seed)[0], 2,
-            "near-tip is the max-height index regardless of order",
-        );
-        // Empty in ⇒ empty out (no panic).
-        assert!(BlockchainNode::select_heartbeat_sample_indices(&[], 2, seed).is_empty());
-        // Deterministic: same inputs ⇒ same indices on every node.
-        assert_eq!(
-            BlockchainNode::select_heartbeat_sample_indices(&heights, 3, seed),
-            BlockchainNode::select_heartbeat_sample_indices(&heights, 3, seed),
-        );
-        // Slot 0 (near-tip) is seed-independent — always the recency proof, whatever the seed.
-        let a = BlockchainNode::select_heartbeat_sample_indices(&heights, 3, "seed-A");
-        let b = BlockchainNode::select_heartbeat_sample_indices(&heights, 3, "seed-B");
-        assert_eq!(a[0], b[0], "near-tip slot is seed-independent");
     }
 
     // P1-D: the committee anchor (N-2) for v2 QC verification. The genesis boundary (index<3 → None)

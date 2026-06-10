@@ -7,7 +7,7 @@ QNet-Project/
 ├── Core Modules (Rust)
 │   ├── qnet-state/          # State management & accounts
 │   ├── qnet-mempool/        # Transaction pool
-│   ├── qnet-consensus/      # Commit-reveal consensus
+│   ├── qnet-consensus/      # Consensus: reputation, leader selection, sharding engine
 │   └── qnet-sharding/       # Advanced sharding (NEW)
 │
 ├── Network & API (Go)
@@ -59,7 +59,7 @@ qnet-network (Go) ←→ qnet-consensus (Rust)
 ## Key Files by Purpose
 
 ### Consensus Implementation
-- `qnet-consensus/src/commit_reveal.rs` - Core consensus logic
+- `qnet-consensus/src/commit_reveal.rs` - Sharding consensus engine (macroblock finality = Checkpoint-BFT, implemented in qnet-integration)
 - `qnet-consensus/src/reputation.rs` - Node reputation
 - `qnet-consensus/src/leader_selection.rs` - Leader selection
 
@@ -158,7 +158,7 @@ qnet-network (Go) ←→ qnet-consensus (Rust)
 - No leader rewards
 
 ### Consensus
-- Commit-reveal mechanism
-- 60s commit, 30s reveal
+- Checkpoint-BFT: single 2f+1 QC per 90-block window
+- No commit/reveal phases; finality at the window boundary
 - Reputation-based selection
 - Fork resolution by weight 

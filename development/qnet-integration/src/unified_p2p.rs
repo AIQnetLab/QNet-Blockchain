@@ -2307,14 +2307,6 @@ pub struct SimplifiedP2P {
     /// All Super nodes maintain identical registry for deterministic ping assignment
     light_node_registry: Arc<RwLock<HashMap<String, LightNodeRegistrationData>>>,
     
-    /// PRODUCTION: Heartbeat history for reward eligibility calculation
-    /// Key: "{node_id}:{heartbeat_index}", Value: HeartbeatRecord
-    /// Full nodes need 8/10, Super nodes need 9/10 heartbeats per 4h window
-    /// PRODUCTION v2.77: Local heartbeat storage for HeartbeatCommitment TX creation
-    /// Stores ONLY this node's own heartbeats (not received via gossip)
-    /// Used to build Merkle tree and create HeartbeatCommitment TX at epoch end
-    /// Scalable: Each node stores only 10 heartbeats per epoch (~1 KB)
-    heartbeat_history: Arc<RwLock<HashMap<String, HeartbeatRecord>>>,
     
     /// PRODUCTION: Storage reference for persistent heartbeat storage
     /// SCALABILITY: Each node stores ONLY its own heartbeats in RocksDB (10 records per 4h)
@@ -2322,7 +2314,6 @@ pub struct SimplifiedP2P {
     storage: Option<Arc<crate::storage::Storage>>,
     
     /// PRODUCTION: Last heartbeat cleanup timestamp (remove entries >24h)
-    last_heartbeat_cleanup: Arc<Mutex<u64>>,
     
     /// PRODUCTION: Light Node attestations for reward eligibility
     /// Key: "{light_node_id}:{slot}", Value: LightNodeAttestation
@@ -3229,9 +3220,7 @@ impl SimplifiedP2P {
             light_node_registry: Arc::new(RwLock::new(HashMap::new())),
             
             // PRODUCTION: Heartbeat history for reward eligibility
-            heartbeat_history: Arc::new(RwLock::new(HashMap::new())),
             storage: storage, // v2.76: Storage for persistent heartbeat storage
-            last_heartbeat_cleanup: Arc::new(Mutex::new(0)),
             
             // PRODUCTION: Light Node attestations for sharded ping system
             light_node_attestations: Arc::new(RwLock::new(HashMap::new())),
@@ -7693,7 +7682,6 @@ impl SimplifiedP2P {
     ///    - 5s timeout total with parallel queries
     /// 
     /// SECURITY v5.0: Heights from NetworkMessage::Block (Dilithium-signed) + HealthPing (Dilithium-signed)
-    /// NodeHeartbeat is ONLY for rewards
     /// ═══════════════════════════════════════════════════════════════════════════
     pub async fn check_block_exists_on_network(&self, block_height: u64) -> BlockExistenceResult {
         // ═══════════════════════════════════════════════════════════════════════════
@@ -9102,12 +9090,12 @@ impl SimplifiedP2P {
         Ok(consensus_height)
     }
     
-    /// Determine if node can participate in consensus validation (replaces single leader model)
-    /// QNet uses CommitReveal Byzantine consensus with multiple validators, not single leader
+    /// Determine if this node is the elected microblock producer for the current slot.
+    /// Microblocks use single-leader VRF rotation over the registered validator set;
+    /// macroblock finality is Checkpoint-BFT v2 (2f+1 QC), handled separately.
     pub fn should_be_leader(&self, node_id: &str) -> bool {
-        // PRODUCTION NOTE: This function name is kept for compatibility with existing code
-        // In full QNet production, this would be: can_participate_in_consensus()
-        // Real consensus uses CommitRevealConsensus with validator selection algorithm
+        // NOTE: name kept for call-site compatibility; semantically this is
+        // "am_i_the_elected_producer_now" — deterministic VRF producer selection.
         
         // PERFORMANCE FIX: Remove unnecessary connected_peers lock
         // All Byzantine safety checks use get_validated_active_peers() which has its own locking
@@ -12169,42 +12157,28 @@ impl SimplifiedP2P {
                 requester_id: node_id,
             };
             
-            // Send to first available peer via QUIC
-            // SCALABILITY: In production, could fan-out to multiple peers
-            for peer_addr in peers.iter().take(3) {  // Try up to 3 peers
+            // Repair fan-out: send to ALL selected holders, not the first to ack at the
+            // transport level. A transport ack only means the request was delivered — not
+            // that the peer served data (it may leader-shed or lack the range). Returning on
+            // first ack stranded a behind node on one unhelpful peer; the first DATA response
+            // now wins and duplicates are deduped on apply.
+            let mut sent = 0u32;
+            for peer_addr in peers.iter().take(3) {
                 let parts: Vec<&str> = peer_addr.split(':').collect();
                 if parts.len() != 2 { continue; }
-                
-                let ip = match parts[0].parse::<std::net::IpAddr>() {
-                    Ok(ip) => ip,
-                    Err(_) => continue,
-                };
-                let port = match parts[1].parse::<u16>() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                
-                let quic_port = port.saturating_add(QUIC_PORT_OFFSET);
-                let quic_addr = std::net::SocketAddr::new(ip, quic_port);
-                
+                let ip = match parts[0].parse::<std::net::IpAddr>() { Ok(ip) => ip, Err(_) => continue };
+                let port = match parts[1].parse::<u16>() { Ok(p) => p, Err(_) => continue };
+                let quic_addr = std::net::SocketAddr::new(ip, port.saturating_add(QUIC_PORT_OFFSET));
                 let transport = transport_arc.read().await;
                 match transport.broadcast_to(quic_addr, &request).await {
-                    Ok(_) => {
-                        // Request sent successfully - response will arrive async
-                        return;
-                    }
-                    Err(e) => {
-                        // Try next peer
-                        if crate::node::is_info() {
-                            println!("[WARN][SYNC] QUIC request to {} failed: {}",
-                                     get_privacy_id_for_addr(peer_addr), e);
-                        }
-                    }
+                    Ok(_) => { sent += 1; }
+                    Err(e) => if crate::node::is_warn() {
+                        println!("[WARN][SYNC] repair_send_fail peer={} err={}", get_privacy_id_for_addr(peer_addr), e);
+                    },
                 }
             }
-            
-            if crate::node::is_info() {
-                println!("[WARN][SYNC] Failed to send QUIC RequestBlocks to any peer");
+            if sent == 0 && crate::node::is_warn() {
+                println!("[WARN][SYNC] repair_send_none h={}-{}", from_height, to_height);
             }
         } else {
             // Fallback: No QUIC transport available
@@ -12272,18 +12246,6 @@ pub struct LightNodeRegistrationData {
 }
 
 fn default_true() -> bool { true }
-
-/// PRODUCTION: Heartbeat record for tracking node liveness
-/// Used for reward eligibility calculation (8/10 for Full, 9/10 for Super)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatRecord {
-    pub node_id: String,
-    pub timestamp: u64,
-    pub heartbeat_index: u8,          // 0-9 within 4h window
-    pub signature: String,
-    pub verified: bool,               // Signature verified
-    pub block_height: u64,            // v2.59: Block height when heartbeat was sent (for epoch filtering)
-}
 
 /// PRODUCTION: Light Node Attestation - proof that Light node responded to ping
 /// Created by pinger after receiving signed response from Light node
@@ -12845,18 +12807,6 @@ pub enum NetworkMessage {
         ping_pubkey: String,          // Dilithium3 ping pubkey (3904 hex) or legacy Ed25519 (64 hex)
         #[serde(default)]
         ping_delegation_cert: String, // Dilithium cert authorizing ping_pubkey
-    },
-    
-    /// PRODUCTION: Super node heartbeat for self-attestation
-    /// Nodes prove liveness by broadcasting signed heartbeats at deterministic times
-    NodeHeartbeat {
-        node_id: String,              // Node identifier
-        node_type: String,            // "super" (v3.18: Full removed)
-        timestamp: u64,               // Unix timestamp of heartbeat
-        block_height: u64,            // Current block height (informational)
-        signature: String,            // Dilithium signature proving key ownership
-        heartbeat_index: u8,          // Which of 10 heartbeats (0-9) in 4h window
-        gossip_hop: u8,               // Hop count for gossip TTL (max 3)
     },
     
     /// PRODUCTION: Request Light Node registry sync from peer
@@ -15376,17 +15326,6 @@ impl SimplifiedP2P {
                 self.gossip_to_random_peers(forward_msg, 3); // Forward to 3 random peers
             }
             
-            // DEPRECATED v2.77: NodeHeartbeat gossip messages are NO LONGER USED for rewards
-            // Heartbeats are now LOCAL ONLY and committed via HeartbeatCommitment TX
-            // This handler is kept for backward compatibility but does nothing
-            NetworkMessage::NodeHeartbeat { node_id, .. } => {
-                // v2.77: NodeHeartbeat gossip messages are NO LONGER USED for rewards
-                // Heartbeats are now LOCAL ONLY and committed via HeartbeatCommitment TX
-                if crate::node::is_debug() {
-                    println!("[WARN][P2P] Ignoring gossip heartbeat from {} (v2.77: using HeartbeatCommitment TX instead)", node_id);
-                }
-            }
-            
             // PRODUCTION: Light Node registry sync request
             NetworkMessage::LightNodeRegistryRequest { requester_id, last_sync_timestamp } => {
                 self.update_peer_last_seen(from_peer);
@@ -17341,298 +17280,6 @@ impl SimplifiedP2P {
         self.peer_id_to_addr.get(node_id).map(|r| r.value().clone())
     }
     
-    /// PRODUCTION: Start heartbeat service for Super nodes (TIME-based, not block-based)
-    /// This is called by the node on startup
-    /// v2.42.2: FIXED - Now uses tokio::spawn instead of std::thread for proper gossip!
-    /// Returns Arc<Self> for thread safety
-    /// 
-    /// CRITICAL: blockchain_height must be a clone of Arc that can be moved into async context
-    pub fn start_heartbeat_service_with_height(self: Arc<Self>, get_height: Arc<dyn Fn() -> u64 + Send + Sync>) {
-        let node_id = self.node_id.clone();
-        // v3.18: Full node type removed - only Light and Super remain
-        let node_type = match self.node_type {
-            NodeType::Super => "super",
-            NodeType::Light => return, // Light nodes don't send heartbeats
-        };
-        
-        let p2p = self.clone();
-        let node_type_str = node_type.to_string();
-        
-        // ═══════════════════════════════════════════════════════════════════════════
-        // CRITICAL FIX v2.42.2: Use tokio::spawn instead of std::thread::spawn!
-        // PROBLEM: std::thread has no tokio runtime, so send_network_message fails silently
-        // SOLUTION: Capture tokio Handle and spawn async task for proper QUIC gossip
-        // ═══════════════════════════════════════════════════════════════════════════
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => {
-                if crate::node::is_info() {
-                    println!("[ERR][P2P] No tokio runtime available - heartbeat service NOT started!");
-                }
-                return;
-            }
-        };
-        
-        handle.spawn(async move {
-            if crate::node::is_info() {
-                println!("[INFO][HEARTBEAT] service_started node={} type={} mode=height_based version=v2.79", 
-                         node_id, node_type_str);
-            }
-            
-            loop {
-                // PRODUCTION v2.79: Use block height instead of timestamp
-                let block_height = get_height();
-                let current_epoch = block_height / 14400;
-                
-                // Calculate deterministic heartbeat heights for this node
-                let heartbeat_heights = calculate_heartbeat_heights_for_node(&node_id, block_height);
-                
-                // PRODUCTION v2.80: Check if any heartbeat is due (expanded window for reliability)
-                // Window: target to target+10 blocks (prevents misses due to sleep timing)
-                for (index, target_height) in heartbeat_heights.iter().enumerate() {
-                    if block_height >= *target_height && block_height <= *target_height + 10 {
-                        // Check if we already sent this heartbeat for current epoch
-                        let heartbeat_key = format!("{}:{}:{}", node_id, index, current_epoch);
-                        let already_sent = {
-                            let history = p2p.heartbeat_history.read();
-                            history.contains_key(&heartbeat_key)
-                        };
-                        
-                        if !already_sent {
-                            // CRITICAL FIX v2.21.1: Check reputation >= 70% before sending heartbeat
-                            // Nodes with low reputation should NOT participate in reward pings (v2.21.5: blockchain)
-                            let our_reputation = p2p.get_node_reputation_from_blockchain(&node_id);
-                            if our_reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
-                                // Log once per epoch (first heartbeat only)
-                                if index == 0 && crate::node::is_warn() {
-                                    println!("[WARN][HEARTBEAT] skipping_low_reputation node={} reputation={:.1}% min=70.0%", 
-                                             node_id, our_reputation);
-                                }
-                                continue; // Skip this heartbeat slot
-                            }
-                            
-                            // Get current timestamp for signature and storage
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            
-                            // SECURITY v2.23: HYBRID signature for heartbeats (NIST/Cisco compliant)
-                            // CRITICAL: Dilithium signs ephemeral Ed25519 key for EVERY heartbeat
-                            // - Generates NEW ephemeral Ed25519 keypair
-                            // - Ed25519 signs: node_id || timestamp || block_height || heartbeat_index
-                            // - Dilithium signs: ephemeral_key || message_hash || timestamp
-                            // - Full quantum resistance for heartbeat integrity
-                            let heartbeat_message = format!("{}:{}:{}:{}", node_id, now, block_height, index);
-                            
-                            // v2.42.3: CRITICAL FIX - Use spawn_blocking for sign_heartbeat_dilithium!
-                            // sign_heartbeat_dilithium creates new Runtime::new() + block_on()
-                            // which PANICS if called from tokio::spawn context
-                            // spawn_blocking runs in separate thread pool - safe!
-                            let p2p_for_sign = p2p.clone();
-                            let message_for_sign = heartbeat_message.clone();
-                            let node_id_for_sign = node_id.clone();
-                            let signature = match tokio::task::spawn_blocking(move || {
-                                p2p_for_sign.sign_heartbeat_dilithium(&message_for_sign, &node_id_for_sign)
-                            }).await {
-                                Ok(Some(sig)) => sig,
-                                Ok(None) | Err(_) => {
-                                    if crate::node::is_warn() {
-                                        println!("[WARN][HEARTBEAT] signing_failed node={} index={} height={}", 
-                                                 node_id, index, block_height);
-                                    }
-                                    continue; // Skip this heartbeat if signing fails
-                                }
-                            };
-                            
-                            // PRODUCTION v2.77: Heartbeat is LOCAL ONLY - no gossip!
-                            // Heartbeats are recorded locally and later committed via HeartbeatCommitment TX
-                            // This approach:
- // Scales to 100M+ nodes (no gossip overhead)
- // Deterministic (no TTL=3 propagation issues)
- // Secure (Merkle proofs in blockchain TX)
- // Simple (no complex gossip logic)
-                            
-                            // Record locally in RAM (for HeartbeatCommitment TX creation)
-                            // v2.59: Include block_height for reliable epoch-based filtering
-                            {
-                                let mut history = p2p.heartbeat_history.write();
-                                history.insert(heartbeat_key.clone(), HeartbeatRecord {
-                                    node_id: node_id.clone(),
-                                    timestamp: now,
-                                    heartbeat_index: index as u8,
-                                    signature: signature.clone(),
-                                    verified: true,
-                                    block_height, // v2.59: Current height for epoch filtering
-                                });
-                            }
-                            
-                            // PRODUCTION v2.78: Save to RocksDB for HeartbeatCommitment TX with Dilithium signature
-                            if let Some(ref storage) = p2p.storage {
-                                if let Err(e) = storage.save_heartbeat(&node_id, index as u8, now, block_height, &signature) {
-                                    if crate::node::is_warn() {
-                                        println!("[WARN][HEARTBEAT] rocksdb_save_failed node={} index={} height={} error={}", 
-                                                 node_id, index, block_height, e);
-                                    }
-                                }
-                            }
-                            
-                            if crate::node::is_info() {
-                                println!("[INFO][HEARTBEAT] sent node={} index={} height={} target={} epoch={}", 
-                                         node_id, index, block_height, target_height, current_epoch);
-                            }
-                        }
-                    }
-                }
-                
-                // PRODUCTION v2.80: FALLBACK for missed heartbeats (late send 11-50 blocks)
-                // If main window missed the heartbeat due to timing issues, send it late
-                // Better late than never - ensures 9-10/10 heartbeats for eligibility
-                for (index, target_height) in heartbeat_heights.iter().enumerate() {
-                    // Check if we're in fallback window (11-50 blocks after target)
-                    if block_height > *target_height + 10 && block_height <= *target_height + 50 {
-                        let heartbeat_key = format!("{}:{}:{}", node_id, index, current_epoch);
-                        let already_sent = {
-                            let history = p2p.heartbeat_history.read();
-                            history.contains_key(&heartbeat_key)
-                        };
-                        
-                        if !already_sent {
-                            // Check reputation before late send
-                            let our_reputation = p2p.get_node_reputation_from_blockchain(&node_id);
-                            if our_reputation < qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION {
-                                continue; // Skip if low reputation
-                            }
-                            
-                            // Log late send for monitoring
-                            let delay_blocks = block_height - target_height;
-                            if crate::node::is_warn() {
-                                println!("[WARN][HEARTBEAT] fallback_send node={} index={} target={} current={} delay={}blocks", 
-                                         node_id, index, target_height, block_height, delay_blocks);
-                            }
-                            
-                            // Get current timestamp for signature and storage
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            
-                            // Sign heartbeat with Dilithium
-                            let heartbeat_message = format!("{}:{}:{}:{}", node_id, now, block_height, index);
-                            let p2p_for_sign = p2p.clone();
-                            let message_for_sign = heartbeat_message.clone();
-                            let node_id_for_sign = node_id.clone();
-                            let signature = match tokio::task::spawn_blocking(move || {
-                                p2p_for_sign.sign_heartbeat_dilithium(&message_for_sign, &node_id_for_sign)
-                            }).await {
-                                Ok(Some(sig)) => sig,
-                                Ok(None) | Err(_) => {
-                                    if crate::node::is_warn() {
-                                        println!("[WARN][HEARTBEAT] fallback_signing_failed node={} index={} height={}", 
-                                                 node_id, index, block_height);
-                                    }
-                                    continue;
-                                }
-                            };
-                            
-                            // Record locally in RAM
-                            {
-                                let mut history = p2p.heartbeat_history.write();
-                                history.insert(heartbeat_key.clone(), HeartbeatRecord {
-                                    node_id: node_id.clone(),
-                                    timestamp: now,
-                                    heartbeat_index: index as u8,
-                                    signature: signature.clone(),
-                                    verified: true,
-                                    block_height,
-                                });
-                            }
-                            
-                            // Save to RocksDB
-                            if let Some(ref storage) = p2p.storage {
-                                if let Err(e) = storage.save_heartbeat(&node_id, index as u8, now, block_height, &signature) {
-                                    if crate::node::is_warn() {
-                                        println!("[WARN][HEARTBEAT] fallback_rocksdb_save_failed node={} index={} error={}", 
-                                                 node_id, index, e);
-                                    }
-                                }
-                            }
-                            
-                            if crate::node::is_info() {
-                                println!("[INFO][HEARTBEAT] fallback_sent node={} index={} height={} target={} delay={}blocks epoch={}", 
-                                         node_id, index, block_height, target_height, delay_blocks, current_epoch);
-                            }
-                        }
-                    }
-                }
-                
-                // Cleanup old heartbeats (>24h)
-                p2p.cleanup_old_heartbeats();
-                
-                // PRODUCTION v2.79: Dynamic sleep interval based on proximity to next target
-                // Optimizes CPU usage while guaranteeing accurate heartbeat timing
-                let sleep_seconds = {
-                    // Find next target height
-                    let mut next_target: Option<u64> = None;
-                    for target_height in &heartbeat_heights {
-                        if *target_height > block_height {
-                            next_target = Some(*target_height);
-                            break;
-                        }
-                    }
-                    
-                    if let Some(target) = next_target {
-                        let blocks_until_target = target.saturating_sub(block_height);
-                        
-                        // PRODUCTION v2.80: Reduced sleep for better timing accuracy
-                        // Sleep 1s when close ensures we don't miss the 10-block window
-                        if blocks_until_target <= 10 {
-                            // CRITICAL: Close to target - check every second
-                            1
-                        } else if blocks_until_target <= 50 {
-                            // APPROACHING: Medium frequency
-                            5
-                        } else if blocks_until_target <= 100 {
-                            // NEAR: Check every 15 seconds
-                            15
-                        } else {
-                            // FAR: Check every 30 seconds
-                            30
-                        }
-                    } else {
-                        // All targets passed - sleep until next epoch
-                        let blocks_until_epoch_end = 14400 - (block_height % 14400);
-                        if blocks_until_epoch_end <= 50 {
-                            // In commitment window - check frequently
-                            5
-                        } else {
-                            // Far from epoch end - check rarely
-                            30
-                        }
-                    }
-                };
-                
-                if sleep_seconds >= 30 && crate::node::is_info() {
-                    if let Some(target) = heartbeat_heights.iter().find(|&&h| h > block_height) {
-                        if crate::node::is_info() {
-                            println!("[INFO][HEARTBEAT] idle node={} height={} next_target={} sleep={}s", 
-                                     node_id, block_height, target, sleep_seconds);
-                        }
-                    }
-                }
-                
-                tokio::time::sleep(tokio::time::Duration::from_secs(sleep_seconds)).await;
-            }
-        });
-    }
-    
-    /// Legacy wrapper for backwards compatibility
-    /// v2.42.2: Delegates to start_heartbeat_service_with_height
-    pub fn start_heartbeat_service(self: Arc<Self>, blockchain_height_fn: impl Fn() -> u64 + Send + Sync + 'static) {
-        let height_fn: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(blockchain_height_fn);
-        self.start_heartbeat_service_with_height(height_fn);
-    }
-    
     /// Sign P2P message with HYBRID cryptography (ASYNC version) - NIST/Cisco compliant
     /// PRODUCTION: Use this in async contexts (warp handlers, tokio tasks)
     /// CRITICAL: Generates NEW ephemeral Ed25519 key for EACH message per NIST/Cisco
@@ -17794,254 +17441,6 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Cleanup heartbeat records older than 24 hours
-    pub fn cleanup_old_heartbeats(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        // Only cleanup once per hour
-        {
-            let mut last_cleanup = self.last_heartbeat_cleanup.lock();
-            if now - *last_cleanup < 3600 {
-                return;
-            }
-            *last_cleanup = now;
-        }
-        
-        let cutoff = now - (24 * 60 * 60); // 24 hours ago
-        let mut removed = 0;
-        
-        {
-            let mut history = self.heartbeat_history.write();
-            history.retain(|_, record| {
-                if record.timestamp < cutoff {
-                    removed += 1;
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-        
-        if removed > 0 {
-            if crate::node::is_info() {
-                println!("[INFO][P2P] Cleaned up {} old heartbeat records", removed);
-            }
-        }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════════════════
-    // v2.41.0: DETERMINISTIC HEARTBEAT COLLECTION FOR MACROBLOCK
-    // Collects heartbeat summaries for on-chain recording instead of gossip
-    // Ensures all nodes see identical heartbeat data = deterministic rewards
-    // ═══════════════════════════════════════════════════════════════════════════════
-    
-    /// Get heartbeat summaries for MacroBlock inclusion
-    /// Called during MacroBlock creation to record heartbeats on-chain
-    /// Returns Vec<HeartbeatSummary> for all nodes that sent heartbeats in completed epoch
-    /// 
-    /// CRITICAL FIX v2.59: Use block_height for 100% reliable epoch filtering
-    /// Previously used timestamp-based 4h windows which failed when:
-    /// - Network didn't start on 4h UTC boundary
-    /// - Clock drift between nodes
-    /// - Emission delayed across window boundaries
-    /// 
-    /// Now uses block_height stored in HeartbeatRecord for deterministic filtering:
-    /// - epoch_start_height = 14400 → heartbeats from blocks 0-14399
-    /// - epoch_start_height = 28800 → heartbeats from blocks 14400-28799
-    pub fn get_heartbeat_summaries_for_macroblock(&self, consensus_start_height: u64) -> Vec<qnet_state::HeartbeatSummary> {
-        const BLOCKS_PER_EPOCH: u64 = 14400;    // 1 block per second, 4 hours
-        
-        // FIX v2.65: Calculate correct epoch boundaries based on ANY height within the epoch
-        // The caller passes consensus_start_height (e.g., 14311 for mb=160)
-        // We need to find the EPOCH that this height belongs to:
-        // - height 14311 belongs to epoch 1 (blocks 0-14399)
-        // - height 28711 belongs to epoch 2 (blocks 14400-28799)
-        let epoch_number = (consensus_start_height / BLOCKS_PER_EPOCH) + 1;  // 1-based
-        let window_end_height = epoch_number * BLOCKS_PER_EPOCH;  // 14400, 28800, etc.
-        let window_start_height = window_end_height.saturating_sub(BLOCKS_PER_EPOCH);  // 0, 14400, etc.
-        
-        if crate::node::is_info() {
-            println!("[INFO][HEARTBEAT] epoch_window epoch={} blocks={}-{} input_h={} (v2.65 fix)", 
-                     epoch_number, window_start_height, window_end_height, consensus_start_height);
-        }
-        
-        // Group heartbeats by node_id
-        let mut node_heartbeats: std::collections::HashMap<String, Vec<&HeartbeatRecord>> = 
-            std::collections::HashMap::new();
-        
-        // CRITICAL: Read from RAM (heartbeat_history) which contains ALL nodes' heartbeats via gossip
-        // This is the CORRECT approach - gossip ensures all nodes receive heartbeats
-        let history = self.heartbeat_history.read();
-        
-        for (_, record) in history.iter() {
-            // CRITICAL FIX v2.59: Filter by block_height instead of timestamp
-            // This is 100% deterministic and doesn't depend on:
-            // - Network start time alignment with UTC
-            // - Clock synchronization between nodes
-            // - Emission timing relative to window boundaries
-            // 
-            // CRITICAL FIX v2.76: Changed < to <= for window_end_height
-            // Emission blocks (14400, 28800, etc.) must be INCLUDED in the heartbeat window
-            // Previously: block < 86400 excluded block 86400 (emission block)
-            // Now: block <= 86400 includes block 86400 (correct!)
-            if record.block_height >= window_start_height 
-                && record.block_height <= window_end_height 
-                && record.verified 
-            {
-                node_heartbeats
-                    .entry(record.node_id.clone())
-                    .or_insert_with(Vec::new)
-                    .push(record);
-            }
-        }
-        
-        // Log heartbeat collection stats
-        let total_heartbeats: usize = node_heartbeats.values().map(|v| v.len()).sum();
-        if crate::node::is_info() {
-            println!("[INFO][HEARTBEAT] collected nodes={} heartbeats={} epoch={} range={}-{}", 
-                     node_heartbeats.len(), total_heartbeats, epoch_number,
-                     window_start_height, window_end_height);
-        }
-        
-        // Create summaries
-        let mut summaries = Vec::new();
-        
-        for (node_id, heartbeats) in node_heartbeats {
-            // ═══════════════════════════════════════════════════════════════════════════
-            // PRODUCTION: Strict node type detection - NO DEFAULTS!
-            // Node IDs MUST follow naming conventions:
-            // - "light_{region}_{hash}" for Light nodes (mobile apps)
-            // - "super_{id}" or "genesis_node_{N}" for Super nodes (full validators)
-            // v3.18: Full nodes removed - "full_" prefix ignored
-            // Unknown formats are REJECTED (not counted for rewards)
-            // ═══════════════════════════════════════════════════════════════════════════
-            let node_type: Option<u8> = if node_id.starts_with("light_") {
-                Some(0) // Light node - mobile app
-            } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
-                Some(2) // Super node - full validator
-            } else if node_id.starts_with("full_") {
-                // v3.18: Full nodes removed - reject old format
-                if crate::node::is_warn() {
-                    println!("[WARN][HEARTBEAT] rejected_full_node_format id={} action=skip_rewards", node_id);
-                }
-                None // Skip this node - Full node type removed
-            } else {
-                // PRODUCTION: Unknown format - REJECT, don't guess!
-                // Node must re-register with correct ID format
-                if crate::node::is_warn() {
-                    println!("[WARN][HEARTBEAT] rejected_unknown_format id={} action=skip_rewards", node_id);
-                }
-                None // Skip this node - invalid format
-            };
-            
-            // Skip nodes with invalid ID format
-            let node_type = match node_type {
-                Some(t) => t,
-                None => continue, // Skip to next node - no rewards for invalid format
-            };
-            
-            let heartbeat_count = heartbeats.len() as u8;
-            
-            // PRODUCTION: Eligibility thresholds per node type
-            // Light nodes: 1 ping per 4h window (100% - single ping must succeed)
-            // Full nodes: 8/10 heartbeats (80% - allows 2 failures per window)
-            // Super nodes: 9/10 heartbeats (90% - stricter, only 1 failure allowed)
-            let required: u8 = match node_type {
-                0 => 1,  // Light: 1/1 (100%)
-                1 => 8,  // Full: 8/10 (80%)
-                2 => 9,  // Super: 9/10 (90%)
-                // Note: node_type is 0, 1, or 2 only - no other values possible
-                // This arm is unreachable but required for exhaustive match
-                3..=u8::MAX => unreachable!("node_type validated above"),
-            };
-            let is_eligible = heartbeat_count >= required;
-            
-            // Get first and last timestamps
-            let first_heartbeat = heartbeats.iter()
-                .map(|h| h.timestamp)
-                .min()
-                .unwrap_or(0);
-            let last_heartbeat = heartbeats.iter()
-                .map(|h| h.timestamp)
-                .max()
-                .unwrap_or(0);
-            
-            summaries.push(qnet_state::HeartbeatSummary {
-                node_id: node_id.clone(),
-                node_type,
-                heartbeat_count,
-                first_heartbeat,
-                last_heartbeat,
-                is_eligible,
-            });
-        }
-        
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v2.59: LIGHT NODES - Collect from attestations (separate storage)
-        // Light nodes don't send heartbeats themselves; Super nodes ping them
-        // and create attestations. Attestations are stored in light_node_attestations.
-        // Light nodes need only 1 attestation per epoch to be eligible for rewards.
-        // ═══════════════════════════════════════════════════════════════════════════
-        {
-            let attestations = self.light_node_attestations.read();
-            
-            // Group attestations by light_node_id, filtered by block_height
-            let mut light_node_attestations_map: std::collections::HashMap<String, Vec<u64>> = 
-                std::collections::HashMap::new();
-            
-            for (_, attestation) in attestations.iter() {
-                // v2.59: Filter by block_height for reliable epoch matching
-                if attestation.block_height >= window_start_height 
-                    && attestation.block_height < window_end_height 
-                {
-                    light_node_attestations_map
-                        .entry(attestation.light_node_id.clone())
-                        .or_insert_with(Vec::new)
-                        .push(attestation.timestamp);
-                }
-            }
-            
-            // Create summaries for Light nodes
-            for (light_node_id, timestamps) in light_node_attestations_map {
-                let attestation_count = timestamps.len() as u8;
-                // Light nodes: 1 attestation per epoch = eligible (100%)
-                let is_eligible = attestation_count >= 1;
-                
-                let first_heartbeat = timestamps.iter().min().copied().unwrap_or(0);
-                let last_heartbeat = timestamps.iter().max().copied().unwrap_or(0);
-                
-                summaries.push(qnet_state::HeartbeatSummary {
-                    node_id: light_node_id,
-                    node_type: 0, // Light node
-                    heartbeat_count: attestation_count,
-                    first_heartbeat,
-                    last_heartbeat,
-                    is_eligible,
-                });
-            }
-            
-            let light_count = summaries.iter().filter(|s| s.node_type == 0).count();
-            if light_count > 0 {
-                if crate::node::is_info() {
-                    println!("[INFO][HEARTBEAT] light_nodes_collected count={} for_epoch={}", 
-                             light_count, epoch_number);
-                }
-            }
-        }
-        
-        if crate::node::is_info() {
-            println!("[INFO][HEARTBEAT] collected_for_macroblock total={} eligible={} (full_super={} light={})", 
-                     summaries.len(),
-                     summaries.iter().filter(|s| s.is_eligible).count(),
-                     summaries.iter().filter(|s| s.node_type != 0).count(),
-                     summaries.iter().filter(|s| s.node_type == 0).count());
-        }
-        
-        summaries
-    }
     
     /// Calculate Merkle root of heartbeat summaries for light client verification
     pub fn calculate_heartbeats_merkle_root(&self, summaries: &[qnet_state::HeartbeatSummary]) -> [u8; 32] {
@@ -18086,119 +17485,6 @@ impl SimplifiedP2P {
         }
         
         leaves[0]
-    }
-    
-    /// PRODUCTION v2.77: Compute Merkle root for node's own heartbeats (for HeartbeatCommitment TX)
-    /// Called before epoch end to create commitment transaction
-    /// 
-    /// Arguments:
-    /// - node_id: Node creating commitment
-    /// - window_start_height: Start of epoch (e.g., 0, 14400)
-    /// - window_end_height: End of epoch (e.g., 14400, 28800)
-    /// 
-    /// Returns: (merkle_root_hex, heartbeat_data, sample_indices)
-    /// - merkle_root_hex: 64-char hex string of Merkle root
-    /// - heartbeat_data: Vec of (index, timestamp, block_height, signature, hash)
-    /// - sample_indices: Deterministic sample indices (20-30% of heartbeats)
-    pub fn compute_heartbeat_merkle_root_for_commitment(
-        &self,
-        node_id: &str,
-        window_start_height: u64,
-        window_end_height: u64,
-    ) -> Result<(String, Vec<(u8, u64, u64, String, String)>, Vec<usize>), String> {
-        use blake3::Hasher;
-        
-        // Collect node's own heartbeats from RAM
-        let history = self.heartbeat_history.read();
-        
-        // Filter heartbeats for this epoch and this node
-        let mut node_heartbeats: Vec<_> = history.iter()
-            .filter_map(|(_, record)| {
-                if record.node_id == node_id 
-                    && record.block_height >= window_start_height 
-                    && record.block_height <= window_end_height 
-                    && record.verified {
-                    Some((
-                        record.heartbeat_index,
-                        record.timestamp,
-                        record.block_height,
-                        record.signature.clone(),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        
-        // Sort by heartbeat_index for deterministic ordering
-        node_heartbeats.sort_by_key(|h| h.0);
-        
-        if node_heartbeats.is_empty() {
-            // No heartbeats - return empty commitment
-            return Ok((
-                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-                Vec::new(),
-                Vec::new(),
-            ));
-        }
-        
-        // Create heartbeat hashes using blake3 (fast, quantum-resistant)
-        let mut heartbeat_data: Vec<(u8, u64, u64, String, String)> = Vec::new();
-        let mut hashes: Vec<String> = Vec::new();
-        
-        for (index, timestamp, block_height, signature) in node_heartbeats {
-            // Hash: blake3(node_id || heartbeat_index || timestamp || block_height || signature)
-            let mut hasher = Hasher::new();
-            hasher.update(node_id.as_bytes());
-            hasher.update(&[index]);
-            hasher.update(&timestamp.to_le_bytes());
-            hasher.update(&block_height.to_le_bytes());
-            hasher.update(signature.as_bytes());
-            let hash = hasher.finalize();
-            let hash_hex = hash.to_hex().to_string();
-            
-            heartbeat_data.push((index, timestamp, block_height, signature, hash_hex.clone()));
-            hashes.push(hash_hex);
-        }
-        
-        // Compute Merkle root using qnet_core::crypto::merkle
-        let merkle_root = qnet_core::crypto::merkle::compute_merkle_root(&hashes)
-            .map_err(|e| format!("Failed to compute Merkle root: {}", e))?;
-        
-        // Deterministic sampling: 20-30% of heartbeats (minimum 1)
-        let sample_count = ((heartbeat_data.len() * 25) / 100).max(1).min(heartbeat_data.len());
-        
-        // Use SHA3-256 for deterministic sample selection
-        use sha3::{Sha3_256, Digest};
-        let mut seed_hasher = Sha3_256::new();
-        seed_hasher.update(b"QNet_Heartbeat_Sampling_v1");
-        seed_hasher.update(node_id.as_bytes());
-        seed_hasher.update(&window_start_height.to_le_bytes());
-        let sample_seed = seed_hasher.finalize();
-        
-        let mut sample_indices = Vec::new();
-        for i in 0..sample_count {
-            let mut index_hasher = Sha3_256::new();
-            index_hasher.update(&sample_seed);
-            index_hasher.update(&(i as u32).to_le_bytes());
-            let hash = index_hasher.finalize();
-            let index = (u64::from_le_bytes([
-                hash[0], hash[1], hash[2], hash[3],
-                hash[4], hash[5], hash[6], hash[7],
-            ]) as usize) % heartbeat_data.len();
-            if !sample_indices.contains(&index) {
-                sample_indices.push(index);
-            }
-        }
-        
-        sample_indices.sort();
-        
-        if crate::node::is_info() {
-            println!("[INFO][HEARTBEAT-COMMITMENT] computed_merkle node={} hb_count={} samples={} root={}",
-                     node_id, heartbeat_data.len(), sample_indices.len(), &merkle_root[..16]);
-        }
-        
-        Ok((merkle_root, heartbeat_data, sample_indices))
     }
     
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -18388,41 +17674,6 @@ impl SimplifiedP2P {
         if crate::node::is_info() {
             println!("[INFO][SYNC] Requested Light node registry sync (since {})", last_sync);
         }
-    }
-    
-    /// Check heartbeat eligibility for reward calculation
-    /// Returns (successful_count, required_count, is_eligible)
-    pub fn check_heartbeat_eligibility(&self, node_id: &str, node_type: &str) -> (u8, u8, bool) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        let current_4h_window = now - (now % (4 * 60 * 60));
-        
-        // Count successful heartbeats in current 4h window
-        let mut count = 0u8;
-        {
-            let history = self.heartbeat_history.read();
-            for i in 0..10 {
-                let key = format!("{}:{}", node_id, i);
-                if let Some(record) = history.get(&key) {
-                    let record_4h = record.timestamp - (record.timestamp % (4 * 60 * 60));
-                    if record_4h == current_4h_window && record.verified {
-                        count += 1;
-                    }
-                }
-            }
-        }
-        
-        // Required count per whitepaper
-        // v3.18: Full nodes removed
-        let required = match node_type {
-            "super" => 9,  // 90% = 9/10
-            _ => 10,       // Light nodes: 100% (but they don't use heartbeats)
-        };
-        
-        (count, required, count >= required)
     }
     
     // ========================================================================
@@ -19346,97 +18597,6 @@ impl SimplifiedP2P {
         });
     }
     
-    /// Get all Super node heartbeats for a 4h window (for Merkle commitment)
-    /// Returns Vec<(node_id, heartbeat_index, timestamp)>
-    /// DEPRECATED: Use get_heartbeats_for_block_range for deterministic emission
-    pub fn get_heartbeats_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u8, u64)> {
-        let window_end = window_start_timestamp + (4 * 60 * 60);
-        
-        let heartbeats = self.heartbeat_history.read();
-        heartbeats.values()
-            .filter(|h| h.timestamp >= window_start_timestamp && h.timestamp < window_end)
-            .map(|h| (h.node_id.clone(), h.heartbeat_index, h.timestamp))
-            .collect()
-    }
-    
-    /// v2.64: Get heartbeats filtered by BLOCK HEIGHT (deterministic!)
-    /// This ensures all nodes see the same heartbeats regardless of when they process the emission
-    /// Block height epoch is deterministic, unlike UTC timestamps which depend on network start time
-    pub fn get_heartbeats_for_block_range(&self, start_height: u64, end_height: u64) -> Vec<(String, u8, u64, u64)> {
-        let heartbeats = self.heartbeat_history.read();
-        
-        let result: Vec<_> = heartbeats.values()
-            .filter(|h| h.block_height >= start_height && h.block_height < end_height && h.verified)
-            .map(|h| (h.node_id.clone(), h.heartbeat_index, h.timestamp, h.block_height))
-            .collect();
-        
-        if crate::node::is_info() {
-            println!("[INFO][HEARTBEAT] block_range_filter start={} end={} found={}", 
-                     start_height, end_height, result.len());
-        }
-        
-        result
-    }
-    
-    /// v2.64: Get eligible Super nodes filtered by BLOCK HEIGHT
-    /// Returns Vec<(node_id, node_type, heartbeat_count)>
-    pub fn get_eligible_full_super_nodes_by_height(&self, start_height: u64, end_height: u64) -> Vec<(String, String, u8)> {
-        let heartbeats = self.get_heartbeats_for_block_range(start_height, end_height);
-        
-        // Count heartbeats per node
-        let mut counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
-        
-        for (node_id, _, _, _) in heartbeats {
-            *counts.entry(node_id).or_insert(0) += 1;
-        }
-        
-        // Get node types and filter by eligibility
-        use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
-        
-        counts.into_iter()
-            .filter_map(|(node_id, count)| {
-                // Get node type
-                let node_type = if let Some(n) = self.active_full_super_nodes.get(&node_id) {
-                    n.value().node_type.clone()
-                } else if node_id.starts_with("genesis_node_") {
-                    "super".to_string()
-                } else {
-                    if crate::node::is_warn() {
-                        println!("[WARN][REWARDS] unknown_node id={} skipping", node_id);
-                    }
-                    return None;
-                };
-                
-                // Check reputation
-                let reputation = self.get_node_reputation_from_blockchain(&node_id);
-                if reputation < MIN_CONSENSUS_REPUTATION {
-                    if crate::node::is_warn() {
-                        println!("[WARN][REWARDS] low_rep node={} rep={:.1}% min={:.0}%", 
-                                 node_id, reputation, MIN_CONSENSUS_REPUTATION);
-                    }
-                    return None;
-                }
-                
-                // Check eligibility threshold (case-insensitive)
-                // v3.18: Full nodes removed
-                let required = match node_type.to_lowercase().as_str() {
-                    "super" => 9,
-                    _ => 10, // Ignore "full"
-                };
-                
-                if count >= required {
-                    Some((node_id, node_type, count))
-                } else {
-                    if crate::node::is_info() {
-                        println!("[INFO][REWARDS] not_eligible node={} count={} required={}", 
-                                 node_id, count, required);
-                    }
-                    None
-                }
-            })
-            .collect()
-    }
-    
     /// Get eligible Light nodes for rewards in current window
     /// Returns Vec<(node_id, wallet_address)> for nodes with at least 1 attestation
     /// DEPRECATED: Use get_eligible_light_nodes_by_height for deterministic emission
@@ -19483,135 +18643,11 @@ impl SimplifiedP2P {
         eligible
     }
     
-    /// Get eligible Super nodes for rewards in current window
-    /// Returns Vec<(node_id, node_type, heartbeat_count)>
-    /// CRITICAL: Only nodes with reputation >= 70% are eligible for QNC rewards!
-    /// DEPRECATED: Use get_eligible_full_super_nodes_by_height for deterministic emission
-    pub fn get_eligible_full_super_nodes(&self, window_start_timestamp: u64) -> Vec<(String, String, u8)> {
-        let heartbeats = self.get_heartbeats_for_window(window_start_timestamp);
-        
-        // Count heartbeats per node
-        let mut counts: std::collections::HashMap<String, (String, u8)> = std::collections::HashMap::new();
-        
-        for (node_id, _, _) in heartbeats {
-            // v3.18: Full nodes removed - default to "super" for backward compatibility
-            let entry = counts.entry(node_id.clone()).or_insert(("super".to_string(), 0));
-            entry.1 += 1;
-        }
-        
-        // Get node types from active_full_super_nodes (v2.51: lock-free via DashMap)
-        
-        counts.into_iter()
-            .filter_map(|(node_id, (_, count))| {
-                // PRODUCTION v2.41.1: Strict node type - NO DEFAULTS!
-                // Node must be in active registry OR be a genesis node
-                let node_type = if let Some(n) = self.active_full_super_nodes.get(&node_id) {
-                    n.value().node_type.clone()
-                } else if node_id.starts_with("genesis_node_") {
-                    // Genesis nodes are always Super
-                    "super".to_string()
-                } else {
-                    // Unknown node - REJECT (shouldn't happen if heartbeat validation works)
-                    if crate::node::is_info() {
-                        println!("[WARN][P2P] Unknown node {} in heartbeat history - skipping", node_id);
-                    }
-                    return None;
-                };
-                Some((node_id, node_type, count))
-            })
-            .filter(|(node_id, node_type, count)| {
-                // CRITICAL FIX v2.21.1: Check reputation >= MIN_CONSENSUS_REPUTATION for QNC rewards!
-                // Nodes with low reputation should NOT receive monetary rewards (v2.21.5: blockchain)
-                use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
-                let reputation = self.get_node_reputation_from_blockchain(node_id);
-                if reputation < MIN_CONSENSUS_REPUTATION {
-                    if crate::node::is_info() {
-                        println!("[WARN][P2P] Node {} excluded from rewards: reputation {:.1}% < {:.0}%",
-                                 node_id, reputation, MIN_CONSENSUS_REPUTATION);
-                    }
-                    return false;
-                }
-                
-                // Filter by eligibility: Full >= 8/10, Super >= 9/10 (case-insensitive)
-                // v3.18: Full nodes removed
-                match node_type.to_lowercase().as_str() {
-                    "super" => *count >= 9,
-                    _ => false, // Ignore "full"
-                }
-            })
-            .collect()
-    }
-    
-    /// Get total counts for Merkle commitment
-    /// DEPRECATED: Use block height based methods for deterministic counting
-    pub fn get_ping_counts_for_window(&self, window_start_timestamp: u64) -> (u64, u64) {
-        let attestations = self.get_attestations_for_window(window_start_timestamp);
-        let heartbeats = self.get_heartbeats_for_window(window_start_timestamp);
-        
-        let total = attestations.len() as u64 + heartbeats.len() as u64;
-        let successful = total; // All stored attestations/heartbeats are verified
-        
-        (total, successful)
-    }
-    
-    /// v2.64: Get total counts by BLOCK HEIGHT (deterministic!)
-    pub fn get_ping_counts_for_block_range(&self, start_height: u64, end_height: u64) -> (u64, u64) {
-        let attestations = self.get_attestations_for_block_range(start_height, end_height);
-        let heartbeats = self.get_heartbeats_for_block_range(start_height, end_height);
-        
-        let total = attestations.len() as u64 + heartbeats.len() as u64;
-        (total, total) // All stored are verified
-    }
-    
     /// Get Light node wallet address from registry
     pub fn get_light_node_wallet(&self, node_id: &str) -> Option<String> {
         let registry = self.light_node_registry.read();
         registry.get(node_id).map(|r| r.wallet_address.clone())
     }
-}
-
-/// PRODUCTION v2.79: Calculate deterministic heartbeat HEIGHTS for a node (10 per epoch)
-/// CRITICAL FIX: Use block height instead of timestamp to guarantee commitment window coverage
-/// Architecture:
-/// - Epoch = 14400 blocks (4 hours)
-/// - 10 heartbeats per epoch
-/// - Last heartbeat ALWAYS in commitment window (last 50 blocks)
-/// - Deterministic based on node_id hash
-fn calculate_heartbeat_heights_for_node(node_id: &str, current_height: u64) -> Vec<u64> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    
-    const EPOCH_BLOCKS: u64 = 14400;  // 4 hours = 14400 blocks
-    const HEARTBEATS_PER_EPOCH: u64 = 10;
-    const BLOCKS_PER_HEARTBEAT: u64 = EPOCH_BLOCKS / HEARTBEATS_PER_EPOCH;  // 1440 blocks
-    const COMMITMENT_WINDOW_SIZE: u64 = 50;  // Last 50 blocks before epoch end
-    
-    // Current epoch
-    let current_epoch = current_height / EPOCH_BLOCKS;
-    let epoch_start = current_epoch * EPOCH_BLOCKS;
-    
-    // Deterministic base offset from node_id hash (0-1439)
-    let mut hasher = DefaultHasher::new();
-    node_id.hash(&mut hasher);
-    let hash = hasher.finish();
-    let base_offset = (hash % BLOCKS_PER_HEARTBEAT) as u64;
-    
-    let mut heights = Vec::with_capacity(HEARTBEATS_PER_EPOCH as usize);
-    
-    // First 9 heartbeats: distributed evenly across epoch
-    for i in 0..9 {
-        let heartbeat_height = epoch_start + base_offset + (i * BLOCKS_PER_HEARTBEAT);
-        heights.push(heartbeat_height);
-    }
-    
-    // CRITICAL: Last heartbeat MUST be in commitment window (last 50 blocks)
-    // This guarantees that HeartbeatCommitment TX will have at least 1 heartbeat
-    let window_offset = (hash % COMMITMENT_WINDOW_SIZE) as u64;  // Deterministic 0-49
-    let last_heartbeat = epoch_start + EPOCH_BLOCKS - COMMITMENT_WINDOW_SIZE + window_offset;
-    heights.push(last_heartbeat);
-    
-    heights.sort();
-    heights
 }
 
 /// Implementation of sync and catch-up methods for SimplifiedP2P
@@ -19649,14 +18685,19 @@ impl SimplifiedP2P {
             }
         }
 
-        // v31.2: if I'm the next-slot producer, shed sync serving with an
-        // empty batch so my production loop keeps its RocksDB I/O budget.
-        // Requester retries another peer via existing empty_batch handling.
+        // Shed sync-serving ONLY while actively producing (protects the producer's RocksDB I/O
+        // budget). A node elected for the next slot but STALLED — no block produced in the last
+        // few seconds — is not producing; shedding then would block the repair that unfreezes the
+        // chain, so it serves instead.
         let local_chain_height_now = LOCAL_BLOCKCHAIN_HEIGHT
             .load(std::sync::atomic::Ordering::Relaxed);
         let next_height = local_chain_height_now.saturating_add(1);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let last_produced = crate::node::LAST_BLOCK_PRODUCED_TIME.load(std::sync::atomic::Ordering::Relaxed);
+        let actively_producing = last_produced > 0 && now_secs.saturating_sub(last_produced) <= 3;
         if let Some((expected_producer, _round)) = crate::node::get_expected_producer(next_height) {
-            if expected_producer == self.node_id {
+            if actively_producing && expected_producer == self.node_id {
                 // I am the elected producer for the next slot — defer sync serving.
                 if crate::node::is_debug() {
                     println!(

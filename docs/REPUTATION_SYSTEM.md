@@ -604,25 +604,26 @@ This prevents false positives from network delays or P2P gossip inconsistencies.
 - Alternative: -1% reputation penalty (`PENALTY_MISSED_CONSENSUS`)
 - Node can still participate in next consensus (89% > 70% threshold)
 
-### Consensus Phase Synchronization (v2.40)
+### Macroblock Finality & Participation (Checkpoint-BFT v2)
 
-Phases are now determined by **block height**, not message counts:
+Macroblock finality no longer uses commit/reveal phases. Each 90-block window is
+finalized by a single checkpoint and one 2f+1 quorum certificate. Reputation
+tracks committee participation against that single signing event:
 
 ```
-Block Layout per 90-block epoch:
-├── Blocks 1-60:  Production (microblocks only)
-├── Blocks 61-72: Commit phase (12 seconds)
-├── Blocks 73-84: Reveal phase (12 seconds)
-└── Blocks 85-90: Finalize phase (6 seconds)
+Window per 90-block epoch:
+├── Blocks N*90+1 .. (N+1)*90:  Production (microblocks)
+└── Block (N+1)*90 (boundary):  Checkpoint — committee signs the window content
+                                 (90 mb hashes + state_root + VRF beacon + epoch)
 
-get_phase_for_block(height) = deterministic on ALL nodes
+Macroblock is final once >= 2f+1 committee signatures form the Quorum Certificate.
 ```
 
-**Grace Periods:**
-| Message | Accept In |
-|---------|-----------|
-| Commits | Commit (61-72) + early Reveal (73-78) |
-| Reveals | late Commit (69-72) + Reveal (73-84) + Finalize (85-90) |
+**Participation accounting:**
+| Action | Reputation effect |
+|--------|-------------------|
+| Signed a valid checkpoint (in committee) | positive participation |
+| Failed content_ok / withheld signature | no automatic jail (timing != offense) |
 
 ### Collection Flow (v2.38)
 

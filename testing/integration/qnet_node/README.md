@@ -11,7 +11,7 @@ Full blockchain node implementation with integrated P2P networking.
 
 - **Integrated Components**:
   - P2P networking with libp2p
-  - Commit-Reveal consensus
+  - Checkpoint-BFT consensus (2f+1 QC per 90-block window)
   - High-performance state management
   - Lock-free mempool
   - REST/WebSocket API

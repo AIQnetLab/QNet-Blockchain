@@ -4,8 +4,8 @@
 
 | Blockchain | Core Language | Current TPS | Theoretical Max | Consensus | Smart Contracts |
 |------------|---------------|-------------|-----------------|-----------|-----------------|
-| **QNet (Now)** | Python + Rust | 100K | 150K | Commit-Reveal + Reputation | WASM |
-| **QNet (Future)** | Rust | 500K+ | 1M+ | Optimized CR + Reputation | WASM |
+| **QNet (Now)** | Python + Rust | 100K | 150K | Checkpoint-BFT + Reputation | WASM |
+| **QNet (Future)** | Rust | 500K+ | 1M+ | Checkpoint-BFT + Reputation | WASM |
 | Solana | Rust | 65K | 710K | PoH + PoS | Rust/C |
 | Aptos | Rust | 160K | 160K | AptosBFT | Move |
 | Sui | Rust | 120K | 297K | Narwhal/Tusk | Move |
@@ -14,19 +14,19 @@
 | Near | Rust | 100K | 100K | Nightshade | WASM |
 | Polkadot | Rust | 1K | 1M (parachains) | GRANDPA | WASM |
 
-## QNet's Unique Consensus: Commit-Reveal + Reputation
+## QNet's Consensus: Checkpoint-BFT + Reputation
 
 ### How It Works:
 
-1. **Commit Phase**:
-   - Validators commit hash of their proposed value
-   - Prevents front-running and manipulation
-   - Adaptive timing based on network conditions
+1. **Microblocks (production)**:
+   - A single VRF-selected leader produces one microblock per second
+   - Dilithium3-signed; the leader rotates every block
 
-2. **Reveal Phase**:
-   - Validators reveal actual values
-   - Only valid reveals from commit phase accepted
-   - Reputation system tracks participation
+2. **Macroblock Checkpoint (finality)**:
+   - Every 90 blocks a VRF-sampled committee signs one checkpoint
+   - The checkpoint binds the window: 90 microblock hashes + state_root + VRF beacon + epoch commitment
+   - content_ok fail-stop: a node signs only if it independently reproduces the content
+   - Final once ≥ 2f+1 committee signatures form the Quorum Certificate (no commit/reveal phases)
 
 3. **Leader Selection**:
    - Deterministic selection using SHA3-256
@@ -41,7 +41,7 @@
 
 ### Advantages Over Traditional Consensus:
 
-- **Front-running Protection**: Commit-reveal prevents value manipulation
+- **Deterministic Finality**: every committee node reproduces the window content (content_ok) before signing the 2f+1 QC
 - **Adaptive Performance**: Dynamic timing adjusts to network conditions
 - **Fair Leader Selection**: Simple qualification threshold (≥70% reputation), equal chances
 - **Sybil Resistance**: Reputation threshold prevents low-quality nodes from participating
@@ -126,7 +126,7 @@
 2. **Mobile-First Design**: Millions of light nodes on phones
 3. **Language Agnostic**: WASM supports all major languages
 4. **Fair Launch**: No VC allocation, community driven
-5. **Unique Consensus**: Commit-Reveal + Reputation prevents manipulation
+5. **Unique Consensus**: Checkpoint-BFT (2f+1 QC) + Reputation prevents manipulation
 
 ## Conclusion
 

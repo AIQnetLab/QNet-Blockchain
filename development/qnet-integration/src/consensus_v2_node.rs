@@ -185,24 +185,12 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 let (reward_heartbeats, reward_light_nodes) = if window > 0 && window % 160 == 0 {
                     let ws = (window / 160 - 1) * 14400;
                     let we = ws + 14400;
-                    let hb = crate::node::BlockchainNode::collect_heartbeat_commitments_from_blocks(storage, p2p, ws, we, true)
-                        .await.ok().map(|(mut s, _)| {
-                            // v34: super/genesis reward eligibility now comes from the UNFORGEABLE
-                            // on-chain heartbeat tally (Account.heartbeat_slots popcount for this
-                            // epoch), NOT the self-attested HBC count — closing the reward forgery.
-                            // HBC still drives candidate discovery (the scan) until it is removed;
-                            // the on-chain tally is the authority for is_eligible.
-                            let hb_epoch = ws / 14400;
-                            for sm in &mut s {
-                                let cnt = storage.load_account(&sm.node_id).ok().flatten()
-                                    .map(|a| crate::node::BlockchainNode::account_heartbeat_count(&a, hb_epoch))
-                                    .unwrap_or(0);
-                                let required: u8 = match sm.node_type { 0 => 1, 2 => 9, _ => 10 };
-                                sm.heartbeat_count = cnt;
-                                sm.is_eligible = cnt >= required;
-                            }
-                            s
-                        }).filter(|s| !s.is_empty())
+                    // v35: discover recipients from on-chain Heartbeat-TX emitters and key
+                    // eligibility on the UNFORGEABLE per-epoch tally (heartbeat_slots popcount).
+                    // No HBC scan, no self-attested count; sorted output ⇒ identical body on all sealers.
+                    let hb = crate::node::BlockchainNode::collect_heartbeat_summaries_from_chain(storage, ws, we)
+                        .await.ok()
+                        .filter(|s| !s.is_empty())
                         .and_then(|s| bincode::serialize(&s).ok());
                     let lt = crate::node::BlockchainNode::collect_ping_commitments_from_blocks(storage, p2p, ws, we)
                         .await.ok().filter(|m| !m.is_empty())
@@ -419,8 +407,9 @@ pub async fn run(
     // committee rotates each epoch (N-2 VRF sample); kept here for verify_msg and
     // mirrored into the driver/engine via build_proposal.
     let mut driver = ConsensusDriver::new(node_id.clone(), committee.clone(), genesis_hash);
-    let timeout_ms: u64 = std::env::var("QNET_BFT2_VIEW_TIMEOUT_MS").ok()
-        .and_then(|s| s.parse().ok()).unwrap_or(4000);
+    // Consensus pacing — network-uniform const, NOT an operator env (per-node tuning desyncs
+    // view-change timing and churns liveness). Change = rebuild the whole network.
+    let timeout_ms: u64 = qnet_consensus::checkpoint_bft::VIEW_TIMEOUT_MS;
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(timeout_ms));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_index = driver.current_index();
@@ -475,7 +464,7 @@ pub async fn run(
                                     _ => {}
                                 }
                                 let content_ok = match &msg {
-                                    ConsensusMsg::Proposal(cp) => window_buf.get(&(cp.window_head_height / 90))
+                                    ConsensusMsg::Proposal(cp) => window_buf.get(&(cp.window_head_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL))
                                         .map(|c| cp.state_root == c.state_root
                                             && cp.window_mb_hashes == c.mb_hashes
                                             && cp.beacon == c.beacon
@@ -492,7 +481,7 @@ pub async fn run(
                                         // DIAG (cycle-1): pinpoint WHICH content field diverges, or a
                                         // missing local window. No behaviour change — still fail-stop.
                                         match &msg {
-                                            ConsensusMsg::Proposal(cp) => match window_buf.get(&(cp.window_head_height / 90)) {
+                                            ConsensusMsg::Proposal(cp) => match window_buf.get(&(cp.window_head_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL)) {
                                                 Some(c) => println!(
                                                     "[WARN][BFT2] proposal_content_rejected idx={} eq state_root={} mb_hashes={} beacon={} epoch_commit={}",
                                                     msg_index(&msg),
@@ -503,7 +492,7 @@ pub async fn run(
                                                 ),
                                                 None => println!(
                                                     "[WARN][BFT2] proposal_content_rejected idx={} window_buf_MISS win={}",
-                                                    msg_index(&msg), cp.window_head_height / 90,
+                                                    msg_index(&msg), cp.window_head_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL,
                                                 ),
                                             },
                                             _ => println!("[WARN][BFT2] proposal_content_rejected idx={}", msg_index(&msg)),

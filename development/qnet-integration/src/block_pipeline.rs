@@ -242,7 +242,7 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
 /// distinct OBSERVER signatures for the same `(height, source_peer_id)`
 /// tuple would justify destructive action. Until that protocol exists,
 /// no destructive rollback fires from this path — recovery happens via
-/// the existing 2f+1 macroblock commit-reveal which finalises the
+/// the existing 2f+1 macroblock Checkpoint-BFT QC which finalises the
 /// canonical branch every 90 microblocks regardless of microblock-level
 /// disagreement.
 ///
@@ -276,7 +276,7 @@ pub fn record_hash_chain_break_witness(height: u64, peer_id: &str) {
     // Advisory signal at f+1. Tags every reporter as a fork-source so the
     // canonical-aware sync peer selector deprioritises them. No state
     // mutation, no rollback — the local chain is preserved and the next
-    // 2f+1 macroblock commit-reveal naturally finalises the canonical
+    // 2f+1 macroblock Checkpoint-BFT QC naturally finalises the canonical
     // branch every 90 microblocks.
     if witnesses == detection_threshold {
         if is_warn() {
@@ -1842,7 +1842,7 @@ impl BlockPipeline {
             // the round>0 case is now structurally unreachable from honest
             // producers, and dishonest emitters are caught by the signature
             // gate immediately below. Macroblock layer retains its own 2f+1
-            // commit-reveal finality — that path is unchanged.
+            // Checkpoint-BFT QC finality — that path is unchanged.
 
             // 3. Signature verification
             // Genesis block (h=0) uses embedded self-signed keys — skip standard verification.

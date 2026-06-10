@@ -782,7 +782,7 @@ When all nodes fall below 70% reputation threshold:
 - **Network Continuity**: Ensures blockchain never halts completely
 
 ### **Macroblock Leader Failover**
-- **Byzantine Consensus**: Full commit-reveal with 67% honest assumption
+- **Byzantine Consensus**: Checkpoint-BFT — a single 2f+1 quorum certificate per 90-block window (committee-signed), with the 67% honest assumption
 - **Timeout Detection**: 30-second threshold for macroblock creation
 - **Emergency Re-consensus**: Automatic restart excluding failed leader
 - **Leader Exclusion**: Failed leaders temporarily excluded from future rounds

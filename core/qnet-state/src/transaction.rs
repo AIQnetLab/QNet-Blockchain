@@ -1355,19 +1355,18 @@ impl Transaction {
                     }
                 }
             }
-            TransactionType::Heartbeat { node_id, anchor_hash, signature, .. } => {
-                // v34: structural checks only. The unforgeable part — anchor_hash == the
-                // canonical hash of block at anchor_height, inclusion recency, and the Dilithium
-                // signature verified against the node's registry PK — is enforced at block
-                // validation (Transaction::validate is pure: no storage / PK-registry access).
+            TransactionType::Heartbeat { node_id, anchor_hash, .. } => {
+                // v35: structural checks only. The Dilithium sig (in dilithium_signature, over
+                // node_id:anchor_height:anchor_hash) + anchor==chain-hash + recency are enforced at
+                // block validation (verify_heartbeat_tx); this gate is pure (no storage/PK access).
                 if node_id.is_empty() {
                     return Err("[REJECT][TX] heartbeat_empty_node_id".to_string());
                 }
                 if anchor_hash.len() != 64 || !anchor_hash.chars().all(|c| c.is_ascii_hexdigit()) {
                     return Err("[REJECT][TX] heartbeat_bad_anchor_hash".to_string());
                 }
-                if signature.is_empty() {
-                    return Err("[REJECT][TX] heartbeat_empty_signature".to_string());
+                if self.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
+                    return Err("[REJECT][TX] heartbeat_missing_signature".to_string());
                 }
             }
             TransactionType::HeartbeatCommitment {
@@ -3356,11 +3355,12 @@ mod tests_v34_heartbeat {
                 node_id: node_id.to_string(),
                 anchor_height,
                 anchor_hash: "a".repeat(64),
-                signature: "deadbeef".to_string(),
+                signature: String::new(),
             },
             data: None,
-            dilithium_signature: None,
-            dilithium_public_key: None,
+            // v35: the heartbeat's single Dilithium sig lives here (over the anchor message).
+            dilithium_signature: Some("deadbeef".to_string()),
+            dilithium_public_key: Some(node_id.to_string()),
             chain_id: 0,
         };
         tx.hash = tx.calculate_hash();
@@ -3422,11 +3422,11 @@ mod tests_v34_heartbeat {
         if let TransactionType::Heartbeat { ref mut anchor_hash, .. } = t.tx_type { *anchor_hash = "zz".to_string(); }
         t.hash = t.calculate_hash();
         assert!(t.validate().is_err(), "bad anchor_hash must reject");
-        // empty signature
+        // v35: missing Dilithium signature (the single auth carrier) must reject
         let mut t = hb("genesis_node_001", 100);
-        if let TransactionType::Heartbeat { ref mut signature, .. } = t.tx_type { *signature = String::new(); }
+        t.dilithium_signature = None;
         t.hash = t.calculate_hash();
-        assert!(t.validate().is_err(), "empty signature must reject");
+        assert!(t.validate().is_err(), "missing dilithium_signature must reject");
     }
 }
 

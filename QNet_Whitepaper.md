@@ -149,7 +149,7 @@ QNet presents an experimental blockchain platform with unique characteristics:
 │  QUIC Transport, P2P, Sharding, Regional Clustering │
 ├─────────────────────────────────────────────────────┤  
 │             Consensus Layer                         │
-│     Commit-Reveal BFT, Producer rotation            │
+│     Checkpoint-BFT (2f+1 QC), Producer rotation     │
 ├─────────────────────────────────────────────────────┤
 │            Blockchain Layer                         │
 │       Microblocks (1s) + Macroblocks                │
@@ -640,19 +640,24 @@ let signature = dilithium3::sign(data, &sk);  // 2420 bytes
 
 ### 4.2 Consensus Algorithm
 
-**Commit-Reveal Byzantine Fault Tolerance (CR-BFT):**
+**Checkpoint-BFT (single-round, 2f+1):**
 
-**Commit Phase:**
-1. All validators send hash of their vote
-2. Sign commit with digital signature
-3. Wait for commits from 2f+1 validators (where f is number of malicious)
+Microblocks are finalized by checkpoints — one quorum certificate per checkpoint, no commit/reveal phases:
+1. At each checkpoint boundary (every `CHECKPOINT_INTERVAL` blocks, default 30) the elected proposer
+   builds the **checkpoint** (the sub-window's microblock hashes, head state_root, VRF beacon,
+   epoch_commitment) and broadcasts it to the committee.
+2. Each committee member **independently recomputes** the checkpoint from its own copy of the
+   blocks (`content_ok`) and signs (Dilithium3) only if its hash matches.
+3. Once **2f+1** matching signatures form a quorum certificate, those microblocks are final; the
+   90-block boundary checkpoint additionally seals the macroblock (epoch transition + emission).
 
-**Reveal Phase:**
-1. Validators reveal their actual votes
-2. Verify correspondence to previously sent hash
-3. Final consensus is reached
+**Security:** withstands <1/3 malicious committee members; a window that cannot reach 2f+1
+(divergent or incomplete) is never finalized — safety over liveness.
 
-**Security:** System withstands up to 33% malicious nodes
+**Finality cadence:** by default a checkpoint finalizes every 30 blocks (≈30–60 s to irreversibility
+under the 2-chain commit), while the macroblock / epoch / emission schedule stays at 90 blocks. The
+cadence is a network parameter (`CHECKPOINT_INTERVAL`, a divisor of 90 shared by every node); set to 90
+it reverts to one checkpoint per macroblock window (≈90–180 s).
 
 ### 4.3 Microblock Production
 
@@ -2307,76 +2312,72 @@ pub struct PreExecutionMetrics {
 
 ---
 
-## 9. Commit-Reveal BFT Consensus
+## 9. Checkpoint-BFT Consensus
 
 ### 9.1 Algorithm Description
 
-**Commit-Reveal Byzantine Fault Tolerance** - QNet's unique consensus:
+**Two-tier consensus.** Microblocks are produced once per second by a single elected
+leader (deterministic VRF rotation over the eligible validator set), each Dilithium3
+(ML-DSA) signed. Every 90 microblocks form a **window** finalized by **Checkpoint-BFT**:
+a VRF-sampled committee (≤100 of up to 1000 eligible) signs ONE **checkpoint** that
+commits the window's content, and the macroblock is final once **2f+1** committee
+signatures form a quorum certificate (QC). Single round — the old two-phase
+commit/reveal protocol has been removed.
 
 **Features:**
-- Protection from "nothing at stake" attacks
-- Prevention of voting manipulation
-- Finalization through information disclosure
-- Resistance to 33% malicious nodes
-- **Block-based phase synchronization (v2.40)**: All nodes in same phase at same height
+- One 2f+1 QC per window — single round, no commit/reveal phase choreography
+- `content_ok` fail-stop: a node signs ONLY a checkpoint whose window content it
+  independently reproduces (microblock hashes, head state_root, VRF beacon,
+  epoch_commitment of the validator/ban set) — a divergent or incomplete window is
+  never finalized (safety over liveness)
+- Resistance to <1/3 malicious committee members (2f+1 quorum)
+- Optimistic microblocks keep flowing while the checkpoint finalizes asynchronously
 
-### 9.2 Block-Based Phase Layout (v2.40)
+### 9.2 Window & Boundary
 
-**90-Block Epoch Structure:**
-| Blocks | Phase | Duration | Purpose |
-|--------|-------|----------|---------|
-| 1-60 | Production | 60s | Microblock creation only |
-| 61-72 | Commit | 12s | Validators submit encrypted votes |
-| 73-84 | Reveal | 12s | Validators reveal votes |
-| 85-90 | Finalize | 6s | Leader creates MacroBlock |
+There are no commit/reveal phases. Microblocks 1..90 of a window are produced
+continuously (1/s); the macroblock for that window is proposed and finalized ONCE, at
+the window boundary (block 90), when the full window is available. The Checkpoint-BFT
+round (propose → 2f+1 sign → QC) runs asynchronously and finalizes within seconds while
+the next window already produces microblocks.
 
-**Phase Determination:**
+| Blocks | Activity |
+|--------|----------|
+| 1–90 | Microblock production (1/s, single-leader VRF rotation) |
+| boundary (90, 180, …) | Checkpoint proposed → committee 2f+1 sign → macroblock QC |
+
+The committee for window N is VRF-sampled using the randomness beacon of macroblock
+**N−2** (unbiasable: the committee cannot be predicted before N−2 is final), so every
+node derives the identical committee deterministically.
+
+### 9.3 Checkpoint & Quorum Certificate
+
+**Checkpoint (proposed at the boundary):**
 ```rust
-// DETERMINISTIC: All nodes compute IDENTICAL phase from height
-fn get_phase_for_block(height: u64) -> ConsensusPhase {
-    match height % 90 {
-        0 => Finalize,        // Block 90, 180, 270...
-        1..=60 => Production, // Microblocks only
-        61..=72 => Commit,    // Submit commits
-        73..=84 => Reveal,    // Submit reveals
-        85..=89 => Finalize,  // Create MacroBlock
-    }
+checkpoint = {
+    macroblock_index:  u64,
+    mb_hashes:         [Hash; 90],   // the window's 90 microblock hashes
+    state_root:        Hash,         // real account-state root of the head block (N*90)
+    randomness_beacon: [u8; 32],     // XOR of the window's signed VRF outputs
+    epoch_commitment:  Hash,         // commits eligible producers, committee, banned set
 }
 ```
 
-**Grace Periods (Network Tolerance):**
-- Commits accepted: blocks 61-78 (includes early Reveal grace)
-- Reveals accepted: blocks 69-90 (includes late Commit and Finalize grace)
-
-### 9.3 Message Structures
-
-**Commit Message:**
+**Vote (committee member, only if `content_ok`):**
 ```rust
-commit = {
-    round_id: u64,
-    validator_id: String,
-    commit_hash: SHA3_256(vote + nonce),
-    timestamp: u64,
-    signature: CRYSTALS_Dilithium_signature
-}
-```
-
-**Reveal Message:**
-```rust
-reveal = {
-    round_id: u64,
-    validator_id: String, 
-    vote: String,           // Real vote
-    nonce: Vec<u8>,         // Random number
-    timestamp: u64,
-    signature: CRYSTALS_Dilithium_signature
+vote = {
+    macroblock_index: u64,
+    checkpoint_hash:  Hash,          // hash(checkpoint) the voter INDEPENDENTLY recomputed
+    signature:        Dilithium3,    // ML-DSA over (index, checkpoint_hash)
 }
 ```
 
 **Finalization:**
-- Verification: SHA3_256(vote + nonce) == commit_hash
-- Count votes from valid reveals
-- Consensus at 2f+1 agreeing votes
+- Each committee member recomputes the checkpoint from its own copy of the window
+  (`content_ok`) and signs only if its `checkpoint_hash` matches the proposal.
+- The macroblock is final once **2f+1** matching votes form a quorum certificate (QC).
+- Fail-stop: with no 2f+1 (divergent/incomplete window) the window is NOT finalized;
+  production gates at the next boundary until BFT catches up — safety over liveness.
 
 ### 9.4 No Automatic Jailing (v2.40)
 
@@ -2624,7 +2625,7 @@ ws://node:8001/ws/transactions // Subscribe to transactions
 **Completed audits:**
 
 - ✅ **Cryptographic audit**: CRYSTALS-Dilithium implementation
-- ✅ **Consensus audit**: CR-BFT resilience
+- ✅ **Consensus audit**: Checkpoint-BFT (2f+1) resilience
 - ✅ **Smart contract audit**: Solana integration
 - ✅ **P2P audit**: Network security
 
@@ -2639,7 +2640,7 @@ ws://node:8001/ws/transactions // Subscribe to transactions
 
 | Attack Type | QNet Protection |
 |-------------|-----------------|
-| **51% attack** | CR-BFT consensus, economic penalties |
+| **51% attack** | Checkpoint-BFT 2f+1 consensus, economic penalties |
 | **Sybil attack** | Burn-to-activate, reputation system |
 | **DDoS** | Rate limiting, regional distribution |
 | **Double-spend** | Byzantine validation, blockchain finalization |
@@ -2968,7 +2969,9 @@ accounts: {
 
 **CRYSTALS-Dilithium**: Digital signature algorithm standardized by NIST in 2024
 
-**Commit-Reveal**: Two-phase protocol where participants first commit an encrypted vote, then reveal it
+**Checkpoint-BFT**: QNet's macroblock finality — a VRF-sampled committee signs one checkpoint per 90-block window; the macroblock is final once 2f+1 signatures form a quorum certificate (QC). Single round, no commit/reveal phases.
+
+**Quorum Certificate (QC)**: the set of 2f+1 committee signatures over a checkpoint that finalizes a macroblock.
 
 **Byzantine Fault Tolerance**: Resistance to arbitrary behavior of up to 1/3 of network participants
 

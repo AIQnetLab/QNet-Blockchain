@@ -5,8 +5,8 @@
 //! ═══════════════════════════════════════════════════════════════════════════════
 //!
 //! This module implements the per-block fork choice rule used between macroblock
-//! finality boundaries. Macroblock finality is anchored every 90 blocks via 2f+1
-//! commit-reveal supermajority. Between those anchors, microblock production is
+//! finality boundaries. Macroblock finality is anchored every 90 blocks via a 2f+1
+//! Checkpoint-BFT quorum certificate. Between those anchors, microblock production is
 //! single-leader and forks are possible during partition / propagation gap.
 //!
 //! The fork choice rule selects the canonical chain head as the descendant of

@@ -1438,9 +1438,13 @@ fn get_genesis_node_ips_dynamic() -> Vec<String> {
 fn check_genesis_node_duplication(bootstrap_id: &str) -> bool {
     println!("[SECURITY] 🔍 Scanning network for duplicate Genesis node {}...", bootstrap_id);
     
-    // PRODUCTION OVERRIDE: Allow skipping duplication check if needed
-    if std::env::var("QNET_SKIP_GENESIS_DUPLICATION_CHECK").unwrap_or_default() == "1" {
-        println!("[SECURITY] ⚠️  DUPLICATION CHECK DISABLED via QNET_SKIP_GENESIS_DUPLICATION_CHECK");
+    // Off-mainnet escape ONLY. This startup IP-scan is a SOFT pre-flight (it already skips our own
+    // IP and allows on detection failure; the HARD duplicate-identity protection is the registry /
+    // consensus IP↔PK binding, which this never bypasses). The bypass is permitted on testnet
+    // (chaotic relaunches) but NEVER on mainnet — a mainnet node sets QNET_NETWORK=mainnet.
+    let is_mainnet = std::env::var("QNET_NETWORK").map(|n| n.eq_ignore_ascii_case("mainnet")).unwrap_or(false);
+    if !is_mainnet && std::env::var("QNET_SKIP_GENESIS_DUPLICATION_CHECK").unwrap_or_default() == "1" {
+        println!("[SECURITY] ⚠️  DUPLICATION CHECK DISABLED via QNET_SKIP_GENESIS_DUPLICATION_CHECK (testnet only)");
         println!("[SECURITY] 🔓 Allowing Genesis node startup without duplication verification");
         return false;
     }

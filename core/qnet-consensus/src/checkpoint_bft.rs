@@ -38,6 +38,27 @@ pub fn leader_index(index: u64, parent_checkpoint_hash: &Hash, committee_len: us
 pub const COMMITTEE_THRESHOLD: usize = 120;
 pub const COMMITTEE_SIZE: usize = 100;
 
+/// Macroblock / epoch cadence: one macroblock (epoch transition, emission, committee
+/// rotation, N-2 snapshot) every MACROBLOCK_INTERVAL microblocks. A true network constant.
+pub const MACROBLOCK_INTERVAL: u64 = 90;
+
+/// Finality-checkpoint cadence: a 2f+1 QC finalizes microblocks every CHECKPOINT_INTERVAL
+/// blocks. MUST divide MACROBLOCK_INTERVAL (every macroblock boundary is also a checkpoint).
+/// CONSENSUS PARAMETER — every node MUST use the same value, or the checkpoint chains diverge
+/// (fork). Changing it = rebuild + relaunch the whole network from genesis. 30 (default) =
+/// intra-window finality (~30-60s to irreversibility); 90 = legacy one-checkpoint-per-macroblock
+/// (~90-180s). Valid values divide 90: {10,15,18,30,45,90}.
+pub const CHECKPOINT_INTERVAL: u64 = 30;
+
+/// Compile-time guard: CHECKPOINT_INTERVAL must divide MACROBLOCK_INTERVAL, else a macroblock
+/// boundary would not coincide with a checkpoint and the seal cadence would be undefined.
+const _: () = assert!(MACROBLOCK_INTERVAL % CHECKPOINT_INTERVAL == 0, "CHECKPOINT_INTERVAL must divide MACROBLOCK_INTERVAL");
+
+/// Checkpoint-BFT view (round) timeout in ms: how long a replica waits for the leader's proposal
+/// before broadcasting a TimeoutVote toward a view change. CONSENSUS PACING — must be network-uniform;
+/// per-node values desync view-change timing and churn liveness (it is NOT a per-operator knob).
+pub const VIEW_TIMEOUT_MS: u64 = 4000;
+
 /// Deterministic VRF committee subsample. `sorted_candidates` MUST be sorted by node_id by the
 /// caller, so the index→candidate mapping is identical on every node; `window` is the macroblock
 /// index the committee serves; `seed` is that window's N-2 randomness beacon. ≤ `threshold` ⇒ the

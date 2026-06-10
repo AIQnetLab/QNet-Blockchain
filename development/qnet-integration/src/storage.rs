@@ -897,7 +897,7 @@ impl PersistentStorage {
     /// Every node performs this work locally for every accepted block;
     /// keeping it off the reactor is what allows a node to simultaneously
     /// (a) accept incoming P2P traffic, (b) serve sync requests from
-    /// fresh peers, and (c) participate in commit-reveal — all while
+    /// fresh peers, and (c) participate in Checkpoint-BFT consensus — all while
     /// the previous block is being persisted to disk.
     pub async fn save_block(&self, block: &qnet_state::Block) -> IntegrationResult<()> {
         let db = self.db.clone();
@@ -1325,75 +1325,25 @@ impl PersistentStorage {
         Ok(deleted)
     }
     
-    /// v3.19: Prune old heartbeats older than retention_seconds
-    /// Heartbeats are only needed for recent epoch, old ones waste space
-    pub fn prune_old_heartbeats(&self, retention_seconds: u64) -> IntegrationResult<usize> {
-        let heartbeats_cf = self.db.cf_handle("heartbeats")
-            .ok_or_else(|| IntegrationError::StorageError("heartbeats CF not found".to_string()))?;
-        
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        let prune_before = current_time.saturating_sub(retention_seconds);
-        let mut deleted = 0;
-        let mut batch = WriteBatch::default();
-        
-        // Iterate through heartbeats and delete old ones
-        let iter = self.db.iterator_cf(&heartbeats_cf, rocksdb::IteratorMode::Start);
-        for item in iter {
-            if let Ok((key, value)) = item {
-                // Try to extract timestamp from value
-                if value.len() >= 8 {
-                    let ts = u64::from_be_bytes(value[0..8].try_into().unwrap_or([0; 8]));
-                    if ts < prune_before {
-                        batch.delete_cf(&heartbeats_cf, &key);
-                        deleted += 1;
-                        
-                        if deleted % 1000 == 0 {
-                            self.db.write(batch)?;
-                            batch = WriteBatch::default();
-                        }
-                    }
-                }
-            }
-        }
-        
-        if deleted % 1000 != 0 {
-            self.db.write(batch)?;
-        }
-        
-        // Trigger compaction
-        self.db.compact_range_cf(&heartbeats_cf, None::<&[u8]>, None::<&[u8]>);
-        
-        if deleted > 0 && crate::node::is_info() {
-            println!("[INFO][STORAGE] pruned_heartbeats deleted={} retention={}s", deleted, retention_seconds);
-        }
-        Ok(deleted)
-    }
-    
     /// v3.19: Run full pruning cycle (call periodically, e.g., every hour)
     /// retention_blocks: How many microblocks to keep (e.g., 86400 = ~1 day at 1 block/sec)
-    /// heartbeat_retention_secs: How long to keep heartbeats (e.g., 86400 = 1 day)
-    pub fn run_pruning_cycle(&self, current_height: u64, retention_blocks: u64, heartbeat_retention_secs: u64) -> IntegrationResult<()> {
+    pub fn run_pruning_cycle(&self, current_height: u64, retention_blocks: u64) -> IntegrationResult<()> {
         use crate::node::is_info;
         if is_info() {
-            println!("[INFO][STORAGE] pruning_cycle_start retention_blocks={} heartbeat_retention={}s",
-                     retention_blocks, heartbeat_retention_secs);
+            println!("[INFO][STORAGE] pruning_cycle_start retention_blocks={}",
+                     retention_blocks);
         }
         
         let start = std::time::Instant::now();
         
         let microblocks_deleted = self.prune_old_microblocks(current_height, retention_blocks)?;
-        let heartbeats_deleted = self.prune_old_heartbeats(heartbeat_retention_secs)?;
         
         self.compact_all()?;
         
         let elapsed = start.elapsed();
         if is_info() {
-            println!("[INFO][STORAGE] pruning_cycle_done elapsed={:?} microblocks={} heartbeats={}",
-                     elapsed, microblocks_deleted, heartbeats_deleted);
+            println!("[INFO][STORAGE] pruning_cycle_done elapsed={:?} microblocks={}",
+                     elapsed, microblocks_deleted);
         }
         
         Ok(())
@@ -4524,14 +4474,6 @@ impl Storage {
             self.persistent.db.compact_range_cf(&microblocks_cf, None::<&[u8]>, None::<&[u8]>);
         }
         
-        // v3.19: Prune old heartbeats every 10 macroblocks (~15 min)
-        // Keep 8h (2 epochs) - enough for reward calculation (needs 4h window)
-        // OLD: 24h = 6 epochs = excessive
-        // NEW: 8h = 2 epochs = safe margin
-        if macroblock.height % 10 == 0 {
-            let _ = self.persistent.prune_old_heartbeats(28800); // 8h = 28800 sec
-        }
-        
         Ok(())
     }
     
@@ -6959,113 +6901,6 @@ impl Storage {
         Ok(())
     }
     
-    // ============================================
-    // PRODUCTION: HEARTBEAT STORAGE (Super nodes)
-    // ============================================
-    
-    /// Save Super node heartbeat (persistent for reward calculation)
-    /// PRODUCTION v2.78: Now includes Dilithium signature for HeartbeatCommitment TX
-    pub fn save_heartbeat(&self, node_id: &str, heartbeat_index: u8, timestamp: u64, block_height: u64, dilithium_signature: &str) -> IntegrationResult<()> {
-        let hb_cf = self.persistent.db.cf_handle("heartbeats")
-            .ok_or_else(|| IntegrationError::StorageError("heartbeats column family not found".to_string()))?;
-        
-        // Key: hb_{node_id}_{4h_window}_{index} for deduplication per window
-        let window = timestamp - (timestamp % (4 * 60 * 60));
-        let key = format!("hb_{}_{}_{}", node_id, window, heartbeat_index);
-        let data = json!({
-            "node_id": node_id,
-            "heartbeat_index": heartbeat_index,
-            "timestamp": timestamp,
-            "block_height": block_height,
-            "window": window,
-            "dilithium_signature": dilithium_signature
-        });
-        
-        self.persistent.db.put_cf(&hb_cf, key.as_bytes(), data.to_string().as_bytes())?;
-        Ok(())
-    }
-    
-    /// Count heartbeats for node in 4h window (for reward eligibility)
-    pub fn count_heartbeats_in_window(&self, node_id: &str, window_timestamp: u64) -> IntegrationResult<u8> {
-        let hb_cf = self.persistent.db.cf_handle("heartbeats")
-            .ok_or_else(|| IntegrationError::StorageError("heartbeats column family not found".to_string()))?;
-        
-        let mut count = 0u8;
-        for index in 0..10 {
-            let key = format!("hb_{}_{}_{}", node_id, window_timestamp, index);
-            if self.persistent.db.get_cf(&hb_cf, key.as_bytes())?.is_some() {
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-    
-    /// Check heartbeat eligibility (8/10 for Full, 9/10 for Super)
-    pub fn check_heartbeat_eligibility(&self, node_id: &str, node_type: &str, window_timestamp: u64) -> IntegrationResult<(u8, u8, bool)> {
-        let count = self.count_heartbeats_in_window(node_id, window_timestamp)?;
-        let required = match node_type {
-            "super" => 9,
-            "full" => 8,
-            _ => 10,
-        };
-        Ok((count, required, count >= required))
-    }
-    
-    /// Cleanup old heartbeats (older than 24 hours)
-    pub fn cleanup_old_heartbeats(&self, cutoff_timestamp: u64) -> IntegrationResult<u32> {
-        let hb_cf = self.persistent.db.cf_handle("heartbeats")
-            .ok_or_else(|| IntegrationError::StorageError("heartbeats column family not found".to_string()))?;
-        
-        let iter = self.persistent.db.iterator_cf(&hb_cf, rocksdb::IteratorMode::Start);
-        let mut batch = WriteBatch::default();
-        let mut removed = 0u32;
-        
-        for item in iter {
-            let (key, value) = item?;
-            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
-                let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
-                if timestamp < cutoff_timestamp {
-                    batch.delete_cf(&hb_cf, &key);
-                    removed += 1;
-                }
-            }
-        }
-        
-        if batch.len() > 0 {
-            self.persistent.db.write(batch)?;
-        }
-        
-        Ok(removed)
-    }
-    
-    /// v2.75: Get all heartbeats for a block height range (for emission fallback)
-    /// PRODUCTION v2.78: Now returns Dilithium signatures for HeartbeatCommitment TX
-    /// Returns Vec<(node_id, heartbeat_index, timestamp, block_height, dilithium_signature)>
-    pub fn get_heartbeats_for_block_range(&self, start_height: u64, end_height: u64) -> IntegrationResult<Vec<(String, u8, u64, u64, String)>> {
-        let hb_cf = self.persistent.db.cf_handle("heartbeats")
-            .ok_or_else(|| IntegrationError::StorageError("heartbeats column family not found".to_string()))?;
-        
-        let iter = self.persistent.db.iterator_cf(&hb_cf, rocksdb::IteratorMode::Start);
-        let mut result = Vec::new();
-        
-        for item in iter {
-            let (_key, value) = item?;
-            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
-                let block_height = parsed["block_height"].as_u64().unwrap_or(0);
-                if block_height >= start_height && block_height < end_height {
-                    let node_id = parsed["node_id"].as_str().unwrap_or("").to_string();
-                    let heartbeat_index = parsed["heartbeat_index"].as_u64().unwrap_or(0) as u8;
-                    let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
-                    let dilithium_signature = parsed["dilithium_signature"].as_str().unwrap_or("").to_string();
-                    result.push((node_id, heartbeat_index, timestamp, block_height, dilithium_signature));
-                }
-            }
-        }
-        
-        println!("[INFO][STORAGE] heartbeats_for_range start={} end={} found={}", start_height, end_height, result.len());
-        Ok(result)
-    }
-    
     // ===== FAILOVER EVENT METHODS =====
     
     /// Save a failover event (optimized with bincode serialization and LZ4 compression)
@@ -8888,7 +8723,7 @@ impl Storage {
     // matches the peer's metadata", not chain-canonicity). Binding: the
     // snapshot-boundary macroblock embeds consensus_data.snapshot_root =
     // SHA3-256 of the canonical snapshot bytes (byte-stable across the
-    // committee, finalised by 2f+1 commit-reveal → forging needs 2f+1 keys).
+    // committee, finalised by a 2f+1 Checkpoint-BFT QC → forging needs 2f+1 keys).
     // Verifier: SHA3 the saved snapshot → fetch macroblock at height/90
     // (local then P2P) → compare → accept or ROLL BACK (delete
     // full_snap_/state_snap_ keys). Every fetch/binding failure returns Err

@@ -138,9 +138,9 @@ fn get_storage_behavior(node_type: NodeType) -> StorageTier {
 
 ### 4. Consensus Participation Load
 
-#### Current Design Issue
+#### Original Design Issue (resolved by committee sampling, below)
 ```
-Commit-Reveal with all nodes:
+All-nodes signing (pre-Checkpoint-BFT):
 - Phase 1: All nodes send commits
 - Phase 2: All nodes send reveals
 - With 1M nodes: 2M messages per block!

@@ -2,6 +2,12 @@
 
 //! Commit-Reveal consensus mechanism for QNet
 //! Provides Byzantine fault tolerance and secure leader election
+//!
+//! LEGACY: this is NOT the live macroblock consensus. Macroblock finality is Checkpoint-BFT v2
+//! (see `checkpoint_bft.rs` — Vote → 2f+1 QC). This engine is retained only because the sharding
+//! modules (`sharded_consensus`/`cross_shard`) reuse its `compute_leader_for_round`, the Python
+//! bindings wrap it, and its `Commit`/`Reveal` types are decoded by the legacy old-format
+//! macroblock-validation fallback. Do not treat it as the current consensus path.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
