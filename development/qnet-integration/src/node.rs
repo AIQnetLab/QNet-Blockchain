@@ -15765,25 +15765,30 @@ impl BlockchainNode {
                     match resolved {
                         Some(exists) => exists,
                         None => {
-                            // Persistent Err reading block 0. CRITICAL distinction: a FRESH empty DB
-                            // (first boot after a genesis_*_data wipe) returns Err here, NOT Ok(None)
-                            // — block 0 simply does not exist yet. That is NOT corruption and MUST
-                            // proceed to normal cold-start (node_001 mints genesis, others await it).
-                            // Only a block-0 Err on an ALREADY-POPULATED chain (chain_height > 0 or
-                            // block 1 present) is fork-dangerous corruption → clear + refuse-to-mint.
-                            // (The prior version flagged corruption unconditionally here, which
-                            // crash-looped EVERY node on a fresh launch: block-0 Err is the normal
-                            // first-boot state, no peer has genesis yet → the fork-safe HALT misfired.)
+                            // Persistent Err reading block 0 = bytes ARE present at key 0 but do NOT
+                            // deserialize (a truly empty DB returns Ok(None), handled above). That is a
+                            // CORRUPT/garbage block 0 — in practice the small response the HTTP genesis
+                            // loader saved (e.g. a 38-byte 404 body). It MUST be deleted: a leftover
+                            // garbage block 0 (a) blocks the real genesis broadcast/sync — a present
+                            // block 0 is treated as "already have it" — and (b) makes the genesis
+                            // await/poll never see Ok(Some), freezing the node forever.
+                            //
+                            // REGRESSION FIX: the previous version DELETED only on a populated chain and
+                            // KEPT the garbage on a fresh DB → that is exactly what froze fresh launches.
+                            // Always clear it. The only fork-safe distinction is whether to HALT after:
+                            // on an ALREADY-POPULATED chain (height > 0 or block 1 present) a vanished/
+                            // garbled block 0 is dangerous → refuse to mint a forking fresh genesis; on a
+                            // fresh DB it is just garbage → clear and let cold-start mint/await normally.
                             let db_populated = storage.get_chain_height().unwrap_or(0) > 0
                                 || matches!(storage.load_microblock_auto_format(1), Ok(Some(_)));
+                            if let Err(e3) = storage.delete_microblock(0) {
+                                eprintln!("[ERR][STORAGE] genesis_delete_failed err={}", e3);
+                            }
                             if db_populated {
-                                println!("[WARN][GEN] genesis_block0_corrupt persistent (chain populated) — clearing for peer-resync (will NOT mint fresh)");
-                                if let Err(e3) = storage.delete_microblock(0) {
-                                    eprintln!("[ERR][STORAGE] genesis_delete_failed err={}", e3);
-                                }
+                                println!("[WARN][GEN] genesis_block0_corrupt persistent (chain populated) — cleared, will NOT mint fresh (fork-safe)");
                                 genesis_was_corrupt = true;
                             } else {
-                                println!("[INFO][GEN] genesis_block0_absent (fresh empty DB) — first boot, will create/await genesis");
+                                println!("[INFO][GEN] genesis_block0_garbage cleared (fresh DB) — first boot, will create/await genesis");
                             }
                             false
                         }
