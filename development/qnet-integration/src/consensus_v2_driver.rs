@@ -27,7 +27,7 @@ pub enum Effect {
     Relay(ConsensusMsg),                        // Qc / Tc: already complete, just broadcast
     // Proposer seals the macroblock: QC (finality) + next-epoch eligible producers + committee.
     Persist { checkpoint: Checkpoint, qc: QuorumCertificate, eligible_producers: Vec<u8>, committee: Vec<NodeId> },
-    Finalize { index: u64, head_height: u64 },  // checkpoint final ⇒ microblocks ≤ head_height irreversible
+    Finalize { index: u64, head_height: u64, state_root: Hash }, // checkpoint final ⇒ microblocks ≤ head_height irreversible; state_root = the QC'd head root, re-checked locally before advancing the marker
 }
 
 /// Canonical bytes a TimeoutMsg signs over (node and driver MUST agree).
@@ -45,6 +45,7 @@ pub struct ConsensusDriver {
     node_id: NodeId,
     proposals: HashMap<(u64, Hash), Checkpoint>,
     heads: HashMap<u64, u64>, // round → window_head_height (Finalize + next_window mapping)
+    state_roots: HashMap<u64, Hash>, // round → checkpoint state_root (Finalize carries it; verified locally, no macroblock body needed)
     seal_data: HashMap<u64, (Vec<u8>, Vec<NodeId>)>, // round → (eligible_producers, committee)
     sealed: std::collections::HashSet<u64>, // windows we already emitted Persist for (dedup)
     last_proposed_round: u64,               // one proposal per round we lead
@@ -57,7 +58,7 @@ impl ConsensusDriver {
         Self {
             eng: CheckpointConsensus::new(node_id.clone(), committee.clone()),
             committee, genesis_hash, node_id,
-            proposals: HashMap::new(), heads: HashMap::new(), seal_data: HashMap::new(),
+            proposals: HashMap::new(), heads: HashMap::new(), state_roots: HashMap::new(), seal_data: HashMap::new(),
             sealed: std::collections::HashSet::new(), last_proposed_round: 0,
             cp_interval: CHECKPOINT_INTERVAL, macro_interval: MACROBLOCK_INTERVAL,
         }
@@ -78,11 +79,16 @@ impl ConsensusDriver {
     /// at commit time — so without a re-attempt, finality could stick behind the committed window
     /// until the NEXT window commits. Re-emitting is safe: `try_advance_finality` is monotonic and
     /// guarded (chain_h ≥ head, state match), so it is a no-op once caught up.
-    pub fn committed_head(&self) -> Option<u64> {
+    /// (head, state_root) of the highest 2-chain-committed checkpoint we hold locally — the run loop
+    /// re-emits a deferred Finalize from this. None if nothing committed OR we lack that checkpoint's
+    /// head/state (⇒ finality WAITS for §4.5 macroblock sync rather than finalizing a head=0 placeholder).
+    pub fn committed_finalize(&self) -> Option<(u64, Hash)> {
         let ci = self.eng.committed_index;
         if ci == 0 { return None; }
-        self.heads.get(&ci).copied().filter(|h| *h > 0)
+        let head = self.heads.get(&ci).copied().filter(|h| *h > 0)?;
+        Some((head, self.state_roots.get(&ci).copied()?))
     }
+    pub fn committed_head(&self) -> Option<u64> { self.committed_finalize().map(|(h, _)| h) }
 
     fn parent_hash(&self) -> Hash {
         self.eng.high_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash)
@@ -138,6 +144,7 @@ impl ConsensusDriver {
         };
         self.last_proposed_round = round;
         self.heads.insert(round, head_height);
+        self.state_roots.insert(round, state_root);
         self.proposals.insert((cp.index, cp.hash()), cp.clone());
         vec![Effect::Propose(cp)]
     }
@@ -160,6 +167,7 @@ impl ConsensusDriver {
     pub fn sync(&mut self, cp: &Checkpoint, qc: &QuorumCertificate) -> Vec<Effect> {
         if cp.index != qc.index || cp.hash() != qc.checkpoint_hash { return Vec::new(); }
         self.heads.insert(cp.index, cp.window_head_height);
+        self.state_roots.insert(cp.index, cp.state_root);
         self.proposals.insert((cp.index, cp.hash()), cp.clone());
         let acts = self.eng.sync_checkpoint(cp, qc);
         self.translate(acts)
@@ -171,6 +179,7 @@ impl ConsensusDriver {
             ConsensusMsg::Proposal(cp) => {
                 let ph = cp.parent_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash);
                 self.heads.insert(cp.index, cp.window_head_height);
+                self.state_roots.insert(cp.index, cp.state_root);
                 self.proposals.insert((cp.index, cp.hash()), cp.clone());
                 self.eng.on_proposal(cp, &ph)
             }
@@ -214,9 +223,17 @@ impl ConsensusDriver {
                     out.extend(self.seal_if_ready(&qc));
                     out.push(Effect::Relay(ConsensusMsg::Qc(qc)));
                 }
-                Action::Commit(idx) => out.push(Effect::Finalize {
-                    index: idx, head_height: self.heads.get(&idx).copied().unwrap_or(0),
-                }),
+                Action::Commit(idx) => {
+                    // Finalize with the committed checkpoint's OWN QC'd head + state_root — NEVER a
+                    // head=0 placeholder (that defers forever and freezes the finality marker, which
+                    // is what wedged the chain). Missing locally ⇒ we committed via a relayed QC
+                    // without holding the checkpoint; skip — §4.5 macroblock sync provides it, so
+                    // finality waits but never wedges.
+                    let head = self.heads.get(&idx).copied().unwrap_or(0);
+                    if let (true, Some(sr)) = (head > 0, self.state_roots.get(&idx).copied()) {
+                        out.push(Effect::Finalize { index: idx, head_height: head, state_root: sr });
+                    }
+                }
                 Action::EnterView(_) => {}
                 Action::BroadcastTimeout(tm) => out.push(Effect::Timeout { index: tm.index, high_qc_index: tm.high_qc_index }),
                 Action::FormedTc(tc) => out.push(Effect::Relay(ConsensusMsg::Tc(tc))),

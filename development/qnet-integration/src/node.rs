@@ -32,7 +32,6 @@ pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 /// See the BFT SCALING ARCHITECTURE block above for the full pipeline.
 pub const MAX_VALIDATORS: usize = 1000;
 pub const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
-const FORK_CHECK_INTERVAL: u64 = 5; // v10.0: Lightweight fork detection every 5 blocks (6× faster than rotation-only)
 #[allow(dead_code)]
 const MIN_BYZANTINE_NODES: usize = 4; // 3f+1 where f=1
 const FAST_SYNC_THRESHOLD: u64 = 10; // Trigger fast sync if behind by 10+ blocks (lowered from 50 for faster detection)  
@@ -998,217 +997,8 @@ pub fn complete_rollback_cleanup(target_height: u64) {
     clear_expected_producer_cache_above(target_height);
     ENTROPY_RESPONSES.retain(|k, _| k.0 < target_height);
     PRODUCER_VOTES.retain(|k, _| k.0 < target_height);
-    FORK_CHECK_RESPONSES.retain(|k, _| k.0 < target_height);
 }
 
-/// v15.11 L5: Fork resolution outcome — what to do after detecting a hash
-/// conflict at a finalized height.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForkResolution {
-    /// Local stored block matches the committee majority — keep local, drop incoming.
-    KeepLocal,
-    /// Incoming block matches the committee majority — local node is in minority,
-    /// rollback to (height-1) and accept the incoming block as canonical.
-    AcceptIncoming,
-    /// Quorum could not be determined within the timeout window. Defensive
-    /// no-op: keep local, log, do not act on uncertain evidence.
-    Abstain,
-}
-
-/// v15.11 L5: MAJORITY-WINS FORK RESOLUTION
-///
-/// Triggered when the storage L4 guard detects an `equivocation_attempt` at a
-/// finalized height. Polls the BFT-canonical active validator set for their
-/// stored block hash at this height, counts the distribution, and decides which
-/// chain — local or incoming — has the committee supermajority (2f+1).
-///
-/// Network protocol:
-///   * Reuses the existing `ForkCheckRequest` / `ForkCheckResponse` message
-///     family (v10.0) and the `FORK_CHECK_RESPONSES` aggregation map.
-///   * Each peer responds with its own stored hash (not a yes/no answer to
-///     ours), so the request body is a probe — `requester_hash` is ignored
-///     by responders for resolution purposes.
-///
-/// Decision rule (matches BFT 2f+1 supermajority):
-///   committee_size  = `get_active_validator_count()` (capped at MAX_VALIDATORS)
-///   threshold       = (committee_size * 2 + 2) / 3   (= 2f+1)
-///   incoming_count  = peers whose hash == incoming_hash
-///   existing_count  = peers whose hash == existing_hash
-///
-///   incoming_count ≥ threshold → AcceptIncoming  (we are minority — rollback)
-///   existing_count ≥ threshold → KeepLocal      (incoming is minority — drop)
-///   otherwise                  → Abstain        (no quorum — defensive hold)
-///
-/// Safety:
-///   * Each ForkCheckResponse is `sender_verified` (responder address matches
-///     the claimed `responder_id`); spoofed responses are dropped at the P2P
-///     layer before reaching FORK_CHECK_RESPONSES.
-///   * 2f+1 threshold guarantees a Byzantine attacker controlling ≤ f keys
-///     cannot induce a wrong KeepLocal / AcceptIncoming decision.
-///   * Abstain is the bias under uncertainty — we never roll back unless we
-///     have cryptographically validated supermajority disagreement.
-///
-/// Scalability:
-///   * Sends to all currently-validated active peers. At committee=1000 this
-///     is ~1000 outbound messages, parallel via QUIC; bandwidth O(committee)
-///     per resolution event (rare — only on detected conflict).
-///   * Response collection is bounded by the timeout window (default 800 ms).
-///   * Memory: one DashMap insert per response, prunable by the standard
-///     FORK_CHECK_RESPONSES cleanup sweep.
-pub async fn resolve_fork_via_majority(
-    height: u64,
-    incoming_hash: [u8; 32],
-    existing_hash: [u8; 32],
-    p2p: std::sync::Arc<crate::unified_p2p::SimplifiedP2P>,
-) -> ForkResolution {
-    // Same hash on both sides → no fork to resolve, idempotent.
-    if incoming_hash == existing_hash {
-        return ForkResolution::KeepLocal;
-    }
-
-    // Clear stale responses for this height before polling so the count
-    // window contains only fresh evidence from this resolution attempt.
-    FORK_CHECK_RESPONSES.retain(|k, _| k.0 != height);
-
-    // Send ForkCheckRequest to all currently-validated active peers.
-    // The body's `block_hash` is informational; responders return their
-    // own stored hash regardless. We use `incoming_hash` as a hint so
-    // peer-side logging captures what we observed.
-    let peers = p2p.get_validated_active_peers();
-    let total_peers = peers.len();
-    let our_id = crate::unified_p2p::GLOBAL_NODE_ID.read().clone();
-    if total_peers == 0 {
-        if is_warn() {
-            println!("[WARN][FORK] resolve_fork_no_peers h={} action=abstain", height);
-        }
-        return ForkResolution::Abstain;
-    }
-
-    let probe = crate::unified_p2p::NetworkMessage::ForkCheckRequest {
-        block_height: height,
-        block_hash: incoming_hash,
-        requester_id: our_id.clone(),
-    };
-    let mut sent = 0u32;
-    for peer in peers.iter() {
-        if peer.id == our_id {
-            continue;
-        }
-        p2p.send_network_message(&peer.addr, probe.clone());
-        sent += 1;
-    }
-
-    if is_info() {
-        println!(
-            "[INFO][FORK] resolve_fork_probe_sent h={} peers={} incoming_hash={:x?} existing_hash={:x?}",
-            height, sent, &incoming_hash[..8], &existing_hash[..8],
-        );
-    }
-
-    // Bounded wait window — 800 ms covers transcontinental RTT with a
-    // generous margin while keeping the apply-pipeline stall short.
-    // Polling cadence 50 ms gives ~16 samples; we exit early once the
-    // committee threshold is reached on either side.
-    let committee_size = p2p.get_active_validator_count();
-    let threshold = (committee_size * 2 + 2) / 3;
-    let started = std::time::Instant::now();
-    let max_wait = std::time::Duration::from_millis(800);
-    let poll_interval = std::time::Duration::from_millis(50);
-
-    loop {
-        let mut incoming_count = 0usize;
-        let mut existing_count = 0usize;
-        let mut other_count = 0usize;
-        for entry in FORK_CHECK_RESPONSES.iter() {
-            if entry.key().0 != height {
-                continue;
-            }
-            let h = *entry.value();
-            if h == incoming_hash {
-                incoming_count += 1;
-            } else if h == existing_hash {
-                existing_count += 1;
-            } else {
-                other_count += 1;
-            }
-        }
-
-        // Early exit — any side has reached threshold.
-        if incoming_count >= threshold {
-            if is_info() {
-                println!(
-                    "[INFO][FORK] resolve_fork_decision h={} winner=incoming incoming={} existing={} other={} threshold={} action=accept_incoming_rollback",
-                    height, incoming_count, existing_count, other_count, threshold,
-                );
-            }
-            return ForkResolution::AcceptIncoming;
-        }
-        if existing_count >= threshold {
-            if is_info() {
-                println!(
-                    "[INFO][FORK] resolve_fork_decision h={} winner=local incoming={} existing={} other={} threshold={} action=keep_local_drop_incoming",
-                    height, incoming_count, existing_count, other_count, threshold,
-                );
-            }
-            return ForkResolution::KeepLocal;
-        }
-
-        if started.elapsed() >= max_wait {
-            // No quorum within budget — defensive hold.
-            if is_warn() {
-                println!(
-                    "[WARN][FORK] resolve_fork_no_quorum h={} incoming={} existing={} other={} threshold={} action=abstain",
-                    height, incoming_count, existing_count, other_count, threshold,
-                );
-            }
-            return ForkResolution::Abstain;
-        }
-
-        tokio::time::sleep(poll_interval).await;
-    }
-}
-
-/// v15.11 L5: Convenience wrapper used by the apply pipeline. Detects a hash
-/// conflict at `height`, runs the majority resolver, and on `AcceptIncoming`
-/// triggers a rollback so the incoming block can be re-applied as canonical.
-///
-/// Returns true if the network is now configured to accept the incoming
-/// block (rollback initiated), false if the local chain remains canonical
-/// or the resolution abstained.
-pub async fn handle_fork_at_height(
-    height: u64,
-    incoming_hash: [u8; 32],
-    existing_hash: [u8; 32],
-    p2p: std::sync::Arc<crate::unified_p2p::SimplifiedP2P>,
-) -> bool {
-    let decision = resolve_fork_via_majority(height, incoming_hash, existing_hash, p2p).await;
-    match decision {
-        ForkResolution::AcceptIncoming => {
-            // Roll local chain back so the incoming block re-enters via the
-            // standard apply path (which will succeed once the existing
-            // conflicting block is gone).
-            if try_fork_recovery() {
-                let rollback_to = height.saturating_sub(1);
-                complete_rollback_cleanup(rollback_to);
-                if is_warn() {
-                    println!(
-                        "[WARN][FORK] minority_rollback_initiated h={} rolled_back_to={} incoming_hash={:x?}",
-                        height, rollback_to, &incoming_hash[..8],
-                    );
-                }
-                return true;
-            }
-            if is_warn() {
-                println!(
-                    "[WARN][FORK] minority_rollback_blocked h={} reason=fork_recovery_in_progress",
-                    height,
-                );
-            }
-            false
-        }
-        ForkResolution::KeepLocal | ForkResolution::Abstain => false,
-    }
-}
 
 /// v10.0: UNIFIED FINALITY ADVANCEMENT — single function for ALL finality paths.
 /// Checks entropy mismatch guard before advancing LAST_FINALIZED_HEIGHT.
@@ -1622,12 +1412,6 @@ lazy_static::lazy_static! {
     /// Used for Byzantine 66% consensus on producer selection
     pub static ref PRODUCER_VOTES: DashMap<(u64, String), String> = DashMap::new();
 
-    /// v10.0: Lightweight fork check responses — early warning system.
-    /// Key: (block_height, responder_node_id)
-    /// Value: block_hash at that height from that peer
-    /// Checked every FORK_CHECK_INTERVAL (5) blocks for fast fork detection.
-    /// Compared against local block hash — mismatch triggers immediate recovery.
-    pub static ref FORK_CHECK_RESPONSES: DashMap<(u64, String), [u8; 32]> = DashMap::new();
 }
 
 /// v9.0: Equivocation evidence queue for timeout vote double-voting.
@@ -1996,8 +1780,6 @@ pub fn cleanup_global_hashmaps(current_height: u64) {
     PRODUCER_VOTES.retain(|k, _| k.0 >= min_valid_height);
     let votes_removed = votes_before.saturating_sub(PRODUCER_VOTES.len());
 
-    // v10.0: Cleanup FORK_CHECK_RESPONSES - remove entries for old heights
-    FORK_CHECK_RESPONSES.retain(|k, _| k.0 >= min_valid_height);
 
     // Cleanup REQUESTED_CERTIFICATES - keep only recent (last 5 minutes)
     let now = std::time::SystemTime::now()
@@ -5261,7 +5043,7 @@ impl BlockchainNode {
     ) -> Option<qnet_state::Transaction> {
         if current_height < 2 { return None; }
         let anchor_height = current_height - 2;
-        let anchor_hash = storage.get_block_hash(anchor_height).ok().flatten()?;
+        let anchor_hash = storage.get_microblock_hash_hex(anchor_height).ok().flatten()?;
         let crypto = try_get_quantum_crypto()?;
         let hb_msg = format!("QNET_HEARTBEAT:{}:{}:{}", node_id, anchor_height, anchor_hash);
         let hb_sig = crypto.create_consensus_signature(node_id, &hb_msg).await.ok()?;
@@ -11710,7 +11492,7 @@ impl BlockchainNode {
         if inclusion_height - anchor_height > HB_ANCHOR_MAX_LAG {
             return Err(format!("anchor_stale node={} lag={}", node_id, inclusion_height - anchor_height));
         }
-        match storage.get_block_hash(anchor_height) {
+        match storage.get_microblock_hash_hex(anchor_height) {
             Ok(Some(h)) if h.eq_ignore_ascii_case(anchor_hash) => {}
             Ok(Some(_)) => return Err(format!("anchor_hash_mismatch node={} anchor={}", node_id, anchor_height)),
             Ok(None) => return Err(format!("anchor_block_missing node={} anchor={}", node_id, anchor_height)),
@@ -12201,21 +11983,24 @@ impl BlockchainNode {
                                                         microblock.merkle_root[4], microblock.merkle_root[5],
                                                         microblock.merkle_root[6], microblock.merkle_root[7]]));
                         }
-                        // v10.0: DETERMINISTIC FORK CHOICE — all nodes pick the same block.
-                        // Without this, nodes that receive blocks in different order keep
-                        // different versions → silent fork → entropy divergence → deadlock.
-                        // Use block signature hash (includes VRF randomness, non-manipulable)
-                        // instead of merkle_root (which a malicious producer could grind).
+                        // Round-aware deterministic fork choice (single authority, consistent with the
+                        // pipeline's certified-round supersession): a strictly HIGHER rotation round wins
+                        // (failover supersedes a stale primary); equal round → lower sig_hash (VRF-bound,
+                        // non-grindable). Identical on every node ⇒ no divergence.
                         let new_sig_hash = Sha3_256::digest(&microblock.signature);
                         let existing_sig_hash = Sha3_256::digest(&existing_block.signature);
-                        if new_sig_hash.as_slice() < existing_sig_hash.as_slice() {
+                        let incoming_wins = match microblock.timeout_round.cmp(&existing_block.timeout_round) {
+                            std::cmp::Ordering::Greater => true,
+                            std::cmp::Ordering::Less => false,
+                            std::cmp::Ordering::Equal => new_sig_hash.as_slice() < existing_sig_hash.as_slice(),
+                        };
+                        if incoming_wins {
                             // New block wins — replace existing. Will be saved below.
                             println!("[INFO][SEC] fork_choice h={} winner=new — replacing existing block (lower sig_hash)",
                                      microblock.height);
                             // Invalidate caches for this height since block changes
                             ENTROPY_RESPONSES.retain(|k, _| k.0 < microblock.height);
                             PRODUCER_VOTES.retain(|k, _| k.0 < microblock.height);
-                            FORK_CHECK_RESPONSES.retain(|k, _| k.0 < microblock.height);
                             // Fall through to save the new block
                         } else {
                             // Existing block wins — keep it, still signal fork for awareness
@@ -17248,17 +17033,7 @@ impl BlockchainNode {
                     }
                 }
                 
-                // ═══════════════════════════════════════════════════════════════
-                // v10.0: LIGHTWEIGHT FORK CHECK — every 5 blocks (early warning)
-                // NOT a full BFT consensus — just compare block hashes with peers.
-                // If mismatch detected → trigger immediate fork recovery.
-                // Detection: ≤5 seconds instead of ≤30 seconds (6× faster).
-                // Overhead: ~100 bytes × 3-5 peers = ~500 bytes per check (negligible).
-                // ═══════════════════════════════════════════════════════════════
                 let is_rotation_boundary_check = next_block_height > 1 && (next_block_height - 1) % ROTATION_INTERVAL_BLOCKS == 0;
-                let is_fork_check = next_block_height > FINALITY_WINDOW
-                    && next_block_height % FORK_CHECK_INTERVAL == 0
-                    && !is_rotation_boundary_check; // Skip when rotation does full entropy check
 
                 // Entropy lookahead. The rotation-boundary block (every 30)
                 // is slow — its producer must finish a synchronous entropy
@@ -17315,83 +17090,6 @@ impl BlockchainNode {
                     }
                 }
 
-                if is_fork_check {
-                    if let Some(p2p) = &unified_p2p {
-                        // Check a finalized block (FINALITY_WINDOW deep) — all synced nodes have it
-                        let check_height = next_block_height - FINALITY_WINDOW;
-                        let our_hash = Self::get_previous_microblock_hash(&storage, check_height + 1).await;
-
-                        if our_hash != [0u8; 32] {
-                            // Send check to 3 random peers (fire-and-forget, no blocking)
-                            let peers = p2p.get_validated_active_peers();
-                            let check_msg = crate::unified_p2p::NetworkMessage::ForkCheckRequest {
-                                block_height: check_height,
-                                block_hash: our_hash,
-                                requester_id: node_id.clone(),
-                            };
-                            for peer in peers.iter().take(3) {
-                                p2p.send_network_message(&peer.addr, check_msg.clone());
-                            }
-
-                            // Check responses from PREVIOUS fork check (5 blocks ago)
-                            let prev_check_height = check_height.saturating_sub(FORK_CHECK_INTERVAL);
-                            let prev_our_hash = Self::get_previous_microblock_hash(&storage, prev_check_height + 1).await;
-                            if prev_our_hash != [0u8; 32] {
-                                let mut fc_matches = 0u32;
-                                let mut fc_mismatches = 0u32;
-                                for entry in FORK_CHECK_RESPONSES.iter() {
-                                    if entry.key().0 == prev_check_height {
-                                        if *entry.value() == prev_our_hash {
-                                            fc_matches += 1;
-                                        } else {
-                                            fc_mismatches += 1;
-                                        }
-                                    }
-                                }
-                                // v13.2: BFT 67% threshold — require supermajority (>2/3) mismatch + quorum of 3
-                                // Previous 50% threshold (fc_mismatches >= fc_matches) was too aggressive:
-                                // 1 mismatch out of 2 responses killed entire network's finality.
-                                // Now: need >2/3 disagree AND minimum 3 responses.
-                                // Scales correctly for any peer count (genesis 5 → production 1000+).
-                                let fc_total = fc_matches + fc_mismatches;
-                                if fc_total >= 3 && fc_mismatches * 3 > fc_total * 2 {
-                                    println!("[ERR][FORK-CHECK] early_fork_detected h={} matches={} mismatches={} — triggering recovery",
-                                             prev_check_height, fc_matches, fc_mismatches);
-                                    ENTROPY_MISMATCH_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    ENTROPY_MISMATCH_HEIGHT.store(prev_check_height, std::sync::atomic::Ordering::SeqCst);
-                                    // v13.2: Record wall-clock time for auto-clear timeout
-                                    ENTROPY_MISMATCH_SET_TIME.store(
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs(),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-
-                                    // Trigger immediate fork recovery (same as entropy fork recovery)
-                                    if try_fork_recovery() {
-                                        let rollback_to = prev_check_height.saturating_sub(90);
-                                        complete_rollback_cleanup(rollback_to);
-                                        if let Some(ref p2p_inner) = unified_p2p {
-                                            let p2p_clone = p2p_inner.clone();
-                                            let mb_from = rollback_to / 90;
-                                            let mb_from = if mb_from == 0 { 1 } else { mb_from };
-                                            let mb_to = next_block_height / 90 + 1;
-                                            tokio::spawn(async move {
-                                                let _ = p2p_clone.sync_macroblocks(mb_from, mb_to).await;
-                                            });
-                                        }
-                                        println!("[INFO][FORK-CHECK] recovery_triggered rollback_to={}", rollback_to);
-                                    }
-                                } else if fc_matches > 0 && fc_mismatches == 0 && is_debug() {
-                                    println!("[DBG][FORK-CHECK] ok h={} matches={}", prev_check_height, fc_matches);
-                                }
-                            }
-                            // Cleanup old fork check responses
-                            FORK_CHECK_RESPONSES.retain(|k, _| k.0 >= check_height.saturating_sub(FORK_CHECK_INTERVAL));
-                        }
-                    }
-                }
 
                 // CRITICAL: Verify entropy consensus at rotation boundaries
                 // This prevents different nodes selecting different producers
@@ -18812,7 +18510,7 @@ impl BlockchainNode {
                                 let ok = tx.validate().is_ok()
                                     && ah < next_block_height
                                     && next_block_height - ah <= HB_ANCHOR_MAX_LAG
-                                    && matches!(storage.get_block_hash(ah), Ok(Some(h)) if h.eq_ignore_ascii_case(&ahash));
+                                    && matches!(storage.get_microblock_hash_hex(ah), Ok(Some(h)) if h.eq_ignore_ascii_case(&ahash));
                                 return (hash, tx, ok, if ok { None } else { Some("heartbeat_stale_or_bad_anchor".to_string()) });
                             }
                             let is_benchmark = benchmark_mode_enabled && tx.from.starts_with("EON1benchmark");

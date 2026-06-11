@@ -134,6 +134,16 @@ fn excluded_producers(storage: &Storage, mb_index: u64) -> Option<Vec<u8>> {
     if excluded.is_empty() { None } else { bincode::serialize(&excluded).ok() }
 }
 
+/// Pure finalize predicate: a checkpoint is finalizable iff our local chain reached its head AND our
+/// locally-applied state at that head matches the checkpoint's QC'd state_root. NO macroblock body
+/// required — an intra-window checkpoint (head not on a /macro_interval boundary) finalizes identically,
+/// which the old macroblock-coupled check could NOT do (it deferred forever → froze the finality marker
+/// → wedged the chain). Fail-stop on a state mismatch (never finalize a root we didn't reproduce); a
+/// head==0 placeholder (a committed index whose checkpoint we don't hold) ⇒ never.
+pub(crate) fn checkpoint_finalizable(chain_h: u64, head_height: u64, local_state_root: Option<Hash>, checkpoint_state_root: Hash) -> bool {
+    head_height > 0 && chain_h >= head_height && local_state_root == Some(checkpoint_state_root)
+}
+
 /// Execute driver Effects: sign+broadcast outbound, persist QCs, record finality.
 pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2P>, storage: &Arc<Storage>) {
     for e in effects {
@@ -249,46 +259,31 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                     },
                 }
             }
-            Effect::Finalize { index, head_height } => {
-                // Finalize only what we locally HOLD and AGREE with, so finality never outruns our own
-                // microblock tip (an ahead-of-chain marker wedges rollback recovery) and a forged root
-                // that slipped a QC can't be finalized by an honest node that applied real state.
-                let window = head_height / 90;
-                let macro_bytes = storage.get_macroblock_by_height(window).ok().flatten();
+            Effect::Finalize { index, head_height, state_root } => {
+                // Finalize a checkpoint on ITS OWN QC'd head + state_root — NOT via a macroblock body.
+                // Macroblocks seal only on /macro_interval boundaries; intra-window checkpoints on the
+                // faster /cp_interval cadence have none, so the old macroblock-coupled check deferred
+                // them forever, froze the finality marker, and wedged the chain. Fail-stop: advance the
+                // monotonic marker (LAST_FINALIZED_HEIGHT, read by the production_gate / sync / RPC) ONLY
+                // if our local microblock tip reached the head AND our locally-applied state at the head
+                // matches the QC'd state_root (never finalize a root we didn't reproduce). Monotonic ⇒
+                // a stale/replayed Finalize never regresses it, and finality never outruns the applied tip.
                 let chain_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
-                // (1) macroblock body present AND (2) our microblock tip reached the window head
-                // (⇒ every microblock ≤ head_height is applied) — keeps finality ≤ local chain tip.
-                let have_window = macro_bytes.is_some() && chain_h >= head_height;
-                // (3) state agreement: the macroblock's state_root must equal our locally-applied
-                // window-head root, else defer (fail-stop) — never finalize state we didn't reproduce.
-                let state_ok = match (
-                    macro_bytes.as_ref().and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(b).ok()),
-                    storage.load_microblock_auto_format(head_height).ok().flatten(),
-                ) {
-                    (Some(mb), Some(head_mb)) if mb.state_root != head_mb.state_root => {
-                        if crate::node::is_warn() {
-                            println!("[WARN][BFT2] finalize_state_mismatch round={} window={} — defer", index, window);
-                        }
-                        false // fail-stop: never finalize a window whose state we don't locally reproduce
-                    }
-                    _ => true,
-                };
-                if !have_window || !state_ok {
-                    if crate::node::is_warn() {
-                        println!("[WARN][BFT2] finalize_deferred round={} window={} body={} chain_h={} state_ok={}",
-                                 index, window, macro_bytes.is_some(), chain_h, state_ok);
-                    }
-                } else {
-                    // v2 is the single finality authority: advance the canonical monotonic marker
-                    // (LAST_FINALIZED_HEIGHT / LAST_FINALIZED_CONSENSUS_ROUND) read by the production_gate,
-                    // sync, recovery and RPC. Monotonic ⇒ a stale/replayed Finalize never regresses it.
-                    let prev = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::Acquire);
-                    if head_height > prev {
+                let local_root = storage.load_microblock_auto_format(head_height).ok().flatten()
+                    .map(|m| m.state_root);
+                if checkpoint_finalizable(chain_h, head_height, local_root, state_root) {
+                    if head_height > crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::Acquire) {
                         crate::node::try_advance_finality(head_height, "BFT2");
                         if crate::node::is_info() {
-                            println!("[INFO][BFT2] checkpoint_final round={} window={} finalized_h={}", index, window, head_height);
+                            println!("[INFO][BFT2] checkpoint_final round={} finalized_h={}", index, head_height);
                         }
                     }
+                } else if crate::node::is_warn() {
+                    // Transient: chain tip not yet at the head, or (fail-stop) our state diverges. The
+                    // run-loop timer re-emits via committed_finalize() until caught up; §4.5 sync repairs a
+                    // genuine state divergence. NOT the old permanent defer (no macroblock dependency now).
+                    println!("[WARN][BFT2] finalize_deferred round={} head_h={} chain_h={} state_match={}",
+                             index, head_height, chain_h, local_root == Some(state_root));
                 }
             }
         }
@@ -588,13 +583,39 @@ pub async fn run(
                 // attempt every tick while the committed head is ahead of finality. try_advance_finality
                 // is monotonic + guarded (chain_h ≥ head, state match) ⇒ a no-op once caught up and it
                 // NEVER advances finality past the applied tip.
-                if let Some(head) = driver.committed_head() {
+                if let Some((head, sr)) = driver.committed_finalize() {
                     if head > crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::Acquire) {
                         let idx = driver.committed_index();
-                        execute(vec![Effect::Finalize { index: idx, head_height: head }], &node_id, &p2p, &storage).await;
+                        execute(vec![Effect::Finalize { index: idx, head_height: head, state_root: sr }], &node_id, &p2p, &storage).await;
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod finality_tests {
+    use super::*;
+    fn h(n: u8) -> Hash { [n; 32] }
+
+    // Regression: an intra-window checkpoint (head not on a /macro_interval boundary) MUST finalize on
+    // head+state_root ALONE. The old macroblock-coupled check (window=head/90 + macroblock body) deferred
+    // every intra-checkpoint forever, froze the finality marker, and wedged the chain (the h~2221 freeze).
+    #[test]
+    fn checkpoint_finalizable_intra_window_needs_no_macroblock() {
+        // intra-window head 120 (120 % 90 != 0): finalize when our tip reached the head + state matches
+        assert!(checkpoint_finalizable(120, 120, Some(h(7)), h(7)));
+        assert!(checkpoint_finalizable(250, 120, Some(h(7)), h(7))); // tip well ahead — fine
+        // a macroblock-boundary head (180) finalizes the SAME way — no special-case, no macroblock needed
+        assert!(checkpoint_finalizable(180, 180, Some(h(9)), h(9)));
+        // tip not yet at the head ⇒ defer (transient, the timer re-emits; NOT a permanent wedge)
+        assert!(!checkpoint_finalizable(119, 120, Some(h(7)), h(7)));
+        // fail-stop: our locally-applied state diverges from the QC'd root ⇒ NEVER finalize
+        assert!(!checkpoint_finalizable(120, 120, Some(h(8)), h(7)));
+        // local head microblock missing ⇒ can't confirm ⇒ defer
+        assert!(!checkpoint_finalizable(120, 120, None, h(7)));
+        // head==0 placeholder (a committed index whose checkpoint we don't hold) ⇒ NEVER finalize
+        assert!(!checkpoint_finalizable(10_000, 0, Some(h(0)), h(0)));
     }
 }

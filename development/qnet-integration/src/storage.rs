@@ -3996,6 +3996,15 @@ impl Storage {
         self.persistent.load_microblock_hash(height)
     }
 
+    /// Canonical anchor-hash accessor for Heartbeat TXs: hex of the microblock CONSENSUS hash at
+    /// `height`, via the backfilling microblock-hash index — NOT get_block_hash, which reads the
+    /// full-block "blocks" CF that microblocks never populate (it returns None for EVERY microblock
+    /// anchor, silently breaking Heartbeat emission AND verification). Single source of truth so the
+    /// emitter, the producer gate and verify_heartbeat_tx can never disagree on the anchor format.
+    pub fn get_microblock_hash_hex(&self, height: u64) -> IntegrationResult<Option<String>> {
+        Ok(self.load_microblock_hash(height)?.map(hex::encode))
+    }
+
     /// v10.2: Save a hash index entry (used for backfilling during validation fallback).
     pub fn save_microblock_hash(&self, height: u64, hash: &[u8]) -> IntegrationResult<()> {
         let metadata_cf = self.persistent.db.cf_handle("metadata")

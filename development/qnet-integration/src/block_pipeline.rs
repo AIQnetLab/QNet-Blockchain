@@ -2816,53 +2816,6 @@ impl BlockPipeline {
                             if is_info() { println!("[INFO][PIPELINE] block_rollback h={} reason=save_failed", height); }
                         }
 
-                        // L5 majority-wins fork-resolution trigger. A
-                        // fork_conflict save error means the storage L4 guard
-                        // caught a different block at this height (and already
-                        // recorded equivocation evidence); here we also invoke
-                        // the BFT majority resolver to pick the canonical chain
-                        // and roll back the local minority. ONLY on
-                        // fork_conflict (other StorageErrors propagate).
-                        // Resolver needs 2f+1 (≤f can't induce a wrong
-                        // rollback); Abstain → keep local (defensive); gated by
-                        // try_fork_recovery (no rollback storms); fire-and-
-                        // forget, 800 ms timeout.
-                        let err_msg = format!("{}", e);
-                        if err_msg.contains("fork_conflict") {
-                            if let Some(ref p2p) = ctx.unified_p2p {
-                                let p2p_clone = p2p.clone();
-                                let storage_for_lookup = ctx.storage.clone();
-                                let incoming_hash = block.microblock.hash();
-                                let conflict_height = height;
-                                tokio::spawn(async move {
-                                    // Recover the existing block's hash from storage (the one
-                                    // that L4 detected as conflicting against incoming).
-                                    let existing_hash = match tokio::task::spawn_blocking(move || {
-                                        storage_for_lookup
-                                            .load_microblock_hash(conflict_height)
-                                            .ok()
-                                            .flatten()
-                                    })
-                                    .await
-                                    {
-                                        Ok(Some(h)) => h,
-                                        _ => {
-                                            // Without the existing hash we cannot resolve;
-                                            // L4 evidence is still recorded for slashing.
-                                            return;
-                                        }
-                                    };
-
-                                    let _ = crate::node::handle_fork_at_height(
-                                        conflict_height,
-                                        incoming_hash,
-                                        existing_hash,
-                                        p2p_clone,
-                                    )
-                                    .await;
-                                });
-                            }
-                        }
 
                         false
                     }
