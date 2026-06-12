@@ -3907,13 +3907,16 @@ async fn handle_transaction_history(
                         "transfer" => matches!(tx.tx_type, qnet_state::TransactionType::Transfer { .. }),
                         "reward" => matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution),
                         "activation" => matches!(tx.tx_type, qnet_state::TransactionType::NodeActivation { .. }),
-                        "heartbeat_commitment" => matches!(tx.tx_type, qnet_state::TransactionType::HeartbeatCommitment { .. }),
+                        "heartbeat_commitment" | "heartbeat" => matches!(tx.tx_type,
+                            qnet_state::TransactionType::HeartbeatCommitment { .. } |
+                            qnet_state::TransactionType::Heartbeat { .. }),
                         "ping_commitment" => matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. }),
                         "node_registration" => matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. }),
                         "node_reactivation" => matches!(tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. }),
                         "swap" => matches!(tx.tx_type, qnet_state::TransactionType::Swap { .. }),
                         "system" => matches!(tx.tx_type,
                             qnet_state::TransactionType::HeartbeatCommitment { .. } |
+                            qnet_state::TransactionType::Heartbeat { .. } |
                             qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
                             qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
                             qnet_state::TransactionType::NodeReactivation { .. } |
@@ -3960,6 +3963,7 @@ async fn handle_transaction_history(
                     qnet_state::TransactionType::BatchRewardClaims { .. } => "batch_reward",
                     qnet_state::TransactionType::BatchNodeActivations { .. } => "batch_activation",
                     qnet_state::TransactionType::HeartbeatCommitment { .. } => "heartbeat_commitment",
+                    qnet_state::TransactionType::Heartbeat { .. } => "heartbeat",
                     qnet_state::TransactionType::PingCommitmentWithSampling { .. } => "ping_commitment",
                     qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } => "bitmap_commitment",
                     qnet_state::TransactionType::NodeRegistration { .. } => "node_registration",

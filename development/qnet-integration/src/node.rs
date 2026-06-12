@@ -928,15 +928,6 @@ pub static LAST_FINALIZED_CONSENSUS_ROUND: AtomicU64 = AtomicU64::new(0);
 // This provides the same guarantee as Casper FFG checkpoints.
 pub static LAST_FINALIZED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
-// v10.0: ENTROPY MISMATCH GUARD — prevents finalizing diverged chains.
-// When entropy mismatch is detected, finality advancement is paused to keep
-// rollback possible. Without this, finalized diverged chains create permanent deadlock.
-// Reset when entropy consensus succeeds (bft_ok) at next rotation boundary.
-pub static ENTROPY_MISMATCH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub static ENTROPY_MISMATCH_HEIGHT: AtomicU64 = AtomicU64::new(0);
-/// v13.2: Wall-clock timestamp when ENTROPY_MISMATCH_ACTIVE was set (for auto-clear timeout)
-pub static ENTROPY_MISMATCH_SET_TIME: AtomicU64 = AtomicU64::new(0);
-
 /// FIX R23-F3: Weak subjectivity checkpoint — prevents long-range attacks.
 /// A syncing node MUST NOT accept a chain whose tip is below this height.
 /// Updated via env var QNET_WEAK_SUBJECTIVITY_CHECKPOINT or hardcoded after each release.
@@ -1000,16 +991,10 @@ pub fn complete_rollback_cleanup(target_height: u64) {
 }
 
 
-/// v10.0: UNIFIED FINALITY ADVANCEMENT — single function for ALL finality paths.
-/// Checks entropy mismatch guard before advancing LAST_FINALIZED_HEIGHT.
-/// Returns true if finality was advanced, false if blocked by entropy mismatch.
-///
-/// v13.2: Auto-clear ENTROPY_MISMATCH after 120s timeout.
-/// Without this, entropy_mismatch creates a permanent deadlock:
-///   ENTROPY_MISMATCH=true → finality blocked → production_gate → no new blocks
-///   → bft_ok never fires → ENTROPY_MISMATCH never cleared → DEAD NETWORK.
-/// Auto-clear breaks the cycle: after 120s the mismatch is considered stale,
-/// finality resumes, production_gate opens, network recovers.
+/// Unified finality advancement — the single entry point for ALL finality paths.
+/// Advances LAST_FINALIZED_HEIGHT/ROUND monotonically; returns true once final
+/// at/beyond `round`. The canonical chain is resolved by round-based fork-choice,
+/// so this path never gates on entropy — it only moves finality forward.
 pub fn try_advance_finality(round: u64, context: &str) -> bool {
     // v14.8.1: ATOMIC ROLLBACK INVARIANT — serialised via FINALITY_MUTEX.
     //
@@ -1028,34 +1013,6 @@ pub fn try_advance_finality(round: u64, context: &str) -> bool {
             println!("[WARN][{}] skip_finality_rollback_in_progress round={}", context, round);
         }
         return false;
-    }
-    if ENTROPY_MISMATCH_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-        // v13.2: Auto-clear after timeout — prevents permanent deadlock
-        let mismatch_age = {
-            let _mismatch_h = ENTROPY_MISMATCH_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-            let _chain_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-            // Use wall-clock: entropy mismatch is time-bound, not height-bound
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let set_time = ENTROPY_MISMATCH_SET_TIME.load(std::sync::atomic::Ordering::Relaxed);
-            if set_time > 0 { now.saturating_sub(set_time) } else { 0 }
-        };
-
-        const ENTROPY_MISMATCH_TIMEOUT_SECS: u64 = 120;
-        if mismatch_age > ENTROPY_MISMATCH_TIMEOUT_SECS {
-            ENTROPY_MISMATCH_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-            println!("[INFO][FINALITY] entropy_mismatch_auto_cleared age={}s timeout={}s round={} context={}",
-                     mismatch_age, ENTROPY_MISMATCH_TIMEOUT_SECS, round, context);
-            // Fall through to advance finality
-        } else {
-            if is_warn() {
-                println!("[WARN][{}] skip_finality_entropy_mismatch round={} age={}s timeout_in={}s",
-                         context, round, mismatch_age, ENTROPY_MISMATCH_TIMEOUT_SECS - mismatch_age);
-            }
-            return false;
-        }
     }
     // Finality is monotonic: a finalized height is irreversible and never moves
     // backward through this path. The only legitimate lowering is explicit fork
@@ -1141,7 +1098,6 @@ static METRIC_ATTEST_BROADCAST_COUNT: AtomicU64 = AtomicU64::new(0);     // Bloc
 static METRIC_EMPTY_SLOT_BROADCAST_COUNT: AtomicU64 = AtomicU64::new(0); // Empty-slot attestations this node broadcast
 static METRIC_EMPTY_SLOT_FAILOVERS: AtomicU64 = AtomicU64::new(0);       // Times empty-slot 2f+1 advanced rotation
 static METRIC_FORK_KEEP_LOCAL_LAYER1: AtomicU64 = AtomicU64::new(0);     // 2f+1 supermajority kept local block
-static METRIC_FORK_KEEP_LOCAL_LAYER2: AtomicU64 = AtomicU64::new(0);     // Chain weight density kept local
 static METRIC_FORK_RESYNC: AtomicU64 = AtomicU64::new(0);                // Local chain abandoned, resyncing
 static METRIC_LATEST_COMMITTEE_SIZE: AtomicU64 = AtomicU64::new(0);      // Last observed committee size
 
@@ -1236,7 +1192,6 @@ pub struct FailoverMetrics {
     pub empty_slot_broadcast_count: u64,
     pub empty_slot_failovers: u64,
     pub fork_keep_local_layer1: u64,
-    pub fork_keep_local_layer2: u64,
     pub fork_resync_count: u64,
     pub latest_committee_size: u64,
     pub node_uptime_secs: u64,
@@ -1261,7 +1216,6 @@ pub fn get_extended_failover_metrics() -> FailoverMetrics {
         empty_slot_broadcast_count: METRIC_EMPTY_SLOT_BROADCAST_COUNT.load(Ordering::Relaxed),
         empty_slot_failovers: METRIC_EMPTY_SLOT_FAILOVERS.load(Ordering::Relaxed),
         fork_keep_local_layer1: METRIC_FORK_KEEP_LOCAL_LAYER1.load(Ordering::Relaxed),
-        fork_keep_local_layer2: METRIC_FORK_KEEP_LOCAL_LAYER2.load(Ordering::Relaxed),
         fork_resync_count: METRIC_FORK_RESYNC.load(Ordering::Relaxed),
         latest_committee_size: METRIC_LATEST_COMMITTEE_SIZE.load(Ordering::Relaxed),
         node_uptime_secs: node_uptime_secs(),
@@ -1276,17 +1230,16 @@ fn emit_attestation_metrics_window(window_secs: u64) {
     let empty = METRIC_EMPTY_SLOT_BROADCAST_COUNT.swap(0, Ordering::Relaxed);
     let empty_failovers = METRIC_EMPTY_SLOT_FAILOVERS.swap(0, Ordering::Relaxed);
     let keep1 = METRIC_FORK_KEEP_LOCAL_LAYER1.swap(0, Ordering::Relaxed);
-    let keep2 = METRIC_FORK_KEEP_LOCAL_LAYER2.swap(0, Ordering::Relaxed);
     let resync = METRIC_FORK_RESYNC.swap(0, Ordering::Relaxed);
     let committee = METRIC_LATEST_COMMITTEE_SIZE.load(Ordering::Relaxed);
 
     let any_activity = attests > 0 || empty > 0 || empty_failovers > 0
-        || keep1 > 0 || keep2 > 0 || resync > 0;
+        || keep1 > 0 || resync > 0;
 
     if any_activity {
         println!(
-            "[METRICS][ATTEST] window={}s committee={} attests={} empty_atts={} empty_failovers={} keep_local_layer1={} keep_local_layer2={} resync={}",
-            window_secs, committee, attests, empty, empty_failovers, keep1, keep2, resync,
+            "[METRICS][ATTEST] window={}s committee={} attests={} empty_atts={} empty_failovers={} keep_local_layer1={} resync={}",
+            window_secs, committee, attests, empty, empty_failovers, keep1, resync,
         );
     }
 }
@@ -3717,10 +3670,6 @@ impl BlockchainNode {
         // sets (RETURNING nodes). Without L2 a genesis node offline >3 epochs
         // is locked out (block-0 registration is outside the scan window).
         {
-            let existing_ids: std::collections::HashSet<String> = eligible.iter()
-                .map(|p| p.node_id.clone())
-                .collect();
-
             // ── LEVEL 1: Recent NodeReactivation TX scan (SYNC-PROOF REQUIRED) ──
             //
             // v10.0 CRITICAL FIX: NodeRegistration alone does NOT grant eligibility.
@@ -3732,8 +3681,6 @@ impl BlockchainNode {
             let scan_end = macroblock_index * 90;
             const PHASE_2A_SCAN_BLOCKS: u64 = 14_400;
             let scan_start = scan_end.saturating_sub(PHASE_2A_SCAN_BLOCKS);
-            const SYNC_PROXIMITY_BLOCKS: u64 = 90;
-            let mut skipped_unsynced_reg = 0usize;
 
             // Phase 1: registered Super node IDs (necessary, not sufficient).
             let mut registered_super_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3749,116 +3696,6 @@ impl BlockchainNode {
                         }
                     }
                 }
-            }
-
-            // Phase 2A: HBC sync proof grants eligibility.
-            // Gates: registered, dedup, window proximity, all samples
-            // chain-anchored, every sample's Dilithium sig + merkle proof
-            // verifies against the TX's merkle_root (v31.10), reputation OK.
-            let mut added_heartbeat_count = 0usize;
-            let mut skipped_forged_samples = 0usize;
-            let mut skipped_bad_merkle = 0usize;
-            for height in scan_start..=scan_end {
-                if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
-                    for tx in &block.transactions {
-                        if let qnet_state::TransactionType::HeartbeatCommitment {
-                            node_id,
-                            heartbeat_samples,
-                            window_end_height,
-                            merkle_root,
-                            ..
-                        } = &tx.tx_type {
-                            if !registered_super_nodes.contains(node_id) {
-                                continue;
-                            }
-                            if existing_ids.contains(node_id)
-                                || eligible.iter().any(|p| p.node_id == *node_id)
-                            {
-                                continue;
-                            }
-                            if *window_end_height + SYNC_PROXIMITY_BLOCKS < scan_end {
-                                continue;
-                            }
-                            let max_sample_h = heartbeat_samples.iter()
-                                .map(|s| s.block_height)
-                                .max()
-                                .unwrap_or(0);
-                            if max_sample_h + SYNC_PROXIMITY_BLOCKS < scan_end
-                                || max_sample_h > scan_end + SYNC_PROXIMITY_BLOCKS
-                            {
-                                continue;
-                            }
-
-                            // v31.7: every sample must reference a real local block.
-                            let all_samples_anchored = heartbeat_samples.iter().all(|s| {
-                                matches!(
-                                    storage.load_microblock_auto_format(s.block_height),
-                                    Ok(Some(_))
-                                )
-                            });
-                            if !all_samples_anchored {
-                                skipped_forged_samples += 1;
-                                continue;
-                            }
-
-                            // v31.10: Dilithium sig + merkle replay vs TX merkle_root.
-                            // p2p is in scope as a function parameter.
-                            let mut all_samples_valid = true;
-                            for sample in heartbeat_samples {
-                                let msg = format!(
-                                    "{}:{}:{}:{}",
-                                    node_id, sample.timestamp, sample.block_height, sample.heartbeat_index
-                                );
-                                if !p2p.verify_dilithium_heartbeat_signature(&msg, &sample.signature, node_id) {
-                                    all_samples_valid = false;
-                                    break;
-                                }
-                                use blake3::Hasher as Blake3Hasher;
-                                let mut hasher = Blake3Hasher::new();
-                                hasher.update(node_id.as_bytes());
-                                hasher.update(&[sample.heartbeat_index]);
-                                hasher.update(&sample.timestamp.to_le_bytes());
-                                hasher.update(&sample.block_height.to_le_bytes());
-                                hasher.update(sample.signature.as_bytes());
-                                let leaf_hex = hasher.finalize().to_hex().to_string();
-                                if !qnet_core::crypto::merkle::verify_merkle_proof(
-                                    &leaf_hex, merkle_root, &sample.merkle_proof
-                                ) {
-                                    all_samples_valid = false;
-                                    break;
-                                }
-                            }
-                            if !all_samples_valid {
-                                skipped_bad_merkle += 1;
-                                continue;
-                            }
-
-                            let reputation = (reputation_map.get(node_id).copied()
-                                .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION)
-                                .clamp(0.0, 100.0) * 100.0).round() as u32;
-                            if reputation < MIN_REPUTATION_BP {
-                                continue;
-                            }
-
-                            eligible.push(qnet_state::EligibleProducer {
-                                node_id: node_id.clone(),
-                                reputation,
-                            });
-                            added_heartbeat_count += 1;
-                        }
-                    }
-                }
-            }
-
-            for reg_node in &registered_super_nodes {
-                if !existing_ids.contains(reg_node) && !eligible.iter().any(|p| p.node_id == *reg_node) {
-                    skipped_unsynced_reg += 1;
-                }
-            }
-
-            if added_heartbeat_count > 0 || skipped_unsynced_reg > 0 || skipped_forged_samples > 0 || skipped_bad_merkle > 0 {
-                println!("[INFO][SNAP] L1_SCAN added_hb={} skipped_no_proof={} skipped_forged={} skipped_bad_merkle={} (h={}-{}) total={}",
-                         added_heartbeat_count, skipped_unsynced_reg, skipped_forged_samples, skipped_bad_merkle, scan_start, scan_end, eligible.len());
             }
 
             // v35: Phase-2A admits a registered Super node on UNFORGEABLE on-chain liveness —
@@ -9337,27 +9174,6 @@ impl BlockchainNode {
                         // Don't exclude yet, but log for monitoring
                     }
                     
-                    // v3.32: COMPETING PRODUCER DETECTION on block reception
-                    // If we're currently producing and receive a valid block from a DIFFERENT
-                    // producer in the same rotation round → signal split-brain conflict.
-                    // The production loop will check this flag and yield immediately.
-                    if producer != &node_id {
-                        let block_round = if received_block.height > 0 {
-                            (received_block.height - 1) / ROTATION_INTERVAL_BLOCKS
-                        } else { 0 };
-                        if let NodeState::Producing { round, .. } = get_node_state() {
-                            if block_round == round {
-                                crate::unified_p2p::set_competing_producer(round, received_block.height);
-                                if is_info() {
-                                    println!("[INFO][CONS] competing_producer_block h={} producer={} our_round={}",
-                                             received_block.height, producer, round);
-                                }
-                            } else if is_debug() {
-                                println!("[DBG][CONS] other_round_block h={} producer={} block_round={} our_round={}",
-                                         received_block.height, producer, block_round, round);
-                            }
-                        }
-                    }
                 }
                 
                 // Periodically clear expired exclusions
@@ -9871,79 +9687,6 @@ impl BlockchainNode {
                                                             return;
                                                         }
 
-                                                        // ═══════════════════════════════════════════════════════════
-                                                        // FORK-CHOICE LAYER 2 — Cumulative chain weight.
-                                                        // ───────────────────────────────────────────────────────────
-                                                        // No 2f+1 supermajority on the disputed block alone — but the
-                                                        // local chain may still be canonical if its CUMULATIVE weight
-                                                        // (sum of attestations along the chain history from the last
-                                                        // finalized macroblock to tip) is dominant. We compute our
-                                                        // local chain weight and a healthy-density threshold.
-                                                        //
-                                                        // Healthy density = ⌈ committee_size / 2 ⌉ × depth.
-                                                        // Rationale: under normal operation a majority of the
-                                                        // committee attests every block, so a depth-K chain
-                                                        // accumulates ~ committee_size × K weight. A chain at
-                                                        // ≥ 50% density is "well-supported" — a minority partition
-                                                        // would be far below this threshold because attestation
-                                                        // committee membership is deterministic and minority
-                                                        // attestations cannot accumulate without majority quorum.
-                                                        //
-                                                        // WARM-UP GATE:
-                                                        //   Skipped during the first ATTESTATION_WARMUP_SECS after
-                                                        //   process startup. The local attestation store is empty
-                                                        //   immediately after restart and rebuilds from the gossip
-                                                        //   stream over ~10–30 s. During that window, the
-                                                        //   cumulative-weight signal is artificially low and would
-                                                        //   force unnecessary rollbacks. Layer 1 (per-block 2f+1)
-                                                        //   continues to provide safety during warm-up.
-                                                        //
-                                                        // SAFETY:
-                                                        //   * Layer 1 already excluded blocks with 2f+1 — those
-                                                        //     keep without further evaluation.
-                                                        //   * Layer 2 is a strictly weaker keep-local condition;
-                                                        //     it never causes us to keep a block that 2f+1 of the
-                                                        //     committee actively dispute (otherwise we'd see a
-                                                        //     competing-block supermajority elsewhere).
-                                                        //   * If local weight is low (partition-isolated), we
-                                                        //     proceed to rollback path — same as before.
-                                                        // ═══════════════════════════════════════════════════════════
-                                                        if !crate::node::attestation_layer_warmed_up() {
-                                                            if is_info() {
-                                                                println!("[INFO][REORG] layer2_warmup_gate uptime={}s required={}s — skipping chain-weight evaluation",
-                                                                         crate::node::node_uptime_secs(),
-                                                                         crate::node::ATTESTATION_WARMUP_SECS);
-                                                            }
-                                                        } else {
-                                                            let finalized_height = crate::node::LAST_FINALIZED_HEIGHT
-                                                                .load(std::sync::atomic::Ordering::SeqCst);
-                                                            let local_weight = Self::compute_local_chain_weight(
-                                                                &storage_clone, finalized_height, local_height,
-                                                            ).await;
-
-                                                            if let Some(ref lw) = local_weight {
-                                                                let healthy_density: u64 = ((committee_size as u64 + 1) / 2)
-                                                                    .saturating_mul(lw.depth);
-
-                                                                if lw.total_weight >= healthy_density && lw.depth > 0 {
-                                                                    METRIC_FORK_KEEP_LOCAL_LAYER2.fetch_add(1, Ordering::Relaxed);
-                                                                    if is_info() {
-                                                                        println!("[INFO][REORG] chain_weight_dominant h={} total_weight={} depth={} avg={:.1} density={} action=keep_local",
-                                                                                 fork_height, lw.total_weight, lw.depth, lw.avg_per_block(), healthy_density);
-                                                                    }
-                                                                    *reorg_flag.write().await = false;
-                                                                    return;
-                                                                }
-
-                                                                if is_info() {
-                                                                    println!("[INFO][REORG] chain_weight_low h={} total_weight={} depth={} avg={:.1} density_required={} action=resync",
-                                                                             fork_height, lw.total_weight, lw.depth, lw.avg_per_block(), healthy_density);
-                                                                }
-                                                            } else if is_warn() {
-                                                                println!("[WARN][REORG] chain_weight_compute_failed h={} reason=missing_local_blocks fallback=resync",
-                                                                         fork_height);
-                                                            }
-                                                        }
                                                         METRIC_FORK_RESYNC.fetch_add(1, Ordering::Relaxed);
 
                                                         if is_info() {
@@ -15691,9 +15434,13 @@ impl BlockchainNode {
                             //               └ yes → skip (leader proven alive)
                             //               └ no  → proceed to emit
                             //       └ not cached → proceed to emit (defensive)
-                            let expected_producer =
-                                crate::node::get_expected_producer(next_height)
-                                    .map(|(producer, _round)| producer);
+                            // Deterministic leader (pure fn of height+certified round+candidates),
+                            // not the evictable cache: chronic-stall clears the cache, which left the
+                            // failover with expected=- and unable to re-elect a producer for the gap.
+                            let expected_producer = Some(Self::select_microblock_producer_with_round(
+                                next_height, &unified_p2p, &node_id, node_type, Some(&storage), &poh,
+                                current_rotation_round,
+                            ).await).filter(|p| !p.is_empty());
 
                             // v26 D2: heartbeat/self may only DELAY view-change,
                             // never veto it indefinitely. Suppression honoured only
@@ -17380,11 +17127,6 @@ impl BlockchainNode {
                                 if matches >= byzantine_threshold {
                                     let elapsed_ms = consensus_start.elapsed().as_millis();
                                     if is_info() { println!("[INFO][CONS] bft_ok match={} ms={}", matches, elapsed_ms); }
-                                    // v10.0: Clear entropy mismatch guard — consensus succeeded
-                                    if ENTROPY_MISMATCH_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-                                        ENTROPY_MISMATCH_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-                                        println!("[INFO][CONS] entropy_mismatch_cleared h={}", next_block_height);
-                                    }
                                     consensus_reached = true;
                                     break;
                                 }
@@ -17468,69 +17210,15 @@ impl BlockchainNode {
                                     println!("[ERR][CONS] fork_detected mismatches={} matches=0 total={}",
                                              mismatches, total_responses);
 
-                                    // v10.0: Block finality advancement while entropy diverges
-                                    // This prevents finalizing diverged chains → permanent deadlock
-                                    ENTROPY_MISMATCH_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    ENTROPY_MISMATCH_HEIGHT.store(next_block_height, std::sync::atomic::Ordering::SeqCst);
-                                    // v13.2: Record wall-clock time for auto-clear timeout
-                                    ENTROPY_MISMATCH_SET_TIME.store(
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs(),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-
+                                    // Round-based fork-choice + macroblock-anchored recovery resolve the
+                                    // canonical chain; here we only yield production this tick so a minority
+                                    // entropy view never extends a losing fork. BFT timeout drives failover.
                                     if is_my_turn_to_produce {
-                                        // v3.33: Producer yields this rotation only — BFT Timeout handles failover.
                                         println!("[INFO][CONS] producer_yield_fork h={} mismatches={}",
                                                  next_block_height, mismatches);
                                         is_my_turn_to_produce = false;
                                         *is_leader.write().await = false;
                                         set_node_state(NodeState::Idle { last_height: microblock_height });
-                                    } else {
-                                        set_node_state(NodeState::Error {
-                                            reason: format!("Fork: {} mismatches, 0 matches", mismatches),
-                                            recoverable: true,
-                                        });
-                                        // v9.5: FORK RECOVERY — rollback to last macroblock boundary + re-sync.
-                                        let rotation_interval = 30u64;
-                                        let exclude_until = ((next_block_height / rotation_interval) + 3) * rotation_interval;
-                                        exclude_producer(&node_id, "entropy_fork_detected", exclude_until);
-
-                                        // v9.5: Cooldown prevents 30000 nodes from spamming sync_macroblocks
-                                        // every consensus tick when network-wide fork occurs.
-                                        if try_fork_recovery() {
-                                            // Rollback at most 2 macroblock epochs (180 blocks).
-                                            // Clamped to prevent O(100000) clear_block_pending_sync calls
-                                            // when height is large (e.g., h=100000, rollback_to=0 → 100k iterations).
-                                            let rollback_to = next_block_height.saturating_sub(180);
-                                            let mb_from = rollback_to / 90;
-                                            let mb_from = if mb_from == 0 { 1 } else { mb_from };
-                                            let mb_to = next_block_height / 90 + 1;
-                                            println!("[INFO][CONS] fork_recovery h={} rollback_to={} mb={}-{} exclude_until={}",
-                                                     next_block_height, rollback_to, mb_from, mb_to, exclude_until);
-
-                                            complete_rollback_cleanup(rollback_to);
-
-                                            if let Some(ref p2p) = unified_p2p {
-                                                let p2p_clone = p2p.clone();
-                                                let clear_from = rollback_to;
-                                                let clear_to = next_block_height;
-                                                tokio::spawn(async move {
-                                                    for h in clear_from..=clear_to {
-                                                        crate::unified_p2p::clear_block_pending_sync(h);
-                                                    }
-                                                    if let Err(e) = p2p_clone.sync_macroblocks(mb_from, mb_to).await {
-                                                        eprintln!("[WARN][CONS] fork_recovery_sync_fail err={}", e);
-                                                    } else {
-                                                        println!("[INFO][CONS] fork_recovery_sync_ok mb_range={}-{}", mb_from, mb_to);
-                                                    }
-                                                });
-                                            }
-                                        } else {
-                                            println!("[INFO][CONS] fork_recovery_cooldown h={} (60s between attempts)", next_block_height);
-                                        }
                                     }
                                     continue;
                                 } else if matches == 0 && (total_responses < min_fork_detection_responses || next_block_height <= 10) {
@@ -17542,61 +17230,15 @@ impl BlockchainNode {
                                     println!("[ERR][CONS] fork_detected mismatches={} matches={} majority=disagree",
                                              mismatches, matches);
 
-                                    // v10.0: Block finality advancement while entropy diverges
-                                    ENTROPY_MISMATCH_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    ENTROPY_MISMATCH_HEIGHT.store(next_block_height, std::sync::atomic::Ordering::SeqCst);
-                                    // v13.2: Record wall-clock time for auto-clear timeout
-                                    ENTROPY_MISMATCH_SET_TIME.store(
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs(),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-
+                                    // Majority holds a different entropy view → we are in the minority.
+                                    // Yield production this tick; round-based fork-choice + the macroblock-
+                                    // anchored recovery path converge us back onto the canonical chain.
                                     if is_my_turn_to_produce {
-                                        // v3.33: Producer yields — majority disagrees with our entropy,
-                                        // meaning majority selected a different producer. We're in the minority.
                                         println!("[INFO][CONS] producer_yield_majority h={} mismatches={} matches={}",
                                                  next_block_height, mismatches, matches);
                                         is_my_turn_to_produce = false;
                                         *is_leader.write().await = false;
                                         set_node_state(NodeState::Idle { last_height: microblock_height });
-                                    } else {
-                                        set_node_state(NodeState::Error {
-                                            reason: format!("Fork: {} mismatches vs {} matches", mismatches, matches),
-                                            recoverable: true,
-                                        });
-                                        // v9.5: FORK RECOVERY — majority disagrees, we're on wrong chain.
-                                        // Cooldown shared with definite-fork path (same AtomicU64).
-                                        if try_fork_recovery() {
-                                            let rollback_to = next_block_height.saturating_sub(180);
-                                            let mb_from = rollback_to / 90;
-                                            let mb_from = if mb_from == 0 { 1 } else { mb_from };
-                                            let mb_to = next_block_height / 90 + 1;
-                                            println!("[INFO][CONS] majority_fork_recovery h={} rollback_to={} mb={}-{}",
-                                                     next_block_height, rollback_to, mb_from, mb_to);
-
-                                            complete_rollback_cleanup(rollback_to);
-
-                                            if let Some(ref p2p) = unified_p2p {
-                                                let p2p_clone = p2p.clone();
-                                                let clear_from = rollback_to;
-                                                let clear_to = next_block_height;
-                                                tokio::spawn(async move {
-                                                    for h in clear_from..=clear_to {
-                                                        crate::unified_p2p::clear_block_pending_sync(h);
-                                                    }
-                                                    if let Err(e) = p2p_clone.sync_macroblocks(mb_from, mb_to).await {
-                                                        eprintln!("[WARN][CONS] majority_fork_recovery_fail err={}", e);
-                                                    } else {
-                                                        println!("[INFO][CONS] majority_fork_recovery_ok mb_range={}-{}", mb_from, mb_to);
-                                                    }
-                                                });
-                                            }
-                                        } else {
-                                            println!("[INFO][CONS] majority_fork_recovery_cooldown h={}", next_block_height);
-                                        }
                                     }
                                     continue;
                                 } else {
@@ -17641,10 +17283,10 @@ impl BlockchainNode {
                     }
                 }
                 // v3.33: Removed v3.32 conflict detection window (800ms sleep) — dead code.
-                // Entropy consensus (above) now handles ALL nodes at rotation boundary,
-                // making the separate 800ms producer sleep unnecessary. The competing
-                // producer detection in block reception (line ~6730) and production loop
-                // (line ~13425) remains as a secondary safety net.
+                // Entropy consensus (above) handles ALL nodes at the rotation boundary, so
+                // the separate 800ms producer sleep is unnecessary. The attestation-based
+                // competing-producer yield in the production loop remains as a secondary
+                // safety net; round-based fork-choice is the primary path.
                 
                 // CRITICAL FIX v9.8: Network-aware NODE_IS_SYNCHRONIZED check.
                 // Previous bug: compared LOCAL stored vs LOCAL height only — never checked network.
@@ -17698,7 +17340,6 @@ impl BlockchainNode {
                                 *is_leader.write().await = false;
                                 set_node_state(NodeState::Idle { last_height: microblock_height });
                                 crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                                crate::unified_p2p::clear_competing_producer();
                                 continue;
                             } else if is_debug() {
                                 println!("[DBG][CONS] competing_attestations h={} count={}/{} threshold={} — producing",
@@ -20046,6 +19687,22 @@ impl BlockchainNode {
                                             Err(e) => println!("[WARN][NODE] pruning_failed err={:?}", e),
                                         }
                                     });
+
+                                    // v36: EIP-4444 body expiry. Super (incl. genesis) is the only tier
+                                    // that stores block data — drop microblock bodies (heartbeats + TXs)
+                                    // older than 6 epochs while keeping hashes, macroblocks, snapshots and
+                                    // state. Bounds storage to a ~6-epoch window instead of growing forever.
+                                    let storage_for_body_prune = Arc::clone(&storage);
+                                    tokio::spawn(async move {
+                                        const HB_BODY_RETENTION: u64 = 6 * 14_400; // 6 epochs (~24h)
+                                        match storage_for_body_prune
+                                            .prune_old_microblock_bodies(microblock_height, HB_BODY_RETENTION)
+                                        {
+                                            Ok(0) => {}
+                                            Ok(n) => println!("[INFO][NODE] microblock_bodies_pruned count={} window=6epochs", n),
+                                            Err(e) => println!("[WARN][NODE] body_prune_failed err={:?}", e),
+                                        }
+                                    });
                                     
                                     // TEMPORAL COMPRESSION: Recompress old blocks with stronger compression
                                     let storage_for_recompression = Arc::clone(&storage);
@@ -21510,96 +21167,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         )
     }
 
-    /// Compute the cumulative attestation weight of the LOCAL chain from
-    /// `finalized_height + 1` to `head_height` inclusive.
-    ///
-    /// Used by the weighted fork-choice rule (LMD-GHOST analogue) when the
-    /// local chain disagrees with the network at some height: instead of
-    /// abandoning the local chain on the first witness mismatch, we compare
-    /// the cumulative attestation weights and only switch when the alternative
-    /// chain is provably heavier (i.e., supported by more committee members).
-    ///
-    /// Returns None if any block in `(finalized_height, head_height]` is
-    /// missing from local storage — caller should treat this as "cannot
-    /// evaluate, defer to peer-driven sync".
-    pub async fn compute_local_chain_weight(
-        storage: &Arc<Storage>,
-        finalized_height: u64,
-        head_height: u64,
-    ) -> Option<crate::chain_weight::ChainWeight> {
-        if head_height <= finalized_height {
-            return Some(crate::chain_weight::ChainWeight {
-                head_hash: [0u8; 32],
-                head_height,
-                total_weight: 0,
-                depth: 0,
-            });
-        }
-
-        let mut hashes: std::collections::HashMap<u64, [u8; 32]> =
-            std::collections::HashMap::with_capacity(
-                (head_height.saturating_sub(finalized_height)) as usize,
-            );
-
-        for h in (finalized_height + 1)..=head_height {
-            // Fast path: pre-computed hash index in storage.
-            match storage.load_microblock_hash(h) {
-                Ok(Some(hash)) => {
-                    hashes.insert(h, hash);
-                }
-                _ => {
-                    // Block missing locally — chain is incomplete.
-                    return None;
-                }
-            }
-        }
-
-        let head_hash = hashes.get(&head_height).copied()?;
-        let candidate = crate::chain_weight::ChainCandidate {
-            head_hash,
-            head_height,
-            hashes_by_height: hashes,
-        };
-
-        crate::chain_weight::compute_chain_weight(
-            &candidate,
-            finalized_height,
-            |h, hash| crate::unified_p2p::get_attestation_count_for_hash(h, hash) as u64,
-        )
-    }
-
-    /// Decide whether to switch from the local chain to a competing peer chain.
-    ///
-    /// Inputs:
-    ///   * `local_chain_weight` — weight of our current head (from `compute_local_chain_weight`)
-    ///   * `peer_head_height` — peer's tip height
-    ///   * `peer_head_hash` — peer's tip hash
-    ///   * `peer_attestations_at_head` — attestation count for peer's tip block
-    ///
-    /// Conservative decision: only switch when the peer's chain has *strictly*
-    /// greater cumulative weight than ours by a safety margin proportional to
-    /// the committee size. The margin prevents flapping on transient
-    /// attestation gossip races.
-    ///
-    /// At low depth (≤10 blocks) any concrete weight advantage is sufficient.
-    /// At higher depth, require margin ≥ committee_size / 4 — roughly one
-    /// round-trip's worth of attestations.
-    pub fn should_switch_to_peer_chain(
-        local_chain_weight: &crate::chain_weight::ChainWeight,
-        peer_head_height: u64,
-        peer_head_hash: [u8; 32],
-        peer_chain_weight_estimate: u64,
-        peer_chain_depth: u64,
-        committee_size: usize,
-    ) -> bool {
-        let peer_weight = crate::chain_weight::ChainWeight {
-            head_hash: peer_head_hash,
-            head_height: peer_head_height,
-            total_weight: peer_chain_weight_estimate,
-            depth: peer_chain_depth,
-        };
-        crate::chain_weight::should_switch_head(local_chain_weight, &peer_weight, committee_size)
-    }
 
     /// v4.0: Get VRF instance from global (for static context in select_producer)
     fn get_vrf_static() -> Option<Arc<crate::crypto::vrf::DilithiumVrf>> {
@@ -25398,7 +24965,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 qnet_state::TransactionType::BatchRewardClaims { .. } |
                 qnet_state::TransactionType::BatchNodeActivations { .. } |
                 qnet_state::TransactionType::EquivocationProof { .. } |
-                qnet_state::TransactionType::VoteEquivocationProof { .. }
+                qnet_state::TransactionType::VoteEquivocationProof { .. } |
+                // v35: Heartbeat is Dilithium-only (no Ed25519) — skip the Ed25519
+                // batch; its Dilithium sig is verified in validate_and_add.
+                qnet_state::TransactionType::Heartbeat { .. }
             );
 
             if is_unsigned_system_tx {
@@ -25820,10 +25390,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Signature validation with cryptographic verification
         // v2.53: System transactions don't need Ed25519 signature - validated through consensus
         // v2.81: HeartbeatCommitment validated through Dilithium signatures in samples + Merkle proofs
-        let is_system_tx = matches!(tx.tx_type, 
-            qnet_state::TransactionType::RewardDistribution | 
+        let is_system_tx = matches!(tx.tx_type,
+            qnet_state::TransactionType::RewardDistribution |
             qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
             qnet_state::TransactionType::HeartbeatCommitment { .. } |
+            qnet_state::TransactionType::Heartbeat { .. } |
             qnet_state::TransactionType::LightNodeEligibilityBitmap { .. }
         );
         
@@ -25905,8 +25476,24 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
                 
                 if is_info() {
-                    println!("[INFO][VERIFY] commitment_tx_hybrid_verified type={:?}", 
+                    println!("[INFO][VERIFY] commitment_tx_hybrid_verified type={:?}",
                              std::mem::discriminant(&tx.tx_type));
+                }
+            }
+
+            // v35: Heartbeat is Dilithium-only (no Ed25519, unlike the hybrid commitment
+            // TXs above). Verify its Dilithium sig here; anchor freshness is re-checked at
+            // production and on receive.
+            if matches!(tx.tx_type, qnet_state::TransactionType::Heartbeat { .. }) {
+                if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
+                    return Err(QNetError::ValidationError(
+                        "Heartbeat REQUIRES Dilithium signature".to_string()
+                    ));
+                }
+                if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                    return Err(QNetError::ValidationError(
+                        "Invalid Dilithium signature on Heartbeat".to_string()
+                    ));
                 }
             }
         } else {
@@ -25949,6 +25536,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // state-level registered_nodes DashMap populated from block history)
         let skip_nonce_check = matches!(tx.tx_type,
             qnet_state::TransactionType::HeartbeatCommitment { .. } |
+            qnet_state::TransactionType::Heartbeat { .. } |
             qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
             qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
             qnet_state::TransactionType::RewardDistribution { .. } |
@@ -27219,10 +26807,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
             crate::unified_p2p::clear_macroblock_pending_sync(index);
 
-            // v13.2: Update finality even for already-saved macroblocks
-            // BFT consensus path (ASYNC-CONS) may have been blocked by ENTROPY_MISMATCH
-            // when it called try_advance_finality(). This second chance ensures finality
-            // advances once the mismatch auto-clears and the broadcast arrives.
+            // v13.2: Update finality even for already-saved macroblocks. A macroblock can
+            // be sealed/broadcast before its 90 microblocks land locally, so the earlier
+            // try_advance_finality() call may have been a no-op; this second chance advances
+            // finality once the body is complete.
             let round = index * 90;
             let prev_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
             if round > prev_round {

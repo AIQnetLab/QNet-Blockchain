@@ -8276,6 +8276,57 @@ impl Storage {
         println!("[INFO][STORAGE] snapshot_announced peers={}", peers.len());
     }
     
+    /// EIP-4444-style body expiry for the archival (Super) tier. Microblock BODIES
+    /// (the bulk: heartbeats + TXs) older than `retention_blocks` are dropped, while
+    /// the hash index (metadata), macroblocks, snapshots and account state are kept —
+    /// so chain-continuity (previous_hash) stays an O(1) hash-index lookup and reward
+    /// eligibility (read from state + macroblock summaries) is unaffected. Block 0
+    /// (genesis) is never pruned. A watermark in `metadata` bounds each run to the
+    /// newly-aged-out range (O(retention/run), not O(height)). Safe by construction:
+    /// every body reader uses `if let Ok(Some(..))`, so a pruned body is skipped, and
+    /// cold-start replays from a <=1h snapshot, never across the retention window.
+    /// Returns the number of bodies pruned this run.
+    pub fn prune_old_microblock_bodies(&self, current_height: u64, retention_blocks: u64) -> IntegrationResult<u64> {
+        // Super (incl. genesis) is the only tier that stores block data: Light nodes
+        // are stateless mobile clients and Full nodes are removed. Off-tier or before
+        // the first full retention window → nothing to prune.
+        if self.storage_mode != StorageMode::Super || current_height <= retention_blocks {
+            return Ok(0);
+        }
+        let prune_before = current_height - retention_blocks;
+
+        let microblocks_cf = self.persistent.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        let metadata_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+
+        const WATERMARK_KEY: &[u8] = b"body_prune_watermark";
+        let watermark = self.persistent.db.get_cf(&metadata_cf, WATERMARK_KEY)?
+            .filter(|v| v.len() == 8)
+            .map(|v| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&v[..8]);
+                u64::from_le_bytes(b)
+            })
+            .unwrap_or(0);
+
+        // Never touch genesis (h=0); resume from the watermark.
+        let from = watermark.max(1);
+        if prune_before <= from {
+            return Ok(0);
+        }
+
+        let mut batch = WriteBatch::default();
+        for h in from..prune_before {
+            // Body only — KEEP metadata/microblock_hash_{h} (continuity) + macroblocks.
+            batch.delete_cf(&microblocks_cf, format!("microblock_{}", h).as_bytes());
+        }
+        batch.put_cf(&metadata_cf, WATERMARK_KEY, &prune_before.to_le_bytes());
+        self.persistent.db.write(batch)?;
+
+        Ok(prune_before - from)
+    }
+
     /// SLIDING WINDOW: Prune old blocks outside of retention window
     pub fn prune_old_blocks(&self) -> IntegrationResult<()> {
         // Super nodes keep everything (archival role)

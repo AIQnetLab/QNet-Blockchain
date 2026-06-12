@@ -3113,9 +3113,9 @@ impl BlockPipeline {
             // BlockAttestationMsg / EmptySlotAttestationMsg handlers in
             // `unified_p2p.rs`). That layer is non-blocking — attestations
             // travel on a separate gossip channel, do not gate block
-            // production, and form the basis of the cumulative-weight fork
-            // choice rule (`chain_weight.rs`). It supplies per-block 2f+1
-            // safety AND deterministic empty-slot failover, without sharing
+            // production, and form the basis of the per-block 2f+1 fork-choice
+            // keep-local rule. It supplies that 2f+1 safety AND deterministic
+            // empty-slot failover, without sharing
             // the macroblock commit rate-limit bucket. Macroblock 2f+1
             // commit/reveal at the 90-block boundary remains the canonical
             // finality anchor.

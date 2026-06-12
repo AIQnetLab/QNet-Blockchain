@@ -682,37 +682,6 @@ pub fn release_sync_slot(from_height: u64) {
     let _ = SYNC_INFLIGHT_FROM.compare_exchange(from_height, 0, Ordering::SeqCst, Ordering::SeqCst);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// v3.32: COMPETING PRODUCER DETECTION
-// Prevents VRF split-brain forks when different nodes elect different producers
-// due to incomplete claim gossip. If a node starts producing but receives blocks
-// from a different producer for the same rotation, it yields immediately.
-// ═══════════════════════════════════════════════════════════════════════════════
-
-static COMPETING_PRODUCER_ROUND: AtomicU64 = AtomicU64::new(u64::MAX);
-static COMPETING_PRODUCER_HEIGHT: AtomicU64 = AtomicU64::new(0);
-
-/// Signal that a competing producer was detected for the given round/height
-pub fn set_competing_producer(round: u64, height: u64) {
-    COMPETING_PRODUCER_ROUND.store(round, Ordering::SeqCst);
-    COMPETING_PRODUCER_HEIGHT.store(height, Ordering::SeqCst);
-}
-
-/// Check if a competing producer was detected for the given round
-pub fn has_competing_producer(round: u64) -> bool {
-    COMPETING_PRODUCER_ROUND.load(Ordering::SeqCst) == round
-}
-
-/// Get the height at which competing producer was first seen
-pub fn get_competing_producer_height() -> u64 {
-    COMPETING_PRODUCER_HEIGHT.load(Ordering::SeqCst)
-}
-
-/// Clear competing producer flag (on new rotation or after yielding)
-pub fn clear_competing_producer() {
-    COMPETING_PRODUCER_ROUND.store(u64::MAX, Ordering::SeqCst);
-    COMPETING_PRODUCER_HEIGHT.store(0, Ordering::SeqCst);
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.33: BLOCK ATTESTATION — committee-based microblock confirmation
@@ -13559,24 +13528,16 @@ impl SimplifiedP2P {
                 let two_f_plus_1 = qnet_consensus::checkpoint_bft::quorum_size(total_validators).max(3); // v34: n−f (was ceil(2n/3))
 
                 if count_after >= two_f_plus_1 {
-                    // 2f+1 observers confirmed — destructive rollback is
-                    // safe because at least f+1 honest observers agree
-                    // the source's chain at this height is byzantine.
-                    let rollback_to = height.saturating_sub(1);
-                    let prev = crate::block_pipeline::FORK_RECOVERY_HEIGHT
-                        .load(std::sync::atomic::Ordering::SeqCst);
-                    if rollback_to > prev {
-                        crate::block_pipeline::FORK_RECOVERY_HEIGHT
-                            .store(rollback_to, std::sync::atomic::Ordering::SeqCst);
-                        if crate::node::is_warn() {
-                            println!(
-                                "[WARN][REJECT] minority_fork_confirmed h={} source={} observers={}/{} rollback_to={} action=destructive_rollback",
-                                height, source_peer_id, count_after, two_f_plus_1, rollback_to
-                            );
-                        }
+                    // 2f+1 observers reject this source at `height` → deprioritise it in
+                    // sync peer selection (non-destructive). The canonical chain itself is
+                    // chosen by round-based fork-choice + macroblock-anchored recovery, so
+                    // observer rejections never trigger a rollback on their own.
+                    if crate::node::is_warn() {
+                        println!(
+                            "[WARN][REJECT] fork_source_flagged h={} source={} observers={}/{}",
+                            height, source_peer_id, count_after, two_f_plus_1
+                        );
                     }
-                    // Mark source as fork-source so the canonical-aware
-                    // sync peer selector deprioritises it during resync.
                     crate::block_pipeline::mark_peer_as_fork_source(&source_peer_id);
                 }
             }

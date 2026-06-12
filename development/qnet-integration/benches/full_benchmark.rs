@@ -3,11 +3,12 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use qnet_integration::{
-    poh::PoH,
-    vrf::{QNetVrf, select_producer_with_vrf},
+    vrf::QNetVrf,
+    vrf_hybrid::select_producer_with_vrf_no_fallback,
     storage::PersistentStorage,
-    node::NodeType,
 };
+use pqcrypto_mldsa::mldsa65 as dilithium3;
+use pqcrypto_traits::sign::{PublicKey as PkTrait, SecretKey as SkTrait};
 use sha3::{Sha3_512, Sha3_256, Digest};
 use std::time::Duration;
 
@@ -48,34 +49,38 @@ fn benchmark_poh_throughput(c: &mut Criterion) {
 fn benchmark_vrf_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("vrf_performance");
     
-    // VRF initialization
+    // Dilithium3 keypair, generated once for the init/evaluate/verify benches.
+    let (pk, sk) = dilithium3::keypair();
+    let pk_b = PkTrait::as_bytes(&pk).to_vec();
+    let sk_b = SkTrait::as_bytes(&sk).to_vec();
+
+    // VRF initialization (construct + load keys)
     group.bench_function("vrf_init", |b| {
         b.iter(|| {
-            let mut vrf = QNetVrf::new();
-            vrf.initialize("test_node_001").unwrap();
+            let mut vrf = QNetVrf::new("test_node_001".to_string());
+            vrf.initialize_from_keys(&pk_b, &sk_b).unwrap();
             black_box(vrf)
         });
     });
-    
+
     // VRF evaluation
-    let mut vrf = QNetVrf::new();
-    vrf.initialize("test_node_001").unwrap();
+    let mut vrf = QNetVrf::new("test_node_001".to_string());
+    vrf.initialize_from_keys(&pk_b, &sk_b).unwrap();
     let input = b"test_input_for_vrf_evaluation";
-    
+
     group.bench_function("vrf_evaluate", |b| {
         b.iter(|| {
             let output = vrf.evaluate(input).unwrap();
             black_box(output)
         });
     });
-    
+
     // VRF verification
     let output = vrf.evaluate(input).unwrap();
-    let public_key = vrf.get_public_key().unwrap();
-    
+
     group.bench_function("vrf_verify", |b| {
         b.iter(|| {
-            let verified = QNetVrf::verify(&public_key, input, &output).unwrap();
+            let verified = QNetVrf::verify_static(&pk_b, input, &output).unwrap();
             black_box(verified)
         });
     });
@@ -99,7 +104,7 @@ fn benchmark_producer_selection(c: &mut Criterion) {
             |b, candidates| {
                 b.to_async(tokio::runtime::Runtime::new().unwrap()).iter(|| async {
                     let entropy = [0x42u8; 32];
-                    let result = select_producer_with_vrf(
+                    let result = select_producer_with_vrf_no_fallback(
                         1,
                         candidates,
                         "test_node",
@@ -160,14 +165,14 @@ fn benchmark_storage(c: &mut Criterion) {
     group.bench_function("save_block_1kb", |b| {
         let mut height = 0u64;
         b.iter(|| {
-            storage.save_microblock(height, &test_block, "test_hash").unwrap();
+            storage.save_microblock(height, &test_block).unwrap();
             height += 1;
             black_box(height)
         });
     });
     
     // Benchmark block load
-    storage.save_microblock(999999, &test_block, "test_hash").unwrap();
+    storage.save_microblock(999999, &test_block).unwrap();
     group.bench_function("load_block", |b| {
         b.iter(|| {
             let block = storage.load_microblock(999999).unwrap();

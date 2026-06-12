@@ -27,7 +27,6 @@ pub mod consensus_v2_driver; // Consensus v2 — Checkpoint-BFT driver (engine �
 pub mod consensus_v2_node;   // Consensus v2 — node runtime (verify + async effect executor + task)
 pub mod block_pipeline;    // Staged block processing pipeline (ingest → decode → verify → apply)
 pub mod attestation_committee;  // Deterministic attestation committee selection (per-microblock BFT layer)
-pub mod chain_weight;            // Weighted fork choice (cumulative attestation weight, fork resolution)
 pub mod genesis_config;    // File-based genesis loader (not p2p)
 pub mod sync_manager;      // Block download coordinator (sequential waves, ordered buffer)
 pub mod p2p_extensions;
