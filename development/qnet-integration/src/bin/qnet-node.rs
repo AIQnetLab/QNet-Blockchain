@@ -1213,44 +1213,10 @@ impl AutoConfig {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         println!("🔧 Auto-configuring QNet node...");
         
-        // PRODUCTION FIX: Allow region override for Genesis nodes to ensure stable P2P ports
-        let region = if let Ok(region_str) = std::env::var("QNET_REGION") {
-            match region_str.to_lowercase().as_str() {
-                "na" | "northamerica" | "north_america" => {
-                    println!("🌍 Using fixed region from QNET_REGION: North America");
-                    Region::NorthAmerica
-                },
-                "eu" | "europe" => {
-                    println!("🌍 Using fixed region from QNET_REGION: Europe");
-                    Region::Europe
-                },
-                "asia" | "ap" | "asia_pacific" => {
-                    println!("🌍 Using fixed region from QNET_REGION: Asia");
-                    Region::Asia
-                },
-                "sa" | "southamerica" | "south_america" => {
-                    println!("🌍 Using fixed region from QNET_REGION: South America");
-                    Region::SouthAmerica
-                },
-                "africa" | "af" => {
-                    println!("🌍 Using fixed region from QNET_REGION: Africa");
-                    Region::Africa
-                },
-                "oceania" | "oc" => {
-                    println!("🌍 Using fixed region from QNET_REGION: Oceania");
-                    Region::Oceania
-                },
-                _ => {
-                    println!("⚠️ Unknown QNET_REGION: {}, auto-detecting...", region_str);
-                    auto_detect_region().await?
-                }
-            }
-        } else {
-            // Auto-detect region if not specified
-            let region = auto_detect_region().await?;
-            println!("🌍 Auto-detected region: {:?}", region);
-            region
-        };
+        // Region is a vestigial cosmetic tag (no consensus/topology/port role) — fixed
+        // default, no QNET_REGION read, no geo-IP detection at boot. P2P ports come from
+        // QNET_P2P_PORT / DOCKER_ENV below, never from region.
+        let region = Region::Europe;
         
         // PRODUCTION FIX: Use fixed P2P port from environment for Docker deployments
         // This ensures Docker port mapping works correctly

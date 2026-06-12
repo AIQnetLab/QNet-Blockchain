@@ -5923,9 +5923,9 @@ impl BlockchainNode {
     
     /// Create a new blockchain node with default settings (backward compatibility)
     pub async fn new(data_dir: &str, p2p_port: u16, bootstrap_peers: Vec<String>) -> Result<Self, QNetError> {
-        // Production region detection - no defaults allowed
-        let region = Self::auto_detect_region().await
-            .map_err(|e| QNetError::NetworkError(format!("Region detection failed: {}", e)))?;
+        // Region is a vestigial cosmetic tag (no consensus/topology role) — fixed
+        // default, no geo-IP/network detection at boot.
+        let region = Region::Europe;
         
         Self::new_with_config(
             data_dir,
@@ -18161,14 +18161,10 @@ impl BlockchainNode {
                             // v2.87: System TX bypass nonce/balance validation
                             // HeartbeatCommitment/PingCommitment are validator rewards - MUST be included!
                             // v2.89: LightNodeEligibilityBitmap (Genesis bitmap TX)
-                            let is_system_tx = tx.from == "system_emission"
-                                || tx.from == "system_ping_commitment"
-                                || tx.from.starts_with("system_")
-                                || matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. })
-                                || matches!(tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. })
-                                || matches!(tx.tx_type, qnet_state::TransactionType::HeartbeatCommitment { .. })
-                                || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. })
-                                || matches!(tx.tx_type, qnet_state::TransactionType::LightNodeEligibilityBitmap { .. });
+                            // Canonical system-TX predicate (single source of truth in qnet-state) +
+                            // system_* sender net. Inline lists here had drifted and silently dropped
+                            // NodeActivation/NodeReactivation from blocks (super-node onboarding stall).
+                            let is_system_tx = tx.is_system_tx() || tx.from.starts_with("system_");
                             
                             let (is_valid, reject_reason) = if is_benchmark || is_system_tx {
                                 // Benchmark OR System TX: skip balance/nonce validation
@@ -18246,13 +18242,11 @@ impl BlockchainNode {
                             // v2.68: Separate system TX from user TX
                             // v2.71: NodeRegistration is also system TX (no state execution needed)
                             // v2.87: HeartbeatCommitment/PingCommitment are validator reward TX
-                            let is_system = tx.from == "system_emission"
-                                || tx.from == "system_ping_commitment"
-                                || tx.from.starts_with("system_")
-                                || matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. })
-                                || matches!(tx.tx_type, qnet_state::TransactionType::HeartbeatCommitment { .. })
-                                || matches!(tx.tx_type, qnet_state::TransactionType::PingCommitmentWithSampling { .. })
-                                || matches!(tx.tx_type, qnet_state::TransactionType::LightNodeEligibilityBitmap { .. });
+                            // Canonical system-TX predicate (single source of truth) → route to
+                            // system_txs so it bypasses the user-only ParallelExecutor, which drops
+                            // anything it doesn't recognise → empty body. The inline list here had
+                            // dropped Heartbeat (no liveness tally) AND NodeActivation (no onboarding).
+                            let is_system = tx.is_system_tx() || tx.from.starts_with("system_");
 
                             // v15.12: state-aware producer dedup (closes the cross-block gap). The
                             // v15.5 filter only deduped WITHIN a block; a commitment already
@@ -19095,18 +19089,12 @@ impl BlockchainNode {
                                         qnet_state::TransactionType::NodeRegistration { .. }
                                     ) && tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:");
                                     
-                                    let is_system_tx = !is_client_nodereg && (
-                                        tx.from == "system_emission"
-                                        || tx.from == "system_ping_commitment"
-                                        || tx.from.starts_with("system_")
-                                        || matches!(tx.tx_type,
-                                            qnet_state::TransactionType::HeartbeatCommitment { .. } |
-                                            qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
-                                            qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
-                                            qnet_state::TransactionType::RewardDistribution { .. } |
-                                            qnet_state::TransactionType::NodeRegistration { .. }
-                                        )
-                                    );
+                                    // Canonical system-TX predicate (single source of truth) + system_*
+                                    // net. Client-signed NodeRegistration stays NON-system so its
+                                    // Ed25519+Dilithium are verified below. The inline list had dropped
+                                    // NodeActivation → activation TX rejected → super-node never onboards.
+                                    let is_system_tx = !is_client_nodereg
+                                        && (tx.is_system_tx() || tx.from.starts_with("system_"));
                                     
                                     if is_system_tx {
                                         // System TX: only basic validation (no signature/amount check)

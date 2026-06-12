@@ -12473,17 +12473,11 @@ pub fn generate_super_node_pseudonym(wallet_address: &str) -> String {
     // independent pseudonyms in the two namespaces.
     let pseudonym_hash = blake3::hash(format!("SUPER_NODE_PRIVACY_{}", wallet_address).as_bytes());
 
-    // PRIVACY: Region hint is a coarse operational tag (eu / us / asia / …).
-    // Default "node" keeps the pseudonym deterministic when QNET_REGION is
-    // unset; operators can override per deployment without affecting the
-    // wallet-derived suffix.
-    let region_hint = std::env::var("QNET_REGION")
-        .unwrap_or_else(|_| "node".to_string())
-        .to_lowercase();
-
-    format!("super_{}_{}",
-            region_hint,
-            &pseudonym_hash.to_hex()[..8])
+    // Identity MUST be region-independent: it is recomputed on every node (the P2P
+    // pre-activation sync gate compares this id), so it cannot depend on a per-node env
+    // var — a region mismatch would make the same wallet resolve to two different ids and
+    // the gate would never open. Fixed "node" segment preserves the historical format.
+    format!("super_node_{}", &pseudonym_hash.to_hex()[..8])
 }
 
 /// Extract peer IP from HTTP headers (PRODUCTION ready)

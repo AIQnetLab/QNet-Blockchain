@@ -888,7 +888,9 @@ impl BlockchainActivationRegistry {
 
         // NOTE: DHT propagation removed - activation syncs through blockchain and ReputationSync
 
-        println!("✅ Activation registered on blockchain successfully");
+        // Local record only — the NodeActivation TX is broadcast separately and its
+        // on-chain inclusion is NOT confirmed here (verify via node/status before trusting).
+        println!("[INFO][ACTIVATION] activation_recorded_local on_chain_inclusion=pending");
         Ok(())
     }
 
