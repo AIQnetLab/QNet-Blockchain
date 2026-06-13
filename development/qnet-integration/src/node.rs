@@ -17876,15 +17876,27 @@ impl BlockchainNode {
                                                 
                                                 // Serialize TX
                                                 if let Ok(tx_bytes) = bincode::serialize(&emission_tx) {
+                                                    let tx_sz = tx_bytes.len();
                                                     emission_tx_opt = Some((emission_tx.hash.clone(), tx_bytes));
-                                                    
+
+                                                    // Scale fail-safe: per-recipient accruals grow O(eligible) and the
+                                                    // emission TX MUST fit in one block (MAX_BLOCK_SIZE_BYTES = 80MB).
+                                                    // Warn well before that so reward distribution is migrated to a
+                                                    // merkle-root + claim model before the artifact can block inclusion.
+                                                    const EMISSION_TX_WARN_BYTES: usize = 40_000_000; // 50% of the 80MB block cap
+                                                    if tx_sz > EMISSION_TX_WARN_BYTES {
+                                                        println!("[WARN][EMISSION] tx_size={}MB eligible={} approaching 80MB block cap — migrate reward distribution to merkle/claim before this scale",
+                                                                 tx_sz / 1_000_000, total_eligible_count);
+                                                    }
+
                                                     if is_info() {
-                                                        println!("[INFO][EMISSION] tx_created block={} mb={} amount={} QNC eligible={} (super={} light={}) hash={}", 
+                                                        println!("[INFO][EMISSION] tx_created block={} mb={} amount={} QNC eligible={} (super={} light={}) size={}KB hash={}",
                                                                  next_block_height, prev_macroblock_index,
                                                                  total_emission / 1_000_000_000,
                                                                  total_eligible_count,
                                                                  eligible_full_super_count,
                                                                  eligible_light_count,
+                                                                 tx_sz / 1000,
                                                                  &emission_tx.hash[..16.min(emission_tx.hash.len())]);
                                                     }
                                                 } else {
