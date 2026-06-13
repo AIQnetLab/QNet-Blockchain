@@ -2021,6 +2021,28 @@ impl BlockchainActivationRegistry {
             let sig = signing_key.sign(canonical_msg.as_bytes());
             transaction.signature  = Some(hex::encode(sig.to_bytes()));
             transaction.public_key = Some(hex::encode(verifying_key.as_bytes()));
+
+            // Post-quantum: ALSO sign with this node's consensus Dilithium3 key (registered
+            // on-chain at NodeRegistration). The ephemeral Ed25519 above only satisfies the
+            // P2P "must carry a signature" gate — it proves no identity and is quantum-breakable.
+            // This Dilithium sig binds the activation to the node's PQ identity. Same crypto
+            // pair as the heartbeat (proven on-chain); verified on admission by
+            // verify_dilithium_tx_signature_async (signer_id = dilithium_public_key) over the
+            // SAME canonical message (build_canonical_verify_message's NodeActivation arm).
+            let local_node_id = crate::unified_p2p::GLOBAL_NODE_ID.read().clone();
+            if !local_node_id.is_empty() {
+                if let Some(crypto) = crate::node::try_get_quantum_crypto() {
+                    match crypto.create_consensus_signature(&local_node_id, &canonical_msg).await {
+                        Ok(dil) => {
+                            transaction.dilithium_signature = Some(dil.signature);
+                            transaction.dilithium_public_key = Some(local_node_id);
+                        }
+                        Err(e) => {
+                            println!("[WARN][ACTIVATION] dilithium_sign_failed err={}", e);
+                        }
+                    }
+                }
+            }
         }
 
         // Calculate hash using canonical serialization (SHA3-256 NIST compliant)

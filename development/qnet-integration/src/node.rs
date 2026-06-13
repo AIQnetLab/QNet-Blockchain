@@ -110,9 +110,9 @@ use std::env;
 // Emergency producer flag removed (non-deterministic, racy, no consensus).
 // Replaced by BFT-agreed rotation: the producer is
 // candidates[(base_idx + rotation_round) % N] where rotation_round is the
-// strict 2f+1 BFT-certified round (HIGHEST_CERTIFIED_ROUND; f+1 adopted is
-// telemetry-only — see the v23.1 invariant), identical on every node once
-// signed votes are gossiped. Wall clock only gates WHEN to vote (capped
+// strict same-round 2f+1 BFT-certified round (HIGHEST_CERTIFIED_ROUND),
+// identical on every node once signed votes are gossiped. Wall clock only
+// gates WHEN to vote (capped
 // 30 s under catch-up). Macroblock commit view-change reuses the same
 // certified-round path — one consensus domain, one deterministic derivation.
 use std::sync::atomic::{AtomicU64 as StdAtomicU64, Ordering as StdOrdering};
@@ -392,14 +392,12 @@ static FAST_SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
 /// Deadlock = no progress for 120s (instead of fixed 300s cap).
 pub static LAST_SYNC_PROGRESS_TIME: AtomicU64 = AtomicU64::new(0);
 
-// v14.8.10: BFT-driven microblock rotation round.
-// timeout_round_for_rotation = certified.max(adopted): certified=
-// HIGHEST_CERTIFIED_ROUND[mb_idx] (signed 2f+1 TC), adopted=
-// HIGHEST_ADOPTED_ROUND[mb_idx] (f+1 aggregated signed votes) — both
-// from Dilithium3-verified gossip, so a catch-up node sees the same as
-// the network. Wall clock is NEVER in the rotation formula (the
-// v14.8.7/8/9 wall-clock pacemaker caused the h=339 catch-up fork:
-// (now-parent_ts) → high rank cycles to self → 2nd block same height).
+// BFT-driven microblock rotation round. timeout_round_for_rotation =
+// HIGHEST_CERTIFIED_ROUND[mb_idx] (signed same-round 2f+1 TC) from
+// Dilithium3-verified gossip, so a catch-up node sees the same round as
+// the network and elects the same producer. Wall clock is NEVER in the
+// rotation formula (a wall-clock ((now-parent_ts)) term caused the h=339
+// catch-up fork: high rank cycles to self → 2nd block at the same height).
 // Wall clock only: local_delay (when to broadcast TimeoutVote; capped
 // 30s pre-PRODUCTION_UNLOCKED) + stall diagnostics. CURRENT_TIMEOUT_
 // ROUND caches the value; reset to 0 on tip advance.
@@ -451,9 +449,9 @@ pub fn reset_timeout_round() {
 //     candidates=eligible_producers(macroblock N-2),
 //     vrf_entropy=SHA3(macroblock(N-2).deterministic_fields),
 //     leadership_round=(h-1)/ROTATION_INTERVAL_BLOCKS,
-//     timeout_round=get_effective_rotation_round(h/90))
-// timeout_round advances ONLY on 2f+1 Dilithium3 TimeoutVotes (or the f+1
-// pacemaker); wall clock is NEVER a leader-selection input → identical
+//     timeout_round=get_certified_rotation_round(h/90))
+// timeout_round advances ONLY on a same-round 2f+1 Dilithium3 TimeoutCertificate;
+// wall clock is NEVER a leader-selection input → identical
 // leader on every honest node (no NTP-drift dual-production split; the
 // v22 clock-derived seed that caused it is gone). Liveness: silent
 // primary → 2f+1 TimeoutVote → certified round advances same on all →
@@ -840,7 +838,9 @@ pub fn window_content_from_accum(mb_idx: u64) -> Option<(Vec<[u8; 32]>, Vec<[u8;
     let buf = map.get(&mb_idx)?;
     if buf.len() != 90 { return None; }
     let mb_hashes: Vec<[u8; 32]> = buf.iter().map(|(h, _)| *h).collect();
-    let vrf_outputs: Vec<[u8; 32]> = buf.iter().filter_map(|(_, v)| *v).collect();
+    // vrf must be complete — a dropped None shortens the beacon → divergent content.
+    let mut vrf_outputs: Vec<[u8; 32]> = Vec::with_capacity(90);
+    for (_, v) in buf.iter() { vrf_outputs.push((*v)?); }
     Some((mb_hashes, vrf_outputs))
 }
 
@@ -1205,8 +1205,8 @@ pub fn get_extended_failover_metrics() -> FailoverMetrics {
         failover_count: METRIC_FAILOVER_COUNT.load(Ordering::Relaxed),
         timestamp_rejections: METRIC_TIMESTAMP_REJECTIONS.load(Ordering::Relaxed),
         window_seconds: 300,
-        // v14.8.10: current BFT-agreed rotation round (certified.max(adopted))
-        // stored by the stall detector; 0 when network is in steady state.
+        // Current BFT-agreed rotation round (HIGHEST_CERTIFIED_ROUND) stored by
+        // the stall detector; 0 when network is in steady state.
         current_timeout_round: get_current_timeout_round(),
         genesis_timestamp: crate::GLOBAL_GENESIS_TIMESTAMP.load(Ordering::Relaxed),
         current_time: get_timestamp_safe(),
@@ -2083,8 +2083,8 @@ pub static HALT_REQUESTED: std::sync::atomic::AtomicBool =
 // timestamp; the stall detector re-emits emit_macroblock_view_change_vote
 // at most once per STALL_GRACE_SECS/mb/node, bounding gossip during a stall
 // at any committee size. Purely an efficiency guard — receiver-side
-// VOTER_MAX_ROUND already dedupes same/lower-round votes, so duplicate
-// emissions can't affect aggregation. Pruned by cleanup_old_timeout_data.
+// TIMEOUT_VOTES enforces (height,round,voter) uniqueness, so duplicate
+// emissions can't affect the 2f+1 count. Pruned by cleanup_old_timeout_data.
 pub static LAST_TIMEOUT_EMIT_PER_MB:
     once_cell::sync::Lazy<dashmap::DashMap<u64, u64>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
@@ -3659,6 +3659,13 @@ impl BlockchainNode {
             .filter(|p| p.reputation >= MIN_REPUTATION_BP)
             .collect();
 
+        // O(1) membership index kept in lockstep with `eligible` so the L1/L2
+        // "already present?" checks are O(1), not O(eligible) per candidate — the
+        // snapshot runs every macroblock and at 100k registered supers the old
+        // `eligible.iter().any()` made admission O(R×E). Insert on every push.
+        let mut eligible_ids: std::collections::HashSet<String> =
+            eligible.iter().map(|p| p.node_id.clone()).collect();
+
         // Break the closed consensus loop. eligible_producers =
         // consensus_participants ONLY was self-referential (participants came
         // from the prev macroblock's eligible from that round's participants)
@@ -3709,7 +3716,7 @@ impl BlockchainNode {
                 regs.sort();
                 let mut added_tally = 0usize;
                 for reg in regs {
-                    if eligible.iter().any(|p| p.node_id == *reg) { continue; }
+                    if eligible_ids.contains(reg) { continue; }
                     let acct = match storage.load_account(reg).ok().flatten() {
                         Some(a) if a.heartbeat_epoch == hb_epoch => a,
                         _ => continue,
@@ -3722,6 +3729,7 @@ impl BlockchainNode {
                         .clamp(0.0, 100.0) * 100.0).round() as u32;
                     if rep < MIN_REPUTATION_BP { continue; }
                     eligible.push(qnet_state::EligibleProducer { node_id: reg.clone(), reputation: rep });
+                    eligible_ids.insert(reg.clone());
                     added_tally += 1;
                 }
                 if added_tally > 0 {
@@ -3744,9 +3752,6 @@ impl BlockchainNode {
             // across nodes). O(peers × lookback).
             const CARRYOVER_LOOKBACK: u64 = 3;
             let carryover_start = macroblock_index.saturating_sub(CARRYOVER_LOOKBACK);
-            let updated_existing_ids: std::collections::HashSet<String> = eligible.iter()
-                .map(|p| p.node_id.clone())
-                .collect();
 
             // Build liveness set: union of committers across lookback macroblocks.
             let mut live_committers: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3771,8 +3776,7 @@ impl BlockchainNode {
                         if let Some(ref snapshot_data) = mb.consensus_data.eligible_producers {
                             if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
                                 for p in &producers {
-                                    if updated_existing_ids.contains(&p.node_id) { continue; }
-                                    if eligible.iter().any(|e| e.node_id == p.node_id) { continue; }
+                                    if eligible_ids.contains(&p.node_id) { continue; }
 
                                     // v14.2: LIVENESS GATE — must have committed in lookback window
                                     if !live_committers.contains(&p.node_id) {
@@ -3788,6 +3792,7 @@ impl BlockchainNode {
                                             node_id: p.node_id.clone(),
                                             reputation,
                                         });
+                                        eligible_ids.insert(p.node_id.clone());
                                         carryover_count += 1;
                                     }
                                 }
@@ -8053,7 +8058,7 @@ impl BlockchainNode {
         // Start QUIC message handler. Per-message CPU offload for crypto-
         // heavy handlers: the legacy single-task loop dispatched every
         // message synchronously, but a Dilithium3-verify handler
-        // (ConsensusCommit/Reveal, TimeoutVote, TC broadcast/aggregate,
+        // (ConsensusCommit/Reveal, TimeoutVote, TC broadcast,
         // ProducerHeartbeat, VrfLeaderClaim) costs 1-2 ms — a 1000-validator
         // commit-reveal burst of 667+667 serialized ≥2 s, starving Block/
         // BlockChunk drain and drifting the macroblock deadline. So route
@@ -8069,7 +8074,6 @@ impl BlockchainNode {
                         | crate::unified_p2p::NetworkMessage::ConsensusReveal { .. }
                         | crate::unified_p2p::NetworkMessage::TimeoutVote { .. }
                         | crate::unified_p2p::NetworkMessage::TimeoutCertificateBroadcast { .. }
-                        | crate::unified_p2p::NetworkMessage::TimeoutAggregateCertificate { .. }
                         | crate::unified_p2p::NetworkMessage::ProducerHeartbeat { .. }
                         | crate::unified_p2p::NetworkMessage::VrfLeaderClaim { .. }
                     );
@@ -10855,9 +10859,9 @@ impl BlockchainNode {
                             match recovery_result {
                                 Ok(()) => {
                                     println!("[INFO][STATE] recovery_complete clearing_mismatch_counters resuming_sync");
-                                    // v14.8.10: reset the BFT rotation round so the
-                                    // next tick re-reads certified/adopted fresh
-                                    // against the post-recovery macroblock index.
+                                    // Reset the BFT rotation round so the next tick
+                                    // re-reads the certified round fresh against the
+                                    // post-recovery macroblock index.
                                     reset_timeout_round();
                                     mismatch_counter.clear();
                                     wrong_producer_counter.clear();
@@ -11726,6 +11730,16 @@ impl BlockchainNode {
                                                         microblock.merkle_root[4], microblock.merkle_root[5],
                                                         microblock.merkle_root[6], microblock.merkle_root[7]]));
                         }
+                        // Finality is irreversible: never replace a block at/below the 2f+1-finalized
+                        // height, whatever the round — the competing block is from a stale/minority fork.
+                        let finalized_h = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
+                        if finalized_h > 0 && microblock.height <= finalized_h {
+                            if is_warn() {
+                                println!("[WARN][SEC] fork_below_finalized h={} finalized={} action=reject",
+                                         microblock.height, finalized_h);
+                            }
+                            return Err(format!("FORK_BELOW_FINALIZED:{}", microblock.height));
+                        }
                         // Round-aware deterministic fork choice (single authority, consistent with the
                         // pipeline's certified-round supersession): a strictly HIGHER rotation round wins
                         // (failover supersedes a stale primary); equal round → lower sig_hash (VRF-bound,
@@ -12518,16 +12532,24 @@ impl BlockchainNode {
                                 }
                             ).await {
                                 Ok(Ok(block_data)) if !block_data.is_empty() => {
-                                    // v12.0: Log consensus hash (from struct fields), not raw-byte hash
-                                    {
-                                        if let Ok(genesis_mb) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                                            let genesis_hash = hex::encode(genesis_mb.hash());
-                                            println!("[INFO][NODE] genesis_downloaded consensus_hash={}", &genesis_hash[..16]);
-                                        } else {
-                                            println!("[WARN][NODE] genesis_downloaded bytes={} deserialize_failed", block_data.len());
+                                    // Only a response that DECODES to the genesis MicroBlock (height 0)
+                                    // is real. A 200-with-garbage body (observed: a 38-byte empty/404 from
+                                    // a peer — or self — whose genesis is not minted yet) must NOT be saved
+                                    // as block 0: a garbage block 0 then fails every load_microblock_auto_format
+                                    // and forces the boot reread/delete/recover dance (and historically risked
+                                    // a fork). Reject and try the next endpoint. Genesis is always a full
+                                    // MicroBlock (EfficientMicroBlock is height>0 only), so this never rejects a
+                                    // valid genesis.
+                                    match bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                                        Ok(ref mb) if mb.height == 0 => {
+                                            println!("[INFO][NODE] genesis_downloaded consensus_hash={}", &hex::encode(mb.hash())[..16]);
+                                        }
+                                        _ => {
+                                            if is_warn() { println!("[WARN][NODE] genesis_download_rejected from={} bytes={} reason=not_genesis_block", ip, block_data.len()); }
+                                            continue;
                                         }
                                     }
-                                    // Try to store as microblock at height 0
+                                    // Store as microblock at height 0 (validated above)
                                     match self.storage.save_microblock(0, &block_data) {
                                         Ok(_) => {
                                             if is_info() {
@@ -12667,9 +12689,12 @@ impl BlockchainNode {
                         if !has_genesis {
                             if is_genesis_creator {
                                 // Node 001: Will create Genesis block after this loop
-                                // CRITICAL v2.19.20: Wait for network stabilization before Genesis creation
-                                // This ensures all peer APIs are fully ready to receive blocks
-                                const NETWORK_STABILIZATION_SECS: u64 = 60;
+                                // Stabilization margin before 001 mints genesis so peers' block-receive
+                                // paths are ready for the broadcast. The peer API (8001) has listened since
+                                // boot — well before this timer starts (QUIC-connected to all 4) — so 30s is
+                                // ample; a peer that still misses the broadcast fetches via the (now
+                                // garbage-rejecting) HTTP path. Was 60 — halved to cut fresh-boot time.
+                                const NETWORK_STABILIZATION_SECS: u64 = 30;
                                 if stabilization_time < NETWORK_STABILIZATION_SECS {
                                     let remaining = NETWORK_STABILIZATION_SECS - stabilization_time;
                                     println!("[INFO][NODE] node_001_stabilizing peers={} remaining={}s",
@@ -15296,7 +15321,7 @@ impl BlockchainNode {
                         // hypervisor), raw `current_time < last_block_time` would
                         // force `local_delay` to 0 via `saturating_sub`, silently
                         // stopping us from ever voting for timeout. That breaks
-                        // f+1 adopted aggregation at small committee sizes.
+                        // the 2f+1 timeout-certificate formation that drives failover.
                         //
                         // `effective_now()` = max(wall_clock, median_of_recent_block_ts
                         // projected forward ~1s/block). In steady-state healthy nodes
@@ -15319,7 +15344,7 @@ impl BlockchainNode {
                         // completely wrong producer selection → consensus stall.
                         // FIX: Until PRODUCTION_UNLOCKED (set when first network block arrives),
                         // cap local_delay to prevent stale-LBPT-driven round inflation.
-                        // Node still uses certified/adopted rounds from BFT protocol.
+                        // Node still uses the 2f+1-certified round from the BFT protocol.
                         let mut production_unlocked = PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 1;
 
                         // v11.1: Auto-unlock when node is synchronized after restart
@@ -15355,21 +15380,20 @@ impl BlockchainNode {
                         };
 
                         // BFT-certified rotation invariant (microblock layer).
-                        // Leader rotation is driven STRICTLY by the 2f+1
-                        // HIGHEST_CERTIFIED_ROUND; the f+1 adopted round is
-                        // telemetry-only and NEVER feeds leader selection —
-                        // only a supermajority is safe for rotation-state
-                        // advancement. Forensic: pre-v15.13 `certified.max(
-                        // adopted)` elevated rotation via the divergent f+1
-                        // adopted → split-brain (h=556); v22 then injected a
-                        // clock-derived bypass (empty_slot_offset from local_now;
-                        // NTP drift >1s → different fallback producer → fork
-                        // h=4742). v23 removes the clock from leader-selection
-                        // inputs entirely, making it structurally impossible.
+                        // Leader rotation is driven STRICTLY by the same-round 2f+1
+                        // HIGHEST_CERTIFIED_ROUND — only a supermajority is safe for
+                        // rotation-state advancement. Forensic (do NOT reintroduce):
+                        // an f+1 `adopted` round once fed rotation via `certified.max(
+                        // adopted)`, but the divergent f+1 caused split-brain (h=556),
+                        // so adopted was removed entirely; a later clock-derived bypass
+                        // (empty_slot_offset from local_now; NTP drift >1s → different
+                        // fallback producer) caused fork h=4742, so the clock is removed
+                        // from leader-selection inputs too — both now structurally
+                        // impossible.
 
-                        // v23.1: ROTATION-ROUND TELEMETRY — strict 2f+1 BFT-certified
-                        // rotation round for the current macroblock (no f+1 adopted),
-                        // reported into the operator dashboard surface via
+                        // ROTATION-ROUND TELEMETRY — strict same-round 2f+1 BFT-certified
+                        // rotation round for the current macroblock, reported into the
+                        // operator dashboard surface via
                         // `update_failover_metrics`. Cheap O(1) DashMap read;
                         // identical cost from 5 to 10 000 super-nodes.
                         let current_rotation_round = {
@@ -15399,7 +15423,7 @@ impl BlockchainNode {
                         // aggregator advances HIGHEST_CERTIFIED_ROUND[mb_idx] → every honest node
                         // computes the SAME fallback leader (pure fn of round + on-chain
                         // candidates). Throttle LAST_TIMEOUT_EMIT_PER_MB (<=1/grace/mb/node);
-                        // receiver VOTER_MAX_ROUND dedupes same-voter same/lower round. Safety:
+                        // receiver TIMEOUT_VOTES enforces (round,voter) uniqueness. Safety:
                         // receiver verifies sig vs on-chain PK registry; <=f byzantine can't
                         // reach 2f+1 (rotation not hijackable). Failover ≈ grace + O(log N) RTT
                         // (3–8s) « 90s view-change. O(1).
@@ -16538,11 +16562,9 @@ impl BlockchainNode {
                 // compute the same leader (no dual-production split). O(1), same cost
                 // at 5 or 10000 nodes. Macroblock 2f+1 Checkpoint-BFT QC = finality.
                 let mb_idx = next_block_height / 90;
-                // v23.1: STRICT 2f+1 CERTIFIED-ONLY for producer selection.
-                // Calling `get_certified_rotation_round` (not
-                // `get_effective_rotation_round`) eliminates the f+1 `adopted`
-                // input that could diverge across nodes under partial gossip
-                // propagation — the h=556 split-brain class fix.
+                // STRICT same-round 2f+1 CERTIFIED-ONLY for producer selection:
+                // `get_certified_rotation_round` is identical on every honest node,
+                // so all nodes elect the same producer — the h=556 split-brain fix.
                 let timeout_round: u64 =
                     crate::unified_p2p::get_certified_rotation_round(mb_idx);
 
@@ -18815,9 +18837,9 @@ impl BlockchainNode {
                         // ────────────────────────────────────────────────────
                         // Carries the `timeout_round` value used by the
                         // leader-election above (snapshotted from
-                        // `get_effective_rotation_round(mb_idx)` — a BFT-
-                        // certified counter advanced ONLY by 2f+1 signed
-                        // TimeoutVotes / f+1 pacemaker, NEVER by local wall
+                        // `get_certified_rotation_round(mb_idx)` — a BFT-
+                        // certified counter advanced ONLY by a same-round 2f+1
+                        // TimeoutCertificate, NEVER by local wall
                         // clock). Block_pipeline ingest recomputes the
                         // same pure function on receive and rejects only
                         // when `block.producer != expected AND
@@ -19315,8 +19337,8 @@ impl BlockchainNode {
 
                     // Pre-save stale-round guard stays removed. The legacy
                     // `effective_round_now > microblock.timeout_round` self-
-                    // check compared two get_effective_rotation_round reads
-                    // that are equal by construction in v23; they differ only
+                    // check compared two get_certified_rotation_round reads
+                    // that are equal by construction; they differ only
                     // if a concurrent 2f+1 cert completed between them — which
                     // advances rotation and makes this node no longer the
                     // producer, so every peer's Category-B ingest check
@@ -20207,12 +20229,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     //   → Each node excluded producers LOCALLY after 4s → NON-DETERMINISTIC
                                     //   → Blocks from real producer REJECTED → NETWORK STALL + FORK
                                     //
-                                    // NEW (CORRECT, v14.8.10):
-                                    //   → Failover is driven by BFT-agreed rotation round
-                                    //     `certified.max(adopted)` — both operands aggregate
-                                    //     only Dilithium3-verified signed TimeoutVotes
-                                    //     (f+1 for HIGHEST_ADOPTED_ROUND, 2f+1 for
-                                    //     HIGHEST_CERTIFIED_ROUND).
+                                    // NEW (CORRECT):
+                                    //   → Failover is driven by the BFT-agreed rotation round
+                                    //     HIGHEST_CERTIFIED_ROUND — advanced only by a signed
+                                    //     same-round 2f+1 TimeoutCertificate (Dilithium3-verified
+                                    //     votes).
                                     //   → Every validator reads the same value once the
                                     //     signed votes have been gossiped, so the VRF
                                     //     formula `(base_idx + rotation_round) % N` selects
@@ -22752,12 +22773,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         ids.sort();
                                         let committee = Self::select_consensus_committee(&ids, macro_window, &storage_cp);
                                         if !committee.iter().any(|id| id == &node_id_cp) { return; } // not voting ⇒ don't emit
+                                        // Checkpoint content = pure function of canonical bodies:
+                                        // hash from the body (NOT the O(1) index, which can lag a
+                                        // replacement), vrf complete-or-defer — never a partial v_vec
+                                        // (a short beacon diverges content_ok → finality stall).
                                         let mut h_vec: Vec<[u8; 32]> = Vec::new();
                                         let mut v_vec: Vec<[u8; 32]> = Vec::new();
                                         for h in start..=b {
-                                            match storage_cp.load_microblock_hash(h) { Ok(Some(x)) => h_vec.push(x), _ => return }
-                                            if let Ok(Some(mb)) = storage_cp.load_microblock_auto_format(h) {
-                                                if let Some(v) = mb.vrf_output { v_vec.push(v); }
+                                            let mb = match storage_cp.load_microblock_auto_format(h) {
+                                                Ok(Some(mb)) => mb,
+                                                _ => return, // body not yet readable → defer, retry next event
+                                            };
+                                            h_vec.push(mb.hash());
+                                            match mb.vrf_output {
+                                                Some(v) => v_vec.push(v),
+                                                None => return, // height>0 must carry vrf; missing → defer
                                             }
                                         }
                                         let state_root = match storage_cp.load_microblock_auto_format(b) {
@@ -23058,9 +23088,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // (e.g. blocks that arrived via out-of-order bulk sync). state_root (the head
                                         // block's real account root, written only after TX apply) is read below.
                                         let mut state_root = [0u8; 32];
-                                        let mut diag_hash_miss = 0u32; // v33-DIAG
-                                        let mut diag_data_miss = 0u32; // v33-DIAG
-                                        let mut diag_vrf_none = 0u32;  // v33-DIAG
                                         let (mb_hashes, vrf_outputs, content_src) =
                                             match crate::node::window_content_from_accum(mb_idx) {
                                                 Some((h, v)) => (h, v, "accum"),
@@ -23101,18 +23128,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                         }
                                                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                                                     }
+                                                    // Body-derived, complete-or-defer (same as the intra path): hash
+                                                    // from the body not the O(1) index; any missing block/vrf → defer.
                                                     let mut h_vec: Vec<[u8; 32]> = Vec::new();
                                                     let mut v_vec: Vec<[u8; 32]> = Vec::new();
                                                     for h in start_height..=end_height {
-                                                        if let Ok(Some(hash)) = storage_cons.load_microblock_hash(h) {
-                                                            h_vec.push(hash);
-                                                        } else {
-                                                            diag_hash_miss += 1;
-                                                        }
-                                                        if let Ok(Some(mb)) = storage_cons.load_microblock_auto_format(h) {
-                                                            if let Some(v) = mb.vrf_output { v_vec.push(v); } else { diag_vrf_none += 1; }
-                                                        } else {
-                                                            diag_data_miss += 1;
+                                                        let mb = match storage_cons.load_microblock_auto_format(h) {
+                                                            Ok(Some(mb)) => mb,
+                                                            _ => return, // incomplete window → defer to §4.5 sync
+                                                        };
+                                                        h_vec.push(mb.hash());
+                                                        match mb.vrf_output {
+                                                            Some(v) => v_vec.push(v),
+                                                            None => return,
                                                         }
                                                     }
                                                     (h_vec, v_vec, "reread")
@@ -23155,21 +23183,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             }
                                         }
                                         let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&vrf_outputs);
-                                        // v33-DIAG: pinpoint the mb_hashes/beacon finality-stall divergence.
-                                        // Compare this line across the 5 nodes for the same mb — differing
-                                        // len/digest/vrf_count/misses localizes the exact non-deterministic
-                                        // input. Remove once the root is fixed.
-                                        if is_warn() {
-                                            use sha3::Digest as _;
-                                            let mut hd = sha3::Sha3_256::new();
-                                            for x in &mb_hashes { hd.update(&x[..]); }
-                                            println!(
-                                                "[WARN][CONS-DIAG] mb={} src={} start={} end={} mb_hashes_len={} digest={} vrf_count={} vrf_none={} hash_miss={} data_miss={} beacon={}",
-                                                mb_idx, content_src, start_height, end_height, mb_hashes.len(),
-                                                hex::encode(&hd.finalize()[..8]), vrf_outputs.len(), diag_vrf_none,
-                                                diag_hash_miss, diag_data_miss, hex::encode(&beacon[..8]),
-                                            );
-                                        }
                                         // P2-D: never signal PARTIAL window content. The accumulator path is
                                         // always complete (window_content_from_accum returns None for an
                                         // incomplete buffer); only the re-read fallback can come up short if a
@@ -23178,7 +23191,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // instead — this node applies the macroblock via the §4.5 sync wire once
                                         // a quorum seals it. (Full window = 90 microblocks.)
                                         let expected_len = (end_height - start_height + 1) as usize;
-                                        if mb_hashes.len() < expected_len {
+                                        if mb_hashes.len() < expected_len || vrf_outputs.len() < expected_len {
                                             if is_warn() {
                                                 println!("[WARN][CONS] window_content_incomplete mb={} src={} have={} need={} — not signalling (defer to §4.5 sync)",
                                                          mb_idx, content_src, mb_hashes.len(), expected_len);
@@ -25374,7 +25387,27 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
             _ => {} // All other variants pass through to standard validation
         }
-        
+
+        // Post-quantum: NodeActivation MUST carry a valid Dilithium3 signature binding it to
+        // the node's on-chain consensus identity. Its ephemeral Ed25519 proves no identity and is
+        // quantum-breakable; without the PQ sig a quantum attacker could forge an activation (which
+        // grants super-node status). Require + verify it (signer = dilithium_public_key, same
+        // canonical message as the Ed25519). The signer PK is on-chain by activation time
+        // (registration precedes activation); a not-yet-applied registration → transient reject,
+        // gossip re-delivers.
+        if matches!(tx.tx_type, qnet_state::TransactionType::NodeActivation { .. }) {
+            let has_dil = tx.dilithium_signature.as_ref().map_or(false, |s| !s.is_empty());
+            if !has_dil {
+                return Err(QNetError::ValidationError(
+                    "[REJECT][GOSSIP] NodeActivation requires a Dilithium3 signature (post-quantum identity binding)".to_string()));
+            }
+            match Self::verify_dilithium_tx_signature_async(&tx).await {
+                Ok(true) => {}
+                _ => return Err(QNetError::ValidationError(
+                    "[REJECT][GOSSIP] NodeActivation Dilithium3 signature invalid or signer not registered".to_string())),
+            }
+        }
+
         // Signature validation with cryptographic verification
         // v2.53: System transactions don't need Ed25519 signature - validated through consensus
         // v2.81: HeartbeatCommitment validated through Dilithium signatures in samples + Merkle proofs
@@ -26524,57 +26557,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             )));
         }
 
-        // Skip-marker macroblock acceptance. A skip marker substitutes
-        // commit-reveal evidence with a 2f+1 AggregatedTimeoutCertificate in
-        // consensus_data.skip_certificate (produced only when commit-reveal
-        // and every fallback failed AND the pacemaker has a TC at the max
-        // view-change round). Validate: refuse if is_skip_marker but no
-        // skip_certificate; re-verify every cert signature vs the active
-        // validator set (same Dilithium3 path as live TCs — no forging);
-        // bypass the structural commits/reveals checks (empty by
-        // construction). Then fall through to the standard save path; skip
-        // markers carry no reputation snapshot so that apply is a no-op.
-        // rayon-parallel sig verify.
+        // Skip-marker macroblocks were legacy commit-reveal failover evidence — no longer
+        // produced. Reject any (a forged is_skip_marker would otherwise bypass the
+        // checkpoint-QC gate below). v2 finality is the 2f+1 checkpoint QC, nothing else.
         if macroblock.consensus_data.is_skip_marker {
-            let cert_bytes = match macroblock.consensus_data.skip_certificate.as_ref() {
-                Some(b) => b,
-                None => {
-                    return Err(QNetError::ValidationError(format!(
-                        "skip_marker_missing_certificate mb={}", index,
-                    )));
-                }
-            };
-
-            // The minimum certified round mirrors the value used by
-            // `build_skip_marker_macroblock`: the participant path drives
-            // exactly MAX_VIEW_CHANGE_ROUNDS=8 view-change rounds before
-            // entering the skip path, and the certificate cannot have
-            // accumulated 2f+1 votes at a round below that ceiling without
-            // 2f+1 honest validators corroborating the failure.
-            const MIN_SKIP_CERTIFIED_ROUND: u64 = 8;
-
-            if let Some(p2p) = self.unified_p2p.as_ref() {
-                if !p2p.verify_skip_certificate_bytes(cert_bytes, index, MIN_SKIP_CERTIFIED_ROUND) {
-                    return Err(QNetError::ValidationError(format!(
-                        "skip_marker_certificate_invalid mb={}", index,
-                    )));
-                }
-            } else {
-                // P2P handle absent (very early bootstrap before mainloop is
-                // up) — refuse to accept a skip marker until the verifier is
-                // available. Caller will retry on the next sync attempt.
-                return Err(QNetError::ValidationError(format!(
-                    "skip_marker_p2p_unavailable mb={}", index,
-                )));
-            }
-
-            if is_info() {
-                println!(
-                    "[INFO][SKIP] verified mb={} from={} action=accept_save",
-                    index, received.from_peer,
-                );
-            }
-            // Fall through to the regular save path below.
+            return Err(QNetError::ValidationError(format!("skip_marker_unsupported mb={}", index)));
         }
 
         // v2 (Checkpoint-BFT): finality is a 2f+1 QC over the checkpoint. checkpoint_qc

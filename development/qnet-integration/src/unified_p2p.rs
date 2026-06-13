@@ -1298,46 +1298,14 @@ static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<u64, u64>>> =
 // v14.8.10: `TIMEOUT_JUMP_TARGET` + `jump_to_highest` REMAIN REMOVED — they
 // were the v13.0 Byzantine-inflation attack vector (one signed vote pinning
 // the whole network at u64::MAX). Good removal, kept.
-//
-// v14.8.10: `HIGHEST_ADOPTED_ROUND` + `VOTER_MAX_ROUND` RESTORED. Their
-// removal in v14.8.7/8/9 was the regression that caused the h=339 catch-up
-// fork: without adopted-round aggregation of signed votes, microblock
-// rotation fell back to a wall-clock pacemaker whose `(now − parent_ts)`
-// term differs by the sync lag between a fresh catch-up node and a live
-// producer, placing them on different ranks of the VRF candidate list and
-// producing two blocks for the same height.
-//
-// The canonical rule restored here: microblock rotation round is driven
-// by BFT-consensus state (signed 2f+1 TC `certified` OR f+1 aggregated
-// signed votes `adopted`), NEVER by local wall-clock. Wall-clock only
-// decides WHEN to vote (stall detection), not WHAT round applies for
-// producer selection. A catch-up node sees `certified` and `adopted` from
-// peers' broadcast votes, joins the live rotation at the same round as
-// every other honest validator, and therefore selects the same producer.
-//
-// Safety: every vote that enters VOTER_MAX_ROUND is Dilithium3-verified at
-// the top of `handle_timeout_vote`. HIGHEST_ADOPTED_ROUND advances only on
-// the f+1-th voter's max round — quantum-signed evidence, not raw bytes.
-// Byzantine attackers with ≤ f keys cannot reach the f+1 threshold alone.
-//
-// Scalability: per-vote O(voters_at_height) partial sort on a DashMap shard
-// iterator; at the 1000-validator committee cap this is a small constant
-// per message and bounded by the active macroblock window (cleanup_sweep
-// prunes stale entries).
+// Microblock rotation round is driven ONLY by BFT-consensus state (signed
+// same-round 2f+1 TimeoutCertificate `certified`), NEVER by local wall-clock.
+// Wall-clock decides WHEN to vote (stall detection), not WHAT round applies for
+// producer selection — so a catch-up node and a live producer always select the
+// same leader for a height once they share the 2f+1-certified round.
 
-/// O(1) tracker: highest adopted round (≥ f+1 voters at max_round ≥ R).
-/// Key: macroblock_index. Value: highest round with f+1 adoption. Cumulative
-/// BFT voting — a voter's signed vote at round R supports ALL rounds ≤ R.
-static HIGHEST_ADOPTED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
-
-/// Per-voter max round tracker. Key: (macroblock_index, voter_id). Value:
-/// max round this voter has signed. Feeds HIGHEST_ADOPTED_ROUND aggregation.
-static VOTER_MAX_ROUND: Lazy<Arc<DashMap<(u64, String), u64>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
-
-// Per-macroblock baseline finalized round. HIGHEST_CERTIFIED/ADOPTED_ROUND
-// are keyed per-mb and persist across all 90 heights, so after a stall at
+// Per-macroblock baseline finalized round. HIGHEST_CERTIFIED_ROUND
+// is keyed per-mb and persists across all 90 heights, so after a stall at
 // height K reaching round R every later height in the mb starts with
 // rotation_round=R while its own snapshot is 0 → the pre-save guard yields
 // every block to the mb boundary, muting the elected producer ~30+ blocks
@@ -1381,14 +1349,10 @@ pub fn get_baseline_round(mb_index: u64) -> u64 {
 /// Returns the BFT-CERTIFIED rotation round for `mb_index`, relative to the
 /// last finalized baseline in this macroblock.
 ///
-/// Strict 2f+1 certified-only. HIGHEST_ADOPTED_ROUND (f+1) is NOT used here:
-/// f+1 voters' max-round can diverge across nodes under partial gossip →
-/// different `adopted` → different leaders for the same height → split-brain
-/// fork (h=556). Only the 2f+1 supermajority-certified round is safe — it is
-/// Dilithium3-unforgeable, monotonic per mb, and identical on every honest
-/// node within a gossip RTT. Adopted stays computed elsewhere (pacemaker /
-/// observability) but MUST NOT enter producer selection. Returns 0 if no
-/// advance is certified, else N where 2f+1 votes aggregated for baseline+N.
+/// Strict same-round 2f+1 certified-only — the SOLE rotation input. The round is
+/// Dilithium3-unforgeable, monotonic per mb, and identical on every honest node
+/// within a gossip RTT, so all nodes elect the same producer for a height.
+/// Returns 0 if no advance is certified, else N where 2f+1 certified baseline+N.
 /// This is the SOLE rotation input to select_microblock_producer_with_round
 /// and the value embedded in microblock.timeout_round (Category-B check).
 ///
@@ -1409,78 +1373,16 @@ pub fn get_certified_rotation_round(mb_index: u64) -> u64 {
 /// `HIGHEST_CERTIFIED_ROUND[mb_idx]` (see `get_certified_rotation_round`) — so the ingest gate
 /// and the producer can never disagree on whether a round is authorised.
 ///
-/// Why this replaces the old gate: `HIGHEST_CERTIFIED_ROUND` is advanced by BOTH 2f+1 paths —
-/// a same-round `TimeoutProof` AND a cross-round `AggregatedTimeoutCertificate` (the pacemaker
-/// that exists precisely for failover storms, where votes spread over rounds and no single round
-/// reaches 2f+1). The previous gate consulted only the same-round `TIMEOUT_CERTIFICATES` map and
-/// keyed it by microblock HEIGHT + the RELATIVE round — a key that is never populated (votes/certs
-/// key by mb_idx + absolute round). So it rejected EVERY failover block, splitting the chain
-/// whenever a round-storm produced one (producer advanced cross-round; receivers demanded a
-/// same-round proof the storm structurally prevents) → multi-hour stall. Same key + same
-/// authority = symmetric, storm-safe, O(1).
+/// Both the producer and this gate read the same `HIGHEST_CERTIFIED_ROUND[mb_idx]`, advanced
+/// only by a same-round 2f+1 `TimeoutProof`, so they can never disagree on whether a round is
+/// authorised. A round>0 block is admitted iff its absolute round is 2f+1-certified. O(1).
 pub fn failover_round_authorized(mb_index: u64, block_round: u64) -> bool {
     if block_round == 0 { return true; } // happy path: no failover, no certificate required
     let baseline = get_baseline_round(mb_index);
     highest_certified_round_for(mb_index) >= block_round.saturating_add(baseline)
 }
 
-/// DEPRECATED in v23.1 — kept only for backward compatibility with
-/// observability/telemetry callers that explicitly want the
-/// max(certified, adopted) view. Producer selection and ingest-side
-/// authority validation MUST use `get_certified_rotation_round` instead.
-///
-/// Removing the wrong helper outright would silently change behavior for
-/// any latent caller; keeping it as a documented deprecation lets us
-/// detect future misuse via grep and migrate explicitly. New code MUST
-/// NOT call this function.
-#[deprecated(
-    note = "Use get_certified_rotation_round for producer selection. \
-            max(certified, adopted) is unsafe under partial gossip propagation \
-            (h=556 forensic). This helper is retained ONLY for observability."
-)]
-pub fn get_effective_rotation_round(mb_index: u64) -> u64 {
-    let baseline = get_baseline_round(mb_index);
-    let certified = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
-    let adopted = HIGHEST_ADOPTED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
-    let live = certified.max(adopted);
-    live.saturating_sub(baseline)
-}
 
-// Pacemaker-certified support. Closes the cascade livelock at
-// h=2880..3151 (voters spread across rounds 3..7 in a partial stall, no
-// single round got 2f+1 same-round sigs, certified stuck at 0 while
-// adopted climbed → commit/reveal hung). Pacemaker = the k-th highest
-// per-voter max_round (k=2f+1) = highest round with ≥2f+1 cumulative
-// support, since a vote@R implies all rounds ≤R; converges even with
-// asynchronously-spread voters. Same byzantine resistance as same-round
-// 2f+1 (each vote Dilithium3-verified before VOTER_MAX_ROUND). O(voters)
-// partial sort.
-
-/// v15.0: Per-voter signed vote data for aggregated certificate construction.
-/// Key: (macroblock_index, voter_id). Value: (vote_round, vote_block_hash,
-/// signature) — the FULL signed payload at that voter's max round. Allows
-/// `generate_and_broadcast_aggregated_tc` to collect 2f+1 signatures at
-/// rounds ≥ R without re-requesting them from peers.
-///
-/// Retention: pruned alongside VOTER_MAX_ROUND by cleanup_old_timeout_data
-/// so memory stays flat at the active macroblock window regardless of
-/// committee size.
-static VOTER_MAX_SIGNED_VOTE: Lazy<Arc<DashMap<(u64, String), (u64, [u8; 32], Vec<u8>)>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
-
-/// v15.0: Aggregated timeout certificate storage. Key: (macroblock_index,
-/// certified_round). Value: full aggregated certificate with 2f+1 signed
-/// votes at rounds ≥ certified_round. Queried by catch-up nodes via
-/// `request_timeout_proofs` — the response path serves both same-round and
-/// aggregated certificates from the same retention window.
-static AGGREGATED_TC: Lazy<Arc<DashMap<(u64, u64), AggregatedTimeoutCertificate>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
-
-/// v15.0: Tracks the highest certified_round this node has already
-/// broadcast an aggregated TC for, per macroblock index. Prevents repeated
-/// broadcasts for the same pacemaker advance. Monotonic per height.
-static AGGREGATED_TC_BROADCAST: Lazy<Arc<DashMap<u64, u64>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
 
 // Remote-producer heartbeat tracking (two wait-free DashMaps).
 // REMOTE_PRODUCER_HEARTBEAT_MS = producer-stamped ts (monotonic, anti-
@@ -5518,18 +5420,10 @@ impl SimplifiedP2P {
                 let timeout_certs_removed = timeout_certs_before.saturating_sub(TIMEOUT_CERTIFICATES.len());
                 
                 HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_height);
-                HIGHEST_ADOPTED_ROUND.retain(|h, _| *h >= min_height);
-                VOTER_MAX_ROUND.retain(|(h, _), _| *h >= min_height);
                 // v15.11: prune per-mb baseline rounds alongside their
                 // companion HIGHEST_*_ROUND maps. Keys are mb_index so the
                 // same retention window applies.
                 LAST_FINALIZED_ROUND_PER_MB.retain(|h, _| *h >= min_height);
-                // v15.0: prune pacemaker-TC maps alongside the rest of the
-                // timeout state so memory stays flat even at committee
-                // upper bound.
-                VOTER_MAX_SIGNED_VOTE.retain(|(h, _), _| *h >= min_height);
-                AGGREGATED_TC.retain(|(h, _), _| *h >= min_height);
-                AGGREGATED_TC_BROADCAST.retain(|h, _| *h >= min_height);
                 // v15.1: prune GLOBAL_PEER_LAST_SEEN_BY_IP so long-gone peers
                 // don't linger. A 30-minute stale cutoff keeps the registry
                 // bounded at the network's currently-reachable peer set
@@ -11501,7 +11395,7 @@ impl SimplifiedP2P {
     /// (TIMEOUT_VOTES round-uniqueness, READY_ACKS distinct-ack DashSet,
     /// BLOCK_REJECTION_OBSERVERS distinct-observer DashSet, etc.) as the
     /// natural emission cap. The legacy 30/min cap was the immediate cause
-    /// of the v17.x stall observed at h=180-241 — under sustained pacemaker
+    /// of the v17.x stall observed at h=180-241 — under a sustained timeout
     /// stall the rotation round increments at ≈1/sec, producing ≈60 signed
     /// TimeoutVotes/min that tripped the 30/min cap and silently dropped
     /// honest validator gossip. With strict 2f+1 BFT-certified rotation
@@ -12373,8 +12267,8 @@ pub enum NetworkMessage {
     ///
     /// Liveness: if 2f+1 acks do not arrive within the ack-wait timeout
     /// (configurable, default 800 ms), the producer simply yields the
-    /// slot and the existing pacemaker advances to round R+1 — same
-    /// progress path as a missing block.
+    /// slot and the round advances to R+1 via the next same-round 2f+1
+    /// timeout — same progress path as a missing block.
     ///
     /// Scalability: only the elected producer broadcasts at round-change
     /// events (rare). Per round-change network cost is O(committee) for
@@ -12501,34 +12395,11 @@ pub enum NetworkMessage {
         votes: Vec<(String, Vec<u8>)>, // (voter_id, signature) pairs
     },
 
-    /// v15.0: Pacemaker-style aggregated timeout certificate.
-    ///
-    /// Unlike `TimeoutCertificateBroadcast` (2f+1 votes at ONE round, same
-    /// last-block-hash), this variant carries 2f+1 votes each at its OWN
-    /// `vote_round ≥ certified_round`. Closes the cascade livelock where
-    /// voters stretch across rounds 3..7 and no single round ever reaches
-    /// 2f+1 — the old same-round aggregator stalled certified at 0 while
-    /// adopted kept climbing.
-    ///
-    /// Safety:
-    ///   * Each (voter_id, vote_round, vote_hash, signature) is independently
-    ///     verified against the message `TIMEOUT:{height}:{vote_round}:{hex(vote_hash)}`.
-    ///   * Receiver checks `vote_round ≥ certified_round` on every entry and
-    ///     counts only unique voter_ids — ≤ f byzantine validators cannot
-    ///     forge the 2f+1 threshold.
-    ///   * `certified_round` is the minimum round any honest voter signed,
-    ///     which is a lower bound on the network's real rotation progress.
-    ///
-    /// Scalability: payload is O(committee) bounded by the committee cap.
-    /// One broadcast per advance of the 2f+1 pacemaker threshold — not per
-    /// vote — so message frequency stays O(rounds × macroblocks), not
-    /// O(voters × rounds).
-    TimeoutAggregateCertificate {
-        height: u64,                                  // macroblock index
-        certified_round: u64,                         // all votes signed round ≥ this
-        // (voter_id, vote_round, vote_block_hash, signature)
-        votes: Vec<(String, u64, Vec<u8>, Vec<u8>)>,
-    },
+    // `TimeoutAggregateCertificate` (cross-round pacemaker cert) REMOVED: it
+    // advanced the leader round from votes SPREAD across rounds, not a same-round
+    // 2f+1, making rotation path-dependent → different leaders per node → dual
+    // production + fork (h=154). Leader round now advances ONLY on a same-round
+    // 2f+1 `TimeoutCertificateBroadcast`.
 
     /// Request timeout certificates for sync (new/reconnecting nodes)
     RequestTimeoutCertificates {
@@ -12953,35 +12824,9 @@ pub struct SignedTimeoutVote {
 pub type TimeoutCertificate = TimeoutProof;
 pub type TimeoutVoteData = SignedTimeoutVote;
 
-/// v15.0: Aggregated per-voter signed timeout payload for pacemaker certificates.
-/// Each entry carries the voter's OWN signed (round, hash) tuple — allows
-/// 2f+1 distinct voters at potentially different rounds to form a single
-/// pacemaker-style certificate for the minimum round among them.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AggregatedSignedVote {
-    pub voter_id: String,
-    pub vote_round: u64,           // ≥ certified_round of enclosing certificate
-    pub vote_block_hash: [u8; 32], // voter's view of the stalled block's hash
-    pub signature: Vec<u8>,        // Dilithium3 over TIMEOUT:{height}:{vote_round}:{hex(vote_block_hash)}
-}
-
-/// v15.0: Aggregated (pacemaker-style) timeout certificate.
-///
-/// Unlike `TimeoutProof` (all votes share round + hash), each contained
-/// vote may signal a DIFFERENT round ≥ `certified_round`. The certificate
-/// proves: "≥ 2f+1 distinct voters have each signed a timeout vote at
-/// some round ≥ certified_round on macroblock index `height`."
-///
-/// Verification: reconstruct each vote's own message and verify Dilithium3.
-/// A certificate is valid only when every contained vote signed its own
-/// round/hash pair AND all rounds are ≥ certified_round AND voter_ids are
-/// distinct AND count ≥ 2f+1.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AggregatedTimeoutCertificate {
-    pub height: u64,                      // macroblock index
-    pub certified_round: u64,             // minimum round any contained voter signed
-    pub votes: Vec<AggregatedSignedVote>, // 2f+1 distinct voters, each round ≥ certified_round
-}
+// `AggregatedSignedVote` / `AggregatedTimeoutCertificate` REMOVED with the
+// cross-round pacemaker (see the NetworkMessage tombstone). Same-round 2f+1 is
+// carried by `TimeoutProof` — all votes share one round + hash.
 
 // v14.7.2: per-microblock `QuorumCertificate` struct + verify REMOVED.
 // Microblock BFT safety is delivered by the canonical macroblock
@@ -13965,7 +13810,7 @@ impl SimplifiedP2P {
 
                 // Count-based rate limit removed for signed TimeoutVotes. The
                 // legacy is_consensus_rate_limited(30/min) caused the v17.x
-                // stall (h=180-241): under pacemaker stall the round
+                // stall (h=180-241): under a timeout stall the round
                 // increments ≈1/s → ≈60 votes/min → trips the 30/min cap on
                 // every receiver, muting a legit voter 5 min; with strict
                 // 2f+1, one muted voter freezes HIGHEST_CERTIFIED_ROUND
@@ -13993,17 +13838,6 @@ impl SimplifiedP2P {
                 self.handle_timeout_proof_broadcast(height, timeout_round, last_block_hash, votes);
             }
 
-            // v15.0: Aggregated (pacemaker-style) TC — 2f+1 votes at rounds ≥ R.
-            NetworkMessage::TimeoutAggregateCertificate { height, certified_round, votes } => {
-                if crate::node::is_info() {
-                    println!(
-                        "[INFO][TIMEOUT] agg_tc_recv h={} certified_round={} votes={}",
-                        height, certified_round, votes.len(),
-                    );
-                }
-                self.handle_aggregated_timeout_cert(height, certified_round, votes);
-            }
-            
             // Request for timeout proofs (sync)
             NetworkMessage::RequestTimeoutCertificates { from_height, to_height, requester_id } => {
                 if crate::node::is_debug() {
@@ -22086,111 +21920,11 @@ impl SimplifiedP2P {
                      height, timeout_round, voter_id, votes_count, byzantine_threshold);
         }
 
-        // BFT consensus-driven rotation (never wall clock; wall clock only
-        // decides WHEN to vote). Two trackers:
-        //   HIGHEST_CERTIFIED_ROUND[mb] — advanced only by a signed 2f+1
-        //     same-round TimeoutCertificate. Strongest, unforgeable.
-        //   HIGHEST_ADOPTED_ROUND[mb] — f+1 aggregation of per-voter max
-        //     rounds. Weaker (f+1 = ≥1 honest) but converges faster: it
-        //     doesn't need 2f+1 at the SAME round — a vote@R supports all ≤R.
-        // Catch-up safety: a synced validator's VOTER_MAX_ROUND fills from
-        // peers' signed vote gossip → its adopted round matches the network
-        // → same producer selected, no wall-clock divergence. O(1) insert +
-        // O(voters) partial-sort; pruned by cleanup_old_timeout_data.
-
-        // Track this voter's max round for f+1 adoption aggregation and
-        // remember the highest signed payload so we can reconstruct a
-        // pacemaker-style aggregated TC without replay-requesting peers.
-        // The insert into VOTER_MAX_SIGNED_VOTE fires only when the
-        // incoming vote's round is the voter's new max — older signed
-        // payloads are never overwritten with lower-round ones.
-        {
-            let prev = VOTER_MAX_ROUND.entry((height, voter_id.clone()))
-                .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
-                .or_insert(timeout_round);
-            if *prev == timeout_round {
-                VOTER_MAX_SIGNED_VOTE.insert(
-                    (height, voter_id.clone()),
-                    (timeout_round, hash_arr, signature.clone()),
-                );
-            }
-        }
-
-        // Cumulative adopted round: the f+1-th voter (by max_round desc) defines
-        // the highest round with ≥ f+1 support. Monotonic — never decreases.
-        // Reuse the sorted snapshot below for pacemaker-certified derivation.
-        let mut max_rounds: Vec<u64> = VOTER_MAX_ROUND.iter()
-            .filter(|e| e.key().0 == height)
-            .map(|e| *e.value())
-            .collect();
-        {
-            let f_plus_1 = (total_validators + 2) / 3; // ceil(n/3)
-            if f_plus_1 > 0 && max_rounds.len() >= f_plus_1 {
-                let idx = f_plus_1 - 1;
-                let mut adopted_view = max_rounds.clone();
-                adopted_view.select_nth_unstable_by(idx, |a, b| b.cmp(a));
-                let best_adopted = adopted_view[idx];
-                if best_adopted > 0 {
-                    HIGHEST_ADOPTED_ROUND.entry(height)
-                        .and_modify(|cur| { if best_adopted > *cur { *cur = best_adopted; } })
-                        .or_insert(best_adopted);
-                }
-            }
-        }
-
-        // v15.0: cross-round pacemaker-certified — 2f+1 with round >= R. Closes
-        // the cascade livelock where voters stretch rounds 3..7 and no single
-        // round gets 2f+1. Each vote's Dilithium3 sig is verified before insert
-        // → as strong as same-round 2f+1. Locally advance HIGHEST_CERTIFIED_ROUND
-        // + broadcast AggregatedTimeoutCertificate (2f+1 votes >=R) for catch-up;
-        // monotonic, deduped, committee-bounded, pruned.
-        // v16.2: at mb_idx==0 (cold-boot, pre-first-macroblock) SAME-ROUND ONLY —
-        // cross-round causes a timing race (pacemaker jumps 1→6→11, each node
-        // sees a different intermediate → two each think "I'm elected" → cold-
-        // boot fork h=154). 5 genesis NTP-synced: same-round 2f+1 suffices.
-        // Cross-round resumes after the first macroblock; 2f+1 invariant intact.
-        let cross_round_pacemaker_enabled = height > 0;
-        if cross_round_pacemaker_enabled {
-            let two_f_plus_1 = qnet_consensus::checkpoint_bft::quorum_size(total_validators); // v34: n−f (was ceil(2n/3))
-            if two_f_plus_1 > 0 && max_rounds.len() >= two_f_plus_1 {
-                let idx = two_f_plus_1 - 1;
-                max_rounds.select_nth_unstable_by(idx, |a, b| b.cmp(a));
-                let pacemaker_certified = max_rounds[idx];
-                if pacemaker_certified > 0 {
-                    let mut advanced_to: Option<u64> = None;
-                    HIGHEST_CERTIFIED_ROUND.entry(height)
-                        .and_modify(|cur| {
-                            if pacemaker_certified > *cur {
-                                *cur = pacemaker_certified;
-                                advanced_to = Some(pacemaker_certified);
-                            }
-                        })
-                        .or_insert_with(|| {
-                            advanced_to = Some(pacemaker_certified);
-                            pacemaker_certified
-                        });
-
-                    if let Some(new_r) = advanced_to {
-                        let should_broadcast = {
-                            let entry = AGGREGATED_TC_BROADCAST.entry(height)
-                                .and_modify(|cur| { if new_r > *cur { *cur = new_r; } })
-                                .or_insert(new_r);
-                            // Only broadcast if this insert/modify genuinely advanced.
-                            *entry == new_r && new_r > 0
-                        };
-                        if should_broadcast {
-                            self.generate_and_broadcast_aggregated_tc(
-                                height, new_r, two_f_plus_1,
-                            );
-                        }
-                    }
-                }
-            }
-        } else if crate::node::is_debug() {
-            println!(
-                "[DBG][TIMEOUT] pacemaker_cross_round_disabled mb_idx=0 reason=cold_boot_strict_same_round"
-            );
-        }
+        // Leader-selection round (HIGHEST_CERTIFIED_ROUND) advances ONLY on a same-round
+        // 2f+1 TimeoutProof (formed below / received via TC broadcast) — never cross-round,
+        // never f+1. A cross-round or f+1 advance is path-dependent (gossip-order skew →
+        // different leaders for one height → dual production, forensic h=154). Liveness:
+        // heartbeat-synchronized timeouts + per-round grace backoff, all strictly 2f+1.
 
         // Signed 2f+1 same-round → TimeoutCertificate (strongest advancement).
         if votes_count >= byzantine_threshold {
@@ -22353,110 +22087,9 @@ impl SimplifiedP2P {
 
     }
 
-    /// v15.0: Build an aggregated (pacemaker-style) timeout certificate for
-    /// round ≥ `certified_round` and broadcast it to all peers.
-    ///
-    /// Collects every voter's highest signed payload from VOTER_MAX_SIGNED_VOTE
-    /// (populated on each verified incoming vote) at this macroblock index,
-    /// keeps those with vote_round ≥ certified_round, sorts by vote_round
-    /// descending and truncates to the first 2f+1 entries. The resulting
-    /// certificate is:
-    ///   * stored locally in AGGREGATED_TC for catch-up serving, and
-    ///   * broadcast as `TimeoutAggregateCertificate` so peers that missed
-    ///     individual votes can independently verify and advance their own
-    ///     HIGHEST_CERTIFIED_ROUND.
-    ///
-    /// Safety: every vote in the certificate was Dilithium3-verified at
-    /// insert-time and its (round, hash) tuple is the exact payload the
-    /// voter signed. Receivers re-verify before acting on it. No trust in
-    /// the aggregator is required.
-    ///
-    /// Scalability: O(committee) local scan bounded by MAX_VALIDATORS; the
-    /// resulting payload is O(2f+1) entries × constant per-entry cost.
-    /// De-duplicated per height via AGGREGATED_TC_BROADCAST so a node never
-    /// re-broadcasts the same certified_round twice.
-    fn generate_and_broadcast_aggregated_tc(
-        &self,
-        height: u64,
-        certified_round: u64,
-        two_f_plus_1: usize,
-    ) {
-        // Collect all known signed votes for this macroblock index.
-        let mut candidates: Vec<AggregatedSignedVote> = VOTER_MAX_SIGNED_VOTE
-            .iter()
-            .filter(|e| e.key().0 == height)
-            .filter_map(|e| {
-                let (_, voter_id) = e.key();
-                let (vr, vh, sig) = e.value();
-                if *vr >= certified_round {
-                    Some(AggregatedSignedVote {
-                        voter_id: voter_id.clone(),
-                        vote_round: *vr,
-                        vote_block_hash: *vh,
-                        signature: sig.clone(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if candidates.len() < two_f_plus_1 {
-            if crate::node::is_warn() {
-                println!(
-                    "[WARN][TIMEOUT] pacemaker_agg_tc_insufficient h={} round={} have={} need={}",
-                    height, certified_round, candidates.len(), two_f_plus_1,
-                );
-            }
-            return;
-        }
-
-        // Prefer highest rounds first — shortens catch-up path for peers.
-        candidates.sort_by(|a, b| b.vote_round.cmp(&a.vote_round));
-        candidates.truncate(two_f_plus_1);
-
-        let cert = AggregatedTimeoutCertificate {
-            height,
-            certified_round,
-            votes: candidates.clone(),
-        };
-
-        // Store locally for backfill responses.
-        AGGREGATED_TC.insert((height, certified_round), cert.clone());
-
-        if crate::node::is_info() {
-            println!(
-                "[INFO][TIMEOUT] pacemaker_agg_tc h={} certified_round={} votes={} max_round={}",
-                height, certified_round, cert.votes.len(),
-                cert.votes.first().map(|v| v.vote_round).unwrap_or(0),
-            );
-        }
-
-        // Build the wire payload.
-        let votes_wire: Vec<(String, u64, Vec<u8>, Vec<u8>)> = cert
-            .votes
-            .iter()
-            .map(|v| (
-                v.voter_id.clone(),
-                v.vote_round,
-                v.vote_block_hash.to_vec(),
-                v.signature.clone(),
-            ))
-            .collect();
-
-        let msg = NetworkMessage::TimeoutAggregateCertificate {
-            height,
-            certified_round,
-            votes: votes_wire,
-        };
-
-        // Reuse the parallel broadcast path used for same-round TCs.
-        self.broadcast_aggregated_timeout_cert(msg);
-    }
-
-    /// v15.0: Broadcast an AggregatedTimeoutCertificate to all validator peers.
-    /// Uses the same parallel fan-out pattern as `broadcast_timeout_proof`.
-    fn broadcast_aggregated_timeout_cert(&self, msg: NetworkMessage) {
+    /// Parallel best-effort fan-out of a consensus message to all validator peers
+    /// (used by BlockRejection / ProducerReady / ReadyAck / attestations).
+    fn broadcast_consensus_message_parallel(&self, msg: NetworkMessage) {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => return,
@@ -22543,8 +22176,7 @@ impl SimplifiedP2P {
             expected_prev_hash,
             signature: signature_bytes,
         };
-        // Reuse the parallel fan-out used for AggregatedTimeoutCertificate.
-        self.broadcast_aggregated_timeout_cert(msg);
+        self.broadcast_consensus_message_parallel(msg);
     }
 
     /// v16.2: Broadcast `ProducerReady` to all validator peers. Caller is
@@ -22568,8 +22200,7 @@ impl SimplifiedP2P {
             producer_id,
             signature: signature_bytes,
         };
-        // Reuse the parallel fan-out used for AggregatedTimeoutCertificate.
-        self.broadcast_aggregated_timeout_cert(msg);
+        self.broadcast_consensus_message_parallel(msg);
     }
 
     /// v16.1: Broadcast a Dilithium3-signed `ProducerHeartbeat` to all
@@ -22603,9 +22234,7 @@ impl SimplifiedP2P {
             slot_height,
             signature: signature_bytes,
         };
-        // Reuse the parallel fan-out used for AggregatedTimeoutCertificate —
-        // identical bandwidth profile, identical PEER_RETRY_COOLDOWN gate.
-        self.broadcast_aggregated_timeout_cert(msg);
+        self.broadcast_consensus_message_parallel(msg);
     }
 
     /// Broadcast timeout proof to all connected nodes
@@ -23130,240 +22759,10 @@ impl SimplifiedP2P {
     // v14.8.10: `take_timeout_jump_target` REMAINS REMOVED — the
     // jump-to-highest mechanism (single signed vote inflating the whole
     // network's round to an attacker-chosen value) was Byzantine-unsafe.
-    // Rotation rounds are now derived from BFT-agreed aggregates:
-    //   * HIGHEST_CERTIFIED_ROUND  — 2f+1 signed same-round TimeoutCertificate
-    //                                OR 2f+1 pacemaker-aggregated TC (v15.0)
-    //   * HIGHEST_ADOPTED_ROUND    — f+1 voters' max signed round
-    // Both require Dilithium3-verified supermajority/honest-plurality
-    // evidence before advancing, so a ≤ f attacker cannot move the
-    // network's rotation round.
+    // The rotation round is now derived solely from HIGHEST_CERTIFIED_ROUND —
+    // advanced only by a Dilithium3-verified same-round 2f+1 TimeoutCertificate,
+    // so a ≤ f attacker cannot move the network's rotation round.
 
-    /// v15.0: Process an aggregated (pacemaker-style) timeout certificate
-    /// received from a peer. Verifies every contained vote independently
-    /// against its OWN (round, hash) signed message, checks distinct voter
-    /// IDs and 2f+1 threshold, then advances local HIGHEST_CERTIFIED_ROUND
-    /// and populates VOTER_MAX_ROUND / VOTER_MAX_SIGNED_VOTE with the newly
-    /// learned signed payloads so this node can re-serve the certificate to
-    /// other catch-up peers.
-    ///
-    /// Safety:
-    ///   * Each vote signature is verified via `verify_timeout_vote_signature`
-    ///     against the message `TIMEOUT:{height}:{vote_round}:{hex(vote_hash)}`.
-    ///   * Rejects any vote with vote_round < certified_round — the certificate
-    ///     promises all contained rounds are ≥ R, violations invalidate it.
-    ///   * Rejects duplicate voter_ids to preserve the 2f+1 distinct-voter
-    ///     guarantee.
-    ///   * Certificate is stored in AGGREGATED_TC only after full verification,
-    ///     so re-broadcasts always carry honest-majority-backed payloads.
-    ///
-    /// Scalability: O(committee) signature verifications per incoming
-    /// certificate, bounded by MAX_VALIDATORS. Cadence is throttled by
-    /// the emitter's AGGREGATED_TC_BROADCAST monotonic gate, so a well-behaved
-    /// network emits at most one certificate per (height, new_R) tuple.
-    fn handle_aggregated_timeout_cert(
-        &self,
-        height: u64,
-        certified_round: u64,
-        votes: Vec<(String, u64, Vec<u8>, Vec<u8>)>,
-    ) {
-        if certified_round == 0 {
-            if crate::node::is_debug() {
-                println!("[DBG][TIMEOUT] agg_tc_noop h={} certified_round=0", height);
-            }
-            return;
-        }
-
-        let current_certified = HIGHEST_CERTIFIED_ROUND
-            .get(&height)
-            .map(|v| *v)
-            .unwrap_or(0);
-        if current_certified >= certified_round {
-            if crate::node::is_debug() {
-                println!(
-                    "[DBG][TIMEOUT] agg_tc_stale h={} cert_round={} local={}",
-                    height, certified_round, current_certified,
-                );
-            }
-            return;
-        }
-
-        let total_validators = self.get_active_validator_count();
-        let two_f_plus_1 = qnet_consensus::checkpoint_bft::quorum_size(total_validators); // v34: n−f, matches macroblock BFT2
-        if two_f_plus_1 == 0 {
-            if crate::node::is_warn() {
-                println!("[WARN][TIMEOUT] agg_tc_no_quorum_target h={} committee=0", height);
-            }
-            return;
-        }
-
-        if votes.len() < two_f_plus_1 {
-            if crate::node::is_warn() {
-                println!(
-                    "[WARN][TIMEOUT] agg_tc_short h={} votes={} need={}",
-                    height, votes.len(), two_f_plus_1,
-                );
-            }
-            return;
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        // v15.2: PARALLEL verification of aggregated timeout certificate.
-        //
-        // Same motivation as the same-round TC path: at MAX_VALIDATORS=1000
-        // the 2f+1 = 667 Dilithium3 signatures are the dominant cost of a
-        // view-change. Parallel verification through rayon amortises the
-        // work across cores and keeps the commit-phase budget healthy.
-        //
-        // Structural checks (round ≥ certified_round, 32-byte hash, distinct
-        // voter_ids) are kept in the serial pre-pass — they are O(1) each
-        // and cheap enough that touching the parallel pool for them would
-        // be pure overhead. Only the per-signature Dilithium3 verify — the
-        // actual hot path — runs in parallel.
-        // ═══════════════════════════════════════════════════════════════════
-
-        // ── SERIAL pre-pass: shape / invariant / duplicate checks. ──
-        // Any violation here rejects the whole certificate (these are cheap
-        // structural invariants that an honest aggregator must satisfy).
-        let mut seen_voters: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut prepared: Vec<(String, u64, [u8; 32], Vec<u8>, String)> =
-            Vec::with_capacity(votes.len());
-        // v27 HOLE5: all aggregate signers must be committee members
-        // (else crafted non-committee 2f+1 forks the view). Fetched once.
-        let committee_gate = self.deterministic_eligible_ids();
-        for (voter_id, vote_round, vote_hash_vec, signature) in votes.into_iter() {
-            if vote_round < certified_round {
-                if crate::node::is_warn() {
-                    println!(
-                        "[WARN][TIMEOUT] agg_tc_round_underflow h={} voter={} round={} cert_round={}",
-                        height, voter_id, vote_round, certified_round,
-                    );
-                }
-                return;
-            }
-            if vote_hash_vec.len() != 32 {
-                if crate::node::is_warn() {
-                    println!(
-                        "[WARN][TIMEOUT] agg_tc_bad_hash h={} voter={} len={}",
-                        height, voter_id, vote_hash_vec.len(),
-                    );
-                }
-                return;
-            }
-            if !seen_voters.insert(voter_id.clone()) {
-                if crate::node::is_warn() {
-                    println!("[WARN][TIMEOUT] agg_tc_duplicate_voter h={} voter={}", height, voter_id);
-                }
-                return;
-            }
-            // v27 HOLE5: signer must be committee (reject-cert idiom).
-            if let Some(ref committee) = committee_gate {
-                if !committee.contains(&voter_id) {
-                    if crate::node::is_warn() {
-                        println!("[WARN][TIMEOUT] agg_tc_noncommittee h={} voter={} committee={} action=reject_cert",
-                                 height, voter_id, committee.len());
-                    }
-                    return;
-                }
-            }
-
-            let mut hash_arr = [0u8; 32];
-            hash_arr.copy_from_slice(&vote_hash_vec);
-            let vote_msg = format!(
-                "TIMEOUT:{}:{}:{}",
-                height, vote_round, hex::encode(&hash_arr),
-            );
-            prepared.push((voter_id, vote_round, hash_arr, signature, vote_msg));
-        }
-
-        // ── PARALLEL verify pass: Dilithium3 signature checks. ──
-        use rayon::prelude::*;
-        let results: Vec<Option<AggregatedSignedVote>> = prepared
-            .par_iter()
-            .map(|(voter_id, vote_round, hash_arr, signature, vote_msg)| {
-                if self.verify_timeout_vote_signature(voter_id, vote_msg, signature) {
-                    Some(AggregatedSignedVote {
-                        voter_id: voter_id.clone(),
-                        vote_round: *vote_round,
-                        vote_block_hash: *hash_arr,
-                        signature: signature.clone(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // ── Any failed verify → whole certificate rejected. ──
-        // This matches the serial loop semantics exactly: the previous
-        // `return;` on bad-sig aborted the entire function, so a single
-        // invalid signature invalidates the aggregate.
-        let mut verified: Vec<AggregatedSignedVote> = Vec::with_capacity(prepared.len());
-        for (idx, result) in results.into_iter().enumerate() {
-            match result {
-                Some(v) => verified.push(v),
-                None => {
-                    if crate::node::is_warn() {
-                        let (voter_id, vote_round, _, _, _) = &prepared[idx];
-                        println!(
-                            "[WARN][TIMEOUT] agg_tc_bad_sig h={} voter={} round={}",
-                            height, voter_id, vote_round,
-                        );
-                    }
-                    return;
-                }
-            }
-        }
-
-        if verified.len() < two_f_plus_1 {
-            if crate::node::is_warn() {
-                println!(
-                    "[WARN][TIMEOUT] agg_tc_not_enough_verified h={} verified={} need={}",
-                    height, verified.len(), two_f_plus_1,
-                );
-            }
-            return;
-        }
-
-        // Store certificate and advance local state monotonically.
-        let cert = AggregatedTimeoutCertificate {
-            height,
-            certified_round,
-            votes: verified.clone(),
-        };
-        AGGREGATED_TC.insert((height, certified_round), cert);
-
-        // Refresh VOTER_MAX_ROUND / VOTER_MAX_SIGNED_VOTE from verified payloads.
-        for v in &verified {
-            let inserted_round = VOTER_MAX_ROUND
-                .entry((height, v.voter_id.clone()))
-                .and_modify(|cur| { if v.vote_round > *cur { *cur = v.vote_round; } })
-                .or_insert(v.vote_round);
-            if *inserted_round == v.vote_round {
-                VOTER_MAX_SIGNED_VOTE.insert(
-                    (height, v.voter_id.clone()),
-                    (v.vote_round, v.vote_block_hash, v.signature.clone()),
-                );
-            }
-        }
-
-        HIGHEST_CERTIFIED_ROUND
-            .entry(height)
-            .and_modify(|cur| { if certified_round > *cur { *cur = certified_round; } })
-            .or_insert(certified_round);
-
-        // Suppress redundant re-broadcasts from this node for the same round.
-        AGGREGATED_TC_BROADCAST
-            .entry(height)
-            .and_modify(|cur| { if certified_round > *cur { *cur = certified_round; } })
-            .or_insert(certified_round);
-
-        if crate::node::is_info() {
-            println!(
-                "[INFO][TIMEOUT] agg_tc_accepted h={} certified_round={} verified={}",
-                height, certified_round, verified.len(),
-            );
-        }
-    }
 
     /// Get current timeout proof if available
     pub fn get_timeout_certificate(&self, height: u64, timeout_round: u64) -> Option<TimeoutProof> {
@@ -23375,224 +22774,27 @@ impl SimplifiedP2P {
         TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round))
     }
 
-    /// v5.4 / v15.0: Get highest certified timeout round for a given macroblock
-    /// index. Advanced by any of three byzantine-safe paths:
-    ///   1. Signed 2f+1 same-round TimeoutCertificate via
-    ///      `handle_timeout_proof_broadcast`.
-    ///   2. Local pacemaker aggregation inside `handle_timeout_vote` once
-    ///      2f+1 distinct voters have each signed a vote at round ≥ R
-    ///      (every contributing signature is Dilithium3-verified at insert).
-    ///   3. Received `TimeoutAggregateCertificate` via
-    ///      `handle_aggregated_timeout_cert`, where each of the 2f+1 votes
-    ///      is re-verified at its own (round, hash) before advancement.
-    /// All three require supermajority-backed cryptographic evidence so a
-    /// ≤ f attacker cannot move this value upward.
+    /// Get highest certified timeout round for a macroblock index. Advanced ONLY
+    /// by a signed same-round 2f+1 TimeoutCertificate (handle_timeout_proof_broadcast)
+    /// — supermajority-backed, so a ≤f attacker cannot move it upward.
     pub fn get_highest_certified_round(&self, height: u64) -> u64 {
         HIGHEST_CERTIFIED_ROUND.get(&height).map(|v| *v).unwrap_or(0)
     }
-
-    /// v14.8.10: Get highest adopted round (≥ f+1 voters at max_round ≥ R).
-    /// Used together with certified round for BFT-driven rotation:
-    ///   timeout_round_for_rotation = certified.max(adopted)
-    /// Weaker than 2f+1 certified but converges faster during early stalls —
-    /// the f+1 threshold guarantees at least one honest voter, so the network
-    /// has evidence that the round is genuinely active.
-    ///
-    /// `_threshold` kept for API compatibility — threshold is applied at
-    /// vote-insert time in handle_timeout_vote.
-    pub fn get_highest_adopted_round(&self, height: u64, _threshold: usize) -> u64 {
-        HIGHEST_ADOPTED_ROUND.get(&height).map(|v| *v).unwrap_or(0)
-    }
-
-    // Skip-marker macroblock support: surface a 2f+1 AggregatedTimeout-
-    // Certificate as evidence for a skip marker and verify the cert carried
-    // by an incoming peer skip marker. Skip markers seal previous_hash
-    // linkage when commit-reveal failed 2f+1 reveals — no rewards, no state.
-
-    /// v15.7: Retrieve the highest-round AggregatedTimeoutCertificate stored
-    /// for a given macroblock index, picking the strongest evidence currently
-    /// known to this node. Returns None when no aggregated certificate has
-    /// reached this node for the given index.
-    ///
-    /// Scalability: at most O(C) where C is the count of certificates the
-    /// pacemaker collected for this index; bounded by the cleanup sweep that
-    /// prunes stale timeout state alongside microblock rotation.
-    pub fn get_aggregated_tc_for(&self, mb_idx: u64) -> Option<AggregatedTimeoutCertificate> {
-        let mut best: Option<AggregatedTimeoutCertificate> = None;
-        for entry in AGGREGATED_TC.iter() {
-            let (h, _r) = entry.key();
-            if *h != mb_idx { continue; }
-            let cert = entry.value().clone();
-            match &best {
-                None => best = Some(cert),
-                Some(curr) if cert.certified_round > curr.certified_round => best = Some(cert),
-                _ => {}
-            }
-        }
-        best
-    }
-
-    /// v16.2: Strict presence check for a SPECIFIC (mb_idx, round) pair.
-    ///
-    /// Used by the verify stage of the block pipeline to enforce that any
-    /// block claiming `timeout_round > 0` has a locally-observed 2f+1
-    /// AggregatedTimeoutCertificate for that exact round. Presence is
-    /// sufficient evidence — `handle_aggregated_timeout_cert` verified
-    /// every Dilithium3 signature in the cert at gossip ingest before
-    /// inserting into AGGREGATED_TC, so anything in the map is already
-    /// 2f+1 supermajority signed by the active committee.
-    ///
-    /// Constant-time DashMap shard lookup; safe to call on every block
-    /// verify pass at any committee size up to the MAX_VALIDATORS cap.
-    pub fn has_aggregated_timeout_cert(&self, mb_idx: u64, round: u64) -> bool {
-        AGGREGATED_TC.contains_key(&(mb_idx, round))
-    }
-
-    /// v15.9: Pure structural validation for an AggregatedTimeoutCertificate
-    /// — no signature verification, no `self`. Returns Ok(()) iff every
-    /// non-cryptographic invariant holds; Err(reason) otherwise. This split
-    /// lets the integration tests exercise the structural rules directly
-    /// without needing a SimplifiedP2P instance, while the runtime path
-    /// composes this check with parallel signature verification.
-    ///
-    /// Invariants enforced (all must pass):
-    /// 1. Certificate's `height` equals `expected_mb_idx` (no replay onto
-    ///    a different macroblock).
-    /// 2. Certificate's `certified_round` ≥ `min_certified_round` — the
-    ///    canonical view-change path actually exhausted enough rounds for
-    ///    a skip to be legitimate.
-    /// 3. `two_f_plus_1` is non-zero AND `cert.votes.len() ≥ two_f_plus_1`.
-    /// 4. Every vote's `vote_round` ≥ `cert.certified_round` (no underflow
-    ///    against the certificate's own claimed minimum).
-    /// 5. Voter IDs are pairwise distinct (no replay of a single voter
-    ///    against the threshold count).
-    pub fn verify_skip_certificate_structure(
-        cert: &AggregatedTimeoutCertificate,
-        expected_mb_idx: u64,
-        min_certified_round: u64,
-        two_f_plus_1: usize,
-    ) -> Result<(), &'static str> {
-        if cert.height != expected_mb_idx {
-            return Err("cert_mb_mismatch");
-        }
-        if cert.certified_round < min_certified_round {
-            return Err("cert_round_below_threshold");
-        }
-        if two_f_plus_1 == 0 || cert.votes.len() < two_f_plus_1 {
-            return Err("cert_short_vote_count");
-        }
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for v in &cert.votes {
-            if v.vote_round < cert.certified_round {
-                return Err("cert_vote_round_underflow");
-            }
-            if !seen.insert(v.voter_id.as_str()) {
-                return Err("cert_duplicate_voter");
-            }
-        }
-        Ok(())
-    }
-
-    /// v15.7: Verify the bincode-serialised AggregatedTimeoutCertificate carried
-    /// inside a skip-marker macroblock. Re-uses the same per-vote Dilithium3
-    /// verification as `handle_aggregated_timeout_cert` and the same 2f+1
-    /// supermajority threshold against the active validator set. Returns
-    /// true iff the certificate is structurally well-formed AND every vote
-    /// passes signature verification AND the count meets the threshold.
-    ///
-    /// Inputs:
-    /// - `bytes`            — serialised AggregatedTimeoutCertificate
-    /// - `expected_mb_idx`  — macroblock index this skip marker claims to seal
-    /// - `min_certified_round` — caller-imposed lower bound on the certified
-    ///   round (typically the maximum view-change round that the participate
-    ///   path drives before invoking the skip path); rejects certificates
-    ///   that do not represent actual exhaustion of the canonical path.
-    ///
-    /// Scalability: signature verification is parallelised through rayon,
-    /// matching the hot-path verification in `handle_aggregated_timeout_cert`.
-    /// Bounded by `cert.votes.len() ≤ active_committee_size`.
-    pub fn verify_skip_certificate_bytes(
-        &self,
-        bytes: &[u8],
-        expected_mb_idx: u64,
-        min_certified_round: u64,
-    ) -> bool {
-        let cert: AggregatedTimeoutCertificate = match bincode::deserialize(bytes) {
-            Ok(c) => c,
-            Err(e) => {
-                if crate::node::is_warn() {
-                    println!(
-                        "[WARN][SKIP] cert_decode_fail mb={} err={}",
-                        expected_mb_idx, e,
-                    );
-                }
-                return false;
-            }
-        };
-
-        let total_validators = self.get_active_validator_count();
-        let two_f_plus_1 = qnet_consensus::checkpoint_bft::quorum_size(total_validators); // v34: n−f, matches macroblock BFT2
-
-        // v15.9: Run structural checks via the static helper so unit tests
-        // can exercise the same logic without spinning up a P2P stack.
-        if let Err(reason) = Self::verify_skip_certificate_structure(
-            &cert, expected_mb_idx, min_certified_round, two_f_plus_1,
-        ) {
-            if crate::node::is_warn() {
-                println!("[WARN][SKIP] {} mb={}", reason, expected_mb_idx);
-            }
-            return false;
-        }
-
-        // Parallel Dilithium3 signature verification. Any single bad signature
-        // invalidates the entire certificate (canonical aggregator semantics).
-        use rayon::prelude::*;
-        let all_valid = cert.votes.par_iter().all(|v| {
-            let vote_msg = format!(
-                "TIMEOUT:{}:{}:{}",
-                cert.height, v.vote_round, hex::encode(&v.vote_block_hash),
-            );
-            self.verify_timeout_vote_signature(&v.voter_id, &vote_msg, &v.signature)
-        });
-
-        if !all_valid {
-            if crate::node::is_warn() {
-                println!(
-                    "[WARN][SKIP] cert_bad_signature mb={} round={}",
-                    expected_mb_idx, cert.certified_round,
-                );
-            }
-            return false;
-        }
-
-        true
-    }
 }
 
-/// v14.8.10: Module-level read of HIGHEST_ADOPTED_ROUND for (macroblock_index).
-/// Read-only, O(1), safe from any crate context without a P2P handle.
-pub fn highest_adopted_round_for(mb_index: u64) -> u64 {
-    HIGHEST_ADOPTED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0)
-}
-
-/// v14.6: Module-level read of HIGHEST_CERTIFIED_ROUND for (macroblock_index).
+/// Module-level read of HIGHEST_CERTIFIED_ROUND for (macroblock_index).
 /// Used by `block_pipeline::verify_stage` which has no P2P handle.
 pub fn highest_certified_round_for(mb_index: u64) -> u64 {
     HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0)
 }
 
-// v14.8.10: `highest_adopted_round_for` RESTORED above together with
-// HIGHEST_ADOPTED_ROUND; see the RESTORED note at the HIGHEST_ADOPTED_ROUND
-// declaration for the full rationale.
-
 // ═══════════════════════════════════════════════════════════════════════════
 // v14.7 (pt 9): SERIALIZERS / DESERIALIZERS for persistent consensus state.
 // ═══════════════════════════════════════════════════════════════════════════
 // The persistence layer (storage.rs) exposes opaque byte-blob save/load for
-// the three consensus DashMaps:
+// the two consensus DashMaps:
 //   * TIMEOUT_CERTIFICATES   (full certificate payload with 2f+1 votes)
 //   * HIGHEST_CERTIFIED_ROUND (O(1) tracker)
-//   * HIGHEST_ADOPTED_ROUND  (O(1) tracker)
 // These helpers produce and consume bincode payloads without leaking the
 // internal DashMap type to callers. The format is versioned via the storage
 // key suffix ("..._v1") so a future schema change is non-breaking.
@@ -23792,43 +22994,13 @@ impl SimplifiedP2P {
             }
         }
 
-        // v15.0: Also collect any aggregated (pacemaker) certificates in range.
-        // They are delivered as separate TimeoutAggregateCertificate messages
-        // because their per-vote (round, hash) structure doesn't fit the legacy
-        // response tuple shape. Catch-up nodes apply them through the usual
-        // handle_aggregated_timeout_cert path.
-        let mut aggregated_msgs: Vec<NetworkMessage> = Vec::new();
-        for entry in AGGREGATED_TC.iter() {
-            let (h, cr) = entry.key();
-            if *h >= from_height && *h <= to_height {
-                let agg = entry.value();
-                let votes_wire: Vec<(String, u64, Vec<u8>, Vec<u8>)> = agg.votes.iter()
-                    .map(|v| (
-                        v.voter_id.clone(),
-                        v.vote_round,
-                        v.vote_block_hash.to_vec(),
-                        v.signature.clone(),
-                    ))
-                    .collect();
-                aggregated_msgs.push(NetworkMessage::TimeoutAggregateCertificate {
-                    height: *h,
-                    certified_round: *cr,
-                    votes: votes_wire,
-                });
-            }
-        }
-
-        if certificates.is_empty() && aggregated_msgs.is_empty() {
+        if certificates.is_empty() {
             return;
         }
 
-        let same_round_msg_opt = if !certificates.is_empty() {
-            Some(NetworkMessage::TimeoutCertificatesResponse {
-                certificates,
-                sender_id: self.node_id.clone(),
-            })
-        } else {
-            None
+        let response_msg = NetworkMessage::TimeoutCertificatesResponse {
+            certificates,
+            sender_id: self.node_id.clone(),
         };
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -23850,12 +23022,7 @@ impl SimplifiedP2P {
                     Err(_) => return,
                 };
                 let t = transport.read().await;
-                if let Some(msg) = same_round_msg_opt {
-                    let _ = t.send_message(quic_addr, &msg).await;
-                }
-                for msg in aggregated_msgs {
-                    let _ = t.send_message(quic_addr, &msg).await;
-                }
+                let _ = t.send_message(quic_addr, &response_msg).await;
             });
         }
     }
@@ -24195,17 +23362,9 @@ impl SimplifiedP2P {
         TIMEOUT_VOTES.retain(|(h, _), _| *h >= min_mb);
         TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h >= min_mb);
         HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h >= min_mb);
-        HIGHEST_ADOPTED_ROUND.retain(|h, _| *h >= min_mb);
-        VOTER_MAX_ROUND.retain(|(h, _), _| *h >= min_mb);
         // v15.11: per-mb baseline rounds share retention with HIGHEST_*_ROUND.
         LAST_FINALIZED_ROUND_PER_MB.retain(|h, _| *h >= min_mb);
         TIMEOUT_VOTED_HEIGHTS.retain(|h, _| *h >= min_mb);
-        // v15.0: prune pacemaker-TC maps together with the rest of the
-        // timeout state so per-voter signed payloads and aggregated certs
-        // do not accumulate past the active retention window.
-        VOTER_MAX_SIGNED_VOTE.retain(|(h, _), _| *h >= min_mb);
-        AGGREGATED_TC.retain(|(h, _), _| *h >= min_mb);
-        AGGREGATED_TC_BROADCAST.retain(|h, _| *h >= min_mb);
 
         // ═══════════════════════════════════════════════════════════════════
         // v23 / v23.1: prune microblock-rotation-related DashMaps under the
@@ -25973,21 +25132,20 @@ impl SimplifiedP2P {
 mod tests {
     use super::*;
 
-    /// v34: the ingest failover-round authority must accept a round reached via the CROSS-ROUND
-    /// pacemaker (HIGHEST_CERTIFIED_ROUND advanced with NO same-round TimeoutProof) — the exact
-    /// case the old cert-gate rejected (it keyed a same-round map by microblock height + relative
-    /// round, never populated), deadlocking the chain during a failover storm. The predicate must
-    /// mirror the producer's own round check: certified_abs >= block_round + baseline.
+    /// The ingest failover-round authority must mirror the producer's own round check exactly:
+    /// a block at relative `block_round` is authorised iff its ABSOLUTE round (block_round +
+    /// baseline) is ≤ the 2f+1-certified HIGHEST_CERTIFIED_ROUND. Both sides read the same map,
+    /// so the gate and the producer can never disagree on whether a failover round is authorised.
     #[test]
     fn failover_round_authorized_matches_producer_authority() {
         // Unique mb_idx values so the global consensus DashMaps don't collide with other tests.
         let mb = 9_100_001u64;
-        // Storm case: pacemaker certified ABSOLUTE round 12; no same-round proof was ever stored.
+        // 2f+1 certified ABSOLUTE round 12 for this macroblock.
         HIGHEST_CERTIFIED_ROUND.insert(mb, 12);
         LAST_FINALIZED_ROUND_PER_MB.insert(mb, 0); // baseline 0
         assert!(failover_round_authorized(mb, 0),  "round 0 (happy path) is always authorised");
         assert!(failover_round_authorized(mb, 11), "round below certified is authorised");
-        assert!(failover_round_authorized(mb, 12), "round == certified is authorised (the storm case the old gate rejected)");
+        assert!(failover_round_authorized(mb, 12), "round == certified is authorised");
         assert!(!failover_round_authorized(mb, 13), "round above certified is NOT authorised (uncertified/forged)");
 
         // Non-zero baseline ⇒ the comparison is in ABSOLUTE units (block_round + baseline).
@@ -26335,200 +25493,11 @@ mod tests {
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    // v15.9: SKIP-CERTIFICATE STRUCTURAL TESTS
-    // ────────────────────────────────────────────────────────────────────────
-    // These tests pin the non-cryptographic invariants of an aggregated
-    // timeout certificate (the artefact embedded in a skip-marker
-    // macroblock). Signature verification is NOT exercised here because it
-    // requires a P2P stack and a registered validator set; the structural
-    // checks are independent of those and are what protects the runtime
-    // from the cheap, non-quantum classes of forgery (replay onto a
-    // different macroblock, count short of 2f+1, duplicate voters, vote
-    // round below the certified minimum).
-    // ════════════════════════════════════════════════════════════════════════
-
-    fn make_vote(voter_id: &str, vote_round: u64) -> AggregatedSignedVote {
-        AggregatedSignedVote {
-            voter_id: voter_id.to_string(),
-            vote_round,
-            vote_block_hash: [0u8; 32],
-            signature: vec![0u8; 64],
-        }
-    }
-
-    fn make_cert(height: u64, certified_round: u64, votes: Vec<AggregatedSignedVote>) -> AggregatedTimeoutCertificate {
-        AggregatedTimeoutCertificate { height, certified_round, votes }
-    }
-
-    /// Happy path: a well-formed certificate with exactly 2f+1 distinct
-    /// voters, every vote round ≥ certified_round, height matches.
-    #[test]
-    fn test_skip_cert_structure_accepts_well_formed() {
-        let cert = make_cert(
-            42,
-            8,
-            vec![
-                make_vote("v1", 8),
-                make_vote("v2", 9),
-                make_vote("v3", 10),
-            ],
-        );
-        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 42, 8, 3);
-        assert!(result.is_ok(), "Well-formed cert should be accepted, got: {:?}", result);
-    }
-
-    /// Replay onto a different macroblock height must be rejected.
-    #[test]
-    fn test_skip_cert_structure_rejects_height_mismatch() {
-        let cert = make_cert(
-            42,
-            8,
-            vec![make_vote("v1", 8), make_vote("v2", 8), make_vote("v3", 8)],
-        );
-        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 999, 8, 3);
-        assert_eq!(result, Err("cert_mb_mismatch"));
-    }
-
-    /// Certificate built before the canonical view-change path actually
-    /// exhausted the configured floor (`min_certified_round`) must be
-    /// rejected — it does not represent legitimate canonical exhaustion.
-    #[test]
-    fn test_skip_cert_structure_rejects_round_below_threshold() {
-        let cert = make_cert(
-            10,
-            5,
-            vec![make_vote("v1", 5), make_vote("v2", 5), make_vote("v3", 5)],
-        );
-        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 10, 8, 3);
-        assert_eq!(result, Err("cert_round_below_threshold"));
-    }
-
-    /// Vote count strictly below 2f+1 must be rejected — supermajority
-    /// quorum is the safety property.
-    #[test]
-    fn test_skip_cert_structure_rejects_short_vote_count() {
-        let cert = make_cert(
-            7,
-            8,
-            vec![make_vote("v1", 8), make_vote("v2", 8)],
-        );
-        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 7, 8, 3);
-        assert_eq!(result, Err("cert_short_vote_count"));
-    }
-
-    /// Vote count == 2f+1 (the boundary) must be accepted.
-    #[test]
-    fn test_skip_cert_structure_accepts_exact_threshold() {
-        let cert = make_cert(
-            9,
-            8,
-            vec![make_vote("v1", 8), make_vote("v2", 8), make_vote("v3", 8)],
-        );
-        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 9, 8, 3);
-        assert!(result.is_ok());
-    }
-
-    /// `two_f_plus_1 = 0` (e.g. empty validator set) must be rejected
-    /// even with non-empty votes — there is no quorum to certify against.
-    #[test]
-    fn test_skip_cert_structure_rejects_zero_threshold() {
-        let cert = make_cert(
-            1,
-            8,
-            vec![make_vote("v1", 8), make_vote("v2", 8), make_vote("v3", 8)],
-        );
-        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 1, 8, 0);
-        assert_eq!(result, Err("cert_short_vote_count"));
-    }
-
-    /// Vote whose round is below the certificate's certified_round
-    /// indicates a malformed aggregator output and must be rejected —
-    /// otherwise an attacker could forge a low-effort skip claim.
-    #[test]
-    fn test_skip_cert_structure_rejects_vote_round_underflow() {
-        let cert = make_cert(
-            5,
-            10,
-            vec![
-                make_vote("v1", 10),
-                make_vote("v2", 9), // below certified_round
-                make_vote("v3", 11),
-            ],
-        );
-        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 5, 8, 3);
-        assert_eq!(result, Err("cert_vote_round_underflow"));
-    }
-
-    /// Counting one voter twice toward the 2f+1 threshold must be
-    /// rejected — distinct voter identities are an explicit safety
-    /// requirement of the aggregated signature scheme.
-    #[test]
-    fn test_skip_cert_structure_rejects_duplicate_voter() {
-        let cert = make_cert(
-            12,
-            8,
-            vec![
-                make_vote("v1", 8),
-                make_vote("v1", 9), // same id
-                make_vote("v2", 8),
-            ],
-        );
-        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 12, 8, 3);
-        assert_eq!(result, Err("cert_duplicate_voter"));
-    }
-
-    /// Different rounds across votes are explicitly allowed — that is the
-    /// pacemaker invariant the aggregated certificate encodes.
-    #[test]
-    fn test_skip_cert_structure_accepts_mixed_rounds_above_certified() {
-        let cert = make_cert(
-            20,
-            8,
-            vec![
-                make_vote("v1", 8),
-                make_vote("v2", 14),
-                make_vote("v3", 22),
-            ],
-        );
-        let result = SimplifiedP2P::verify_skip_certificate_structure(&cert, 20, 8, 3);
-        assert!(result.is_ok());
-    }
-
-    /// Bincode round-trip of the certificate must be lossless — the
-    /// runtime path round-trips through `bincode::serialize/deserialize`
-    /// when embedding into the macroblock's `skip_certificate` field.
-    #[test]
-    fn test_skip_cert_bincode_round_trip() {
-        let cert = make_cert(
-            33,
-            12,
-            vec![
-                make_vote("v1", 12),
-                make_vote("v2", 13),
-                make_vote("v3", 14),
-            ],
-        );
-        let bytes = bincode::serialize(&cert).expect("serialize");
-        let decoded: AggregatedTimeoutCertificate =
-            bincode::deserialize(&bytes).expect("deserialize");
-        assert_eq!(decoded.height, cert.height);
-        assert_eq!(decoded.certified_round, cert.certified_round);
-        assert_eq!(decoded.votes.len(), cert.votes.len());
-        for (orig, dec) in cert.votes.iter().zip(decoded.votes.iter()) {
-            assert_eq!(orig.voter_id, dec.voter_id);
-            assert_eq!(orig.vote_round, dec.vote_round);
-            assert_eq!(orig.vote_block_hash, dec.vote_block_hash);
-            assert_eq!(orig.signature, dec.signature);
-        }
-        let result = SimplifiedP2P::verify_skip_certificate_structure(&decoded, 33, 12, 3);
-        assert!(result.is_ok());
-    }
 
     /// 2f+1 calculation matches BFT formula across small / medium /
-    /// large committee sizes. This is the threshold the runtime feeds
-    /// into `verify_skip_certificate_structure` from
-    /// `get_active_validator_count()`.
+    /// large committee sizes. This is the threshold the runtime computes
+    /// from `get_active_validator_count()` to gate timeout-certificate
+    /// formation.
     #[test]
     fn test_skip_cert_two_f_plus_one_formula() {
         // v34: the failover/timeout layer now uses the SAME quorum as the macroblock BFT —

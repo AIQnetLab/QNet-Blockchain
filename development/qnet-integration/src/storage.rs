@@ -2713,10 +2713,10 @@ impl PersistentStorage {
     }
 
     // Timeout-certificate persistence. 2f+1 TimeoutCertificates and the
-    // HIGHEST_CERTIFIED/ADOPTED_ROUND trackers were RAM-only, so a restart
+    // HIGHEST_CERTIFIED_ROUND tracker were RAM-only, so a restart
     // blanked them and the pre-save stale-primary guard malfunctioned for
     // the first seconds after reboot. Now write-through into the "consensus"
-    // CF on every insert/adopt and rehydrated at startup before the
+    // CF on every insert and rehydrated at startup before the
     // production loop. Keys: tcerts_v1 / hi_cert_v1 / hi_adopt_v1 (bincode
     // Vec). O(k) serialise, k = retention window (pruned per block).
     pub fn save_timeout_certificates(&self, payload: &[u8]) -> IntegrationResult<()> {
@@ -2745,14 +2745,11 @@ impl PersistentStorage {
         Ok(self.db.get_cf(&cf, b"hi_cert_v1")?)
     }
 
-    // v14.8.10: `save_highest_adopted_rounds` / `load_highest_adopted_rounds`
-    // REMAIN REMOVED. HIGHEST_ADOPTED_ROUND is RAM-only: on restart, the
-    // map starts empty and is rebuilt from incoming Dilithium3-verified
-    // signed TimeoutVotes once the node rejoins the network (VOTER_MAX_ROUND
-    // aggregation at f+1 threshold). Only TIMEOUT_CERTIFICATES (the 2f+1
-    // supermajority proof) are persisted — those are the hard finality
-    // evidence that must survive restart. The RocksDB key "hi_adopt_v1"
-    // is left intact on disk (harmless stale bytes) — no migration needed.
+    // `save_highest_adopted_rounds` / `load_highest_adopted_rounds` REMOVED with
+    // the adopted-round tracker. Only TIMEOUT_CERTIFICATES (the 2f+1 supermajority
+    // proof) and HIGHEST_CERTIFIED_ROUND are persisted — the hard finality evidence
+    // that must survive restart. Any legacy "hi_adopt_v1" key on disk is harmless
+    // stale bytes, ignored on boot — no migration needed.
 
     /// Save sync progress for resuming after restart
     pub fn save_sync_progress(&self, from_height: u64, to_height: u64, current: u64) -> IntegrationResult<()> {
@@ -4606,9 +4603,8 @@ impl Storage {
     pub fn load_highest_certified_rounds(&self) -> IntegrationResult<Option<Vec<u8>>> {
         self.persistent.load_highest_certified_rounds()
     }
-    // v14.8.10: wrapper functions for HIGHEST_ADOPTED_ROUND persistence REMAIN
-    // REMOVED — that map is RAM-only and rebuilt on boot from gossiped signed
-    // votes. See the detailed rationale in the persistent impl above.
+    // Wrapper functions for adopted-round persistence REMOVED with the tracker.
+    // See the rationale in the persistent impl above.
 
     /// Save sync progress
     pub fn save_sync_progress(&self, from_height: u64, to_height: u64, current: u64) -> IntegrationResult<()> {

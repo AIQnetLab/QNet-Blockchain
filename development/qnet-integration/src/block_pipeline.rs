@@ -113,10 +113,10 @@ static FORK_RECOVERY_TRIGGER_TIMES: once_cell::sync::Lazy<
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 const FORK_RECOVERY_COOLDOWN_SECS: u64 = 60;
 
-// v34: cooldown for the failover-cert pull-on-reject. mb_idx → wall-clock secs of last request.
+// Cooldown for the failover-cert pull-on-reject. mb_idx → wall-clock secs of last request.
 // Bounds how often a node stuck on an uncertified failover block asks peers for that window's
-// timeout certificates (the request/serve already exists for sync and returns the cross-round
-// AggregatedTimeoutCertificate). 2s is fast enough to recover within a window, slow enough that
+// timeout certificates (the request/serve already exists for sync and returns the same-round
+// 2f+1 TimeoutCertificate). 2s is fast enough to recover within a window, slow enough that
 // the repeated per-block reject loop can't flood peers.
 static FAILOVER_CERT_PULL_TIMES: once_cell::sync::Lazy<
     dashmap::DashMap<u64, u64>
@@ -1767,7 +1767,12 @@ impl BlockPipeline {
                                 if cooldown_ok {
                                     let prev = FORK_RECOVERY_HEIGHT
                                         .load(std::sync::atomic::Ordering::SeqCst);
-                                    let target = finalized_h.saturating_add(1);
+                                    // Roll back to the last good height = disputed-2 (the forked block is
+                                    // local[disputed-1]), clamped to ≥ finalized. finalized_h+1 was wrong when
+                                    // the fork IS at finalized+1 (our own tip): the handler's `rollback_to <
+                                    // local_h` guard then never fires → forked tip kept → permanent
+                                    // hash_chain_break (the N004 single-source self-fork wedge).
+                                    let target = disputed_h.saturating_sub(2).max(finalized_h);
                                     if target > prev {
                                         FORK_RECOVERY_HEIGHT.store(
                                             target,
@@ -1947,7 +1952,7 @@ impl BlockPipeline {
 
             // Producer authority check (same-round mismatch ≡ HARD reject).
             //   A. timeout_divergence (block round != cached round): views of
-            //      HIGHEST_CERTIFIED/ADOPTED_ROUND diverged in transit. Soft —
+            //      HIGHEST_CERTIFIED_ROUND diverged in transit. Soft —
             //      log only; hash-chain + sig + 2f+1 commit resolve it. Expected
             //      producer is NOT re-derived on ingest (needs remote VRF preimage).
             //   B. same_round_mismatch (cached round == block round, wrong signer):
@@ -1971,28 +1976,24 @@ impl BlockPipeline {
                 // producer at certification) arrives, or via sync (which skips this gate,
                 // trusting macroblock finality). Round 0 (happy path) needs no cert. O(1).
                 if mb.timeout_round > 0 {
-                    // v34: authorise the failover round with the SAME predicate the producer used to
+                    // Authorise the failover round with the SAME predicate the producer used to
                     // pick it — `highest_certified_round_for(mb_idx) >= round + baseline`, keyed by
-                    // mb_idx + ABSOLUTE round. HIGHEST_CERTIFIED_ROUND advances on BOTH a same-round
-                    // TimeoutProof AND a cross-round AggregatedTimeoutCertificate, so a round reached
-                    // via the storm pacemaker (no single round at 2f+1) is accepted. The prior gate
-                    // keyed get_timeout_certificate by microblock HEIGHT + RELATIVE round — a key
-                    // never populated — so it rejected every failover block: the producer advanced
-                    // cross-round while receivers demanded a same-round proof the storm structurally
-                    // prevents → split-brain, multi-hour stall. Still 2f+1-gated (a forged round
-                    // isn't certified ⇒ rejected); round 0 (happy path) needs no certificate.
+                    // mb_idx + ABSOLUTE round. HIGHEST_CERTIFIED_ROUND advances ONLY on a same-round
+                    // 2f+1 TimeoutCertificate, so the producer can be at round R only if the network
+                    // certified R — both sides read the same map and can never disagree. A forged
+                    // round isn't certified ⇒ rejected; round 0 (happy path) needs no certificate.
                     let round_certified =
                         crate::unified_p2p::failover_round_authorized(mb.height / 90, mb.timeout_round);
                     if !round_certified {
-                        // v34 PULL-ON-REJECT: the round IS legitimate (a producer reached it via
-                        // 2f+1), but the proving certificate never arrived — the agg-TC broadcast is
-                        // one-shot (deduped) and vote gossip only re-fans on NEW votes, which stop once
-                        // the storm settles, so a node that missed the brief window would stay stuck
-                        // forever (the multi-hour split-brain). Actively request this window's timeout
-                        // certificates from peers (rate-limited per mb_idx); the existing serve returns
-                        // the cross-round AggregatedTimeoutCertificate, which advances our
-                        // HIGHEST_CERTIFIED_ROUND so this still-replayable block is accepted next pass.
-                        // Reuses the sync catch-up request/serve — no new wire type.
+                        // PULL-ON-REJECT: the round IS legitimate (a producer reached it via a
+                        // same-round 2f+1), but the proving TimeoutCertificate never arrived — its
+                        // broadcast is one-shot and vote gossip only re-fans on NEW votes, which stop
+                        // once the storm settles, so a node that missed the brief window would stay
+                        // stuck forever. Actively request this window's timeout certificates from
+                        // peers (rate-limited per mb_idx); the existing serve returns the same-round
+                        // 2f+1 TimeoutCertificate, which advances our HIGHEST_CERTIFIED_ROUND so this
+                        // still-replayable block is accepted next pass. Reuses the sync catch-up
+                        // request/serve — no new wire type.
                         let mb_idx = mb.height / 90;
                         let now_secs = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -2926,8 +2927,8 @@ impl BlockPipeline {
                             );
                         }
                         // Request certificates for the macroblock window
-                        // covering this block — peers serve both same-round
-                        // and aggregated certificates in one response.
+                        // covering this block — peers serve the same-round
+                        // 2f+1 TimeoutCertificates for it.
                         p2p.request_timeout_proofs(mb_idx, mb_idx);
                     }
                 }
