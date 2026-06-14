@@ -19033,22 +19033,14 @@ impl SimplifiedP2P {
         // that scales identically at thousands of validators.
         let required_microblock_height: u64 = to_index.saturating_mul(90);
 
-        // CRITICAL: Only request from Super/Full nodes that are ACTUALLY ONLINE
+        // Candidates: ALL synced Super nodes, not genesis-only. Genesis-only serving is a
+        // bottleneck + sync single-point at 100k+ nodes; the height filter ensures the peer
+        // actually covers the range, and genesis stay preferred via the sort below.
         let mut eligible_peers: Vec<_> = peers.iter()
             .filter(|p| matches!(p.node_type, NodeType::Super))
             .filter(|p| {
-                // v2.96: Filter by failover connectivity cache
-                let peer_ip = p.addr.split(':').next().unwrap_or("");
-                working_genesis_ips.iter().any(|ip| ip == peer_ip)
-            })
-            .filter(|p| {
-                // v15.7: Skip peers below the microblock-height of the target
-                // macroblock. A peer with last_block_height == 0 is treated as
-                // "height unknown" rather than "definitively below" — the
-                // heartbeat may simply not have fired yet — so we keep it
-                // eligible to avoid empty candidate sets during early
-                // bootstrap. In steady state every active peer publishes a
-                // height so this acts as a strict filter.
+                // v15.7: peer must cover the target range; last_block_height==0 = "unknown"
+                // (heartbeat not yet fired) → kept eligible to avoid empty sets at bootstrap.
                 p.last_block_height == 0 || p.last_block_height >= required_microblock_height
             })
             .cloned()
@@ -19069,10 +19061,14 @@ impl SimplifiedP2P {
             return Err("No Super/Full nodes available for macroblock sync".to_string());
         }
         
-        // v2.96: Sort by reputation (best first) for retry order
-        eligible_peers.sort_by(|a, b| b.combined_reputation()
-            .partial_cmp(&a.combined_reputation())
-            .unwrap_or(std::cmp::Ordering::Equal));
+        // Sort: prefer LIVE genesis (reliable anchor sources), then by reputation.
+        eligible_peers.sort_by(|a, b| {
+            let a_gen = working_genesis_ips.iter().any(|ip| ip == a.addr.split(':').next().unwrap_or(""));
+            let b_gen = working_genesis_ips.iter().any(|ip| ip == b.addr.split(':').next().unwrap_or(""));
+            b_gen.cmp(&a_gen).then_with(|| b.combined_reputation()
+                .partial_cmp(&a.combined_reputation())
+                .unwrap_or(std::cmp::Ordering::Equal))
+        });
         
         // Create request message
         let request = NetworkMessage::RequestMacroblocks {

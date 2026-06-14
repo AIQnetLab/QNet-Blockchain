@@ -2886,6 +2886,118 @@ impl BlockchainNode {
     }
     
 
+    /// PURE per-epoch reward split + merkle root over an already-resolved eligible set — the
+    /// deterministic core shared by the producer and the apply-time recompute, factored out so it
+    /// can be unit-tested without storage. Input: (node_id, wallet) pairs. Pool 1 equal-per-eligible:
+    /// per_node = total/eligible; the first (total % eligible) nodes by sorted node_id get +1 nano.
+    /// Aggregated per wallet; leaf = SHA3(wallet‖epoch‖amount); root via domain-separated merkle.
+    /// Order-independent (sorts internally) and conserves the sum (Σ amounts == total).
+    fn distribute_equal_rewards(
+        eligible_node_wallets: &[(String, String)],
+        total: u64,
+        epoch: u64,
+    ) -> (Vec<(String, u64)>, String) {
+        if eligible_node_wallets.is_empty() || total == 0 {
+            return (Vec::new(), String::new());
+        }
+        // Deterministic order for the remainder split: sort by node_id.
+        let mut ordered: Vec<&(String, String)> = eligible_node_wallets.iter().collect();
+        ordered.sort_by(|a, b| a.0.cmp(&b.0));
+        let count = ordered.len() as u64;
+        let per_node = total / count;
+        let remainder = total % count;
+        let mut wmap: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for (i, (_node_id, wallet)) in ordered.iter().enumerate() {
+            let amt = per_node + if (i as u64) < remainder { 1 } else { 0 };
+            *wmap.entry(wallet.clone()).or_insert(0) += amt;
+        }
+        let wallet_vec: Vec<(String, u64)> = wmap.into_iter().collect();
+        let leaves: Vec<String> = wallet_vec.iter().map(|(w, a)| {
+            let mut h = Sha3_256::new();
+            h.update(w.as_bytes());
+            h.update(&epoch.to_le_bytes());
+            h.update(&a.to_le_bytes());
+            hex::encode(h.finalize())
+        }).collect();
+        let root = if leaves.is_empty() {
+            String::new()
+        } else {
+            qnet_core::crypto::merkle::compute_merkle_root(&leaves).unwrap_or_default()
+        };
+        (wallet_vec, root)
+    }
+
+    /// Deterministic per-epoch reward distribution + merkle root, derived ENTIRELY from on-chain
+    /// data (the rewarding macroblock's heartbeat snapshot + total_emission). Called by BOTH the
+    /// emission producer and the apply-time recompute, so the committed root and every node's
+    /// independently recomputed root are byte-identical. Resolves the eligible set from the
+    /// macroblock, then delegates the split to the pure `distribute_equal_rewards`.
+    /// Returns (sorted wallet→amount pairs, merkle root hex); empty when no eligible / no emission.
+    fn compute_epoch_reward_distribution(
+        storage: &crate::storage::Storage,
+        macroblock_index: u64,
+        total_emission: u64,
+    ) -> (Vec<(String, u64)>, String) {
+        // Rewarded epoch window from the emission macroblock index (= window = height/90;
+        // emission at window%160==0 rewards the prior 14400-block epoch).
+        if macroblock_index < 160 { return (Vec::new(), String::new()); }
+        let ws = (macroblock_index / 160 - 1) * 14400;
+        let epoch_num = ws / 14400;
+
+        let mut eligible: Vec<(String, String)> = Vec::new();
+
+        // SUPER/genesis: enumerate chain-registered nodes (deterministic CF) and keep those whose
+        // on-chain heartbeat tally for the epoch is ≥ 9 — identical to the producer's emitter scan
+        // but O(registered) and recomputable on every node without the macroblock snapshot.
+        if let Ok(supers) = storage.super_registrations_sorted() {
+            for (node_id, wallet) in supers {
+                if wallet.is_empty() { continue; }
+                let cnt = storage.load_account(&node_id).ok().flatten()
+                    .map(|a| Self::account_heartbeat_count(&a, epoch_num)).unwrap_or(0);
+                if cnt >= 9 { eligible.push((node_id, wallet)); }
+            }
+        }
+
+        // LIGHT: recompute from on-chain eligibility bitmaps mapped through the deterministic
+        // pre-epoch roster (sorted node_registry, NOT the RAM mirror) + the same linear 5-genesis
+        // sharding the producer used, so every node maps bits→nodes identically. O(1) macroblock.
+        if let Ok(roster) = storage.light_roster_sorted(ws) {
+            let total = roster.len();
+            if total > 0 {
+                let per = (total + 4) / 5;
+                let mut bitmaps: std::collections::BTreeMap<usize, Vec<u8>> = std::collections::BTreeMap::new();
+                for h in ws..(ws + 14400) {
+                    if let Ok(Some(block)) = storage.load_microblock_auto_format(h) {
+                        for tx in &block.transactions {
+                            if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, bitmap_compressed, .. } = &tx.tx_type {
+                                if let Some(gidx) = genesis_id.strip_prefix("genesis_node_")
+                                    .and_then(|n| n.parse::<usize>().ok())
+                                    .filter(|n| (1..=5).contains(n)).map(|n| n - 1)
+                                {
+                                    if let Ok(bm) = zstd::decode_all(&bitmap_compressed[..]) {
+                                        bitmaps.insert(gidx, bm); // dedup per genesis, last wins
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for (gidx, bm) in bitmaps {
+                    let my_start = (gidx * per).min(total);
+                    let my_end = (my_start + per).min(total);
+                    for local_i in 0..(my_end - my_start) {
+                        if bm.get(local_i / 8).map(|b| b & (1 << (local_i % 8)) != 0).unwrap_or(false) {
+                            let (node_id, wallet) = &roster[my_start + local_i];
+                            if !wallet.is_empty() { eligible.push((node_id.clone(), wallet.clone())); }
+                        }
+                    }
+                }
+            }
+        }
+
+        Self::distribute_equal_rewards(&eligible, total_emission, macroblock_index)
+    }
+
     // Single apply_block_to_state() for ALL paths (startup replay, recovery
     // fast-forward, normal sync) → no replay-vs-live divergence. Caller
     // handles pre-image recording, state_root verify, rollback, deferred
@@ -2906,15 +3018,14 @@ impl BlockchainNode {
     ///   - microblock: the block to apply
     ///   - storage: for loading node registrations (producer wallet lookup)
     ///   - block_snapshot: if Some, pre-images are recorded before each mutation (for rollback)
-    ///   - processed_emission_mbs: if Some, skip emission TXs whose MB index is already in the set
-    ///                             (prevents double emission during normal processing).
-    ///                             If None, all emissions are applied unconditionally (replay mode).
+    ///   - _processed_emission_mbs: retained for API compatibility; emission double-spend
+    ///                              is now prevented by the watermark inside state.emit_rewards.
     pub fn apply_block_to_state(
         state_guard: &StateManager,
         microblock: &MicroBlock,
         storage: &crate::storage::Storage,
         mut block_snapshot: Option<&mut qnet_state::BlockSnapshot>,
-        processed_emission_mbs: Option<&std::collections::HashSet<u64>>,
+        _processed_emission_mbs: Option<&std::collections::HashSet<u64>>,
     ) -> BlockApplyResult {
         let h = microblock.height;
 
@@ -2947,44 +3058,61 @@ impl BlockchainNode {
                 0
             };
 
-            // Check double-emission (only during normal processing, not replay)
-            let skip = if let Some(processed) = processed_emission_mbs {
-                processed.contains(&emission_mb_index)
-            } else {
-                false
-            };
-
-            if skip {
-                if is_debug() {
-                    println!("[DBG][STATE] emission_skip_dup mb={} h={} (already via MacroBlock)", emission_mb_index, h);
-                }
-            } else {
-                if let Err(e) = state_guard.emit_rewards(tx.amount) {
-                    eprintln!("[WARN][STATE] emission_failed err={}", e);
-                } else {
+            // emit_rewards is watermark-idempotent (mints once per emission mb).
+            // apply_block_to_state is the SINGLE apply path every node runs for every
+            // block (live and bulk-sync), so this is the sole deterministic mint —
+            // no node-local race, no sync-skip. The macroblock recompute path no
+            // longer mints supply.
+            match state_guard.emit_rewards(tx.amount, emission_mb_index) {
+                Ok(minted) if minted > 0 => {
                     if is_info() {
-                        let new_supply = state_guard.get_total_supply();
                         println!("[INFO][STATE] emission_from_tx mb={} amount={} total={} QNC h={}",
-                                 emission_mb_index, tx.amount / 1_000_000_000, new_supply / 1_000_000_000, h);
+                                 emission_mb_index, tx.amount / 1_000_000_000,
+                                 state_guard.get_total_supply() / 1_000_000_000, h);
                     }
                     if emission_mb_index > 0 {
                         result.deferred_emission_mbs.push(emission_mb_index);
                     }
                 }
+                Ok(_) => {} // already minted at this mb — idempotent skip
+                Err(e) => eprintln!("[WARN][STATE] emission_failed err={}", e),
             }
 
-            // Parse per-wallet reward accruals (v7.0 JSON v2 format)
+            // v3 merkle-claim: persist the per-epoch reward root (+ params) and recompute it
+            // locally with the SAME pure fn the producer used to verify the commitment. NO eager
+            // accrual — rewards are credited later via proof-verified claim TXs (result.reward_accruals
+            // stays empty → Phase 4 is a no-op). During bulk replay the rewarding epoch's heartbeat
+            // bodies may be pruned; then trust the committed (consensus-applied) root from the TX.
             if let Some(ref data) = tx.data {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                    if parsed.get("v").and_then(|v| v.as_u64()) == Some(2) {
-                        if let Some(accruals) = parsed.get("accruals").and_then(|v| v.as_object()) {
-                            for (wallet, amount_val) in accruals {
-                                if let Some(amount) = amount_val.as_u64() {
-                                    if amount > 0 {
-                                        result.reward_accruals.push((wallet.clone(), amount));
-                                    }
-                                }
+                    if parsed.get("v").and_then(|v| v.as_u64()) == Some(3) {
+                        let epoch = parsed.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let committed_root = parsed.get("root").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let total = parsed.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let c_per = parsed.get("per_node").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let c_cnt = parsed.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let (wallet_vec, recomputed_root) = Self::compute_epoch_reward_distribution(storage, epoch, total);
+                        if !recomputed_root.is_empty() {
+                            if recomputed_root != committed_root {
+                                eprintln!("[ERR][REWARDS] root_mismatch epoch={} committed={}.. recomputed={}..",
+                                          epoch, &committed_root[..16.min(committed_root.len())],
+                                          &recomputed_root[..16.min(recomputed_root.len())]);
                             }
+                            let rtotal: u64 = wallet_vec.iter().map(|(_, a)| *a).sum();
+                            let rcount = wallet_vec.len() as u32;
+                            let rper = if rcount > 0 { rtotal / rcount as u64 } else { 0 };
+                            let _ = storage.save_epoch_reward_root(epoch, &recomputed_root, rper, rcount, rtotal);
+                            let _ = storage.save_epoch_reward_wallets(epoch, &wallet_vec);
+                            let _ = storage.append_reward_epoch(epoch);
+                            if is_info() {
+                                println!("[INFO][REWARDS] reward_root_applied epoch={} root={}.. count={} total={} QNC",
+                                         epoch, &recomputed_root[..16.min(recomputed_root.len())], rcount, rtotal / 1_000_000_000);
+                            }
+                        } else if !committed_root.is_empty() {
+                            // Rewarding epoch's heartbeat bodies pruned (bulk replay) — trust the
+                            // consensus-applied committed root so claims still verify on this node.
+                            let _ = storage.save_epoch_reward_root(epoch, &committed_root, c_per, c_cnt, total);
+                            let _ = storage.append_reward_epoch(epoch);
                         }
                     }
                 }
@@ -3046,10 +3174,14 @@ impl BlockchainNode {
                         };
                         let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
                         result.deferred_registrations.push((activation_id, type_str.to_string(), tx.from.clone()));
-                        // v32.15: feed pre-activation P2P gate registry
+                        // Super activation self-registers under its canonical region-independent
+                        // pseudonym (the id used to sign heartbeats/blocks) so reward crediting
+                        // resolves node_id→wallet even if the NodeRegistration TX is lost. Light
+                        // ids are region-dependent → never recomputed in apply (bind via their TX).
                         if matches!(node_type, qnet_state::account::NodeType::Super) {
                             let pseudonym = crate::rpc::generate_super_node_pseudonym(&tx.from);
-                            crate::unified_p2p::add_registered_super_node(pseudonym);
+                            crate::unified_p2p::add_registered_super_node(pseudonym.clone());
+                            result.deferred_registrations.push((pseudonym, "super".to_string(), tx.from.clone()));
                         }
                     }
                     _ => {}
@@ -3063,6 +3195,63 @@ impl BlockchainNode {
                         if parts.len() >= 2 && parts[0] == "reward_claim" {
                             result.deferred_reward_clears.push((parts[1].to_string(), tx.amount));
                         }
+                    }
+                }
+            }
+        }
+
+        // ── Phase 2b: Merkle reward claims (proof-verified credit, batched) ──
+        // A claim TX is RewardDistribution from system_rewards_pool carrying
+        // {claims:[{epoch,amount,proof},...]} — one TX can cover ALL of a wallet's unclaimed epochs
+        // (no forfeiture). Each entry's proof binds wallet+epoch+amount against the locally-stored
+        // epoch root; claim_reward enforces the monotonic last_claimed_epoch watermark (replay-safe).
+        // Runs after Phase 2 so the claim TX's pre-images already exist for rollback.
+        for tx in &microblock.transactions {
+            if tx.tx_type != qnet_state::TransactionType::RewardDistribution
+               || tx.from != "system_rewards_pool" {
+                continue;
+            }
+            let to = match &tx.to { Some(w) => w, None => continue };
+            let data = match &tx.data { Some(d) => d, None => continue };
+            let parsed = match serde_json::from_str::<serde_json::Value>(data) { Ok(p) => p, Err(_) => continue };
+            let entries = match parsed.get("claims").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
+            // Parse each {epoch, amount, proof}, then sort by epoch so the monotonic watermark
+            // credits every entry (claiming out of order would otherwise skip the lower epochs).
+            let mut claims: Vec<(u64, u64, Vec<(String, bool)>)> = entries.iter().filter_map(|e| {
+                let epoch = e.get("epoch")?.as_u64()?;
+                let amount = e.get("amount")?.as_u64()?;
+                let proof: Vec<(String, bool)> = e.get("proof")?.as_array()?.iter().filter_map(|p| {
+                    let a = p.as_array()?;
+                    Some((a.get(0)?.as_str()?.to_string(), a.get(1)?.as_bool()?))
+                }).collect();
+                Some((epoch, amount, proof))
+            }).collect();
+            claims.sort_by_key(|(e, _, _)| *e);
+            // Record the recipient pre-image once before any credit (rollback safety).
+            if !claims.is_empty() {
+                if let Some(ref mut snap) = block_snapshot {
+                    snap.record_pre_images(&[to.clone()], &state_guard.accounts);
+                }
+            }
+            for (epoch, amount, proof) in &claims {
+                let root_hex = match storage.load_epoch_reward_root(*epoch) {
+                    Ok(Some((r, _, _, _))) => r,
+                    _ => continue,
+                };
+                // leaf = SHA3(wallet ‖ epoch ‖ amount) — identical to the producer's leaf.
+                let mut hasher = Sha3_256::new();
+                hasher.update(to.as_bytes());
+                hasher.update(&epoch.to_le_bytes());
+                hasher.update(&amount.to_le_bytes());
+                let leaf_hex = hex::encode(hasher.finalize());
+                if !qnet_core::crypto::merkle::verify_merkle_proof(&leaf_hex, &root_hex, proof) {
+                    eprintln!("[WARN][REWARDS] claim_proof_invalid wallet={}.. epoch={}", &to[..16.min(to.len())], epoch);
+                    continue;
+                }
+                if state_guard.claim_reward(to, *epoch, *amount) {
+                    if is_info() {
+                        println!("[INFO][REWARDS] claim_credited wallet={}.. epoch={} amount={} QNC",
+                                 &to[..16.min(to.len())], epoch, amount / 1_000_000_000);
                     }
                 }
             }
@@ -3328,6 +3517,7 @@ impl BlockchainNode {
                     {
                         let mut cs = sg.chain_state.write();
                         cs.total_supply = 0;
+                        cs.last_minted_emission_mb = 0; // reset watermark so re-apply re-mints
                         cs.height = 0;
                     }
                     qnet_state::clear_credited_fees_cache();
@@ -5784,22 +5974,12 @@ impl BlockchainNode {
             return Ok(0);
         }
         
-        // CRITICAL: Update total supply
-        let state = self.state.read().await;
-        let emission_result = (*state).emit_rewards(total_emission);
-        drop(state);
-        
-        let actual_emission = match emission_result {
-            Ok(amount) => {
-                if is_info() { println!("[INFO][REWARDS] EMISSION_COMPLETE amount={} eligible={}", 
-                         amount / 1_000_000_000, pending_rewards.len()); }
-                amount
-            }
-            Err(e) => {
-                eprintln!("[ERR][REWARDS] emission_failed err={}", e);
-                return Err(QNetError::ConsensusError(format!("Failed to emit rewards: {}", e)));
-            }
-        };
+        // Supply is minted solely when the emission TX is applied (state.emit_rewards,
+        // watermark-idempotent). This producer path only builds that TX — minting here
+        // too was a redundant producer-side path that diverged total_supply.
+        let actual_emission = total_emission;
+        if is_info() { println!("[INFO][REWARDS] EMISSION_BUILT amount={} eligible={}",
+                 actual_emission / 1_000_000_000, pending_rewards.len()); }
         
         // v7.0: update_pending_rewards REMOVED — rewards applied via emission TX in block execution
         
@@ -5826,50 +6006,11 @@ impl BlockchainNode {
             }
         }
         
-        // v2.68: Only add TX to mempool if requested (OLD behavior)
-        if add_to_mempool && actual_emission > 0 {
-            drop(reward_manager); // Release lock before async call
-            
-            let current_time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            
-            let state = self.state.read().await;
-            let _total_supply = (*state).get_total_supply();
-            drop(state);
-            
-            let mut emission_tx = qnet_state::Transaction {
-                from: "system_emission".to_string(),
-                to: Some("system_rewards_pool".to_string()),
-                amount: actual_emission,
-                tx_type: qnet_state::TransactionType::RewardDistribution,
-                timestamp: current_time,
-                hash: String::new(),
-                signature: None,
-                public_key: None,
-                gas_price: u64::MAX,
-                gas_limit: 0,
-                nonce: 0,
-                // v7.0: Include per-wallet accruals for deterministic block-level application
-                data: Some(serde_json::json!({
-                    "v": 2,
-                    "accruals": accrual_wallet_map
-                }).to_string()),
-                dilithium_signature: None,
-                dilithium_public_key: None,
-                chain_id: 0,
-            };
-
-            emission_tx.hash = emission_tx.calculate_hash();
-
-            if let Err(e) = self.add_transaction_to_mempool(emission_tx).await {
-                eprintln!("[ERR][REWARDS] emission_tx_mempool_fail err={}", e);
-                return Err(QNetError::ConsensusError(format!("Emission TX failed to add to mempool: {}", e)));
-            } else {
-                if is_info() { println!("[INFO][REWARDS] emission_tx_added_to_mempool"); }
-            }
-        }
+        // DEAD PATH (de-hazarded): the whole process_reward_window* family has ZERO callers —
+        // the inline block producer builds the emission TX directly as v3 merkle-claim. The
+        // legacy v2 emission build was REMOVED here so a future accidental re-wire cannot emit a
+        // v2 TX, which the v3 apply path ignores → would silently drop an epoch's rewards.
+        let _ = (&accrual_wallet_map, add_to_mempool);
 
         Ok(actual_emission)
     }
@@ -7925,7 +8066,7 @@ impl BlockchainNode {
                 // v2.70: CRITICAL - Save Genesis node to storage for reward recovery on restart
                 // Without this, rewards won't restore after node restart!
                 use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
-                if let Err(e) = blockchain.storage.save_node_registration(&genesis_node_id, "super", &genesis_wallet, INITIAL_REPUTATION) {
+                if let Err(e) = blockchain.storage.save_node_registration_at_height(&genesis_node_id, "super", &genesis_wallet, INITIAL_REPUTATION, 0) {
                     eprintln!("[WARN][STORAGE] genesis_reg_save_fail node={} err={}", genesis_node_id, e);
                 } else {
                     if is_info() { println!("[INFO][STORAGE] genesis_saved node={}", genesis_node_id); }
@@ -10040,7 +10181,7 @@ impl BlockchainNode {
                                             if is_debug() { println!("[DBG][POOL3] deferred_pool3_applied amount={}", apply_result.deferred_pool3); }
                                         }
                                         for (node_id, type_str, wallet) in &apply_result.deferred_registrations {
-                                            if let Err(e) = storage.save_node_registration(node_id, type_str, wallet, 1.0) {
+                                            if let Err(e) = storage.save_node_registration_at_height(node_id, type_str, wallet, 1.0, microblock.height) {
                                                 eprintln!("[ERR][STORAGE] save_node_registration failed node={} err={}", node_id, e);
                                             }
                                         }
@@ -10800,6 +10941,7 @@ impl BlockchainNode {
                                     {
                                         let mut cs = sg.chain_state.write();
                                         cs.total_supply = 0;
+                                        cs.last_minted_emission_mb = 0; // reset watermark so replay re-mints
                                         cs.height = 0;
                                     }
                                     drop(sg);
@@ -11368,6 +11510,7 @@ impl BlockchainNode {
                     // microblock.height), not over insertion-order — fixes false
                     // positives during catch-up sync.
                     if let Some(median_past) = median_past_timestamp_at_height(microblock.height) {
+                        // Floor (BIP-113 anti-backdate): strictly above median-past.
                         if microblock.timestamp <= median_past {
                             METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
                             eprintln!(
@@ -11377,6 +11520,26 @@ impl BlockchainNode {
                             return Err(format!(
                                 "TIMESTAMP_INVALID:median_past:h={}:block_ts={}:median_past={}",
                                 microblock.height, microblock.timestamp, median_past
+                            ));
+                        }
+                        // Forward cap (anti-grief): must not lead median-past projected
+                        // past the window by more than the bounded skew. SAME median_past
+                        // + formula + parent floor as block generation, so every node
+                        // computes an identical cap → clock-independent (no NTP-skew fork),
+                        // replacing reliance on the per-node 2h wall-clock window.
+                        let fwd_cap = median_past
+                            .saturating_add(MEDIAN_PAST_WINDOW as u64)
+                            .saturating_add(BLOCK_TS_MAX_FWD_SKEW_SECS)
+                            .max(parent_ts.saturating_add(1));
+                        if microblock.timestamp > fwd_cap {
+                            METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "[ERR][TIMESTAMP] fwd_cap_violation h={} ts={} cap={}",
+                                microblock.height, microblock.timestamp, fwd_cap
+                            );
+                            return Err(format!(
+                                "TIMESTAMP_INVALID:fwd_cap:h={}:block_ts={}:cap={}",
+                                microblock.height, microblock.timestamp, fwd_cap
                             ));
                         }
                     }
@@ -13261,9 +13424,12 @@ impl BlockchainNode {
                                     .map(|id| id.saturating_sub(1))
                                     .unwrap_or(0);
                                 
-                                // v2.89 OPTIMIZATION: Get sorted registry ONCE and build index map
-                                // This is O(n log n) instead of O(n * m log m) for each lookup!
-                                let sorted_registry = p2p.get_all_light_node_ids_sorted();
+                                // Deterministic pre-epoch roster (sorted node_registry, height-pinned),
+                                // NOT the RAM mirror, so the reward reader maps bits→nodes identically.
+                                let sorted_registry: Vec<String> = crate::node::try_get_storage()
+                                    .and_then(|s| s.light_roster_sorted(epoch_start).ok())
+                                    .map(|r| r.into_iter().map(|(id, _)| id).collect())
+                                    .unwrap_or_default();
                                 let total_light_nodes = sorted_registry.len() as u32;
                                 
                                 // v2.95 FIX: Skip TX creation if no Light nodes registered
@@ -17700,222 +17866,84 @@ impl BlockchainNode {
                             // Load PREVIOUS MacroBlock (always ready - no waiting!)
                             if let Ok(Some(mb_bytes)) = storage.get_macroblock_by_height(prev_macroblock_index) {
                                 if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
-                            // Extract reward_heartbeats from MacroBlock (Super-node self-attestations)
-                            if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
-                                if !heartbeats_data.is_empty() {
-                                    if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
-                                        // v3.1: Log REAL heartbeat data from MacroBlock (THIS IS THE TRUTH!)
-                                        let eligible_nodes: Vec<_> = heartbeat_summaries.iter()
-                                            .filter(|s| s.is_eligible)
-                                            .map(|s| s.node_id.clone())
-                                            .collect();
-                                        println!("[INFO][EMISSION] REAL heartbeat_eligible={} from mb={}: {:?}",
-                                                 eligible_nodes.len(), prev_macroblock_index, eligible_nodes);
-                                        
-                                        // PRODUCTION v2.78: Extract reward_light_nodes from MacroBlock (Light nodes)
-                                        let light_node_rewards: std::collections::HashMap<String, u32> = 
-                                            if let Some(ref light_data) = macroblock.consensus_data.reward_light_nodes {
-                                                bincode::deserialize(light_data).unwrap_or_default()
-                                            } else {
-                                                std::collections::HashMap::new()
-                                            };
-                                        
-                                        // Calculate total emission amount FROM MACROBLOCK DATA
-                                        // CRITICAL: Do NOT use reward_mgr.get_last_epoch_emission() - it may be 0
-                                        // if this node hasn't processed MacroBlock via P2P yet (race condition!)
-                                        // Instead, calculate emission deterministically from MacroBlock data
-                                        
-                                        let eligible_full_super_count = heartbeat_summaries.iter().filter(|s| s.is_eligible).count() as u64;
-                                        let eligible_light_count = light_node_rewards.len() as u64;
-                                        let total_eligible_count = eligible_full_super_count + eligible_light_count;
-                                        
-                                        if total_eligible_count > 0 {
-                                            // Calculate Pool 1 base emission using reward_manager's dynamic function
-                                            // This correctly handles halving every 4 years + sharp drop at year 20
-                                            let pool1_base_emission = {
-                                                let reward_mgr = reward_manager_for_spawn.read().await;
-                                                reward_mgr.get_pool1_base_emission()
-                                            };
-                                            
-                                            // Extract pool2 and pool3 from MacroBlock
-                                            let pool2_total = macroblock.consensus_data.pool2_total_fees.unwrap_or(0);
-                                            let pool3_total = macroblock.consensus_data.pool3_total_activations.unwrap_or(0);
-                                            
-                                            // PRODUCTION v2.78: REWARD DISTRIBUTION RULES
-                                            // ═══════════════════════════════════════════════════════════════
-                                            // Pool 1: Base emission (halves every 4 years)
-                                            //   - Distributed to ALL eligible nodes (Light + Super; v3.18: "Full" removed)
-                                            //   - Equal share per node type weight:
-                                            //     * Super: 1.0 weight
-                                            //     * Full:  1.0 weight  
-                                            //     * Light: 1.0 weight (equal participation)
-                                            // 
-                                            // Pool 2: REMOVED in v3.18
-                                            //   - Fees go directly to block producer
-                                            //   - See fees_collected in MicroBlock
-                                            // 
-                                            // Pool 3: Activation bonuses (Phase 2 only)
-                                            //   - Equal share to ALL eligible nodes (Light + Super; v3.18: "Full" removed)
-                                            //   - Only active in Phase 2 (QNC economy)
-                                            // ═══════════════════════════════════════════════════════════════
-                                            
-                                            let total_emission = pool1_base_emission + pool2_total + pool3_total;
-                                            
-                                            if total_emission > 0 {
-                                                let current_time = SystemTime::now()
-                                                    .duration_since(UNIX_EPOCH)
-                                                    .unwrap_or_default()
-                                                    .as_secs();
-                                                
-                                                let mut emission_tx = qnet_state::Transaction {
-                                                    from: "system_emission".to_string(),
-                                                    to: Some("system_rewards_pool".to_string()),
-                                                    amount: total_emission,
-                                                    tx_type: qnet_state::TransactionType::RewardDistribution,
-                                                    timestamp: current_time,
-                                                    hash: String::new(),
-                                                    signature: None,
-                                                    public_key: None,
-                                                    gas_price: u64::MAX, // MAX priority - FIRST in block
-                                                    gas_limit: 0,
-                                                    nonce: 0,
-                                                    data: Some(format!("Emission Block {}: {} QNC distributed to {} eligible nodes (Super={} Light={})",
-                                                                     next_block_height,
-                                                                     total_emission / 1_000_000_000,
-                                                                     total_eligible_count,
-                                                                     eligible_full_super_count,
-                                                                     eligible_light_count)),
-                                                    dilithium_signature: None,
-                                                    dilithium_public_key: None,
-                                                    chain_id: 0,
-                                                };
-                                                
-                                                // PRODUCTION v2.78: Process Super + Light node rewards via unified deterministic path.
-                                                // Convert Light nodes to HeartbeatSummaryData format to process alongside Super-node heartbeats.
-                                                // This ensures BOTH node roles (Light, Super) are processed IDENTICALLY on every Super node.
-                                                // (v3.18: the "Full" tier was removed from the protocol.)
-                                                let mut all_summaries = heartbeat_summaries.clone();
-                                                
-                                                if !light_node_rewards.is_empty() {
-                                                    // Convert Light nodes to HeartbeatSummaryData
-                                                    for (light_node_id, _ping_count) in &light_node_rewards {
-                                                        all_summaries.push(qnet_state::HeartbeatSummary {
-                                                            node_id: light_node_id.clone(),
-                                                            node_type: 0, // Light
-                                                            heartbeat_count: 1, // 1 ping per epoch
-                                                            first_heartbeat: 0,
-                                                            last_heartbeat: 0,
-                                                            is_eligible: true, // Already validated by PingCommitment
-                                                        });
-                                                    }
-                                                }
-                                                
-                                                // v3.18: Process all nodes (Light/Super) via unified deterministic function
-                                                // This ensures:
-                                                // - Pool 1: ALL nodes get equal share
-                                                // - Pool 2: REMOVED - fees go to block producer
-                                                // - Pool 3: ALL nodes get equal share (Phase 2 only)
-                                                {
-                                                    let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = all_summaries.iter()
-                                                        .map(|s| qnet_consensus::HeartbeatSummaryData {
-                                                            node_id: s.node_id.clone(),
-                                                            node_type: s.node_type,
-                                                            heartbeat_count: s.heartbeat_count,
-                                                            first_heartbeat: s.first_heartbeat,
-                                                            last_heartbeat: s.last_heartbeat,
-                                                            is_eligible: s.is_eligible,
-                                                        })
-                                                        .collect();
-                                                    
-                                                    let mut reward_mgr = reward_manager_for_spawn.write().await;
-                                                    if let Err(e) = reward_mgr.process_macroblock_heartbeats_deterministic(
-                                                        prev_macroblock_index,
-                                                        &summary_data,
-                                                        Some(pool2_total),
-                                                        Some(pool3_total),
-                                                    ) {
-                                                        eprintln!("[ERR][EMISSION] rewards_process_fail mb={} err={}", prev_macroblock_index, e);
-                                                    }
-                                                    
-                                                    let accruals = reward_mgr.get_last_epoch_accruals();
-                                                    let mut wallet_map = std::collections::BTreeMap::<String, u64>::new();
-                                                    if !accruals.is_empty() {
-                                                        for (nid, &amt) in accruals.iter() {
-                                                            if let Ok(Some((_nt, wallet, _rep))) = storage.load_node_registration(nid) {
-                                                                if !wallet.is_empty() {
-                                                                    *wallet_map.entry(wallet).or_insert(0) += amt;
-                                                                }
-                                                            }
-                                                        }
-                                                    } else if total_eligible_count > 0 {
-                                                        // Delayed reward: epoch < 2 skipped reward_manager accumulation,
-                                                        // but emission TX must still distribute to eligible nodes.
-                                                        // Calculate per-node share directly from MacroBlock heartbeat data.
-                                                        let per_node_reward = total_emission / total_eligible_count;
-                                                        if per_node_reward > 0 {
-                                                            for s in &all_summaries {
-                                                                if s.is_eligible {
-                                                                    if let Ok(Some((_, wallet, _))) = storage.load_node_registration(&s.node_id) {
-                                                                        if !wallet.is_empty() {
-                                                                            *wallet_map.entry(wallet).or_insert(0) += per_node_reward;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        println!("[INFO][EMISSION] delayed_reward_accruals: {} wallets, per_node={} nanoQNC from mb={}",
-                                                                 wallet_map.len(), per_node_reward, prev_macroblock_index);
-                                                    }
-                                                    emission_tx.data = Some(serde_json::json!({
-                                                        "v": 2,
-                                                        "accruals": wallet_map
-                                                    }).to_string());
-                                                    // Recalculate hash — data field changed after initial hash
-                                                    emission_tx.hash = emission_tx.calculate_hash();
-                                                }
-                                                
-                                                // Serialize TX
-                                                if let Ok(tx_bytes) = bincode::serialize(&emission_tx) {
-                                                    let tx_sz = tx_bytes.len();
-                                                    emission_tx_opt = Some((emission_tx.hash.clone(), tx_bytes));
-
-                                                    // Scale fail-safe: per-recipient accruals grow O(eligible) and the
-                                                    // emission TX MUST fit in one block (MAX_BLOCK_SIZE_BYTES = 80MB).
-                                                    // Warn well before that so reward distribution is migrated to a
-                                                    // merkle-root + claim model before the artifact can block inclusion.
-                                                    const EMISSION_TX_WARN_BYTES: usize = 40_000_000; // 50% of the 80MB block cap
-                                                    if tx_sz > EMISSION_TX_WARN_BYTES {
-                                                        println!("[WARN][EMISSION] tx_size={}MB eligible={} approaching 80MB block cap — migrate reward distribution to merkle/claim before this scale",
-                                                                 tx_sz / 1_000_000, total_eligible_count);
-                                                    }
-
-                                                    if is_info() {
-                                                        println!("[INFO][EMISSION] tx_created block={} mb={} amount={} QNC eligible={} (super={} light={}) size={}KB hash={}",
-                                                                 next_block_height, prev_macroblock_index,
-                                                                 total_emission / 1_000_000_000,
-                                                                 total_eligible_count,
-                                                                 eligible_full_super_count,
-                                                                 eligible_light_count,
-                                                                 tx_sz / 1000,
-                                                                 &emission_tx.hash[..16.min(emission_tx.hash.len())]);
-                                                    }
-                                                } else {
-                                                    eprintln!("[ERR][EMISSION] tx_serialize_fail block={}", next_block_height);
-                                                }
-                                            } else {
-                                                eprintln!("[WARN][EMISSION] zero_emission block={} mb={}", next_block_height, prev_macroblock_index);
-                                            }
-                                        } else {
-                                            eprintln!("[WARN][EMISSION] no_eligible_nodes block={} mb={}", next_block_height, prev_macroblock_index);
-                                        }
-                                    } else {
-                                        eprintln!("[ERR][EMISSION] heartbeat_deserialize_fail block={} mb={}", next_block_height, prev_macroblock_index);
+                            // Emission AMOUNT is independent of the recipient set: Pool-1 halving
+                            // schedule + the macroblock's sealed pool2/pool3 totals. The recipient
+                            // set + merkle root are recomputed from on-chain (Super: registry +
+                            // heartbeat tally; Light: bitmaps + roster) so the macroblock carries no
+                            // recipient list (O(1)) and every node rebuilds an identical root.
+                            let pool1_base_emission = {
+                                let reward_mgr = reward_manager_for_spawn.read().await;
+                                reward_mgr.get_pool1_base_emission()
+                            };
+                            let pool2_total = macroblock.consensus_data.pool2_total_fees.unwrap_or(0);
+                            let pool3_total = macroblock.consensus_data.pool3_total_activations.unwrap_or(0);
+                            let total_emission = pool1_base_emission + pool2_total + pool3_total;
+                            if total_emission > 0 {
+                                let reward_epoch = prev_macroblock_index;
+                                let (wallet_vec, reward_root_hex) =
+                                    Self::compute_epoch_reward_distribution(&storage, reward_epoch, total_emission);
+                                let reward_total: u64 = wallet_vec.iter().map(|(_, a)| *a).sum();
+                                let reward_count = wallet_vec.len() as u32;
+                                let reward_per_node = if reward_count > 0 { reward_total / reward_count as u64 } else { 0 };
+                                if reward_count > 0 {
+                                    if let Err(e) = storage.save_epoch_reward_wallets(reward_epoch, &wallet_vec) {
+                                        eprintln!("[WARN][EMISSION] reward_wallets_save_fail epoch={} err={}", reward_epoch, e);
+                                    }
+                                    if let Err(e) = storage.save_epoch_reward_root(reward_epoch, &reward_root_hex, reward_per_node, reward_count, reward_total) {
+                                        eprintln!("[WARN][EMISSION] reward_root_save_fail epoch={} err={}", reward_epoch, e);
+                                    }
+                                    if is_info() {
+                                        println!("[INFO][EMISSION] reward_root epoch={} root={}.. count={} total={} QNC",
+                                                 reward_epoch, &reward_root_hex[..16.min(reward_root_hex.len())],
+                                                 reward_count, reward_total / 1_000_000_000);
+                                    }
+                                }
+                                let current_time = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                // v3 emission TX commits ONLY the merkle root (+ scalar params), never the
+                                // O(N) recipient map. reward_total == total_emission (conserved) ⇒ apply
+                                // recomputes byte-identically from this `total`.
+                                let mut emission_tx = qnet_state::Transaction {
+                                    from: "system_emission".to_string(),
+                                    to: Some("system_rewards_pool".to_string()),
+                                    amount: total_emission,
+                                    tx_type: qnet_state::TransactionType::RewardDistribution,
+                                    timestamp: current_time,
+                                    hash: String::new(),
+                                    signature: None,
+                                    public_key: None,
+                                    gas_price: u64::MAX, // MAX priority - FIRST in block
+                                    gas_limit: 0,
+                                    nonce: 0,
+                                    data: Some(serde_json::json!({
+                                        "v": 3,
+                                        "epoch": reward_epoch,
+                                        "root": reward_root_hex,
+                                        "per_node": reward_per_node,
+                                        "count": reward_count,
+                                        "total": reward_total
+                                    }).to_string()),
+                                    dilithium_signature: None,
+                                    dilithium_public_key: None,
+                                    chain_id: 0,
+                                };
+                                emission_tx.hash = emission_tx.calculate_hash();
+                                if let Ok(tx_bytes) = bincode::serialize(&emission_tx) {
+                                    let tx_sz = tx_bytes.len();
+                                    emission_tx_opt = Some((emission_tx.hash.clone(), tx_bytes));
+                                    if is_info() {
+                                        println!("[INFO][EMISSION] tx_created block={} mb={} amount={} QNC recipients={} size={}B hash={}",
+                                                 next_block_height, prev_macroblock_index,
+                                                 total_emission / 1_000_000_000, reward_count, tx_sz,
+                                                 &emission_tx.hash[..16.min(emission_tx.hash.len())]);
                                     }
                                 } else {
-                                    eprintln!("[WARN][EMISSION] empty_heartbeats block={} mb={}", next_block_height, prev_macroblock_index);
+                                    eprintln!("[ERR][EMISSION] tx_serialize_fail block={}", next_block_height);
                                 }
                             } else {
-                                eprintln!("[WARN][EMISSION] no_heartbeat_data block={} mb={}", next_block_height, prev_macroblock_index);
+                                eprintln!("[WARN][EMISSION] zero_emission block={} mb={}", next_block_height, prev_macroblock_index);
                             }
                                 } // Close if let Ok(macroblock)
                             } else {
@@ -18496,40 +18524,45 @@ impl BlockchainNode {
                         // lower = max(parent+1, median_past+1): strict
                         // monotonic + anti-rewrite; clock-behind node pulled
                         // up here (bounded, no projection).
+                        // Height-ordered median-past (BIP-113): the deterministic basis
+                        // for BOTH the floor and the forward cap, identical to the
+                        // validator's `median_past_timestamp_at_height`, so every node
+                        // derives the same [lower, upper] band → block_ts validity is
+                        // clock-independent (no NTP-skew fork).
+                        let median_past = median_past_timestamp_at_height(next_block_height);
+
                         let lower = parent_ts
                             .saturating_add(1)
                             .max(
-                                median_past_timestamp_at_height(next_block_height)
+                                median_past
                                     .map(|m| m.saturating_add(1))
                                     .unwrap_or(0),
                             );
 
-                        // RAW network median (no forward projection — that was the
-                        // ratchet). Used only for the anti-inflation upper cap.
-                        let network_median = {
-                            let ring = NETWORK_TIME_RING.lock();
-                            let m = ring.median_sample().map(|(ts, _h)| ts);
-                            drop(ring);
-                            m
-                        };
-
-                        let candidate = match network_median {
-                            Some(m) => {
-                                // Lead the network median by ≤ MAX_FWD_SKEW; never
-                                // below `lower` (validity wins over anti-inflation).
-                                let upper = m
+                        // Forward cap = median-past projected past the window (≈ real
+                        // "now") + bounded skew, floored at `lower`. Lets block_ts TRACK
+                        // the producer's NTP wall clock. The old cap used the RAW trailing
+                        // median (≈ parent−15), so raw_median+SKEW sat BELOW `lower` →
+                        // upper collapsed to `lower` → block_ts pinned to parent+1
+                        // (+1/block) and decoupled from real time → unbounded observational
+                        // clock-drift. This is a clamp (min), NOT the old one-way max()
+                        // ratchet, so it tracks wall-clock both directions.
+                        let candidate = match median_past {
+                            Some(mp) => {
+                                let upper = mp
+                                    .saturating_add(MEDIAN_PAST_WINDOW as u64)
                                     .saturating_add(BLOCK_TS_MAX_FWD_SKEW_SECS)
                                     .max(lower);
                                 wall_ts.clamp(lower, upper)
                             }
-                            // Ring undersized (first blocks): no median yet.
+                            // Genesis-adjacent prefix (< WINDOW heights): floor only.
                             None => wall_ts.max(lower),
                         };
 
                         if is_debug() && next_block_height > 0 {
                             println!(
-                                "[DBG][TIMESTAMP] gen h={} wall={} lower={} net_med={:?} → chosen={}",
-                                next_block_height, wall_ts, lower, network_median, candidate
+                                "[DBG][TIMESTAMP] gen h={} wall={} lower={} median_past={:?} → chosen={}",
+                                next_block_height, wall_ts, lower, median_past, candidate
                             );
                         }
                         candidate
@@ -26877,11 +26910,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let is_emission_macroblock = index > 0 && index % EMISSION_MACROBLOCK_INTERVAL == 0;
         
         if is_emission_macroblock {
-            // v2.99: ALL nodes process rewards from MacroBlock (deterministic!)
-            // MacroBlock contains reward_heartbeats → ALL nodes use SAME data → SAME result!
-            if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
-                if !heartbeats_data.is_empty() {
-                    if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
+            // Reward crediting is via the in-block emission TX (deterministic root + claims); this
+            // sync-skippable handler only persists the periodic snapshot + dedup marker. Recipient
+            // summaries are no longer sealed in the macroblock (O(1) at scale), so the reward_mgr
+            // accounting below runs on an empty set (vestigial under the root model, harmless).
+            {
+                {
+                    {
+                        let heartbeat_summaries: Vec<qnet_state::HeartbeatSummary> = macroblock.consensus_data.reward_heartbeats.as_ref()
+                            .and_then(|d| bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(d).ok())
+                            .unwrap_or_default();
                         // PRODUCTION v2.78: Merge Super nodes with Light nodes for unified processing
                         let mut all_summaries = heartbeat_summaries.clone();
                         
@@ -26937,19 +26975,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     let total_emission = reward_mgr.get_last_epoch_emission();
                                     drop(reward_mgr);
                                     
-                                    if total_emission > 0 {
-                                        let state = self.state.read().await;
-                                        if let Err(e) = (*state).emit_rewards(total_emission) {
-                                            eprintln!("[ERR][REWARDS] supply_update_fail err={}", e);
-                                        } else {
-                                            let new_supply = (*state).get_total_supply();
-                                            if is_info() {
-                                                println!("[INFO][REWARDS] SYNC supply_updated emission={} total={} QNC", 
-                                                         total_emission / 1_000_000_000, new_supply / 1_000_000_000);
-                                            }
-                                        }
-                                        drop(state);
-                                    }
+                                    // Supply mint REMOVED here: total_supply is minted solely by the
+                                    // in-block emission TX (state.emit_rewards, watermark-idempotent).
+                                    // This macroblock handler is sync-skippable, so minting here was the
+                                    // source of per-node total_supply divergence.
+                                    let _ = total_emission;
                                     
                                     // v7.0: update_pending_rewards REMOVED — now applied via emission TX in block execution
                                     // Persist pending rewards to RocksDB (survive restarts)
@@ -29280,6 +29310,118 @@ impl Clone for BlockchainNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── B cutover: merkle reward-claim determinism + security ──
+    // The producer's committed root and every node's apply-time recompute call the SAME
+    // distribute_equal_rewards over the SAME consensus inputs. These pin the three properties
+    // the cross-node agreement depends on: order-independence, conservation, proof verifiability.
+
+    #[test]
+    fn reward_distribution_is_order_independent() {
+        // Same eligible set in two different input orders → identical root + per-wallet amounts.
+        // This is THE determinism guarantee: light-node merge order (HashMap) must not matter.
+        let a = vec![
+            ("node_c".to_string(), "wallet_c".to_string()),
+            ("node_a".to_string(), "wallet_a".to_string()),
+            ("node_b".to_string(), "wallet_b".to_string()),
+        ];
+        let b = vec![
+            ("node_a".to_string(), "wallet_a".to_string()),
+            ("node_b".to_string(), "wallet_b".to_string()),
+            ("node_c".to_string(), "wallet_c".to_string()),
+        ];
+        let total = 1_000_000_001; // not divisible by 3 → exercises the remainder split
+        let (va, ra) = BlockchainNode::distribute_equal_rewards(&a, total, 160);
+        let (vb, rb) = BlockchainNode::distribute_equal_rewards(&b, total, 160);
+        assert_eq!(ra, rb, "root must be order-independent");
+        assert_eq!(va, vb, "per-wallet amounts must be order-independent");
+        assert!(!ra.is_empty());
+    }
+
+    #[test]
+    fn reward_distribution_conserves_total() {
+        let elig: Vec<(String, String)> =
+            (0..7).map(|i| (format!("node_{}", i), format!("wallet_{}", i))).collect();
+        let total = 1_000_000_000_000u64 + 5; // remainder = 5 over 7 eligible
+        let (v, root) = BlockchainNode::distribute_equal_rewards(&elig, total, 320);
+        let sum: u64 = v.iter().map(|(_, a)| *a).sum();
+        assert_eq!(sum, total, "Σ distributed must equal total (no QNC lost or created)");
+        let max = v.iter().map(|(_, a)| *a).max().unwrap();
+        let min = v.iter().map(|(_, a)| *a).min().unwrap();
+        assert!(max - min <= 1, "equal-per-eligible: amounts differ by at most 1 nano");
+        assert!(!root.is_empty());
+    }
+
+    #[test]
+    fn light_eligibility_bitmap_roundtrips() {
+        // Fork-safety: the reward reader must recover EXACTLY the shard-local indices the bitmap
+        // producer marked. Encode with the real producer fn, decode with the reader's bit logic.
+        let total_assigned = 13u32;
+        let eligible: Vec<u32> = vec![0, 3, 7, 12];
+        let tx = BlockchainNode::create_light_node_bitmap_tx("genesis_node_002", 5, &eligible, total_assigned)
+            .expect("bitmap tx");
+        let bm = match tx.tx_type {
+            qnet_state::TransactionType::LightNodeEligibilityBitmap { bitmap_compressed, total_assigned: ta, eligible_count, .. } => {
+                assert_eq!(ta, total_assigned);
+                assert_eq!(eligible_count, eligible.len() as u32);
+                zstd::decode_all(&bitmap_compressed[..]).expect("decompress")
+            }
+            _ => panic!("wrong tx type"),
+        };
+        let mut recovered: Vec<u32> = Vec::new();
+        for i in 0..total_assigned as usize {
+            if bm[i / 8] & (1 << (i % 8)) != 0 { recovered.push(i as u32); }
+        }
+        assert_eq!(recovered, eligible, "reader must recover exactly the producer's eligible set");
+    }
+
+    #[test]
+    fn light_shards_partition_roster() {
+        // The linear 5-genesis shards must tile the roster with no gap/overlap, so every Light
+        // node maps to exactly one genesis bitmap (producer + reader use this identical formula).
+        for total in [1usize, 4, 5, 23, 100, 100_003] {
+            let per = (total + 4) / 5;
+            let mut covered = 0usize;
+            let mut prev_end = 0usize;
+            for gidx in 0..5usize {
+                let start = (gidx * per).min(total);
+                let end = (start + per).min(total);
+                assert_eq!(start, prev_end, "shard {} must start where the previous ended (total={})", gidx, total);
+                covered += end - start;
+                prev_end = end;
+            }
+            assert_eq!(covered, total, "shards must cover the full roster (total={})", total);
+        }
+    }
+
+    #[test]
+    fn reward_claim_proof_round_trip() {
+        // Producer builds the root; a claimant proves its exact (wallet, epoch, amount) leaf.
+        // A tampered amount must NOT verify — this is the claim's security property.
+        let epoch = 480u64;
+        let elig: Vec<(String, String)> =
+            (0..5).map(|i| (format!("n{}", i), format!("w{}", i))).collect();
+        let (wallet_vec, root) = BlockchainNode::distribute_equal_rewards(&elig, 500, epoch);
+        let leaf_of = |w: &str, amount: u64| {
+            let mut h = Sha3_256::new();
+            h.update(w.as_bytes());
+            h.update(&epoch.to_le_bytes());
+            h.update(&amount.to_le_bytes());
+            hex::encode(h.finalize())
+        };
+        let leaves: Vec<String> = wallet_vec.iter().map(|(w, a)| leaf_of(w, *a)).collect();
+        let idx = 2usize;
+        let (w, amount) = &wallet_vec[idx];
+        let proof = qnet_core::crypto::merkle::generate_merkle_proof(&leaves, idx).unwrap();
+        assert!(
+            qnet_core::crypto::merkle::verify_merkle_proof(&leaf_of(w, *amount), &root, &proof),
+            "valid (wallet,epoch,amount) proof must verify against the committed root"
+        );
+        assert!(
+            !qnet_core::crypto::merkle::verify_merkle_proof(&leaf_of(w, amount + 1), &root, &proof),
+            "tampered amount must fail verification (no over-claim)"
+        );
+    }
 
     // v34: reward/producer eligibility reads the UNFORGEABLE on-chain liveness count (popcount
     // of the subwindow bitmask set by validated Heartbeat TXs), NOT the self-attested HBC count.

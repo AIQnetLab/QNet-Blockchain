@@ -87,6 +87,7 @@ impl StateDB {
                     heartbeat_slots: 0,
                     heartbeat_final_epoch: 0,
                     heartbeat_final_count: 0,
+                    last_claimed_epoch: 0,
                 }
             });
 
@@ -155,6 +156,7 @@ impl StateDB {
                     heartbeat_slots: 0,
                     heartbeat_final_epoch: 0,
                     heartbeat_final_count: 0,
+                    last_claimed_epoch: 0,
                 }
             });
 

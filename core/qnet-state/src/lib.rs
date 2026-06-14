@@ -15,6 +15,7 @@ pub mod state_db;
 pub mod state_manager;
 pub mod errors;
 pub mod state;
+pub mod feature_gates;
 
 #[cfg(feature = "python")]
 mod python_bindings;

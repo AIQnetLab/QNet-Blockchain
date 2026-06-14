@@ -187,26 +187,11 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                 // it == qc.checkpoint_hash (binds this exact block), and full-verify the QC.
                 let qc_bytes = bincode::serialize(&(checkpoint.clone(), qc.clone())).unwrap_or_default();
                 let excluded = excluded_producers(storage, window);
-                // Emission macroblock (every 160 windows ≈ 4h): record the PREVIOUS epoch's
-                // reward recipients on-chain (Super HBC + Light pings) so the emission TX and
-                // the deterministic crediting (both read these fields) work under v2. Determ-
-                // inistic ⇒ every sealer records the same set. pool2 (fees→producer since
-                // v3.18) / pool3 (Phase 2) stay None. Heavy epoch scan, but 1 window in 160.
-                let (reward_heartbeats, reward_light_nodes) = if window > 0 && window % 160 == 0 {
-                    let ws = (window / 160 - 1) * 14400;
-                    let we = ws + 14400;
-                    // v35: discover recipients from on-chain Heartbeat-TX emitters and key
-                    // eligibility on the UNFORGEABLE per-epoch tally (heartbeat_slots popcount).
-                    // No HBC scan, no self-attested count; sorted output ⇒ identical body on all sealers.
-                    let hb = crate::node::BlockchainNode::collect_heartbeat_summaries_from_chain(storage, ws, we)
-                        .await.ok()
-                        .filter(|s| !s.is_empty())
-                        .and_then(|s| bincode::serialize(&s).ok());
-                    let lt = crate::node::BlockchainNode::collect_ping_commitments_from_blocks(storage, p2p, ws, we)
-                        .await.ok().filter(|m| !m.is_empty())
-                        .and_then(|m| bincode::serialize(&m).ok());
-                    (hb, lt)
-                } else { (None, None) };
+                // Reward recipients are NOT sealed in the macroblock — apply recomputes both Super
+                // (registry + per-epoch heartbeat tally) and Light (on-chain eligibility bitmaps +
+                // deterministic roster), giving an O(1) macroblock with an identical reward root on
+                // every node. pool2/pool3 stay None.
+                let _ = &p2p; // sealing removed; p2p no longer read here
                 // v2 SCALE ANCHOR: cumulative equivocation ban-set as of this window (prev
                 // macroblock's set ∪ this window's verified proofs), sorted for byte-stable
                 // bincode. Lets the next epoch's reputation fold derive bans in O(window)
@@ -232,8 +217,8 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                         excluded_producers_for_next_epoch: excluded,
                         consensus_committee: Some(committee),
                         banned_validators,
-                        reward_heartbeats,
-                        reward_light_nodes,
+                        reward_heartbeats: None,
+                        reward_light_nodes: None,
                         ..Default::default()
                     },
                     previous_hash,

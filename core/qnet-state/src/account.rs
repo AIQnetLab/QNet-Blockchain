@@ -130,6 +130,12 @@ pub struct Account {
     /// popcount of `heartbeat_slots` for `heartbeat_final_epoch` (the finalized liveness count).
     #[serde(default)]
     pub heartbeat_final_count: u8,
+
+    /// Highest reward epoch this account has already claimed (merkle-claim anti-replay).
+    /// A claim TX is valid only for an epoch strictly greater than this and advances it on
+    /// success. Part of the leaf hash (consensus-bound — see hash_account).
+    #[serde(default)]
+    pub last_claimed_epoch: u64,
 }
 
 /// Account state (alias for compatibility)
@@ -188,6 +194,7 @@ impl Default for AccountState {
             heartbeat_slots: 0,
             heartbeat_final_epoch: 0,
             heartbeat_final_count: 0,
+            last_claimed_epoch: 0,
         }
     }
 }
@@ -262,6 +269,7 @@ impl Account {
             heartbeat_slots: 0,
             heartbeat_final_epoch: 0,
             heartbeat_final_count: 0,
+            last_claimed_epoch: 0,
         }
     }
 
@@ -287,6 +295,7 @@ impl Account {
             heartbeat_slots: 0,
             heartbeat_final_epoch: 0,
             heartbeat_final_count: 0,
+            last_claimed_epoch: 0,
         }
     }
 

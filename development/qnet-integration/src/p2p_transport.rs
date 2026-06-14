@@ -56,6 +56,11 @@ use crate::crypto::hybrid_crypto::HybridCertificate;
 /// Protocol version for binary messages
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// Oldest wire version this binary still accepts. Accepting the range [MIN, CURRENT] (instead of an
+/// exact match) lets a future version bump roll out node-by-node without partitioning the network —
+/// upgraded nodes keep talking to not-yet-upgraded peers. MIN==CURRENT ⇒ behaviour unchanged today.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 1;
+
 /// Maximum message size (10 MB - enough for macroblocks)
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
@@ -172,7 +177,9 @@ impl MessageHeader {
         }
         
         let version = bytes[0];
-        if version != PROTOCOL_VERSION {
+        // Accept the supported range, not an exact match → a coordinated version bump rolls out
+        // without partitioning. Out-of-range (too old / unknown-newer) is still rejected.
+        if version < MIN_SUPPORTED_PROTOCOL_VERSION || version > PROTOCOL_VERSION {
             return Err(TransportError::ProtocolMismatch(PROTOCOL_VERSION, version));
         }
         

@@ -149,6 +149,10 @@ fn max_size_for_message_type(msg_type: u8) -> usize {
 /// Protocol version
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// Oldest wire version still accepted. Accepting [MIN, CURRENT] lets a coordinated version bump
+/// roll out node-by-node without partitioning. MIN==CURRENT ⇒ behaviour unchanged today.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u8 = 1;
+
 /// Maximum concurrent incoming handshakes (v6.3: DoS protection).
 /// Each TLS 1.3 + Kyber handshake costs ~2-5ms CPU. Capping at 64
 /// limits worst-case CPU burn to ~320ms even under botnet flood.
@@ -1731,10 +1735,12 @@ impl QuicTransport {
             return Err("Message too short".into());
         }
 
-        // Check header
+        // Check header — accept the supported range so a coordinated version bump rolls out
+        // without partitioning; out-of-range (too old / unknown-newer) is still rejected.
         let version = data[0];
-        if version != PROTOCOL_VERSION {
-            return Err(format!("Protocol version mismatch: {}", version));
+        if version < MIN_SUPPORTED_PROTOCOL_VERSION || version > PROTOCOL_VERSION {
+            return Err(format!("Protocol version mismatch: {} (supported {}..={})",
+                               version, MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION));
         }
 
         let msg_type = data[1];

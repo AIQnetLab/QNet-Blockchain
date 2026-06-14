@@ -9541,6 +9541,81 @@ async fn handle_claim_rewards(
     }
     let _claim_guard = ClaimGuard(claim_request.node_id.clone());
 
+    // ── v3 merkle-claim: batch ALL of a wallet's unclaimed epochs into one proof-carrying TX ──
+    // Sig already verified above. Enumerate epochs via the reward-epochs index (no scan cap),
+    // generate each merkle proof from the locally-stored leaf set, and submit ONE batch claim TX
+    // covering every unclaimed epoch (oldest-first → no forfeiture). Apply re-verifies every proof
+    // against the consensus root, so this RPC cannot forge a credit.
+    {
+        let storage = blockchain.get_storage();
+        let last_claimed = {
+            let state = blockchain.get_state_manager();
+            let g = state.read().await;
+            (*g).get_last_claimed_epoch(&wallet_address)
+        };
+        let epochs = storage.load_reward_epochs().unwrap_or_default();
+        let mut claim_entries: Vec<serde_json::Value> = Vec::new();
+        let mut total_amount: u64 = 0;
+        const MAX_BATCH: usize = 512; // bound the TX size; the wallet re-calls for any remainder
+        for epoch in epochs.into_iter().filter(|e| *e > last_claimed) {
+            if claim_entries.len() >= MAX_BATCH { break; }
+            if let Ok(Some(wallets)) = storage.load_epoch_reward_wallets(epoch) {
+                if let Some(idx) = wallets.iter().position(|(w, _)| w == &wallet_address) {
+                    let amount = wallets[idx].1;
+                    let leaves: Vec<String> = wallets.iter().map(|(w, a)| {
+                        let mut hh = Sha3_256::new();
+                        hh.update(w.as_bytes());
+                        hh.update(&epoch.to_le_bytes());
+                        hh.update(&a.to_le_bytes());
+                        hex::encode(hh.finalize())
+                    }).collect();
+                    if let Ok(proof) = qnet_core::crypto::merkle::generate_merkle_proof(&leaves, idx) {
+                        let proof_json: Vec<serde_json::Value> = proof.iter().map(|(hh, l)| json!([hh, l])).collect();
+                        claim_entries.push(json!({ "epoch": epoch, "amount": amount, "proof": proof_json }));
+                        total_amount = total_amount.saturating_add(amount);
+                    }
+                }
+            }
+        }
+        if !claim_entries.is_empty() {
+            let n = claim_entries.len();
+            let data = json!({ "claims": claim_entries }).to_string();
+            let mut tx = qnet_state::Transaction {
+                hash: String::new(),
+                from: "system_rewards_pool".to_string(),
+                to: Some(wallet_address.clone()),
+                amount: total_amount,
+                nonce: 0,
+                gas_price: 0,
+                gas_limit: 0,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                signature: Some(claim_request.quantum_signature.clone()),
+                public_key: Some(claim_request.public_key.clone()),
+                tx_type: qnet_state::TransactionType::RewardDistribution,
+                data: Some(data),
+                dilithium_signature: claim_request.dilithium_signature.clone(),
+                dilithium_public_key: claim_request.dilithium_public_key.clone(),
+                chain_id: 0,
+            };
+            tx.hash = tx.calculate_hash();
+            return match blockchain.submit_transaction(tx).await {
+                Ok(tx_hash) => {
+                    println!("[INFO][CLAIM] merkle_claim_submitted wallet={}.. epochs={} amount={} QNC hash={}",
+                             &wallet_address[..16.min(wallet_address.len())], n, total_amount / 1_000_000_000, tx_hash);
+                    Ok(warp::reply::json(&json!({
+                        "success": true,
+                        "tx_hash": tx_hash,
+                        "epochs_claimed": n,
+                        "amount_qnc": total_amount as f64 / 1_000_000_000.0,
+                        "message": "Merkle reward claim submitted; credited on inclusion"
+                    })))
+                }
+                Err(e) => Ok(warp::reply::json(&json!({ "success": false, "error": format!("{}", e) }))),
+            };
+        }
+        // No unclaimed merkle reward for this wallet → fall through to the legacy pending path.
+    }
+
     // v2.96: CRITICAL SECURITY FIX - Check pending rewards from BLOCKCHAIN (not memory/RocksDB)!
     // This is the ONLY source of truth that all nodes agree on
     let reward_amount = {

@@ -851,13 +851,37 @@ impl PersistentStorage {
             ]
         }
 
+        // Downgrade-safe open: rocksdb requires EVERY existing CF to be declared, so an older binary
+        // opening a DB a newer binary extended would otherwise fail to start. Union our known CFs
+        // with any extra ones already on disk (opened with generic opts). Forward (missing CF) is
+        // covered by create_missing_column_families; this covers the reverse. Keep list in sync with
+        // build_column_families() above.
+        const KNOWN_CF_NAMES: &[&str] = &[
+            "blocks", "transactions", "accounts", "metadata", "microblocks", "consensus",
+            "sync_state", "pending_rewards", "node_registry", "ping_history", "failover_events",
+            "snapshots", "tx_index", "tx_by_address", "attestations", "heartbeats", "poh_state",
+            "contract_storage", "fcm_tokens", "mempool", "cross_shard_pending", "cross_shard_receipts",
+        ];
+        let open_descriptors = || -> Vec<ColumnFamilyDescriptor> {
+            let mut cfs = build_column_families();
+            if let Ok(existing) = DB::list_cf(&Options::default(), path) {
+                for name in existing {
+                    if name != "default" && !KNOWN_CF_NAMES.contains(&name.as_str()) {
+                        eprintln!("[WARN][STORAGE] opening unknown CF '{}' (newer-binary DB → downgrade-safe)", name);
+                        cfs.push(ColumnFamilyDescriptor::new(&name, create_cf_opts()));
+                    }
+                }
+            }
+            cfs
+        };
+
         // RETRY: survive stale LOCK file after fast Docker restart.
         // Previous process may not have released the lock yet.
         let db = {
             let mut last_err = String::new();
             let mut opened = None;
             for attempt in 1u32..=10 {
-                match DB::open_cf_descriptors(&opts, path, build_column_families()) {
+                match DB::open_cf_descriptors(&opts, path, open_descriptors()) {
                     Ok(db) => { opened = Some(db); break; }
                     Err(e) => {
                         last_err = format!("{}", e);
@@ -5919,7 +5943,87 @@ impl Storage {
             None => Ok(None),
         }
     }
-    
+
+    /// Persist the per-epoch reward merkle root + scalar params (merkle-claim model).
+    /// Stored on every node from the applied emission TX; claim TXs verify proofs against it.
+    /// Tuple = (root_hex, per_node_nano, eligible_count, total_nano).
+    pub fn save_epoch_reward_root(&self, epoch: u64, root_hex: &str, per_node: u64, eligible_count: u32, total: u64) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let key = format!("epoch_root_{}", epoch);
+        let data = bincode::serialize(&(root_hex.to_string(), per_node, eligible_count, total))
+            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+        self.persistent.db.put_cf(&cf, key.as_bytes(), &data)?;
+        Ok(())
+    }
+
+    /// Load per-epoch reward root params: (root_hex, per_node_nano, eligible_count, total_nano).
+    pub fn load_epoch_reward_root(&self, epoch: u64) -> IntegrationResult<Option<(String, u64, u32, u64)>> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let key = format!("epoch_root_{}", epoch);
+        match self.persistent.db.get_cf(&cf, key.as_bytes())? {
+            Some(data) => Ok(Some(bincode::deserialize(&data)
+                .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the per-epoch reward leaf set (sorted (wallet, amount) pairs) for proof
+    /// generation. Survives heartbeat-body pruning so claims remain provable indefinitely.
+    pub fn save_epoch_reward_wallets(&self, epoch: u64, wallets: &[(String, u64)]) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let key = format!("epoch_wallets_{}", epoch);
+        let data = bincode::serialize(wallets)
+            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+        self.persistent.db.put_cf(&cf, key.as_bytes(), &data)?;
+        Ok(())
+    }
+
+    /// Load the per-epoch reward leaf set (sorted (wallet, amount) pairs).
+    pub fn load_epoch_reward_wallets(&self, epoch: u64) -> IntegrationResult<Option<Vec<(String, u64)>>> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let key = format!("epoch_wallets_{}", epoch);
+        match self.persistent.db.get_cf(&cf, key.as_bytes())? {
+            Some(data) => Ok(Some(bincode::deserialize(&data)
+                .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Append an emission epoch to the sorted, append-only reward-epochs index (deduped).
+    /// Lets the claim RPC enumerate exactly the epochs that carry a reward root in O(epochs)
+    /// instead of scanning macroblock indices — so a wallet far behind on claims is found
+    /// without any scan cap, and a batch claim can cover ALL unclaimed epochs at once.
+    pub fn append_reward_epoch(&self, epoch: u64) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let key = b"reward_epochs_index";
+        let mut list: Vec<u64> = match self.persistent.db.get_cf(&cf, key)? {
+            Some(d) => bincode::deserialize(&d).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if let Err(pos) = list.binary_search(&epoch) {
+            list.insert(pos, epoch); // keep sorted + deduped
+            let data = bincode::serialize(&list)
+                .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+            self.persistent.db.put_cf(&cf, key, &data)?;
+        }
+        Ok(())
+    }
+
+    /// Load the sorted reward-epochs index (every emission epoch with a committed root).
+    pub fn load_reward_epochs(&self) -> IntegrationResult<Vec<u64>> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        match self.persistent.db.get_cf(&cf, b"reward_epochs_index")? {
+            Some(d) => Ok(bincode::deserialize(&d).unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Delete pending reward after claim
     pub fn delete_pending_reward(&self, node_id: &str) -> IntegrationResult<()> {
         let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
@@ -6001,23 +6105,41 @@ impl Storage {
     /// Stores BOTH forward index (node_id → data) AND reverse index (wallet → node_id)
     /// for O(1) lookups in both directions.
     pub fn save_node_registration(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64) -> IntegrationResult<()> {
+        self.save_node_registration_inner(node_id, node_type, wallet, reputation, None)
+    }
+
+    /// Block-apply registration: stamps the deterministic `reg_height` so the entry is recognised as
+    /// chain-confirmed. Only such entries enter the reward roster (RPC-cache writes have no height).
+    pub fn save_node_registration_at_height(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: u64) -> IntegrationResult<()> {
+        self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height))
+    }
+
+    fn save_node_registration_inner(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: Option<u64>) -> IntegrationResult<()> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
-        
+
         // ATOMIC: WriteBatch ensures both forward and reverse indexes are written together
         // Prevents inconsistency if crash occurs between writes
         let mut batch = rocksdb::WriteBatch::default();
-        
+
         // Forward index: node_id → data
         let key = format!("node_{}", node_id);
-        let data = json!({
+        let mut data = json!({
             "node_type": node_type,
             "wallet": wallet,
             "reputation": reputation,
             "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
         });
+        // reg_height present ⇒ chain-confirmed; preserve a prior height if an RPC-cache write would clobber it.
+        if let Some(h) = reg_height {
+            data["reg_height"] = json!(h);
+        } else if let Ok(Some(old)) = self.persistent.db.get_cf(&registry_cf, key.as_bytes()) {
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&old) {
+                if let Some(h) = parsed["reg_height"].as_u64() { data["reg_height"] = json!(h); }
+            }
+        }
         batch.put_cf(&registry_cf, key.as_bytes(), data.to_string().as_bytes());
-        
+
         // Reverse index: wallet → node_id (O(1) lookup by wallet)
         let wallet_key = format!("wallet_{}", wallet);
         let wallet_data = json!({
@@ -6025,10 +6147,56 @@ impl Storage {
             "node_type": node_type,
         });
         batch.put_cf(&registry_cf, wallet_key.as_bytes(), wallet_data.to_string().as_bytes());
-        
+
         self.persistent.db.write(batch)?;
-        
+
         Ok(())
+    }
+
+    /// Deterministic epoch roster of chain-confirmed Light nodes registered below `before_height`,
+    /// sorted by node_id. This replaces the gossip-synced RAM registry as the bit→node_id mapping
+    /// for eligibility bitmaps, so reward distribution is recomputable identically on every node.
+    pub fn light_roster_sorted(&self, before_height: u64) -> IntegrationResult<Vec<(String, String)>> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let mut out: Vec<(String, String)> = Vec::new();
+        for item in self.persistent.db.iterator_cf(&registry_cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = item?;
+            let key = match std::str::from_utf8(&k) { Ok(s) => s, Err(_) => continue };
+            let node_id = match key.strip_prefix("node_") { Some(id) => id, None => continue };
+            let parsed = match serde_json::from_slice::<serde_json::Value>(&v) { Ok(p) => p, Err(_) => continue };
+            if parsed["node_type"].as_str() != Some("light") { continue; }
+            match parsed["reg_height"].as_u64() {
+                Some(h) if h < before_height => {}
+                _ => continue,
+            }
+            let wallet = parsed["wallet"].as_str().unwrap_or("");
+            if !wallet.is_empty() { out.push((node_id.to_string(), wallet.to_string())); }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// Sorted (node_id, wallet) of all chain-registered Super/genesis nodes — the deterministic
+    /// candidate set for heartbeat-eligibility reward enumeration (popcount filter applied by caller).
+    pub fn super_registrations_sorted(&self) -> IntegrationResult<Vec<(String, String)>> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let mut out: Vec<(String, String)> = Vec::new();
+        for item in self.persistent.db.iterator_cf(&registry_cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = item?;
+            let key = match std::str::from_utf8(&k) { Ok(s) => s, Err(_) => continue };
+            let node_id = match key.strip_prefix("node_") { Some(id) => id, None => continue };
+            if !(node_id.starts_with("super_") || node_id.starts_with("genesis_node_")) { continue; }
+            let parsed = match serde_json::from_slice::<serde_json::Value>(&v) { Ok(p) => p, Err(_) => continue };
+            // Only chain-confirmed registrations (reg_height stamped at block-apply / genesis boot) —
+            // excludes non-deterministic RPC/discovery cache writes so the set is identical per node.
+            if parsed["reg_height"].as_u64().is_none() { continue; }
+            let wallet = parsed["wallet"].as_str().unwrap_or("");
+            if !wallet.is_empty() { out.push((node_id.to_string(), wallet.to_string())); }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
     }
     
     /// O(1) lookup: get node by wallet address using reverse index
@@ -8737,39 +8905,47 @@ impl Storage {
             return Err(IntegrationError::Other("No snapshots available from network".to_string()));
         }
 
-        // ── Phase 2: filter to peers that actually advertised best_height ──
+        // ── Phase 2: pick the HIGHEST height advertised by a quorum (>=2) of peers so the
+        // download has redundant sources for parallel fan-out + retry. The single max is
+        // often one peer mid-boundary → serial download. Fall back to max if none shared.
+        let target_height = {
+            let mut counts: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+            for (_, h) in &peer_heights { *counts.entry(*h).or_insert(0) += 1; }
+            let quorum = 2usize.min(peer_heights.len());
+            counts.iter().rev().find(|(_, c)| **c >= quorum).map(|(h, _)| *h).unwrap_or(best_height)
+        };
         let peer_addrs: Vec<String> = peer_heights
             .iter()
-            .filter(|(_, h)| *h == best_height)
+            .filter(|(_, h)| *h == target_height)
             .map(|(addr, _)| addr.clone())
             .collect();
 
         if peer_addrs.is_empty() {
-            // Defensive: best_height computed from peer_heights — at least one
-            // entry must match. Return Err rather than indexing into an empty
-            // vec on the legacy fallback path below.
             return Err(IntegrationError::Other(format!(
-                "snapshot_peer_filter_empty best_height={} candidates={}",
-                best_height, peer_heights.len(),
+                "snapshot_peer_filter_empty target_height={} candidates={}",
+                target_height, peer_heights.len(),
             )));
         }
 
         println!(
             "[INFO][SYNC] snapshot_download h={} capable_peers={}/{} discovery=two_phase",
-            best_height, peer_addrs.len(), peer_heights.len(),
+            target_height, peer_addrs.len(), peer_heights.len(),
         );
 
-        // Try chunked parallel download first (v5.0), fallback to single-peer
-        match self.download_snapshot_chunked(p2p, &peer_addrs, best_height).await {
+        // Chunked parallel download first, fallback to single-peer. verify_snapshot_consensus_binding
+        // re-checks the applied state against the 2f+1-bound macroblock root and, on ANY failure
+        // (root unfetchable / no binding / mismatch), wipes the applied state so the orphaned
+        // snapshot can never pollute the fallback block-sync.
+        match self.download_snapshot_chunked(p2p, &peer_addrs, target_height).await {
             Ok(()) => {
-                self.verify_snapshot_consensus_binding(p2p, best_height).await?;
-                Ok(best_height)
+                self.verify_snapshot_consensus_binding(p2p, target_height).await?;
+                Ok(target_height)
             }
             Err(e) => {
                 println!("[WARN][SYNC] chunked_download_failed err={} fallback=legacy", e);
-                self.download_snapshot_legacy(p2p, &peer_addrs[0], best_height).await?;
-                self.verify_snapshot_consensus_binding(p2p, best_height).await?;
-                Ok(best_height)
+                self.download_snapshot_legacy(p2p, &peer_addrs[0], target_height).await?;
+                self.verify_snapshot_consensus_binding(p2p, target_height).await?;
+                Ok(target_height)
             }
         }
     }
@@ -8841,6 +9017,7 @@ impl Storage {
                         mb_idx, MB_FETCH_MAX_ATTEMPTS,
                     );
                 }
+                let _ = self.discard_snapshot_state(snapshot_height);
                 return Err(IntegrationError::Other(format!(
                     "snapshot_binding_unavailable mb={} reason=mb_fetch_exhausted attempts={}",
                     mb_idx, MB_FETCH_MAX_ATTEMPTS
@@ -8857,6 +9034,7 @@ impl Storage {
                         mb_idx, e,
                     );
                 }
+                let _ = self.discard_snapshot_state(snapshot_height);
                 return Err(IntegrationError::Other(format!(
                     "snapshot_binding_unavailable mb={} reason=mb_decode_failed err={}",
                     mb_idx, e
@@ -8880,6 +9058,7 @@ impl Storage {
                         mb_idx, snapshot_height,
                     );
                 }
+                let _ = self.discard_snapshot_state(snapshot_height);
                 return Err(IntegrationError::Other(format!(
                     "snapshot_binding_missing mb={} reason=mb_has_no_snapshot_root",
                     mb_idx
@@ -8895,15 +9074,9 @@ impl Storage {
             .map_err(|e| IntegrationError::Other(format!("canonical_root_compute_err h={} err={:?}", snapshot_height, e)))?;
 
         if computed != expected_root {
-            // Rollback: erase the bad snapshot key. Note: applied accounts
-            // remain in RocksDB; caller must trigger block-by-block re-sync
-            // to overwrite from canonical chain.
-            if let Some(snapshots_cf) = self.persistent.db.cf_handle("snapshots") {
-                for prefix in &["full_snap_", "state_snap_"] {
-                    let key = format!("{}{}", prefix, snapshot_height);
-                    let _ = self.persistent.db.delete_cf(&snapshots_cf, key.as_bytes());
-                }
-            }
+            // Real rollback: a peer served state that doesn't match the 2f+1-bound root.
+            // Wipe it entirely (not just the key) so it can't pollute the fallback block-sync.
+            self.discard_snapshot_state(snapshot_height)?;
             return Err(IntegrationError::Other(format!(
                 "snapshot_root_mismatch h={} mb={} expected={} computed={}",
                 snapshot_height, mb_idx,
@@ -8920,7 +9093,36 @@ impl Storage {
         }
         Ok(())
     }
-    
+
+    /// Wipe every key of a CF (cold-start rollback helper).
+    fn clear_cf(&self, cf_name: &str) -> IntegrationResult<()> {
+        if let Some(cf) = self.persistent.db.cf_handle(cf_name) {
+            let mut batch = WriteBatch::default();
+            for item in self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+                let (k, _) = item?;
+                batch.delete_cf(&cf, k);
+            }
+            self.persistent.db.write(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Roll back a rejected snapshot: wipe all state it wrote + reset height to 0 so the
+    /// orphaned state can never pollute the fallback block-sync. Node re-bootstraps clean.
+    fn discard_snapshot_state(&self, height: u64) -> IntegrationResult<()> {
+        for cf in &["accounts", "pending_rewards", "node_registry", "contract_storage"] {
+            self.clear_cf(cf)?;
+        }
+        self.set_chain_height(0)?;
+        if let Some(snapshots_cf) = self.persistent.db.cf_handle("snapshots") {
+            for prefix in &["full_snap_", "state_snap_"] {
+                let _ = self.persistent.db.delete_cf(&snapshots_cf, format!("{}{}", prefix, height).as_bytes());
+            }
+        }
+        println!("[WARN][SYNC] snapshot_state_discarded h={} action=clean_rollback", height);
+        Ok(())
+    }
+
     /// Query peer for available snapshots
     async fn query_peer_snapshot(&self, peer_addr: &str) -> IntegrationResult<Option<(u64, String)>> {
         // Query peer's /api/v1/snapshot endpoint

@@ -419,6 +419,11 @@ impl StateMerkleTree {
         hasher.update(&account.heartbeat_slots.to_le_bytes());
         hasher.update(&account.heartbeat_final_epoch.to_le_bytes());
         hasher.update(&[account.heartbeat_final_count]);
+        // last_claimed_epoch: reward-claim watermark — ALWAYS in leaf hash (fixed schema,
+        // same rule as pending_rewards/HB). Anti-replay for merkle claims must be
+        // consensus-bound, else nodes diverge on which epochs an account already claimed.
+        hasher.update(b"LCE:");
+        hasher.update(&account.last_claimed_epoch.to_le_bytes());
         // EXCLUDED from hash (non-deterministic or metadata-only):
         //   - reputation: f64 is non-deterministic across platforms
         //   - is_node, node_type, created_at, updated_at: metadata only
@@ -638,6 +643,9 @@ pub struct ChainState {
     pub height: u64,
     /// Total supply in nanoQNC (smallest units: 1 QNC = 10^9 nanoQNC)
     pub total_supply: u64,
+    /// Highest emission macroblock already minted into total_supply.
+    /// Monotonic watermark — makes emission idempotent across re-apply/sync.
+    pub last_minted_emission_mb: u64,
 
     /// Current epoch
     pub epoch: u64,
@@ -650,6 +658,7 @@ impl Default for ChainState {
         Self {
             height: 0,
             total_supply: 0, // FAIR LAUNCH: starts at 0, increases only through Pool 1 Base Emission
+            last_minted_emission_mb: 0,
 
             epoch: 0,
             last_finalized: 0,
@@ -1306,6 +1315,7 @@ impl StateManager {
             heartbeat_slots: 0,
             heartbeat_final_epoch: 0,
             heartbeat_final_count: 0,
+            last_claimed_epoch: 0,
         };
         
         StateMerkleTree::verify_proof(
@@ -1930,7 +1940,33 @@ impl StateManager {
 
         Ok(())
     }
-    
+
+    /// v3 merkle-claim credit: credit a proof-verified reward into the wallet's balance and
+    /// advance the per-account claim watermark. Anti-replay: returns false (no-op) if the
+    /// account already claimed this epoch or a later one. The merkle proof itself is verified
+    /// by the caller (node.rs apply, which holds the epoch root); this enforces the watermark
+    /// and applies the balance credit + Merkle update atomically under the state lock.
+    pub fn claim_reward(&self, wallet: &str, epoch: u64, amount: u64) -> bool {
+        let mut account = self.accounts.entry(wallet.to_string())
+            .or_insert_with(|| Account::new(wallet.to_string()));
+        if epoch <= account.last_claimed_epoch {
+            return false;
+        }
+        account.balance = account.balance.saturating_add(amount);
+        account.last_claimed_epoch = epoch;
+        {
+            let mut tree = self.merkle_tree.write();
+            tree.insert_lazy(wallet, &account);
+        }
+        true
+    }
+
+    /// Highest reward epoch this account has already claimed (0 if never claimed).
+    /// The RPC uses it to find the next unclaimed epoch to build a merkle claim for.
+    pub fn get_last_claimed_epoch(&self, wallet: &str) -> u64 {
+        self.accounts.get(wallet).map(|a| a.last_claimed_epoch).unwrap_or(0)
+    }
+
     /// v2.96: Get pending rewards for an account
     pub fn get_pending_rewards(&self, wallet: &str) -> u64 {
         self.accounts.get(wallet)
@@ -2028,20 +2064,30 @@ impl StateManager {
     /// Emit rewards with MAX_SUPPLY control
     /// amount: emission amount in nanoQNC (smallest units)
     /// Returns: actual emitted amount in nanoQNC (may be less if MAX_SUPPLY reached)
-    pub fn emit_rewards(&self, amount: u64) -> StateResult<u64> {
+    /// Idempotent: mints only when `emission_mb` exceeds the watermark, so re-apply,
+    /// bulk-sync, or any redundant call path can never double- or under-count supply.
+    pub fn emit_rewards(&self, amount: u64, emission_mb: u64) -> StateResult<u64> {
         let mut chain_state = self.chain_state.write();
-        
+
+        // Watermark: each emission macroblock mints exactly once, deterministically.
+        if emission_mb > 0 && emission_mb <= chain_state.last_minted_emission_mb {
+            return Ok(0);
+        }
+
         // Check if we would exceed MAX_SUPPLY (all in nanoQNC)
         let remaining_supply = MAX_QNC_SUPPLY_NANO.saturating_sub(chain_state.total_supply);
         let actual_emission = amount.min(remaining_supply);
-        
+
         if actual_emission == 0 {
             println!("⚠️ MAX_SUPPLY reached: {} QNC. No more emissions possible!", MAX_QNC_SUPPLY);
             return Ok(0);
         }
-        
+
         // Update total supply (in nanoQNC)
         chain_state.total_supply += actual_emission;
+        if emission_mb > 0 {
+            chain_state.last_minted_emission_mb = emission_mb;
+        }
         
         if actual_emission < amount {
             println!("⚠️ Emission limited: requested {} QNC, emitted {} QNC (remaining: {} QNC)",
@@ -2073,6 +2119,7 @@ impl StateManager {
             let mut chain_state = self.chain_state.write();
             chain_state.height = 0;
             chain_state.total_supply = 0; // NO PREMINE - starts at 0!
+            chain_state.last_minted_emission_mb = 0; // reset watermark with supply
             chain_state.epoch = 0;
             chain_state.last_finalized = 0;
         }
@@ -2203,6 +2250,27 @@ mod cache_tests {
         let mut a = Account::default();
         a.balance = balance;
         a
+    }
+
+    /// B cutover anti-replay: claim_reward credits once per epoch and is monotonic.
+    /// last_claimed_epoch is consensus-bound (SMT leaf) so this property holds network-wide.
+    #[test]
+    fn claim_reward_is_replay_and_monotonic_safe() {
+        let sm = StateManager::new();
+        // First claim for epoch 5 credits and sets the watermark.
+        assert!(sm.claim_reward("w", 5, 100), "first claim must credit");
+        assert_eq!(sm.accounts.get("w").unwrap().balance, 100);
+        assert_eq!(sm.accounts.get("w").unwrap().last_claimed_epoch, 5);
+        // Replaying the SAME epoch must be a no-op (no double credit).
+        assert!(!sm.claim_reward("w", 5, 100), "replaying the same epoch must not credit");
+        assert_eq!(sm.accounts.get("w").unwrap().balance, 100);
+        // An OLDER epoch must be rejected (watermark is monotonic).
+        assert!(!sm.claim_reward("w", 4, 100), "older epoch must not credit");
+        assert_eq!(sm.accounts.get("w").unwrap().balance, 100);
+        // A NEWER epoch credits and advances the watermark.
+        assert!(sm.claim_reward("w", 6, 50), "newer epoch must credit");
+        assert_eq!(sm.accounts.get("w").unwrap().balance, 150);
+        assert_eq!(sm.accounts.get("w").unwrap().last_claimed_epoch, 6);
     }
 
     #[test]

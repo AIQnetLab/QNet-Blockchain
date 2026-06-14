@@ -2483,16 +2483,11 @@ impl BlockPipeline {
                     metrics.apply_failed.fetch_add(1, Ordering::Relaxed);
                     crate::unified_p2p::clear_block_pending_sync(height);
 
-                    // v14.8: Per-peer local quarantine — repeated state_root
-                    // mismatches from the same peer signal either (a) the
-                    // peer is on a different fork, or (b) the peer is
-                    // actively hostile. Either way, stop wasting apply
-                    // cycles on them for a cooldown window. This is a
-                    // LOCAL defense; on-chain slashing still happens via
-                    // the macroblock analyze_chain_for_slashing path.
-                    if let Some(ref p2p) = ctx.unified_p2p {
-                        p2p.record_apply_strike(&block.from_peer, "state_root_mismatch");
-                    }
+                    // Do NOT strike the peer here: the block already passed signature/hash
+                    // validation before apply, so a state_root_mismatch is a LOCAL-state defect
+                    // (e.g. a contaminated/orphaned base), not the peer's fault. Striking honest
+                    // peers poisoned the pool and blocked cold-start recovery. Genuine forks are
+                    // resolved by fork-choice; malice by on-chain analyze_chain_for_slashing.
                     metrics.mark_apply_idle();
                     continue;
                 }
@@ -2675,7 +2670,7 @@ impl BlockPipeline {
                             }
                         }
                         for (node_id, type_str, wallet) in &apply_result.deferred_registrations {
-                            let _ = ctx.storage.save_node_registration(node_id, type_str, wallet, 1.0);
+                            let _ = ctx.storage.save_node_registration_at_height(node_id, type_str, wallet, 1.0, height);
                         }
                         for mb_idx in &apply_result.deferred_emission_mbs {
                             let mut reward_mgr = ctx.reward_manager.write().await;

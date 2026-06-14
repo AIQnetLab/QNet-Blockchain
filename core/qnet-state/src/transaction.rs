@@ -2444,9 +2444,19 @@ impl Transaction {
                 // v2.96: CLAIM TX - validate and process reward claim
                 // This happens when user calls /api/v1/claim_rewards
                 if let Some(to) = &self.to {
+                    // v3 merkle-claim: the proofs were verified and balances credited in node.rs
+                    // apply Phase 2b (which has storage→epoch root). Skip the legacy pending_rewards
+                    // debit so a merkle claim is not double-applied here.
+                    if let Some(ref d) = self.data {
+                        if let Ok(p) = serde_json::from_str::<serde_json::Value>(d) {
+                            if p.get("claims").is_some() {
+                                return Ok(());
+                            }
+                        }
+                    }
                     let recipient = accounts.entry(to.clone())
                         .or_insert_with(|| Account::new(to.clone()));
-                    
+
                     // v2.96: SECURITY - Check if recipient has sufficient pending rewards
                     if self.amount > recipient.pending_rewards {
                         return Err(StateError::InvalidTransaction(
