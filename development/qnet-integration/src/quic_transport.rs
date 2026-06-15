@@ -256,6 +256,11 @@ static HANDSHAKE_FAIL_TRACKER: once_cell::sync::Lazy<
     DashMap<std::net::IpAddr, HandshakeFailState>
 > = once_cell::sync::Lazy::new(DashMap::new);
 
+/// Total ip_identity_gate rejects since boot. Security signal: a registered
+/// identity claimed from a non-registered IP (key compromise or misconfig).
+static IP_GATE_REJECTS: AtomicU64 = AtomicU64::new(0);
+pub fn ip_gate_reject_count() -> u64 { IP_GATE_REJECTS.load(Ordering::Relaxed) }
+
 #[inline]
 fn unix_secs_now() -> u64 {
     std::time::SystemTime::now()
@@ -1338,10 +1343,13 @@ impl QuicTransport {
             // pinned IP and registered super-node identity from a different
             // IP than its on-chain endpoint are conclusively rejected.
             if !ip_identity_gate(&peer_handshake.node_id, peer_addr.ip()) {
-                if crate::node::is_warn() {
+                // Impostor flood from rotating IPs is high-rate → count always, log
+                // sampled (1/256). The metric carries the security signal.
+                let n = IP_GATE_REJECTS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 256 == 1 && crate::node::is_warn() {
                     println!(
-                        "[WARN][HANDSHAKE] ip_identity_gate_reject side=server node={} src_ip={} action=close",
-                        peer_handshake.node_id, peer_addr.ip()
+                        "[WARN][HANDSHAKE] ip_identity_gate_reject node={} src_ip={} total={} action=close",
+                        peer_handshake.node_id, peer_addr.ip(), n
                     );
                 }
                 return Err("ip_identity_gate_reject".to_string());

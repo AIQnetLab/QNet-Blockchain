@@ -223,6 +223,10 @@ pub struct Checkpoint {
     /// eligible producers + committee). In the QC-signed hash ⇒ 2f+1 certify the
     /// validator set, so syncing (non-committee) nodes trust it without re-deriving.
     pub epoch_commitment: Hash,
+    /// Per-epoch reward merkle root for the emission-boundary window ([0;32] otherwise);
+    /// QC-signed ⇒ 2f+1 certify it ⇒ nodes adopt this root for claims, never a single
+    /// producer's unverified value (no Byzantine/lag reward divergence).
+    pub reward_root: Hash,
     /// Proposer's wall-clock for this window (the head microblock's timestamp).
     /// In the QC-signed hash ⇒ agreed by the committee ⇒ every node seals an
     /// identical MacroBlock from the checkpoint (no producer dependency, no fork).
@@ -246,6 +250,7 @@ impl Checkpoint {
         h.update(self.state_root);
         h.update(self.beacon);
         h.update(self.epoch_commitment);
+        h.update(self.reward_root);
         h.update(self.timestamp.to_le_bytes());
         h.update(self.proposer.as_bytes());
         h.finalize().into()
@@ -275,7 +280,7 @@ pub fn sig_merkle_root(sigs: &[Vec<u8>]) -> Hash {
 impl QuorumCertificate {
     /// Structural + cryptographic validity. `verify_sig(voter, msg, sig)` is
     /// injected so this crate stays crypto-agnostic. `committee` = sorted epoch set.
-    pub fn verify<F: Fn(&str, &[u8], &[u8]) -> bool>(
+    pub fn verify<F: Fn(&str, &[u8], &[u8]) -> bool + Sync>(
         &self,
         committee: &[NodeId],
         verify_sig: F,
@@ -289,9 +294,13 @@ impl QuorumCertificate {
             if !committee.iter().any(|c| c == s) { return Err("qc_non_member"); }
         }
         if sig_merkle_root(&self.sigs) != self.sig_merkle_root { return Err("qc_merkle_mismatch"); }
-        for (voter, sig) in self.signers.iter().zip(self.sigs.iter()) {
-            if !verify_sig(voter, &self.checkpoint_hash, sig) { return Err("qc_bad_sig"); }
-        }
+        // Verify signatures in parallel: a committee is ≤1000 post-quantum sigs and ML-DSA has no
+        // BLS-style aggregation, so par_iter spreads the per-sig Dilithium open across cores.
+        // all() ≡ the serial AND (short-circuits on the first invalid); order is irrelevant.
+        use rayon::prelude::*;
+        let all_ok = self.signers.par_iter().zip(self.sigs.par_iter())
+            .all(|(voter, sig)| verify_sig(voter, &self.checkpoint_hash, sig));
+        if !all_ok { return Err("qc_bad_sig"); }
         Ok(())
     }
 }
@@ -411,13 +420,21 @@ mod tests {
         let mut c = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 90,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3),
-            beacon: h(4), epoch_commitment: h(0), timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let x = c.hash();
         c.proposer_sig = vec![9, 9, 9];   // sig change must NOT change hash
         assert_eq!(c.hash(), x);
         c.state_root = h(7);              // field change MUST change hash
         assert_ne!(c.hash(), x);
+        // reward_root MUST be bound into the hash: the QC signs cp.hash(), so a checkpoint
+        // differing only in reward_root must produce a different hash (else 2f+1 could not
+        // certify the reward distribution and a proposer-chosen root would ride uncertified).
+        let mut a = c.clone();
+        a.reward_root = h(0);
+        let mut b = a.clone();
+        b.reward_root = h(5);
+        assert_ne!(a.hash(), b.hash());
     }
 
     #[test]
@@ -585,7 +602,7 @@ mod tests {
         let child = Checkpoint {
             index: 5, parent_qc: Some(parent_qc), window_head_height: 450,
             window_mb_hashes: vec![h(1)], state_root: h(2), beacon: h(3),
-            epoch_commitment: h(0), timestamp: 0, proposer: "n0".into(), proposer_sig: vec![],
+            epoch_commitment: h(0), reward_root: h(0), timestamp: 0, proposer: "n0".into(), proposer_sig: vec![],
         };
         let child_qc = mk_qc(&committee, child.hash(), 5, 3);
         assert_eq!(commits_parent(&child, &child_qc), Some(4)); // C4 final
@@ -601,7 +618,7 @@ mod tests {
         let c = Checkpoint {
             index: 7, parent_qc: Some(qc.clone()), window_head_height: 630,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3), beacon: h(4),
-            epoch_commitment: h(0), timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            epoch_commitment: h(0), reward_root: h(0), timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let bytes = bincode::serialize(&c).unwrap();
         let back: Checkpoint = bincode::deserialize(&bytes).unwrap();

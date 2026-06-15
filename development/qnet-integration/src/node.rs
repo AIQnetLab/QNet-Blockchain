@@ -727,7 +727,7 @@ pub fn observe_clock_drift(block_ts: u64, local_now: u64) {
     let ema_secs = next / 1000;
     if ema_secs > 10 && is_warn() {
         println!(
-            "[WARN][DRIFT] ema={}s peak={}s obs_now={} block_ts={} — check host NTP",
+            "[WARN][PACING] ema={}s peak={}s wall={} block_ts={} — chain off real-time schedule",
             ema_secs, abs_drift_secs, local_now, block_ts
         );
     }
@@ -878,6 +878,11 @@ pub fn try_get_storage() -> Option<&'static Arc<Storage>> {
 // This prevents network from getting stuck when all nodes stop producing
 pub static LAST_BLOCK_PRODUCED_TIME: AtomicU64 = AtomicU64::new(0);
 pub static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
+// Stall/timeout liveness timer: wall instant when our applied height last advanced.
+// Decoupled from slot-anchored block_ts so local_delay = real no-progress, not the
+// chain's lifetime production deficit.
+pub static STALL_PROGRESS_HEIGHT: AtomicU64 = AtomicU64::new(0);
+pub static STALL_PROGRESS_WALL: AtomicU64 = AtomicU64::new(0);
 
 // Producer liveness watchdog. Forensic: node 002 went silent 85.6 s at
 // h=154345 (a sync RocksDB call under compaction blocked the async runtime;
@@ -1164,6 +1169,34 @@ pub const MEDIAN_PAST_WINDOW: usize = 11;
 /// v27 HOLE2: forward cap — block_ts may lead the raw network median by
 /// ≤ this (breaks the old unbounded max(effective_now) drift ratchet).
 pub const BLOCK_TS_MAX_FWD_SKEW_SECS: u64 = 12;
+
+/// Microblock slot duration. block_ts is a pure function of height anchored to
+/// genesis (block_ts = genesis_ts + height*SLOT) ⇒ clock-independent: no drift,
+/// no median ring, no NTP dependency, deterministic on every node.
+pub const MICROBLOCK_INTERVAL_SECS: u64 = 1;
+
+/// Genesis anchor for slot timestamps: block 0's signed timestamp, cached on
+/// first load (immutable for the chain's life).
+static GENESIS_TS_CACHE: AtomicU64 = AtomicU64::new(0);
+
+/// Block 0's timestamp (the genesis wall-clock instant). 0 only before genesis exists.
+pub fn genesis_timestamp(storage: &crate::storage::Storage) -> u64 {
+    // GLOBAL_GENESIS_TIMESTAMP is the canonical anchor (set at block-0 apply) — prefer it
+    // so generation and validation derive block_ts from one identical source.
+    let g = crate::GLOBAL_GENESIS_TIMESTAMP.load(Ordering::Relaxed);
+    if g != 0 { return g; }
+    let c = GENESIS_TS_CACHE.load(Ordering::Relaxed);
+    if c != 0 { return c; }
+    let ts = storage.load_microblock_auto_format(0).ok().flatten().map(|b| b.timestamp).unwrap_or(0);
+    if ts != 0 { GENESIS_TS_CACHE.store(ts, Ordering::Relaxed); }
+    ts
+}
+
+/// Deterministic clock-independent timestamp for a microblock at `height`.
+#[inline]
+pub fn expected_block_timestamp(genesis_ts: u64, height: u64) -> u64 {
+    genesis_ts.saturating_add(height.saturating_mul(MICROBLOCK_INTERVAL_SECS))
+}
 
 /// Get current failover metrics (for Prometheus/Grafana integration)
 pub fn get_failover_metrics() -> (u64, u64, u64, u64) {
@@ -2949,12 +2982,18 @@ impl BlockchainNode {
         // SUPER/genesis: enumerate chain-registered nodes (deterministic CF) and keep those whose
         // on-chain heartbeat tally for the epoch is ≥ 9 — identical to the producer's emitter scan
         // but O(registered) and recomputable on every node without the macroblock snapshot.
-        if let Ok(supers) = storage.super_registrations_sorted() {
-            for (node_id, wallet) in supers {
-                if wallet.is_empty() { continue; }
-                let cnt = storage.load_account(&node_id).ok().flatten()
-                    .map(|a| Self::account_heartbeat_count(&a, epoch_num)).unwrap_or(0);
-                if cnt >= 9 { eligible.push((node_id, wallet)); }
+        // Read the apply-time eligibility index (popcount≥9) for the epoch — O(eligible) prefix scan
+        // — and map each to its reward wallet via the registration set, instead of an O(registered)
+        // per-account scan. Identical set (index = same on-chain tally ∩ registrations); the split
+        // sorts internally so push order is irrelevant. Deterministic + recomputable on every node.
+        if let (Ok(eligible_ids), Ok(supers)) =
+            (storage.load_super_eligible(epoch_num), storage.super_registrations_sorted())
+        {
+            let reg: std::collections::HashMap<String, String> = supers.into_iter().collect();
+            for node_id in eligible_ids {
+                if let Some(wallet) = reg.get(&node_id) {
+                    if !wallet.is_empty() { eligible.push((node_id, wallet.clone())); }
+                }
             }
         }
 
@@ -2965,23 +3004,9 @@ impl BlockchainNode {
             let total = roster.len();
             if total > 0 {
                 let per = (total + 4) / 5;
-                let mut bitmaps: std::collections::BTreeMap<usize, Vec<u8>> = std::collections::BTreeMap::new();
-                for h in ws..(ws + 14400) {
-                    if let Ok(Some(block)) = storage.load_microblock_auto_format(h) {
-                        for tx in &block.transactions {
-                            if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, bitmap_compressed, .. } = &tx.tx_type {
-                                if let Some(gidx) = genesis_id.strip_prefix("genesis_node_")
-                                    .and_then(|n| n.parse::<usize>().ok())
-                                    .filter(|n| (1..=5).contains(n)).map(|n| n - 1)
-                                {
-                                    if let Ok(bm) = zstd::decode_all(&bitmap_compressed[..]) {
-                                        bitmaps.insert(gidx, bm); // dedup per genesis, last wins
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                // Read the ≤5 genesis bitmaps from the apply-time index (epoch = window) — O(5)
+                // keys, not an O(14400)-block scan; identical content (last-in-window write wins).
+                let bitmaps = storage.load_light_bitmaps(epoch_num).unwrap_or_default();
                 for (gidx, bm) in bitmaps {
                     let my_start = (gidx * per).min(total);
                     let my_end = (my_start + per).min(total);
@@ -2996,6 +3021,45 @@ impl BlockchainNode {
         }
 
         Self::distribute_equal_rewards(&eligible, total_emission, macroblock_index)
+    }
+
+    /// Emission for a checkpoint window: finds the window's v3 system_emission TX and recomputes
+    /// the distribution from its (epoch,total). Returns (root_hex, leaf_set, total, epoch) where
+    /// `epoch` is the CANONICAL /90 macroblock-index reward epoch carried in the TX (the SAME key
+    /// the producer/apply/claim use — NOT window_head_height/CHECKPOINT_INTERVAL). None off an
+    /// emission boundary. Self-aligning with apply (same epoch/total inputs) ⇒ proposer/committee/
+    /// apply roots are byte-identical. Cheap range gate avoids I/O on the 159/160 non-emission windows.
+    fn compute_window_reward(storage: &crate::storage::Storage, start_height: u64, end_height: u64)
+        -> Option<(String, Vec<(String, u64)>, u64, u64)> {
+        const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+        if !(start_height..=end_height).any(|h| h > 0 && h % EMISSION_BLOCK_INTERVAL == 0) {
+            return None;
+        }
+        for h in start_height..=end_height {
+            let mb = match storage.load_microblock_auto_format(h) { Ok(Some(m)) => m, _ => continue };
+            for tx in &mb.transactions {
+                if tx.from != "system_emission" { continue; }
+                let data = match tx.data.as_ref() { Some(d) => d, None => continue };
+                let parsed: serde_json::Value = match serde_json::from_str(data) { Ok(p) => p, _ => continue };
+                if parsed.get("v").and_then(|v| v.as_u64()) != Some(3) { continue; }
+                let epoch = parsed.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                let total = parsed.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                let (wallets, root_hex) = Self::compute_epoch_reward_distribution(storage, epoch, total);
+                if root_hex.is_empty() { return None; }
+                return Some((root_hex, wallets, total, epoch));
+            }
+        }
+        None
+    }
+
+    /// Checkpoint.reward_root for a window (2f+1-certified, [0;32] off an emission boundary).
+    fn compute_window_reward_root(storage: &crate::storage::Storage, start_height: u64, end_height: u64) -> [u8; 32] {
+        if let Some((root_hex, _, _, _)) = Self::compute_window_reward(storage, start_height, end_height) {
+            if let Ok(b) = hex::decode(&root_hex) {
+                if b.len() == 32 { let mut o = [0u8; 32]; o.copy_from_slice(&b); return o; }
+            }
+        }
+        [0u8; 32]
     }
 
     // Single apply_block_to_state() for ALL paths (startup replay, recovery
@@ -3091,13 +3155,14 @@ impl BlockchainNode {
                         let total = parsed.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                         let c_per = parsed.get("per_node").and_then(|v| v.as_u64()).unwrap_or(0);
                         let c_cnt = parsed.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        // Persist the locally recomputed distribution (deterministic from on-chain
+                        // data; in-order apply ⇒ correct). The single-producer TX `committed_root` is
+                        // NOT trusted — the committee-certified Checkpoint.reward_root is the consensus
+                        // reference and OVERWRITES this on macroblock finalization for a node whose
+                        // recompute differs (catch-up / incomplete data). Mint (emit_rewards above) is
+                        // separate + watermark-idempotent.
                         let (wallet_vec, recomputed_root) = Self::compute_epoch_reward_distribution(storage, epoch, total);
                         if !recomputed_root.is_empty() {
-                            if recomputed_root != committed_root {
-                                eprintln!("[ERR][REWARDS] root_mismatch epoch={} committed={}.. recomputed={}..",
-                                          epoch, &committed_root[..16.min(committed_root.len())],
-                                          &recomputed_root[..16.min(recomputed_root.len())]);
-                            }
                             let rtotal: u64 = wallet_vec.iter().map(|(_, a)| *a).sum();
                             let rcount = wallet_vec.len() as u32;
                             let rper = if rcount > 0 { rtotal / rcount as u64 } else { 0 };
@@ -3109,8 +3174,8 @@ impl BlockchainNode {
                                          epoch, &recomputed_root[..16.min(recomputed_root.len())], rcount, rtotal / 1_000_000_000);
                             }
                         } else if !committed_root.is_empty() {
-                            // Rewarding epoch's heartbeat bodies pruned (bulk replay) — trust the
-                            // consensus-applied committed root so claims still verify on this node.
+                            // Bodies pruned ⇒ cannot recompute. Provisionally adopt the TX root so the
+                            // epoch is indexed; finalization overwrites it with the certified root.
                             let _ = storage.save_epoch_reward_root(epoch, &committed_root, c_per, c_cnt, total);
                             let _ = storage.append_reward_epoch(epoch);
                         }
@@ -3127,6 +3192,19 @@ impl BlockchainNode {
                 snap.record_pre_images(&affected, &state_guard.accounts);
             }
 
+            // Index Light eligibility bitmaps at apply (epoch = height-window) so the emission
+            // recompute reads ≤5 keys, not a 14400-block scan. Last-in-window write wins (= scan).
+            if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, bitmap_compressed, .. } = &tx.tx_type {
+                if let Some(gidx) = genesis_id.strip_prefix("genesis_node_")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|n| (1..=5).contains(n)).map(|n| n - 1)
+                {
+                    if let Ok(bm) = zstd::decode_all(&bitmap_compressed[..]) {
+                        let _ = storage.save_light_bitmap(h / 14400, gidx, &bm);
+                    }
+                }
+            }
+
             if let Err(e) = state_guard.apply_transaction_lazy(tx) {
                 if is_debug() {
                     println!("[DBG][STATE] tx_skip h={} err={}", h, e);
@@ -3137,6 +3215,18 @@ impl BlockchainNode {
                     snap.record_pre_images(&[tx.from.clone()], &state_guard.accounts);
                 }
                 let _ = state_guard.apply_gas_refund(tx, h);
+
+                // Super-eligibility index: when a sender's heartbeat popcount for its epoch reaches
+                // the reward threshold (9), record it so the emission recompute reads O(eligible),
+                // not an O(registered) per-super account scan. Idempotent; tally is monotonic in-epoch.
+                if let qnet_state::TransactionType::Heartbeat { anchor_height, .. } = &tx.tx_type {
+                    let epoch = anchor_height / 14400;
+                    if let Some(acct) = state_guard.accounts.get(&tx.from) {
+                        if acct.heartbeat_epoch == epoch && acct.heartbeat_slots.count_ones() >= 9 {
+                            let _ = storage.save_super_eligible(epoch, &tx.from);
+                        }
+                    }
+                }
 
                 // Collect deferred side effects from successful TXs
                 match &tx.tx_type {
@@ -11466,91 +11556,22 @@ impl BlockchainNode {
                 if !is_syncing {
                     // LIVE MODE: Full validation — future check + monotonicity
 
-                    // FUTURE CHECK: block cannot claim to be from the future
-                    let max_allowed_timestamp = local_time + TIMESTAMP_FUTURE_TOLERANCE;
-                    if microblock.timestamp > max_allowed_timestamp {
-                        let future_delta = microblock.timestamp - local_time;
-                        METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("[ERR][TIMESTAMP] future_block h={} ts={} local={} delta=+{}s (max={}s)",
-                                 microblock.height, microblock.timestamp, local_time,
-                                 future_delta, TIMESTAMP_FUTURE_TOLERANCE);
-                        return Err(format!(
-                            "TIMESTAMP_INVALID:future:h={}:block_ts={}:local_ts={}:delta=+{}s",
-                            microblock.height, microblock.timestamp, local_time, future_delta
-                        ));
-                    }
-
-                    // MONOTONICITY: block.timestamp > parent.timestamp
-                    let parent_ts = match storage.load_microblock_auto_format(microblock.height - 1) {
-                        Ok(Some(parent)) => parent.timestamp,
-                        _ => 0,
-                    };
-
-                    if parent_ts > 0 && microblock.timestamp <= parent_ts {
-                        METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("[ERR][TIMESTAMP] non_monotonic h={} ts={} parent_ts={}",
-                                 microblock.height, microblock.timestamp, parent_ts);
-                        return Err(format!(
-                            "TIMESTAMP_INVALID:non_monotonic:h={}:block_ts={}:parent_ts={}",
-                            microblock.height, microblock.timestamp, parent_ts
-                        ));
-                    }
-
-                    // v14.8.11: MEDIAN-PAST rule.
-                    // `block.timestamp` must be strictly greater than the median
-                    // of the last MEDIAN_PAST_WINDOW (11) on-chain timestamps.
-                    // Blocks the near-past-rewrite attempts that slip through the
-                    // monotonicity check (which only compares against parent).
-                    // Silently skipped during the first ~11 blocks after boot when
-                    // the ring is undersized — parent monotonicity already
-                    // guarantees ordering there.
-                    //
-                    // v15.15: height-ordered (BIP-113 canonical). Median is taken
-                    // over the parent-chain segment [microblock.height - WINDOW,
-                    // microblock.height), not over insertion-order — fixes false
-                    // positives during catch-up sync.
-                    if let Some(median_past) = median_past_timestamp_at_height(microblock.height) {
-                        // Floor (BIP-113 anti-backdate): strictly above median-past.
-                        if microblock.timestamp <= median_past {
+                    // Slot exact-match: block_ts = genesis_ts + height*SLOT; any other
+                    // value is invalid. Clock-independent — no median/parent/NTP.
+                    let g = genesis_timestamp(storage);
+                    if g != 0 {
+                        let expected_ts = expected_block_timestamp(g, microblock.height);
+                        if microblock.timestamp != expected_ts {
                             METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                            eprintln!(
-                                "[ERR][TIMESTAMP] median_past_violation h={} ts={} median_past={}",
-                                microblock.height, microblock.timestamp, median_past
-                            );
+                            eprintln!("[ERR][TIMESTAMP] slot_mismatch h={} ts={} expected={}",
+                                     microblock.height, microblock.timestamp, expected_ts);
                             return Err(format!(
-                                "TIMESTAMP_INVALID:median_past:h={}:block_ts={}:median_past={}",
-                                microblock.height, microblock.timestamp, median_past
-                            ));
-                        }
-                        // Forward cap (anti-grief): must not lead median-past projected
-                        // past the window by more than the bounded skew. SAME median_past
-                        // + formula + parent floor as block generation, so every node
-                        // computes an identical cap → clock-independent (no NTP-skew fork),
-                        // replacing reliance on the per-node 2h wall-clock window.
-                        let fwd_cap = median_past
-                            .saturating_add(MEDIAN_PAST_WINDOW as u64)
-                            .saturating_add(BLOCK_TS_MAX_FWD_SKEW_SECS)
-                            .max(parent_ts.saturating_add(1));
-                        if microblock.timestamp > fwd_cap {
-                            METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                            eprintln!(
-                                "[ERR][TIMESTAMP] fwd_cap_violation h={} ts={} cap={}",
-                                microblock.height, microblock.timestamp, fwd_cap
-                            );
-                            return Err(format!(
-                                "TIMESTAMP_INVALID:fwd_cap:h={}:block_ts={}:cap={}",
-                                microblock.height, microblock.timestamp, fwd_cap
+                                "TIMESTAMP_INVALID:slot:h={}:block_ts={}:expected={}",
+                                microblock.height, microblock.timestamp, expected_ts
                             ));
                         }
                     }
 
-                    if is_debug() {
-                        let delta = local_time.saturating_sub(microblock.timestamp);
-                        if delta > 60 {
-                            println!("[DBG][TIMESTAMP] old_ts h={} ts={} local={} delta=-{}s (warn_only)",
-                                     microblock.height, microblock.timestamp, local_time, delta);
-                        }
-                    }
                 } else {
                     // SYNC MODE: Skip wall-clock checks.
                     // VTS monotonicity (checked below) + chain hash continuity (checked above)
@@ -15478,31 +15499,22 @@ impl BlockchainNode {
                         //   - All nodes use certificate's timeout_round for producer selection
                         // ═══════════════════════════════════════════════════════════════════════
                         
-                        let last_block_time = LAST_BLOCK_PRODUCED_TIME.load(std::sync::atomic::Ordering::Relaxed);
-                        let last_block_time = if last_block_time == 0 { genesis_ts } else { last_block_time };
-
-                        // v14.8.10: stall-detection timing uses `effective_now()`
-                        // instead of raw wall clock. If our wall clock has drifted
-                        // BEHIND the network (VM paused, NTP server dead, skewed
-                        // hypervisor), raw `current_time < last_block_time` would
-                        // force `local_delay` to 0 via `saturating_sub`, silently
-                        // stopping us from ever voting for timeout. That breaks
-                        // the 2f+1 timeout-certificate formation that drives failover.
-                        //
-                        // `effective_now()` = max(wall_clock, median_of_recent_block_ts
-                        // projected forward ~1s/block). In steady-state healthy nodes
-                        // it returns wall_clock (no-op). On a clock-behind drift it
-                        // returns the network-time estimate built from 2f+1-agreed
-                        // signed on-chain timestamps — unforgeable by ≤ f Byzantine.
-                        //
-                        // CRITICAL SAFETY: only used here (and grace math derived
-                        // from local_delay). NEVER used in signed block timestamps,
-                        // vote timestamps, or attestations — those require raw
-                        // wall clock for cross-network TIMESTAMP_FUTURE_TOLERANCE.
-                        let effective_now_ts = effective_now();
-
-                        // Local delay detection (triggers voting, NOT producer selection)
-                        let local_delay = effective_now_ts.saturating_sub(last_block_time + 1);
+                        // Local liveness timer: wall-seconds since OUR applied height last
+                        // advanced. Slot-anchored block_ts must NOT drive this — it carries the
+                        // chain's lifetime production deficit and would trip the pacemaker against
+                        // a healthy leader. Per-node by design; rotation safety is the same-round
+                        // 2f+1 certificate, not this gate. Clock-behind self-heals: the marker is
+                        // re-stamped from this node's wall every time height advances.
+                        let wall_now = get_timestamp_safe();
+                        let cur_applied_h = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
+                        let prev_progress_h = STALL_PROGRESS_HEIGHT.swap(cur_applied_h, Ordering::Relaxed);
+                        let anchor = STALL_PROGRESS_WALL.load(Ordering::Relaxed);
+                        // Re-stamp on height advance, init, or a BACKWARD wall step (SystemTime is
+                        // non-monotonic) — the rewind case keeps a clock step-back from suppressing votes.
+                        if cur_applied_h != prev_progress_h || anchor == 0 || wall_now < anchor {
+                            STALL_PROGRESS_WALL.store(wall_now, Ordering::Relaxed);
+                        }
+                        let local_delay = wall_now.saturating_sub(STALL_PROGRESS_WALL.load(Ordering::Relaxed));
 
                         // v11.0: STALE LBPT PROTECTION after restart
                         // After restart, LBPT comes from replay (last saved block timestamp).
@@ -18507,65 +18519,17 @@ impl BlockchainNode {
                     // validation with zero NTP dependency. block.timestamp is
                     // Dilithium3-signed, so the producer can't show different
                     // peers different values. Four O(1) reads.
+                    // Slot-anchored deterministic timestamp: block_ts = genesis_ts +
+                    // height*SLOT. Identical on every node ⇒ clock-independent, no drift,
+                    // no median ring, no NTP. Dilithium3-signed.
                     let deterministic_timestamp = {
-                        let wall_ts = get_timestamp_safe();
-                        let parent_ts = if next_block_height > 0 {
-                            match storage.load_microblock_auto_format(next_block_height - 1) {
-                                Ok(Some(parent)) => parent.timestamp,
-                                _ => 0,
-                            }
-                        } else {
-                            0
-                        };
-
-                        // v27 HOLE2: NTP wall clock clamped to
-                        // [lower, raw_median+MAX_FWD_SKEW] — replaces the old
-                        // one-way max(effective_now()) drift ratchet (11s→33s).
-                        // lower = max(parent+1, median_past+1): strict
-                        // monotonic + anti-rewrite; clock-behind node pulled
-                        // up here (bounded, no projection).
-                        // Height-ordered median-past (BIP-113): the deterministic basis
-                        // for BOTH the floor and the forward cap, identical to the
-                        // validator's `median_past_timestamp_at_height`, so every node
-                        // derives the same [lower, upper] band → block_ts validity is
-                        // clock-independent (no NTP-skew fork).
-                        let median_past = median_past_timestamp_at_height(next_block_height);
-
-                        let lower = parent_ts
-                            .saturating_add(1)
-                            .max(
-                                median_past
-                                    .map(|m| m.saturating_add(1))
-                                    .unwrap_or(0),
-                            );
-
-                        // Forward cap = median-past projected past the window (≈ real
-                        // "now") + bounded skew, floored at `lower`. Lets block_ts TRACK
-                        // the producer's NTP wall clock. The old cap used the RAW trailing
-                        // median (≈ parent−15), so raw_median+SKEW sat BELOW `lower` →
-                        // upper collapsed to `lower` → block_ts pinned to parent+1
-                        // (+1/block) and decoupled from real time → unbounded observational
-                        // clock-drift. This is a clamp (min), NOT the old one-way max()
-                        // ratchet, so it tracks wall-clock both directions.
-                        let candidate = match median_past {
-                            Some(mp) => {
-                                let upper = mp
-                                    .saturating_add(MEDIAN_PAST_WINDOW as u64)
-                                    .saturating_add(BLOCK_TS_MAX_FWD_SKEW_SECS)
-                                    .max(lower);
-                                wall_ts.clamp(lower, upper)
-                            }
-                            // Genesis-adjacent prefix (< WINDOW heights): floor only.
-                            None => wall_ts.max(lower),
-                        };
-
+                        let g = genesis_timestamp(&storage);
+                        let ts = expected_block_timestamp(g, next_block_height);
                         if is_debug() && next_block_height > 0 {
-                            println!(
-                                "[DBG][TIMESTAMP] gen h={} wall={} lower={} median_past={:?} → chosen={}",
-                                next_block_height, wall_ts, lower, median_past, candidate
-                            );
+                            println!("[DBG][TIMESTAMP] gen h={} genesis_ts={} → ts={}",
+                                     next_block_height, g, ts);
                         }
-                        candidate
+                        ts
                     };
 
 
@@ -22843,7 +22807,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // Empty eligible/banned: an intra-window checkpoint publishes NO epoch
                                         // transition (only the macroblock-boundary checkpoint does).
                                         crate::consensus_v2_node::signal_window_end(
-                                            cp_index, b, h_vec, state_root, beacon, committee, Vec::new(), Vec::new(),
+                                            cp_index, b, h_vec, state_root, beacon, committee, Vec::new(), Vec::new(), [0u8; 32],
                                         );
                                         if crate::node::is_info() {
                                             println!("[INFO][BFT2] intra_checkpoint_signalled cp_index={} head={} k={}", cp_index, b, k);
@@ -23041,8 +23005,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 // If current_active < macroblock_index, the old task is stale - override it
                                 // This handles: panic in old task, timeout, stuck consensus
                                 if current_active > 0 && current_active < macroblock_index {
-                                    println!("[WARN][CONS] stale_lock_override old_mb={} new_mb={}", 
-                                             current_active, macroblock_index);
+                                    // Contiguous advance = normal epoch progress (DBG); a gap means a
+                                    // skipped/stuck window (WARN).
+                                    if macroblock_index == current_active + 1 {
+                                        if is_debug() { println!("[DBG][CONS] lock_advance old_mb={} new_mb={}", current_active, macroblock_index); }
+                                    } else if is_warn() {
+                                        println!("[WARN][CONS] stale_lock_override old_mb={} new_mb={} gap={}",
+                                                 current_active, macroblock_index, macroblock_index - current_active);
+                                    }
                                     // Force override - old consensus is stale
                                     ACTIVE_CONSENSUS_MB.store(macroblock_index, std::sync::atomic::Ordering::SeqCst);
                                 } else if current_active == 0 {
@@ -23258,9 +23228,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // index = checkpoint index = head/CHECKPOINT_INTERVAL (at K=90 this == mb_idx).
                                         // The macroblock-boundary checkpoint carries the FULL window + epoch data;
                                         // intra-window checkpoints (signalled separately) carry K-block sub-windows.
+                                        // Self-aligning emission reward root for this window (committee-verified
+                                        // via Checkpoint.reward_root; [0;32] off an emission boundary).
+                                        let reward_root = Self::compute_window_reward_root(&storage_cons, start_height, end_height);
                                         crate::consensus_v2_node::signal_window_end(
                                             end_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL,
-                                            end_height, mb_hashes, state_root, beacon, committee, eligible_bytes, banned_for_epoch,
+                                            end_height, mb_hashes, state_root, beacon, committee, eligible_bytes, banned_for_epoch, reward_root,
                                         );
                                         return;
                                     }
@@ -24282,20 +24255,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Err(format!("Too many transactions: {} (max: 200000)", microblock.transactions.len()));
         }
         
-        // Validate timestamp is not too far in future
-        // NOTE: Producer uses slot-based waiting (v2.42), so this should rarely trigger
-        // Threshold = ~1 macroblock (60 sec) - same as MAX_SLOT_WAIT_SECS in timing
-        // Normal: 0-2 sec, sync: 0-10 sec, >60 sec = attack/bug
-        const MAX_FUTURE_TIMESTAMP_SECS: u64 = 60;
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        if microblock.timestamp > current_time + MAX_FUTURE_TIMESTAMP_SECS {
-            return Err(format!(
-                "Timestamp too far in future: block #{} ts={} now={} drift={}s max={}s",
-                microblock.height, microblock.timestamp, current_time, 
-                microblock.timestamp - current_time, MAX_FUTURE_TIMESTAMP_SECS
-            ));
-        }
-        
+        // block_ts is slot-deterministic (genesis_ts + height*SLOT), enforced on
+        // ingest; no producer-side future check needed.
         Ok(())
     }
     
@@ -26559,6 +26520,24 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if qnet_consensus::checkpoint_bft::epoch_commitment(elig, &cmt, &banned) != cp.epoch_commitment {
             return Err(format!("v2_epoch_uncertified mb={}", index));
         }
+        // Observability backstop: independently re-derive the certified reward_root and ALARM on a
+        // mismatch — but never reject. The committee already fail-stops on a divergent reward_root at
+        // vote time (consensus_v2_node content_ok), so under the BFT bound (<1/3 Byzantine) the
+        // 2f+1-certified root is honest by construction; a local disagreement therefore means OUR
+        // tally is incomplete (fast-sync/snapshot), NOT that the root is forged. Rejecting a
+        // QC-certified macroblock on a local recompute would stall exactly those catch-up nodes
+        // (the recurring cold-start class) — so we trust the QC and let the adoption backstop
+        // reconcile our local root. (Defending a >1/3-Byzantine committee is moot: that breaks
+        // state_root too.) Only checked when the window is locally re-derivable (Some).
+        if cp.reward_root != [0u8; 32] {
+            let ci = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+            let start = cp.window_head_height.saturating_sub(ci).saturating_add(1);
+            if let Some((root_hex, _, _, _)) = Self::compute_window_reward(storage, start, cp.window_head_height) {
+                if root_hex != hex::encode(cp.reward_root) && is_warn() {
+                    println!("[WARN][REWARDS] reward_root_local_mismatch mb={} (trusting 2f+1 QC; adoption reconciles)", index);
+                }
+            }
+        }
         let verified = qc.verify(&committee, |voter, body, sig| match std::str::from_utf8(sig) {
             Ok(s) => p2p.verify_consensus_signature(voter, &format!("QNET_BFT2_VOTE:{}", hex::encode(body)), s),
             Err(_) => false,
@@ -26626,6 +26605,52 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 .map_err(QNetError::ValidationError)?;
             if is_info() {
                 println!("[INFO][MB] v2_qc_ok mb={}", index);
+            }
+            // C2: adopt the committee-certified reward root. If this node's locally-applied root for
+            // an emission epoch differs (applied with incomplete data during catch-up), overwrite it
+            // with the QC-certified Checkpoint.reward_root + re-derive the leaf set from the synced
+            // window — never a single producer's TX root. Off state_root ⇒ cannot fork.
+            if let Ok((cp, _qc)) = bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate)>(cp_qc) {
+                if cp.reward_root != [0u8; 32] {
+                    let ci = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+                    let mbi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                    let start = cp.window_head_height.saturating_sub(ci).saturating_add(1);
+                    let certified = hex::encode(cp.reward_root);
+                    // The reward root is committee-verified (content_ok) + QC-signed ⇒ the 2f+1
+                    // authority. Adopt it on EVERY finalizing node so claims verify everywhere. A
+                    // local recompute that disagrees means OUR data is incomplete (catch-up), not
+                    // that the root is wrong — never leave a node serving a divergent local root.
+                    match Self::compute_window_reward(&self.storage, start, cp.window_head_height) {
+                        // Re-derived root matches: store root + full leaf set (proofs available here).
+                        Some((root_hex, wallets, _, epoch)) if root_hex == certified => {
+                            let cur = self.storage.load_epoch_reward_root(epoch).ok().flatten().map(|(r, ..)| r);
+                            if cur.as_deref() != Some(certified.as_str()) {
+                                let rtotal: u64 = wallets.iter().map(|(_, a)| *a).sum();
+                                let rcount = wallets.len() as u32;
+                                let rper = if rcount > 0 { rtotal / rcount as u64 } else { 0 };
+                                let _ = self.storage.save_epoch_reward_root(epoch, &certified, rper, rcount, rtotal);
+                                let _ = self.storage.save_epoch_reward_wallets(epoch, &wallets);
+                                let _ = self.storage.append_reward_epoch(epoch);
+                                if is_info() { println!("[INFO][REWARDS] reward_root_adopted epoch={} root={}..", epoch, &certified[..16.min(certified.len())]); }
+                            }
+                        }
+                        // Leaf set not re-derivable here (incomplete/pruned/divergent): still adopt the
+                        // certified ROOT under the canonical epoch so claims verify; wallets are served
+                        // by synced peers. Epoch = boundary-height index − macroblocks/epoch (no scan).
+                        other => {
+                            let epoch = match other {
+                                Some((_, _, _, e)) => e,
+                                None => (cp.window_head_height / mbi).saturating_sub(14400 / mbi),
+                            };
+                            let cur = self.storage.load_epoch_reward_root(epoch).ok().flatten().map(|(r, ..)| r);
+                            if cur.as_deref() != Some(certified.as_str()) {
+                                let _ = self.storage.save_epoch_reward_root(epoch, &certified, 0, 0, 0);
+                                let _ = self.storage.append_reward_epoch(epoch);
+                                if is_warn() { println!("[WARN][REWARDS] reward_root_adopted_rootonly epoch={} (leaf set deferred; local recompute absent/divergent)", epoch); }
+                            }
+                        }
+                    }
+                }
             }
             // Catch-up safety-net (§4.5): hand the now-VERIFIED (checkpoint, QC) to the BFT2 driver so
             // a node whose consensus round fell behind the live quorum fast-forwards from committed
@@ -29616,6 +29641,7 @@ mod tests {
             state_root: [0u8; 32],
             beacon: [0u8; 32],
             epoch_commitment: [0u8; 32],
+            reward_root: [0u8; 32],
             timestamp: 1000,
             proposer: node.to_string(),
             proposer_sig: Vec::new(),

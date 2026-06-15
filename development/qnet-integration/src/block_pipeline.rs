@@ -1795,44 +1795,19 @@ impl BlockPipeline {
                 }
             }
 
-            // 2. Timestamp validation (only in live mode — sync mode skips)
-            // v14.8.11: three-check canonical timestamp model.
-            //   (a) FUTURE:       block.ts ≤ wall_clock + TIMESTAMP_FUTURE_TOLERANCE
-            //   (b) MEDIAN-PAST:  block.ts > median(last 11 on-chain timestamps)
-            //   (c) MONOTONICITY: block.ts > parent.ts (enforced in step 1 hash chain)
-            // Same ruleset is applied in `validate_received_microblock`; this
-            // pipeline check catches bad blocks before they reach the apply
-            // stage.
+            // 2. Slot-anchored timestamp validation (LIVE only; SYNC skips — block_ts is
+            // already bound by the block hash + producer Dilithium sig + hash-chain).
+            // block_ts must equal genesis_ts + height*SLOT exactly: deterministic,
+            // clock-independent, non-gameable. The single source of truth on the live path.
             let snap = coordinator.snapshot();
             if !snap.is_syncing() && mb.height > 0 {
-                let now = crate::node::get_timestamp_safe();
-                // (a) FUTURE check against raw wall clock: canonical design, so
-                // an attacker cannot game the window via network-adjusted time.
-                // TIMESTAMP_FUTURE_TOLERANCE = 7200 s (2 h) comfortably covers
-                // realistic hypervisor / NTP events without letting Byzantine
-                // inflation go unchecked.
-                if mb.timestamp > now + crate::node::TIMESTAMP_FUTURE_TOLERANCE {
-                    if is_warn() {
-                        println!("[WARN][PIPELINE] future_block h={} delta=+{}s from={}",
-                                 mb.height, mb.timestamp.saturating_sub(now), decoded.from_peer);
-                    }
-                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                // (b) MEDIAN-PAST rule. Silently skipped during the first ~11
-                // blocks after boot when the ring is undersized.
-                // v15.15: height-ordered (BIP-113 canonical) — median is taken
-                // over the parent-chain segment [mb.height - WINDOW, mb.height),
-                // not over the last WINDOW insertions. Fixes false positives
-                // during catch-up sync where blocks legitimately re-arrive in
-                // non-height order.
-                if let Some(median_past) = crate::node::median_past_timestamp_at_height(mb.height) {
-                    if mb.timestamp <= median_past {
+                let g = crate::GLOBAL_GENESIS_TIMESTAMP.load(Ordering::Relaxed);
+                if g != 0 {
+                    let expected = crate::node::expected_block_timestamp(g, mb.height);
+                    if mb.timestamp != expected {
                         if is_warn() {
-                            println!(
-                                "[WARN][PIPELINE] median_past_violation h={} ts={} median_past={} from={}",
-                                mb.height, mb.timestamp, median_past, decoded.from_peer
-                            );
+                            println!("[WARN][PIPELINE] slot_mismatch h={} ts={} expected={} from={}",
+                                     mb.height, mb.timestamp, expected, decoded.from_peer);
                         }
                         metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                         continue;

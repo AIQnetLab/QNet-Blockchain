@@ -6510,7 +6510,8 @@ impl SimplifiedP2P {
                         .map(|p| p.id.clone())
                         .collect();
                     if crate::node::is_info() {
-                        println!("[WARN][SHRED] Rate limit: {}/{} sends to {} unique peers",
+                        // Semaphore-paced fan-out (anti-UDP-burst); nothing is dropped.
+                        println!("[INFO][SHRED] paced_send concurrency={} total={} peers={}",
                             max_concurrent, total_sends, unique_peers.len());
                     }
                 }
@@ -16353,10 +16354,17 @@ impl SimplifiedP2P {
         let signature = signature.to_string();
         let node_id = node_id.to_string();
         
+        // Reused process-wide runtime: a QC verifies up to committee-size signatures; the old path
+        // built + tore down a tokio runtime PER signature (67–1000× per QC). One shared runtime
+        // (init once) drops that to the Dilithium open alone; the thread still isolates block_on
+        // from an enclosing async caller (RPC). Init failure ⇒ thread panic ⇒ join Err ⇒ reject.
+        use std::sync::OnceLock;
+        static SIG_VERIFY_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
         let handle = std::thread::spawn(move || {
-            // Create runtime in isolated thread - safe from nested runtime issues
-            match tokio::runtime::Runtime::new() {
-                Ok(rt) => {
+            let rt = SIG_VERIFY_RT.get_or_init(|| {
+                tokio::runtime::Runtime::new().expect("sig_verify runtime init")
+            });
+            {
                     rt.block_on(async move {
                         // PRODUCTION v2.50: Lock-free quantum crypto in isolated thread
                         use crate::node::try_get_quantum_crypto;
@@ -16410,13 +16418,6 @@ impl SimplifiedP2P {
                             }
                         }
                     })
-                }
-                Err(e) => {
-                    if crate::node::is_info() {
-                        println!("[ERR][P2P] Cannot create runtime for verification: {}", e);
-                    }
-                    false
-                }
             }
         });
         

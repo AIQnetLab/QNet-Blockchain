@@ -2,7 +2,7 @@
 // Integrates with existing ParallelValidator and ShardCoordinator
 
 use std::sync::Arc;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, BTreeSet, VecDeque};
 use tokio::sync::RwLock;
 use qnet_state::{Transaction, TransactionType};
 use qnet_sharding::{ShardCoordinator, ParallelValidator, CrossShardTx};
@@ -235,7 +235,9 @@ impl ParallelExecutor {
     fn compute_execution_order(&self, contexts: &[ExecutionContext]) -> Result<Vec<Vec<usize>>, String> {
         let mut execution_order = Vec::new();
         let mut processed = HashSet::new();
-        let mut remaining: HashSet<usize> = (0..contexts.len()).collect();
+        // BTreeSet (not HashSet): ascending, deterministic batch selection — two producers with
+        // the same mempool emit byte-identical block ordering (no SipHash-seeded reorder).
+        let mut remaining: BTreeSet<usize> = (0..contexts.len()).collect();
         
         while !remaining.is_empty() {
             let mut batch = Vec::new();

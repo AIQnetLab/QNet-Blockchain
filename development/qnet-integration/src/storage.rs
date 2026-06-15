@@ -5993,6 +5993,61 @@ impl Storage {
         }
     }
 
+    /// Persist a Light-node eligibility bitmap (decompressed) keyed by (epoch, genesis_idx),
+    /// indexed at apply so the emission recompute reads ≤5 keys, not a 14400-block scan. Last
+    /// write per (epoch,gidx) wins — identical to the in-order block scan it replaces, and it
+    /// survives heartbeat-body pruning so an old epoch stays recomputable.
+    pub fn save_light_bitmap(&self, epoch: u64, gidx: usize, bitmap: &[u8]) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let key = format!("light_bm_{}_{}", epoch, gidx);
+        self.persistent.db.put_cf(&cf, key.as_bytes(), bitmap)?;
+        Ok(())
+    }
+
+    /// Load the ≤5 Light eligibility bitmaps for an epoch as (genesis_idx → bitmap), sorted.
+    pub fn load_light_bitmaps(&self, epoch: u64) -> IntegrationResult<std::collections::BTreeMap<usize, Vec<u8>>> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let mut out = std::collections::BTreeMap::new();
+        for gidx in 0..5usize {
+            let key = format!("light_bm_{}_{}", epoch, gidx);
+            if let Some(d) = self.persistent.db.get_cf(&cf, key.as_bytes())? {
+                out.insert(gidx, d);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Mark a super-node eligible for an epoch's reward (heartbeat popcount ≥ threshold), keyed
+    /// per (epoch, node_id). Written at apply when the tally crosses the threshold — idempotent
+    /// O(1) put. Lets the emission recompute read O(eligible) instead of an O(registered) per-super
+    /// account scan. Deterministic: apply order = block order, and the tally is monotonic in-epoch.
+    pub fn save_super_eligible(&self, epoch: u64, node_id: &str) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let key = format!("super_elig_{}_{}", epoch, node_id);
+        self.persistent.db.put_cf(&cf, key.as_bytes(), &[])?;
+        Ok(())
+    }
+
+    /// Load the eligible super node_ids for an epoch (prefix scan, ascending by node_id).
+    pub fn load_super_eligible(&self, epoch: u64) -> IntegrationResult<Vec<String>> {
+        use rocksdb::{IteratorMode, Direction};
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let prefix = format!("super_elig_{}_", epoch);
+        let pb = prefix.as_bytes();
+        let mut out: Vec<String> = Vec::new();
+        let iter = self.persistent.db.iterator_cf(&cf, IteratorMode::From(pb, Direction::Forward));
+        for item in iter {
+            let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(pb) { break; }
+            if let Ok(s) = std::str::from_utf8(&k[pb.len()..]) { out.push(s.to_string()); }
+        }
+        Ok(out)
+    }
+
     /// Append an emission epoch to the sorted, append-only reward-epochs index (deduped).
     /// Lets the claim RPC enumerate exactly the epochs that carry a reward root in O(epochs)
     /// instead of scanning macroblock indices — so a wallet far behind on claims is found
@@ -9789,6 +9844,41 @@ mod v32_9_pattern_c_tests {
         put_account(&storage, b"acct_bbb", b"v2");
         let after = storage.compute_canonical_state_root(90).expect("after");
         assert_ne!(before, after, "root must change when accounts CF mutates");
+    }
+
+    #[test]
+    fn super_eligible_index_roundtrips_sorted_and_epoch_isolated() {
+        // R6: the apply-time super-eligibility index must return EXACTLY the saved node set, sorted
+        // by node_id, deduped, epoch-isolated — so every node recomputes the same reward_root
+        // (the split sorts internally ⇒ set-equality is what matters).
+        let (storage, _dir) = open_test_storage();
+        storage.save_super_eligible(160, "node_c").unwrap();
+        storage.save_super_eligible(160, "node_a").unwrap();
+        storage.save_super_eligible(160, "node_b").unwrap();
+        storage.save_super_eligible(160, "node_a").unwrap(); // idempotent re-save
+        storage.save_super_eligible(1600, "node_z").unwrap(); // different epoch (prefix-collision check)
+        let e160 = storage.load_super_eligible(160).unwrap();
+        assert_eq!(e160.iter().map(|s| s.as_str()).collect::<Vec<_>>(), vec!["node_a", "node_b", "node_c"]);
+        assert!(!e160.iter().any(|n| n == "node_z"), "epoch 160 must not pick up epoch 1600 keys");
+        assert_eq!(storage.load_super_eligible(1600).unwrap().iter().map(|s| s.as_str()).collect::<Vec<_>>(), vec!["node_z"]);
+        assert!(storage.load_super_eligible(161).unwrap().is_empty(), "empty epoch → empty set");
+    }
+
+    #[test]
+    fn light_bitmap_index_last_write_wins_and_epoch_isolated() {
+        // R1: the light-bitmap index must return the LATEST bitmap per (epoch, genesis) — matching
+        // the old scan's "last-in-window write wins" — and stay epoch-isolated.
+        let (storage, _dir) = open_test_storage();
+        storage.save_light_bitmap(160, 0, &[0b0001]).unwrap();
+        storage.save_light_bitmap(160, 0, &[0b1010]).unwrap(); // later write wins
+        storage.save_light_bitmap(160, 2, &[0b1111]).unwrap();
+        storage.save_light_bitmap(1600, 0, &[0b0101]).unwrap();
+        let bm = storage.load_light_bitmaps(160).unwrap();
+        assert_eq!(bm.get(&0).map(|v| v.as_slice()), Some(&[0b1010u8][..]), "last write wins");
+        assert_eq!(bm.get(&2).map(|v| v.as_slice()), Some(&[0b1111u8][..]));
+        assert!(!bm.contains_key(&1), "only written genesis indices present");
+        assert!(storage.load_light_bitmaps(1600).unwrap().contains_key(&0));
+        assert!(storage.load_light_bitmaps(161).unwrap().is_empty());
     }
 
     #[test]

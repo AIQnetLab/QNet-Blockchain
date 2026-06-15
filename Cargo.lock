@@ -3373,6 +3373,7 @@ dependencies = [
  "pyo3-asyncio",
  "qnet-state",
  "rand 0.8.5",
+ "rayon",
  "serde",
  "serde_bytes",
  "serde_json",

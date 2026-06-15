@@ -59,6 +59,9 @@ dashmap = "5.5"
 parking_lot = "0.12"
 crossbeam = "0.8"
 
+# Parallel signature verification (QC committee can be ≤1000 post-quantum sigs)
+rayon = "1.10"
+
 # Metrics
 prometheus = "0.13"
 lazy_static = "1.4"

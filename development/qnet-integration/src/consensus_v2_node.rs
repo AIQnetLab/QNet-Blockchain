@@ -283,6 +283,7 @@ pub enum V2Event {
         committee: Vec<String>,        // epoch committee (N-2 VRF sample) for this window
         eligible_producers: Vec<u8>,   // bincode Vec<EligibleProducer> for the macroblock body
         banned: Vec<String>,           // QC-bound cumulative ban set (binds stored banned_validators)
+        reward_root: Hash,             // per-epoch reward merkle root ([0;32] off emission boundary)
     },
     // A macroblock whose checkpoint QC the apply path already verified against the correct epoch
     // committee — fed here so a driver too far behind for gossip fast-forwards from committed
@@ -302,6 +303,7 @@ struct WindowContent {
     committee: Vec<String>,
     eligible: Vec<u8>,
     banned: Vec<String>,   // QC-bound cumulative ban set (folded into epoch_commitment)
+    reward_root: Hash,     // per-epoch reward merkle root, QC-certified via Checkpoint.reward_root
 }
 
 /// Adopt the in-flight window's committee and, if we lead the current round, propose the
@@ -315,7 +317,7 @@ fn try_propose(
     match buf.get(&w) {
         Some(c) => {
             *committee = c.committee.clone(); // committee is per-window (epoch); QC/TC verify against it
-            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone())
+            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root)
         }
         None => Vec::new(),
     }
@@ -353,10 +355,10 @@ pub fn route_inbound(data: Vec<u8>) {
 /// Production loop calls this at each checkpoint-window boundary.
 pub fn signal_window_end(
     index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
-    committee: Vec<String>, eligible_producers: Vec<u8>, banned: Vec<String>,
+    committee: Vec<String>, eligible_producers: Vec<u8>, banned: Vec<String>, reward_root: Hash,
 ) {
     if let Some(tx) = V2_TX.get() {
-        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned });
+        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root });
     }
 }
 
@@ -448,7 +450,14 @@ pub async fn run(
                                         .map(|c| cp.state_root == c.state_root
                                             && cp.window_mb_hashes == c.mb_hashes
                                             && cp.beacon == c.beacon
-                                            && qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee, &c.banned) == cp.epoch_commitment)
+                                            && qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee, &c.banned) == cp.epoch_commitment
+                                            // reward_root is QC-certified (folded into Checkpoint::hash), so it
+                                            // MUST be independently reproduced before we sign — exactly like the
+                                            // other four fields. A node only re-derives a non-[0;32] root at an
+                                            // emission boundary; off-boundary both sides are [0;32] and this is a
+                                            // trivial match. Without this, a single Byzantine leader could get an
+                                            // arbitrary reward_root 2f+1-certified (unbounded reward mint).
+                                            && cp.reward_root == c.reward_root)
                                         // No locally-derived content for the proposer's claimed window ⇒
                                         // we cannot verify it, so we never sign it (fail-stop).
                                         .unwrap_or(false),
@@ -463,12 +472,13 @@ pub async fn run(
                                         match &msg {
                                             ConsensusMsg::Proposal(cp) => match window_buf.get(&(cp.window_head_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL)) {
                                                 Some(c) => println!(
-                                                    "[WARN][BFT2] proposal_content_rejected idx={} eq state_root={} mb_hashes={} beacon={} epoch_commit={}",
+                                                    "[WARN][BFT2] proposal_content_rejected idx={} eq state_root={} mb_hashes={} beacon={} epoch_commit={} reward_root={}",
                                                     msg_index(&msg),
                                                     cp.state_root == c.state_root,
                                                     cp.window_mb_hashes == c.mb_hashes,
                                                     cp.beacon == c.beacon,
                                                     qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee, &c.banned) == cp.epoch_commitment,
+                                                    cp.reward_root == c.reward_root,
                                                 ),
                                                 None => println!(
                                                     "[WARN][BFT2] proposal_content_rejected idx={} window_buf_MISS win={}",
@@ -494,7 +504,7 @@ pub async fn run(
                         }
                         Err(_) => Vec::new(),
                     },
-                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned } => {
+                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned, reward_root } => {
                         // Buffer this window's content (head microblock's real timestamp rides in
                         // the QC-agreed checkpoint). Then propose the contiguous next window if we
                         // lead, and replay buffered inbound.
@@ -502,7 +512,7 @@ pub async fn run(
                         let head_ts = storage.load_microblock_auto_format(head_height)
                             .ok().flatten().map(|m| m.timestamp).unwrap_or(0);
                         window_buf.insert(index, WindowContent {
-                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned,
+                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root,
                         });
                         if window_buf.len() > MAX_WINDOW_BUF {
                             if let Some(&lo) = window_buf.keys().min() { window_buf.remove(&lo); }

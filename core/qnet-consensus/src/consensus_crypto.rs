@@ -2081,8 +2081,9 @@ async fn verify_with_real_dilithium(
                          node_id, hex::encode(&public_key_bytes[..8]));
                 return true;
             } else {
-                eprintln!("[ERR][CONSENSUS] msg_mismatch node={} expected_len={} recovered_len={}",
-                         node_id, expected_msg.len(), recovered_message.len());
+                // Recovered != expected: stale/cross-round signature or forgery. Rejection
+                // is unconditional (security boundary); expected at low rate ⇒ WARN, not ERR.
+                eprintln!("[WARN][CONSENSUS] sig_reject node={} reason=msg_mismatch", node_id);
                 return false;
             }
         }
