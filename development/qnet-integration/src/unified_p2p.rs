@@ -19891,10 +19891,17 @@ pub fn get_privacy_id_for_addr(addr: &str) -> String {
         return format!("genesis_node_{}", genesis_id);
     }
     
-    // Check if it's a private/internal IP that shouldn't be in P2P network
-    if ip.starts_with("172.") || ip.starts_with("10.") || ip.starts_with("192.168.") {
-        // These are private IPs that shouldn't be exposed in P2P
-        // This includes Docker networks (172.17.x.x), private LANs, etc.
+    // Private/internal IPs (Docker bridges, private LANs) get a separate label. RFC1918 172 is
+    // private ONLY for second octet 16..=31 — 172.32+ (e.g. carrier-grade 172.58.x) is PUBLIC and
+    // must not be mislabeled "private_" (it surfaced as the impostor IP behind the gate-reject flood).
+    let is_private = ip.starts_with("10.")
+        || ip.starts_with("192.168.")
+        || ip.strip_prefix("172.")
+             .and_then(|rest| rest.split('.').next())
+             .and_then(|oct| oct.parse::<u8>().ok())
+             .map(|oct| (16..=31).contains(&oct))
+             .unwrap_or(false);
+    if is_private {
         let ip_hash = blake3::hash(format!("PRIVATE_{}", ip).as_bytes());
         return format!("private_{}", &ip_hash.to_hex()[..8]);
     }

@@ -4946,7 +4946,30 @@ impl BlockchainNode {
     pub fn cache_node_registrations_from_transactions(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
         Self::cache_node_registrations_from_transactions_with_dashmap(storage, transactions, &DashMap::new());
     }
-    
+
+    /// Stamp `reg_height = 0` for every genesis NodeRegistration TX in block 0.
+    /// `super_registrations_sorted` (the reward roster) only counts entries with a stamped
+    /// reg_height. Synced peers stamp all five genesis nodes via the block-apply path
+    /// (deferred_registrations → save_node_registration_at_height, height 0, reputation 1.0).
+    /// The block CREATOR, however, applies block 0 through cache_node_registrations_from_transactions
+    /// → save_node_registration (NO height), so its roster would hold only its own self-registered
+    /// genesis id (count=1) while peers compute count=5 — a persistent per-epoch reward divergence.
+    /// This backfill makes the creator/restarted node byte-identical to synced peers. Idempotent.
+    fn stamp_genesis_registration_heights(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
+        for tx in transactions {
+            if let qnet_state::TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } = &tx.tx_type {
+                let type_str = match node_type {
+                    qnet_state::NodeType::Super => "super",
+                    qnet_state::NodeType::Light => "light",
+                };
+                // height 0 + reputation 1.0 == the values synced peers write via deferred_registrations.
+                if let Err(e) = storage.save_node_registration_at_height(node_id, type_str, wallet_address, 1.0, 0) {
+                    eprintln!("[WARN][REG] genesis_reg_height_stamp_fail node={} err={}", node_id, e);
+                }
+            }
+        }
+    }
+
     /// Register all 5 Genesis nodes on-chain (called once at blockchain start)
     /// Returns Vec of registration transactions to include in genesis/first block
     /// Create Genesis node registration TXs with FIXED timestamp for determinism
@@ -7369,6 +7392,10 @@ impl BlockchainNode {
         let genesis_timestamp = match storage.load_microblock_auto_format(0) {
             Ok(Some(genesis_block)) => {
                 if is_info() { println!("[INFO][GEN] loaded_ts={}", genesis_block.timestamp); }
+                // Self-heal the reward roster on restart: stamp reg_height=0 for the genesis
+                // registrations so a former creator (which only cached them without a height)
+                // matches synced peers. Idempotent for peers that already stamped them.
+                Self::stamp_genesis_registration_heights(&storage, &genesis_block.transactions);
                 genesis_block.timestamp
             }
             Ok(None) => {
@@ -14170,7 +14197,9 @@ impl BlockchainNode {
                                                 // CRITICAL FIX v3.2: Cache NodeRegistration TXs from genesis block
                                                 // Without this, genesis creator can't find wallet addresses for rewards!
                                                 Self::cache_node_registrations_from_transactions(&storage, &genesis_microblock.transactions);
-                                                println!("[INFO][GEN] Cached {} NodeRegistration TXs from genesis block", 
+                                                // Stamp reg_height=0 so the creator's reward roster matches synced peers (count=5, not 1).
+                                                Self::stamp_genesis_registration_heights(&storage, &genesis_microblock.transactions);
+                                                println!("[INFO][GEN] Cached {} NodeRegistration TXs from genesis block",
                                                     genesis_microblock.transactions.iter()
                                                         .filter(|tx| matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. }))
                                                         .count());

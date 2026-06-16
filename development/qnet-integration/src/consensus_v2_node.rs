@@ -410,6 +410,32 @@ pub async fn run(
     if crate::node::is_info() {
         println!("[INFO][BFT2] runtime_started committee={} view_timeout_ms={}", committee.len(), timeout_ms);
     }
+    // Eager startup catch-up: if the chain already holds committed macroblocks (restart, or the chain
+    // synced before this task spawned), adopt the latest checkpoint QC from storage NOW so the driver
+    // starts at the live window instead of index=1 — closing the cold-start lag at its source rather
+    // than waiting for the watchdog below to detect it reactively. driver.sync is monotonic +
+    // content-checked, and the stored QC was verified at apply time, so a fresh first boot (no
+    // macroblock yet) is a harmless no-op. The watchdog remains as the mid-run backstop.
+    if let Ok(idx) = storage.get_latest_macroblock_index() {
+        if idx > 0 {
+            if let Ok(Some(raw)) = storage.get_macroblock_by_height(idx) {
+                if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&raw) {
+                    if let Some(cp_qc) = mb.consensus_data.checkpoint_qc.as_ref() {
+                        if let Ok((cp, qc)) = bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)>(cp_qc) {
+                            let effs = driver.sync(&cp, &qc);
+                            if !effs.is_empty() {
+                                if crate::node::is_info() {
+                                    println!("[INFO][BFT2] eager_startup_sync window={} next_window={}", idx, driver.next_window());
+                                }
+                                execute(effs, &node_id, &p2p, &storage).await;
+                            }
+                            last_index = driver.current_index();
+                        }
+                    }
+                }
+            }
+        }
+    }
     loop {
         tokio::select! {
             Some(ev) = rx.recv() => {
@@ -552,22 +578,44 @@ pub async fn run(
                     execute(effects, &node_id, &p2p, &storage).await;
                 }
                 last_index = driver.current_index();
-                // LIVENESS WATCHDOG: the applied chain tip advances via macroblock sync even when the
-                // driver is frozen — so a large, sustained gap between the chain's window and the
-                // window the driver still wants to commit means the driver fell behind the live quorum
-                // and the §4.5 sync catch-up did NOT recover it. Surface it LOUDLY (this failure was
-                // previously invisible: the container stayed "healthy"). Re-armed once recovered.
+                // LIVENESS WATCHDOG + SELF-HEAL: the applied chain tip advances via macroblock sync even
+                // when the driver is frozen — so a large, sustained gap between the chain's window and the
+                // window the driver still wants to commit means the driver fell behind the live quorum.
+                // Live §4.5 catch-up only fires on a freshly RECEIVED macroblock, so a node that caught its
+                // chain up by other means (or lagged at cold start) can stay stuck. Instead of only logging,
+                // re-feed the latest stored (already-verified) macroblock QC to the driver: driver.sync is
+                // monotonic + content-checked ⇒ a safe no-op once caught up, and it jumps the driver to the
+                // committed window deterministically. Recovery is logged once the gap closes.
                 const STUCK_WINDOWS: u64 = 3;   // beyond normal 2-chain finality lag
-                const STUCK_TICKS: u32 = 5;     // sustained (~20s at the 4s view timer) before alarming
+                const STUCK_TICKS: u32 = 5;     // sustained (~20s at the 4s view timer) before acting
                 let chain_window = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed) / 90;
                 if chain_window > driver.next_window().saturating_add(STUCK_WINDOWS) {
                     stuck_ticks = stuck_ticks.saturating_add(1);
-                    if stuck_ticks >= STUCK_TICKS && !stuck_alarmed {
-                        stuck_alarmed = true;
-                        println!("[ERROR][BFT2] consensus_driver_behind round={} next_window={} chain_window={} — driver lagging the quorum; §4.5 sync did not recover it (previously a SILENT dropout)",
-                                 driver.current_index(), driver.next_window(), chain_window);
+                    if stuck_ticks >= STUCK_TICKS {
+                        // Self-heal from local committed state: adopt the latest stored macroblock's QC.
+                        if let Ok(idx) = storage.get_latest_macroblock_index() {
+                            if let Ok(Some(raw)) = storage.get_macroblock_by_height(idx) {
+                                if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&raw) {
+                                    if let Some(cp_qc) = mb.consensus_data.checkpoint_qc.as_ref() {
+                                        if let Ok((cp, qc)) = bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, QuorumCertificate)>(cp_qc) {
+                                            let effs = driver.sync(&cp, &qc);
+                                            if !effs.is_empty() { execute(effs, &node_id, &p2p, &storage).await; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !stuck_alarmed {
+                            stuck_alarmed = true;
+                            println!("[WARN][BFT2] consensus_driver_behind round={} next_window={} chain_window={} — self-healing from latest stored macroblock QC",
+                                     driver.current_index(), driver.next_window(), chain_window);
+                        }
                     }
                 } else {
+                    if stuck_alarmed {
+                        println!("[INFO][BFT2] consensus_driver_recovered next_window={} chain_window={}",
+                                 driver.next_window(), chain_window);
+                    }
                     stuck_ticks = 0;
                     stuck_alarmed = false;
                 }

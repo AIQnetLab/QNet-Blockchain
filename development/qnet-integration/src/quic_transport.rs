@@ -1172,7 +1172,12 @@ impl QuicTransport {
                     let (remote_node_id, remote_cert_serial, remote_node_type, remote_block_height) = match handshake_result {
                         Ok(h) => h,
                         Err(e) => {
-                            if crate::node::is_warn() { println!("[WARN][QUIC] handshake_failed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e); }
+                            // ip_identity_gate_reject is already logged (1/256 sampled) and metered at the gate
+                            // itself; re-logging it through this generic catch-all floods (one impostor IP
+                            // produced thousands of identical lines). Suppress that class here — the metric carries it.
+                            if e != "ip_identity_gate_reject" && crate::node::is_warn() {
+                                println!("[WARN][QUIC] handshake_failed peer={} err={}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
+                            }
                             return;
                         }
                     };
