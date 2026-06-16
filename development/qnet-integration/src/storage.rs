@@ -6255,7 +6255,25 @@ impl Storage {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
-    
+
+    /// True iff this node's NodeRegistration is chain-confirmed (reg_height stamped at
+    /// block-apply / genesis boot) in the local node_registry. The on-chain binding is the
+    /// source of truth — a locally-persisted activation code does NOT prove the registration
+    /// TX landed. Used at boot to decide whether to (re)send the binding TX.
+    pub fn is_node_registration_onchain(&self, node_id: &str) -> bool {
+        let registry_cf = match self.persistent.db.cf_handle("node_registry") {
+            Some(cf) => cf,
+            None => return false,
+        };
+        let key = format!("node_{}", node_id);
+        match self.persistent.db.get_cf(&registry_cf, key.as_bytes()) {
+            Ok(Some(v)) => serde_json::from_slice::<serde_json::Value>(&v)
+                .map(|p| p["reg_height"].as_u64().is_some())
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
     /// O(1) lookup: get node by wallet address using reverse index
     /// Returns (node_id, node_type) if found
     pub fn get_node_by_wallet(&self, wallet_address: &str) -> IntegrationResult<Option<(String, String)>> {
@@ -8892,6 +8910,28 @@ impl Storage {
         Ok(root)
     }
 
+    /// Rebuild the canonical account-state merkle root (the consensus
+    /// finalize_merkle output) from the accounts CF. Binds a restored snapshot
+    /// to the QC-certified mb.state_root: a forged snapshot yields a different
+    /// root. Deterministic — a fresh StateMerkleTree full-recomputes (no
+    /// incremental cache), matching every node's finalize().
+    pub fn recompute_account_merkle_root(&self) -> IntegrationResult<[u8; 32]> {
+        let accounts_cf = self.persistent.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let mut updates: Vec<(String, qnet_state::Account)> = Vec::new();
+        for item in self.persistent.db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = item.map_err(|e| IntegrationError::StorageError(format!("merkle_iter_err: {}", e)))?;
+            let addr = String::from_utf8(k.to_vec())
+                .map_err(|e| IntegrationError::StorageError(format!("merkle_addr_utf8_err: {}", e)))?;
+            let account: qnet_state::Account = bincode::deserialize(&v)
+                .map_err(|e| IntegrationError::SerializationError(format!("merkle_account_decode_err: {}", e)))?;
+            updates.push((addr, account));
+        }
+        let mut tree = qnet_state::StateMerkleTree::new();
+        tree.insert_batch(&updates);
+        Ok(tree.finalize())
+    }
+
     /// Get raw snapshot data for P2P download (v2.19.12)
     /// Returns compressed binary snapshot data
     pub fn get_snapshot_data(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
@@ -9050,11 +9090,17 @@ impl Storage {
                     mb_idx, attempt, MB_FETCH_MAX_ATTEMPTS, snapshot_height,
                 );
             }
-            if let Err(e) = p2p.sync_macroblocks(mb_idx, mb_idx).await {
+            // Fetch the macroblock PREFIX up to the binding index, not just mb_idx:
+            // storing macroblock N requires its N-2 predecessor (Checkpoint-BFT anchor),
+            // so a fresh joiner must fill the chain [latest+1..=mb_idx] for mb_idx to
+            // persist and become readable. Bounded one-time cost (~tens of KB each);
+            // sync_macroblocks dedups any already present.
+            let mb_from = self.get_latest_macroblock_index().unwrap_or(0).saturating_add(1).max(1);
+            if let Err(e) = p2p.sync_macroblocks(mb_from, mb_idx).await {
                 if crate::node::is_warn() {
                     println!(
-                        "[WARN][SYNC] verifier_macroblock_fetch_retry mb={} attempt={}/{} err={}",
-                        mb_idx, attempt, MB_FETCH_MAX_ATTEMPTS, e,
+                        "[WARN][SYNC] verifier_macroblock_fetch_retry mb={} from={} attempt={}/{} err={}",
+                        mb_idx, mb_from, attempt, MB_FETCH_MAX_ATTEMPTS, e,
                     );
                 }
             }
@@ -9099,36 +9145,30 @@ impl Storage {
             }
         };
 
-        // Step 2: read the supermajority-bound snapshot_root.
-        let expected_root = match macroblock.consensus_data.snapshot_root {
-            Some(r) => r,
-            None => {
-                // No snapshot_root in the binding macroblock — cannot verify.
-                // Reject and let the caller fall through to block-by-block
-                // sync. Pre-binding (legacy) macroblocks should not appear
-                // in a freshly-deployed network; if seen during a protocol
-                // upgrade, operator must produce a fresh macroblock at the
-                // next boundary before snapshot-based sync resumes.
-                if crate::node::is_warn() {
-                    println!(
-                        "[WARN][SYNC] verifier_no_binding mb={} snapshot_h={} action=reject_snapshot",
-                        mb_idx, snapshot_height,
-                    );
-                }
-                let _ = self.discard_snapshot_state(snapshot_height);
-                return Err(IntegrationError::Other(format!(
-                    "snapshot_binding_missing mb={} reason=mb_has_no_snapshot_root",
-                    mb_idx
-                )));
+        // Step 2: the 2f+1-bound account-state root. The macroblock's top-level
+        // state_root IS checkpoint.state_root (finalize_merkle), certified by the
+        // checkpoint QC — the trustless anchor. (consensus_data.snapshot_root is unused.)
+        let expected_root = macroblock.state_root;
+        if expected_root == [0u8; 32] {
+            if crate::node::is_warn() {
+                println!(
+                    "[WARN][SYNC] verifier_no_binding mb={} snapshot_h={} action=reject_snapshot",
+                    mb_idx, snapshot_height,
+                );
             }
-        };
+            let _ = self.discard_snapshot_state(snapshot_height);
+            return Err(IntegrationError::Other(format!(
+                "snapshot_binding_missing mb={} reason=zero_state_root", mb_idx
+            )));
+        }
 
-        // v32.9 Pattern C: snapshot bytes have ALREADY been applied to the
-        // accounts CF by load_state_snapshot() upstream. We re-compute the
-        // canonical state root from RocksDB and compare to the macroblock's
-        // 2f+1-bound snapshot_root (which commits to the same canonical root).
-        let computed = self.compute_canonical_state_root(snapshot_height)
-            .map_err(|e| IntegrationError::Other(format!("canonical_root_compute_err h={} err={:?}", snapshot_height, e)))?;
+        // Pattern C: snapshot bytes were applied to the accounts CF by
+        // load_state_snapshot() upstream. Rebuild the SAME account merkle the
+        // consensus committed (finalize_merkle) from the restored accounts and
+        // compare to the QC-bound mb.state_root; a forged snapshot yields a
+        // different root.
+        let computed = self.recompute_account_merkle_root()
+            .map_err(|e| IntegrationError::Other(format!("merkle_recompute_err h={} err={:?}", snapshot_height, e)))?;
 
         if computed != expected_root {
             // Real rollback: a peer served state that doesn't match the 2f+1-bound root.

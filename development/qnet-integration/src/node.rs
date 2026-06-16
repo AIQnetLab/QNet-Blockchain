@@ -15164,31 +15164,34 @@ impl BlockchainNode {
                     let reg_our_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                     let reg_best_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
 
+                    // Sync-INDEPENDENT binding-TX rebroadcast: a node's own NodeRegistration must land
+                    // on-chain even while it is still syncing (identity binding is signature-validated,
+                    // not chain-state-validated). This does NOT make an unsynced node VRF-eligible —
+                    // that is gated separately by register_as_active_node_async below. Producer-direct
+                    // gossip + genesis fan-out (same delivery as NodeActivation); re-applying an included
+                    // registration is a nonce/dedup no-op; the attempt budget bounds it.
+                    if let Some(ref p2p) = unified_p2p {
+                        let resend = if let Ok(mut guard) = PENDING_NODE_REGISTRATION.lock() {
+                            let out = if let Some((id, bytes, attempts)) = guard.as_mut() {
+                                if *attempts > 0 { *attempts -= 1; Some((id.clone(), bytes.clone(), *attempts)) } else { None }
+                            } else { None };
+                            if matches!(guard.as_ref(), Some((_, _, 0))) { *guard = None; }
+                            out
+                        } else { None };
+                        if let Some((reg_id, reg_bytes, attempts_left)) = resend {
+                            let _ = p2p.broadcast_transaction(reg_bytes.clone());
+                            let tx_msg = crate::unified_p2p::NetworkMessage::Transaction { data: reg_bytes };
+                            for ip in &crate::unified_p2p::get_genesis_bootstrap_ips() {
+                                p2p.send_network_message(&format!("{}:8001", ip), tx_msg.clone());
+                            }
+                            if is_info() { println!("[INFO][REG] registration_rebroadcast id={} attempts_left={}", reg_id, attempts_left); }
+                        }
+                    }
+
                     if reg_synced {
                         if let Some(ref p2p) = unified_p2p {
                             if is_info() { println!("[INFO][ACTIVE] periodic_registration h={} best={}", reg_our_h, reg_best_h); }
                             p2p.register_as_active_node_async().await;
-
-                            // Bounded rebroadcast of our own NodeRegistration so a dropped join-time
-                            // broadcast still reaches a producer. Re-applying an already-included
-                            // registration is a no-op (nonce/dedup), so this is safe; the budget stops it.
-                            let resend = if let Ok(mut guard) = PENDING_NODE_REGISTRATION.lock() {
-                                let out = if let Some((id, bytes, attempts)) = guard.as_mut() {
-                                    if *attempts > 0 {
-                                        *attempts -= 1;
-                                        Some((id.clone(), bytes.clone(), *attempts))
-                                    } else { None }
-                                } else { None };
-                                if matches!(guard.as_ref(), Some((_, _, 0))) { *guard = None; } // budget spent
-                                out
-                            } else { None };
-                            if let Some((reg_id, reg_bytes, attempts_left)) = resend {
-                                if let Err(e) = p2p.broadcast_transaction(reg_bytes) {
-                                    if is_warn() { println!("[WARN][REG] rebroadcast_fail id={} err={}", reg_id, e); }
-                                } else if is_info() {
-                                    println!("[INFO][REG] registration_rebroadcast id={} attempts_left={}", reg_id, attempts_left);
-                                }
-                            }
                         }
                     } else {
                         if is_info() {
@@ -27914,14 +27917,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if let Ok(mut pend) = PENDING_NODE_REGISTRATION.lock() {
                     *pend = Some((self.node_id.clone(), tx_bytes.clone(), PENDING_REGISTRATION_MAX_REBROADCASTS));
                 }
-                // Broadcast NodeRegistration TX (producer-direct + gossip backup) so a non-producer
-                // node's TX still reaches a producer for inclusion.
+                // Deliver with the same guarantee as NodeActivation: producer-direct gossip + direct
+                // fan-out to every genesis node. A fresh joiner usually has no producer info yet, so a
+                // single gossip is fragile; the genesis fan-out ensures the binding TX reaches the
+                // network even before sync completes.
                 if let Some(ref p2p) = self.unified_p2p {
-                    if let Err(e) = p2p.broadcast_transaction(tx_bytes) {
-                        if is_warn() { println!("[WARN][REG] broadcast_fail hash={}... err={}", &tx_hash[..16.min(tx_hash.len())], e); }
-                    } else {
-                        if is_info() { println!("[INFO][REG] registration_tx_broadcast hash={}", &tx_hash[..16.min(tx_hash.len())]); }
+                    let _ = p2p.broadcast_transaction(tx_bytes.clone());
+                    let tx_msg = crate::unified_p2p::NetworkMessage::Transaction { data: tx_bytes };
+                    let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
+                    for ip in &genesis_ips {
+                        p2p.send_network_message(&format!("{}:8001", ip), tx_msg.clone());
                     }
+                    if is_info() { println!("[INFO][REG] registration_tx_broadcast hash={} genesis={}", &tx_hash[..16.min(tx_hash.len())], genesis_ips.len()); }
                 }
             } else {
                 eprintln!("[WARN][REG] onchain_tx_failed node={}", self.node_id);

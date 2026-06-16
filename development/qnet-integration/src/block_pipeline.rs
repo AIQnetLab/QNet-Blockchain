@@ -2904,105 +2904,19 @@ impl BlockPipeline {
                 }
             }
 
-            // v15.9: committee-wide canonical snapshot at each
-            // SNAPSHOT_INCREMENTAL_INTERVAL — fresh nodes parallel-download from any
-            // committee member; macroblock snapshot_root has a byte-identical
-            // artefact on every honest node; rollback finds a snapshot <= target.
-            // SOURCE = in-memory state.accounts (the Arc<DashMap> every apply
-            // mutates), NOT the RocksDB accounts CF (only written on restore →
-            // stale/empty → bad snapshot_root). Sort by address before bincode
-            // (DashMap iter order is shard/node-dependent) → identical bytes → root
-            // converges. Off-reactor (blocking pool, Arc to accounts); pipeline
-            // returns immediately; failure WARN-only, never blocks liveness.
+            // Canonical boundary snapshot (raw accounts-CF dump via create_state_snapshot) at every
+            // SNAPSHOT_INCREMENTAL_INTERVAL, on EVERY node's apply path (not just the producer) so a
+            // cold joiner can fast-sync from any peer. This is the SAME representation the macroblock
+            // snapshot_root binds (compute_canonical_state_root over the accounts CF) → restore
+            // reproduces the bound root. Off-reactor; WARN-only, never blocks liveness.
             const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
             if height > 0 && height % SNAPSHOT_INCREMENTAL_INTERVAL == 0 {
                 let storage_for_snapshot = ctx.storage.clone();
-                let state_for_snapshot = ctx.state.clone();
                 let snapshot_height = height;
                 tokio::spawn(async move {
-                    let start = std::time::Instant::now();
-
-                    // Read the in-memory state under a brief read lock to
-                    // capture: (a) a strong handle to the accounts map,
-                    // (b) the current state_root, (c) the current
-                    // total_supply. We drop the lock before the heavy
-                    // serialise step so block apply is not blocked.
-                    let (accounts_arc, state_root, total_supply) = {
-                        let sg = state_for_snapshot.read().await;
-                        let accounts_arc = sg.accounts.clone();
-                        let state_root = sg.calculate_state_root().unwrap_or([0u8; 32]);
-                        let total_supply = sg.chain_state.read().total_supply;
-                        (accounts_arc, state_root, total_supply)
-                    };
-
-                    // Heavy work: iterate DashMap, clone, sort, bincode.
-                    // Lives on the blocking thread pool so the reactor
-                    // stays free; the closure consumes `accounts_arc` so
-                    // no shared-state hazards remain after spawn.
-                    let serialise_result = tokio::task::spawn_blocking(move || {
-                        let mut accounts: Vec<(String, qnet_state::Account)> = accounts_arc
-                            .iter()
-                            .map(|e| (e.key().clone(), e.value().clone()))
-                            .collect();
-                        accounts.sort_by(|a, b| a.0.cmp(&b.0));
-                        bincode::serialize(&accounts)
-                    }).await;
-
-                    let state_data = match serialise_result {
-                        Ok(Ok(data)) => data,
-                        Ok(Err(e)) => {
-                            if is_warn() {
-                                println!(
-                                    "[WARN][PIPELINE] snapshot_serialize_fail h={} err={}",
-                                    snapshot_height, e,
-                                );
-                            }
-                            return;
-                        }
-                        Err(e) => {
-                            if is_warn() {
-                                println!(
-                                    "[WARN][PIPELINE] snapshot_join_fail h={} err={:?}",
-                                    snapshot_height, e,
-                                );
-                            }
-                            return;
-                        }
-                    };
-
-                    if state_data.is_empty() {
-                        // Genesis-window or pre-state node — nothing to bind.
-                        return;
-                    }
-
-                    // Write the canonical snapshot artefact. `save_state_snapshot`
-                    // wraps zstd-15 + integrity hash + atomic batch write —
-                    // already off-reactor (Fix #2 spawn_blocking).
-                    match storage_for_snapshot
-                        .save_state_snapshot(
-                            snapshot_height,
-                            state_root,
-                            total_supply,
-                            state_data,
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            if is_info() {
-                                println!(
-                                    "[INFO][PIPELINE] snapshot_created h={} elapsed_ms={} source=apply_stage",
-                                    snapshot_height,
-                                    start.elapsed().as_millis(),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if is_warn() {
-                                println!(
-                                    "[WARN][PIPELINE] snapshot_save_failed h={} err={:?}",
-                                    snapshot_height, e,
-                                );
-                            }
+                    if let Err(e) = storage_for_snapshot.create_state_snapshot(snapshot_height).await {
+                        if is_warn() {
+                            println!("[WARN][PIPELINE] snapshot_create_failed h={} err={:?}", snapshot_height, e);
                         }
                     }
                 });

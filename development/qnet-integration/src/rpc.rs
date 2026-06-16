@@ -11352,7 +11352,12 @@ async fn handle_register_node(
                          &wallet_address[..16.min(wallet_address.len())],
                          &tx_hash[..16.min(tx_hash.len())]);
                 if let Some(p2p) = blockchain.get_unified_p2p() {
-                    let _ = p2p.broadcast_transaction(tx_bytes);
+                    let _ = p2p.broadcast_transaction(tx_bytes.clone());
+                    // Same guaranteed delivery as NodeActivation: direct fan-out to all genesis.
+                    let tx_msg = crate::unified_p2p::NetworkMessage::Transaction { data: tx_bytes };
+                    for ip in &crate::unified_p2p::get_genesis_bootstrap_ips() {
+                        p2p.send_network_message(&format!("{}:8001", ip), tx_msg.clone());
+                    }
                 }
             } else {
                 eprintln!("[WARN][REG] super_onchain_tx_failed node={}", node_id);

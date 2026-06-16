@@ -2880,8 +2880,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let already_persisted = node.get_storage().load_activation_code()
             .map(|opt| opt.is_some())
             .unwrap_or(false);
-        if already_persisted {
-            if is_info() { println!("[INFO][NODE] activation_already_persisted skip=fallback_call"); }
+        // Chain is the source of truth: skip the (re)send only if the code is persisted AND this
+        // node's NodeRegistration is already on-chain. If persisted on an earlier boot but the
+        // registration never landed (dropped join-time broadcast), re-send so the binding TX reaches
+        // a producer. One send per boot; the early-activation path is sync-gated (OFF on a cold
+        // joiner) so there is no same-boot double-submit.
+        let reg_onchain = node.get_storage().is_node_registration_onchain(&node.get_node_id());
+        if already_persisted && reg_onchain {
+            if is_info() { println!("[INFO][NODE] activation_persisted reg_onchain=true skip=fallback_call"); }
         } else if let Err(e) = node.save_activation_code(&activation_code, node_type).await {
             if is_warn() { println!("[WARN][NODE] activation_code_save_failed err={}", e); }
         }
