@@ -182,6 +182,16 @@ pub static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
 
+/// Signed NodeRegistration awaiting on-chain inclusion: (node_id, tx_bytes, attempts_left). The
+/// periodic registration loop rebroadcasts it (one per ~60s cycle, bounded budget) so a single
+/// join-time broadcast that is dropped while the node is poorly connected still reaches a producer.
+/// One-shot send does not scale to thousands of joining super-nodes. Cleared when the budget runs out
+/// (by then, with serving open, the node is well-connected and inclusion has long since happened).
+pub static PENDING_NODE_REGISTRATION: std::sync::Mutex<Option<(String, Vec<u8>, u32)>> =
+    std::sync::Mutex::new(None);
+/// Rebroadcast budget for a pending NodeRegistration (~1 per 60s ⇒ ~30 min of retries).
+pub const PENDING_REGISTRATION_MAX_REBROADCASTS: u32 = 30;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // L1 ARCHITECTURE: Global coordinator handle for phase-aware decisions
 // Set once during node startup, read from anywhere.
@@ -4869,8 +4879,15 @@ impl BlockchainNode {
                         if pk_hex.len() == crate::crypto::vrf::D3_PK_BYTES * 2 {
                             // Log if registering key from unsigned TX (no proof-of-possession)
                             if tx.dilithium_signature.is_none() || tx.dilithium_signature.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-                                println!("[WARN][VRF] key_registered_without_pop node={}",
-                                         &node_id[..16.min(node_id.len())]);
+                                // Genesis identities install their key from the trusted genesis block
+                                // (no proof-of-possession by design) — DBG. Only a NON-genesis unsigned
+                                // key warrants a WARN (real missing-PoP signal).
+                                if node_id.starts_with("genesis_node_") {
+                                    if is_debug() { println!("[DBG][VRF] genesis_key_registered node={}", &node_id[..16.min(node_id.len())]); }
+                                } else {
+                                    println!("[WARN][VRF] key_registered_without_pop node={}",
+                                             &node_id[..16.min(node_id.len())]);
+                                }
                             }
                             if !crate::genesis_constants::has_vrf_key(node_id) {
                                 if let Ok(pk_bytes) = hex::decode(pk_hex) {
@@ -15151,6 +15168,27 @@ impl BlockchainNode {
                         if let Some(ref p2p) = unified_p2p {
                             if is_info() { println!("[INFO][ACTIVE] periodic_registration h={} best={}", reg_our_h, reg_best_h); }
                             p2p.register_as_active_node_async().await;
+
+                            // Bounded rebroadcast of our own NodeRegistration so a dropped join-time
+                            // broadcast still reaches a producer. Re-applying an already-included
+                            // registration is a no-op (nonce/dedup), so this is safe; the budget stops it.
+                            let resend = if let Ok(mut guard) = PENDING_NODE_REGISTRATION.lock() {
+                                let out = if let Some((id, bytes, attempts)) = guard.as_mut() {
+                                    if *attempts > 0 {
+                                        *attempts -= 1;
+                                        Some((id.clone(), bytes.clone(), *attempts))
+                                    } else { None }
+                                } else { None };
+                                if matches!(guard.as_ref(), Some((_, _, 0))) { *guard = None; } // budget spent
+                                out
+                            } else { None };
+                            if let Some((reg_id, reg_bytes, attempts_left)) = resend {
+                                if let Err(e) = p2p.broadcast_transaction(reg_bytes) {
+                                    if is_warn() { println!("[WARN][REG] rebroadcast_fail id={} err={}", reg_id, e); }
+                                } else if is_info() {
+                                    println!("[INFO][REG] registration_rebroadcast id={} attempts_left={}", reg_id, attempts_left);
+                                }
+                            }
                         }
                     } else {
                         if is_info() {
@@ -15422,8 +15460,14 @@ impl BlockchainNode {
 
                                     if mb_missing && expected_mb > 0 {
                                         let blocks_since = canonical_height.saturating_sub(check_boundary);
-                                        println!("[WARN][SYNC] epoch_boundary_crossed h={} mb={} MISSING blocks_without={} → direct macroblock sync",
-                                                 canonical_height, expected_mb, blocks_since);
+                                        // Routine: fires at every macroblock boundary whose macroblock
+                                        // the node has not sealed locally yet (finality trails production) → triggers
+                                        // a direct macroblock sync. DBG, not WARN — a persistent gap surfaces via
+                                        // finality height / consensus_driver_behind, not this per-boundary trace.
+                                        if is_debug() {
+                                            println!("[DBG][SYNC] epoch_boundary_crossed h={} mb={} missing blocks_without={} → direct macroblock sync",
+                                                     canonical_height, expected_mb, blocks_since);
+                                        }
 
                                         let p2p_pfp = unified_p2p.clone();
                                         tokio::spawn(async move {
@@ -27865,11 +27909,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                              &wallet_address[..16.min(wallet_address.len())],
                              &tx_hash[..16.min(tx_hash.len())]);
                 }
-                // v6.5 FIX: Broadcast NodeRegistration TX to network
-                // PROBLEM: TX was only added to local mempool without broadcast.
-                //   If this node is not the current producer, TX would never be included in a block.
-                // SOLUTION: Use broadcast_transaction() (Gulf Stream → producer + gossip backup)
-                //   Same as NodeActivation TX in activation_validation.rs:1984
+                // Track for bounded rebroadcast: the periodic registration loop re-sends this so a
+                // dropped join-time broadcast still reaches a producer for inclusion.
+                if let Ok(mut pend) = PENDING_NODE_REGISTRATION.lock() {
+                    *pend = Some((self.node_id.clone(), tx_bytes.clone(), PENDING_REGISTRATION_MAX_REBROADCASTS));
+                }
+                // Broadcast NodeRegistration TX (producer-direct + gossip backup) so a non-producer
+                // node's TX still reaches a producer for inclusion.
                 if let Some(ref p2p) = self.unified_p2p {
                     if let Err(e) = p2p.broadcast_transaction(tx_bytes) {
                         if is_warn() { println!("[WARN][REG] broadcast_fail hash={}... err={}", &tx_hash[..16.min(tx_hash.len())], e); }

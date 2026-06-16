@@ -482,9 +482,10 @@ pub fn get_pending_sync_count() -> usize {
 pub static SYNC_PEER_COOLDOWN: Lazy<DashMap<String, (u64, u32)>> =
     Lazy::new(|| DashMap::new());
 
-// v32.15: pre-activation P2P sync gate. Holds super-node ids whose on-chain
-// NodeActivation has been applied. Populated from state at boot + on each
-// block apply. Drives admission in handle_block_request / handle_macroblock_sync_request.
+// Super-node ids whose on-chain NodeActivation has been applied (from state at boot + on each
+// block apply). NOTE: no longer gates sync serving — finalized blocks/macroblocks are public,
+// QC-bound data served to any peer (sync-first, register-second). Kept as the registered-super
+// set for participation-side use (eligibility/reputation), NOT for admission.
 pub static REGISTERED_SUPER_NODES: Lazy<DashMap<String, ()>> = Lazy::new(DashMap::new);
 
 pub fn add_registered_super_node(node_id: String) {
@@ -18395,33 +18396,10 @@ impl SimplifiedP2P {
         // Update last_seen for requesting peer
         self.update_peer_last_seen(from_peer);
 
-        // v32.15: pre-activation gate. Genesis IPs always pass. Bootstrap grace
-        // window (chain ≤ 90) allows all peers to solve chicken-and-egg. Past
-        // that, super_node_* requester_ids must be on-chain registered. Reply
-        // with an empty batch so the requester doesn't timeout; they need to
-        // complete activation before bulk-sync is served.
-        let from_ip = from_peer.split(':').next().unwrap_or(from_peer);
-        let is_genesis_peer = is_genesis_node_ip(from_ip);
-        if !is_genesis_peer && requester_id.starts_with("super_node_") {
-            let chain_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-            if chain_h > 90 && !is_super_node_registered(&requester_id) {
-                if crate::node::is_warn() {
-                    let id_short: String = requester_id.chars().take(20).collect();
-                    println!("[WARN][SYNC] gate_unregistered peer={} id={} chain_h={} require_activation",
-                             from_peer, id_short, chain_h);
-                }
-                let response = NetworkMessage::BlocksBatch {
-                    blocks: Vec::new(),
-                    from_height,
-                    to_height: from_height,
-                    sender_id: self.node_id.clone(),
-                };
-                if let Some(peer_addr) = self.peer_id_to_addr.get(&requester_id) {
-                    self.send_network_message(&peer_addr.clone(), response);
-                }
-                return;
-            }
-        }
+        // Finalized blocks are public, QC-bound data: served to ANY peer so a fresh node bootstraps
+        // BEFORE it is on-chain registered (sync-first, register-second). A peer cannot forge a block
+        // (needs a 2f+1 Dilithium3 QC), so identity is not a serving prerequisite. DoS is bounded by
+        // the per-(IP,id) rate-limit below + leader-shed — not by registration status.
 
         // Shed sync-serving ONLY while actively producing (protects the producer's RocksDB I/O
         // budget). A node elected for the next slot but STALLED — no block produced in the last
@@ -18763,24 +18741,10 @@ impl SimplifiedP2P {
         // Update last_seen for requesting peer
         self.update_peer_last_seen(from_peer);
 
-        // v32.15: pre-activation gate — same policy as handle_block_request.
-        // Bootstrap grace (chain ≤ 90), genesis IP, or on-chain registered id.
-        {
-            let from_ip = from_peer.split(':').next().unwrap_or(from_peer);
-            let is_genesis_peer = is_genesis_node_ip(from_ip);
-            if !is_genesis_peer && requester_id.starts_with("super_node_") {
-                let chain_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                if chain_h > 90 && !is_super_node_registered(&requester_id) {
-                    if crate::node::is_warn() {
-                        let id_short: String = requester_id.chars().take(20).collect();
-                        println!("[WARN][MB_SYNC] gate_unregistered peer={} id={} chain_h={} require_activation",
-                                 from_peer, id_short, chain_h);
-                    }
-                    return;
-                }
-            }
-        }
-        
+        // Finalized macroblocks (and the snapshot-binding fetch that rides this path) are public,
+        // 2f+1-QC-bound data: served to ANY peer so a fresh node can fast-sync via snapshot BEFORE
+        // registration. No identity gate; DoS is bounded by the rate-limit below.
+
         // v3.0: CRITICAL FIX - Genesis nodes bypass rate limiting to prevent network isolation
         let is_genesis_requester = requester_id.starts_with("genesis_node_");
         let is_genesis_peer = from_peer.split(':').next()
@@ -20527,8 +20491,10 @@ impl SimplifiedP2P {
         } else {
             get_privacy_id_for_addr(node_id)
         };
-        if crate::node::is_info() {
-            println!("[WARN][P2P] set_node_reputation() deprecated - {} reputation managed via blockchain", display_id);
+        // Deprecated no-op (reputation is chain-derived). Trace at DBG only — it was firing
+        // hundreds of [WARN] lines per run from recurring call sites, drowning real warnings.
+        if crate::node::is_debug() {
+            println!("[DBG][P2P] set_node_reputation() deprecated - {} reputation managed via blockchain", display_id);
         }
     }
     

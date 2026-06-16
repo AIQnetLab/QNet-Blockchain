@@ -1053,8 +1053,8 @@ impl PersistentStorage {
         // Previously had arbitrary `< 100` cutoff — if metadata stuck at e.g. 5000
         // but blocks exist up to 8000, recovery was SKIPPED and node stalled permanently.
         if result.is_none() {
-            if is_warn() {
-                println!("[WARN][STORAGE] no_continuous_from_h={} scanning_for_first_block", metadata_height);
+            if is_debug() {
+                println!("[DBG][STORAGE] no_continuous_from_h={} scanning_for_first_block", metadata_height);
             }
             
             // Find first existing block using RocksDB iterator
@@ -3449,7 +3449,9 @@ impl Storage {
             let network_size = Self::estimate_network_size_from_storage(&persistent);
             let optimal_shards = crate::reward_sharding::calculate_optimal_shards(network_size) as u64;
             
-            println!("[WARN][STORAGE] AUTO-SCALING: Calculated optimal shards: {}", optimal_shards);
+            if crate::node::is_debug() {
+                println!("[DBG][STORAGE] auto_scaling optimal_shards={}", optimal_shards);
+            }
             
             optimal_shards
         };
