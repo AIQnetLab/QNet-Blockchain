@@ -9045,7 +9045,12 @@ impl Storage {
                 // rather than the validator committee.
                 if !cid.is_empty() && std::env::var("IPFS_ENABLED").unwrap_or_default() == "1" {
                     if let Ok(_) = self.download_snapshot_from_ipfs(&cid, height).await {
-                        println!("[INFO][SYNC] snapshot_from_ipfs h={}", height);
+                        // An IPFS CID is content-addressed but NOT consensus-bound — a byzantine
+                        // advertiser can serve a self-consistent FORGED snapshot. Route it through the
+                        // SAME 2f+1-QC anchor binding as the chunked/legacy paths (discards orphaned
+                        // state on any failure → falls back to verified block-sync). No bypass.
+                        self.verify_snapshot_consensus_binding(p2p, height).await?;
+                        println!("[INFO][SYNC] snapshot_from_ipfs h={} bound=ok", height);
                         return Ok(height);
                     }
                 }
@@ -9132,37 +9137,47 @@ impl Storage {
         // failed under network/peer cascade load; joiners then fell back to
         // slow block-by-block. Retry with exponential backoff covers
         // transient peer unavailability (peers busy with their own view-change).
-        const MB_FETCH_MAX_ATTEMPTS: u32 = 5;
+        // 8 windows × repair-window(64) reaches deep lineages (height ~46k); true maturity is served
+        // by the weak-subjectivity checkpoint (P4) which removes the lineage walk entirely.
+        const MB_FETCH_MAX_ATTEMPTS: u32 = 8;
         const MB_FETCH_BASE_DELAY_MS: u64 = 2_000;
         let mut macroblock_bytes_opt: Option<Vec<u8>> = self.get_macroblock_by_height(mb_idx)
             .map_err(|e| IntegrationError::Other(format!("mb_load_err mb={} err={:?}", mb_idx, e)))?;
         let mut attempt = 0u32;
+        // Monotonic lineage cursor. Storing macroblock N requires its N-2 predecessor (Checkpoint-BFT
+        // anchor), so a fresh joiner must fill the lineage [first-missing ..= mb_idx]. The snapshot
+        // set chain_height=mb_idx*90 WITHOUT storing the macroblock objects, so
+        // get_latest_macroblock_index() (= chain_height/90) is mb_idx and the old `latest+1` start
+        // was > mb_idx → an empty request → mb never fetched (the root of "snapshot binding never
+        // worked"). We advance this cursor past contiguously-stored macroblocks each attempt so the
+        // repair window SLIDES forward toward mb_idx (a fixed from=1 capped reachability at ~64
+        // macroblocks). Warm nodes (already-stored) skip straight to mb_idx.
+        let mut lineage_from = 1u64;
         while macroblock_bytes_opt.is_none() && attempt < MB_FETCH_MAX_ATTEMPTS {
             attempt += 1;
+            while lineage_from < mb_idx
+                && self.get_macroblock_by_height(lineage_from).ok().flatten().is_some()
+            {
+                lineage_from = lineage_from.saturating_add(1);
+            }
             if crate::node::is_info() {
                 println!(
-                    "[INFO][SYNC] verifier_fetching_macroblock mb={} attempt={}/{} for_snapshot_h={}",
-                    mb_idx, attempt, MB_FETCH_MAX_ATTEMPTS, snapshot_height,
+                    "[INFO][SYNC] verifier_fetching_macroblock mb={} from={} attempt={}/{} for_snapshot_h={}",
+                    mb_idx, lineage_from, attempt, MB_FETCH_MAX_ATTEMPTS, snapshot_height,
                 );
             }
-            // Fetch the macroblock PREFIX up to the binding index, not just mb_idx:
-            // storing macroblock N requires its N-2 predecessor (Checkpoint-BFT anchor),
-            // so a fresh joiner must fill the chain [latest+1..=mb_idx] for mb_idx to
-            // persist and become readable. Bounded one-time cost (~tens of KB each);
-            // sync_macroblocks dedups any already present.
-            let mb_from = self.get_latest_macroblock_index().unwrap_or(0).saturating_add(1).max(1);
-            if let Err(e) = p2p.sync_macroblocks(mb_from, mb_idx).await {
+            if let Err(e) = p2p.sync_macroblocks_repair(lineage_from, mb_idx).await {
                 if crate::node::is_warn() {
                     println!(
                         "[WARN][SYNC] verifier_macroblock_fetch_retry mb={} from={} attempt={}/{} err={}",
-                        mb_idx, mb_from, attempt, MB_FETCH_MAX_ATTEMPTS, e,
+                        mb_idx, lineage_from, attempt, MB_FETCH_MAX_ATTEMPTS, e,
                     );
                 }
             }
             macroblock_bytes_opt = self.get_macroblock_by_height(mb_idx)
                 .map_err(|e| IntegrationError::Other(format!("mb_reload_err mb={} err={:?}", mb_idx, e)))?;
             if macroblock_bytes_opt.is_none() && attempt < MB_FETCH_MAX_ATTEMPTS {
-                let backoff_ms = MB_FETCH_BASE_DELAY_MS.saturating_mul(1u64 << (attempt - 1).min(4));
+                let backoff_ms = MB_FETCH_BASE_DELAY_MS.saturating_mul(1u64 << (attempt - 1).min(3));
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
             }
         }
@@ -9199,6 +9214,24 @@ impl Storage {
                 )));
             }
         };
+
+        // Anchor-QC gate (P2/P1): trust the macroblock's state_root ONLY after its own 2f+1
+        // checkpoint QC verifies against the committee anchored to the embedded genesis keys.
+        // Without this a Byzantine peer forges a self-consistent (macroblock, snapshot) pair the
+        // merkle recompute below would accept (a None-QC macroblock passes verify_v2_macroblock's
+        // early return). On ANY failure, discard the applied state → fall back to verified block-sync.
+        if let Err(e) = crate::node::verify_snapshot_anchor_qc(&macroblock, mb_idx, self).await {
+            if crate::node::is_warn() {
+                println!(
+                    "[WARN][SYNC] verifier_anchor_qc_failed mb={} snapshot_h={} err={} action=reject_snapshot",
+                    mb_idx, snapshot_height, e,
+                );
+            }
+            let _ = self.discard_snapshot_state(snapshot_height);
+            return Err(IntegrationError::Other(format!(
+                "snapshot_binding_unverified mb={} reason=anchor_qc_invalid err={}", mb_idx, e
+            )));
+        }
 
         // Step 2: the 2f+1-bound account-state root. The macroblock's top-level
         // state_root IS checkpoint.state_root (finalize_merkle), certified by the

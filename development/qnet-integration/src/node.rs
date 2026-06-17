@@ -2197,6 +2197,28 @@ pub fn try_get_p2p() -> Option<&'static Arc<crate::unified_p2p::SimplifiedP2P>> 
     GLOBAL_P2P_INSTANCE.get()
 }
 
+/// Snapshot anchor QC gate (P2/P1). A fast-sync snapshot is trustworthy ONLY if the macroblock
+/// it binds to carries a 2f+1 checkpoint QC the joiner itself verifies against the committee
+/// anchored (via N-2 / genesis) to the embedded genesis consensus keys. `verify_v2_macroblock`
+/// returns Ok early for a None-QC macroblock, so without this a Byzantine peer could serve a
+/// self-consistent FORGED (macroblock, snapshot) pair that the binder's merkle recompute accepts.
+/// node_id/node_type do NOT affect the derived committee (it is on-chain-deterministic; node_type
+/// is unused, node_id only self-includes a genesis verifier), so the running identity is used.
+/// Returns Err — snapshot rejected, fall back to verified block-sync — when the anchor lacks a QC,
+/// p2p is not yet up, or the QC fails to verify.
+pub(crate) async fn verify_snapshot_anchor_qc(
+    macroblock: &qnet_state::MacroBlock,
+    mb_idx: u64,
+    storage: &Storage,
+) -> Result<(), String> {
+    if macroblock.consensus_data.checkpoint_qc.is_none() {
+        return Err(format!("anchor_no_qc mb={}", mb_idx));
+    }
+    let p2p = try_get_p2p().ok_or_else(|| format!("anchor_no_p2p mb={}", mb_idx))?;
+    let node_id = crate::unified_p2p::GLOBAL_NODE_ID.read().clone();
+    BlockchainNode::verify_v2_macroblock(macroblock, mb_idx, p2p, &node_id, NodeType::Super, storage).await
+}
+
 // CRITICAL: Track certificate requests to prevent DDoS (request flooding)
 // Maps certificate_serial -> last_request_timestamp
 // v2.96: Using DashMap for lock-free operations
@@ -7818,7 +7840,14 @@ impl BlockchainNode {
         if let Ok(wallet_seed) = std::env::var("QNET_WALLET_SEED") {
             match blockchain.initialize_wallet_identity(&wallet_seed) {
                 Ok(()) => println!("[INFO][NODE] wallet_identity initialized from QNET_WALLET_SEED"),
-                Err(e) => println!("[WARN][NODE] wallet_identity_init err={}", e),
+                // FATAL: identity-anchor mismatch / keypair-derivation failure is the documented
+                // halt_startup case (a wrong seed → a key no peer's registry accepts → silent
+                // signature invalidation = the pk_mismatch/h=781 incident). Must HALT, not run as a
+                // non-signing zombie with the wrong key already cached. Matches genesis_fallback_id_fatal.
+                Err(e) => {
+                    eprintln!("[CRIT][NODE] wallet_identity_init_fatal err={} action=halt_startup", e);
+                    std::process::exit(1);
+                }
             }
         } else if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
             // Genesis nodes: generate identity from bootstrap config
@@ -7826,7 +7855,10 @@ impl BlockchainNode {
                 .unwrap_or_else(|_| format!("genesis_bootstrap_{}", node_id));
             match blockchain.initialize_wallet_identity(&genesis_seed) {
                 Ok(()) => println!("[INFO][NODE] genesis wallet_identity initialized"),
-                Err(e) => println!("[WARN][NODE] genesis wallet_identity err={}", e),
+                Err(e) => {
+                    eprintln!("[CRIT][NODE] genesis_wallet_identity_fatal err={} action=halt_startup", e);
+                    std::process::exit(1);
+                }
             }
         }
         
@@ -8969,47 +9001,27 @@ impl BlockchainNode {
                                 if is_info() { println!("[INFO][MB-SYNC] syncing from={} to={}", 
                                     local_macroblock_index + 1, network_macroblock_index); }
                                 
-                                // v3.2: Sync macroblocks in batches of 10, with retry on failure
-                                let mut current_macro = local_macroblock_index + 1;
-                                let mut consecutive_failures = 0;
-                                const MAX_CONSECUTIVE_FAILURES: u32 = 5;
-                                
-                                while current_macro <= network_macroblock_index {
-                                    let batch_end = std::cmp::min(current_macro + 9, network_macroblock_index);
-                                    
-                                    if is_debug() { println!("[DBG][MB-SYNC] request from={} to={}", current_macro, batch_end); }
-                                    
-                                    // v3.2: Clear pending sync for this batch to allow fresh request
-                                    for idx in current_macro..=batch_end {
-                                        crate::unified_p2p::clear_macroblock_pending_sync(idx);
+                                // Drive forward in coordinator-bounded windows until caught up or
+                                // a round makes no progress. The single sync_macroblocks coordinator
+                                // clamps each call to [applied+1, applied+WINDOW] and overlap-dedups,
+                                // so we re-issue as the apply frontier advances instead of the old
+                                // manual 10-wide batching + clear-before-request + per-index flood
+                                // (which self-DoS'd genesis → priority_rate_exceeded). No-progress
+                                // breaks out; the periodic macrocheck/repair retries any residual gap.
+                                let mut last_macro = local_macroblock_index;
+                                loop {
+                                    let cur = blockchain_for_sync.storage.get_latest_macroblock_index().unwrap_or(last_macro);
+                                    if cur >= network_macroblock_index { break; }
+                                    if let Err(e) = p2p.sync_macroblocks(cur + 1, network_macroblock_index).await {
+                                        if is_warn() { println!("[WARN][MB-SYNC] sync_failed from={} to={} err={}", cur + 1, network_macroblock_index, e); }
                                     }
-                                    
-                                    if let Err(e) = p2p.sync_macroblocks(current_macro, batch_end).await {
-                                        println!("[WARN][MB-SYNC] sync_failed idx={}-{} err={}", current_macro, batch_end, e);
-                                        consecutive_failures += 1;
-                                        
-                                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                                            println!("[WARN][MB-SYNC] too_many_failures={} stopping_batch_sync", consecutive_failures);
-                                        break;
-                                        }
-                                        
-                                        // v3.2: Don't break on single failure - try individual macroblocks
-                                        for idx in current_macro..=batch_end {
-                                            if let Err(e2) = p2p.sync_macroblocks(idx, idx).await {
-                                                if is_debug() { println!("[DBG][MB-SYNC] individual_fail idx={} err={}", idx, e2); }
-                                            }
-                                            tokio::time::sleep(Duration::from_millis(100)).await;
-                                        }
-                                    } else {
-                                        consecutive_failures = 0; // Reset on success
-                                    }
-                                    
-                                    current_macro = batch_end + 1;
-                                    
-                                    // Delay between batches
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                    // Let the apply pipeline advance the frontier before the next window.
+                                    tokio::time::sleep(Duration::from_millis(300)).await;
+                                    let after = blockchain_for_sync.storage.get_latest_macroblock_index().unwrap_or(cur);
+                                    if after <= last_macro { break; } // no progress → periodic repair retries
+                                    last_macro = after;
                                 }
-                                
+
                                 if is_info() { println!("[INFO][MB-SYNC] complete"); }
                             } else {
                                 if is_info() { println!("[INFO][MB-SYNC] synchronized idx={}", local_macroblock_index); }
@@ -9106,19 +9118,15 @@ impl BlockchainNode {
                     // CRITICAL FIX: Increased limit from 10 to 30 to recover faster from DESYNC
                     // Also clear pending queue for these indices to allow re-request
                     if let Some(ref p2p) = blockchain_for_macrocheck.unified_p2p {
-                        // v3.2: Clear pending sync for missing macroblocks to allow fresh request
-                        for mb_index in missing_macroblocks.iter() {
-                            crate::unified_p2p::clear_macroblock_pending_sync(*mb_index);
-                        }
-                        
-                        // Request in larger batches for faster recovery
-                        for mb_index in missing_macroblocks.iter().take(30) {
-                            if is_debug() { println!("[DBG][MB-CHECK] request idx={}", mb_index); }
-                            if let Err(e) = p2p.sync_macroblocks(*mb_index, *mb_index).await {
-                                println!("[WARN][MB-CHECK] sync_failed idx={} err={}", mb_index, e);
+                        // Gap-repair: one contiguous range over the missing span via the repair
+                        // coordinator (honors below-frontier indices, skip-present so already-held
+                        // indices in a sparse span are not re-requested, width-capped + deduped).
+                        // Replaces the clear-before-request + per-index take(30) flood.
+                        if let (Some(&lo), Some(&hi)) = (missing_macroblocks.iter().min(), missing_macroblocks.iter().max()) {
+                            if is_debug() { println!("[DBG][MB-CHECK] repair range={}-{}", lo, hi); }
+                            if let Err(e) = p2p.sync_macroblocks_repair(lo, hi).await {
+                                if is_warn() { println!("[WARN][MB-CHECK] sync_failed range={}-{} err={}", lo, hi, e); }
                             }
-                            // Small delay between requests
-                            tokio::time::sleep(Duration::from_millis(300)).await;
                         }
                     }
                 } else if current_height % 180 == 0 {
@@ -9130,2351 +9138,6 @@ impl BlockchainNode {
         });
         
         Ok(blockchain)
-    }
-    
-    /// Process received blocks from P2P network 
-    async fn process_received_blocks(
-        mut block_rx: tokio::sync::mpsc::Receiver<crate::unified_p2p::ReceivedBlock>,
-        storage: Arc<Storage>,
-        state: Arc<RwLock<StateManager>>,
-        height: Arc<RwLock<u64>>,
-        unified_p2p: Option<Arc<SimplifiedP2P>>,
-        poh: Option<Arc<crate::poh::PoH>>,
-        node_id: String,
-        node_type: NodeType,
-        block_event_tx: tokio::sync::broadcast::Sender<u64>,
-        reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
-        mempool: Arc<SimpleMempool>,
-        _wallet_identity: Option<Arc<crate::crypto::vrf::WalletIdentity>>,
-    ) {
-        // CRITICAL FIX: Buffer for out-of-order blocks
-        // Key: block height, Value: (block data, retry count, timestamp)
-        let mut pending_blocks: std::collections::HashMap<u64, (crate::unified_p2p::ReceivedBlock, u16, std::time::Instant)> =
-            std::collections::HashMap::new();
-
-        // CRITICAL: Separate timers for retry (fast) and cleanup (slow)
-        let mut last_retry_check = std::time::Instant::now();  // Retry pending blocks every 2s
-        let mut last_cleanup_check = std::time::Instant::now(); // Cleanup expired every 30s
-
-        // CRITICAL FIX: Create channel for re-queuing blocks
-        let (retry_tx, mut retry_rx) = tokio::sync::mpsc::channel::<crate::unified_p2p::ReceivedBlock>(1000);
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // v10.0 CRITICAL FIX: ORDERED SYNC BUFFER
-        //
-        // During initial sync (SYNC_IN_PROGRESS=true), blocks arrive from 3 peers
-        // simultaneously in ARBITRARY order. Without ordering, each out-of-order
-        // block triggers MISSING_PREVIOUS → pending_blocks → 2s retry timer,
-        // turning a 100-block chunk into a 200+ second ordeal.
-        //
-        // Solution: BTreeMap collects ALL arriving blocks during sync. After each
-        // insertion, drain the contiguous sequence starting from (local_height+1)
-        // and feed them to the processing pipeline IN ORDER. This eliminates
-        // MISSING_PREVIOUS entirely during sync — O(1) amortized per block.
-        //
-        // The buffer is bounded by MAX_SYNC_BUFFER_SIZE to prevent memory abuse.
-        // When not in sync mode, blocks bypass this buffer entirely (live mode).
-        // ═══════════════════════════════════════════════════════════════════════
-        let mut sync_order_buffer: std::collections::BTreeMap<u64, crate::unified_p2p::ReceivedBlock> =
-            std::collections::BTreeMap::new();
-        // v11.0: Increased from 2000 to 4000 — with sequential sync, buffer pressure is lower
-        // but larger buffer handles edge cases during wave transitions
-        const MAX_SYNC_BUFFER_SIZE: usize = 4000;
-
-        // DDoS PROTECTION: Track requested blocks to avoid duplicate requests
-        // Key: block height, Value: (request timestamp, retry count)
-        let mut requested_blocks: std::collections::HashMap<u64, (std::time::Instant, u16)> =
-            std::collections::HashMap::new();
-        const MAX_CONCURRENT_REQUESTS: usize = 10; // Limit concurrent block requests
-        // ADAPTIVE SYNC: Fast mode for catching up, normal mode for steady state
-        const REQUEST_COOLDOWN_NORMAL: u64 = 10; // Normal: 10 seconds between requests
-        const REQUEST_COOLDOWN_FAST: u64 = 1;    // Fast sync: 1 second for catching up
-        const FAST_SYNC_THRESHOLD: u64 = 10;     // Switch to fast sync if >10 blocks behind
-        
-        // MEMORY PROTECTION v2.19.20: Adaptive in-RAM dedup buffer size
-        // by node role. This sizes a per-process RAM table that tracks
-        // recently received block heights to defend against malicious
-        // peers sending out-of-order blocks. It is NOT on-disk storage.
-        //
-        //   * Super: 500 entries (~50 MB) — covers ~8 minutes of churn
-        //   * Light: 100 entries (~10 MB) — defensive cap only. Light is
-        //     a mobile pure-API-client role and does NOT receive block
-        //     broadcasts in normal operation, so this arm is effectively
-        //     unreachable in production. The small bound prevents an
-        //     unbounded buffer from ever growing on a Light role even if
-        //     a legacy code path leaks a block reception into the table.
-        let max_pending_blocks: usize = match node_type {
-            NodeType::Light => 100,  // defensive RAM cap; Light never syncs blocks
-            NodeType::Super => 500,  // Super: ~50 MB in-RAM dedup buffer
-        };
-        
-        // CRITICAL: REORG PROTECTION - Prevent concurrent reorgs and DoS attacks
-        let reorg_in_progress = Arc::new(tokio::sync::RwLock::new(false));
-        let last_fork_attempt = Arc::new(tokio::sync::RwLock::new(
-            std::time::Instant::now() - std::time::Duration::from_secs(120)
-        ));
-        // v4.2: Reduced from 60s to 10s. Previous 60s cooldown prevented fork resolution
-        // when the first attempt failed, locking nodes on wrong chain indefinitely.
-        // 10s still prevents reorg DoS while allowing recovery within 2-3 attempts.
-        const FORK_ATTEMPT_COOLDOWN_SECS: u64 = 10;
-        
-        // v3.34: Per-height state_root_mismatch counter — breaks infinite retry loop.
-        // Key: block_height, Value: (fail_count, first_seen).
-        // When a block fails state_root check 5+ times, we stop retrying and trigger
-        // state recovery from the last macroblock snapshot instead.
-        let mut mismatch_counter: std::collections::HashMap<u64, (u32, std::time::Instant)> = 
-            std::collections::HashMap::new();
-        const MISMATCH_RECOVERY_THRESHOLD: u32 = 5;
-
-        // v3.36: Per-height "Wrong producer" counter — detects reputation divergence.
-        // When a block is rejected as "Wrong producer" 3+ times, the node's reputation
-        // state has diverged from the network (missed macroblock). Trigger macroblock
-        // recovery instead of endlessly rejecting valid blocks and penalizing peers.
-        let mut wrong_producer_counter: std::collections::HashMap<u64, (u32, std::time::Instant)> =
-            std::collections::HashMap::new();
-        const WRONG_PRODUCER_RECOVERY_THRESHOLD: u32 = 3;
-        let mut last_wp_recovery_attempt = std::time::Instant::now().checked_sub(Duration::from_secs(120)).unwrap_or_else(std::time::Instant::now);
-        const WP_RECOVERY_COOLDOWN_SECS: u64 = 60;
-        
-        let mut sync_buf_flush_interval = tokio::time::interval(Duration::from_secs(3));
-        sync_buf_flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            // Check channels + periodic flush timer
-            let (received_block_opt, is_retry) = tokio::select! {
-                Some(block) = retry_rx.recv() => (Some(block), true),
-                Some(block) = block_rx.recv() => (Some(block), false),
-                _ = sync_buf_flush_interval.tick() => (None, false), // Periodic flush trigger
-                else => break, // Both channels closed
-            };
-
-            // v10.0: Periodic flush — when tick fires with no block, just flush buffer
-            if received_block_opt.is_none() {
-                let is_sync_active = coordinator_is_syncing();
-                if !is_sync_active && !sync_order_buffer.is_empty() {
-                    let flushed = sync_order_buffer.len();
-                    for (_, block) in std::mem::take(&mut sync_order_buffer) {
-                        let _ = retry_tx.try_send(block);
-                    }
-                    println!("[INFO][SYNC-BUF] periodic_flush={} blocks_to_retry", flushed);
-                }
-                // Also try draining contiguous blocks even during sync (timer-based)
-                if is_sync_active && !sync_order_buffer.is_empty() {
-                    let local_h = storage.get_chain_height().unwrap_or(0);
-                    let genesis_ok = local_h > 0 || storage.load_microblock(0).map(|r| r.is_some()).unwrap_or(false)
-                        || sync_order_buffer.contains_key(&0);
-                    if genesis_ok {
-                        let mut next_exp = if local_h == 0 && sync_order_buffer.contains_key(&0)
-                            && storage.load_microblock(0).map(|r| r.is_none()).unwrap_or(true) { 0 } else { local_h + 1 };
-                        let mut timer_drained = Vec::new();
-                        while let Some(block) = sync_order_buffer.remove(&next_exp) {
-                            timer_drained.push(block);
-                            next_exp += 1;
-                        }
-                        if !timer_drained.is_empty() {
-                            println!("[INFO][SYNC-BUF] timer_drain={} h={}-{}", timer_drained.len(),
-                                     timer_drained.first().map(|b| b.height).unwrap_or(0),
-                                     timer_drained.last().map(|b| b.height).unwrap_or(0));
-                            for block in timer_drained {
-                                let _ = retry_tx.try_send(block);
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            let received_block = match received_block_opt {
-                Some(b) => b,
-                None => continue, // Safety: should not reach here after continue above
-            };
-
-            // DIAGNOSTIC: Log retry attempts
-            if is_retry {
-                if is_debug() { println!("[DBG][BLOCK] retry h={}", received_block.height); }
-            }
-
-            // ═══════════════════════════════════════════════════════════════════════
-            // v10.0: ORDERED SYNC BUFFER — collect blocks, drain in order
-            //
-            // During sync, blocks arrive from multiple peers in arbitrary order.
-            // Instead of validating immediately (triggering MISSING_PREVIOUS for
-            // out-of-order blocks), buffer in BTreeMap and drain contiguously.
-            //
-            // This converts O(n * retry_delay) sync into O(n) — blocks are never
-            // rejected for ordering, only for actual validation errors.
-            // ═══════════════════════════════════════════════════════════════════════
-            let is_sync_active = coordinator_is_syncing();
-
-            // Collect blocks to process: either from sync buffer drain or single block
-            let blocks_to_process: Vec<(crate::unified_p2p::ReceivedBlock, bool)>;
-
-            if is_sync_active && !is_retry {
-                // SYNC MODE: buffer the block, then drain contiguous sequence
-                let bh = received_block.height;
-                if sync_order_buffer.len() < MAX_SYNC_BUFFER_SIZE {
-                    sync_order_buffer.entry(bh).or_insert(received_block);
-                } else if !sync_order_buffer.contains_key(&bh) {
-                    // Buffer full — evict highest block to make room for lower (more useful) block
-                    if let Some((&max_h, _)) = sync_order_buffer.iter().next_back() {
-                        if bh < max_h {
-                            sync_order_buffer.remove(&max_h);
-                            sync_order_buffer.insert(bh, received_block);
-                        }
-                        // else: block is higher than everything in buffer, drop it
-                    }
-                }
-
-                // Drain contiguous sequence starting from local_height + 1
-                let local_h = storage.get_chain_height().unwrap_or(0);
-                let genesis_in_storage = local_h > 0 || storage.load_microblock(0).map(|r| r.is_some()).unwrap_or(false);
-                let mut next_expected = local_h + 1;
-
-                if !genesis_in_storage {
-                    // Genesis (block 0) is missing — we MUST process it first
-                    if sync_order_buffer.contains_key(&0) {
-                        // Genesis is in buffer — drain starting from 0
-                        next_expected = 0;
-                    } else {
-                        // Genesis not in buffer AND not in storage — cannot drain anything
-                        if is_debug() { println!("[DBG][SYNC-BUF] waiting_genesis buffered={}", sync_order_buffer.len()); }
-                        continue;
-                    }
-                }
-
-                let mut drained = Vec::new();
-                while let Some(block) = sync_order_buffer.remove(&next_expected) {
-                    drained.push((block, false));
-                    next_expected += 1;
-                }
-
-                if !drained.is_empty() && drained.len() > 1 {
-                    if is_info() {
-                        println!("[INFO][SYNC-BUF] drained {} blocks h={}-{} buffered={}",
-                                 drained.len(),
-                                 drained.first().map(|(b, _)| b.height).unwrap_or(0),
-                                 drained.last().map(|(b, _)| b.height).unwrap_or(0),
-                                 sync_order_buffer.len());
-                    }
-                }
-
-                if drained.is_empty() {
-                    // No contiguous blocks ready yet — continue receiving
-                    continue;
-                }
-                blocks_to_process = drained;
-            } else {
-                // LIVE MODE or RETRY: process single block immediately (existing behavior)
-                blocks_to_process = vec![(received_block, is_retry)];
-            }
-
-            // When sync completes, flush remaining buffer into retry channel
-            if !is_sync_active && !sync_order_buffer.is_empty() {
-                let flushed = sync_order_buffer.len();
-                for (_, block) in std::mem::take(&mut sync_order_buffer) {
-                    let _ = retry_tx.try_send(block);
-                }
-                if flushed > 0 {
-                    println!("[INFO][SYNC-BUF] sync_complete flush={} blocks_to_retry", flushed);
-                }
-            }
-
-            for (received_block, is_retry) in blocks_to_process {
-
-            // PERF: Decompress block data once and reuse across all processing stages
-            // Avoids 3x redundant zstd decompression (producer check, storage, WS broadcast, mempool)
-            let cached_decompressed: Vec<u8> = zstd::decode_all(&received_block.data[..])
-                .unwrap_or_else(|_| received_block.data.clone());
-
-            // ═══════════════════════════════════════════════════════════════════
-            // v4.1: Ignore blocks from self-excluded producers (entropy_fork_detected only)
-            // v3.10 origin: was also used by emergency_failover, now removed (caused FORKS)
-            // Remaining use: node self-excludes when it detects entropy fork (line 12186)
-            // ═══════════════════════════════════════════════════════════════════
-            {
-                let current_height = *height.read().await;
-
-                // Extract producer from block data (if available)
-                let block_producer: Option<String> = {
-                    if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&cached_decompressed) {
-                        Some(microblock.producer.clone())
-                    } else {
-                        None
-                    }
-                };
-                
-                if let Some(ref producer) = block_producer {
-                    // v14.8.9: in-RAM `is_producer_excluded` CHECK ON INGEST removed.
-                    //
-                    // Rationale: the exclusion is written to a node-local
-                    // `EXCLUDED_PRODUCERS` map at times that differ per node
-                    // (who triggered fork detection first, network delay of
-                    // emergency-failover gossip, etc.). Rejecting on ingest
-                    // against that mutable local state means two honest
-                    // validators can disagree on whether a given block is
-                    // acceptable at the same height → divergent canonical
-                    // chains → avoidable fork.
-                    //
-                    // Canonical authority for "this producer is excluded"
-                    // is the on-chain `macroblock.excluded_producers_for_next_epoch`
-                    // snapshot, which is identical on every node by
-                    // construction. That snapshot is already consulted when
-                    // building the candidate list in producer selection
-                    // (see the excluded_node_ids filter around the VRF
-                    // candidate builder). A producer excluded by consensus
-                    // will never be the expected VRF winner → blocks they
-                    // sign will fail the ingest hash-chain check on their
-                    // own minority branch.
-                    //
-                    // The in-RAM tracker is retained for the SELF-exclude
-                    // gate only (this-node-will-not-produce-if-it-detected-
-                    // its-own-fork) which cannot create divergence because
-                    // it's an output-side filter, not an input-side reject.
-                    
-                    // Also check if this block is way ahead of our chain (fork indicator)
-                    // If block height > local + 100, producer might be on a fork
-                    // saturating_add: prevents overflow when current_height is near u64::MAX
-                    if received_block.height > current_height.saturating_add(100) {
-                        println!("[WARN][FORK] suspicious_block h={} local={} producer={} gap={}", 
-                                 received_block.height, current_height, producer,
-                                 received_block.height.saturating_sub(current_height));
-                        // Don't exclude yet, but log for monitoring
-                    }
-                    
-                }
-                
-                // Periodically clear expired exclusions
-                if received_block.height % 100 == 0 {
-                    clear_expired_exclusions(current_height);
-                }
-                
-                // v3.20: Cleanup global DashMaps to prevent memory leaks
-                cleanup_global_hashmaps(current_height);
-            }
-            
-            // v3.0 FIX: Skip duplicate processing for NON-RETRY blocks
-            // If block is already in pending_blocks and was added recently (< 1 sec), skip
-            // This prevents memory growth from multiple peers sending same block
-            if !is_retry {
-                if let Some((_, _, timestamp)) = pending_blocks.get(&received_block.height) {
-                    if timestamp.elapsed() < std::time::Duration::from_secs(1) {
-                        if is_debug() { 
-                            println!("[DBG][BLOCK] skip_dup h={} age={}ms", 
-                                     received_block.height, timestamp.elapsed().as_millis()); 
-                        }
-                        continue; // Skip - already being processed
-                    }
-                }
-            }
-            
-            // Check for special ping signal
-            if received_block.height == u64::MAX {
-                // Parse ping data: "PING:node_id:success:response_time_ms"
-                if let Ok(ping_str) = String::from_utf8(received_block.data.clone()) {
-                    let parts: Vec<&str> = ping_str.split(':').collect();
-                    if parts.len() == 4 && parts[0] == "PING" {
-                        let node_id = parts[1];
-                        let success = parts[2] == "true";
-                        let response_time_ms = parts[3].parse::<u32>().unwrap_or(0);
-                        
-                        if is_debug() { println!("[DBG][PING] processing node={} latency={}ms", node_id, response_time_ms); }
-                        
-                        // CRITICAL FIX: Forward to reward manager for tracking
-                        // Note: In this context we only log, actual recording happens in RPC handler
-                        if success {
-                            if is_debug() { println!("[DBG][PING] recorded node={} status=ok", node_id); }
-                        } else {
-                            println!("[WARN][PING] failed node={}", node_id);
-                        }
-                    }
-                }
-                continue; // Skip normal block processing
-            }
-            
-            // PRODUCTION: Enhanced logging for debugging compression issues
-            // Check if data is compressed (Zstd magic bytes: 0x28, 0xB5, 0x2F, 0xFD)
-            let is_compressed = received_block.data.len() >= 4 && 
-                               received_block.data[0] == 0x28 && 
-                               received_block.data[1] == 0xB5 &&
-                               received_block.data[2] == 0x2F &&
-                               received_block.data[3] == 0xFD;
-            
-            // Log every 10th block or special cases
-            let should_log = received_block.height % 10 == 0 || received_block.height <= 5;
-            if should_log {
-                if is_info() { println!("[INFO][BLOCK] recv type={} h={} from={} bytes={} zstd={}",
-                         received_block.block_type, 
-                         received_block.height, 
-                         received_block.from_peer, 
-                         received_block.data.len(),
-                         if is_compressed { "yes" } else { "no" }); }
-            }
-            
-            // PRODUCTION: Validate and store received block
-            // REPUTATION FIX: Track producer_id for reputation sync across all nodes
-            let mut block_producer_id: Option<String> = None;
-            
-            let store_result = match received_block.block_type.as_str() {
-                "micro" => {
-                    // Validate microblock signature and structure
-                    if let Err(e) = Self::validate_received_microblock(&received_block, &storage, unified_p2p.as_ref(), None).await {
-                        // CRITICAL FIX: Check if error is due to CERTIFICATE RACE CONDITION
-                        // Block arrives before certificate → buffer for retry when certificate arrives
-                        if e.contains("Invalid signature") && e.contains("from producer") {
-                            let retry_count = pending_blocks.get(&received_block.height)
-                                .map(|(_, count, _)| count + 1)
-                                .unwrap_or(0);
-                            
-                            // v8.1: During sync, allow more retries — VRF keys arrive via heartbeat
-                            // which may take 10-30s after connection is established.
-                            // Live mode: 5 retries (cert race is short-lived)
-                            // Sync mode: 30 retries (need to wait for heartbeat with VRF pubkey)
-                            let is_sync_mode = coordinator_is_syncing()
-                                || {
-                                    let local_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
-                                    local_h + 50 < received_block.height
-                                };
-                            let max_cert_retries: u16 = if is_sync_mode { 30 } else { 5 };
-                            
-                            if retry_count < max_cert_retries {
-                                if is_debug() { println!("[DBG][BLOCK] buffer h={} retry={} wait_cert={}", 
-                                         received_block.height, retry_count, received_block.from_peer); }
-                                
-                                // MEMORY PROTECTION: Enforce maximum buffer size (adaptive by node type)
-                                if pending_blocks.len() >= max_pending_blocks {
-                                    // Remove oldest block to make room (but not the one we're inserting)
-                                    if let Some((&oldest_height, _)) = pending_blocks.iter()
-                                        .filter(|(&h, _)| h != received_block.height)  // Don't remove current block
-                                        .min_by_key(|(_, (_, _, timestamp))| timestamp) {
-                                        pending_blocks.remove(&oldest_height);
-                                        println!("[WARN][BLOCK] buffer_full max={} evicted={}", 
-                                                 max_pending_blocks, oldest_height);
-                                    }
-                                }
-                                
-                                pending_blocks.insert(
-                                    received_block.height, 
-                                    (received_block.clone(), retry_count, std::time::Instant::now())
-                                );
-                                
-                                // v2.105: Clear from PENDING_SYNC_BLOCKS so duplicate can come if needed
-                                crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                                
-                                // METRICS: Track certificate race condition occurrence
-                                if retry_count == 0 {
-                                    RETRY_CERT_RACE.fetch_add(1, Ordering::Relaxed);
-                                }
-                                
-                                // VRF keys arrive via heartbeat broadcast (every 10-30s)
-                                if is_debug() { println!("[DBG][BLOCK] cert_pending retry={}/{} sync={}", retry_count, max_cert_retries, is_sync_mode); }
-                                continue;
-                            } else {
-                                crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                                if is_warn() { println!("[WARN][BLOCK] cert_exhausted h={} retries={} sync={}", 
-                                         received_block.height, retry_count, is_sync_mode); }
-                            }
-                        }
-                        // CRITICAL FIX: Check if error is due to missing previous block
-                        else if e.starts_with("MISSING_PREVIOUS:") {
-                            // Parse missing block height
-                            if let Some(height_str) = e.strip_prefix("MISSING_PREVIOUS:") {
-                                if let Ok(missing_height) = height_str.parse::<u64>() {
-                                    // CRITICAL FIX: Buffer this block for retry
-                                    let retry_count = pending_blocks.get(&received_block.height)
-                                        .map(|(_, count, _)| count + 1)
-                                        .unwrap_or(0);
-                                    
-                                    // CRITICAL v2.19.20: PSEUDO-INFINITE retries for block reliability
-                                    // Blocks are critical data - NEVER discard them!
-                                    // Protection layers:
-                                    // 1. max_pending_blocks = 500 (Super) / 100 (Light defensive cap; Light never syncs)
-                                    // 2. Exponential backoff after 10 retries (network protection)
-                                    // 3. Rate limiting on requests (CPU protection)
-                                    // 4. Background sync every 30s (persistent recovery)
-                                    //
-                                    // Backoff schedule:
-                                    // - Retries 0-9: aggressive (immediate)
-                                    // - Retries 10+: exponential (30s, 60s, 120s, 240s, 300s max)
-                                    let backoff_phase = if retry_count < 10 { "aggressive" } else { "backoff" };
-                                    if is_debug() { println!("[DBG][BLOCK] buffer h={} retry={} reason={} wait_prev={}", 
-                                             received_block.height, retry_count, backoff_phase, missing_height); }
-                                    
-                                    // ALWAYS buffer - never discard! (pseudo-infinite)
-                                        
-                                        // MEMORY PROTECTION: Enforce maximum buffer size (adaptive by node type)
-                                        if pending_blocks.len() >= max_pending_blocks {
-                                            // Remove oldest block to make room (but not the one we're inserting)
-                                            if let Some((&oldest_height, _)) = pending_blocks.iter()
-                                                .filter(|(&h, _)| h != received_block.height)  // Don't remove current block
-                                                .min_by_key(|(_, (_, _, timestamp))| timestamp) {
-                                                pending_blocks.remove(&oldest_height);
-                                                println!("[WARN][BLOCK] buffer_full max={} evicted={}", 
-                                                         max_pending_blocks, oldest_height);
-                                            }
-                                        }
-                                        
-                                        pending_blocks.insert(
-                                            received_block.height, 
-                                            (received_block.clone(), retry_count, std::time::Instant::now())
-                                        );
-                                        
-                                        // v2.105: Clear from PENDING_SYNC_BLOCKS so block can be re-requested
-                                        crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                                        
-                                        // METRICS: Track missing previous block occurrence
-                                        if retry_count == 0 {
-                                            RETRY_MISSING_PREV.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        
-                                        // CRITICAL FIX v3.0: Request missing block PERIODICALLY, not just on first attempt
-                                        // Bug fix: If first request fails, missing block was NEVER requested again!
-                                        // Now request on: first attempt (0), every 5 retries (5,10,15...) 
-                                        let should_request_missing = retry_count == 0 || retry_count % 5 == 0;
-                                        if should_request_missing {
-                                            // Check if we can request this block (rate limiting)
-                                            let can_request = if let Some((last_request, request_count)) = requested_blocks.get(&missing_height) {
-                                                // ADAPTIVE: Use fast sync if far behind
-                                                let blocks_behind = pending_blocks.len() as u64;
-                                                let cooldown = if blocks_behind > FAST_SYNC_THRESHOLD {
-                                                    REQUEST_COOLDOWN_FAST  // Fast sync mode
-                                                } else {
-                                                    REQUEST_COOLDOWN_NORMAL // Normal mode
-                                                };
-                                                
-                                                // Check cooldown period
-                                                if last_request.elapsed().as_secs() >= cooldown {
-                                                    // Cooldown passed, check retry limit
-                                                    // v3.0: Increased from 3 to 10 since we now request every 5 retries
-                                                    *request_count < 10 // Max 10 request attempts per block
-                                                } else {
-                                                    false // Still in cooldown
-                                                }
-                                            } else {
-                                                // Never requested before, check total concurrent requests
-                                                requested_blocks.len() < MAX_CONCURRENT_REQUESTS
-                                            };
-                                            
-                                            if can_request {
-                                                if is_debug() { println!("[DBG][BLOCK] request_missing h={}", missing_height); }
-                                                
-                                                // Update request tracking
-                                                let request_count = requested_blocks.get(&missing_height)
-                                                    .map(|(_, count)| count + 1)
-                                                    .unwrap_or(1);
-                                                requested_blocks.insert(missing_height, (std::time::Instant::now(), request_count));
-                                                
-                                                // CRITICAL: Actually request the missing block via P2P
-                                                // v3.34: Dedup — skip if sync for this height is already in-flight
-                                                if let Some(p2p) = &unified_p2p {
-                                                    if !crate::unified_p2p::try_acquire_sync_slot(missing_height) {
-                                                        if is_debug() { println!("[DBG][SYNC] dedup_skip h={} already_inflight", missing_height); }
-                                                    } else {
-                                                    let p2p_clone = p2p.clone();
-                                                    let retry_missing_height = missing_height;
-                                                    tokio::spawn(async move {
-                                                        for attempt in 1..=3 {
-                                                            if retry_missing_height == 0 {
-                                                                if is_debug() { println!("[DBG][BLOCK] request_genesis attempt={}", attempt); }
-                                                            if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
-                                                                    println!("[WARN][BLOCK] genesis_req_fail attempt={} err={}", attempt, e);
-                                                                    if attempt < 3 {
-                                                                        tokio::time::sleep(Duration::from_secs(attempt)).await;
-                                                                        continue;
-                                                                    }
-                                                            } else {
-                                                                if is_debug() { println!("[DBG][BLOCK] genesis_requested"); }
-                                                                    break;
-                                                            }
-                                                        } else {
-                                                            let network_h = p2p_clone.get_max_peer_height();
-                                                            let gap = network_h.saturating_sub(retry_missing_height);
-                                                            
-                                                            let (from, to) = if gap > 5 && retry_missing_height > 0 {
-                                                                let batch_end = std::cmp::min(network_h, retry_missing_height + 50);
-                                                                if is_info() {
-                                                                    println!("[INFO][SYNC] batch_request gap={} range={}-{}", 
-                                                                             gap, retry_missing_height, batch_end);
-                                                                }
-                                                                (retry_missing_height, batch_end)
-                                                            } else {
-                                                                (retry_missing_height, retry_missing_height)
-                                                            };
-                                                            
-                                                            if let Err(e) = p2p_clone.sync_blocks(from, to).await {
-                                                                println!("[WARN][BLOCK] request_fail h={}-{} attempt={} err={}", from, to, attempt, e);
-                                                                if attempt < 3 {
-                                                                    tokio::time::sleep(Duration::from_secs(attempt)).await;
-                                                                    continue;
-                                                                }
-                                                            } else {
-                                                                if is_debug() { println!("[DBG][BLOCK] requested h={}-{}", from, to); }
-                                                                break;
-                                                            }
-                                                        }
-                                                        }
-                                                        crate::unified_p2p::release_sync_slot(retry_missing_height);
-                                                    });
-                                                    } // end dedup else
-                                                }
-                                            } else {
-                                                if is_debug() { println!("[DBG][BLOCK] rate_limit delay h={}", missing_height); }
-                                            }
-                                        }
-                                    
-                                    // PSEUDO-INFINITE: No else branch - block is ALWAYS buffered above
-                                    // Background sync (every 30s) will re-request with exponential backoff
-                                }
-                            }
-                        } else if e.starts_with("PRODUCER_MISMATCH:") {
-                            // v5.5: Block from wrong producer at round=0 — discard silently.
-                            // This prevents forks during rolling updates when a restarted node
-                            // produces with a stale timeout_round.
-                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                            if is_warn() {
-                                println!("[WARN][SEC] {} — block discarded", e);
-                            }
-                        } else if e.starts_with("FORK_DETECTED:") {
-                            // CRITICAL: Fork detected - handle asynchronously to avoid blocking
-                            if let Some(fork_info) = e.strip_prefix("FORK_DETECTED:") {
-                                let parts: Vec<&str> = fork_info.split(':').collect();
-                                if parts.len() == 2 {
-                                    if let Ok(fork_height) = parts[0].parse::<u64>() {
-                                        // CRITICAL: Clone fork_producer to String for async move
-                                        let fork_producer = parts[1].to_string();
-                                        
-                                        // CRITICAL: Check if reorg already in progress (prevent race condition)
-                                        let is_reorg_active = *reorg_in_progress.read().await;
-                                        if is_reorg_active {
-                                            // v2.105: Clear pending so block can be re-requested after reorg
-                                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                                            if is_debug() { println!("[DBG][REORG] in_progress=true skip fork_from={}", fork_producer); }
-                                            continue;
-                                        }
-                                        
-                                        // CRITICAL: Rate limit fork attempts (prevent DoS) 
-                                        // But allow immediate sync if it's our own fork
-                                        let last_attempt = *last_fork_attempt.read().await;
-                                        let own_fork = if let Some(p2p) = &unified_p2p {
-                                            fork_producer == p2p.get_node_id()
-                                        } else { false };
-                                        
-                                        // CRITICAL FIX: Always handle forks immediately, but rate limit to prevent DoS
-                                        if !own_fork && last_attempt.elapsed().as_secs() < FORK_ATTEMPT_COOLDOWN_SECS {
-                                            // v2.105: Clear pending so block can be re-requested later
-                                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                                            println!("[WARN][REORG] rate_limited cooldown={}s", FORK_ATTEMPT_COOLDOWN_SECS);
-                                            continue;
-                                        }
-                                        
-                                        // Update last attempt timestamp
-                                        *last_fork_attempt.write().await = std::time::Instant::now();
-                                        
-                                        if is_info() { println!("[INFO][REORG] fork_detected h={} producer={}", fork_height, fork_producer); }
-                                        
-                                        // PRODUCTION: Compute our consensus hash BEFORE spawning async task
-                                        // v12.0: Use load_microblock_auto_format + block.hash() — consensus hash from struct fields,
-                                        // not raw storage bytes (which depend on compression/serialization format).
-                                        let our_hash_for_state = {
-                                            let storage_ref = storage.clone();
-                                            let fh = fork_height;
-                                            match tokio::task::spawn_blocking(move || storage_ref.load_microblock_auto_format(fh)).await {
-                                                Ok(Ok(Some(block))) => hex::encode(&block.hash()[0..8]),
-                                                _ => format!("missing@{}", fork_height),
-                                            }
-                                        };
-                                        
-                                        // STATE MACHINE: Resolving fork (with real hash)
-                                        set_node_state(NodeState::ResolvingFork {
-                                            fork_height,
-                                            our_hash: our_hash_for_state,
-                                        });
-                                        
-                                        // CRITICAL FIX: Instead of complex reorg, sync with network majority
-                                        // This is simpler and more reliable for Byzantine consensus
-                                        let storage_clone = storage.clone();
-                                        let height_clone = height.clone();
-                                        let p2p_clone = unified_p2p.clone();
-                                        let reorg_flag = reorg_in_progress.clone();
-                                        let fork_producer_clone = fork_producer.clone();
-                                        // v15.9: Capture state into the spawned reorg task so the
-                                        // post-rollback reconciliation can rebuild the in-memory
-                                        // account view. Without this clone the spawned future
-                                        // could not access the StateManager and the rollback would
-                                        // leave a stale in-memory view as before.
-                                        let state_clone_reorg = state.clone();
-                                        
-                                        tokio::spawn(async move {
-                                            // Mark reorg as in progress
-                                            *reorg_flag.write().await = true;
-                                            
-                                            // CRITICAL: Query network for consensus on this height
-                                            if let Some(p2p) = &p2p_clone {
-                                                // Get network consensus height
-                                                if let Ok(network_height) = p2p.sync_blockchain_height().await {
-                                                    let local_height = *height_clone.read().await;
-                                                    
-                                                    if is_debug() { println!("[DBG][REORG] compare local={} network={} fork={}", 
-                                                             local_height, network_height, fork_height); }
-                                                    
-                                                    // CASE 1: Network is ahead - sync to catch up
-                                                    if network_height > local_height {
-                                                        if is_info() { println!("[INFO][REORG] network_ahead local={} network={}", local_height, network_height); }
-                                                        
-                                                        // Rollback to fork point and resync
-                                                        if fork_height <= local_height {
-                                                            let rollback_to = fork_height.saturating_sub(1);
-
-                                                            // v14.8: Atomic claim + finality check.
-                                                            let finalized_h = crate::node::LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-                                                            if let Err(reason) = crate::storage::begin_finality_guarded_rollback(rollback_to, finalized_h) {
-                                                                println!("[WARN][REORG] {} — skipping reorg", reason);
-                                                                return;
-                                                            }
-
-                                                            if is_info() { println!("[INFO][REORG] rollback from={} to={}", local_height, rollback_to); }
-                                                            
-                                                            for h in fork_height..=local_height {
-                                                                if let Err(e) = storage_clone.delete_microblock(h) {
-                                                                    println!("[WARN][REORG] delete_failed h={} err={}", h, e);
-                                                                }
-                                                            }
-
-                                                            // v10.2: DISK FIRST, RAM SECOND (crash-safe order)
-                                                            if let Err(e) = storage_clone.set_chain_height(rollback_to) {
-                                                                eprintln!("[ERR][STORAGE] rollback_set_chain_height failed h={}: {}", rollback_to, e);
-                                                            }
-                                                            *height_clone.write().await = rollback_to;
-                                                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                                                rollback_to, std::sync::atomic::Ordering::Release
-                                                            );
-
-                                                            crate::storage::end_rollback_protection();
-
-                                                            // v3.31: Clear pending sync queues after rollback
-                                                            complete_rollback_cleanup(rollback_to);
-
-                                                            // v15.9: STATE RECONCILIATION (REORG path)
-                                                            // ─────────────────────────────────────────
-                                                            // Same invariant as the FORK rollback site:
-                                                            // disk-side delete must be paired with an
-                                                            // in-memory state rebuild. Without this,
-                                                            // the next sync round validates blocks
-                                                            // against a state that includes the
-                                                            // rolled-back mutations and silently
-                                                            // diverges from the canonical chain.
-                                                            if let Err(e) = Self::reconcile_state_after_rollback(
-                                                                &state_clone_reorg,
-                                                                &storage_clone,
-                                                                rollback_to,
-                                                            ).await {
-                                                                println!(
-                                                                    "[ERR][STATE] reconcile_after_reorg_failed target={} err={} action=resync_required",
-                                                                    rollback_to, e,
-                                                                );
-                                                            } else {
-                                                                println!(
-                                                                    "[INFO][STATE] reconcile_after_reorg_ok target={}",
-                                                                    rollback_to,
-                                                                );
-                                                            }
-                                                        }
-
-                                                        // Sync missing blocks
-                                                        let sync_to = std::cmp::min(network_height, fork_height.saturating_add(100));
-                                                        if is_debug() { println!("[DBG][REORG] request from={} to={}", fork_height, sync_to); }
-                                                        if let Err(e) = p2p.sync_blocks(fork_height, sync_to).await {
-                                                            println!("[ERR][REORG] sync_failed err={}", e);
-                                                        } else {
-                                                            if is_info() { println!("[INFO][REORG] resolved synced=longer_chain"); }
-                                                        }
-                                                    }
-                                                    // CASE 2: Same height — attestation fork-choice with Byzantine-safe threshold.
-                                                    //
-                                                    // v14.8.8: tightened from `count > 0` to 2f+1 of the active validator
-                                                    // set. Rationale: with `count > 0` a Byzantine validator could emit
-                                                    // a single attestation for its own minority fork and make our node
-                                                    // keep-local against a legitimately different network chain — forcing
-                                                    // us off the canonical path until the macroblock boundary resolves
-                                                    // it (~90 s lag). With 2f+1 the attacker would need to produce
-                                                    // Byzantine-supermajority signatures, which by definition exceeds
-                                                    // their ≤ f key budget.
-                                                    //
-                                                    // v3.33 (preserved): only attestations for THIS exact block hash
-                                                    // count — prevents a rival fork's attestations from being conflated.
-                                                    //
-                                                    // Liveness: at 2f+1 we resync immediately when unsure, instead of
-                                                    // waiting for macroblock finality to disambiguate.
-                                                    //
-                                                    // Scalability: `has_sufficient_attestations_for_hash` uses the
-                                                    // already-populated per-hash counter, O(validators_at_height) once
-                                                    // per fork event; negligible at 5 or 5000 validators.
-                                                    else if network_height == local_height && fork_height <= local_height {
-                                                        // Compute SHA3-256 of our local block at fork_height
-                                                        let our_local_hash: Option<[u8; 32]> =
-                                                            storage_clone.load_microblock(fork_height)
-                                                                .ok()
-                                                                .and_then(|opt| opt)
-                                                                .map(|block_data| {
-                                                                    let mut h = Sha3_256::new();
-                                                                    h.update(&block_data);
-                                                                    let mut arr = [0u8; 32];
-                                                                    arr.copy_from_slice(&h.finalize());
-                                                                    arr
-                                                                });
-
-                                                        let total_validators = p2p.get_active_validator_count();
-                                                        let committee_size = crate::attestation_committee::get_attestation_committee_size(total_validators);
-                                                        let attest_byz_threshold = (committee_size.saturating_mul(2).saturating_add(2)) / 3;
-                                                        let our_attest = our_local_hash
-                                                            .map(|hash| crate::unified_p2p::get_attestation_count_for_hash(fork_height, &hash))
-                                                            .unwrap_or(0);
-
-                                                        // ═══════════════════════════════════════════════════════════
-                                                        // FORK-CHOICE LAYER 1 — Per-block 2f+1 supermajority on the
-                                                        // disputed height. Same as before; if our block is locked in
-                                                        // by a Byzantine supermajority of committee attestations, we
-                                                        // KEEP local — no rollback.
-                                                        // ═══════════════════════════════════════════════════════════
-                                                        let is_sufficient = our_local_hash
-                                                            .map(|hash| crate::unified_p2p::get_attestation_count_for_hash(
-                                                                fork_height, &hash,
-                                                            ) >= attest_byz_threshold)
-                                                            .unwrap_or(false);
-
-                                                        if is_sufficient {
-                                                            METRIC_FORK_KEEP_LOCAL_LAYER1.fetch_add(1, Ordering::Relaxed);
-                                                            METRIC_LATEST_COMMITTEE_SIZE.store(committee_size as u64, Ordering::Relaxed);
-                                                            if is_info() {
-                                                                println!("[INFO][REORG] supermajority_lock h={} attestations={}/{} threshold=2f+1={} action=keep_local",
-                                                                         fork_height, our_attest, committee_size, attest_byz_threshold);
-                                                            }
-                                                            // Our block has a Byzantine-supermajority of attestations —
-                                                            // keep it, do NOT resync.
-                                                            *reorg_flag.write().await = false;
-                                                            return;
-                                                        }
-
-                                                        METRIC_FORK_RESYNC.fetch_add(1, Ordering::Relaxed);
-
-                                                        if is_info() {
-                                                            println!("[INFO][REORG] same_height={} fork=detected attestations_for_our_hash={}/{} below_2f+1={} resync=network",
-                                                                     local_height, our_attest, committee_size, attest_byz_threshold);
-                                                        }
-
-                                                        // Get our hash at fork_height for logging (hex prefix)
-                                                        let our_hash = our_local_hash
-                                                            .map(|h| hex::encode(&h[..8]))
-                                                            .unwrap_or_else(|| "unknown".to_string());
-                                                        
-                                                        if is_debug() { println!("[DBG][REORG] our_block h={} hash={}", fork_height, our_hash); }
-                                                        if is_debug() { println!("[DBG][REORG] fork_from={}", fork_producer_clone); }
-                                                        
-                                                        // SIMPLE AND RELIABLE APPROACH:
-                                                        // 1. Rollback to fork point
-                                                        // 2. Request blocks from highest-reputation peer
-                                                        // 3. The correct chain will be validated and accepted
-                                                        // 4. Macroblock (every 90 blocks) will finalize the correct chain
-                                                        
-                                                        // Count high-rep validators for logging (using cached reputation)
-                                                        use qnet_consensus::deterministic_reputation::MIN_CONSENSUS_REPUTATION;
-                                                        let peers = p2p.get_validated_active_peers();
-                                                        let high_rep_count = peers.iter()
-                                                            .filter(|p| p.reputation() >= MIN_CONSENSUS_REPUTATION)
-                                                            .count();
-                                                        
-                                                        if is_debug() { println!("[DBG][REORG] high_rep_validators={}", high_rep_count); }
-                                                        
-                                                        // Only resync if we have enough validators to trust
-                                                        // BFT 3f+1 where f=1 → need 4 peers minimum
-                                                        const MIN_PEERS_FOR_RESYNC: usize = 4;
-                                                        
-                                                        if high_rep_count >= MIN_PEERS_FOR_RESYNC {
-                                                            if is_info() { println!("[INFO][REORG] resync validators={}", high_rep_count); }
-                                                            let rollback_to = fork_height.saturating_sub(1);
-
-                                                            // v14.8: Atomic claim + finality check.
-                                                            let finalized_h = crate::node::LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-                                                            if let Err(reason) = crate::storage::begin_finality_guarded_rollback(rollback_to, finalized_h) {
-                                                                println!("[WARN][REORG] {} — skipping resync", reason);
-                                                                return;
-                                                            }
-                                                            
-                                                            // Rollback to fork point
-                                                            for h in fork_height..=local_height {
-                                                                let _ = storage_clone.delete_microblock(h);
-                                                            }
-                                                            // v10.2: DISK FIRST, RAM SECOND (crash-safe order)
-                                                            if let Err(e) = storage_clone.set_chain_height(rollback_to) {
-                                                                eprintln!("[ERR][STORAGE] rollback_set_chain_height failed h={}: {}", rollback_to, e);
-                                                            }
-                                                            *height_clone.write().await = rollback_to;
-                                                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                                                rollback_to, std::sync::atomic::Ordering::Release
-                                                            );
-
-                                                            crate::storage::end_rollback_protection();
-
-                                                            // v3.31: Clear pending sync queues after rollback
-                                                            complete_rollback_cleanup(rollback_to);
-
-                                                            // v15.9: STATE RECONCILIATION (same-height fork path)
-                                                            // ─────────────────────────────────────────────────────
-                                                            // The attestation fork-choice failed (we hold the
-                                                            // minority chain at this height) — disk-side rollback
-                                                            // erased our microblocks at heights > rollback_to.
-                                                            // Reconcile the in-memory state to match the new
-                                                            // chain tip before fresh blocks land from the
-                                                            // canonical chain.
-                                                            if let Err(e) = Self::reconcile_state_after_rollback(
-                                                                &state_clone_reorg,
-                                                                &storage_clone,
-                                                                rollback_to,
-                                                            ).await {
-                                                                println!(
-                                                                    "[ERR][STATE] reconcile_after_attest_fork_failed target={} err={} action=resync_required",
-                                                                    rollback_to, e,
-                                                                );
-                                                            } else {
-                                                                println!(
-                                                                    "[INFO][STATE] reconcile_after_attest_fork_ok target={}",
-                                                                    rollback_to,
-                                                                );
-                                                            }
-
-                                                            // Request blocks from network
-                                                            // sync_blocks() selects best_peer (highest combined reputation)
-                                                            // Blocks will be validated when received
-                                                            if let Err(e) = p2p.sync_blocks(fork_height, local_height).await {
-                                                                println!("[ERR][REORG] sync_failed err={}", e);
-                                                            } else {
-                                                                if is_info() { println!("[INFO][REORG] resolved resync=network"); }
-                                                                if is_info() { println!("[INFO][REORG] finalize=pending blocks=90"); }
-                                                            }
-                                                        } else {
-                                                            // Not enough validators - keep our chain and wait
-                                                            // This prevents switching to a malicious chain from few nodes
-                                                            println!("[WARN][REORG] insufficient validators={} need={} action=keep", 
-                                                                     high_rep_count, MIN_PEERS_FOR_RESYNC);
-                                                            if is_debug() { println!("[DBG][REORG] retry=pending wait=validators"); }
-                                                        }
-                                                    }
-                                                    // CASE 3: We're ahead - keep our chain
-                                                    else {
-                                                        if is_debug() { println!("[DBG][REORG] ahead local={} network={} action=keep", 
-                                                                 local_height, network_height); }
-                                                    }
-                                                }
-                                            }
-                                            
-                                            // Clear reorg flag
-                                            *reorg_flag.write().await = false;
-                                        });
-                                        
-                                        // Continue processing other blocks immediately
-                                        if is_debug() { println!("[DBG][REORG] fork_analysis=background status=continue"); }
-                                    }
-                                }
-                            }
-                        } else if e.contains("Wrong producer") {
-                            // v3.36: "Wrong producer" means this node's reputation diverged
-                            // from the network (missed macroblock). Track failures and trigger
-                            // macroblock recovery instead of penalizing valid peers.
-                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
-
-                            let wp_entry = wrong_producer_counter
-                                .entry(received_block.height)
-                                .or_insert((0, std::time::Instant::now()));
-                            wp_entry.0 += 1;
-                            let wp_fails = wp_entry.0;
-
-                            if wp_fails < WRONG_PRODUCER_RECOVERY_THRESHOLD {
-                                if is_info() {
-                                    println!("[INFO][CONS] wrong_producer h={} fails={}/{} — waiting for macroblock sync",
-                                             received_block.height, wp_fails, WRONG_PRODUCER_RECOVERY_THRESHOLD);
-                                }
-                            } else if last_wp_recovery_attempt.elapsed().as_secs() < WP_RECOVERY_COOLDOWN_SECS {
-                                if is_info() {
-                                    println!("[INFO][CONS] wrong_producer h={} fails={} — recovery cooldown ({}s left)",
-                                             received_block.height, wp_fails,
-                                             WP_RECOVERY_COOLDOWN_SECS - last_wp_recovery_attempt.elapsed().as_secs());
-                                }
-                            } else {
-                                last_wp_recovery_attempt = std::time::Instant::now();
-                                println!("[WARN][CONS] wrong_producer h={} fails={} — reputation diverged, triggering macroblock recovery",
-                                         received_block.height, wp_fails);
-
-                                let mb_index = received_block.height / 90;
-                                let scan_from = if mb_index > 5 { mb_index - 5 } else { 1 };
-
-                                for idx in scan_from..=mb_index {
-                                    crate::unified_p2p::clear_macroblock_pending_sync(idx);
-                                }
-
-                                clear_expected_producer_cache_above(received_block.height.saturating_sub(1));
-
-                                // Spawn recovery in background to avoid blocking block processing loop
-                                // sync_macroblocks can take up to 75s (5 peers × 15s timeout)
-                                if let Some(p2p) = &unified_p2p {
-                                    let p2p_clone = p2p.clone();
-                                    let recovery_height = received_block.height;
-                                    tokio::spawn(async move {
-                                        if let Err(err) = p2p_clone.sync_macroblocks(scan_from, mb_index).await {
-                                            println!("[WARN][CONS] mb_recovery_failed h={} err={}", recovery_height, err);
-                                        } else {
-                                            println!("[INFO][CONS] mb_recovery_complete h={} range={}-{}", recovery_height, scan_from, mb_index);
-                                        }
-                                    });
-                                }
-                            }
-                        } else if e.contains("TIMESTAMP_INVALID") {
-                            // v9.0: TIMESTAMP_INVALID escalation.
-                            // Problem: clearing pending and retrying doesn't help if sync flags
-                            // aren't set — the block gets rejected again in an infinite loop.
-                            // Solution: count consecutive failures per height. After 3 failures,
-                            // force FAST_SYNC_IN_PROGRESS=true so timestamp validation switches
-                            // to sync mode (skips monotonicity check). Auto-clear after 30s.
-                            static TIMESTAMP_FAIL_COUNTS: once_cell::sync::Lazy<dashmap::DashMap<u64, u32>> =
-                                once_cell::sync::Lazy::new(|| dashmap::DashMap::new());
-                            // Bound: evict old entries if map grows beyond 500 (prevents OOM under attack)
-                            if TIMESTAMP_FAIL_COUNTS.len() > 500 {
-                                let local_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
-                                TIMESTAMP_FAIL_COUNTS.retain(|h, _| *h + 200 > local_h);
-                            }
-                            let fail_count = {
-                                let mut entry = TIMESTAMP_FAIL_COUNTS.entry(received_block.height).or_insert(0);
-                                *entry += 1;
-                                *entry
-                            };
-
-                            if fail_count >= 3 && !coordinator_is_syncing() {
-                                eprintln!("[WARN][TIMESTAMP] escalation h={} fails={} — forcing sync-mode bypass for 30s",
-                                         received_block.height, fail_count);
-                                FAST_SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
-                                // Auto-clear sync flag after 30 seconds
-                                tokio::spawn(async {
-                                    tokio::time::sleep(Duration::from_secs(30)).await;
-                                    FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                                    TIMESTAMP_FAIL_COUNTS.clear();
-                                });
-                            } else {
-                                eprintln!("[WARN][TIMESTAMP] recovery h={} fails={} err={} — clearing pending, will retry",
-                                         received_block.height, fail_count, e);
-                            }
-                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                        } else {
-                            eprintln!("[ERR][BLOCK] invalid_microblock h={} err={}", received_block.height, e);
-                            
-                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                            
-                            if let Some(p2p) = &unified_p2p {
-                                p2p.track_invalid_block(&received_block.from_peer, received_block.height, &e);
-                            }
-                        }
-                        continue;
-                    }
-                    
-                    // PERF: Reuse cached decompressed data from producer extraction above
-                    // Avoids redundant zstd decompression (was done at block reception)
-                    let decompressed_data = cached_decompressed.clone();
-                    
-                    // CRITICAL: Apply transactions from block to state BEFORE saving
-                    // This ensures state consistency across all nodes
-                    match bincode::deserialize::<qnet_state::MicroBlock>(&decompressed_data) {
-                        Ok(microblock) => {
-                            // CRITICAL: Save producer_id for reputation update after storage
-                            block_producer_id = Some(microblock.producer.clone());
-                            if is_debug() { println!("[DBG][REP] block={} producer={}", received_block.height, microblock.producer); }
-                            
-                            // CRITICAL FIX v2.76.1: Take WRITE lock ONCE before loop, not on every iteration!
-                            // Taking lock inside loop caused timeouts and blocked block saving
-                            let state_guard = state.write().await;
-                            
-                            // ═══════════════════════════════════════════════════════════════════
-                            // v3.39: BLOCK-LEVEL SNAPSHOT for full rollback on state_root mismatch
-                            // ONLY create for v3.27+ blocks (with state_root)
-                            // For old blocks - no snapshot needed (saves ~200MB RAM per block)
-                            // ═══════════════════════════════════════════════════════════════════
-                            let has_state_root = microblock.state_root != [0u8; 32];
-                            let mut block_snapshot = if has_state_root {
-                                Some(state_guard.create_block_snapshot(microblock.height))
-                            } else {
-                                None
-                            };
-                            
-                            // ═══════════════════════════════════════════════════════════════════
-                            // v3.38: GENESIS BLOCK TRANSACTIONAL - Clear state before applying
-                            // For Genesis block (h=0): ALWAYS start with clean state
-                            // This ensures all nodes compute identical state_root
-                            // Without this, repeated Genesis reception corrupts state
-                            // ═══════════════════════════════════════════════════════════════════
-                            if microblock.height == 0 {
-                                let existing_accounts = state_guard.account_count();
-                                if existing_accounts > 0 {
-                                    println!("[INFO][STATE] genesis_recv_clear existing_accounts={}", existing_accounts);
-                                    state_guard.clear();
-                                }
-                            }
-                            
-                            // ═══════════════════════════════════════════════════════════════════
-                            // v10.0: Use shared apply_block_to_state() — SINGLE code path
-                            // for all state mutations. Caller handles snapshot, emission check,
-                            // state_root verification, and deferred side effect persistence.
-                            // ═══════════════════════════════════════════════════════════════════
-
-                            // Get processed emission MBs for double-emission prevention
-                            let processed_emission_set = {
-                                let reward_mgr = reward_manager.read().await;
-                                reward_mgr.get_processed_emission_macroblocks().clone()
-                            };
-
-                            let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
-                            let apply_result = Self::apply_block_to_state(
-                                &state_guard,
-                                &microblock,
-                                &storage,
-                                block_snapshot.as_mut(),
-                                Some(&processed_emission_set),
-                            );
-
-                            // v7.1: Persist fork flag on first activation
-                            if !fork_was_active && !apply_result.reward_accruals.is_empty()
-                               && qnet_state::is_pending_rewards_in_merkle() {
-                                if let Err(e) = storage.save_fork_flag("pending_rewards_in_merkle", true) {
-                                    if crate::node::is_warn() {
-                                        println!("[WARN][STORAGE] fork_flag_save_failed key=pending_rewards_in_merkle val=true err={}", e);
-                                    }
-                                }
-                                println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (sync h={})", microblock.height);
-                            }
-                            if is_info() && !apply_result.reward_accruals.is_empty() {
-                                println!("[INFO][REWARDS] sync_accruals_applied count={} h={}",
-                                         apply_result.reward_accruals.len(), microblock.height);
-                            }
-
-                            let computed_state_root = apply_result.merkle_root;
-                            
-                            // Check state root only for v3.27+ blocks (non-zero state_root)
-                            // has_state_root already computed above when deciding to create snapshot
-                            
-                            if has_state_root && computed_state_root != microblock.state_root {
-                                // ═══════════════════════════════════════════════════════════════════
-                                // v3.39: STATE ROOT MISMATCH - FULL BLOCK ROLLBACK!
-                                // This means either:
-                                // 1. Block producer computed different state
-                                // 2. Our state is corrupted/diverged
-                                // 3. Malicious block with wrong state_root
-                                // 
-                                // CRITICAL: Rollback ENTIRE block to prevent state corruption
-                                // Without rollback, node would have invalid state after rejection
-                                // ═══════════════════════════════════════════════════════════════════
-                                eprintln!("[ERR][STATE] state_root_mismatch h={} expected={} computed={}",
-                                         microblock.height,
-                                         hex::encode(&microblock.state_root[..8]),
-                                         hex::encode(&computed_state_root[..8]));
-                                
-                                // v3.39: CRITICAL - Rollback to pre-block state
-                                // This ensures node state is NOT corrupted by partially applied block
-                                if let Some(ref snapshot) = block_snapshot {
-                                    state_guard.rollback_block(snapshot);
-                                    println!("[INFO][STATE] block_rollback h={} (state_root_mismatch)", microblock.height);
-                                }
-                                
-                                // Return error to skip saving this block, but continue loop
-                                Err(format!("state_root_mismatch h={}", microblock.height))
-                            } else {
-                                // State root verified successfully
-                                if is_debug() && microblock.transactions.len() > 0 {
-                                    println!("[DBG][STATE] verified h={} root={} tx={}",
-                                             microblock.height,
-                                             hex::encode(&computed_state_root[..8]),
-                                             microblock.transactions.len());
-                                }
-                                
-                                // State verified - now save the block.
-                                // CRITICAL: if save fails, roll back in-memory state to keep
-                                // RocksDB and StateManager consistent.
-                                match storage.save_microblock(received_block.height, &decompressed_data) {
-                                    Ok(()) => {
-                                        // Block saved — now apply deferred side effects (safe: block is committed)
-                                        if apply_result.deferred_pool3 > 0 {
-                                            if let Some(ref p2p) = unified_p2p {
-                                                p2p.add_to_pool3(apply_result.deferred_pool3);
-                                            }
-                                            if is_debug() { println!("[DBG][POOL3] deferred_pool3_applied amount={}", apply_result.deferred_pool3); }
-                                        }
-                                        for (node_id, type_str, wallet) in &apply_result.deferred_registrations {
-                                            if let Err(e) = storage.save_node_registration_at_height(node_id, type_str, wallet, 1.0, microblock.height) {
-                                                eprintln!("[ERR][STORAGE] save_node_registration failed node={} err={}", node_id, e);
-                                            }
-                                        }
-                                        if is_debug() && !apply_result.deferred_registrations.is_empty() {
-                                            println!("[DBG][REG] deferred_registrations_applied count={} h={}",
-                                                     apply_result.deferred_registrations.len(), microblock.height);
-                                        }
-                                        for mb_idx in &apply_result.deferred_emission_mbs {
-                                            let mut reward_mgr = reward_manager.write().await;
-                                            let mut processed_set = reward_mgr.get_processed_emission_macroblocks().clone();
-                                            processed_set.insert(*mb_idx);
-                                            reward_mgr.set_processed_emission_macroblocks(processed_set.clone());
-                                            drop(reward_mgr);
-                                            if let Err(e) = storage.save_processed_emission_macroblocks(&processed_set) {
-                                                eprintln!("[WARN][STATE] deferred_emission_save_fail mb={} err={}", mb_idx, e);
-                                            }
-                                        }
-                                        for (node_id, amount) in &apply_result.deferred_reward_clears {
-                                            {
-                                                let mut reward_mgr = reward_manager.write().await;
-                                                let _ = reward_mgr.clear_pending_reward(node_id);
-                                            }
-                                            if let Err(e) = storage.delete_pending_reward(node_id) {
-                                                if is_debug() { println!("[DBG][CLAIM] deferred_delete_fail node={} err={}", node_id, e); }
-                                            } else if is_info() {
-                                                println!("[INFO][CLAIM] synced_claim node={} amount={} QNC", 
-                                                         node_id, amount / 1_000_000_000);
-                                            }
-                                        }
-                                        // v7.0: Note — reward accruals already applied BEFORE finalize_merkle above
-
-                                        // v9.5: CRITICAL — Extract VRF keys from NodeRegistration TXs in synced blocks.
-                                        // Without this, a node syncing from h=0 has NO VRF keys in memory,
-                                        // causing block #1+ validation to fail with "Invalid signature"
-                                        // because verify_microblock_signature() can't find the producer's key.
-                                        // Genesis block contains all 5 genesis NodeRegistration TXs with VRF keys.
-                                        // Later blocks may contain new node registrations/reactivations.
-                                        if !microblock.transactions.is_empty() {
-                                            let has_reg_tx = microblock.transactions.iter().any(|tx| {
-                                                matches!(&tx.tx_type,
-                                                    qnet_state::TransactionType::NodeRegistration { .. } |
-                                                    qnet_state::TransactionType::NodeReactivation { .. })
-                                            });
-                                            if has_reg_tx {
-                                                Self::cache_node_registrations_from_transactions(&storage, &microblock.transactions);
-                                                if is_info() {
-                                                    println!("[INFO][VRF-SYNC] extracted_keys h={} tx_count={}",
-                                                             microblock.height, microblock.transactions.len());
-                                                }
-                                            }
-                                        }
-
-                                        // ═══════════════════════════════════════════════════════════════
-                                        // BLOCK ATTESTATION — committee-based per-microblock confirmation
-                                        // ═══════════════════════════════════════════════════════════════
-                                        // A node attests a block when:
-                                        //   (1) it has decoded, validated and applied the block locally
-                                        //       (we are inside the apply-success branch), AND
-                                        //   (2) it is in the deterministic attestation committee for this
-                                        //       height (committee is bandwidth-bounded — sample 32/64/128
-                                        //       depending on total validator count; ≤32 → all attest).
-                                        //
-                                        // Sync-state gating REMOVED: a node that successfully applied a block
-                                        // has produced a local fact ("I observed and accepted this block").
-                                        // Withholding attestations until production-ready creates a
-                                        // propagation-gap window where the canonical chain cannot accumulate
-                                        // supermajority attestations from briefly-desynced nodes — this was
-                                        // the architectural cause of split-brain forks in prior versions.
-                                        //
-                                        // Bandwidth bound: at committee_size=128 (cap), a single attestation
-                                        // is ≈3.4 KB, so the network-wide attestation gossip is bounded at
-                                        // ≈435 KB/sec independent of total validator count.
-                                        // ═══════════════════════════════════════════════════════════════
-                                        if let Some(ref p2p) = unified_p2p {
-                                            let in_committee = Self::is_node_in_attestation_committee(
-                                                &node_id,
-                                                received_block.height,
-                                                p2p,
-                                                &storage,
-                                            ).await;
-
-                                            if in_committee {
-                                                // v12.0: Attestation hash = consensus hash from struct fields.
-                                                // Previously hashed raw decompressed bytes — depends on serialization format.
-                                                let attest_hash = microblock.hash();
-
-                                                // Sign "QNET_ATTEST:{height}:{hash_hex}" with Dilithium3 (same key as block signing)
-                                                let attest_msg = format!("QNET_ATTEST:{}:{}", received_block.height, hex::encode(&attest_hash));
-                                                let attest_sig: Vec<u8> = {
-                                                    use pqcrypto_mldsa::mldsa65 as dilithium3;
-                                                    use pqcrypto_traits::sign::SecretKey as SkTrait;
-                                                    use pqcrypto_traits::sign::DetachedSignature as SigTrait;
-                                                    GLOBAL_VRF_INSTANCE.lock().clone()
-                                                        .and_then(|vrf| vrf.get_secret_key_bytes())
-                                                        .and_then(|sk_bytes| {
-                                                            dilithium3::SecretKey::from_bytes(&sk_bytes).ok()
-                                                                .map(|sk| dilithium3::detached_sign(attest_msg.as_bytes(), &sk))
-                                                                .map(|sig| SigTrait::as_bytes(&sig).to_vec())
-                                                        })
-                                                        .unwrap_or_default()
-                                                };
-
-                                                if !attest_sig.is_empty() {
-                                                    p2p.broadcast_block_attestation(received_block.height, attest_hash, attest_sig);
-                                                    METRIC_ATTEST_BROADCAST_COUNT.fetch_add(1, Ordering::Relaxed);
-                                                    if is_debug() {
-                                                        println!("[DBG][ATTEST] committee_member h={} producer={} attesting=true",
-                                                                 received_block.height, microblock.producer);
-                                                    }
-                                                } else if is_warn() {
-                                                    println!("[WARN][ATTEST] sign_failed h={} no_vrf_key", received_block.height);
-                                                }
-                                            } else if is_debug() {
-                                                println!("[DBG][ATTEST] not_in_committee h={} skipping_attestation",
-                                                         received_block.height);
-                                            }
-
-                                            crate::unified_p2p::cleanup_old_attestations(received_block.height);
-                                            crate::unified_p2p::cleanup_old_empty_slot_attestations(received_block.height);
-                                        }
-                                        
-                                        Ok(())
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[ERR][BLOCK] save_failed_rolling_back h={} err={:?}", microblock.height, e);
-                                        if let Some(ref snapshot) = block_snapshot {
-                                            state_guard.rollback_block(snapshot);
-                                            if is_info() {
-                                                println!("[INFO][STATE] block_rollback h={} reason=save_failed", microblock.height);
-                                            }
-                                        }
-                                        Err(format!("storage_error h={} err={:?}", microblock.height, e))
-                                    }
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            Err(format!("Failed to deserialize microblock for state update: {}", e))
-                        }
-                    }
-                },
-                "macro" => {
-                    // Validate macroblock consensus and finality
-                    if let Err(e) = Self::validate_received_macroblock(&received_block, &storage, unified_p2p.as_ref(), &node_id, node_type).await {
-                        eprintln!("[ERR][BLOCK] invalid_macroblock h={} err={}", received_block.height, e);
-                        continue;
-                    }
-                    
-                    // CRITICAL FIX: Actually SAVE the macroblock to storage!
-                    // PRODUCTION: Decompress before deserializing
-                    let decompressed_data = match zstd::decode_all(&received_block.data[..]) {
-                        Ok(data) => data,
-                        Err(_) => received_block.data.clone(),
-                    };
-                    
-                    // Deserialize decompressed macroblock struct
-                    match bincode::deserialize::<qnet_state::MacroBlock>(&decompressed_data) {
-                        Ok(macroblock) => {
-                            
-                            // v2.92: PARTICIPANT P2P path - ONLY saves MacroBlock
-                            // Rewards are processed in SYNC path (process_received_macroblock) to avoid duplication
-                            // This ensures single code path for reward processing
-                            
-                            // save_macroblock IS async
-                            let mb_height = macroblock.height;
-                            let save_result = storage.save_macroblock(mb_height, &macroblock).await
-                                .map_err(|e| format!("Storage error: {:?}", e));
-                            
-                            // v4.4: Update finality ONLY if all constituent microblocks exist.
-                            // Same guard as process_received_macroblock — without it, a node
-                            // receiving a macroblock via P2P broadcast before syncing the
-                            // microblocks would advance LAST_FINALIZED_HEIGHT ahead of
-                            // chain_height → stall recovery rollback blocked by FINALITY_VIOLATION.
-                            if save_result.is_ok() {
-                                let round = mb_height * 90;
-                                let prev_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
-                                if round > prev_round {
-                                    let expected_start = if mb_height == 1 { 1 } else { (mb_height - 1) * 90 + 1 };
-                                    let expected_end = mb_height * 90;
-                                    let all_microblocks_present = (expected_start..=expected_end)
-                                        .all(|h| storage.load_microblock(h).unwrap_or(None).is_some());
-
-                                    if all_microblocks_present {
-                                        if try_advance_finality(round, "MB-P2P") {
-                                            if is_debug() { println!("[DBG][MB-P2P] finalized_round={} mb={} finality_h={}", round, mb_height, round); }
-                                        }
-                                    } else {
-                                        println!("[WARN][MB-P2P] skip_finality_update mb={} round={} — microblocks incomplete, finality stays at {}",
-                                                 mb_height, round, prev_round);
-                                    }
-                                }
-                            }
-                            
-                            save_result
-                        },
-                        Err(e) => {
-                            Err(format!("Failed to deserialize macroblock: {}", e))
-                        }
-                    }
-                },
-                _ => {
-                    println!("[WARN][BLOCK] unknown_type type={}", received_block.block_type);
-                    continue;
-                }
-            };
-            
-            // Log storage results
-            match store_result {
-                Ok(_) => {
-                    // v3.10 BUG 1 FIX: Mark block as received (remove from awaiting)
-                    mark_block_received(received_block.height);
-                    
-                    if should_log {
-                        if is_debug() { println!("[DBG][BLOCK] stored h={}", received_block.height); }
-                    }
-                    
-                    // v2.72: Broadcast NewBlock via WebSocket for real-time explorer updates
-                    // PERF: Reuse cached decompressed data instead of re-decompressing
-                    if received_block.block_type == "micro" {
-                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&cached_decompressed) {
-                            crate::rpc::broadcast_ws_event(crate::rpc::WsEvent::NewBlock {
-                                height: mb.height,
-                                hash: hex::encode(mb.hash()),
-                                timestamp: mb.timestamp,
-                                tx_count: mb.transactions.len(),
-                                producer: mb.producer.clone(),
-                            });
-                        }
-                    }
-                    
-                    // CRITICAL v2.32: If we just received Genesis block, update GLOBAL_GENESIS_TIMESTAMP!
-                    // This ensures non-genesis nodes get the correct timestamp from network
-                    // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
-                    if received_block.height == 0 && received_block.block_type == "micro" {
-                        if let Ok(Some(genesis_block)) = storage.load_microblock_auto_format(0) {
-                            let current_ts = crate::GLOBAL_GENESIS_TIMESTAMP
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            if current_ts == 0 || current_ts != genesis_block.timestamp {
-                                crate::GLOBAL_GENESIS_TIMESTAMP.store(
-                                    genesis_block.timestamp,
-                                    std::sync::atomic::Ordering::Relaxed
-                                );
-                                if is_info() { println!("[INFO][GEN] synced_timestamp ts={}", genesis_block.timestamp); }
-                            }
-                        }
-                    }
-                    
-                    // CRITICAL FIX: Remove block from pending_blocks after successful storage
-                    // This prevents infinite retry loops and memory leaks
-                    if pending_blocks.remove(&received_block.height).is_some() {
-                        // METRICS: Track successful retry
-                        RETRY_SUCCESS.fetch_add(1, Ordering::Relaxed);
-                        if is_debug() { println!("[DBG][BLOCK] pending_removed h={} retry=ok", received_block.height); }
-                    }
-                    
-                    // v11.0: Completion-based cleanup — clear this block AND all below
-                    // Blocks below current height are already stored, no need to track
-                    crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                    crate::unified_p2p::clear_blocks_below_height(received_block.height);
-
-                    // v3.0: EVENT-DRIVEN sync completion (NOT polling!)
-                    // Check if we've reached the target height and clear sync flags
-                    let target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
-                    if target > 0 && received_block.height >= target {
-                        // ═══════════════════════════════════════════════════════════════════
-                        // v9.7: RE-CHECK — did network advance while we were syncing?
-                        // ═══════════════════════════════════════════════════════════════════
-                        // ROOT CAUSE: Sync target was set from stale data (e.g., HTTP probe
-                        // returned ~100 when network is at 5220). Handshake heights and
-                        // HealthPings updated BEST_PEER_HEIGHT during sync, but target was
-                        // already locked. Now we check: if BEST_PEER_HEIGHT >> our height,
-                        // re-enter sync with correct target instead of declaring "synchronized".
-                        //
-                        // Without this fix: node reaches h=100, declares NODE_IS_SYNCHRONIZED=true,
-                        // registers as active, gets selected by VRF → can't produce → timeout.
-                        // ═══════════════════════════════════════════════════════════════════
-                        let our_height = received_block.height;
-                        let best_peer_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
-
-                        if best_peer_h > our_height + 20 {
-                            // Network is still far ahead — re-enter sync with real target.
-                            // Guard: only spawn new sync task if target actually changes.
-                            // Without this guard, multiple concurrent sync_blocks tasks could
-                            // be spawned if blocks arrive from gap_sync / block propagation
-                            // while the previous re-sync is still running.
-                            let new_target = best_peer_h;
-                            let old_target = SYNC_TARGET_HEIGHT.load(Ordering::Relaxed);
-                            if new_target > old_target {
-                                SYNC_TARGET_HEIGHT.store(new_target, Ordering::SeqCst);
-                                // Keep SYNC_IN_PROGRESS = true, NODE_IS_SYNCHRONIZED = false
-                                println!("[INFO][SYNC] re-entering_sync: target_was={} reached={} best_peer={} new_target={}",
-                                         target, our_height, best_peer_h, new_target);
-
-                                // v11.0: Trigger continued sync with CHUNKED sequential download
-                                if let Some(ref p2p) = unified_p2p {
-                                    let p2p_clone = p2p.clone();
-                                    let from_h = our_height + 1;
-                                    let to_h = new_target;
-                                    tokio::spawn(async move {
-                                        // v15.8: 1000-block chunks for re-sync as well.
-                                        // Same rationale as the primary sync path —
-                                        // amortises the per-chunk roundtrip cost
-                                        // across a larger payload while staying
-                                        // within the QUIC stream budget.
-                                        const SYNC_CHUNK_SIZE: u64 = 1_000;
-                                        let mut current = from_h;
-                                        while current <= to_h {
-                                            let chunk_end = std::cmp::min(current + SYNC_CHUNK_SIZE.saturating_sub(1), to_h);
-                                            if let Err(e) = p2p_clone.sync_blocks(current, chunk_end).await {
-                                                if crate::node::is_warn() {
-                                                    println!("[WARN][SYNC] re-sync_chunk_err h={}-{} err={}", current, chunk_end, e);
-                                                }
-                                            }
-                                            current = chunk_end + 1;
-                                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                        }
-                                    });
-                                }
-                            } else {
-                                // Target already set to this or higher value — another re-sync
-                                // is already in progress. Don't spawn duplicate task.
-                                if is_debug() {
-                                    println!("[DBG][SYNC] re-sync_skip: target_already={} new_would_be={}",
-                                             old_target, new_target);
-                                }
-                            }
-                        } else if best_peer_h == 0 {
-                        // v9.8: BEST_PEER_HEIGHT not yet populated (handshake pending).
-                        // Don't declare sync complete on zero data — defer to main loop
-                        // FIX 1 (network-aware NODE_IS_SYNCHRONIZED via get_max_peer_height).
-                        // End sync process so we don't block, but don't force sync=true.
-                        SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
-                        JUST_COMPLETED_SYNC.store(true, Ordering::SeqCst);
-                        if is_info() {
-                            println!("[INFO][SYNC] target_reached h={} best_peer=0 — deferring sync flag to main loop",
-                                     received_block.height);
-                        }
-                        } else {
-                        // Sync truly complete — network height matches or is close.
-                        // v9.8: Do NOT set NODE_IS_SYNCHRONIZED=true here. BEST_PEER_HEIGHT
-                        // can be stale (handshake race). Let main loop FIX 1 (line ~15564)
-                        // determine sync status via live get_max_peer_height() from DashMap.
-                        // This eliminates the race: event sets true → VRF selects → main loop
-                        // would set false 1s later → but too late, block already produced unsynced.
-                        SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                        SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
-
-                        // v3.5: Set flag to skip slot timing on first block after sync
-                        // CRITICAL: If we become producer immediately after sync, we must
-                        // create block without waiting for slot time (network expects it NOW)
-                        JUST_COMPLETED_SYNC.store(true, Ordering::SeqCst);
-
-                        if is_info() {
-                            println!("[INFO][SYNC] target_reached h={} target={} best_peer={} sync_complete — sync flag deferred to main loop",
-                                     received_block.height, target, best_peer_h);
-                        }
-
-                        // v31.14: HBC-only eligibility model. NodeReactivation auto-send removed;
-                        // returning nodes re-enter eligible_producers via next HBC emission picked up
-                        // by Phase 2A (full-epoch scan window).
-                        } // end else (sync truly complete)
-                    }
-
-                    // CRITICAL FIX v3.3: Remove TX from mempool after receiving block from other node
-                    // This prevents TX duplication when THIS node becomes producer
-                    // Problem: TX stays in mempool after being included in block by OTHER node
-                    // Result: Same TX gets included again when THIS node produces a block
-                    // PERF: Reuse cached decompressed data instead of re-decompressing
-                    if received_block.block_type == "micro" {
-                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&cached_decompressed) {
-                            let tx_hashes: Vec<String> = mb.transactions.iter()
-                                .map(|tx| tx.hash.clone())
-                                .collect();
-                            
-                            if !tx_hashes.is_empty() {
-                                let tx_count = tx_hashes.len();
-                                // PROTOCOL: Record hashes FIRST (prevents re-add via delayed gossip)
-                                // Then remove from active mempool
-                                mempool.record_included_txs(&tx_hashes);
-                                mempool.batch_remove_transactions(&tx_hashes);
-                                if is_info() {
-                                    println!("[INFO][MEMPOOL] cleanup_received_block h={} tx_count={}", 
-                                             received_block.height, tx_count);
-                                }
-                            }
-                        }
-                    }
-                    
-                    // CRITICAL FIX: Check if we're the producer for next block after rotation boundary
-                    // This ensures nodes immediately know they're selected after receiving rotation block
-                    if received_block.height > 0 && received_block.height % ROTATION_INTERVAL_BLOCKS == 0 {
-                        // Just received last block of a round (30, 60, 90...)
-                        if is_debug() { println!("[DBG][ROTATION] boundary h={} check=next_producer", received_block.height); }
-                        if is_debug() { println!("[DBG][ROTATION] block_type={} producer_id={:?}", received_block.block_type, block_producer_id); }
-                        
-                        
-                        // Update global height immediately to ensure proper producer calculation
-                        {
-                            let mut global_height = height.write().await;
-                            if received_block.height > *global_height {
-                                *global_height = received_block.height;
-                                if is_debug() { println!("[DBG][ROTATION] height_updated h={}", received_block.height); }
-                            }
-                        }
-                        
-                        // CRITICAL: Wait for block to be fully saved before calculating next producer
-                        // This ensures all nodes use the same entropy source
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        
-                        // CRITICAL: Check if WE are producer for next block
-                        // If yes, set flag for immediate production (skip sleep in main loop)
-                        let next_height = received_block.height.saturating_add(1);
-                        let next_producer = Self::select_microblock_producer(
-                            next_height,
-                            &unified_p2p,
-                            &node_id,
-                            node_type,
-                            Some(&storage),
-                            &poh
-                        ).await;
-                        
-                        if next_producer == node_id {
-                            if is_info() { println!("[INFO][ROTATION] we_are_producer h={} notify=main_loop", next_height); }
-                        } else {
-                            if is_debug() { println!("[DBG][ROTATION] producer h={} node={}", next_height, next_producer); }
-                        }
-                        
-                        // NOTE: Main loop will naturally check on next iteration (max 1 second delay)
-                        // This is more reliable than interrupt-based notifications
-                    }
-                    
-                    // CRITICAL FIX: Asynchronous PoH synchronization to prevent blocking
-                    // This ensures all nodes maintain consistent PoH state without blocking block processing
-                    if let Some(ref poh) = poh {
-                        if received_block.height > 0 {
-                            // CRITICAL FIX: Synchronous PoH sync to prevent race conditions
-                            // Producer must wait for PoH sync before creating next block
-                            // This prevents PoH counter regression at rotation boundaries
-                            // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
-                            if let Ok(Some(microblock)) = storage.load_microblock_auto_format(received_block.height) {
-                                if !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
-                                    poh.sync_from_checkpoint(&microblock.poh_hash, microblock.poh_count).await;
-                                    if is_debug() { println!("[DBG][POH] synced h={} count={}", 
-                                            microblock.height, microblock.poh_count); }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Height is automatically updated in storage by save_microblock/save_macroblock
-                    // CRITICAL: Also update global height variable for API and consensus
-                    {
-                        let current_height = *height.read().await;
-                        if received_block.height > current_height {
-                            *height.write().await = received_block.height;
-                            if is_debug() { println!("[DBG][BLOCK] height_updated h={}", received_block.height); }
-                            
-                            // v13.0: Capture previous tip BEFORE updating atomics.
-                            // CRITICAL ORDERING: prev_tip must be read BEFORE LAST_BLOCK_PRODUCED_HEIGHT
-                            // is overwritten, otherwise the tip-advance check always compares
-                            // received_block.height against itself (== prev_tip + 1 is impossible).
-                            let prev_tip = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
-
-                            // v5.4: Use block's ON-CHAIN timestamp for LBPT (not wall-clock).
-                            // Block timestamp is identical on all nodes → identical local_delay →
-                            // identical timeout_round. Using get_timestamp_safe() caused divergence
-                            // because nodes received the same block at different wall-clock times.
-                            // Stall timer must reference the block's on-chain timestamp,
-                            // not the local reception time.
-                            let block_ts = storage.load_microblock_auto_format(received_block.height)
-                                .ok().flatten().map(|mb| mb.timestamp)
-                                .unwrap_or_else(get_timestamp_safe);
-                            LAST_BLOCK_PRODUCED_TIME.store(block_ts, Ordering::Relaxed);
-                            LAST_BLOCK_PRODUCED_HEIGHT.store(received_block.height, Ordering::Relaxed);
-
-                            // v14.8.10: observational drift monitor — compares our
-                            // local wall clock to the just-applied network block's
-                            // on-chain timestamp. Purely observational: triggers
-                            // WARN log / async NTP re-sync on drift, never feeds
-                            // back into consensus rotation.
-                            observe_clock_drift(block_ts, get_timestamp_safe());
-
-                            // v9.0: Track sync progress for deadlock detection
-                            LAST_SYNC_PROGRESS_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
-
-                            // v14.8.10: Reset CURRENT_TIMEOUT_ROUND ONLY on tip
-                            // advance (the next expected microblock was just
-                            // applied). During sync (catch-up blocks far behind
-                            // tip) the stored round stays intact so we do not
-                            // disrupt the rotation state nodes at the tip are
-                            // using. The BFT-agreed round will be re-evaluated
-                            // on the next stall-detection tick if no new block
-                            // arrives.
-                            {
-                                let is_tip_advance = received_block.height == prev_tip + 1;
-                                if is_tip_advance {
-                                    reset_timeout_round();
-                                    if is_debug() {
-                                        println!("[DBG][TIMEOUT] round_reset h={} prev_tip={}",
-                                                 received_block.height, prev_tip);
-                                    }
-                                } else if is_debug() {
-                                    let current_round = get_current_timeout_round();
-                                    if current_round > 0 {
-                                        println!("[DBG][TIMEOUT] round_preserved={} h={} prev_tip={} reason=sync_or_skip",
-                                                 current_round, received_block.height, prev_tip);
-                                    }
-                                }
-                            }
-
-                            // v5.5: Unlock production — we confirmed sync with network
-                            // by receiving a new block at our tip height
-                            if PRODUCTION_UNLOCKED.load(Ordering::Relaxed) == 0 {
-                                PRODUCTION_UNLOCKED.store(1, Ordering::Relaxed);
-                                if is_info() { println!("[INFO][STATE] production_unlocked h={} (confirmed sync)", received_block.height); }
-                            }
-                            
-                            // CRITICAL FIX: Update P2P local height for message filtering
-                            // v9.0: Release ordering pairs with Acquire in consensus paths
-                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                received_block.height,
-                                std::sync::atomic::Ordering::Release
-                            );
-
-                            // v10.2: PERIODIC DISK/RAM HEIGHT CONSISTENCY CHECK
-                            // Detects divergence between disk chain_height and RAM height at runtime.
-                            // Previously only checked at startup (verify_and_repair_chain_height).
-                            // Now: every 1000 blocks, verify disk and RAM agree.
-                            if received_block.height % 1000 == 0 {
-                                let disk_height = storage.get_chain_height().unwrap_or(0);
-                                let ram_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
-                                    .load(std::sync::atomic::Ordering::Relaxed);
-                                if disk_height != ram_height && disk_height > 0 {
-                                    eprintln!("[ERR][INTEGRITY] disk_ram_divergence disk_h={} ram_h={} block_h={}",
-                                             disk_height, ram_height, received_block.height);
-                                    // Repair: trust disk (persistent), update RAM
-                                    let repair_h = std::cmp::min(disk_height, ram_height);
-                                    if let Ok(Some(_)) = storage.load_microblock(repair_h) {
-                                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                            repair_h, std::sync::atomic::Ordering::SeqCst
-                                        );
-                                        *height.write().await = repair_h;
-                                        println!("[INFO][INTEGRITY] repaired ram_h={} -> {}", ram_height, repair_h);
-                                    }
-                                } else if is_debug() && received_block.height % 10000 == 0 {
-                                    println!("[DBG][INTEGRITY] check_ok disk={} ram={}", disk_height, ram_height);
-                                }
-                            }
-
-                            // v10.1: Update peer height on EVERY received block (real-time, not just heartbeats).
-                            // Previously peer heights were only updated via HealthPing every 30s,
-                            // causing catastrophically stale height data for sync decisions.
-                            // Now: if peer sent us block N, peer is at least at height N.
-                            if let Some(ref p2p) = unified_p2p {
-                                p2p.update_peer_last_seen_with_height(&received_block.from_peer, Some(received_block.height), false);
-                            }
-                            
-                            // EVENT-BASED OPTIMIZATION: Broadcast height update to all listeners
-                            // Replaces polling in consensus listener (100K polls/sec → reactive events only)
-                            // Note: send() returns Err if no receivers exist, which is normal
-                            let _ = block_event_tx.send(received_block.height);
-                            
-                            // CRITICAL FIX: Check for macroblock boundary on ALL nodes (not just producer)
-                            // This ensures ALL nodes see the macroblock boundary banner
-                            if received_block.height % 90 == 0 && received_block.height > 0 {
-                                let shard_count = 256; // From perf_config
-                                let avg_tx_per_block = 200000; // 200K TX/block max (v4.1)
-                                let blocks_per_second = 1.0;
-                                let theoretical_tps = blocks_per_second * avg_tx_per_block as f64 * shard_count as f64;
-                                
-                                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                                if is_info() { println!("[INFO][MB] boundary h={} consensus=background", received_block.height); }
-                                if is_debug() { println!("[DBG][MB] microblocks=continue downtime=zero"); }
-                                if is_debug() { println!("[DBG][PERF] tps_capacity={:.0} shards={} tx_per_block={}", 
-                                         theoretical_tps, shard_count, avg_tx_per_block); }
-                                if is_info() { println!("[INFO][MB] consensus_boundary h={} next={}", received_block.height, received_block.height + 1); }
-                                
-                                // ═══════════════════════════════════════════════════════════════════
-                                // PRODUCTION v2.31: Schedule macroblock verification after boundary
-                                // Wait for consensus to complete, then verify we have the macroblock
-                                // RATE LIMITING: Prevent spawn storm on high-traffic networks
-                                // ═══════════════════════════════════════════════════════════════════
-                                let current_tasks = ACTIVE_MACROBLOCK_CHECK_TASKS.load(std::sync::atomic::Ordering::Relaxed);
-                                if current_tasks < MAX_CONCURRENT_MACROBLOCK_CHECKS {
-                                    let expected_macroblock = received_block.height / 90;
-                                    let storage_verify = storage.clone();
-                                    let p2p_verify = unified_p2p.clone();
-                                    
-                                    ACTIVE_MACROBLOCK_CHECK_TASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    
-                                    tokio::spawn(async move {
-                                        // Ensure we decrement counter on exit
-                                        struct TaskGuard;
-                                        impl Drop for TaskGuard {
-                                            fn drop(&mut self) {
-                                                ACTIVE_MACROBLOCK_CHECK_TASKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                                            }
-                                        }
-                                        let _guard = TaskGuard;
-                                        
-                                        // Wait for consensus to complete (typically 10-30 seconds)
-                                        tokio::time::sleep(Duration::from_secs(45)).await;
-                                        
-                                        // Verify macroblock exists
-                                        let has_macroblock = storage_verify.get_macroblock_by_height(expected_macroblock)
-                                            .map(|mb| mb.is_some())
-                                            .unwrap_or(false);
-                                        
-                                        if has_macroblock {
-                                            if is_debug() { println!("[DBG][MB-VERIFY] confirmed idx={}", expected_macroblock); }
-                                        } else {
-                                            println!("[WARN][MB-VERIFY] missing idx={} action=request", expected_macroblock);
-                                            
-                                            // Request from network
-                                            if let Some(p2p) = p2p_verify {
-                                                for attempt in 1..=3 {
-                                                    if let Err(e) = p2p.sync_macroblocks(expected_macroblock, expected_macroblock).await {
-                                                        println!("[WARN][MB-VERIFY] sync_failed attempt={}/3 err={}", attempt, e);
-                                                    }
-                                                    tokio::time::sleep(Duration::from_secs(3)).await;
-                                                    
-                                                    // Check again
-                                                    let received = storage_verify.get_macroblock_by_height(expected_macroblock)
-                                                        .map(|mb| mb.is_some())
-                                                        .unwrap_or(false);
-                                                    if received {
-                                                        if is_info() { println!("[INFO][MB-VERIFY] received idx={} sync=ok", expected_macroblock); }
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    
-                    // CRITICAL FIX: Clear request tracking for this successfully stored block
-                    requested_blocks.remove(&received_block.height);
-                    
-                    // CRITICAL FIX: Check if any pending blocks can now be processed
-                    // Process multiple consecutive blocks in parallel
-                    let mut blocks_to_retry = Vec::new();
-                    let mut check_height = received_block.height + 1;
-                    
-                    // Collect up to 10 consecutive blocks that can now be processed
-                    while blocks_to_retry.len() < 10 {
-                        if let Some((pending_block, _, _)) = pending_blocks.remove(&check_height) {
-                            blocks_to_retry.push(pending_block);
-                            check_height += 1;
-                        } else {
-                            break; // No more consecutive blocks
-                        }
-                    }
-                    
-                    // Re-queue all found blocks for parallel processing
-                    if !blocks_to_retry.is_empty() {
-                        if is_debug() { println!("[DBG][BLOCK] fast_forward count={} after={}", 
-                                 blocks_to_retry.len(), received_block.height); }
-                        for pending_block in blocks_to_retry {
-                            if let Err(e) = retry_tx.try_send(pending_block) {
-                                println!("[WARN][BLOCK] requeue_failed err={:?}", e);
-                            }
-                        }
-                    }
-                },
-                Err(e) => {
-                    eprintln!("[ERR][BLOCK] store_failed h={} err={}", received_block.height, e);
-                    
-                    // v3.34: Track consecutive state_root_mismatch per height.
-                    // Without this, a diverged state causes an infinite retry loop:
-                    //   mismatch → rollback(no-op) → stall → re-request → mismatch → ...
-                    // which eventually freezes the server (12h+ loop observed in production).
-                    if e.contains("state_root_mismatch") {
-                        let entry = mismatch_counter
-                            .entry(received_block.height)
-                            .or_insert((0, std::time::Instant::now()));
-                        entry.0 += 1;
-                        let fail_count = entry.0;
-                        
-                        if fail_count >= MISMATCH_RECOVERY_THRESHOLD {
-                            println!("[ERR][STATE] persistent_mismatch h={} fails={} — triggering state recovery from macroblock snapshot",
-                                     received_block.height, fail_count);
-                            
-                            // STATE RECOVERY v5.1: snapshot → replay (with full replay fallback)
-                            let recovery_result: Result<(), String> = async {
-                                let chain_h = storage.get_chain_height().unwrap_or(0);
-                                if chain_h == 0 {
-                                    return Err("empty_chain".to_string());
-                                }
-
-                                // v7.1: Reset fork flag in memory only. DB flag will be:
-                                //   - Reset if full replay from genesis (no valid snapshot)
-                                //   - Restored from DB if snapshot-based recovery (flag already persisted)
-                                // This prevents losing fork activation state on snapshot-based recovery
-                                // when replay range doesn't cover the activation block.
-                                qnet_state::reset_pending_rewards_in_merkle();
-
-                                // Try loading snapshot
-                                let mut replay_from = 0u64; // default: full replay from genesis (including block 0)
-                                match storage.load_latest_state_snapshot().await {
-                                    Ok(Some((snap_height, _snap_root, accounts_data, snap_total_supply)))
-                                        if snap_height <= chain_h && !accounts_data.is_empty() =>
-                                    {
-                                        // Tolerant deserialization (same as startup)
-                                        let deser = bincode::DefaultOptions::new()
-                                            .with_fixint_encoding()
-                                            .allow_trailing_bytes()
-                                            .deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_data)
-                                            .or_else(|_| bincode::deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_data));
-
-                                        match deser {
-                                            Ok(accounts) => {
-                                                let count = accounts.len();
-                                                let state_guard = state.write().await;
-                                                if state_guard.restore_accounts(accounts).is_ok() {
-                                                    // Restore chain_state from snapshot
-                                                    {
-                                                        let mut cs = state_guard.chain_state.write();
-                                                        if snap_total_supply > 0 {
-                                                            cs.total_supply = snap_total_supply;
-                                                        }
-                                                        cs.height = snap_height;
-                                                    }
-                                                    drop(state_guard);
-                                                    qnet_state::clear_credited_fees_cache();
-                                                    // v7.1: Restore fork flag from DB for snapshot-based recovery
-                                                    if let Ok(Some(true)) = storage.load_fork_flag("pending_rewards_in_merkle") {
-                                                        qnet_state::activate_pending_rewards_in_merkle();
-                                                        println!("[INFO][STATE] fork_flag_restored pending_rewards_in_merkle=true (recovery snapshot)");
-                                                    }
-                                                    println!("[INFO][STATE] snapshot_restored h={} accounts={} total_supply={}", snap_height, count, snap_total_supply);
-                                                    replay_from = snap_height.saturating_add(1);
-                                                } else {
-                                                    eprintln!("[WARN][STATE] restore_fail — falling back to full replay");
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!("[WARN][STATE] deserialize_fail err={} — full replay from genesis", e);
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        println!("[INFO][STATE] no_valid_snapshot — full replay from genesis");
-                                    }
-                                }
-
-                                let replay_to = chain_h;
-                                // CRITICAL: For full replay from genesis, clear ALL state
-                                // to prevent double-counting total_supply, duplicate accounts,
-                                // and stale fee/commitment caches
-                                if replay_from == 0 {
-                                    let sg = state.write().await;
-                                    sg.clear();  // clears accounts, committed_epochs, registered_nodes, merkle tree
-                                    {
-                                        let mut cs = sg.chain_state.write();
-                                        cs.total_supply = 0;
-                                        cs.last_minted_emission_mb = 0; // reset watermark so replay re-mints
-                                        cs.height = 0;
-                                    }
-                                    drop(sg);
-                                    qnet_state::clear_credited_fees_cache();
-                                    qnet_state::reset_pending_rewards_in_merkle();
-                                    if let Err(e) = storage.save_fork_flag("pending_rewards_in_merkle", false) {
-                                        if crate::node::is_warn() {
-                                            println!("[WARN][STORAGE] fork_flag_save_failed key=pending_rewards_in_merkle val=false err={}", e);
-                                        }
-                                    }
-                                    if is_info() {
-                                        println!("[INFO][STATE] recovery_state_cleared for full replay from genesis");
-                                    }
-                                }
-                                if replay_from <= replay_to {
-                                    let mut replayed = 0u64;
-                                    let mut replay_errs = 0u64;
-                                    let mut last_replay_ts: u64 = 0;
-                                    for h in replay_from..=replay_to {
-                                        match storage.load_microblock_auto_format(h) {
-                                            Ok(Some(mb)) => {
-                                                last_replay_ts = mb.timestamp;
-                                                let sg = state.write().await;
-
-                                                // v10.0: Use shared apply_block_to_state (replay mode)
-                                                let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
-                                                let apply_result = Self::apply_block_to_state(
-                                                    &sg, &mb, &storage, None, None,
-                                                );
-
-                                                if !fork_was_active && !apply_result.reward_accruals.is_empty()
-                                                   && qnet_state::is_pending_rewards_in_merkle() {
-                                                    if let Err(e) = storage.save_fork_flag("pending_rewards_in_merkle", true) {
-                                                        if crate::node::is_warn() {
-                                                            println!("[WARN][STORAGE] fork_flag_save_failed key=pending_rewards_in_merkle val=true err={}", e);
-                                                        }
-                                                    }
-                                                    println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (recovery h={})", h);
-                                                }
-                                                replayed += 1;
-                                            }
-                                            _ => { replay_errs += 1; }
-                                        }
-                                    }
-                                    let mode = if replay_from == 0 { "full" } else { "incremental" };
-                                    println!("[INFO][STATE] recovery_{}_replay from={} chain={} replayed={} errors={}",
-                                             mode, replay_from, replay_to, replayed, replay_errs);
-                                    // v5.2: Update LAST_BLOCK_PRODUCED_TIME for correct timeout_round
-                                    if last_replay_ts > 0 {
-                                        LAST_BLOCK_PRODUCED_TIME.store(last_replay_ts, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                }
-                                
-                                Ok(())
-                            }.await;
-                            
-                            match recovery_result {
-                                Ok(()) => {
-                                    println!("[INFO][STATE] recovery_complete clearing_mismatch_counters resuming_sync");
-                                    // Reset the BFT rotation round so the next tick
-                                    // re-reads the certified round fresh against the
-                                    // post-recovery macroblock index.
-                                    reset_timeout_round();
-                                    mismatch_counter.clear();
-                                    wrong_producer_counter.clear();
-                                    pending_blocks.clear();
-                                    requested_blocks.clear();
-                                    crate::unified_p2p::release_sync_slot(received_block.height);
-                                    crate::unified_p2p::clear_all_pending_sync();
-                                    crate::unified_p2p::clear_all_pending_sync_macroblocks();
-                                }
-                                Err(reason) => {
-                                    // v9.0 BUG-28: Track recovery failures. If snapshot+replay
-                                    // fails 3 times for the same height, escalate to full rollback
-                                    // to the last macroblock boundary and re-sync from network.
-                                    static RECOVERY_FAIL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                                    let rf = RECOVERY_FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                                    println!("[ERR][STATE] recovery_failed reason={} attempt={}/3", reason, rf);
-
-                                    if rf >= 3 {
-                                        // v9.0: Circuit breaker — track TOTAL escalations (never resets)
-                                        static TOTAL_ESCALATION_COUNT: std::sync::atomic::AtomicU64 =
-                                            std::sync::atomic::AtomicU64::new(0);
-                                        let total_esc = TOTAL_ESCALATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-
-                                        if total_esc > 3 {
-                                            // Circuit breaker OPEN: stop auto-recovery, need manual intervention
-                                            println!("[CRIT][STATE] CIRCUIT_BREAKER: {} escalations, entering safe mode. Manual restart required.", total_esc);
-                                            mismatch_counter.clear();
-                                            RECOVERY_FAIL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-                                            // Don't rollback — just stop processing mismatched blocks
-                                        } else {
-                                            println!("[ERR][STATE] escalating to full rollback (escalation {}/3)", total_esc);
-                                            RECOVERY_FAIL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-                                            let cycle_start = (received_block.height / 90) * 90;
-                                            let rb_target = if cycle_start >= 90 { cycle_start.saturating_sub(90) } else { 0 };
-                                            // v14.8: Atomic claim + finality check in one step.
-                                            let finalized_h = LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst);
-                                            if let Err(reason) = crate::storage::begin_finality_guarded_rollback(rb_target, finalized_h) {
-                                                println!("[WARN][STATE] rollback_skipped reason={}", reason);
-                                            } else {
-                                                for h in (rb_target + 1)..=received_block.height {
-                                                    if let Err(e) = storage.delete_microblock(h) {
-                                                        eprintln!("[ERR][STORAGE] rollback_delete_failed h={} err={}", h, e);
-                                                    }
-                                                }
-                                                // v10.2: DISK FIRST, RAM SECOND (crash-safe order)
-                                                if let Err(e) = storage.set_chain_height(rb_target) {
-                                                    eprintln!("[ERR][STORAGE] rollback_set_chain_height failed h={}: {}", rb_target, e);
-                                                }
-                                                *height.write().await = rb_target;
-                                                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                                    rb_target, std::sync::atomic::Ordering::Release);
-                                                crate::storage::end_rollback_protection();
-                                                mismatch_counter.clear();
-                                                complete_rollback_cleanup(rb_target);
-
-                                                println!("[INFO][STATE] escalation_rollback_complete new_h={}", rb_target);
-                                            }
-                                        }
-                                    } else {
-                                        // Don't remove counter — just decrement to prevent restart from 0
-                                        mismatch_counter.entry(received_block.height)
-                                            .and_modify(|(count, _)| *count = count.saturating_sub(2));
-                                    }
-                                }
-                            }
-                        } else if fail_count < MISMATCH_RECOVERY_THRESHOLD {
-                            // v3.36: Clear pending sync to allow immediate re-request
-                            // Without this, block stays in PENDING_SYNC_BLOCKS for 60s TTL,
-                            // delaying each retry attempt and extending recovery time from
-                            // ~5 seconds to ~5 minutes.
-                            crate::unified_p2p::clear_block_pending_sync(received_block.height);
-                            if is_info() {
-                                println!("[INFO][STATE] mismatch_count h={} fails={}/{}", 
-                                         received_block.height, fail_count, MISMATCH_RECOVERY_THRESHOLD);
-                            }
-                        }
-                    }
-                }
-            }
-            
-            } // end for (received_block, is_retry) in blocks_to_process — v10.0 ordered sync buffer
-
-            // v3.34: Periodic cleanup of stale mismatch counters (prevent memory leak)
-            if !mismatch_counter.is_empty() {
-                let current_chain_h = storage.get_chain_height().unwrap_or(0);
-                mismatch_counter.retain(|h, (_, first_seen)| {
-                    *h >= current_chain_h && first_seen.elapsed().as_secs() < 600
-                });
-            }
-
-            // v3.36: Periodic cleanup of wrong_producer counters
-            if !wrong_producer_counter.is_empty() {
-                wrong_producer_counter.retain(|_, (_, first_seen)| {
-                    first_seen.elapsed().as_secs() < 300
-                });
-            }
-            
-            // CRITICAL FIX: Fast retry for certificate race condition (every 2 seconds)
-            // This handles: block arrives → buffered → certificate arrives → retry succeeds
-            // Separate from cleanup to minimize latency while avoiding overhead
-            // FIX v2.28: Also trigger immediately when new certificate received
-            static LAST_CERT_COUNTER: AtomicU64 = AtomicU64::new(0);
-            let current_cert_counter = NEW_CERTIFICATE_COUNTER.load(Ordering::Relaxed);
-            let cert_arrived = current_cert_counter > LAST_CERT_COUNTER.swap(current_cert_counter, Ordering::Relaxed);
-            
-            if cert_arrived || last_retry_check.elapsed() > std::time::Duration::from_secs(2) {
-                if cert_arrived && !pending_blocks.is_empty() {
-                    if is_debug() { println!("[DBG][BLOCK] cert_received pending_retry={}", pending_blocks.len()); }
-                }
-                last_retry_check = std::time::Instant::now();
-                
-                // CRITICAL v2.28: Retry ALL pending blocks more aggressively
-                // FIX: Certificate race condition can leave blocks stuck in buffer
-                // This ensures blocks are retried when certificate becomes available
-                let heights_to_retry: Vec<u64> = pending_blocks.iter()
-                    .filter_map(|(height, (_, _retry_count, timestamp))| {
-                        let elapsed_secs = timestamp.elapsed().as_secs();
-                        // FIX v2.28: Keep blocks in buffer for 120 seconds
-                        // retry_count is for LOGGING only, not for dropping blocks
-                        // Blocks are dropped by TIMEOUT (120s), not by retry count
-                        if elapsed_secs < 120 {
-                            Some(*height)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                
-                // Re-queue pending blocks for retry
-                if !heights_to_retry.is_empty() {
-                    // FIX v2.28: Log every retry cycle to debug stuck blocks
-                    static RETRY_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
-                    let log_count = RETRY_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    
-                    // Log every 5 cycles (10 seconds) instead of 60 cycles
-                    if log_count % 5 == 0 {
-                        if is_debug() { println!("[DBG][BLOCK] retry pending={}", heights_to_retry.len()); }
-                        // Log first 3 heights for debugging
-                        for (i, h) in heights_to_retry.iter().take(3).enumerate() {
-                            if let Some((_, retry_count, ts)) = pending_blocks.get(h) {
-                                if is_debug() { println!("[DBG][BLOCK] retry_item idx={} h={} count={} age={}s", 
-                                         i+1, h, retry_count, ts.elapsed().as_secs()); }
-                            }
-                        }
-                    }
-                    
-                    for height in heights_to_retry {
-                        // FIX v2.28: Clone first, then modify to satisfy borrow checker
-                        let block_to_retry = pending_blocks.get(&height)
-                            .map(|(block, _, _)| block.clone());
-                        
-                        if let Some(pending_block) = block_to_retry {
-                            // Increment retry count
-                            pending_blocks.entry(height).and_modify(|(_, cnt, _)| *cnt += 1);
-                            
-                            if let Err(e) = retry_tx.try_send(pending_block) {
-                                println!("[WARN][BLOCK] requeue_failed h={} err={:?}", height, e);
-                            } else {
-                                RETRY_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // CRITICAL: Periodic cleanup of stale pending blocks and requests (every 30 seconds)
-            // This is separate from retry to avoid unnecessary overhead
-            if last_cleanup_check.elapsed() > std::time::Duration::from_secs(30) {
-                last_cleanup_check = std::time::Instant::now();
-                
-                // v3.20: Cleanup global DashMaps on timer (in case no blocks received)
-                let cleanup_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
-                cleanup_global_hashmaps(cleanup_height);
-                
-                // ═══════════════════════════════════════════════════════════════════
-                // v3.24: REMOVED Runtime Height Check - caused FALSE POSITIVES
-                // ═══════════════════════════════════════════════════════════════════
-                // WHY REMOVED:
-                //   - Used CACHED heights from peers (can be stale by 30+ blocks)
-                //   - local > network + 20 triggered even when node was correct
-                //   - Entropy Voting already handles fork detection via HASH comparison
-                //   - MacroBlock BFT provides finality every 90 blocks
-                //
-                // CORRECT FORK DETECTION:
-                //   1. Entropy Voting: compares entropy HASHES (not heights)
-                //   2. MacroBlock validation: 2/3+ BFT consensus
-                //   3. Block hash comparison on receive (validate_received_microblock)
-                // ═══════════════════════════════════════════════════════════════════
-                
-                // MONITORING ONLY: Log if significantly behind network (not a fork, just sync needed)
-                if should_check_fork() {
-                    if let Some(p2p) = &unified_p2p {
-                        if let Ok(network_height) = p2p.sync_blockchain_height().await {
-                            let local_height = *height.read().await;
-
-                            if network_height > local_height.saturating_add(50) {
-                                println!("[WARN][SYNC] behind_network local={} network={} gap={}",
-                                         local_height, network_height, network_height.saturating_sub(local_height));
-                            }
-                        }
-                    }
-                }
-                
-                // v3.10 BUG 1 FIX: Check for consensus blocks awaiting data
-                // If consensus passed but block not received within 8 seconds, request it
-                // FIX v2.49: Increased from 5→8 seconds to reduce false-positive retries
-                // 5s was too aggressive for cross-region P2P delivery (EU↔NA latency ~100-200ms + jitter)
-                // 8s gives producers adequate time while keeping recovery fast
-                let blocks_to_request = get_blocks_needing_request(8);
-                if !blocks_to_request.is_empty() {
-                    if let Some(p2p) = &unified_p2p {
-                        for (block_height, producer) in blocks_to_request {
-                            // v3.11 FIX: Don't request blocks that already exist in storage!
-                            // This prevents duplicate reception → false fork detection
-                            if storage.load_microblock(block_height).map(|opt| opt.is_some()).unwrap_or(false) {
-                                // Block already exists - just mark it as received
-                                mark_block_received(block_height);
-                                if is_debug() {
-                                    println!("[DBG][CONS] block_already_exists h={} skipping_request", block_height);
-                                }
-                                continue;
-                            }
-                            
-                            if is_info() {
-                                println!("[INFO][CONS] requesting_missing_block h={} producer={}", 
-                                         block_height, producer);
-                            }
-                            // Request block from producer or any peer
-                            let _ = p2p.request_specific_block(block_height).await;
-                        }
-                    }
-                }
-                
-                // CRITICAL v2.19.20: Don't remove expired pending blocks - re-request missing dependencies!
-                // Blocks are critical data, never throw them away
-                // Instead, re-request the missing previous block after 30 seconds
-                let mut blocks_to_retry = Vec::new();
-                for (height, (_, retry_count, timestamp)) in pending_blocks.iter() {
-                    if timestamp.elapsed() > std::time::Duration::from_secs(30) {
-                        blocks_to_retry.push((*height, *retry_count));
-                    }
-                }
-                
-                // Re-request missing blocks for expired pending blocks
-                for (height, retry_count) in blocks_to_retry {
-                    if height > 0 {
-                        let missing_height = height.saturating_sub(1);  // Previous block is likely missing
-                        
-                        // Check if we can request (rate limiting)
-                        // PSEUDO-INFINITE v2.19.20: Exponential backoff for retries >= 10
-                        // Backoff schedule: 10s (retries 0-9), 30s, 60s, 120s, 240s, 300s max
-                        let backoff_secs = if retry_count < 10 {
-                            10u64  // Aggressive: 10 seconds for first 10 retries
-                        } else {
-                            // Exponential: 30 * 2^(retry-10), max 300s (5 minutes)
-                            let exp = (retry_count - 10).min(4) as u32;  // Cap at 2^4 = 16
-                            std::cmp::min(30 * (1u64 << exp), 300)
-                        };
-                        
-                        let can_request = requested_blocks.get(&missing_height)
-                            .map(|(ts, _)| ts.elapsed() > std::time::Duration::from_secs(backoff_secs))
-                            .unwrap_or(true);
-                        
-                        if can_request {
-                            let phase = if retry_count < 10 { "aggressive" } else { "backoff" };
-                            if is_debug() { println!("[DBG][BLOCK] rerequest missing={} pending={} retry={} status={} next={}s", 
-                                     missing_height, height, retry_count, phase, backoff_secs); }
-                            
-                            // Update request tracking
-                            // SECURITY: Use saturating_add to prevent overflow, capped at 1000
-                            requested_blocks.insert(missing_height, (std::time::Instant::now(), (retry_count as u16).min(1000).saturating_add(1)));
-                            
-                            // v3.7: CRITICAL FIX - Request BATCH of blocks, not just one!
-                            // v3.34: Dedup — skip if sync for this height is already in-flight
-                            if let Some(p2p) = &unified_p2p {
-                                if !crate::unified_p2p::try_acquire_sync_slot(missing_height) {
-                                    if is_debug() { println!("[DBG][SYNC] rerequest_dedup_skip h={}", missing_height); }
-                                } else {
-                                let p2p_clone = p2p.clone();
-                                let missing = missing_height;
-                                let local_h = storage.get_chain_height().unwrap_or(0);
-                                let network_h = p2p.get_max_peer_height();
-                                
-                                tokio::spawn(async move {
-                                    let gap = network_h.saturating_sub(local_h);
-                                    let (from, to) = if gap > 5 {
-                                        let batch_end = std::cmp::min(network_h, local_h + 100);
-                                        if crate::node::is_info() {
-                                            println!("[INFO][SYNC] batch_rerequest local={} network={} gap={} range={}-{}", 
-                                                     local_h, network_h, gap, local_h + 1, batch_end);
-                                        }
-                                        (local_h + 1, batch_end)
-                                    } else {
-                                        (missing, missing)
-                                    };
-                                    
-                                    if let Err(e) = p2p_clone.sync_blocks(from, to).await {
-                                        println!("[WARN][BLOCK] rerequest_failed h={}-{} err={}", from, to, e);
-                                    }
-                                    crate::unified_p2p::release_sync_slot(missing);
-                                });
-                                } // end dedup else
-                            }
-                            
-                            // Reset timestamp for pending block (give it more time)
-                            if let Some((data, count, _)) = pending_blocks.remove(&height) {
-                                pending_blocks.insert(height, (data, count, std::time::Instant::now()));
-                            }
-                        }
-                    }
-                }
-                
-                // Clean expired block requests (older than 60 seconds)
-                let mut expired_requests = Vec::new();
-                for (height, (timestamp, _)) in requested_blocks.iter() {
-                    if timestamp.elapsed() > std::time::Duration::from_secs(60) {
-                        expired_requests.push(*height);
-                    }
-                }
-                for height in expired_requests {
-                    requested_blocks.remove(&height);
-                }
-                
-                // METRICS: Log retry statistics every 5 minutes (10 cleanup cycles @ 30s)
-                static CLEANUP_COUNTER: AtomicU64 = AtomicU64::new(0);
-                let cleanup_count = CLEANUP_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-                
-                if cleanup_count % 10 == 0 {
-                    // Log every 5 minutes (10 cycles × 30s = 300s)
-                    let total = RETRY_TOTAL.load(Ordering::Relaxed);
-                    let success = RETRY_SUCCESS.load(Ordering::Relaxed);
-                    let cert_race = RETRY_CERT_RACE.load(Ordering::Relaxed);
-                    let missing_prev = RETRY_MISSING_PREV.load(Ordering::Relaxed);
-                    
-                    if total > 0 {
-                        let success_rate = (success as f64 / total as f64 * 100.0) as u64;
-                        if is_debug() { 
-                            println!("[DBG][METRICS] retry_stats window=5min total={} success={} rate={:.1}% cert_race={} missing_prev={}", 
-                                     total, success, success_rate, cert_race, missing_prev);
-                        }
-                    }
-                }
-                
-                // Log status
-                if !pending_blocks.is_empty() || !requested_blocks.is_empty() {
-                    if is_debug() { println!("[DBG][BLOCK] status buffered={} requested={}", 
-                             pending_blocks.len(), requested_blocks.len()); }
-                }
-            }
-        }
     }
     
     /// Validate received microblock
@@ -13554,17 +11217,11 @@ impl BlockchainNode {
                                     total_assigned,
                                 ) {
                                     Ok(mut tx) => {
-                                        // HYBRID SIGNATURE (Ed25519 + Dilithium3) — same as HeartbeatCommitment
-                                        let canonical_msg = format!(
-                                            "{}|{}|{}|{}|{}|{}|{}",
-                                            tx.from,
-                                            tx.to.as_deref().unwrap_or(""),
-                                            tx.amount,
-                                            tx.nonce,
-                                            tx.gas_price,
-                                            tx.gas_limit,
-                                            tx.timestamp,
-                                        );
+                                        // HYBRID SIGNATURE (Ed25519 + Dilithium3). Sign the SINGLE
+                                        // canonical message the verifier uses (Self::build_canonical_verify_message)
+                                        // so the bitmap content (genesis_id/epoch/counts/bitmap) is bound, not
+                                        // just the header — closes the unsigned-field forgery (P1).
+                                        let canonical_msg = Self::build_canonical_verify_message(&tx);
 
                                         // Step 1: Ed25519 ephemeral signature (forward secrecy)
                                         {
@@ -15871,11 +13528,10 @@ impl BlockchainNode {
                                     next_height, local_delay, latest_mb, missing_mb
                                 );
                                 if let Some(p2p) = &unified_p2p {
-                                    for idx in missing_mb.saturating_sub(1)..=latest_mb {
-                                        crate::unified_p2p::clear_macroblock_pending_sync(idx);
-                                    }
                                     clear_expected_producer_cache_above(next_height.saturating_sub(1));
-                                    let _ = p2p.sync_macroblocks(
+                                    // Backward tip-window repair (at/below frontier) → repair path,
+                                    // no clear-before-request flood.
+                                    let _ = p2p.sync_macroblocks_repair(
                                         missing_mb.saturating_sub(1), latest_mb,
                                     ).await;
                                     // v32.2: adaptive resync range. If gap to network tip > 90,
@@ -16094,12 +13750,13 @@ impl BlockchainNode {
                 }
 
                 if let Some(p2p) = &unified_p2p {
-                    // Get best known network height: prefer BEST_PEER_HEIGHT (updated on every block
-                    // receipt via Fix 1), fall back to cached/forced query
+                    // Sync target = the attested/quorum network height (sync_blockchain_height /
+                    // get_cached_network_height), NOT the raw BEST_PEER_HEIGHT max. The atomic is a
+                    // forward-pull tail HINT (still tracked inside the catch-up loop below), but it
+                    // must not be the entry target — a stale/over-reported peer height could otherwise
+                    // inflate it above the attested view (P0b).
                     static LAST_BLOCK_TIME_SECS: StdAtomicU64 = StdAtomicU64::new(0);
                     static LAST_HEIGHT_CHECK: StdAtomicU64 = StdAtomicU64::new(0);
-
-                    let best_peer_h = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
 
                     let should_force_update = {
                         let last_height = LAST_HEIGHT_CHECK.load(StdOrdering::Relaxed);
@@ -16132,10 +13789,9 @@ impl BlockchainNode {
                         p2p.get_cached_network_height().unwrap_or(microblock_height)
                     };
 
-                    // v10.1: Use the MAXIMUM of BEST_PEER_HEIGHT and cached height.
-                    // BEST_PEER_HEIGHT is updated on every received block (real-time),
-                    // cached height comes from heartbeats (30s stale).
-                    let network_height = std::cmp::max(best_peer_h, cached_height);
+                    // Entry target = attested/quorum cached height only (P0b: no BEST_PEER_HEIGHT
+                    // override). cached_height floors at local height, so this stays >= local.
+                    let network_height = cached_height;
 
                     if network_height > microblock_height {
                         let height_difference = network_height.saturating_sub(microblock_height);
@@ -25251,6 +22907,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 format!("QNET_HEARTBEAT:{}:{}:{}", node_id, anchor_height, anchor_hash)
             }
 
+            // Light reward eligibility bitmap: bind EVERY reward-determining field, not just the
+            // header, so a flipped eligibility bit / swapped genesis_id / altered counts breaks the
+            // genesis signature (the pipe-default _ => arm signed none of these, leaving the bitmap
+            // forgeable). Hash bitmap_compressed (not embed ~KBs) to keep the signed message O(1);
+            // pure function of TX fields → deterministic in apply.
+            qnet_state::TransactionType::LightNodeEligibilityBitmap {
+                genesis_id, epoch, total_assigned, eligible_count, bitmap_compressed
+            } => {
+                let bm = hex::encode(Sha3_256::digest(bitmap_compressed));
+                format!("light_bitmap:{}:{}:{}:{}:{}", genesis_id, epoch, total_assigned, eligible_count, bm)
+            }
+
             // === NODE-SIGNED SYSTEM TRANSACTIONS (signed with ephemeral Ed25519 + Dilithium) ===
             // HeartbeatCommitment, PingCommitmentWithSampling — use pipe-separated format
             // This matches node.rs:2817/2997 where nodes sign with:
@@ -25564,7 +23232,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if !Self::verify_dilithium_tx_signature_async(&tx).await? {
                     return Err(QNetError::ValidationError("Invalid Dilithium signature on commitment TX".to_string()));
                 }
-                
+
+                // P2: bind the bitmap's self-declared genesis_id to the AUTHENTICATED signer. The
+                // Dilithium verify above already proved the signer is a genesis PK (anti-squat); this
+                // also forbids one genesis emitting a bitmap for ANOTHER's shard (genesis_id != signer
+                // → cross-shard reward hijack / denial-of-commit). Genuine bitmaps set
+                // dilithium_public_key = node_id = genesis_id, so they pass.
+                if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } = &tx.tx_type {
+                    if tx.dilithium_public_key.as_deref() != Some(genesis_id.as_str()) {
+                        return Err(QNetError::ValidationError(format!(
+                            "LightNodeEligibilityBitmap genesis_id={} != signer={:?} (cross-shard forbidden)",
+                            genesis_id, tx.dilithium_public_key
+                        )));
+                    }
+                }
+
                 if is_info() {
                     println!("[INFO][VERIFY] commitment_tx_hybrid_verified type={:?}",
                              std::mem::discriminant(&tx.tx_type));
@@ -26537,7 +24219,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     ///  (6) Dilithium-verifies EVERY committee signature. A forged committee or any invalid/zero
     ///      signature cannot pass. Returns Ok(()) for a non-v2 (legacy) macroblock — the caller
     ///      handles that path.
-    async fn verify_v2_macroblock(
+    pub(crate) async fn verify_v2_macroblock(
         macroblock: &qnet_state::MacroBlock,
         index: u64,
         p2p: &Arc<SimplifiedP2P>,
@@ -26554,6 +24236,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         if cp.window_head_height / 90 != index || cp.hash() != qc.checkpoint_hash {
             return Err(format!("v2_qc_unbound mb={}", index));
         }
+        // Weak-subjectivity window (P4) — INERT at ws=0 (fresh genesis). Re-verify QCs only for
+        // index >= the embedded WS checkpoint; below it is trusted history (no QC re-verify, closing
+        // the long-range committee-history attack at maturity). The WS point itself is pinned by hash.
+        // At ws=0 the index<ws branch is unreachable and the hash branch is gated on index>0, so a
+        // fresh-genesis chain (lineage from index 0) behaves exactly as before.
+        let ws = crate::genesis_constants::ws_checkpoint();
+        if index < ws.0 {
+            return Err(format!("v2_below_ws mb={} ws={}", index, ws.0));
+        }
+        if index > 0 && index == ws.0 && macroblock.hash()[..] != ws.1[..] {
+            return Err(format!("v2_ws_hash_mismatch mb={}", index));
+        }
         if cp.window_mb_hashes != macroblock.micro_blocks
             || cp.state_root != macroblock.state_root
             || macroblock.consensus_data.randomness_beacon != Some(cp.beacon)
@@ -26561,8 +24255,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         {
             return Err(format!("v2_body_mismatch mb={}", index));
         }
+        // Decouple (P4): a standalone macroblock whose OWN 2f+1 QC verifies (below) needs its N-2
+        // committee anchor only when that anchor is ABOVE the WS checkpoint; at/below WS the committee
+        // is binary-trusted, so the lineage walk stops at WS, not genesis. INERT at ws=0 (n2=index-2>=1
+        // > 0 for every index with an anchor), i.e. identical to the prior unconditional defer.
         if let Some(n2) = Self::v2_committee_anchor_index(index) {
-            if storage.get_macroblock_by_height(n2).ok().flatten().is_none() {
+            if n2 > ws.0 && storage.get_macroblock_by_height(n2).ok().flatten().is_none() {
                 return Err(format!("v2_qc_defer_anchor mb={} need_mb_n2={}", index, n2));
             }
         }
@@ -27182,25 +24880,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
 
         if let Some(ref p2p) = self.unified_p2p {
-            println!("[INFO][SYNC] macroblock_sync_start from={} to={}", from_index, to_index);
-            
-            // Use batch sync for efficiency (max 10 macroblocks per request)
-            let mut current = from_index;
-            while current <= to_index {
-                let batch_end = std::cmp::min(current + 9, to_index);
-                
-                if let Err(e) = p2p.sync_macroblocks(current, batch_end).await {
-                    println!("[WARN][SYNC] macroblock_request_failed range={}-{} err={}", current, batch_end, e);
-                    // Continue with next batch instead of failing completely
-                }
-                
-                current = batch_end + 1;
-                
-                // Small delay between batches to avoid overwhelming peers
-                tokio::time::sleep(Duration::from_millis(200)).await;
+            if is_info() { println!("[INFO][SYNC] macroblock_sync from={} to={}", from_index, to_index); }
+            // Single delegation to the P2P coordinator, which windows + overlap-dedups internally.
+            // The old manual 10-wide re-batching here fought that window (overlapping chunks) — drop it.
+            if let Err(e) = p2p.sync_macroblocks(from_index, to_index).await {
+                if is_warn() { println!("[WARN][SYNC] macroblock_sync_failed from={} to={} err={}", from_index, to_index, e); }
             }
-            
-            println!("[INFO][SYNC] macroblock_sync_requests_sent from={} to={}", from_index, to_index);
             Ok(())
         } else {
             Err(QNetError::NetworkError("P2P system not available".to_string()))
@@ -27626,6 +25311,31 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     Ok(true) => {
                         println!("[INFO][ACTIVATION] code_verified method=mnemonic_xor_match solana={}...",
                             &solana_from_mnemonic[..16.min(solana_from_mnemonic.len())]);
+                        // G3-L1: admission-advisory — re-verify the 1DEV burn ACTUALLY happened on
+                        // Solana. The XOR check above only proves code↔wallet↔CLAIMED-burn-params
+                        // consistency (the params are operator-supplied), NOT that a real burn occurred;
+                        // without this an operator self-derives a valid code with a fabricated burn_tx.
+                        // Same live getTransaction the HTTP register paths enforce. Per-node (NOT
+                        // consensus — a live RPC is non-deterministic and cannot be in apply), so it
+                        // refuses to activate THIS node without a real burn yet can never fork. Genesis
+                        // bootstrap codes don't set QNET_BURN_TX_HASH so this whole branch is skipped.
+                        match crate::rpc::verify_burn_transaction_exists(
+                            &env_burn_tx, &solana_from_mnemonic, env_burn_amount, 1,
+                        ).await {
+                            Ok(true) => {
+                                if is_info() {
+                                    println!("[INFO][ACTIVATION] burn_verified_onchain tx={}...",
+                                        &env_burn_tx[..16.min(env_burn_tx.len())]);
+                                }
+                            }
+                            Ok(false) => return Err(QNetError::ValidationError(format!(
+                                "burn_not_found_on_solana tx={} amount={} — no real 1DEV burn backs this activation",
+                                env_burn_tx, env_burn_amount,
+                            ))),
+                            Err(e) => return Err(QNetError::ValidationError(format!(
+                                "burn_verify_error tx={} err={}", env_burn_tx, e,
+                            ))),
+                        }
                     }
                     Ok(false) => {
                         println!("[ERR][ACTIVATION] mnemonic_mismatch solana_from_seed={}... code_wallet=different",

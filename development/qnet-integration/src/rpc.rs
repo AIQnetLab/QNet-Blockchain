@@ -6329,6 +6329,62 @@ pub fn generate_quantum_challenge() -> String {
     hex::encode(challenge_bytes)
 }
 
+// SECURITY (G2): light-ping challenge is server-AUTHENTICATED and STATELESS (FCM-safe).
+// Old flow let a light node invent its own challenge → self-attest liveness without being pinged.
+// Now the genesis stamps a challenge = hex(nonce[16] | expiry_be[8] | mac[16]); the device echoes it
+// and the same genesis re-verifies the mac. No per-node store (survives FCM-woken devices that never
+// poll). Off-consensus path. Secret = SHA3(domain | node seed) — stable across restarts, never logged.
+const LIGHT_CHALLENGE_TTL_SECS: u64 = 180;
+
+fn light_challenge_mac(node_id: &str, nonce: &[u8; 16], expiry: u64) -> [u8; 16] {
+    use sha3::{Digest, Sha3_256};
+    let seed = std::env::var("QNET_WALLET_SEED")
+        .or_else(|_| std::env::var("QNET_GENESIS_SEED"))
+        .unwrap_or_default();
+    let mut h = Sha3_256::new();
+    h.update(b"qnet-light-challenge-secret-v1");
+    h.update(seed.as_bytes());          // per-node secret (one-way, never exposed)
+    h.update(node_id.as_bytes());       // bind to THIS node
+    h.update(nonce);
+    h.update(&expiry.to_be_bytes());
+    let full = h.finalize();
+    let mut mac = [0u8; 16];
+    mac.copy_from_slice(&full[..16]);
+    mac
+}
+
+/// Issue a server-authenticated, unexpired challenge stamp for `node_id`.
+fn make_challenge_stamp(node_id: &str) -> String {
+    use rand::{RngCore, rngs::OsRng};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut nonce = [0u8; 16];
+    OsRng.fill_bytes(&mut nonce);
+    let expiry = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        + LIGHT_CHALLENGE_TTL_SECS;
+    let mac = light_challenge_mac(node_id, &nonce, expiry);
+    let mut buf = Vec::with_capacity(40);
+    buf.extend_from_slice(&nonce);
+    buf.extend_from_slice(&expiry.to_be_bytes());
+    buf.extend_from_slice(&mac);
+    hex::encode(buf)
+}
+
+/// Verify a challenge stamp was issued by THIS server to THIS node and is not expired.
+fn verify_challenge_stamp(node_id: &str, challenge: &str) -> bool {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let bytes = match hex::decode(challenge) { Ok(b) => b, Err(_) => return false };
+    if bytes.len() != 40 { return false; }
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&bytes[0..16]);
+    let mut exp_b = [0u8; 8];
+    exp_b.copy_from_slice(&bytes[16..24]);
+    let expiry = u64::from_be_bytes(exp_b);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    if expiry < now { return false; }
+    let expected = light_challenge_mac(node_id, &nonce, expiry);
+    bytes[24..40] == expected[..]
+}
+
 // PRODUCTION: Sign with HYBRID cryptography (Ed25519 + CRYSTALS-Dilithium) per NIST/Cisco
 // CRITICAL: Generates NEW ephemeral Ed25519 key for each challenge - NO FALLBACK!
 async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
@@ -7299,7 +7355,10 @@ async fn handle_light_node_register(
                 devices: vec![new_device],
                 quantum_pubkey: register_request.quantum_pubkey.clone(),
                 registered_at: now,
-                last_ping: 0,
+                // Seed with current time, NOT 0: a fresh registration with last_ping=0 is the global
+                // min-by-last_ping, so a full registry would evict the just-registered node (cache
+                // thrash / self-eviction). now keeps it at the freshest end until its first real ping.
+                last_ping: now,
                 ping_count: 0,
                 reward_eligible: true,
             };
@@ -7729,7 +7788,19 @@ async fn handle_light_node_ping_response(
     let node_id = params.get("node_id").unwrap_or(&"unknown".to_string()).clone();
     let signature = params.get("signature").unwrap_or(&"".to_string()).clone();
     let challenge = params.get("challenge").unwrap_or(&"".to_string()).clone();
-    
+
+    // SECURITY (G2): the challenge MUST be one THIS server stamped for THIS node and unexpired —
+    // closes self-attestation (a light node inventing its own challenge to fake liveness/rewards).
+    if !verify_challenge_stamp(&node_id, &challenge) {
+        if crate::node::is_warn() {
+            println!("[WARN][LIGHT] challenge_unrecognized node={}", node_id);
+        }
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Unrecognized or expired challenge"
+        })));
+    }
+
     // PRODUCTION v2.78: Verify Light node HYBRID signature (Ed25519+Dilithium)
     let signature_valid = verify_light_node_signature(&node_id, &challenge, &signature, &blockchain).await;
     
@@ -8051,9 +8122,9 @@ async fn handle_light_node_pending_challenge(
                     }
                 }
                 
-                // Generate new challenge for polling node
-                let challenge = generate_quantum_challenge();
-                let expires_at = now + 180; // 3 minute expiry
+                // Generate a server-stamped challenge (G2: authenticated, FCM-safe).
+                let challenge = make_challenge_stamp(&node_id);
+                let expires_at = now + 180; // 3 minute expiry (matches LIGHT_CHALLENGE_TTL_SECS)
                 
                 // Store pending challenge
                 {
@@ -9036,7 +9107,8 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                     for (light_node, role) in nodes_to_ping {
                         let semaphore = semaphore.clone();
                         let blockchain = blockchain_for_pings.clone();
-                        let challenge = generate_quantum_challenge();
+                        // G2: server-stamped challenge bound to THIS node (FCM-safe, stateless).
+                        let challenge = make_challenge_stamp(&light_node.node_id);
                         let delay = p2p.get_ping_delay(role);
                         let _our_node_id = blockchain.get_node_id();
                         
@@ -11245,7 +11317,9 @@ async fn handle_register_node(
             }],
             quantum_pubkey: quantum_pubkey.to_string(),
             registered_at: now,
-            last_ping: 0,
+            // Seed with now, not 0 (else a fresh node is the global min-by-last_ping and a full
+            // registry self-evicts the just-registered entry — cache thrash).
+            last_ping: now,
             ping_count: 0,
             reward_eligible: true,
         };
@@ -12609,40 +12683,45 @@ fn extract_burn_amount_from_token_balances(tx_data: &serde_json::Value) -> Resul
         .and_then(|v| v.as_array())
         .ok_or_else(|| "postTokenBalances not found".to_string())?;
     
-    // Calculate burned amount: sum of (pre - post) for all token accounts
+    // SECURITY: only the canonical 1DEV SPL mint counts toward the activation burn — without this
+    // filter a burn of any worthless self-issued SPL token would pass the >=1 DEV check (free node).
+    let onedev_mint = crate::network_config::get_onedev_mint();
+
+    // Sum (pre - post) for 1DEV accounts ONLY, matching pre<->post by accountIndex+mint (Solana does
+    // NOT guarantee pre/postTokenBalances share array order, so the old positional .zip() was unsafe).
     let mut total_burned: u64 = 0;
-    
-    for (pre_balance, post_balance) in pre_token_balances.iter().zip(post_token_balances.iter()) {
-        // Extract token amounts from uiTokenAmount field
-        if let (Some(pre_amount_str), Some(post_amount_str)) = (
-            pre_balance.get("uiTokenAmount")
-                .and_then(|v| v.get("amount"))
-                .and_then(|v| v.as_str()),
-            post_balance.get("uiTokenAmount")
-                .and_then(|v| v.get("amount"))
-                .and_then(|v| v.as_str())
-        ) {
-            // Parse amounts as u64 (token smallest units)
-            let pre_amount = pre_amount_str.parse::<u64>()
-                .map_err(|e| format!("Failed to parse pre amount: {}", e))?;
-            let post_amount = post_amount_str.parse::<u64>()
-                .map_err(|e| format!("Failed to parse post amount: {}", e))?;
-            
-            // Calculate decrease (burned amount)
-            let burned = pre_amount.saturating_sub(post_amount);
-            total_burned += burned;
-            
-            if burned > 0 {
-                println!("[BURN] 🔥 Token balance decrease detected: {} units", burned);
-            }
+
+    for pre_balance in pre_token_balances.iter() {
+        if pre_balance.get("mint").and_then(|m| m.as_str()) != Some(onedev_mint) {
+            continue; // not 1DEV → ignore
+        }
+        let acct_index = pre_balance.get("accountIndex").and_then(|v| v.as_u64());
+        let pre_amount = pre_balance.get("uiTokenAmount")
+            .and_then(|v| v.get("amount"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        // Matching post entry for the SAME account AND 1DEV mint (absent = account closed → post 0).
+        let post_amount = post_token_balances.iter()
+            .find(|pb| pb.get("accountIndex").and_then(|v| v.as_u64()) == acct_index
+                && pb.get("mint").and_then(|m| m.as_str()) == Some(onedev_mint))
+            .and_then(|pb| pb.get("uiTokenAmount"))
+            .and_then(|v| v.get("amount"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let burned = pre_amount.saturating_sub(post_amount);
+        total_burned = total_burned.saturating_add(burned);
+        if burned > 0 && crate::node::is_info() {
+            println!("[INFO][BURN] onedev_balance_decrease units={}", burned);
         }
     }
-    
+
     Ok(total_burned)
 }
 
 /// Verify burn transaction actually exists on blockchain
-async fn verify_burn_transaction_exists(
+pub(crate) async fn verify_burn_transaction_exists(
     burn_tx_hash: &str,
     wallet_address: &str,  // v4.7: MUST be the Solana address that signed the burn TX
     burn_amount: u64,

@@ -3228,6 +3228,18 @@ impl SimplifiedP2P {
         )
     }
 
+    /// Control-lane serve requests: the single-anchor binding fetch a fresh node needs to bind a
+    /// snapshot BEFORE it is on-chain. These get a RESERVED serve quota a bulk cold-sync flood can
+    /// never consume, so a 100k join storm cannot starve the one fetch every joiner must complete.
+    /// (RequestMacroblockAnchor is intentionally OUT of is_bulk_lane_message so it stays on the
+    /// high-priority lane — do not "fix" that by adding it there.)
+    #[inline]
+    pub(crate) fn is_control_lane_message(msg: &NetworkMessage) -> bool {
+        matches!(msg,
+            NetworkMessage::RequestMacroblockAnchor { .. }
+        )
+    }
+
     /// PRODUCTION v2.19.21: Initialize QUIC transport for high-performance P2P
     /// 
     /// Features:
@@ -12785,6 +12797,24 @@ pub enum NetworkMessage {
         self_signature: Vec<u8>,   // Dilithium3 detached signature over "QNET_VRF_KEY_v1:{node_id}"
         timestamp: u64,
     },
+
+    // NOTE: bincode serializes enum variants by POSITIONAL index — APPEND new variants at the
+    // tail only; inserting mid-enum shifts every later index and breaks wire compat with deployed
+    // binaries.
+    /// Control-lane fetch of ONE self-contained QC-bound macroblock by index (snapshot binding /
+    /// anchor verify). Deliberately NOT in is_bulk_lane_message → stays on the high-priority lane
+    /// and gets the reserved control-lane serve quota that a bulk cold-sync flood cannot consume.
+    RequestMacroblockAnchor {
+        index: u64,
+        requester_id: String,
+    },
+
+    /// Response carrying a single QC-bound macroblock for RequestMacroblockAnchor.
+    MacroblockAnchor {
+        index: u64,
+        data: Vec<u8>,
+        sender_id: String,
+    },
 }
 
 /// PRODUCTION: Active node info for gossip sync
@@ -14363,7 +14393,23 @@ impl SimplifiedP2P {
                 }
                 self.handle_macroblocks_batch(macroblocks, from_index, to_index, sender_id);
             }
-            
+
+            NetworkMessage::RequestMacroblockAnchor { index, requester_id } => {
+                // Control-lane single-anchor fetch (snapshot binding before registration).
+                if crate::node::is_info() {
+                    println!("[INFO][ANCHOR] anchor_request from={} idx={}", requester_id, index);
+                }
+                self.handle_macroblock_anchor_request(from_peer, index, requester_id);
+            }
+
+            NetworkMessage::MacroblockAnchor { index, data, sender_id } => {
+                // Single QC-bound macroblock anchor — route through the same verified ingest path.
+                if crate::node::is_info() {
+                    println!("[INFO][ANCHOR] anchor_recv idx={} from={} bytes={}", index, sender_id, data.len());
+                }
+                self.handle_macroblocks_batch(vec![(index, data)], index, index, sender_id);
+            }
+
             NetworkMessage::RequestConsensusState { round, requester_id } => {
                 // Handle consensus state request
                 if crate::node::is_info() {
@@ -18735,6 +18781,53 @@ impl SimplifiedP2P {
     //   REST API instead of macroblock peer-to-peer sync.
     // =========================================================================
     
+    /// Handle a control-lane single-anchor macroblock request (P6). Same public-data + IP-genesis
+    /// bypass model as handle_macroblock_request, but its OWN burst-then-throttle bucket sized to one
+    /// cold-start anchor sweep (not the strict 5/min bulk bucket), so a legit joiner can pull the
+    /// lineage it needs to bind a snapshot while a Byzantine flood stays bounded per (IP,id). Serves
+    /// via the same storage-backed channel; the control-lane priority is on the REQUEST side.
+    pub fn handle_macroblock_anchor_request(&self, from_peer: &str, index: u64, requester_id: String) {
+        self.update_peer_last_seen(from_peer);
+
+        let is_genesis_peer = from_peer.split(':').next()
+            .map(|ip| is_genesis_node_ip(ip))
+            .unwrap_or(false);
+        if !is_genesis_peer {
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let from_ip = from_peer.split(':').next().unwrap_or(from_peer);
+            let id_prefix: String = requester_id.chars().take(48).collect();
+            // Burst sized to one cold-start anchor sweep per minute, then throttle.
+            const MB_ANCHOR_BURST: usize = 120;
+            let rate_key = format!("mb_anchor_{}_{}", from_ip, id_prefix);
+            let mut rate_limit = self.rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
+                requests: Vec::new(),
+                max_requests: MB_ANCHOR_BURST,
+                window_seconds: 60,
+                blocked_until: 0,
+            });
+            if rate_limit.blocked_until > current_time {
+                return;
+            }
+            let window = rate_limit.window_seconds;
+            rate_limit.requests.retain(|&t| t > current_time - window);
+            if rate_limit.requests.len() >= rate_limit.max_requests {
+                rate_limit.blocked_until = current_time + 60;
+                if crate::node::is_warn() {
+                    println!("[WARN][ANCHOR] rate_exceeded peer={} id={} idx={}", from_peer, id_prefix, index);
+                }
+                return;
+            }
+            rate_limit.requests.push(current_time);
+        }
+
+        if let Some(ref sync_tx) = self.macroblock_sync_request_tx {
+            let _ = sync_tx.try_send((index, index, requester_id));
+        }
+    }
+
     /// Handle macroblock request from peer for sync
     /// PRODUCTION: Full macroblock sync with rate limiting and validation
     pub fn handle_macroblock_request(&self, from_peer: &str, from_index: u64, to_index: u64, requester_id: String) {
@@ -18745,8 +18838,10 @@ impl SimplifiedP2P {
         // 2f+1-QC-bound data: served to ANY peer so a fresh node can fast-sync via snapshot BEFORE
         // registration. No identity gate; DoS is bounded by the rate-limit below.
 
-        // v3.0: CRITICAL FIX - Genesis nodes bypass rate limiting to prevent network isolation
-        let is_genesis_requester = requester_id.starts_with("genesis_node_");
+        // Genesis bypass uses ONLY the transport-verified source IP (from_peer), NOT the
+        // self-declared requester_id which is spoofable. QUIC+TLS anchors from_peer to a valid
+        // cert, so the IP cannot be forged; a non-genesis peer claiming requester_id="genesis_node_*"
+        // no longer escapes the rate limit. Matches the already-hardened handle_block_request path.
         let is_genesis_peer = from_peer.split(':').next()
             .map(|ip| is_genesis_node_ip(ip))
             .unwrap_or(false);
@@ -18773,8 +18868,8 @@ impl SimplifiedP2P {
 
         // Check rate limit
         let rate_limited = {
-            // v3.0: GENESIS BYPASS - Never rate limit genesis nodes syncing with each other
-            if is_genesis_requester || is_genesis_peer {
+            // GENESIS BYPASS - by transport-verified IP only, not self-declared id
+            if is_genesis_peer {
                 false // Genesis nodes always allowed
             // v10.1: Relaxed rate limit for peers catching up (requesting old macroblocks)
             // Not unlimited — prevents DDoS via repeated index-0 requests
@@ -18947,20 +19042,120 @@ impl SimplifiedP2P {
     /// Request macroblocks from network for sync
     /// PRODUCTION: Used during initial sync and catch-up
     /// v2.96: Filter by failover cache + retry to next peer on failure
+    /// Single-owner FORWARD macroblock sync coordinator (mirrors sync_blocks). Window in
+    /// MACROBLOCK-INDEX space, clamped to [applied+1, applied+WINDOW] so it never requests
+    /// faster than the apply pipeline drains. (0,0) = tip-nudge idiom. Overlap-dedup +
+    /// bounded concurrency kill the duplicate-range storm that distinct callers (catch-up
+    /// loop, recovery) used to flood genesis with → priority_rate_exceeded. Macroblocks are
+    /// 90x rarer than microblocks, so the window/concurrency are deliberately small.
+    /// Repair of a gap BELOW the frontier goes through sync_macroblocks_repair (not clamped).
     pub async fn sync_macroblocks(&self, from_index: u64, to_index: u64) -> Result<(), String> {
-        // v14.8: Top-level hard timeout (safety net over the inner loop).
-        // Inner bounds: ≤15s × 5 peers ≈ 75s. Hard cap sits just above that
-        // to guarantee we never sit forever on one call.
+        const SYNC_MB_WINDOW: u64 = 64;
+        // Apply-frontier in macroblock-index space (no atomic exists; cheap point lookup).
+        let applied_mb = match crate::node::try_get_storage() {
+            Some(s) => s.get_latest_macroblock_index().unwrap_or(0),
+            None => return Err("storage_unavailable_for_macroblock_sync".to_string()),
+        };
+        // (0,0) tip-nudge → [applied+1, applied+WINDOW]. Macroblock index 0 never exists.
+        let (req_from, req_to) = if from_index == 0 && to_index == 0 {
+            (applied_mb.saturating_add(1), applied_mb.saturating_add(SYNC_MB_WINDOW))
+        } else {
+            (from_index.max(1), to_index)
+        };
+        // A request whose whole range is at/below the apply-frontier is a GAP REPAIR (recovery /
+        // N-2 seed / deep-gap fetch of an already-passed index — note get_latest_macroblock_index()
+        // is chain_height/90, so a real hole can exist below it), NOT forward catch-up. Route it to
+        // the repair path (skip-present, no forward clamp) so the forward window can't silently drop
+        // it to a no-op. Forward sweeps (req_to above the frontier) keep the sliding window below.
+        if req_to <= applied_mb {
+            return self.sync_macroblocks_repair(req_from, req_to).await;
+        }
+        // Forward window clamp to the apply-frontier (FILL-LOWEST-FIRST).
+        let lo = req_from.max(applied_mb.saturating_add(1));
+        let hi = req_to.min(applied_mb.saturating_add(SYNC_MB_WINDOW));
+        if lo > hi {
+            return Ok(()); // already applied, or beyond the window the pipeline can absorb
+        }
+        self.drive_macroblock_sync(lo, hi).await
+    }
+
+    /// REPAIR/backfill path for macroblock gaps at or below the apply-frontier (reorg
+    /// recovery, desync missing-macroblock detection). Unlike sync_macroblocks it honors the
+    /// explicit [from,to] range so an advanced frontier does not clamp away a genuine hole;
+    /// still width-capped, skip-present (so an already-present prefix isn't re-requested),
+    /// overlap-deduped and semaphore-bounded via the shared driver.
+    pub async fn sync_macroblocks_repair(&self, from_index: u64, to_index: u64) -> Result<(), String> {
+        const SYNC_MB_WINDOW: u64 = 64;
+        let from_index = from_index.max(1);
+        if from_index > to_index {
+            return Ok(());
+        }
+        let storage = match crate::node::try_get_storage() {
+            Some(s) => s,
+            None => return Err("storage_unavailable_for_macroblock_repair".to_string()),
+        };
+        // Width-cap, then skip a contiguously-present prefix → fetch from the first real hole.
+        let cap = to_index.min(from_index.saturating_add(SYNC_MB_WINDOW).saturating_sub(1));
+        let mut lo = from_index;
+        while lo <= cap && storage.get_macroblock_by_height(lo).ok().flatten().is_some() {
+            lo = lo.saturating_add(1);
+        }
+        if lo > cap {
+            return Ok(()); // requested range already present
+        }
+        self.drive_macroblock_sync(lo, cap).await
+    }
+
+    /// Shared driver: overlap-dedup + bounded concurrency + hard timeout over the inner loop.
+    /// Both the forward coordinator and the repair path funnel here so a single in-flight set
+    /// and concurrency budget govern ALL macroblock fetches (no duplicate-range flood).
+    async fn drive_macroblock_sync(&self, lo: u64, hi: u64) -> Result<(), String> {
+        const MAX_CONCURRENT_SYNC_MB: usize = 2;
         const SYNC_MACROBLOCKS_HARD_TIMEOUT_SECS: u64 = 90;
+
+        static SYNC_MB_INFLIGHT: Lazy<std::sync::Mutex<Vec<(u64, u64)>>> =
+            Lazy::new(|| std::sync::Mutex::new(Vec::new()));
+        static SYNC_MB_CONCURRENCY: Lazy<tokio::sync::Semaphore> =
+            Lazy::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_SYNC_MB));
+
+        // Overlap-dedup + register (short sync critical section, no await).
+        {
+            let mut inflight = match SYNC_MB_INFLIGHT.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(), // poisoned: recover, never block sync
+            };
+            if inflight.iter().any(|&(a, b)| !(hi < a || lo > b)) {
+                if crate::node::is_debug() {
+                    println!("[DBG][MB-SYNC] coalesced lo={} hi={} reason=overlaps_inflight", lo, hi);
+                }
+                return Ok(());
+            }
+            inflight.push((lo, hi));
+        }
+        struct InflightGuard(u64, u64);
+        impl Drop for InflightGuard {
+            fn drop(&mut self) {
+                if let Ok(mut v) = SYNC_MB_INFLIGHT.lock() {
+                    v.retain(|&(a, b)| !(a == self.0 && b == self.1));
+                }
+            }
+        }
+        let _ig = InflightGuard(lo, hi);
+
+        let _permit = match SYNC_MB_CONCURRENCY.acquire().await {
+            Ok(p) => p,
+            Err(_) => return Err("sync_macroblocks_semaphore_closed".to_string()),
+        };
+
         match tokio::time::timeout(
             std::time::Duration::from_secs(SYNC_MACROBLOCKS_HARD_TIMEOUT_SECS),
-            self.sync_macroblocks_inner(from_index, to_index),
+            self.sync_macroblocks_inner(lo, hi),
         ).await {
             Ok(res) => res,
             Err(_) => {
                 if crate::node::is_warn() {
-                    println!("[WARN][MB-SYNC] hard_timeout from={} to={} after={}s",
-                             from_index, to_index, SYNC_MACROBLOCKS_HARD_TIMEOUT_SECS);
+                    println!("[WARN][MB-SYNC] hard_timeout lo={} hi={} after={}s",
+                             lo, hi, SYNC_MACROBLOCKS_HARD_TIMEOUT_SECS);
                 }
                 Err(format!("sync_macroblocks_hard_timeout {}s",
                             SYNC_MACROBLOCKS_HARD_TIMEOUT_SECS))
@@ -18987,41 +19182,18 @@ impl SimplifiedP2P {
         // v2.96: Get LIVE genesis nodes from failover cache (updated every 20s)
         let working_genesis_ips = Self::filter_working_genesis_nodes_static(get_genesis_bootstrap_ips());
 
-        // v15.7: Targeted DESYNC peer query — minimum chain-height threshold.
-        // A peer can only serve macroblock `to_index` if its observed chain
-        // height covers the entire range. Without this filter the sync path
-        // round-robins through every peer including those that are themselves
-        // behind, wastes the 5-peer attempt budget on `not_found` responses,
-        // and surfaces as `all peers did not respond` even when the right
-        // peers are reachable. Using `last_block_height` (kept fresh by the
-        // heartbeat / block-broadcast paths) gives an O(1) per-peer filter
-        // that scales identically at thousands of validators.
-        let required_microblock_height: u64 = to_index.saturating_mul(90);
-
-        // Candidates: ALL synced Super nodes, not genesis-only. Genesis-only serving is a
-        // bottleneck + sync single-point at 100k+ nodes; the height filter ensures the peer
-        // actually covers the range, and genesis stay preferred via the sort below.
+        // Peer-pick: trust = QC, not peer-reported height (P3). The server serves finalized
+        // macroblocks to all (handle_macroblock_request) and every fetched macroblock is
+        // QC/crypto-verified on apply, so a behind peer simply returns nothing and the retry
+        // loop tries the next. Filtering candidates by last_block_height here self-poisoned a
+        // cold joiner: stale per-peer heights disqualified otherwise-serving genesis peers,
+        // yielding `no_live_peers` and a failed snapshot bind. Candidate set = ALL connected
+        // Super peers; the genesis-preferred + reputation sort below orders them.
         let mut eligible_peers: Vec<_> = peers.iter()
             .filter(|p| matches!(p.node_type, NodeType::Super))
-            .filter(|p| {
-                // v15.7: peer must cover the target range; last_block_height==0 = "unknown"
-                // (heartbeat not yet fired) → kept eligible to avoid empty sets at bootstrap.
-                p.last_block_height == 0 || p.last_block_height >= required_microblock_height
-            })
             .cloned()
             .collect();
-        
-        // Fallback: if no peers pass failover filter, use all (network might be starting)
-        if eligible_peers.is_empty() {
-            if crate::node::is_warn() {
-                println!("[WARN][MB-SYNC] no_live_peers fallback=all_eligible");
-            }
-            eligible_peers = peers.iter()
-                .filter(|p| matches!(p.node_type, NodeType::Super))
-                .cloned()
-                .collect();
-        }
-        
+
         if eligible_peers.is_empty() {
             return Err("No Super/Full nodes available for macroblock sync".to_string());
         }

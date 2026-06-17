@@ -2954,9 +2954,13 @@ impl BlockchainActivationRegistry {
             }
         }
         
-        // Check time-based phase transition (5 years from launch: Nov 2024)
-        // Launch date: November 1, 2024
-        let launch_timestamp: u64 = 1730419200; // Nov 1, 2024 00:00:00 UTC
+        // Time-based phase transition = 5 years from the GENESIS block timestamp (block-0 ts),
+        // NOT a hardcoded date. The network runs fresh-genesis launches, so a fixed Nov-2024 anchor
+        // would mis-time Phase-1→2 (e.g. a 2026 genesis would flip ~3.4y in). Anchor to the same
+        // GLOBAL_GENESIS_TIMESTAMP every other phase/timing detector uses; fall back to the historical
+        // mainnet launch date only if the genesis ts is not yet known at boot (genesis_ts==0).
+        let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+        let launch_timestamp: u64 = if genesis_ts != 0 { genesis_ts } else { 1730419200 };
         let five_years_seconds: u64 = 5 * 365 * 24 * 60 * 60;
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
