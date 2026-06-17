@@ -7852,6 +7852,61 @@ impl Storage {
         }
     }
 
+    /// Decode a snapshot blob into its account list for in-memory state rebuild during
+    /// fork-recovery. Reads BOTH the canonical full_snap_ (Format A: raw accounts-CF dump)
+    /// and the legacy state_snap_ (Format B: bincode Vec). Accounts only — other CF sections
+    /// ignored. Pure (no DB). Inverse of create_state_snapshot/save_state_snapshot writers.
+    pub fn decode_snapshot_accounts(&self, snap_data: &[u8]) -> IntegrationResult<Vec<(String, qnet_state::Account)>> {
+        if snap_data.len() < 41 {
+            return Err(IntegrationError::StorageError(format!("snapshot too short: {} bytes", snap_data.len())));
+        }
+        let stored_hash = &snap_data[..32];
+        let compressed = &snap_data[40..];
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(compressed);
+        if stored_hash != hasher.finalize().as_slice() {
+            return Err(IntegrationError::StorageError("snapshot integrity check failed".to_string()));
+        }
+        let buf = zstd::decode_all(compressed)
+            .map_err(|e| IntegrationError::StorageError(format!("snapshot decompress failed: {}", e)))?;
+        if buf.first().copied() != Some(0x02) || buf.len() < 5 {
+            return Err(IntegrationError::StorageError("snapshot wrong/short type".to_string()));
+        }
+        // probe u32 after type byte: >=10_000 ⇒ Format B (state_root bytes); else Format A version
+        let probe = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+        let mut out: Vec<(String, qnet_state::Account)> = Vec::new();
+        if probe >= 10_000 {
+            // Format B: [0x02 | state_root(32) | total_supply(8) | height(8) | bincode(Vec<(addr,Account)>)]
+            let body = 1 + 32 + 8 + 8;
+            if buf.len() < body { return Err(IntegrationError::StorageError("format_b truncated".to_string())); }
+            out = bincode::deserialize(&buf[body..])
+                .map_err(|e| IntegrationError::SerializationError(format!("format_b decode: {}", e)))?;
+        } else {
+            // Format A: [0x02 | version(4) | height(8) | ts(8) | (klen|k|vlen|v)* | REWARDS_V1 ...]
+            let mut cursor = 1 + 4 + 8 + 8;
+            while cursor < buf.len() {
+                if cursor + 10 <= buf.len() && &buf[cursor..cursor + 10] == b"REWARDS_V1" { break; }
+                if cursor + 4 > buf.len() { break; }
+                let klen = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                if cursor + klen > buf.len() { break; }
+                let key = &buf[cursor..cursor + klen]; cursor += klen;
+                if cursor + 4 > buf.len() { break; }
+                let vlen = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                if cursor + vlen > buf.len() { break; }
+                let val = &buf[cursor..cursor + vlen]; cursor += vlen;
+                let addr = String::from_utf8(key.to_vec())
+                    .map_err(|e| IntegrationError::StorageError(format!("addr utf8: {}", e)))?;
+                let account = bincode::deserialize::<qnet_state::Account>(val)
+                    .map_err(|e| IntegrationError::SerializationError(format!("account decode: {}", e)))?;
+                out.push((addr, account));
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn load_state_snapshot_by_height(&self, height: u64) -> IntegrationResult<Option<([u8; 32], Vec<u8>)>> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;

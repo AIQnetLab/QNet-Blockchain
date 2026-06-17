@@ -3500,45 +3500,32 @@ impl BlockchainNode {
         // Decoding is purely a CPU transformation of bytes the caller
         // already owns; doing it BEFORE we acquire the write lock keeps
         // the apply pipeline blocked for the minimum possible window.
+        // Decode the snapshot bytes already fetched by find_snapshot_at_or_before (canonical
+        // full_snap_ or legacy state_snap_). Restoring from the freshest snapshot ≤ target
+        // bounds replay to ≤ SNAPSHOT_INCREMENTAL_INTERVAL instead of a full genesis replay.
         let restored_baseline: Option<(u64, Vec<(String, qnet_state::Account)>)> =
             match snap_choice {
-                Some((snap_height, _snap_data)) => {
-                    match storage.load_state_snapshot_by_height(snap_height).await {
-                        Ok(Some((_state_root, accounts_bytes))) => {
-                            let deser = bincode::DefaultOptions::new()
-                                .with_fixint_encoding()
-                                .allow_trailing_bytes()
-                                .deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_bytes)
-                                .or_else(|_| bincode::deserialize::<Vec<(String, qnet_state::Account)>>(&accounts_bytes));
-                            match deser {
-                                Ok(accounts) => Some((snap_height, accounts)),
-                                Err(e) => {
-                                    println!(
-                                        "[WARN][STATE] reconcile_deserialize_failed snap_h={} err={} action=full_replay",
-                                        snap_height, e,
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        Ok(None) => None,
+                Some((snap_height, snap_data)) => {
+                    match storage.decode_snapshot_accounts(&snap_data) {
+                        Ok(accounts) => Some((snap_height, accounts)),
                         Err(e) => {
-                            println!(
-                                "[WARN][STATE] reconcile_load_snapshot_failed snap_h={} err={:?} action=full_replay",
-                                snap_height, e,
-                            );
+                            println!("[WARN][STATE] reconcile_decode_failed snap_h={} err={:?}", snap_height, e);
                             None
                         }
                     }
                 }
-                None => {
-                    println!(
-                        "[INFO][STATE] reconcile_no_snapshot_available target={} action=full_replay",
-                        target_height,
-                    );
-                    None
-                }
+                None => None,
             };
+
+        // No usable snapshot above the genesis window ⇒ refuse a from-0 replay (it freezes the
+        // node under the state lock and resets the per-mb baseline). Return Err so the caller
+        // re-syncs from the canonical 2f+1 chain instead. A snapshot exists at every interval.
+        const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
+        if restored_baseline.is_none() && target_height > SNAPSHOT_INCREMENTAL_INTERVAL {
+            return Err(format!(
+                "reconcile_no_usable_snapshot target={} action=resync_required", target_height
+            ));
+        }
 
         // Step 3: pre-load every microblock that needs to be replayed.
         // Doing this BEFORE we acquire the state write lock means the
