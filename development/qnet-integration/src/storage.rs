@@ -6033,6 +6033,328 @@ impl Storage {
         Ok(())
     }
 
+    /// Batch-load accounts from the persistent `accounts` CF in ONE RocksDB multi_get (vs N single
+    /// reads). Lets the epoch-boundary super-eligibility pass resolve a large EVICTED-super set with a
+    /// single batched I/O instead of sequential cold reads that would stall the boundary block at scale.
+    /// Order matches `addresses`; missing/undecodable → None.
+    pub fn load_accounts_batch(&self, addresses: &[String]) -> Vec<Option<qnet_state::Account>> {
+        let cf = match self.persistent.db.cf_handle("accounts") {
+            Some(c) => c,
+            None => return vec![None; addresses.len()],
+        };
+        self.persistent.db
+            .multi_get_cf(addresses.iter().map(|a| (&cf, a.as_bytes())))
+            .into_iter()
+            .map(|r| match r { Ok(Some(b)) => bincode::deserialize(&b).ok(), _ => None })
+            .collect()
+    }
+
+    /// Genesis-local PERSISTENT burn-attestation dedup (one burn_tx → one wallet). Survives process
+    /// restart — the prior in-memory map was wiped on restart, letting one burn back >1 node across
+    /// restarts. Genesis-node-local memory (NOT consensus state); under honest 2f+1 genesis a reused
+    /// burn can never reach the on-chain quorum because honest attestors refuse to re-sign it.
+    pub fn attested_burn_put(&self, burn_tx: &str, wallet: &str) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.persistent.db.put_cf(&cf, format!("attburn_{}", burn_tx).as_bytes(), wallet.as_bytes())?;
+        Ok(())
+    }
+
+    /// The wallet this genesis already attested for `burn_tx`, or None.
+    pub fn attested_burn_get(&self, burn_tx: &str) -> IntegrationResult<Option<String>> {
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        match self.persistent.db.get_cf(&cf, format!("attburn_{}", burn_tx).as_bytes())? {
+            Some(v) => Ok(Some(String::from_utf8_lossy(&v).to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// COMMITTED burn→wallet binding (on-chain uniqueness, NOT the genesis-local attested_burn).
+    /// Written FIRST-WINS when a burn-backed NodeRegistration is applied; read at block-validation
+    /// (verify_burn_attestation_quorum) to reject a second registration reusing the same burn for a
+    /// different wallet. With a ROTATING committee the genesis-local dedup is insufficient (disjoint
+    /// honest sub-committees could each attest the same burn); this committed binding is the
+    /// deterministic global stop. Idempotent (only sets if unset → binding immutable).
+    pub fn committed_burn_wallet_put(&self, burn_tx: &str, wallet: &str) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let key = format!("cbw_{}", burn_tx);
+        if self.persistent.db.get_cf(&cf, key.as_bytes())?.is_none() {
+            self.persistent.db.put_cf(&cf, key.as_bytes(), wallet.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// The wallet a `burn_tx` is committed-bound to on-chain, or None.
+    pub fn committed_burn_wallet_get(&self, burn_tx: &str) -> IntegrationResult<Option<String>> {
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        match self.persistent.db.get_cf(&cf, format!("cbw_{}", burn_tx).as_bytes())? {
+            Some(v) => Ok(Some(String::from_utf8_lossy(&v).to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// True iff `wallet` has a chain-confirmed burn-attested NodeRegistration — a node_ entry with a
+    /// non-empty backing burn. Gates NodeActivation (which carries no burn of its own) at verify: an
+    /// activation is valid only for a wallet that already proved a burn at registration, so a raw
+    /// activation cannot mint a node identity (super pseudonym / reward-eligible row) for free. Two O(1)
+    /// point-reads (wallet_ reverse index → node_ forward entry). Genesis registrations carry an empty
+    /// burn (and never activate), so this correctly returns false for them.
+    pub fn wallet_is_burn_registered(&self, wallet: &str) -> bool {
+        let cf = match self.persistent.db.cf_handle("node_registry") { Some(c) => c, None => return false };
+        let nid = match self.persistent.db.get_cf(&cf, format!("wallet_{}", wallet).as_bytes()) {
+            Ok(Some(v)) => serde_json::from_slice::<serde_json::Value>(&v).ok()
+                .and_then(|j| j["node_id"].as_str().map(|s| s.to_string())),
+            _ => None,
+        };
+        let nid = match nid { Some(n) => n, None => return false };
+        match self.persistent.db.get_cf(&cf, format!("node_{}", nid).as_bytes()) {
+            Ok(Some(v)) => serde_json::from_slice::<serde_json::Value>(&v).ok()
+                .and_then(|j| j["burn"].as_str().map(|b| !b.is_empty())).unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// Rebuild the committed burn→wallet index (cbw_) DETERMINISTICALLY from the chain-confirmed
+    /// node_ registry entries, considering ONLY registrations with reg_height <= up_to_height.
+    /// cbw is a pure DERIVED index, never deleted per-block — so a snapshot/fast-sync join (restores
+    /// node_registry but not the 'metadata' CF where cbw lives) and any node after a reorg reconstruct
+    /// a cbw IDENTICAL to a from-genesis node. The reg_height<=up_to bound excludes orphaned
+    /// registrations on reorg (no per-block delete, no absence window). First-wins by (reg_height,
+    /// node_id): the earliest canonical registration of a burn owns it. Atomic: the old cbw_ region is
+    /// cleared and the rebuilt set written in ONE WriteBatch (no reader observes an empty intermediate).
+    /// Burns only ever back Super/genesis registrations, so this scans the `srtr_` roster index
+    /// (O(supers)) and never the millions of light node_ entries.
+    pub fn rebuild_committed_burn_wallet(&self, up_to_height: u64) -> IntegrationResult<u32> {
+        use rocksdb::{IteratorMode, Direction};
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let metadata_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let mut cands: Vec<(u64, String, String, String)> = Vec::new();
+        // Scan BOTH roster indices: srtr_ (super/genesis) AND lrtr_ (light). Light nodes are also
+        // burn-attested on-chain (Option A), so their burn→wallet binding must enter cbw and be
+        // reconstructed here EXACTLY like the incremental (all-types) writers — else live-vs-rebuild
+        // cbw diverges → fork. burn lives only in the node_ JSON (point-read), not in the index value.
+        for prefix in [b"srtr_".as_ref(), b"lrtr_".as_ref()] {
+            for item in self.persistent.db.iterator_cf(&registry_cf, IteratorMode::From(prefix, Direction::Forward)) {
+                let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+                if !k.starts_with(prefix) { break; }
+                let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s, Err(_) => continue };
+                // Point-read the node_ entry for the co-resident (reg_height, burn, wallet).
+                let nk = format!("node_{}", node_id);
+                let val = match self.persistent.db.get_cf(&registry_cf, nk.as_bytes()) { Ok(Some(v)) => v, _ => continue };
+                let parsed: serde_json::Value = match serde_json::from_slice(&val) { Ok(p) => p, Err(_) => continue };
+                let h = match parsed["reg_height"].as_u64() { Some(h) => h, None => continue }; // chain-confirmed only
+                if h > up_to_height { continue; } // orphan/above-bound exclusion
+                let burn = parsed["burn"].as_str().unwrap_or("");
+                let wallet = parsed["wallet"].as_str().unwrap_or("");
+                if burn.is_empty() || wallet.is_empty() { continue; }
+                cands.push((h, node_id.to_string(), burn.to_string(), wallet.to_string()));
+            }
+        }
+        cands.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut bound: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (_, _, burn, wallet) in cands { bound.entry(burn).or_insert(wallet); }
+        let mut batch = rocksdb::WriteBatch::default();
+        for item in self.persistent.db.iterator_cf(&metadata_cf, IteratorMode::From(b"cbw_".as_ref(), Direction::Forward)) {
+            let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(b"cbw_") { break; }
+            batch.delete_cf(&metadata_cf, &k);
+        }
+        let count = bound.len() as u32;
+        for (burn, wallet) in bound {
+            batch.put_cf(&metadata_cf, format!("cbw_{}", burn).as_bytes(), wallet.as_bytes());
+        }
+        self.persistent.db.write(batch)?;
+        Ok(count)
+    }
+
+    /// Key of the running registry_root LtHash accumulator (metadata CF). One 2048-byte blob updated
+    /// incrementally by save_node_registration_inner; recomputed from scratch on reorg/boot/snapshot.
+    const REGISTRY_LT_STATE_KEY: &'static [u8] = b"registry_lt_state";
+    /// How far back per-checkpoint-head seals are retained (~1 epoch of 30-block heads). A read that
+    /// misses a pruned seal falls back to the O(N) from-scratch recompute — correctness, not just perf.
+    const REGISTRY_SEAL_RETENTION: u64 = 14400;
+
+    /// Load the running registry_root LtHash accumulator (empty if absent / not yet built).
+    fn registry_lt_load(&self) -> crate::registry_lthash::LtHash {
+        let cf = match self.persistent.db.cf_handle("metadata") { Some(c) => c, None => return crate::registry_lthash::LtHash::new() };
+        match self.persistent.db.get_cf(&cf, Self::REGISTRY_LT_STATE_KEY) {
+            Ok(Some(v)) => crate::registry_lthash::LtHash::from_bytes(&v),
+            _ => crate::registry_lthash::LtHash::new(),
+        }
+    }
+
+    /// Read a per-checkpoint-head seal `rr_seal_{H}` = sha3(lt_state as-of reg_height<=H), if present.
+    fn registry_root_seal_get(&self, height: u64) -> Option<[u8; 32]> {
+        let cf = self.persistent.db.cf_handle("metadata")?;
+        let mut key = b"rr_seal_".to_vec();
+        key.extend_from_slice(&height.to_be_bytes());
+        match self.persistent.db.get_cf(&cf, &key) {
+            Ok(Some(v)) if v.len() == 32 => { let mut out = [0u8; 32]; out.copy_from_slice(&v); Some(out) }
+            _ => None,
+        }
+    }
+
+    /// FROM-SCRATCH recompute of the registry_root LtHash accumulator over the chain-confirmed roster
+    /// {node_id, wallet, reg_height, burn} (SUPER+genesis AND LIGHT) with reg_height <= up_to_height.
+    /// Scans BOTH roster indices (srtr_+lrtr_) and DEDUPES by node_id (a node that — only via a crafted
+    /// node_id — lands in both indices is counted ONCE, matching the single incremental delta per
+    /// registration; without dedup the from-scratch path would double-count and diverge from the live
+    /// accumulator → fork). Includes EVERY reg_height-stamped row, INCLUDING empty-burn genesis/not-yet-
+    /// attested rows (unlike rebuild_committed_burn_wallet, which skips empty-burn) — the live delta adds
+    /// them, so the recompute must too. LtHash is order-independent, so the scan order is irrelevant and
+    /// the result is byte-identical to the incrementally-maintained accumulator at the same bound.
+    fn compute_lt_state(&self, up_to_height: u64) -> crate::registry_lthash::LtHash {
+        use rocksdb::{IteratorMode, Direction};
+        let registry_cf = match self.persistent.db.cf_handle("node_registry") { Some(cf) => cf, None => return crate::registry_lthash::LtHash::new() };
+        let mut lt = crate::registry_lthash::LtHash::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for prefix in [b"srtr_".as_ref(), b"lrtr_".as_ref()] {
+            for item in self.persistent.db.iterator_cf(&registry_cf, IteratorMode::From(prefix, Direction::Forward)) {
+                let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+                if !k.starts_with(prefix) { break; }
+                let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s.to_string(), Err(_) => continue };
+                if !seen.insert(node_id.clone()) { continue; } // counted under the other prefix already
+                let nk = format!("node_{}", node_id);
+                let val = match self.persistent.db.get_cf(&registry_cf, nk.as_bytes()) { Ok(Some(v)) => v, _ => continue };
+                let parsed: serde_json::Value = match serde_json::from_slice(&val) { Ok(p) => p, Err(_) => continue };
+                let h = match parsed["reg_height"].as_u64() { Some(h) => h, None => continue }; // chain-confirmed only
+                if h > up_to_height { continue; } // orphan/above-bound exclusion
+                let wallet = parsed["wallet"].as_str().unwrap_or("");
+                let burn = parsed["burn"].as_str().unwrap_or("");
+                lt.add(&crate::registry_lthash::row_lanes(&node_id, wallet, h, burn));
+            }
+        }
+        lt
+    }
+
+    /// QC-certified digest of the chain-confirmed registry BURN-IDENTITY (SUPER+genesis AND LIGHT),
+    /// considering ONLY registrations with reg_height <= up_to_height. Implemented as a SOUND INCREMENTAL
+    /// multiset hash (LtHash, registry_lthash::LtHash) — O(1) per registration to maintain and O(1) to
+    /// read via a per-checkpoint-head seal — so it scales to millions of on-chain light nodes (a flat
+    /// per-checkpoint recompute is O(N); a plain additive-mod-2^N set hash is O(1) but FORGEABLE on an
+    /// adversary-chosen snapshot roster via generalized-birthday — LtHash is the lattice-based primitive
+    /// that is both incremental AND collision-resistant). Bound into the macroblock checkpoint as
+    /// `registry_root` so a node joining via an UNTRUSTED snapshot can verify the restored node_registry
+    /// (the SOURCE OF cbw for BOTH super and light) matches the 2f+1-committed registry, closing the
+    /// forgeable-snapshot Sybil/fork vector. FAST PATH: the seal sha3(lt_state<=H) written at apply
+    /// (read only at checkpoint heads, all multiples of CHECKPOINT_INTERVAL). FALLBACK (snapshot cold-
+    /// join before the anchor is sealed / a pruned seal): one from-scratch O(N) recompute — correct at
+    /// any height. Scope MUST equal cbw (rebuild_committed_burn_wallet scans the SAME srtr_+lrtr_).
+    pub fn compute_registry_root(&self, up_to_height: u64) -> [u8; 32] {
+        if let Some(seal) = self.registry_root_seal_get(up_to_height) { return seal; }
+        self.compute_lt_state(up_to_height).root()
+    }
+
+    /// Seal `rr_seal_{height}` = sha3(current lt_state) — the O(1) read value for that checkpoint head.
+    /// Called from the block-scoped end-of-apply hook (on BOTH producer-inline and validator-deferred
+    /// paths, BEFORE save_microblock) once per applied block at height % CHECKPOINT_INTERVAL == 0, after
+    /// all of that block's registrations have updated lt_state. Prunes the seal one retention-window
+    /// below to bound growth (heights are checkpoint-aligned ⇒ exact key).
+    pub fn seal_registry_root(&self, height: u64) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let root = self.registry_lt_load().root();
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut key = b"rr_seal_".to_vec();
+        key.extend_from_slice(&height.to_be_bytes());
+        batch.put_cf(&cf, &key, &root);
+        if height >= Self::REGISTRY_SEAL_RETENTION {
+            let mut old = b"rr_seal_".to_vec();
+            old.extend_from_slice(&(height - Self::REGISTRY_SEAL_RETENTION).to_be_bytes());
+            batch.delete_cf(&cf, &old);
+        }
+        self.persistent.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Recompute the registry_root LtHash accumulator FROM SCRATCH at `up_to_height` and replace the
+    /// running blob, then delete every seal strictly above the new tip (orphaned on reorg) and seal the
+    /// new tip (so the immediate snapshot-verify / content_ok read is O(1), not an O(N) fallback). Call
+    /// at EVERY height-reset site that calls rebuild_committed_burn_wallet — boot, snapshot-apply, and
+    /// both reorg paths — so the live accumulator on a reorged/snapshot-joined node is byte-identical to
+    /// a from-genesis node's at the same height. Atomic (one WriteBatch).
+    /// ONE scan does BOTH: (a) recompute the registry_root LtHash accumulator from reg_height ≤
+    /// up_to_height, and (b) PRUNE orphan roster entries (reg_height > up_to_height) left by now-
+    /// discarded blocks — deleting node_/srtr_/lrtr_/wallet_. Then delete every seal strictly above the
+    /// tip and seal the tip (so the immediate snapshot-verify read is O(1)). Folding the prune into this
+    /// scan (was a separate full srtr_+lrtr_ pass) keeps a deep reorg at millions to TWO index scans
+    /// (cbw + this), not three, under the rollback barrier. Why prune is needed: cbw + lt_state are
+    /// reg_height-bounded so they already exclude orphans, but the reward-roster readers
+    /// (super_registrations_sorted, light_roster_sorted) scan srtr_/lrtr_ KEYS directly, so an orphan-
+    /// ONLY registration (never re-registered canonically) would keep its key and shift the positional
+    /// reward shard → reward_root divergence; deleting node_ also stops backfill_roster_indices from
+    /// resurrecting it. Canonical target+1.. is re-added by the live apply pipeline on re-sync. Call at
+    /// EVERY height-reset site (boot, snapshot-apply, both reorg paths) so a reorged/snapshot-joined/
+    /// crash-recovered node is byte-identical to a from-genesis node. Returns the orphan count. Atomic.
+    pub fn rebuild_registry_lthash(&self, up_to_height: u64) -> IntegrationResult<u32> {
+        use rocksdb::{IteratorMode, Direction};
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let meta_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let mut lt = crate::registry_lthash::LtHash::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut batch = rocksdb::WriteBatch::default(); // spans node_registry (prune) + metadata (lt/seals), atomic
+        let mut pruned = 0u32;
+        for prefix in [b"srtr_".as_ref(), b"lrtr_".as_ref()] {
+            for item in self.persistent.db.iterator_cf(&registry_cf, IteratorMode::From(prefix, Direction::Forward)) {
+                let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+                if !k.starts_with(prefix) { break; }
+                let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s.to_string(), Err(_) => continue };
+                if !seen.insert(node_id.clone()) { continue; } // counted/handled under the other prefix already
+                let nk = format!("node_{}", node_id);
+                let val = match self.persistent.db.get_cf(&registry_cf, nk.as_bytes()) { Ok(Some(v)) => v, _ => continue };
+                let parsed: serde_json::Value = match serde_json::from_slice(&val) { Ok(p) => p, Err(_) => continue };
+                let h = match parsed["reg_height"].as_u64() { Some(h) => h, None => continue };
+                let wallet = parsed["wallet"].as_str().unwrap_or("");
+                if h <= up_to_height {
+                    let burn = parsed["burn"].as_str().unwrap_or("");
+                    lt.add(&crate::registry_lthash::row_lanes(&node_id, wallet, h, burn));
+                } else {
+                    // orphan of a discarded block — prune both index keys + node_ + the wallet reverse
+                    // index (one wallet backs one node, so this wallet_ belongs to the orphan).
+                    batch.delete_cf(&registry_cf, nk.as_bytes());
+                    batch.delete_cf(&registry_cf, format!("srtr_{}", node_id).as_bytes());
+                    batch.delete_cf(&registry_cf, format!("lrtr_{}", node_id).as_bytes());
+                    if !wallet.is_empty() { batch.delete_cf(&registry_cf, format!("wallet_{}", wallet).as_bytes()); }
+                    pruned += 1;
+                }
+            }
+        }
+        let root = lt.root();
+        batch.put_cf(&meta_cf, Self::REGISTRY_LT_STATE_KEY, lt.to_bytes().as_ref());
+        for item in self.persistent.db.iterator_cf(&meta_cf, IteratorMode::From(b"rr_seal_", Direction::Forward)) {
+            let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(b"rr_seal_") { break; }
+            if k.len() == 8 + 8 {
+                let h = u64::from_be_bytes(k[8..16].try_into().unwrap_or([0u8; 8]));
+                if h > up_to_height { batch.delete_cf(&meta_cf, &k); }
+            }
+        }
+        let mut key = b"rr_seal_".to_vec();
+        key.extend_from_slice(&up_to_height.to_be_bytes());
+        batch.put_cf(&meta_cf, &key, &root);
+        self.persistent.db.write(batch)?;
+        Ok(pruned)
+    }
+
+    /// Batch-write the eligible super set for an epoch in one WriteBatch (epoch-boundary snapshot).
+    pub fn save_super_eligible_batch(&self, epoch: u64, node_ids: &[String]) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        for node_id in node_ids {
+            batch.put_cf(&cf, format!("super_elig_{}_{}", epoch, node_id).as_bytes(), &[]);
+        }
+        self.persistent.db.write(batch)?;
+        Ok(())
+    }
+
     /// Load the eligible super node_ids for an epoch (prefix scan, ascending by node_id).
     pub fn load_super_eligible(&self, epoch: u64) -> IntegrationResult<Vec<String>> {
         use rocksdb::{IteratorMode, Direction};
@@ -6162,18 +6484,29 @@ impl Storage {
     /// Stores BOTH forward index (node_id → data) AND reverse index (wallet → node_id)
     /// for O(1) lookups in both directions.
     pub fn save_node_registration(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64) -> IntegrationResult<()> {
-        self.save_node_registration_inner(node_id, node_type, wallet, reputation, None)
+        self.save_node_registration_inner(node_id, node_type, wallet, reputation, None, None)
     }
 
     /// Block-apply registration: stamps the deterministic `reg_height` so the entry is recognised as
     /// chain-confirmed. Only such entries enter the reward roster (RPC-cache writes have no height).
     pub fn save_node_registration_at_height(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: u64) -> IntegrationResult<()> {
-        self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height))
+        self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height), None)
     }
 
-    fn save_node_registration_inner(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: Option<u64>) -> IntegrationResult<()> {
+    /// Chain-apply registration that also persists the backing `burn_tx` co-resident with `reg_height`
+    /// in ONE node_ entry. This is the single authoritative writer of the burn binding: the committed
+    /// burn→wallet index (cbw) is REBUILT deterministically from these entries on snapshot/reorg/boot
+    /// (rebuild_committed_burn_wallet), and the registry digest (registry_root) hashes them. Genesis /
+    /// non-burn callers use save_node_registration_at_height (burn empty). burn empty ⇒ binding skipped.
+    pub fn save_node_registration_at_height_burn(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: u64, burn_tx: &str) -> IntegrationResult<()> {
+        self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height), Some(burn_tx))
+    }
+
+    fn save_node_registration_inner(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: Option<u64>, burn_tx: Option<&str>) -> IntegrationResult<()> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let metadata_cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
 
         // ATOMIC: WriteBatch ensures both forward and reverse indexes are written together
         // Prevents inconsistency if crash occurs between writes
@@ -6181,29 +6514,107 @@ impl Storage {
 
         // Forward index: node_id → data
         let key = format!("node_{}", node_id);
+        // ALWAYS read the prior entry: needed both to preserve chain-confirmed fields against an
+        // RPC-cache clobber AND to compute the registry_root LtHash delta (subtract the old row).
+        let prior = self.persistent.db.get_cf(&registry_cf, key.as_bytes()).ok().flatten()
+            .and_then(|old| serde_json::from_slice::<serde_json::Value>(&old).ok());
+        let prior_height = prior.as_ref().and_then(|p| p["reg_height"].as_u64());
+
+        // The chain-confirmed identity {wallet, reg_height, burn} is IMMUTABLE once stamped: those are
+        // exactly the fields registry_root commits, so a non-deterministic RPC/discovery-cache write
+        // (reg_height None) must NEVER rebind them — else node_ would diverge from lt_state → fork.
+        // A chain-apply (reg_height Some) sets wallet; an RPC-cache write keeps the prior chain wallet.
+        let final_wallet = if reg_height.is_some() {
+            wallet.to_string()
+        } else if prior_height.is_some() {
+            prior.as_ref().and_then(|p| p["wallet"].as_str()).unwrap_or(wallet).to_string()
+        } else {
+            wallet.to_string()
+        };
         let mut data = json!({
             "node_type": node_type,
-            "wallet": wallet,
+            "wallet": final_wallet,
             "reputation": reputation,
             "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
         });
-        // reg_height present ⇒ chain-confirmed; preserve a prior height if an RPC-cache write would clobber it.
-        if let Some(h) = reg_height {
+        // reg_height is IMMUTABLE once chain-stamped (same invariant as wallet/burn): keep the FIRST
+        // stamped height. A re-presented NodeActivation applies as an Ok no-op (single-use guard) yet
+        // still re-pushes the super pseudonym row; without this it would re-stamp H1->H2 and, on a reorg
+        // into [H1,H2), make the from-scratch recompute drop a row a never-reorged node still holds →
+        // registry_root divergence. First chain-apply (prior None) uses the incoming height.
+        if let Some(ph) = prior_height {
+            data["reg_height"] = json!(ph);
+        } else if let Some(h) = reg_height {
             data["reg_height"] = json!(h);
-        } else if let Ok(Some(old)) = self.persistent.db.get_cf(&registry_cf, key.as_bytes()) {
-            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&old) {
-                if let Some(h) = parsed["reg_height"].as_u64() { data["reg_height"] = json!(h); }
+        }
+        // burn binding: set when provided non-empty, else preserve a prior chain-confirmed burn.
+        match burn_tx {
+            Some(b) if !b.is_empty() => { data["burn"] = json!(b); }
+            _ => {
+                if let Some(b) = prior.as_ref().and_then(|p| p["burn"].as_str()) {
+                    if !b.is_empty() { data["burn"] = json!(b); }
+                }
             }
         }
         batch.put_cf(&registry_cf, key.as_bytes(), data.to_string().as_bytes());
 
-        // Reverse index: wallet → node_id (O(1) lookup by wallet)
-        let wallet_key = format!("wallet_{}", wallet);
+        // Reverse index: wallet → node_id (O(1) lookup by wallet). Uses the FINAL (preserved) wallet.
+        let wallet_key = format!("wallet_{}", final_wallet);
         let wallet_data = json!({
             "node_id": node_id,
             "node_type": node_type,
         });
         batch.put_cf(&registry_cf, wallet_key.as_bytes(), wallet_data.to_string().as_bytes());
+
+        // Reward-roster indices (chain-confirmed only). Written in THIS batch so they are atomic
+        // with the node_ entry and ride the node_registry snapshot (whole-CF copy). Keyed node_id-
+        // first so a prefix scan yields the SAME node_id-ascending order the reward roster needs —
+        // no JSON parse, no sort on the emission hot path. Gate = reg_height Some (first chain-apply):
+        // RPC/discovery-cache writes (None) never index, mirroring the readers that skip un-stamped
+        // entries; a later None re-cache preserves the prior height above and the index key already
+        // exists, so we never write/delete on None. The super/light predicates are INDEPENDENT
+        // (matching the two independent readers) — super keys on node_id prefix, light on node_type.
+        if let Some(h) = reg_height {
+            if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
+                let ik = format!("srtr_{}", node_id);
+                batch.put_cf(&registry_cf, ik.as_bytes(), final_wallet.as_bytes());
+            }
+            if node_type == "light" {
+                let ik = format!("lrtr_{}", node_id);
+                let mut val = Vec::with_capacity(8 + final_wallet.len());
+                val.extend_from_slice(&h.to_be_bytes());
+                val.extend_from_slice(final_wallet.as_bytes());
+                batch.put_cf(&registry_cf, ik.as_bytes(), &val);
+            }
+        }
+
+        // ── registry_root LtHash maintenance (incremental, O(1)) ──
+        // Update the running multiset accumulator IN THE SAME BATCH as the node_ put, so node_ and
+        // lt_state can never disagree across a crash. Gated on the CALL being a chain-apply
+        // (reg_height param Some): block-apply is strictly serialized per node, so the load→delta→store
+        // is race-free, and RPC-cache/discovery writes (None) are skipped entirely (they preserve the
+        // chain-confirmed identity above, so they would be net-zero anyway — skipping avoids a
+        // redundant lt_state write that could lost-update a concurrent chain-apply). Scope = exactly
+        // the set compute_registry_root scans (super by node_id prefix OR node_type==light); node type
+        // and id-prefix are immutable post-registration, so prior membership == current membership.
+        // The delta = add(final row) - remove(prior row): a first registration adds once; a
+        // re-registration subtracts the old identity and adds the new; an idempotent re-apply of the
+        // same block reads back its own row (old==new) → net zero.
+        if reg_height.is_some() {
+            let in_scope = node_id.starts_with("super_") || node_id.starts_with("genesis_node_") || node_type == "light";
+            if in_scope {
+                let mut lt = self.registry_lt_load();
+                if let (Some(ph), Some(p)) = (prior_height, prior.as_ref()) {
+                    let pw = p["wallet"].as_str().unwrap_or("");
+                    let pb = p["burn"].as_str().unwrap_or("");
+                    lt.remove(&crate::registry_lthash::row_lanes(node_id, pw, ph, pb));
+                }
+                let nh = data["reg_height"].as_u64().unwrap_or(0);
+                let nb = data["burn"].as_str().unwrap_or("");
+                lt.add(&crate::registry_lthash::row_lanes(node_id, &final_wallet, nh, nb));
+                batch.put_cf(&metadata_cf, Self::REGISTRY_LT_STATE_KEY, lt.to_bytes().as_ref());
+            }
+        }
 
         self.persistent.db.write(batch)?;
 
@@ -6211,9 +6622,57 @@ impl Storage {
     }
 
     /// Deterministic epoch roster of chain-confirmed Light nodes registered below `before_height`,
-    /// sorted by node_id. This replaces the gossip-synced RAM registry as the bit→node_id mapping
-    /// for eligibility bitmaps, so reward distribution is recomputable identically on every node.
+    /// sorted by node_id — the bit→node_id mapping for eligibility bitmaps, recomputable identically
+    /// on every node. Reads the apply-time `lrtr_` index (prefix scan, node_id-ascending, no JSON,
+    /// no sort) instead of a full-CF scan; byte-identical to `light_roster_sorted_scan` (asserted by
+    /// a determinism test) but O(roster) without a per-entry JSON parse — scalable to millions.
     pub fn light_roster_sorted(&self, before_height: u64) -> IntegrationResult<Vec<(String, String)>> {
+        use rocksdb::{IteratorMode, Direction};
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let prefix = b"lrtr_";
+        let mut out: Vec<(String, String)> = Vec::new();
+        let iter = self.persistent.db.iterator_cf(&registry_cf, IteratorMode::From(prefix, Direction::Forward));
+        for item in iter {
+            let (k, v) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(prefix) { break; }
+            let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s, Err(_) => continue };
+            if v.len() < 8 { continue; }
+            // Value = reg_height (8B BE) ++ wallet. Cutoff applied at READ (constraint b) so inserts
+            // of newer nodes never shift the positions of older ones (the positional 5-genesis shard).
+            let h = u64::from_be_bytes(v[..8].try_into().unwrap_or([0u8; 8]));
+            if h >= before_height { continue; }
+            let wallet = match std::str::from_utf8(&v[8..]) { Ok(s) => s, Err(_) => continue };
+            if !wallet.is_empty() { out.push((node_id.to_string(), wallet.to_string())); }
+        }
+        Ok(out)
+    }
+
+    /// Sorted (node_id, wallet) of all chain-registered Super/genesis nodes — the deterministic
+    /// candidate set for heartbeat-eligibility reward enumeration (popcount filter applied by caller).
+    /// Reads the apply-time `srtr_` index (prefix scan, node_id-ascending, no JSON, no sort);
+    /// byte-identical to `super_registrations_sorted_scan` but O(supers) without a per-entry parse.
+    pub fn super_registrations_sorted(&self) -> IntegrationResult<Vec<(String, String)>> {
+        use rocksdb::{IteratorMode, Direction};
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let prefix = b"srtr_";
+        let mut out: Vec<(String, String)> = Vec::new();
+        let iter = self.persistent.db.iterator_cf(&registry_cf, IteratorMode::From(prefix, Direction::Forward));
+        for item in iter {
+            let (k, v) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(prefix) { break; }
+            let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s, Err(_) => continue };
+            let wallet = match std::str::from_utf8(&v) { Ok(s) => s, Err(_) => continue };
+            if !wallet.is_empty() { out.push((node_id.to_string(), wallet.to_string())); }
+        }
+        Ok(out)
+    }
+
+    /// Legacy full-CF scan source of truth for the Light roster. Kept as the backfill builder and
+    /// the determinism-test oracle for `light_roster_sorted` (index reader); NOT on any hot path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn light_roster_sorted_scan(&self, before_height: u64) -> IntegrationResult<Vec<(String, String)>> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
         let mut out: Vec<(String, String)> = Vec::new();
@@ -6234,9 +6693,10 @@ impl Storage {
         Ok(out)
     }
 
-    /// Sorted (node_id, wallet) of all chain-registered Super/genesis nodes — the deterministic
-    /// candidate set for heartbeat-eligibility reward enumeration (popcount filter applied by caller).
-    pub fn super_registrations_sorted(&self) -> IntegrationResult<Vec<(String, String)>> {
+    /// Legacy full-CF scan source of truth for the Super roster — backfill builder + determinism-test
+    /// oracle for `super_registrations_sorted` (index reader); NOT on any hot path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn super_registrations_sorted_scan(&self) -> IntegrationResult<Vec<(String, String)>> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
         let mut out: Vec<(String, String)> = Vec::new();
@@ -6254,6 +6714,66 @@ impl Storage {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
+    }
+
+    /// Reconcile the reward-roster indices (`srtr_`/`lrtr_`) from the chain-confirmed `node_` entries.
+    /// Needed once when upgrading a pre-index DB and after a snapshot jump (state fast-sync writes
+    /// node_ entries directly, not via the apply funnel). Pure function of the stamped node_ set ⇒
+    /// deterministic; skip-if-present ⇒ safe to re-run. Cold path only (one full-CF scan).
+    pub fn backfill_roster_indices(&self) -> IntegrationResult<u32> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let iter = self.persistent.db.prefix_iterator_cf(&registry_cf, b"node_");
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut added = 0u32;
+        for item in iter {
+            let (key, value) = match item { Ok(kv) => kv, Err(_) => continue };
+            let key_str = match std::str::from_utf8(&key) { Ok(s) => s, Err(_) => continue };
+            if !key_str.starts_with("node_") { continue; }
+            let node_id = &key_str[5..];
+            let parsed: serde_json::Value = match serde_json::from_slice(&value) { Ok(v) => v, Err(_) => continue };
+            let h = match parsed["reg_height"].as_u64() { Some(h) => h, None => continue }; // chain-confirmed only
+            let wallet = parsed["wallet"].as_str().unwrap_or("");
+            let node_type = parsed["node_type"].as_str().unwrap_or("");
+            if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
+                let ik = format!("srtr_{}", node_id);
+                if self.persistent.db.get_cf(&registry_cf, ik.as_bytes())?.is_none() {
+                    batch.put_cf(&registry_cf, ik.as_bytes(), wallet.as_bytes());
+                    added += 1;
+                }
+            }
+            if node_type == "light" {
+                let ik = format!("lrtr_{}", node_id);
+                if self.persistent.db.get_cf(&registry_cf, ik.as_bytes())?.is_none() {
+                    let mut val = Vec::with_capacity(8 + wallet.len());
+                    val.extend_from_slice(&h.to_be_bytes());
+                    val.extend_from_slice(wallet.as_bytes());
+                    batch.put_cf(&registry_cf, ik.as_bytes(), &val);
+                    added += 1;
+                }
+            }
+        }
+        if added > 0 {
+            self.persistent.db.write(batch)?;
+            println!("[INFO][STORAGE] backfill_roster_indices added={}", added);
+        }
+        Ok(added)
+    }
+
+    /// One-time marker so the O(N) roster-index migration scan runs once, not on every restart.
+    pub fn roster_index_built(&self) -> bool {
+        match self.persistent.db.cf_handle("node_registry") {
+            Some(cf) => self.persistent.db.get_cf(&cf, b"meta_roster_index_v1").map(|o| o.is_some()).unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Set the roster-index migration marker after a successful backfill.
+    pub fn set_roster_index_built(&self) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        self.persistent.db.put_cf(&cf, b"meta_roster_index_v1", b"1")?;
+        Ok(())
     }
 
     /// True iff this node's NodeRegistration is chain-confirmed (reg_height stamped at
@@ -8300,6 +8820,27 @@ impl Storage {
                     registry_count += 1;
                 }
                 self.persistent.db.write(nr_batch)?;
+                // State fast-sync writes node_ entries directly (not via the apply funnel). The
+                // snapshot carries the srtr_/lrtr_ index keys (whole-CF copy), but reconcile to be
+                // safe — idempotent skip-if-present — so a fast-synced node never reads an empty
+                // roster index and diverges on reward_root.
+                let _ = self.backfill_roster_indices();
+                // cbw lives in the 'metadata' CF, which the snapshot does NOT carry — without this a
+                // snapshot-joined node has NO burn→wallet binding for any pre-snapshot registration and
+                // would ACCEPT a reused-burn block that from-genesis nodes REJECT (fork + Sybil). Rebuild
+                // it deterministically from the snapshot-carried node_registry, bounded by the snapshot
+                // height (registrations are committed at-or-below it).
+                match self.rebuild_committed_burn_wallet(height) {
+                    Ok(n) if crate::node::is_info() => println!("[INFO][SNAPSHOT] cbw_rebuilt bindings={}", n),
+                    Err(e) => println!("[WARN][SNAPSHOT] cbw_rebuild_failed err={}", e),
+                    _ => {}
+                }
+                // registry_root LtHash: the accumulator + per-head seals live in 'metadata' (NOT snapshot-
+                // carried); recompute from the snapshot-carried node_registry at the snapshot height and
+                // seal it so the immediate snapshot-verify read is O(1). Same discipline as cbw.
+                if let Err(e) = self.rebuild_registry_lthash(height) {
+                    println!("[WARN][SNAPSHOT] registry_lthash_rebuild_failed err={}", e);
+                }
             }
         }
 
@@ -9270,6 +9811,39 @@ impl Storage {
             )));
         }
 
+        // #8 registry binding: the account-merkle check above covers ONLY the accounts CF, NOT the
+        // node_registry CF — from which cbw AND the attestor VRF keys are derived. Without this an
+        // untrusted snapshot server could serve correct accounts but a FORGED node_registry (rebinding
+        // a burn to its own wallet, or swapping a VRF key) → the joiner accepts reused-burn blocks
+        // honest nodes reject, or verifies attestations against forged keys. Recompute the deterministic
+        // registry digest from the restored registry and compare to the anchor checkpoint's QC-certified
+        // registry_root (bounded by the checkpoint's window head). Gated: until the rule activates the
+        // root is computed+committed but not enforced here (staging window to prove live agreement).
+        if qnet_state::feature_gates::is_active("registry_root_required", snapshot_height) {
+            let cp_opt = macroblock.consensus_data.checkpoint_qc.as_ref().and_then(|b| {
+                bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate)>(b).ok()
+            }).map(|(cp, _)| cp);
+            match cp_opt {
+                Some(cp) => {
+                    let computed_rr = self.compute_registry_root(cp.window_head_height);
+                    if computed_rr != cp.registry_root {
+                        self.discard_snapshot_state(snapshot_height)?;
+                        return Err(IntegrationError::Other(format!(
+                            "snapshot_registry_root_mismatch h={} mb={} committed={} computed={}",
+                            snapshot_height, mb_idx,
+                            hex::encode(&cp.registry_root[..8]), hex::encode(&computed_rr[..8]),
+                        )));
+                    }
+                }
+                None => {
+                    self.discard_snapshot_state(snapshot_height)?;
+                    return Err(IntegrationError::Other(format!(
+                        "snapshot_registry_root_unavailable mb={} reason=no_checkpoint_qc", mb_idx
+                    )));
+                }
+            }
+        }
+
         if crate::node::is_info() {
             println!(
                 "[INFO][SYNC] verifier_pass mb={} snapshot_h={} root={} pattern=C",
@@ -9297,6 +9871,20 @@ impl Storage {
     fn discard_snapshot_state(&self, height: u64) -> IntegrationResult<()> {
         for cf in &["accounts", "pending_rewards", "node_registry", "contract_storage"] {
             self.clear_cf(cf)?;
+        }
+        // The registry_root LtHash accumulator + per-head seals live in 'metadata' (not cleared above)
+        // and are meaningless once the roster is wiped — drop them so a stale value is never read before
+        // the clean re-bootstrap's rebuild_registry_lthash (cbw is likewise rebuilt on next boot).
+        if let Some(meta_cf) = self.persistent.db.cf_handle("metadata") {
+            use rocksdb::{IteratorMode, Direction};
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.delete_cf(&meta_cf, Self::REGISTRY_LT_STATE_KEY);
+            for item in self.persistent.db.iterator_cf(&meta_cf, IteratorMode::From(b"rr_seal_", Direction::Forward)) {
+                let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+                if !k.starts_with(b"rr_seal_") { break; }
+                batch.delete_cf(&meta_cf, &k);
+            }
+            let _ = self.persistent.db.write(batch);
         }
         self.set_chain_height(0)?;
         if let Some(snapshots_cf) = self.persistent.db.cf_handle("snapshots") {
@@ -10044,5 +10632,293 @@ mod v32_9_pattern_c_tests {
         let ra = storage_a.compute_canonical_state_root(90).expect("ra");
         let rb = storage_b.compute_canonical_state_root(90).expect("rb");
         assert_eq!(ra, rb, "empty CF root must match across instances");
+    }
+
+    #[test]
+    fn cbw_rebuild_from_registry_height_bounded_and_deterministic() {
+        // The committed burn→wallet index is a DERIVED, reg_height-bounded rebuild of node_registry:
+        // a snapshot/reorg/boot reconstruct an identical cbw, and an orphaned (above-bound) reg drops.
+        let (storage, _dir) = open_test_storage();
+        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+        storage.save_node_registration_at_height_burn("super_b", "super", "walletB", 1.0, 200, "burnB").unwrap();
+        storage.save_node_registration_at_height_burn("genesis_node_001", "super", "walletG", 1.0, 0, "").unwrap();
+
+        // Bounded BELOW super_b's reg_height: only burnA binds; burnB excluded; empty-burn genesis never binds.
+        let n1 = storage.rebuild_committed_burn_wallet(100).unwrap();
+        assert_eq!(n1, 1, "only burnA (reg_height 50 <= 100) binds");
+        assert_eq!(storage.committed_burn_wallet_get("burnA").unwrap().as_deref(), Some("walletA"));
+        assert_eq!(storage.committed_burn_wallet_get("burnB").unwrap(), None, "burnB reg_height 200 > 100 excluded");
+
+        // Raise the bound: both burns bind (atomic clear+repopulate); genesis empty burn still excluded.
+        let n2 = storage.rebuild_committed_burn_wallet(300).unwrap();
+        assert_eq!(n2, 2, "burnA + burnB bind; empty-burn genesis excluded");
+        assert_eq!(storage.committed_burn_wallet_get("burnA").unwrap().as_deref(), Some("walletA"));
+        assert_eq!(storage.committed_burn_wallet_get("burnB").unwrap().as_deref(), Some("walletB"));
+
+        // Idempotent: a second rebuild yields the identical set.
+        assert_eq!(storage.rebuild_committed_burn_wallet(300).unwrap(), 2);
+    }
+
+    #[test]
+    fn registry_root_deterministic_bound_sensitive_and_cross_instance() {
+        // registry_root is the QC-bound digest a snapshot joiner checks: deterministic, bound-sensitive,
+        // and identical across nodes that applied the same registrations (so content_ok cannot fork).
+        let (storage, _dir) = open_test_storage();
+        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+        let r_a = storage.compute_registry_root(100);
+        assert_eq!(r_a, storage.compute_registry_root(100), "registry_root must be deterministic");
+        assert_ne!(r_a, [0u8; 32], "non-empty registry → non-zero root");
+
+        // A registration ABOVE the bound must NOT change the bounded root; raising the bound DOES.
+        storage.save_node_registration_at_height_burn("super_b", "super", "walletB", 1.0, 200, "burnB").unwrap();
+        assert_eq!(storage.compute_registry_root(100), r_a, "reg above the bound must not change the bounded root");
+        assert_ne!(storage.compute_registry_root(300), r_a, "including a new reg changes the root");
+
+        // Cross-node determinism: a second instance built identically yields the identical root.
+        let (storage_b, _db) = open_test_storage();
+        storage_b.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+        assert_eq!(storage_b.compute_registry_root(100), r_a, "same registry → identical root across instances");
+
+        // LIGHT coverage (closes the light snapshot-forge gap): a light registration (lrtr_) MUST be
+        // included in registry_root, so adding one changes the bounded root and snapshot-verify binds it.
+        let before_light = storage_b.compute_registry_root(100);
+        storage_b.save_node_registration_at_height_burn("light_x", "light", "walletL", 1.0, 60, "burnL").unwrap();
+        assert_ne!(storage_b.compute_registry_root(100), before_light, "a light reg must be in registry_root (light in scope)");
+    }
+
+    #[test]
+    fn lthash_incremental_equals_from_scratch_with_rereg() {
+        // THE core LtHash invariant: the live INCREMENTAL accumulator (maintained per-write in
+        // save_node_registration_inner) must equal the FROM-SCRATCH recompute (used on reorg/boot/
+        // snapshot/fallback) at the same bound — else a reorged/snapshot-joined node forks. Exercises
+        // first-registration, re-registration (wallet+height change ⇒ subtract old, add new), and
+        // super+light scope. HUGE bound so the unbounded live accumulator == bounded recompute.
+        let (storage, _dir) = open_test_storage();
+        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+        storage.save_node_registration_at_height_burn("light_x", "light", "walletL", 1.0, 60, "burnL").unwrap();
+        storage.save_node_registration_at_height_burn("genesis_node_001", "super", "walletG", 1.0, 0, "").unwrap();
+        // re-registration of super_a at a new height with a new wallet+burn (old row must be removed).
+        storage.save_node_registration_at_height_burn("super_a", "super", "walletA2", 1.0, 80, "burnA2").unwrap();
+        let live = storage.registry_lt_load().root();
+        let scratch = storage.compute_lt_state(u64::MAX).root();
+        assert_eq!(live, scratch, "incremental accumulator must equal from-scratch recompute");
+        // The from-scratch must reflect ONLY the new super_a identity (old walletA/burnA fully removed).
+        assert_eq!(storage.compute_registry_root(u64::MAX), live, "fallback root == live root (no seal)");
+    }
+
+    #[test]
+    fn lthash_seal_equals_fallback_at_checkpoint_head() {
+        // The O(1) seal read MUST equal the O(N) from-scratch fallback at the same height. Live, the
+        // seal is taken at block-H apply when lt_state holds exactly reg_height<=H (in-order apply);
+        // here we mimic that by registering only at heights <= H before sealing.
+        let (storage, _dir) = open_test_storage();
+        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 30, "burnA").unwrap();
+        storage.save_node_registration_at_height_burn("light_x", "light", "walletL", 1.0, 60, "burnL").unwrap();
+        let head = 90u64; // a checkpoint head (multiple of 30)
+        storage.seal_registry_root(head).unwrap();
+        let via_seal = storage.compute_registry_root(head); // O(1) seal hit
+        let via_scratch = storage.compute_lt_state(head).root();
+        assert_eq!(via_seal, via_scratch, "seal value must equal the from-scratch recompute");
+        // A registration ABOVE the head, added AFTER the seal, must NOT change the sealed read.
+        storage.save_node_registration_at_height_burn("super_b", "super", "walletB", 1.0, 120, "burnB").unwrap();
+        assert_eq!(storage.compute_registry_root(head), via_seal, "post-seal above-bound reg must not change the sealed root");
+    }
+
+    #[test]
+    fn lthash_dual_index_node_counted_once() {
+        // A crafted node that is BOTH super_-prefixed AND node_type==light lands in srtr_ AND lrtr_.
+        // The incremental delta runs ONCE per registration; the from-scratch scan iterates both indices
+        // and MUST dedup by node_id to count it once — else live != from-scratch → fork. This asserts
+        // the dedup: live (one add) == from-scratch (deduped).
+        let (storage, _dir) = open_test_storage();
+        storage.save_node_registration_at_height_burn("super_dual", "light", "walletD", 1.0, 40, "burnD").unwrap();
+        storage.save_node_registration_at_height_burn("light_y", "light", "walletY", 1.0, 50, "burnY").unwrap();
+        let live = storage.registry_lt_load().root();
+        let scratch = storage.compute_lt_state(u64::MAX).root();
+        assert_eq!(live, scratch, "a dual-index node must be counted exactly once on both paths");
+    }
+
+    #[test]
+    fn lthash_rpc_cache_write_is_net_zero() {
+        // An RPC/discovery-cache write (reg_height None) MUST NOT touch lt_state and MUST NOT rebind the
+        // chain-confirmed identity — even with a different wallet — else each node's accumulator drifts
+        // at non-deterministic wall-clock times → content_ok fork.
+        let (storage, _dir) = open_test_storage();
+        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+        let before = storage.registry_lt_load().root();
+        let before_scratch = storage.compute_lt_state(u64::MAX).root();
+        // RPC-cache re-write with a DIFFERENT wallet (and no height) — must be ignored for identity.
+        storage.save_node_registration("super_a", "super", "ATTACKER_WALLET", 99.0).unwrap();
+        assert_eq!(storage.registry_lt_load().root(), before, "RPC-cache write must not change lt_state");
+        assert_eq!(storage.compute_lt_state(u64::MAX).root(), before_scratch, "RPC-cache must not rebind the chain identity");
+        // The chain-confirmed wallet is preserved in the srtr_ index too.
+        assert_eq!(storage.super_registrations_sorted().unwrap(),
+                   vec![("super_a".to_string(), "walletA".to_string())], "chain wallet preserved against RPC clobber");
+    }
+
+    #[test]
+    fn lthash_reapply_is_idempotent() {
+        // Re-applying the SAME registration (crash-replay / repair) must be a no-op on lt_state
+        // (old row == new row ⇒ net-zero), so the accumulator never drifts on replay.
+        let (storage, _dir) = open_test_storage();
+        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+        let once = storage.registry_lt_load().root();
+        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+        assert_eq!(storage.registry_lt_load().root(), once, "identical re-apply must not change lt_state");
+    }
+
+    #[test]
+    fn lthash_rebuild_matches_live_after_reset() {
+        // rebuild_registry_lthash (reorg/boot/snapshot) must reconstruct an accumulator byte-identical
+        // to the live incremental one at the same bound, and seal the tip so the verify read is O(1).
+        let (storage, _dir) = open_test_storage();
+        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+        storage.save_node_registration_at_height_burn("light_x", "light", "walletL", 1.0, 60, "burnL").unwrap();
+        let live = storage.registry_lt_load().root();
+        let head = 90u64;
+        storage.rebuild_registry_lthash(head).unwrap();
+        assert_eq!(storage.registry_lt_load().root(), live, "rebuilt accumulator == live (all regs <= head)");
+        assert_eq!(storage.compute_registry_root(head), live, "rebuild seals the tip ⇒ O(1) read == live");
+    }
+
+    #[test]
+    fn lthash_restamp_keeps_first_height_netzero() {
+        // A re-presented NodeActivation (Ok no-op via the single-use guard) would re-stamp the super
+        // pseudonym at a NEW height. reg_height is immutable once chain-stamped, so the row stays at H1:
+        // the lt_state delta is net-zero AND a reorg into [H1,H2) cannot make from-scratch drop a row a
+        // never-reorged node still holds. Without immutability this would move the row H1->H2 and fork.
+        let (storage, _dir) = open_test_storage();
+        storage.save_node_registration_at_height_burn("super_node_x", "super", "walletX", 1.0, 30, "").unwrap();
+        let after_first = storage.registry_lt_load().root();
+        storage.save_node_registration_at_height_burn("super_node_x", "super", "walletX", 1.0, 90, "").unwrap(); // re-stamp
+        assert_eq!(storage.registry_lt_load().root(), after_first, "re-stamp must be net-zero (reg_height immutable)");
+        assert_eq!(storage.compute_lt_state(u64::MAX).root(), after_first, "from-scratch == live (row kept at H1)");
+        // The decisive anti-fork check: a node at a bound in [H1,H2) agrees with a node that re-stamped.
+        let (storage2, _d2) = open_test_storage();
+        storage2.save_node_registration_at_height_burn("super_node_x", "super", "walletX", 1.0, 30, "").unwrap();
+        assert_eq!(storage.compute_lt_state(60).root(), storage2.compute_lt_state(60).root(),
+                   "re-stamped node and never-reorged node compute the identical root at a bound in [30,90)");
+    }
+
+    #[test]
+    fn wallet_burn_registration_gate() {
+        // C: NodeActivation is gated on the wallet holding a burn-attested registration.
+        let (storage, _dir) = open_test_storage();
+        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+        assert!(storage.wallet_is_burn_registered("walletA"), "burn-attested registration ⇒ activation allowed");
+        // Genesis-style empty-burn registration is NOT a burn proof (genesis never activates).
+        storage.save_node_registration_at_height_burn("genesis_node_001", "super", "walletG", 1.0, 0, "").unwrap();
+        assert!(!storage.wallet_is_burn_registered("walletG"), "empty-burn registration ⇒ not a burn proof");
+        // A raw activation from an unregistered wallet is rejected.
+        assert!(!storage.wallet_is_burn_registered("walletX"), "no registration ⇒ activation rejected");
+    }
+
+    #[test]
+    fn prune_orphan_registrations_drops_above_target() {
+        // B: on reorg, orphan roster index KEYS (reg_height > target) are pruned so the reward-roster
+        // readers (super/light, which scan srtr_/lrtr_ directly) match a from-genesis node.
+        let (storage, _dir) = open_test_storage();
+        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+        storage.save_node_registration_at_height_burn("super_orphan", "super", "walletO", 1.0, 200, "burnO").unwrap();
+        storage.save_node_registration_at_height_burn("light_a", "light", "walletL", 1.0, 60, "burnL").unwrap();
+        storage.save_node_registration_at_height_burn("light_orphan", "light", "walletLO", 1.0, 250, "burnLO").unwrap();
+        assert_eq!(storage.super_registrations_sorted().unwrap().len(), 2, "both supers in the unbounded roster pre-prune");
+        // rebuild_registry_lthash folds the orphan prune into its single scan; it returns the orphan count.
+        let pruned = storage.rebuild_registry_lthash(100).unwrap();
+        assert_eq!(pruned, 2, "both orphans (reg_height 200, 250) pruned");
+        assert_eq!(storage.super_registrations_sorted().unwrap(),
+                   vec![("super_a".to_string(), "walletA".to_string())], "orphan super gone from the roster");
+        assert_eq!(storage.light_roster_sorted(1000).unwrap(),
+                   vec![("light_a".to_string(), "walletL".to_string())], "orphan light gone from the roster");
+        assert!(storage.wallet_is_burn_registered("walletA"), "canonical entry survives");
+        assert!(!storage.wallet_is_burn_registered("walletO"), "orphan node_ entry also pruned");
+        // The reg_height-bounded views (cbw / lt_state) already excluded the orphans by bound.
+        assert_eq!(storage.compute_lt_state(u64::MAX).root(), {
+            let (s2, _d) = open_test_storage();
+            s2.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+            s2.save_node_registration_at_height_burn("light_a", "light", "walletL", 1.0, 60, "burnL").unwrap();
+            s2.compute_lt_state(u64::MAX).root()
+        }, "post-prune roster == a from-genesis node with only the canonical registrations");
+    }
+
+    // Positional 5-genesis sharding (mirrors node.rs reward + producer): roster sorted by node_id,
+    // per=(total+4)/5, shard g = roster[g*per .. (g+1)*per]; bit i within a shard ⇒ roster member.
+    fn shard_eligible(roster: &[(String, String)], bitmaps: &[(usize, Vec<u8>)]) -> Vec<(String, String)> {
+        let total = roster.len();
+        if total == 0 { return Vec::new(); }
+        let per = (total + 4) / 5;
+        let mut out = Vec::new();
+        for (gidx, bm) in bitmaps {
+            let my_start = (gidx * per).min(total);
+            let my_end = (my_start + per).min(total);
+            for local_i in 0..(my_end - my_start) {
+                if bm.get(local_i / 8).map(|b| b & (1 << (local_i % 8)) != 0).unwrap_or(false) {
+                    out.push(roster[my_start + local_i].clone());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn roster_index_equals_full_scan_bit_identical() {
+        // P6/P7: the apply-time srtr_/lrtr_ index readers MUST be byte-identical to the legacy
+        // full-CF JSON scans — a divergence reorders the positional shard ⇒ different reward_root ⇒
+        // fork. Exercises: node_id ordering, RPC-cache (None) exclusion, before_height cutoff,
+        // positional-shard equivalence, and backfill reconstruction from node_ entries.
+        let (storage, _dir) = open_test_storage();
+        // Chain-confirmed (reg_height stamped) — inserted out of order to prove ordering is by node_id.
+        storage.save_node_registration_at_height("super_c", "super", "wc", 70.0, 5).unwrap();
+        storage.save_node_registration_at_height("super_a", "super", "wa", 70.0, 10).unwrap();
+        storage.save_node_registration_at_height("super_b", "super", "wb", 70.0, 3).unwrap();
+        storage.save_node_registration_at_height("genesis_node_001", "genesis", "wg", 100.0, 0).unwrap();
+        storage.save_node_registration_at_height("light_z", "light", "lz", 70.0, 100).unwrap();
+        storage.save_node_registration_at_height("light_a", "light", "la", 70.0, 100).unwrap();
+        storage.save_node_registration_at_height("light_m", "light", "lm", 70.0, 100).unwrap();
+        storage.save_node_registration_at_height("light_late", "light", "ll", 70.0, 200).unwrap(); // > cutoff
+        // RPC/discovery cache write (no reg_height) — must NOT enter either index.
+        storage.save_node_registration("light_rpc", "light", "lr", 70.0).unwrap();
+
+        let before = 150u64;
+        // (1) Index reader == full-CF scan, byte-identical Vec.
+        assert_eq!(storage.super_registrations_sorted().unwrap(),
+                   storage.super_registrations_sorted_scan().unwrap(), "super index != scan");
+        assert_eq!(storage.light_roster_sorted(before).unwrap(),
+                   storage.light_roster_sorted_scan(before).unwrap(), "light index != scan");
+
+        // (2) Exact expected sets (ascending node_id; RPC-cache + too-new excluded).
+        assert_eq!(storage.super_registrations_sorted().unwrap(),
+                   vec![("genesis_node_001".to_string(), "wg".to_string()),
+                        ("super_a".to_string(), "wa".to_string()),
+                        ("super_b".to_string(), "wb".to_string()),
+                        ("super_c".to_string(), "wc".to_string())]);
+        let lr = storage.light_roster_sorted(before).unwrap();
+        assert_eq!(lr, vec![("light_a".to_string(), "la".to_string()),
+                            ("light_m".to_string(), "lm".to_string()),
+                            ("light_z".to_string(), "lz".to_string())]);
+        assert!(!lr.iter().any(|(id, _)| id == "light_rpc"), "RPC-cache (None) must be excluded");
+        assert!(!lr.iter().any(|(id, _)| id == "light_late"), "before_height cutoff must exclude too-new");
+
+        // (3) Positional-shard equivalence: same eligible set whether derived from index or scan.
+        let bitmaps = vec![(0usize, vec![0b1u8]), (1usize, vec![0b1u8]), (2usize, vec![0b1u8])];
+        assert_eq!(shard_eligible(&storage.light_roster_sorted(before).unwrap(), &bitmaps),
+                   shard_eligible(&storage.light_roster_sorted_scan(before).unwrap(), &bitmaps),
+                   "positional shard must be identical across readers");
+
+        // (4) Backfill reconstruction: drop the index, confirm reader empties, rebuild from node_.
+        let cf = storage.persistent.db.cf_handle("node_registry").unwrap();
+        let mut del = rocksdb::WriteBatch::default();
+        for item in storage.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (k, _) = item.unwrap();
+            if k.starts_with(b"srtr_") || k.starts_with(b"lrtr_") { del.delete_cf(&cf, &k); }
+        }
+        storage.persistent.db.write(del).unwrap();
+        assert!(storage.super_registrations_sorted().unwrap().is_empty(), "index should be empty after drop");
+        assert!(storage.light_roster_sorted(before).unwrap().is_empty(), "index should be empty after drop");
+        assert!(storage.backfill_roster_indices().unwrap() > 0, "backfill must add entries");
+        assert_eq!(storage.super_registrations_sorted().unwrap(),
+                   storage.super_registrations_sorted_scan().unwrap(), "post-backfill super mismatch");
+        assert_eq!(storage.light_roster_sorted(before).unwrap(),
+                   storage.light_roster_sorted_scan(before).unwrap(), "post-backfill light mismatch");
     }
 }

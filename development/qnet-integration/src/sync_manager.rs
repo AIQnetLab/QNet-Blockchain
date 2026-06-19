@@ -268,10 +268,21 @@ impl SyncManager {
         }
     }
 
-    /// Detect network height from peers.
+    /// Cold-start sync target = QC-verified finality frontier; the peer/bootstrap-HTTP hint may only
+    /// add the ≤2-macroblock unsealed tail above it (no unverified scalar drives the bulk target).
+    /// frontier==0 (h<90 / fresh genesis) ⇒ the hint alone, so the 5-genesis bootstrap is never blocked.
+    async fn detect_network_height(&self) -> u64 {
+        let hint = self.detect_network_height_hint().await;
+        let frontier = crate::node::qc_verified_frontier_height();
+        if frontier == 0 { hint }
+        else { std::cmp::max(frontier, std::cmp::min(hint, frontier.saturating_add(180))) }
+    }
+
+    /// Peer/bootstrap-HTTP height HINT (unverified scalar) — used only to pick the probe target and the
+    /// near-tip tail; floored by the QC frontier in detect_network_height above.
     /// FIX M-H16: Don't trust a single peer if height is significantly ahead.
     /// Verify against bootstrap nodes before accepting large jumps.
-    async fn detect_network_height(&self) -> u64 {
+    async fn detect_network_height_hint(&self) -> u64 {
         let local_h = self.coordinator.chain_height();
         let best = self.p2p.get_best_peer_height();
 

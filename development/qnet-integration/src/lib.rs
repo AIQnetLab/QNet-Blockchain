@@ -22,6 +22,7 @@ pub mod network_config;
 pub mod archive_manager;
 pub mod genesis_constants;
 pub mod reward_sharding;
+pub mod registry_lthash;   // Homomorphic (incremental, O(1)) multiset hash for registry_root at scale
 pub mod consensus_state;   // L1 consensus state machine (single coordinator)
 pub mod consensus_v2_driver; // Consensus v2 — Checkpoint-BFT driver (engine ↔ node bridge)
 pub mod consensus_v2_node;   // Consensus v2 — node runtime (verify + async effect executor + task)

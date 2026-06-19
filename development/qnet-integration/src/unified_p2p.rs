@@ -1322,6 +1322,12 @@ static TIMEOUT_VOTED_HEIGHTS: Lazy<Arc<DashMap<u64, u64>>> =
 static LAST_FINALIZED_ROUND_PER_MB: Lazy<Arc<DashMap<u64, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
+/// Epoch-keyed committee cache. deterministic_eligible_ids resolves the N-2 VRF committee via a
+/// macroblock deserialize+sort+sample (O(E log E)); without caching a timeout-vote/TC flood pays
+/// that per message. Cached only for the canonical N-2 source; pruned to a few recent epochs.
+static EPOCH_COMMITTEE_CACHE: Lazy<Arc<DashMap<u64, Arc<std::collections::HashSet<String>>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
 /// Records that a microblock for `mb_index` has been finalized at `round`.
 /// Monotonic — only advances upward.
 ///
@@ -1364,6 +1370,23 @@ pub fn get_certified_rotation_round(mb_index: u64) -> u64 {
     let baseline = get_baseline_round(mb_index);
     let certified = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
     certified.saturating_sub(baseline)
+}
+
+/// Highest failover round for `mb_index` co-signed by ≥ `support` DISTINCT committee voters
+/// (TIMEOUT_VOTES is committee-filtered and voter-deduped at insert). With support = f+1 this
+/// proves ≥1 honest validator already reached that round, so a node lagging by the certified-round
+/// offset may raise its vote TARGET to it and reconverge — instead of voting certified+1 forever
+/// while the split never closes. NEVER feeds leader election: the certified/rotation round still
+/// advances only on a same-round n-f TC, so this cannot cause dual production. O(active rounds).
+pub fn highest_failover_round_with_support(mb_index: u64, support: usize) -> u64 {
+    let mut best = 0u64;
+    for e in TIMEOUT_VOTES.iter() {
+        let (h, r) = *e.key();
+        if h == mb_index && r > best && e.value().len() >= support {
+            best = r;
+        }
+    }
+    best
 }
 
 /// v34: ingest authority for a failover microblock — true iff a relative rotation round
@@ -2191,6 +2214,10 @@ pub struct SimplifiedP2P {
     /// Key: "{light_node_id}:{slot}", Value: LightNodeAttestation
     /// Dedupe ensures only one attestation per Light node per slot
     light_node_attestations: Arc<RwLock<HashMap<String, LightNodeAttestation>>>,
+    /// Per-epoch attested light node_ids (uncapped, compact), populated at every attestation insert
+    /// so the shard bitmap reflects ALL responders — not just the 100k-capped attestation map.
+    /// Pruned to the few most recent epochs.
+    epoch_light_eligible: Arc<RwLock<HashMap<u64, std::collections::HashSet<String>>>>,
     
     /// PRODUCTION: Active Super nodes for pinger selection
     /// Updated via gossip, used for deterministic pinger assignment
@@ -3096,6 +3123,7 @@ impl SimplifiedP2P {
             
             // PRODUCTION: Light Node attestations for sharded ping system
             light_node_attestations: Arc::new(RwLock::new(HashMap::new())),
+            epoch_light_eligible: Arc::new(RwLock::new(HashMap::new())),
             
             // PRODUCTION v2.51: Lock-free active nodes map for pinger selection
             active_full_super_nodes: Arc::new(DashMap::new()),
@@ -15308,6 +15336,8 @@ impl SimplifiedP2P {
                     });
                 }
                 
+                self.record_light_epoch_eligible(block_height, &light_node_id);
+
                 // WHITEPAPER: Light nodes have FIXED reputation of 70
                 // NO reputation changes for Light nodes - they are always eligible if attested
                 
@@ -17867,13 +17897,15 @@ impl SimplifiedP2P {
             block_height: attestation.block_height, // v2.59: For epoch-based filtering
         };
         
-        // Store locally first
+        // Store locally first + record into the per-epoch eligibility set (the live origination
+        // path: this genesis received the light node's ping reply directly).
         let key = format!("{}:{}", attestation.light_node_id, attestation.slot);
+        self.record_light_epoch_eligible(attestation.block_height, &attestation.light_node_id);
         {
             let mut attestations = self.light_node_attestations.write();
             attestations.insert(key, attestation);
         }
-        
+
         // Gossip to peers
         self.gossip_to_random_peers(msg, 5);
     }
@@ -18371,7 +18403,7 @@ impl SimplifiedP2P {
         let mut attestations = self.light_node_attestations.write();
         
         attestations.insert(attestation_key, LightNodeAttestation {
-            light_node_id,
+            light_node_id: light_node_id.clone(),
             pinger_id,
             slot,
             timestamp,
@@ -18380,8 +18412,28 @@ impl SimplifiedP2P {
             challenge,
             block_height,
         });
+        drop(attestations);
+        self.record_light_epoch_eligible(block_height, &light_node_id);
     }
-    
+
+    /// Record an attested light node into the per-epoch eligibility set (uncapped) + prune old epochs.
+    fn record_light_epoch_eligible(&self, block_height: u64, light_node_id: &str) {
+        const EPOCH_BLOCKS: u64 = 14400;
+        let epoch = block_height / EPOCH_BLOCKS;
+        let mut map = self.epoch_light_eligible.write();
+        map.entry(epoch).or_default().insert(light_node_id.to_string());
+        if map.len() > 3 {
+            let keep_from = epoch.saturating_sub(2);
+            map.retain(|e, _| *e >= keep_from);
+        }
+    }
+
+    /// All light node_ids attested in `epoch` (uncapped union of received + gossiped pings).
+    pub fn get_light_eligible_for_epoch(&self, epoch: u64) -> Vec<String> {
+        self.epoch_light_eligible.read().get(&epoch)
+            .map(|s| s.iter().cloned().collect()).unwrap_or_default()
+    }
+
     /// Get eligible Light nodes for rewards in current window
     /// Returns Vec<(node_id, wallet_address)> for nodes with at least 1 attestation
     /// DEPRECATED: Use get_eligible_light_nodes_by_height for deterministic emission
@@ -23011,7 +23063,40 @@ impl SimplifiedP2P {
 
     /// Handle incoming timeout proof broadcast
     /// SECURITY: Verifies all signatures before accepting
-    fn handle_timeout_proof_broadcast(&self, height: u64, timeout_round: u64, 
+    /// Single authority for accepting a timeout certificate (broadcast + pull adopt paths).
+    /// Dedups by voter and drops non-committee members BEFORE counting, then verifies the
+    /// remaining Dilithium signatures in parallel. Returns the distinct committee signers iff
+    /// they reach quorum — so a replayed single vote or a non-committee key can never inflate
+    /// the count and illegitimately advance the leader-selection round.
+    fn verify_timeout_certificate(
+        &self, height: u64, timeout_round: u64, hash_arr: [u8; 32],
+        votes: &[(String, Vec<u8>)],
+    ) -> Option<Vec<SignedTimeoutVote>> {
+        let quorum = qnet_consensus::checkpoint_bft::quorum_size(self.get_active_validator_count());
+        let committee = self.deterministic_eligible_ids(); // None at genesis → signature-only
+        // Dedup BEFORE verify; drop non-committee voters (None = genesis fallback, no filter).
+        let mut by_voter: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        for (voter, sig) in votes {
+            if committee.as_ref().map_or(true, |c| c.contains(voter)) {
+                by_voter.insert(voter.clone(), sig.clone());
+            }
+        }
+        if by_voter.len() < quorum { return None; }
+        let vote_msg = format!("TIMEOUT:{}:{}:{}", height, timeout_round, hex::encode(&hash_arr));
+        let candidates: Vec<(String, Vec<u8>)> = by_voter.into_iter().collect();
+        use rayon::prelude::*;
+        let verified: Vec<SignedTimeoutVote> = candidates
+            .par_iter()
+            .filter_map(|(voter, sig)| {
+                if self.verify_timeout_vote_signature(voter, &vote_msg, sig) {
+                    Some(SignedTimeoutVote { voter_id: voter.clone(), signature: sig.clone() })
+                } else { None }
+            })
+            .collect();
+        if verified.len() < quorum { None } else { Some(verified) }
+    }
+
+    fn handle_timeout_proof_broadcast(&self, height: u64, timeout_round: u64,
                                        last_block_hash: Vec<u8>, votes: Vec<(String, Vec<u8>)>) {
         // Skip if we already have this proof
         if TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round)) {
@@ -23028,94 +23113,31 @@ impl SimplifiedP2P {
         let mut hash_arr = [0u8; 32];
         hash_arr.copy_from_slice(&last_block_hash);
         
-        // Verify Byzantine threshold
-        let total_validators = self.get_active_validator_count();
-        let byzantine_threshold = qnet_consensus::checkpoint_bft::quorum_size(total_validators); // v34: n−f, matches macroblock BFT2
-
-        if votes.len() < byzantine_threshold {
-            if crate::node::is_warn() {
-                println!("[WARN][TIMEOUT] proof_insufficient_votes h={} round={} votes={} need={}", 
-                         height, timeout_round, votes.len(), byzantine_threshold);
-            }
-            return;
-        }
-        
-        // ═══════════════════════════════════════════════════════════════════
-        // v15.2: PARALLEL Dilithium3 signature verification.
-        //
-        // At the MAX_VALIDATORS=1000 committee cap, a same-round TC carries
-        // up to 2f+1 = 667 signed votes. Serial verification at ~1-2ms per
-        // Dilithium3 signature = ~670-1340ms — long enough to eat into the
-        // 12s commit-phase budget and blow the 90s macroblock window under
-        // concurrent view-change storms.
-        //
-        // rayon's work-stealing pool parallelises verification across every
-        // available core. Each vote is independently verifiable — no shared
-        // mutable state during the verify step — so parallelism is safe.
-        // The final ordering-sensitive work (collecting verified votes,
-        // logging rejected ones) happens after the parallel barrier.
-        //
-        // Scalability: O(committee / num_cores) latency instead of O(committee).
-        // At 1000-committee on an 8-core host: ~170ms instead of ~1340ms.
-        // At small committees (≤ 20) the overhead of the parallel fan-out is
-        // negligible; no special-case needed.
-        // ═══════════════════════════════════════════════════════════════════
-        let vote_msg = format!("TIMEOUT:{}:{}:{}", height, timeout_round, hex::encode(&hash_arr));
-
-        use rayon::prelude::*;
-        let verify_results: Vec<Option<SignedTimeoutVote>> = votes
-            .par_iter()
-            .map(|(voter_id, signature)| {
-                if self.verify_timeout_vote_signature(voter_id, &vote_msg, signature) {
-                    Some(SignedTimeoutVote {
-                        voter_id: voter_id.clone(),
-                        signature: signature.clone(),
-                    })
-                } else {
-                    None
+        // Distinct committee signers ≥ quorum (dedup + committee filter inside) — a replayed
+        // single vote or a non-committee key cannot advance the round.
+        let verified_votes = match self.verify_timeout_certificate(height, timeout_round, hash_arr, &votes) {
+            Some(v) => v,
+            None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][TIMEOUT] tc_rejected h={} round={} raw_votes={}",
+                             height, timeout_round, votes.len());
                 }
-            })
-            .collect();
-
-        let mut verified_votes = Vec::with_capacity(verify_results.len());
-        for (idx, result) in verify_results.into_iter().enumerate() {
-            match result {
-                Some(v) => verified_votes.push(v),
-                None => {
-                    if crate::node::is_warn() {
-                        let voter_id = &votes[idx].0;
-                        println!("[WARN][TIMEOUT] proof_bad_sig h={} voter={}", height, voter_id);
-                    }
-                }
+                return;
             }
-        }
-        
-        // Must have 2/3+ valid signatures
-        if verified_votes.len() < byzantine_threshold {
-            if crate::node::is_warn() {
-                println!("[WARN][TIMEOUT] proof_not_enough_valid h={} verified={} need={}", 
-                         height, verified_votes.len(), byzantine_threshold);
-            }
-            return;
-        }
-        
-        // Store valid proof
-        let proof = TimeoutProof {
-            height,
-            timeout_round,
-            last_block_hash: hash_arr,
-            votes: verified_votes,
         };
-        
-        TIMEOUT_CERTIFICATES.insert((height, timeout_round), proof);
+        let signers = verified_votes.len();
 
-        // O(1) tracker update
+        TIMEOUT_CERTIFICATES.insert((height, timeout_round), TimeoutProof {
+            height, timeout_round, last_block_hash: hash_arr, votes: verified_votes,
+        });
+
+        // O(1) tracker update — round advances only on a quorum of DISTINCT committee signers.
         HIGHEST_CERTIFIED_ROUND.entry(height)
             .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
             .or_insert(timeout_round);
 
         if crate::node::is_info() {
-            println!("[INFO][TIMEOUT] proof_accepted h={} round={}", height, timeout_round);
+            println!("[INFO][TIMEOUT] proof_accepted h={} round={} signers={}", height, timeout_round, signers);
         }
     }
     
@@ -23353,8 +23375,8 @@ impl SimplifiedP2P {
     /// v27 HOLE5: deterministic N-2 eligible-producer node_id set for the
     /// current height — single source of truth shared with the BFT-threshold
     /// denominator and every quorum-vote gate (numerator==denominator set).
-    /// `None` = non-deterministic fallback (genesis pre-180 / snapshot
-    /// absent) → unchanged signature-only doctrine. O(1) lookup, ≤1000.
+    /// `None` = non-deterministic fallback (genesis pre-180 / snapshot absent) → signature-only
+    /// doctrine. Returns the ≤100 VRF committee (epoch-cached; computing it is O(E log E)).
     fn deterministic_eligible_ids(&self) -> Option<std::collections::HashSet<String>> {
         let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
         if local_h <= 180 {
@@ -23364,6 +23386,9 @@ impl SimplifiedP2P {
         let required_macroblock = current_epoch.saturating_sub(2);
         if required_macroblock == 0 {
             return None;
+        }
+        if let Some(c) = EPOCH_COMMITTEE_CACHE.get(&current_epoch) {
+            return Some(c.value().as_ref().clone());
         }
         let storage = crate::node::try_get_storage()?;
         // P1.5 self-healing: the committee is the eligible_producers snapshot
@@ -23418,7 +23443,15 @@ impl SimplifiedP2P {
                                     qnet_consensus::checkpoint_bft::COMMITTEE_SIZE,
                                 );
                                 let set: std::collections::HashSet<String> = committee.into_iter().collect();
-                                if idx != required_macroblock && crate::node::is_warn() {
+                                if idx == required_macroblock {
+                                    // Cache only the canonical N-2 result (fallback is transient
+                                    // and per-node, must not be pinned).
+                                    let arc = Arc::new(set);
+                                    EPOCH_COMMITTEE_CACHE.insert(current_epoch, arc.clone());
+                                    EPOCH_COMMITTEE_CACHE.retain(|e, _| *e + 4 >= current_epoch);
+                                    return Some(arc.as_ref().clone());
+                                }
+                                if crate::node::is_warn() {
                                     println!("[WARN][BFT] committee_fallback used_mb={} wanted_mb={} depth={} reason=n2_absent_self_heal",
                                              idx, required_macroblock, required_macroblock - idx);
                                 }

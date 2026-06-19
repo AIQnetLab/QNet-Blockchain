@@ -389,6 +389,16 @@ pub fn should_check_fork() -> bool {
 
 static SYNC_TARGET_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
+// QC-verified finality frontier (height = highest macroblock whose 2f+1 QC this node verified ×90).
+// The cold-join sync target floors on THIS, never a peer-reported median: a self-reported height is
+// unauthenticated, so averaging it can't be a trust anchor and on a fresh joiner the honest sample is
+// stale-low → the node would stop below the real tip. The frontier is unforgeable (raising it needs a
+// valid 2f+1 Dilithium QC under the embedded genesis committee). 0 before the first macroblock (h<90)
+// ⇒ callers fall back to the capped near-tip hint, so the genesis bootstrap is never blocked.
+static QC_VERIFIED_FRONTIER: AtomicU64 = AtomicU64::new(0);
+// Throttle for the frontier's bulk lineage-walk probe (coordinator also dedups overlapping ranges).
+static LAST_FRONTIER_PROBE_SECS: AtomicU64 = AtomicU64::new(0);
+
 // v3.5: Flag to skip slot timing after sync completion
 // PROBLEM: After sync, node may be "ahead" of slot time and wait unnecessarily
 // while network expects block from it immediately
@@ -1084,6 +1094,30 @@ pub async fn update_all_heights(
 // Uses compare_exchange to atomically check-and-set
 // Value 0 = no active consensus, Value N = consensus active for MB#N
 pub static ACTIVE_CONSENSUS_MB: AtomicU64 = AtomicU64::new(0);
+
+/// Releases the ACTIVE_CONSENSUS_MB lock if the consensus task exits WITHOUT signalling (a
+/// content defer). Without this a deferred task leaks the lock for the rest of the epoch, so
+/// the window is never re-attempted and finality wedges. Disarmed on success to keep the lock
+/// held (overridden by the next epoch), matching prior semantics.
+struct ActiveConsensusGuard { mb_idx: u64, signalled: bool }
+impl Drop for ActiveConsensusGuard {
+    fn drop(&mut self) {
+        if !self.signalled {
+            let _ = ACTIVE_CONSENSUS_MB.compare_exchange(
+                self.mb_idx, 0,
+                std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// May this node join THIS (unfinalized) window's checkpoint consensus? Synced nodes always may.
+/// A SYNCING node may iff it holds the full window (local_h >= mb_end_height): it can build+sign
+/// the checkpoint correctly, receivers' content_ok rejects any divergent vote, and the extra
+/// committee participant only helps reach quorum (unblocks a macro-boundary finality-lag redrive).
+/// A syncing node WITHOUT the window defers to macroblock sync instead.
+pub(crate) fn checkpoint_participation_allowed(is_synchronized: bool, local_h: u64, mb_end_height: u64) -> bool {
+    is_synchronized || local_h >= mb_end_height
+}
 
 // METRICS: Track retry statistics for monitoring certificate race condition
 // Used to tune retry interval and detect systemic issues
@@ -2219,6 +2253,61 @@ pub(crate) async fn verify_snapshot_anchor_qc(
     BlockchainNode::verify_v2_macroblock(macroblock, mb_idx, p2p, &node_id, NodeType::Super, storage).await
 }
 
+/// QC-verified finality frontier as a height (idx*90): the highest macroblock OBJECT this node holds,
+/// which is QC-verified by construction (process_received_macroblock / local finalize both gate on
+/// verify_v2_macroblock against the genesis-anchored committee before storage). Drives the bulk
+/// macroblock lineage walk toward the peer-hinted top so the frontier climbs to the network's verified
+/// tip. The peer hint is MAX (not median): an over-reported height only makes us probe a higher index,
+/// where a forged macroblock fails the QC gate and never stores — so MAX self-limits to reality and the
+/// median's anti-high-poisoning role is subsumed by the QC verify. Returns 0 before any macroblock
+/// (h<90 / fresh genesis) so callers fall back to the capped near-tip hint (bootstrap never blocked).
+/// O(epoch checkpoints); WS checkpoint truncates the lineage at maturity. NOT for hot loops.
+pub(crate) fn qc_verified_frontier_height() -> u64 {
+    const MB: u64 = 90; // microblocks per macroblock (boundary granularity)
+    use std::sync::atomic::Ordering::Relaxed;
+    let storage = match try_get_storage() { Some(s) => s, None => return QC_VERIFIED_FRONTIER.load(Relaxed) };
+    let local_mb = storage.get_latest_macroblock_index().unwrap_or(0); // = chain_height/90 (own progress)
+    let hint_mb = try_get_p2p().map(|p| p.get_best_peer_height() / MB).unwrap_or(0);
+    // Fire-and-forget the bulk lineage extension (throttled) — NEVER block the production hot path on
+    // peer I/O. The local scan below reports the frontier from whatever has already been QC-stored;
+    // the spawned walk extends it for the next call. Skip-present + windowed; fetches objects + N-2
+    // anchors so verify_v2_macroblock certifies each before storage.
+    if hint_mb > local_mb {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        if now.saturating_sub(LAST_FRONTIER_PROBE_SECS.load(Relaxed)) >= 3 {
+            LAST_FRONTIER_PROBE_SECS.store(now, Relaxed);
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let from = local_mb.saturating_add(1).max(1);
+                rt.spawn(async move {
+                    if let Some(p) = try_get_p2p() { let _ = p.sync_macroblocks_repair(from, hint_mb).await; }
+                });
+            }
+        }
+    }
+    // Highest STORED macroblock object above local progress. Existence ⟹ QC-verified: the only store
+    // paths are process_received_macroblock (gated on verify_v2_macroblock before save_macroblock) and
+    // the local sealer (own 2f+1 QC); no reachable path stores a None-QC macroblock. Bounded scan —
+    // cap the window so a far-ahead hint can't trigger an unbounded DB scan.
+    let scan_top = hint_mb.min(local_mb.saturating_add(128));
+    let mut frontier = local_mb.saturating_mul(MB);
+    let mut idx = scan_top;
+    while idx > local_mb {
+        if storage.get_macroblock_by_height(idx).ok().flatten().is_some() {
+            frontier = idx.saturating_mul(MB);
+            break;
+        }
+        idx = idx.saturating_sub(1);
+    }
+    QC_VERIFIED_FRONTIER.fetch_max(frontier, Relaxed);
+    QC_VERIFIED_FRONTIER.load(Relaxed)
+}
+
+/// O(1) cached QC frontier (no network probe) for hot gates. Monotonic; refreshed by every
+/// qc_verified_frontier_height() probe AND every QC macroblock commit (fetch_max at save_macroblock).
+pub(crate) fn qc_verified_frontier_cached() -> u64 {
+    QC_VERIFIED_FRONTIER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // CRITICAL: Track certificate requests to prevent DDoS (request flooding)
 // Maps certificate_serial -> last_request_timestamp
 // v2.96: Using DashMap for lock-free operations
@@ -2671,9 +2760,13 @@ pub struct BlockApplyResult {
     pub merkle_root: [u8; 32],
     pub reward_accruals: Vec<(String, u64)>,
     pub deferred_pool3: u64,
-    pub deferred_registrations: Vec<(String, String, String)>,
+    // (node_id, type_str, wallet, burn_tx). burn_tx empty for non-NodeRegistration (activations).
+    pub deferred_registrations: Vec<(String, String, String, String)>,
     pub deferred_emission_mbs: Vec<u64>,
     pub deferred_reward_clears: Vec<(String, u64)>,
+    /// (epoch, total, committed_root, c_per, c_cnt) — emission reward recompute the caller runs
+    /// AFTER the state write-lock so the O(recipients) merkle build never blocks block apply.
+    pub deferred_emission_root: Option<(u64, u64, String, u64, u32)>,
 }
 
 #[allow(dead_code)]
@@ -2998,7 +3091,7 @@ impl BlockchainNode {
     /// independently recomputed root are byte-identical. Resolves the eligible set from the
     /// macroblock, then delegates the split to the pure `distribute_equal_rewards`.
     /// Returns (sorted wallet→amount pairs, merkle root hex); empty when no eligible / no emission.
-    fn compute_epoch_reward_distribution(
+    pub(crate) fn compute_epoch_reward_distribution(
         storage: &crate::storage::Storage,
         macroblock_index: u64,
         total_emission: u64,
@@ -3132,6 +3225,7 @@ impl BlockchainNode {
             deferred_registrations: Vec::new(),
             deferred_emission_mbs: Vec::new(),
             deferred_reward_clears: Vec::new(),
+            deferred_emission_root: None,
         };
 
         // ── Phase 1: Process emission TXs — update total_supply + parse reward accruals ──
@@ -3193,24 +3287,10 @@ impl BlockchainNode {
                         // reference and OVERWRITES this on macroblock finalization for a node whose
                         // recompute differs (catch-up / incomplete data). Mint (emit_rewards above) is
                         // separate + watermark-idempotent.
-                        let (wallet_vec, recomputed_root) = Self::compute_epoch_reward_distribution(storage, epoch, total);
-                        if !recomputed_root.is_empty() {
-                            let rtotal: u64 = wallet_vec.iter().map(|(_, a)| *a).sum();
-                            let rcount = wallet_vec.len() as u32;
-                            let rper = if rcount > 0 { rtotal / rcount as u64 } else { 0 };
-                            let _ = storage.save_epoch_reward_root(epoch, &recomputed_root, rper, rcount, rtotal);
-                            let _ = storage.save_epoch_reward_wallets(epoch, &wallet_vec);
-                            let _ = storage.append_reward_epoch(epoch);
-                            if is_info() {
-                                println!("[INFO][REWARDS] reward_root_applied epoch={} root={}.. count={} total={} QNC",
-                                         epoch, &recomputed_root[..16.min(recomputed_root.len())], rcount, rtotal / 1_000_000_000);
-                            }
-                        } else if !committed_root.is_empty() {
-                            // Bodies pruned ⇒ cannot recompute. Provisionally adopt the TX root so the
-                            // epoch is indexed; finalization overwrites it with the certified root.
-                            let _ = storage.save_epoch_reward_root(epoch, &committed_root, c_per, c_cnt, total);
-                            let _ = storage.append_reward_epoch(epoch);
-                        }
+                        // Defer the O(recipients) recompute+persist to the caller, AFTER the state
+                        // write-lock. It is a pure fn of storage (off state_root), so running it off
+                        // the lock keeps the merkle build out of the block-apply critical path.
+                        result.deferred_emission_root = Some((epoch, total, committed_root, c_per, c_cnt));
                     }
                 }
             }
@@ -3224,18 +3304,9 @@ impl BlockchainNode {
                 snap.record_pre_images(&affected, &state_guard.accounts);
             }
 
-            // Index Light eligibility bitmaps at apply (epoch = height-window) so the emission
-            // recompute reads ≤5 keys, not a 14400-block scan. Last-in-window write wins (= scan).
-            if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, bitmap_compressed, .. } = &tx.tx_type {
-                if let Some(gidx) = genesis_id.strip_prefix("genesis_node_")
-                    .and_then(|n| n.parse::<usize>().ok())
-                    .filter(|n| (1..=5).contains(n)).map(|n| n - 1)
-                {
-                    if let Ok(bm) = zstd::decode_all(&bitmap_compressed[..]) {
-                        let _ = storage.save_light_bitmap(h / 14400, gidx, &bm);
-                    }
-                }
-            }
+            // Index Light eligibility bitmaps at apply via the SHARED helper (byte-identical on the
+            // producer-inline path) so the emission recompute reads ≤5 keys, not a 14400-block scan.
+            Self::index_light_eligibility_bitmap(storage, h, tx);
 
             if let Err(e) = state_guard.apply_transaction_lazy(tx) {
                 if is_debug() {
@@ -3247,18 +3318,6 @@ impl BlockchainNode {
                     snap.record_pre_images(&[tx.from.clone()], &state_guard.accounts);
                 }
                 let _ = state_guard.apply_gas_refund(tx, h);
-
-                // Super-eligibility index: when a sender's heartbeat popcount for its epoch reaches
-                // the reward threshold (9), record it so the emission recompute reads O(eligible),
-                // not an O(registered) per-super account scan. Idempotent; tally is monotonic in-epoch.
-                if let qnet_state::TransactionType::Heartbeat { anchor_height, .. } = &tx.tx_type {
-                    let epoch = anchor_height / 14400;
-                    if let Some(acct) = state_guard.accounts.get(&tx.from) {
-                        if acct.heartbeat_epoch == epoch && acct.heartbeat_slots.count_ones() >= 9 {
-                            let _ = storage.save_super_eligible(epoch, &tx.from);
-                        }
-                    }
-                }
 
                 // Collect deferred side effects from successful TXs
                 match &tx.tx_type {
@@ -3281,13 +3340,13 @@ impl BlockchainNode {
                         }
                     }
                     qnet_state::TransactionType::NodeRegistration {
-                        node_id, node_type, wallet_address, ..
+                        node_id, node_type, wallet_address, burn_tx, ..
                     } => {
                         let type_str = match node_type {
                             qnet_state::NodeType::Super => "super",
                             qnet_state::NodeType::Light => "light",
                         };
-                        result.deferred_registrations.push((node_id.clone(), type_str.to_string(), wallet_address.clone()));
+                        result.deferred_registrations.push((node_id.clone(), type_str.to_string(), wallet_address.clone(), burn_tx.clone()));
                     }
                     qnet_state::TransactionType::NodeActivation { node_type, .. } => {
                         let type_str = match node_type {
@@ -3295,7 +3354,7 @@ impl BlockchainNode {
                             qnet_state::account::NodeType::Light => "light",
                         };
                         let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
-                        result.deferred_registrations.push((activation_id, type_str.to_string(), tx.from.clone()));
+                        result.deferred_registrations.push((activation_id, type_str.to_string(), tx.from.clone(), String::new()));
                         // Super activation self-registers under its canonical region-independent
                         // pseudonym (the id used to sign heartbeats/blocks) so reward crediting
                         // resolves node_id→wallet even if the NodeRegistration TX is lost. Light
@@ -3303,7 +3362,7 @@ impl BlockchainNode {
                         if matches!(node_type, qnet_state::account::NodeType::Super) {
                             let pseudonym = crate::rpc::generate_super_node_pseudonym(&tx.from);
                             crate::unified_p2p::add_registered_super_node(pseudonym.clone());
-                            result.deferred_registrations.push((pseudonym, "super".to_string(), tx.from.clone()));
+                            result.deferred_registrations.push((pseudonym, "super".to_string(), tx.from.clone(), String::new()));
                         }
                     }
                     _ => {}
@@ -3322,62 +3381,16 @@ impl BlockchainNode {
             }
         }
 
+        // Epoch-boundary super reward-eligibility snapshot (deterministic; replaces per-TX writer).
+        Self::populate_super_elig_at_boundary(state_guard, storage, h);
+
         // ── Phase 2b: Merkle reward claims (proof-verified credit, batched) ──
         // A claim TX is RewardDistribution from system_rewards_pool carrying
         // {claims:[{epoch,amount,proof},...]} — one TX can cover ALL of a wallet's unclaimed epochs
         // (no forfeiture). Each entry's proof binds wallet+epoch+amount against the locally-stored
         // epoch root; claim_reward enforces the monotonic last_claimed_epoch watermark (replay-safe).
         // Runs after Phase 2 so the claim TX's pre-images already exist for rollback.
-        for tx in &microblock.transactions {
-            if tx.tx_type != qnet_state::TransactionType::RewardDistribution
-               || tx.from != "system_rewards_pool" {
-                continue;
-            }
-            let to = match &tx.to { Some(w) => w, None => continue };
-            let data = match &tx.data { Some(d) => d, None => continue };
-            let parsed = match serde_json::from_str::<serde_json::Value>(data) { Ok(p) => p, Err(_) => continue };
-            let entries = match parsed.get("claims").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
-            // Parse each {epoch, amount, proof}, then sort by epoch so the monotonic watermark
-            // credits every entry (claiming out of order would otherwise skip the lower epochs).
-            let mut claims: Vec<(u64, u64, Vec<(String, bool)>)> = entries.iter().filter_map(|e| {
-                let epoch = e.get("epoch")?.as_u64()?;
-                let amount = e.get("amount")?.as_u64()?;
-                let proof: Vec<(String, bool)> = e.get("proof")?.as_array()?.iter().filter_map(|p| {
-                    let a = p.as_array()?;
-                    Some((a.get(0)?.as_str()?.to_string(), a.get(1)?.as_bool()?))
-                }).collect();
-                Some((epoch, amount, proof))
-            }).collect();
-            claims.sort_by_key(|(e, _, _)| *e);
-            // Record the recipient pre-image once before any credit (rollback safety).
-            if !claims.is_empty() {
-                if let Some(ref mut snap) = block_snapshot {
-                    snap.record_pre_images(&[to.clone()], &state_guard.accounts);
-                }
-            }
-            for (epoch, amount, proof) in &claims {
-                let root_hex = match storage.load_epoch_reward_root(*epoch) {
-                    Ok(Some((r, _, _, _))) => r,
-                    _ => continue,
-                };
-                // leaf = SHA3(wallet ‖ epoch ‖ amount) — identical to the producer's leaf.
-                let mut hasher = Sha3_256::new();
-                hasher.update(to.as_bytes());
-                hasher.update(&epoch.to_le_bytes());
-                hasher.update(&amount.to_le_bytes());
-                let leaf_hex = hex::encode(hasher.finalize());
-                if !qnet_core::crypto::merkle::verify_merkle_proof(&leaf_hex, &root_hex, proof) {
-                    eprintln!("[WARN][REWARDS] claim_proof_invalid wallet={}.. epoch={}", &to[..16.min(to.len())], epoch);
-                    continue;
-                }
-                if state_guard.claim_reward(to, *epoch, *amount) {
-                    if is_info() {
-                        println!("[INFO][REWARDS] claim_credited wallet={}.. epoch={} amount={} QNC",
-                                 &to[..16.min(to.len())], epoch, amount / 1_000_000_000);
-                    }
-                }
-            }
-        }
+        Self::apply_merkle_claims(state_guard, storage, &microblock.transactions, block_snapshot.as_deref_mut());
 
         // ── Phase 3: Credit producer fees (with recalculation) ──
         if microblock.fees_collected > 0 {
@@ -4378,6 +4391,36 @@ impl BlockchainNode {
         committee
     }
 
+    /// Deterministic consensus committee for the EPOCH of block height `h`, from the finalized
+    /// N-2 macroblock snapshot — a pure function of on-chain state, so every validator computes the
+    /// same set for the same `h` (required: a NodeRegistration is re-validated on every node).
+    /// window = epoch, seed = N-2 beacon, candidates = N-2 eligible_producers (sorted) — identical
+    /// parameterisation to the failover-voting committee (unified_p2p::deterministic_eligible_ids),
+    /// but keyed on `h` not the local tip and with NO walk-back (reject, don't guess, if N-2 is
+    /// absent locally). `None` = genesis era (no N-2 yet); the caller falls back to the genesis
+    /// committee (the only nodes that exist then). NOT a crutch: post-genesis this IS the live
+    /// committee; at genesis the committee simply IS the 5 genesis.
+    pub(crate) fn committee_for_height(storage: &Storage, h: u64) -> Option<Vec<String>> {
+        let epoch = (h.saturating_sub(1)) / 90 + 1;
+        let n2 = epoch.saturating_sub(2);
+        if n2 == 0 { return None; } // genesis era: epochs 1-2 have no N-2 snapshot
+        let raw = storage.get_macroblock_by_height(n2).ok()??;
+        let mb = bincode::deserialize::<qnet_state::MacroBlock>(&raw).ok()?;
+        let snap = mb.consensus_data.eligible_producers.as_ref()?;
+        let eligible = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snap).ok()?;
+        let mut ids: Vec<String> = eligible.into_iter()
+            .map(|p| p.node_id).filter(|s| !s.is_empty()).collect();
+        if ids.is_empty() { return None; }
+        ids.sort(); // byte-stable input to the VRF sample
+        // Seed = the N-2 macroblock's OWN beacon (matches deterministic_eligible_ids). NOT
+        // try_load_macroblock_beacon(n2) — that subtracts 2 AGAIN → epoch-4 randomness → a
+        // different VRF subset than the real consensus committee.
+        let seed = mb.consensus_data.randomness_beacon?;
+        Some(qnet_consensus::checkpoint_bft::sample_committee(
+            &ids, epoch, &seed, Self::COMMITTEE_THRESHOLD, Self::CONSENSUS_COMMITTEE_SIZE,
+        ))
+    }
+
     
     // NOTE: get_eligible_producers_for_height() was REMOVED in v2.46
     // Use calculate_qualified_candidates() instead - it's the SINGLE SOURCE OF TRUTH
@@ -4458,6 +4501,12 @@ impl BlockchainNode {
                 wallet_address: wallet_address.to_string(),
                 registration_proof: registration_proof.to_string(),
                 api_endpoint: final_endpoint.clone(),
+                // Phase-1 burn-attestation carrier. Empty here: genesis (registration_proof=="genesis")
+                // is exempt; a burn-backed super fills these (burn_tx/amount + 2f+1 genesis quorum)
+                // via the attestation collection path before broadcasting.
+                burn_tx: String::new(),
+                burn_amount: 0,
+                burn_attestors: Vec::new(),
             },
             data: Some(format!("node_registration:{}:{}:{}:{}", node_id, wallet_address, registration_proof, final_endpoint)),
             dilithium_signature: None,
@@ -4859,8 +4908,8 @@ impl BlockchainNode {
         
         for tx in transactions {
             match &tx.tx_type {
-                qnet_state::TransactionType::NodeRegistration { 
-                    node_id, node_type, wallet_address, api_endpoint, .. 
+                qnet_state::TransactionType::NodeRegistration {
+                    node_id, node_type, wallet_address, api_endpoint, ..
                 } => {
                     let type_str = match node_type {
                         qnet_state::NodeType::Super => "super",
@@ -4882,6 +4931,11 @@ impl BlockchainNode {
                         println!("[INFO][REG] cached_from_produced_block node={} wallet={}...",
                                  node_id, &wallet_address[..wallet_address.len().min(16)]);
                     }
+                    // NOTE: the committed burn→wallet binding (cbw) is NO LONGER written here. It is
+                    // materialised incrementally at apply BEFORE save_microblock (within-window
+                    // ordering) and rebuilt deterministically from node_registry on snapshot/reorg/boot
+                    // (rebuild_committed_burn_wallet). This call site runs AFTER save, too late for the
+                    // verify(h+1) read, so it must not be the binding's writer.
 
                     // v4.6: Extract VRF public key from on-chain TX (non-genesis nodes)
                     if let Some(ref pk_hex) = tx.dilithium_public_key {
@@ -4971,6 +5025,24 @@ impl BlockchainNode {
     /// Legacy wrapper for backward compatibility (static calls without DashMap)
     pub fn cache_node_registrations_from_transactions(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
         Self::cache_node_registrations_from_transactions_with_dashmap(storage, transactions, &DashMap::new());
+    }
+
+    /// Index a Light eligibility bitmap at apply (epoch = height/14400 window) so the emission
+    /// recompute reads ≤5 keys, not a 14400-block scan. Last-in-window write wins (== scan). THE ONE
+    /// writer for this index, called from BOTH apply_block_to_state (validator) AND the producer-inline
+    /// apply, so the producer of a bitmap-carrying block stamps its own shard IDENTICALLY — else its
+    /// light reward roster diverges from validators at the emission boundary → reward_root fork.
+    fn index_light_eligibility_bitmap(storage: &crate::storage::Storage, h: u64, tx: &qnet_state::Transaction) {
+        if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, bitmap_compressed, .. } = &tx.tx_type {
+            if let Some(gidx) = genesis_id.strip_prefix("genesis_node_")
+                .and_then(|n| n.parse::<usize>().ok())
+                .filter(|n| (1..=5).contains(n)).map(|n| n - 1)
+            {
+                if let Ok(bm) = zstd::decode_all(&bitmap_compressed[..]) {
+                    let _ = storage.save_light_bitmap(h / 14400, gidx, &bm);
+                }
+            }
+        }
     }
 
     /// Stamp `reg_height = 0` for every genesis NodeRegistration TX in block 0.
@@ -5259,6 +5331,135 @@ impl BlockchainNode {
             account.heartbeat_final_count
         } else {
             0
+        }
+    }
+
+    /// Epoch-boundary super reward-eligibility snapshot. At the first block of epoch N+1 — the only
+    /// moment account_heartbeat_count(.,N) is still valid for every super (rolled or not) — record the
+    /// popcount>=9 set deterministically from committed state into super_elig_{N}, one WriteBatch.
+    /// Replaces the per-TX writer so producer and replicas (different apply paths) record an identical
+    /// set; called from both apply_block_to_state and the producer inline-apply path. Idempotent.
+    pub(crate) fn populate_super_elig_at_boundary(
+        state_guard: &StateManager,
+        storage: &crate::storage::Storage,
+        h: u64,
+    ) {
+        const EPOCH_BLOCKS: u64 = 14400;
+        if h == 0 || h % EPOCH_BLOCKS != 0 { return; }
+        let finalized_epoch = h / EPOCH_BLOCKS - 1;
+        let supers = match storage.super_registrations_sorted() { Ok(s) => s, Err(_) => return };
+        let mut eligible: Vec<String> = Vec::new();
+        // Resident supers: read the committed tally from RAM (authoritative). Evicted (inactive) ones:
+        // collect for ONE batched disk read below — avoids N sequential cold reads stalling the
+        // boundary block at scale. Same set + same values as a per-super warm_account loop.
+        let mut evicted: Vec<String> = Vec::new();
+        for (node_id, _wallet) in &supers {
+            match state_guard.accounts.get(node_id) {
+                Some(acct) => {
+                    if Self::account_heartbeat_count(acct.value(), finalized_epoch) >= 9 {
+                        eligible.push(node_id.clone());
+                    }
+                }
+                None => evicted.push(node_id.clone()),
+            }
+        }
+        if !evicted.is_empty() {
+            for (node_id, acct) in evicted.iter().zip(storage.load_accounts_batch(&evicted)) {
+                if let Some(a) = acct {
+                    if Self::account_heartbeat_count(&a, finalized_epoch) >= 9 {
+                        eligible.push(node_id.clone());
+                    }
+                }
+            }
+        }
+        match storage.save_super_eligible_batch(finalized_epoch, &eligible) {
+            Ok(()) => if is_info() { println!("[INFO][REWARDS] super_elig_snapshot epoch={} eligible={}", finalized_epoch, eligible.len()); },
+            Err(e) => if is_warn() { println!("[WARN][REWARDS] super_elig_snapshot_failed epoch={} err={}", finalized_epoch, e); },
+        }
+    }
+
+    /// Recompute + persist the per-epoch local reward root. Pure over storage (off state_root); the
+    /// caller runs it OFF the apply write-lock so the O(recipients) merkle build never stalls block
+    /// apply. The committee-certified root overwrites this at macroblock finalization if it differs.
+    pub(crate) fn persist_local_reward_root(
+        storage: &crate::storage::Storage, epoch: u64, total: u64, committed_root: &str, c_per: u64, c_cnt: u32,
+    ) {
+        let (wallet_vec, recomputed_root) = Self::compute_epoch_reward_distribution(storage, epoch, total);
+        if !recomputed_root.is_empty() {
+            let rtotal: u64 = wallet_vec.iter().map(|(_, a)| *a).sum();
+            let rcount = wallet_vec.len() as u32;
+            let rper = if rcount > 0 { rtotal / rcount as u64 } else { 0 };
+            let _ = storage.save_epoch_reward_root(epoch, &recomputed_root, rper, rcount, rtotal);
+            let _ = storage.append_reward_epoch(epoch);
+            if is_info() {
+                println!("[INFO][REWARDS] reward_root_applied epoch={} root={}.. count={} total={} QNC",
+                         epoch, &recomputed_root[..16.min(recomputed_root.len())], rcount, rtotal / 1_000_000_000);
+            }
+        } else if !committed_root.is_empty() {
+            // Bodies pruned ⇒ cannot recompute. Provisionally adopt the TX root so the epoch is
+            // indexed; finalization overwrites it with the certified root.
+            let _ = storage.save_epoch_reward_root(epoch, committed_root, c_per, c_cnt, total);
+            let _ = storage.append_reward_epoch(epoch);
+        }
+    }
+
+    /// v3 merkle-claim crediting (proof-verified). For each RewardDistribution-from-system_rewards_pool
+    /// TX carrying {claims:[{epoch,amount,proof}]}, verify each proof against the locally-stored epoch
+    /// reward root and credit via claim_reward (monotonic last_claimed_epoch watermark). SHARED by
+    /// apply_block_to_state and the producer inline-apply so a producer crediting claims in its OWN block
+    /// matches validators byte-for-byte (no state_root divergence). Entries sorted by epoch so the
+    /// monotonic watermark credits every one.
+    fn apply_merkle_claims(
+        state_guard: &StateManager,
+        storage: &crate::storage::Storage,
+        transactions: &[qnet_state::Transaction],
+        mut block_snapshot: Option<&mut qnet_state::BlockSnapshot>,
+    ) {
+        for tx in transactions {
+            if tx.tx_type != qnet_state::TransactionType::RewardDistribution
+               || tx.from != "system_rewards_pool" {
+                continue;
+            }
+            let to = match &tx.to { Some(w) => w, None => continue };
+            let data = match &tx.data { Some(d) => d, None => continue };
+            let parsed = match serde_json::from_str::<serde_json::Value>(data) { Ok(p) => p, Err(_) => continue };
+            let entries = match parsed.get("claims").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
+            let mut claims: Vec<(u64, u64, Vec<(String, bool)>)> = entries.iter().filter_map(|e| {
+                let epoch = e.get("epoch")?.as_u64()?;
+                let amount = e.get("amount")?.as_u64()?;
+                let proof: Vec<(String, bool)> = e.get("proof")?.as_array()?.iter().filter_map(|p| {
+                    let a = p.as_array()?;
+                    Some((a.get(0)?.as_str()?.to_string(), a.get(1)?.as_bool()?))
+                }).collect();
+                Some((epoch, amount, proof))
+            }).collect();
+            claims.sort_by_key(|(e, _, _)| *e);
+            if !claims.is_empty() {
+                if let Some(ref mut snap) = block_snapshot {
+                    snap.record_pre_images(&[to.clone()], &state_guard.accounts);
+                }
+            }
+            for (epoch, amount, proof) in &claims {
+                let root_hex = match storage.load_epoch_reward_root(*epoch) {
+                    Ok(Some((r, _, _, _))) => r,
+                    _ => continue,
+                };
+                let mut hasher = Sha3_256::new();
+                hasher.update(to.as_bytes());
+                hasher.update(&epoch.to_le_bytes());
+                hasher.update(&amount.to_le_bytes());
+                let leaf_hex = hex::encode(hasher.finalize());
+                if !qnet_core::crypto::merkle::verify_merkle_proof(&leaf_hex, &root_hex, proof) {
+                    eprintln!("[WARN][REWARDS] claim_proof_invalid wallet={}.. epoch={}", &to[..16.min(to.len())], epoch);
+                    continue;
+                }
+                if state_guard.claim_reward(to, *epoch, *amount) {
+                    if is_info() {
+                        println!("[INFO][REWARDS] claim_credited wallet={}.. epoch={} amount={} QNC",
+                                 &to[..16.min(to.len())], epoch, amount / 1_000_000_000);
+                    }
+                }
+            }
         }
     }
 
@@ -7963,13 +8164,63 @@ impl BlockchainNode {
                 }
             }
         }
-        
+
+        // Genesis vrf_pk uniformity (CRITICAL): each node persists ONLY its OWN genesis key to storage
+        // (peers are RAM-pinned by install_genesis_anchors_at_startup; the block-0 save is short-circuited
+        // by has_vrf_key). But verify_burn_attestation_quorum resolves an attestor's PK ONLY from storage
+        // (no RAM/anchor source, by design — registry eviction → fork, TOFV → forge). Without this seed,
+        // every node would skip a PEER genesis attestor's sig → a non-genesis (super OR light) burn-
+        // attested registration could never reach the 2f+1 quorum → onboarding is dead. Seed all pinned
+        // genesis pks (O(5), idempotent, pre-P2P) so vrf_pk_ is byte-identical on every node.
+        for (gid, pk_hex) in crate::genesis_constants::GENESIS_CONSENSUS_PKS {
+            if matches!(blockchain.storage.load_vrf_public_key(gid), Ok(None)) {
+                if let Err(e) = blockchain.storage.save_vrf_public_key(gid, pk_hex) {
+                    println!("[WARN][NODE] genesis_vrf_seed_fail id={} err={}", gid, e);
+                }
+            }
+        }
+
         // v4.1: Backfill wallet reverse index (migration for pre-v4.1 data)
         // Ensures O(1) verify-activation lookups work for nodes registered before reverse index existed
         match blockchain.storage.backfill_wallet_reverse_index() {
             Ok(count) if count > 0 => println!("[INFO][NODE] wallet_reverse_index_migrated entries={}", count),
             Ok(_) => {} // No migration needed
             Err(e) => println!("[WARN][NODE] wallet_index_backfill err={}", e),
+        }
+
+        // Reward-roster indices (srtr_/lrtr_) one-time migration for pre-index DBs. Marker-guarded so
+        // the O(N) scan runs once, not on every restart (millions of light nodes). Fresh genesis sets
+        // the marker on an empty registry; subsequent registrations index via the apply funnel.
+        // Snapshot fast-sync reconciles separately at restore time.
+        if !blockchain.storage.roster_index_built() {
+            match blockchain.storage.backfill_roster_indices() {
+                Ok(count) => {
+                    let _ = blockchain.storage.set_roster_index_built();
+                    if count > 0 { println!("[INFO][NODE] roster_index_migrated entries={}", count); }
+                }
+                Err(e) => println!("[WARN][NODE] roster_index_backfill err={}", e),
+            }
+        }
+
+        // Rebuild the committed burn→wallet index (cbw) from node_registry at boot: migrates a pre-cbw
+        // DB and self-heals a stale cbw left by a crash mid-reorg. Unconditional but super-scoped
+        // (srtr_ roster only, O(supers)) — trivial for a genesis launch; bounded by the local height.
+        {
+            let boot_h = blockchain.storage.get_chain_height().unwrap_or(0);
+            match blockchain.storage.rebuild_committed_burn_wallet(boot_h) {
+                Ok(n) if n > 0 => println!("[INFO][NODE] cbw_rebuilt_at_boot bindings={} up_to={}", n, boot_h),
+                Ok(_) => {}
+                Err(e) => println!("[WARN][NODE] cbw_rebuild_boot err={}", e),
+            }
+            // registry_root LtHash (metadata CF, not snapshot-carried): ONE scan recomputes the
+            // accumulator at the boot tip AND prunes any crash-mid-reorg orphans (reg_height > tip), so a
+            // restarted / snapshot-joined / crash-recovered node is byte-identical to a from-genesis node.
+            // No-op prune on a clean boot. Same derived-from-roster discipline as cbw.
+            match blockchain.storage.rebuild_registry_lthash(boot_h) {
+                Ok(n) if n > 0 => println!("[INFO][NODE] registry_lthash_rebuilt_at_boot orphans_pruned={} up_to={}", n, boot_h),
+                Ok(_) => {}
+                Err(e) => println!("[WARN][NODE] registry_lthash_rebuild_boot err={}", e),
+            }
         }
         
         // v4.3: Restore P2P light node registry from blockchain storage (RocksDB)
@@ -8605,15 +8856,25 @@ impl BlockchainNode {
                 }
             }
 
-            // Sync done — update flags
+            // Sync done — update flags. This loop can also exit on a 60s STALL below target, so gate
+            // the Synchronized transition on the QC-verified frontier: a node must NOT declare synced
+            // (and start producing/voting) below verified finality (the stale-low false-complete).
+            // frontier==0 (h<90) ⇒ genesis bootstrap proceeds. Below the frontier: stay syncing —
+            // sync_manager check_desync + the production-loop fast-sync keep driving and emit
+            // SyncComplete (frontier-floored via detect_network_height) once the frontier is reached.
             let stored_h = storage_for_sync_check.get_chain_height().unwrap_or(0);
             SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
             SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
-            NODE_IS_SYNCHRONIZED.store(true, Ordering::SeqCst);
-            coordinator_for_sync.try_send(crate::consensus_state::ConsensusEvent::SyncComplete {
-                height: stored_h,
-            });
-            if is_info() { println!("[INFO][SYNC] initial_sync_complete h={}", stored_h); }
+            let frontier = crate::node::qc_verified_frontier_height();
+            if frontier == 0 || stored_h >= frontier {
+                NODE_IS_SYNCHRONIZED.store(true, Ordering::SeqCst);
+                coordinator_for_sync.try_send(crate::consensus_state::ConsensusEvent::SyncComplete {
+                    height: stored_h,
+                });
+                if is_info() { println!("[INFO][SYNC] initial_sync_complete h={}", stored_h); }
+            } else if is_warn() {
+                println!("[WARN][SYNC] initial_sync_below_frontier h={} frontier={} action=continue", stored_h, frontier);
+            }
         });
         // ═══════════════════════════════════════════════════════════════════════════
         // NOTE: Legacy sync code (400+ lines) REMOVED — replaced by SyncManager.
@@ -8738,7 +8999,24 @@ impl BlockchainNode {
                                 &blockchain_for_sync.storage,
                                 network_height,
                             ).await;
-                            
+
+                            // cbw rebuild bounded by the new tip, BEFORE the barrier drops — orphaned
+                            // bindings (reg_height > network_height) drop out; no per-block delete ⇒ no
+                            // absence window. This path resyncs macroblocks only, so the rebuild is the
+                            // authoritative cbw reconciliation here.
+                            if let Err(e) = blockchain_for_sync.storage.rebuild_committed_burn_wallet(network_height) {
+                                println!("[WARN][ROLLBACK] cbw_rebuild_fail to={} err={}", network_height, e);
+                            }
+                            // registry_root LtHash recompute + orphan prune (reg_height > tip) + seal
+                            // cleanup at the new tip in ONE scan, BEFORE the barrier drops — so the
+                            // unbounded reward-roster readers match a from-genesis node and no stale seal
+                            // above the tip is served. Canonical target+1.. re-added by the live pipeline.
+                            match blockchain_for_sync.storage.rebuild_registry_lthash(network_height) {
+                                Ok(n) if n > 0 => println!("[INFO][ROLLBACK] registry_lthash_rebuilt orphans_pruned={} to={}", n, network_height),
+                                Err(e) => println!("[WARN][ROLLBACK] registry_lthash_rebuild_fail to={} err={}", network_height, e),
+                                _ => {}
+                            }
+
                             // End rollback protection
                             crate::storage::end_rollback_protection();
                             
@@ -11120,8 +11398,9 @@ impl BlockchainNode {
                             if let Some(ref p2p) = unified_p2p {
                                 // Get attestations for this epoch
                                 let epoch_start = current_epoch * EMISSION_BLOCK_INTERVAL;
-                                let epoch_end = (current_epoch + 1) * EMISSION_BLOCK_INTERVAL;
-                                let all_attestations = p2p.get_attestations_for_block_range(epoch_start, epoch_end);
+                                // Uncapped per-epoch attested set (union of received + gossiped pings);
+                                // not the 100k-capped attestation map, so the bitmap reflects all responders.
+                                let attested_light_ids = p2p.get_light_eligible_for_epoch(current_epoch);
 
                                 // Use ALL attestations for the epoch regardless of which genesis
                                 // node received the FCM response. The light node device sends its
@@ -11190,19 +11469,15 @@ impl BlockchainNode {
                                 // at this stage are later deduplicated by the bitmap set-bit logic).
                                 // Only nodes whose global index falls inside [my_start, my_end)
                                 // are counted — this is the shard ownership check.
-                                let eligible_indices: Vec<u32> = {
-                                    let mut seen = std::collections::HashSet::new();
-                                    all_attestations.iter()
-                                        .filter_map(|(light_node_id, _, _, _, _)| {
-                                            if !seen.insert(light_node_id.clone()) {
-                                                return None; // deduplicate same node attested multiple times
-                                            }
-                                            index_map.get(light_node_id)
-                                                .filter(|&&global_idx| global_idx >= my_start && global_idx < my_end)
-                                                .map(|&global_idx| global_idx - my_start)
-                                        })
-                                        .collect()
-                                };
+                                // Source set is already deduped (per-epoch node_id set); map each to its
+                                // shard-local index, keeping only those owned by this genesis shard.
+                                let eligible_indices: Vec<u32> = attested_light_ids.iter()
+                                    .filter_map(|light_node_id| {
+                                        index_map.get(light_node_id)
+                                            .filter(|&&global_idx| global_idx >= my_start && global_idx < my_end)
+                                            .map(|&global_idx| global_idx - my_start)
+                                    })
+                                    .collect();
 
                                 if is_info() {
                                     println!("[INFO][LIGHT-BITMAP] Genesis {} shard [{},{}) → {} eligible / {} assigned Light nodes",
@@ -12850,7 +13125,12 @@ impl BlockchainNode {
                         // 50 blocks (not 20): avoid flapping from normal propagation jitter.
                         let desync_net_h = if let Some(ref p2p) = unified_p2p {
                             let live_h = p2p.get_max_peer_height();
-                            if live_h > reg_our_h { live_h } else { 0 }
+                            // Cap the desync chase on the QC frontier (cached, O(1)); the fast-sync path
+                            // re-probes the frontier and drives the remainder. frontier==0 ⇒ unchanged.
+                            let frontier = crate::node::qc_verified_frontier_cached();
+                            let target = if frontier == 0 { live_h }
+                                else { std::cmp::max(frontier, std::cmp::min(live_h, frontier.saturating_add(180))) };
+                            if target > reg_our_h { target } else { 0 }
                         } else { 0 };
                         if coordinator_is_synchronized() && desync_net_h > 0 && reg_our_h + 50 < desync_net_h {
                             NODE_IS_SYNCHRONIZED.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -13605,6 +13885,23 @@ impl BlockchainNode {
                                             rollback_to, std::sync::atomic::Ordering::Release
                                         );
 
+                                        // cbw is validation-critical: rebuild it from node_registry bounded by the
+                                        // rollback target so orphaned-block bindings (reg_height > rollback_to) drop
+                                        // out, BEFORE the rollback barrier is released. No per-block delete ⇒ no
+                                        // absence window; the canonical binding (reg_height ≤ target) survives.
+                                        if let Err(e) = storage.rebuild_committed_burn_wallet(rollback_to) {
+                                            if is_warn() { println!("[WARN][FORK] cbw_rebuild_fail to={} err={}", rollback_to, e); }
+                                        }
+                                        // registry_root LtHash recompute + orphan prune (reg_height >
+                                        // target) + seal cleanup at the rollback target in ONE scan,
+                                        // BEFORE the barrier is released — unbounded reward rosters match a
+                                        // from-genesis node; canonical re-added by the live pipeline.
+                                        match storage.rebuild_registry_lthash(rollback_to) {
+                                            Ok(n) if n > 0 => { if is_info() { println!("[INFO][FORK] registry_lthash_rebuilt orphans_pruned={} to={}", n, rollback_to); } }
+                                            Err(e) => { if is_warn() { println!("[WARN][FORK] registry_lthash_rebuild_fail to={} err={}", rollback_to, e); } }
+                                            _ => {}
+                                        }
+
                                         crate::storage::end_rollback_protection();
 
                                         // Clear stale caches
@@ -13667,16 +13964,18 @@ impl BlockchainNode {
                             if let Some(p2p) = &unified_p2p {
                                 // v2.44: Use Byzantine median from peer heights (QUIC HealthPing data)
                                 // This is MORE reliable than single cached value
-                                let network_height = match p2p.sync_blockchain_height().await {
-                                        Ok(h) => {
-                                            if crate::node::is_info() { println!("[INFO][SYNC] median_height={}", h); }
-                                            h
-                                        },
+                                let hint = match p2p.sync_blockchain_height().await {
+                                        Ok(h) => h,
                                         Err(e) => {
-                                            if crate::node::is_warn() { println!("[WARN][SYNC] median_failed err={}", e); }
+                                            if crate::node::is_warn() { println!("[WARN][SYNC] height_hint_failed err={}", e); }
                                             p2p.get_cached_network_height().unwrap_or(0)
                                         }
                                     };
+                                    // Floor the Syncing target on QC-verified finality (frontier==0 ⇒ hint, genesis-safe).
+                                    let frontier = qc_verified_frontier_height();
+                                    let network_height = if frontier == 0 { hint }
+                                        else { std::cmp::max(frontier, std::cmp::min(hint, frontier.saturating_add(180))) };
+                                    if crate::node::is_info() { println!("[INFO][SYNC] sync_target={} frontier={} hint={}", network_height, frontier, hint); }
                                     let height_gap = network_height.saturating_sub(microblock_height);
                                     
                                     // ═══════════════════════════════════════════════════════════════════
@@ -13789,9 +14088,17 @@ impl BlockchainNode {
                         p2p.get_cached_network_height().unwrap_or(microblock_height)
                     };
 
-                    // Entry target = attested/quorum cached height only (P0b: no BEST_PEER_HEIGHT
-                    // override). cached_height floors at local height, so this stays >= local.
-                    let network_height = cached_height;
+                    // Bulk target = QC-verified finality frontier (unforgeable, never a peer median).
+                    // The cached peer height is demoted to a hint that may only add the ≤2-macroblock
+                    // unsealed tail above the frontier: a stale-low hint can't undershoot finality, an
+                    // over-reported one can't overshoot it. frontier==0 (h<90) ⇒ fall back to the hint
+                    // so the genesis bootstrap (0..89, no macroblock yet) is never blocked.
+                    let frontier = qc_verified_frontier_height();
+                    let network_height = if frontier == 0 {
+                        cached_height
+                    } else {
+                        std::cmp::max(frontier, std::cmp::min(cached_height, frontier.saturating_add(180)))
+                    };
 
                     if network_height > microblock_height {
                         let height_difference = network_height.saturating_sub(microblock_height);
@@ -15235,7 +15542,11 @@ impl BlockchainNode {
                         true // No P2P yet — trust local
                     };
 
-                    let is_synchronized = local_ok && network_ok;
+                    // QC floor: never declare synced below the verified finality frontier even if peers
+                    // under-report (the stale-low-median false-complete). frontier==0 ⇒ genesis pre-mb.
+                    let frontier = crate::node::qc_verified_frontier_cached();
+                    let qc_ok = frontier == 0 || current_stored_height >= frontier;
+                    let is_synchronized = local_ok && network_ok && qc_ok;
                     NODE_IS_SYNCHRONIZED.store(is_synchronized, Ordering::SeqCst);
                 }
                 
@@ -15617,9 +15928,6 @@ impl BlockchainNode {
                                 let reward_count = wallet_vec.len() as u32;
                                 let reward_per_node = if reward_count > 0 { reward_total / reward_count as u64 } else { 0 };
                                 if reward_count > 0 {
-                                    if let Err(e) = storage.save_epoch_reward_wallets(reward_epoch, &wallet_vec) {
-                                        eprintln!("[WARN][EMISSION] reward_wallets_save_fail epoch={} err={}", reward_epoch, e);
-                                    }
                                     if let Err(e) = storage.save_epoch_reward_root(reward_epoch, &reward_root_hex, reward_per_node, reward_count, reward_total) {
                                         eprintln!("[WARN][EMISSION] reward_root_save_fail epoch={} err={}", reward_epoch, e);
                                     }
@@ -16158,7 +16466,52 @@ impl BlockchainNode {
                     );
                     txs.extend(system_txs);
                     txs.extend(processed_user_txs);
-                    
+
+                    // Producer re-validation (D): a NodeRegistration admitted to the mempool earlier
+                    // (against the chain tip THEN) may be invalid at THIS block's height — its burn now
+                    // bound to a different wallet, the committee rotated, or another reg in this same
+                    // block reuses the burn. Re-run the EXACT validator check (verify_burn_attestation_
+                    // quorum) at next_block_height + a same-block burn dedup, and DROP any conflict so the
+                    // producer never emits a block peers reject at the burn-uniqueness gate (wasted slot)
+                    // and never inline-binds cbw for a registration the network won't accept.
+                    {
+                        let mut kept: Vec<qnet_state::Transaction> = Vec::with_capacity(txs.len());
+                        let mut seen_burns: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        for tx in txs.into_iter() {
+                            if let qnet_state::TransactionType::NodeRegistration { burn_tx, .. } = &tx.tx_type {
+                                if !burn_tx.is_empty() && !seen_burns.insert(burn_tx.clone()) {
+                                    if is_warn() { println!("[WARN][MB] drop_dup_burn_reg h={}", next_block_height); }
+                                    continue;
+                                }
+                                if Self::verify_burn_attestation_quorum(&tx, next_block_height, &*storage).await.is_err() {
+                                    if is_warn() { println!("[WARN][MB] drop_invalid_burn_reg h={}", next_block_height); }
+                                    continue;
+                                }
+                            }
+                            kept.push(tx);
+                        }
+                        txs = kept;
+                    }
+
+                    // Producer pre-filter (C): drop any NodeActivation whose wallet lacks a burn-attested
+                    // registration — committed in a PRIOR block OR a (kept) NodeRegistration in THIS block
+                    // — the EXACT rule validators enforce at verify (block_pipeline). Without it the
+                    // producer would emit a block every peer rejects at the activation-burn gate (wasted
+                    // slot → liveness loss under an unbacked-activation spam). Same activation-height gate.
+                    if qnet_state::feature_gates::is_active("burn_attestation_required", next_block_height) {
+                        let this_block_burned: std::collections::HashSet<String> = txs.iter().filter_map(|t| match &t.tx_type {
+                            qnet_state::TransactionType::NodeRegistration { wallet_address, burn_tx, .. } if !burn_tx.is_empty() => Some(wallet_address.clone()),
+                            _ => None,
+                        }).collect();
+                        txs.retain(|t| {
+                            if matches!(t.tx_type, qnet_state::TransactionType::NodeActivation { .. }) {
+                                let backed = this_block_burned.contains(&t.from) || storage.wallet_is_burn_registered(&t.from);
+                                if !backed && is_warn() { println!("[WARN][MB] drop_unbacked_activation h={}", next_block_height); }
+                                backed
+                            } else { true }
+                        });
+                    }
+
                     // PRE-EXECUTION: Update leader schedule and pre-execute if we're a future leader
                     {
                         // Get current producer list for rotation schedule
@@ -16585,15 +16938,26 @@ impl BlockchainNode {
                     // MUST happen BEFORE signing so signature covers state_root!
                     // Order: apply_tx → credit_fees → finalize_merkle → get state_root
                     // ═══════════════════════════════════════════════════════════════════════════
+                    // Track registrations whose state-apply SUCCEEDED so the producer records
+                    // node_/reg_height/burn/cbw ONLY for those — mirroring the validator, whose
+                    // deferred_registrations are built only on apply Ok. Without this a re-registration
+                    // that fails apply on EVERY node would still be written by the producer ALONE, so its
+                    // node_registry / cbw / registry_root diverge from the network.
+                    let mut applied_reg_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
                     {
                         let state_guard = state.write().await;
-                        
+
                         // 1. Apply all transactions
                         // v7.0: Also collect reward accruals from emission TXs for state application
                         let mut producer_reward_accruals: Vec<(String, u64)> = Vec::new();
                         for tx in &txs {
+                            // Index Light eligibility bitmaps via the SHARED helper (byte-identical to
+                            // the validator apply path) so the producer of a bitmap block stamps its own
+                            // shard → no reward_root divergence at the emission boundary.
+                            Self::index_light_eligibility_bitmap(&storage, next_block_height, tx);
+
                             // v3.33: Handle CLAIM transactions on producer side
-                            if tx.tx_type == qnet_state::TransactionType::RewardDistribution 
+                            if tx.tx_type == qnet_state::TransactionType::RewardDistribution
                                && tx.from == "system_rewards_pool" {
                                 if let Some(ref data) = tx.data {
                                     let parts: Vec<&str> = data.split(':').collect();
@@ -16641,9 +17005,24 @@ impl BlockchainNode {
                                 }
                             } else {
                                 let _ = state_guard.apply_gas_refund(tx, next_block_height);
+                                // Track BOTH NodeRegistration AND NodeActivation: the producer materialises
+                                // the SAME registry rows the validator's deferred_registrations does (incl.
+                                // the super-activation pseudonym), so it must know which of each applied Ok.
+                                if matches!(tx.tx_type,
+                                    qnet_state::TransactionType::NodeRegistration { .. }
+                                    | qnet_state::TransactionType::NodeActivation { .. }) {
+                                    applied_reg_hashes.insert(tx.hash.clone());
+                                }
                             }
                         }
-                        
+
+                        // Epoch-boundary super reward-eligibility snapshot (same fn as the apply path).
+                        Self::populate_super_elig_at_boundary(&state_guard, &*storage, next_block_height);
+
+                        // v3 merkle-claim credit (same fn as the apply path) BEFORE state_root so a
+                        // producer crediting claims in its OWN block matches validators (no state_root split).
+                        Self::apply_merkle_claims(&state_guard, &*storage, &txs, None);
+
                         // v7.0: Apply reward accruals BEFORE finalize_merkle
                         let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
                         for (wallet, delta) in &producer_reward_accruals {
@@ -16701,7 +17080,72 @@ impl BlockchainNode {
                                      next_block_height, hex::encode(&computed_state_root[..8]));
                         }
                     }
-                    
+
+                    // Producer applies its own block INLINE (bypassing apply_block_to_state's
+                    // deferred_registrations), so it must stamp reg_height + the backing burn for its
+                    // OWN block's registrations exactly as a peer-applying validator does — otherwise
+                    // the producer's node_ entry has no reg_height and rebuild_committed_burn_wallet /
+                    // the reward roster drop it, diverging from synced peers. Mirror of the peer-apply
+                    // deferred consumer (block_pipeline.rs).
+                    for tx in &txs {
+                        // Only TXs whose state-apply SUCCEEDED (same gate the validator's deferred path uses).
+                        if !applied_reg_hashes.contains(&tx.hash) { continue; }
+                        match &tx.tx_type {
+                            qnet_state::TransactionType::NodeRegistration {
+                                node_id: rid, node_type: rtype, wallet_address: rwallet, burn_tx: rburn, ..
+                            } => {
+                                let rtype_str = match rtype {
+                                    qnet_state::NodeType::Super => "super",
+                                    qnet_state::NodeType::Light => "light",
+                                };
+                                let _ = storage.save_node_registration_at_height_burn(
+                                    rid, rtype_str, rwallet, 1.0, next_block_height, rburn);
+                                // Incremental cbw binding for the producer's own block (before save below),
+                                // mirroring peer-apply. Scope = any non-empty burn (super + LIGHT), MATCHING
+                                // rebuild_committed_burn_wallet (srtr_+lrtr_). Empty-burn regs auto-skip.
+                                if !rburn.is_empty() {
+                                    let _ = storage.committed_burn_wallet_put(rburn, rwallet);
+                                }
+                            }
+                            qnet_state::TransactionType::NodeActivation { node_type: ntype, phase, .. } => {
+                                // Mirror apply_block_to_state EXACTLY, including its FIRST-MATCH-WINS arm
+                                // order: there a Phase2 NodeActivation is consumed by the pool3 arm
+                                // (node.rs ~3333) and NEVER reaches the registry-stamping arm (~3360), so a
+                                // Phase2 activation stamps NO registry rows. The producer MUST skip Phase2
+                                // too — else it writes srtr_/lt_state rows the validator never writes →
+                                // registry_root + reward-roster diverge → content_ok never 2f+1 → halt.
+                                // Phase1/other → stamp activation_<hash16> (both types) + super_node_
+                                // pseudonym, byte-identical to the validator. burn empty ⇒ no cbw bind.
+                                if matches!(phase, qnet_state::account::ActivationPhase::Phase2) { continue; }
+                                let ntype_str = match ntype {
+                                    qnet_state::account::NodeType::Super => "super",
+                                    qnet_state::account::NodeType::Light => "light",
+                                };
+                                let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
+                                let _ = storage.save_node_registration_at_height_burn(
+                                    &activation_id, ntype_str, &tx.from, 1.0, next_block_height, "");
+                                if matches!(ntype, qnet_state::account::NodeType::Super) {
+                                    let pseudonym = crate::rpc::generate_super_node_pseudonym(&tx.from);
+                                    crate::unified_p2p::add_registered_super_node(pseudonym.clone());
+                                    let _ = storage.save_node_registration_at_height_burn(
+                                        &pseudonym, "super", &tx.from, 1.0, next_block_height, "");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // registry_root seal (LtHash): at a checkpoint head, capture sha3(lt_state) for THIS
+                    // block's roster AFTER all of its registrations updated lt_state (loop above) and
+                    // BEFORE save below — so the WindowEnd checkpoint compute (gated on the head being
+                    // loadable, which happens at save) always reads a present, complete seal. Mirror of
+                    // the validator path (block_pipeline). Fires once per checkpoint head, incl. zero-
+                    // registration heads. The producer's later cache re-write (cache_node_registrations,
+                    // reg_height None) does NOT touch lt_state, so this is the block's final accumulator.
+                    if next_block_height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
+                        let _ = storage.seal_registry_root(next_block_height);
+                    }
+
                     // QUANTUM VTS: Mix microblock into VTS chain for cryptographic time proof
                     if let Some(ref poh) = poh {
                         let block_data = bincode::serialize(&microblock).unwrap_or_default();
@@ -17643,9 +18087,13 @@ impl BlockchainNode {
                                 };
                                 
                                 if let Some(network_height) = network_height {
+                                // Cap the bg-sync target on the QC-verified frontier (frontier==0 ⇒ unchanged, genesis-safe).
+                                let frontier = qc_verified_frontier_height();
+                                let network_height = if frontier == 0 { network_height }
+                                    else { std::cmp::max(frontier, std::cmp::min(network_height, frontier.saturating_add(180))) };
                                 if network_height > current_height {
                                     let height_difference = network_height.saturating_sub(current_height);
-                                    
+
                                     // CRITICAL FIX v2.21.3: Detect significant lag and use FAST_SYNC mode
                                     // Previous bug: FAST_SYNC only triggered in producer loop
                                     // Non-producers could fall behind without triggering fast recovery
@@ -20414,28 +20862,52 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // the first event so a restart does not re-emit historical windows. Dormant (never
             // advanced) when CHECKPOINT_INTERVAL == 90, since no boundary is intra-window then.
             let mut last_intra_signalled: u64 = 0;
+            // Finality-lag self-heal pacemaker. The checkpoint signal is event-driven (reactive,
+            // O(1)/node, idle-free) — but the macro-boundary checkpoint is a one-shot on its block
+            // event; if that build defers it is never retried, so finality (and production, via the
+            // gate) wedges. This tick re-drives the unfinalized macro boundary even with no new
+            // block. Period = the BFT view timeout.
+            let mut lag_timer = tokio::time::interval(
+                std::time::Duration::from_millis(qnet_consensus::checkpoint_bft::VIEW_TIMEOUT_MS));
+            lag_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                // EVENT-BASED OPTIMIZATION: Wait for block events instead of polling
-                // This replaces the 1-second polling loop with reactive events
-                // 
-                // Benefits:
-                // - No CPU usage when no blocks are being produced
-                // - Instant reaction to new blocks (no 1-second delay)
-                // - Scales to millions of nodes (O(1) per node, not O(N) polling)
-                // - With 100K Super nodes: 0μs CPU (vs 100μs polling) when idle
-                
-                let current_height = match block_event_rx.recv().await {
-                    Ok(height) => height,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        // Channel full, some events were dropped - this is OK
-                        // Just means we missed some intermediate heights
-                        println!("[WARN][MB] consensus_lagged skipped={}", skipped);
-                        continue; // Wait for next event
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // Channel closed - node is shutting down
-                        println!("[WARN][MB] consensus_channel_closed action=stop");
-                        break;
+                let current_height = tokio::select! {
+                    ev = block_event_rx.recv() => match ev {
+                        Ok(height) => height,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            println!("[WARN][MB] consensus_lagged skipped={}", skipped);
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            println!("[WARN][MB] consensus_channel_closed action=stop");
+                            break;
+                        }
+                    },
+                    _ = lag_timer.tick() => {
+                        // Re-drive the driver's FRONTIER checkpoint (intra OR macro) when finality
+                        // lags the tip beyond the normal 2-chain trail. A checkpoint build is a
+                        // one-shot on its block event; if it deferred once it is never retried, and
+                        // with production gated no new event ever arrives — so the driver waits
+                        // forever for content. Frontier = committed+2 windows (2-chain: highest QC =
+                        // committed+1, next-to-propose = QC+1), i.e. (fin/K + 2). At K<MACROBLOCK that
+                        // frontier is usually an INTRA boundary, so targeting only the macro boundary
+                        // leaves the intra one-shot open. Re-signal is idempotent (driver dedup).
+                        let fin = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
+                        let tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                        let macro_i = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                        let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+                        let b = (fin / k + 2) * k; // frontier window head height
+                        if tip.saturating_sub(fin) > 2 * k && b <= tip {
+                            // Intra frontier: re-arm the cursor so the intra path re-attempts exactly b.
+                            if b % macro_i != 0 { last_intra_signalled = b.saturating_sub(k); }
+                            if is_warn() {
+                                println!("[WARN][MB] finality_lag_redrive fin={} tip={} boundary={} kind={}",
+                                         fin, tip, b, if b % macro_i == 0 { "macro" } else { "intra" });
+                            }
+                            b
+                        } else {
+                            continue;
+                        }
                     }
                 };
                 // v35: trigger the macroblock consensus ONLY on the COMPLETE window (the
@@ -20525,8 +20997,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         let beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&v_vec);
                                         // Empty eligible/banned: an intra-window checkpoint publishes NO epoch
                                         // transition (only the macroblock-boundary checkpoint does).
+                                        // registry_root as of this intra head — deterministic, enforced (gated)
+                                        // by content_ok like every checkpoint; the field is in the QC hash regardless.
+                                        let registry_root = storage_cp.compute_registry_root(b);
                                         crate::consensus_v2_node::signal_window_end(
                                             cp_index, b, h_vec, state_root, beacon, committee, Vec::new(), Vec::new(), [0u8; 32],
+                                            registry_root,
                                         );
                                         if crate::node::is_info() {
                                             println!("[INFO][BFT2] intra_checkpoint_signalled cp_index={} head={} k={}", cp_index, b, k);
@@ -20566,24 +21042,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         // Check if node is synchronized before participating
                         let is_synchronized = coordinator_is_synchronized();
 
-                        // v15.15: genesis-epoch bootstrap exception to "skip consensus while
-                        // SYNCING". On a fresh 5-genesis cold-start every node lags the network
-                        // median for the first seconds → all would refuse MB1 → empty sub-quorum
-                        // macroblock → 2f+1 rejects → deadlock. Exception: a SYNCING node MAY
-                        // join macroblock consensus iff (1) genesis-epoch MB (mb_idx<=2: baked
-                        // committee + genesis-seed beacon, no prior-MB dep), (2) local height
-                        // reached this MB's end boundary, (3) commit/reveal computable from local
-                        // genesis-derived state. Safety: commit/reveal Dilithium-sig-bound
-                        // (verified regardless of sender sync); receiver 2f+1 uses the baked
-                        // genesis committee_size; HARD-gated mb_idx<=2. Fires <=2x per cold start.
+                        // A SYNCING node may still join THIS (unfinalized) window's checkpoint iff it
+                        // already holds the full window (local_h >= mb_end_height): it can build+sign
+                        // correctly, receivers' content_ok rejects any divergent vote, and the extra
+                        // committee participant only helps reach quorum — this is what lets a
+                        // macro-boundary finality-lag redrive seal on a node whose phase briefly
+                        // flipped to Syncing. Subsumes the old genesis mb<=2 carve-out. Without the
+                        // window we defer to §4.5 macroblock sync below.
                         let local_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                             .load(std::sync::atomic::Ordering::Relaxed);
                         let mb_end_height = macroblock_index * 90;
-                        let bootstrap_eligible = !is_synchronized
-                            && macroblock_index <= 2
-                            && local_h >= mb_end_height;
 
-                        if !is_synchronized && !bootstrap_eligible {
+                        if !checkpoint_participation_allowed(is_synchronized, local_h, mb_end_height) {
                             if is_warn() {
                                 println!(
                                     "[WARN][MB] consensus_skip_unsynced mb={} local_h={} reason=not_synchronized_outside_bootstrap_window",
@@ -20668,13 +21138,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             continue;
                         }
 
-                        // v15.15: Log when bootstrap exception is exercised so
-                        // operators can see participation under the genesis-epoch
-                        // SYNCING relaxation. This log fires AT MOST twice per
-                        // network lifetime (mb=1 and mb=2 on cold-start).
-                        if bootstrap_eligible && is_info() {
+                        // Operator visibility: a syncing node participated because it holds the full
+                        // window (covers genesis cold-start and finality-lag redrive of an old window).
+                        if !is_synchronized && local_h >= mb_end_height && is_info() {
                             println!(
-                                "[INFO][MB] bootstrap_consensus_participation mb={} local_h={} mb_end={} synced=false reason=genesis_epoch_at_boundary",
+                                "[INFO][MB] consensus_participate_while_syncing mb={} local_h={} mb_end={} reason=holds_full_window",
                                 macroblock_index, local_h, mb_end_height
                             );
                         }
@@ -20786,6 +21254,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 let mb_idx = macroblock_index;
 
                                 tokio::spawn(async move {
+                                    // Frees the active-consensus lock if this task defers without
+                                    // signalling, so the window is re-attempted; disarmed on signal.
+                                    let mut active_guard = ActiveConsensusGuard { mb_idx, signalled: false };
                                     let role = if should_initiate { "PROPOSER" } else { "REPLICA" };
                                     if is_info() {
                                         println!("[INFO][ASYNC-CONS] mb={} role={} start_h={} end_h={} async=true",
@@ -20950,9 +21421,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // Self-aligning emission reward root for this window (committee-verified
                                         // via Checkpoint.reward_root; [0;32] off an emission boundary).
                                         let reward_root = Self::compute_window_reward_root(&storage_cons, start_height, end_height);
+                                        // Deterministic Super/genesis registry digest as of the window head — QC-certified
+                                        // via Checkpoint.registry_root so an untrusted-snapshot joiner can verify the
+                                        // restored node_registry (source of cbw + attestor VRF keys). reg_height<=end_height.
+                                        let registry_root = storage_cons.compute_registry_root(end_height);
+                                        active_guard.signalled = true; // content delivered → keep the lock held
                                         crate::consensus_v2_node::signal_window_end(
                                             end_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL,
                                             end_height, mb_hashes, state_root, beacon, committee, eligible_bytes, banned_for_epoch, reward_root,
+                                            registry_root,
                                         );
                                         return;
                                     }
@@ -21183,11 +21660,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         let mb_index = round_id / 90;
 
-        // Next round = current certified + 1. Using certified (not locally
-        // proposed) as the base keeps all nodes convergent — every honest
-        // validator starts from the same consensus-visible value.
+        // Base = certified+1 (consensus-visible, identical on every node). f+1 amplification:
+        // also jump to the highest round ≥1 honest validator already reached, so a node lagging
+        // by the certified-round offset reconverges instead of voting certified+1 forever. The cap
+        // is the failover-round ceiling enforced by the caller; leader election still reads only the
+        // n-f-certified round, so amplifying the TARGET cannot cause dual production.
         let current_cert = p2p.get_highest_certified_round(mb_index);
-        let next_round = current_cert.saturating_add(1);
+        let n = p2p.get_active_validator_count();
+        let f = if n > 0 { (n - 1) / 3 } else { 0 };
+        let observed = crate::unified_p2p::highest_failover_round_with_support(mb_index, f + 1);
+        let next_round = current_cert.saturating_add(1).max(observed);
 
         // Anchor the vote to the latest macroblock hash for cryptographic
         // binding. Falls back to zeros at genesis before any macroblock exists.
@@ -23007,7 +23489,203 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             Err(e) => Err(QNetError::ValidationError(format!("Runtime error: {}", e))),
         }
     }
-    
+
+    /// Phase-1 proof-of-burn consensus gate. The external Solana 1DEV burn is non-deterministic
+    /// (live RPC) and cannot be re-checked in apply, so a Byzantine producer could otherwise inject
+    /// a NodeRegistration with a fabricated burn that every honest node applies — minting a free
+    /// reward/producer-eligible node. This gate brings the burn fact ON-CHAIN as a genesis quorum:
+    /// a non-genesis NodeRegistration is valid only if it carries ≥2f+1 distinct valid genesis
+    /// Dilithium signatures over the canonical burn message. Returns Ok(()) when the rule is INACTIVE
+    /// at `height`, the registration is a genesis identity (exempt), or the quorum verifies.
+    ///
+    /// DETERMINISM: a pure function of the TX bytes + the binary-pinned GENESIS_CONSENSUS_PKS
+    /// (installed at startup on every node) — NO live RPC, NO node-local state — so the verdict is
+    /// byte-identical on every validator regardless of sync mode. Enforced at block validation (the
+    /// signature-check tier; apply trusts validated blocks); one-burn-one-node is enforced upstream
+    /// by honest-genesis refusal to double-attest (≤f Byzantine cannot reach the 2f+1 quorum).
+    pub(crate) async fn verify_burn_attestation_quorum(
+        tx: &qnet_state::Transaction,
+        height: u64,
+        storage: &crate::storage::Storage,
+    ) -> Result<(), QNetError> {
+        let (node_id, node_type, wallet, reg_proof, burn_tx, burn_amount, attestors) = match &tx.tx_type {
+            qnet_state::TransactionType::NodeRegistration {
+                node_id, node_type, wallet_address, registration_proof, burn_tx, burn_amount, burn_attestors, ..
+            } => (node_id.as_str(), node_type, wallet_address.as_str(), registration_proof.as_str(),
+                  burn_tx.as_str(), *burn_amount, burn_attestors),
+            _ => return Ok(()), // only NodeRegistration is gated
+        };
+
+        // Inert below the coordinated activation height (Phase-1 era gate).
+        if !qnet_state::feature_gates::is_active("burn_attestation_required", height) {
+            return Ok(());
+        }
+        // Genesis identities are protocol-minted (anchored by GENESIS_CONSENSUS_PKS), not burn-backed —
+        // but the exemption MUST bind to a real genesis node_id, else any reg sets reg_proof="genesis".
+        if reg_proof == "genesis" {
+            if crate::genesis_constants::is_legacy_genesis_node(node_id) {
+                return Ok(());
+            }
+            return Err(QNetError::ValidationError(
+                "burn_attestation_required: genesis reg_proof from non-genesis node_id".to_string()));
+        }
+        // A burn-backed registration MUST reference its burn; an empty burn_tx is the dodge to reject.
+        if burn_tx.is_empty() {
+            return Err(QNetError::ValidationError(
+                "burn_attestation_required: NodeRegistration missing burn_tx".to_string()));
+        }
+        // On-chain burn→wallet uniqueness: a burn already committed-bound to a DIFFERENT wallet in an
+        // earlier block cannot back a second node (Sybil amplification under a rotating committee).
+        // Deterministic read of committed state ≤ H; same-block reuse is caught by the block-level
+        // burn_tx dedup in the pipeline. First-wins binding is written at registration apply.
+        if let Ok(Some(bound)) = storage.committed_burn_wallet_get(burn_tx) {
+            if bound != wallet {
+                return Err(QNetError::ValidationError(
+                    "burn_attestation_required: burn_tx already bound to a different wallet".to_string()));
+            }
+        }
+
+        // Recompute the exact message the committee signed; count DISTINCT valid committee sigs.
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, wallet, burn_amount, node_type);
+
+        // Attestor set = the deterministic consensus committee for THIS registration's epoch.
+        // Post-genesis: the N-2 VRF committee (committee_for_height). Genesis era (no N-2 snapshot
+        // yet): the genesis nodes — the ONLY consensus participants then, so the committee simply IS
+        // the genesis set. Threshold = quorum_size (n−f), the same quorum consensus uses. PK comes
+        // from on-chain state, NOT the RAM registry (deterministic + forge-proof; see bound verify).
+        // Genesis era (epochs 1-2, no N-2 snapshot) ⇒ the committee IS the genesis set — decided by
+        // HEIGHT (deterministic on every node). CRITICAL: a POST-genesis None means THIS node is
+        // BEHIND (can't read N-2), NOT that the committee is genesis. Falling back to the genesis set
+        // there would let a lagging node validate against 5 genesis while synced nodes use the real
+        // committee → block-validity divergence (FORK). So post-genesis-without-committee ⇒ REJECT:
+        // the node resyncs and re-validates once N-2 is present (it stalls, never forks).
+        let genesis_era = (height.saturating_sub(1) / 90 + 1).saturating_sub(2) == 0;
+        let committee: Option<std::collections::HashSet<String>> =
+            Self::committee_for_height(storage, height).map(|v| v.into_iter().collect());
+        if committee.is_none() && !genesis_era {
+            return Err(QNetError::ValidationError(
+                "burn_attestation_required: N-2 committee unavailable (node behind chain; resync)".to_string()));
+        }
+        let committee_size = match &committee {
+            Some(c) => c.len(),
+            None => crate::genesis_constants::genesis_node_count(), // None here ⇒ genesis era only
+        };
+        let threshold = qnet_consensus::checkpoint_bft::quorum_size(committee_size);
+
+        let mut valid: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (attestor_id, sig) in attestors {
+            if valid.contains(attestor_id) { continue; } // distinct only
+            let is_member = match &committee {
+                Some(c) => c.contains(attestor_id),
+                None => crate::genesis_constants::is_legacy_genesis_node(attestor_id),
+            };
+            if !is_member { continue; } // committee members only
+            // On-chain PK (deterministic) + bound verify — never the RAM registry (eviction → fork,
+            // Tier-3 TOFV → forge). A non-registered attestor (no on-chain PK) cannot count. Genesis
+            // attestors fall back to the binary-pinned anchor (deterministic + process-uniform on every
+            // node) — belt-and-suspenders for the storage seed, never a forgeable RAM source.
+            let pk = match storage.load_vrf_public_key(attestor_id) {
+                Ok(Some(p)) => p,
+                _ => match crate::genesis_constants::get_genesis_anchor_pk(attestor_id) {
+                    Some(p) => p,
+                    None => continue,
+                },
+            };
+            if qnet_consensus::consensus_crypto::verify_consensus_signature_bound(
+                attestor_id, &msg, sig, &pk).await
+            {
+                valid.insert(attestor_id.clone());
+            }
+        }
+        if valid.len() >= threshold {
+            Ok(())
+        } else {
+            Err(QNetError::ValidationError(format!(
+                "burn_attestation_required: {}/{} distinct committee attestations", valid.len(), threshold)))
+        }
+    }
+
+    /// True iff THIS node may sign burn attestations = it is in the current consensus committee.
+    /// Genesis era (no N-2 snapshot yet): the committee IS the genesis set. Was genesis-only;
+    /// now committee-wide so attestation decentralises with the network instead of forever resting
+    /// on the 5 genesis (the SPOF). Membership for the local tip's epoch (signer side).
+    pub fn is_genesis_attestor(&self) -> bool {
+        let h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        match Self::committee_for_height(&self.storage, h) {
+            Some(c) => c.iter().any(|id| id == &self.node_id),
+            None => crate::genesis_constants::is_legacy_genesis_node(&self.node_id),
+        }
+    }
+
+    /// Genesis-side burn attestation (PRODUCTION half of the burn-oracle). The CALLER must have
+    /// already verified the external Solana 1DEV burn (verify_burn_transaction_exists). Signs the
+    /// canonical burn message with this genesis's consensus key and returns (genesis_id, sig). One
+    /// burn_tx is bound to ONE qnet wallet (per-genesis off-chain dedup): an honest genesis refuses
+    /// to attest a reused burn for a second node, so with ≤f Byzantine genesis a reused burn can
+    /// never reach the on-chain 2f+1 quorum verified by verify_burn_attestation_quorum.
+    pub fn sign_burn_attestation(
+        &self, burn_tx: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType,
+    ) -> Option<(String, String)> {
+        if !self.is_genesis_attestor() { return None; }
+        // One burn → one wallet, PERSISTED (survives process restart; the prior in-memory map was
+        // wiped on restart, letting one burn back >1 node). Genesis-local, off-chain.
+        match self.storage.attested_burn_get(burn_tx) {
+            Ok(Some(w)) if w != qnet_wallet => return None,   // already attested for a different wallet
+            Ok(Some(_)) => {}                                 // same wallet ⇒ idempotent re-attest
+            _ => { let _ = self.storage.attested_burn_put(burn_tx, qnet_wallet); }
+        }
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, qnet_wallet, amount, &node_type);
+        let sig = self.wallet_identity.as_ref()?.sign_consensus(&self.node_id, msg.as_bytes()).ok()?;
+        Some((self.node_id.clone(), sig))
+    }
+
+    /// Super-side: gather ≥2f+1 genesis burn-attestations for this node's Phase-1 Solana burn so the
+    /// NodeRegistration passes the burn-attestation gate. Queries each genesis JSON-RPC endpoint
+    /// (node_attestBurn); each independently re-verifies the Solana burn and signs. Best-effort with
+    /// a per-request timeout — returns the distinct genesis sigs gathered (caller checks the count).
+    pub async fn collect_burn_attestations(
+        burn_tx: &str, solana_wallet: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType,
+        storage: &crate::storage::Storage,
+    ) -> Vec<(String, String)> {
+        let nt = match node_type { qnet_state::NodeType::Light => "light", _ => "super" };
+        // Attestor set = the consensus committee for the current tip (genesis era ⇒ the genesis set,
+        // the only members then). need = quorum_size(committee) — exactly what the verifier requires,
+        // so a gathered set actually passes whether the network is at genesis or scaled past 120.
+        let tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        let committee: Vec<String> = match Self::committee_for_height(storage, tip) {
+            Some(c) => c,
+            None => crate::genesis_constants::GENESIS_NODE_IPS.iter()
+                .map(|(_ip, id)| format!("genesis_node_{}", id)).collect(),
+        };
+        let need = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30)).build() { Ok(c) => c, Err(_) => return Vec::new() };
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "node_attestBurn",
+            "params": { "burn_tx": burn_tx, "solana_wallet": solana_wallet,
+                        "qnet_wallet": qnet_wallet, "amount": amount, "node_type": nt }
+        });
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for member_id in &committee {
+            if out.len() >= need { break; }
+            // Endpoint IP: chain-registered api_endpoint, else the pinned genesis IP for genesis members.
+            let ip = crate::genesis_constants::get_node_endpoint_ip(member_id)
+                .or_else(|| crate::genesis_constants::genesis_ip_for_node_id(member_id).map(|s| s.to_string()));
+            let ip = match ip { Some(i) if !i.is_empty() => i, _ => continue };
+            let url = format!("http://{}:8001/", ip);
+            let resp = match client.post(&url).json(&body).send().await { Ok(r) => r, Err(_) => continue };
+            let json: serde_json::Value = match resp.json().await { Ok(j) => j, Err(_) => continue };
+            let result = match json.get("result") { Some(r) => r, None => continue };
+            let gid = result.get("genesis_id").and_then(|v| v.as_str()).unwrap_or("");
+            let sig = result.get("sig").and_then(|v| v.as_str()).unwrap_or("");
+            // Count only a committee member's signed response (the verifier enforces membership too).
+            if gid.is_empty() || sig.is_empty() || !committee.iter().any(|m| m == gid) { continue; }
+            if seen.insert(gid.to_string()) { out.push((gid.to_string(), sig.to_string())); }
+        }
+        out
+    }
+
     /// PRODUCTION v2.19.25: Validate and add transaction received from P2P network
     /// Unlike submit_transaction(), this does NOT broadcast to avoid infinite loops
     pub async fn validate_and_add_network_transaction(&self, tx: qnet_state::Transaction) -> Result<String, QNetError> {
@@ -23123,6 +23801,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 ));
             }
             _ => {} // All other variants pass through to standard validation
+        }
+
+        // Advisory mirror of the block-validation burn-attestation gate
+        // (verify_burn_attestation_quorum): reject an invalid NodeRegistration at admission so a
+        // producer never wastes a slot on a block its peers would reject. The authoritative
+        // deterministic check runs at block validation; here we use the current chain tip and the
+        // SAME pure verifier. Inert below the gate height (returns Ok), so onboarding is unchanged.
+        if matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. }) {
+            let h = self.storage.get_chain_height().unwrap_or(0);
+            if let Err(e) = Self::verify_burn_attestation_quorum(&tx, h, &self.storage).await {
+                if crate::node::is_warn() {
+                    println!("[WARN][TX-GOSSIP] reject_gossip_node_registration reason={}", e);
+                }
+                return Err(QNetError::ValidationError(format!("[REJECT][GOSSIP] {}", e)));
+            }
         }
 
         // Post-quantum: NodeActivation MUST carry a valid Dilithium3 signature binding it to
@@ -24390,7 +25083,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 let rcount = wallets.len() as u32;
                                 let rper = if rcount > 0 { rtotal / rcount as u64 } else { 0 };
                                 let _ = self.storage.save_epoch_reward_root(epoch, &certified, rper, rcount, rtotal);
-                                let _ = self.storage.save_epoch_reward_wallets(epoch, &wallets);
                                 let _ = self.storage.append_reward_epoch(epoch);
                                 if is_info() { println!("[INFO][REWARDS] reward_root_adopted epoch={} root={}..", epoch, &certified[..16.min(certified.len())]); }
                             }
@@ -24660,7 +25352,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             
             // Save macroblock to storage
             self.storage.save_macroblock(index, &macroblock).await?;
-            
+
+            // Advance the QC-verified frontier immediately on a QC-bearing commit (keeps the cached
+            // gate fresh between probes; this is the sole commit-time writer the cache relies on).
+            if macroblock.consensus_data.checkpoint_qc.is_some() {
+                QC_VERIFIED_FRONTIER.fetch_max(index.saturating_mul(90), std::sync::atomic::Ordering::Relaxed);
+            }
+
             // v3.1: Clear from pending sync tracker after successful save
             crate::unified_p2p::clear_macroblock_pending_sync(index);
             
@@ -25550,7 +26248,42 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 &registration_proof,
                 &api_endpoint,
             );
-            
+
+            // Phase-1 burn-attestation (PRODUCTION half): when the gate is active, collect the genesis
+            // quorum that proves the Solana 1DEV burn on-chain and embed it so block validation accepts
+            // the registration. Inert below the gate height ⇒ current onboarding is byte-for-byte
+            // unchanged (this whole block is skipped). Set before the final hash below.
+            {
+                let cur_h = self.storage.get_chain_height().unwrap_or(0);
+                if qnet_state::feature_gates::is_active("burn_attestation_required", cur_h) {
+                    let b_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
+                    let b_amt: u64 = std::env::var("QNET_BURN_AMOUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let mnemonic = std::env::var("QNET_WALLET_SEED").unwrap_or_default();
+                    let solana_wallet = crate::crypto::solana_derivation::derive_solana_address_from_mnemonic(&mnemonic)
+                        .unwrap_or_default();
+                    if !b_tx.is_empty() && !solana_wallet.is_empty() {
+                        // Re-derive (qnet_node_type was moved into the registration builder above).
+                        let qnt = match node_type {
+                            NodeType::Super => qnet_state::NodeType::Super,
+                            NodeType::Light => qnet_state::NodeType::Light,
+                        };
+                        let attestors = Self::collect_burn_attestations(
+                            &b_tx, &solana_wallet, &wallet_address, b_amt, qnt, &self.storage).await;
+                        let need = qnet_consensus::checkpoint_bft::quorum_size(
+                            crate::genesis_constants::genesis_node_count());
+                        if attestors.len() < need {
+                            eprintln!("[WARN][REG] burn_attest_incomplete got={}/{} — registration will be rejected until quorum reached",
+                                      attestors.len(), need);
+                        }
+                        if let qnet_state::TransactionType::NodeRegistration {
+                            burn_tx: bt, burn_amount: ba, burn_attestors: at, ..
+                        } = &mut registration_tx.tx_type {
+                            *bt = b_tx; *ba = b_amt; *at = attestors;
+                        }
+                    }
+                }
+            }
+
             // v6.1: Hybrid Ed25519+Dilithium3 signing for User Super Nodes
             // Keys are created ON THIS NODE — sign locally before submitting to mempool.
             // This prevents any block producer from forging a NodeRegistration for a foreign wallet.
@@ -27115,6 +27848,33 @@ impl Clone for BlockchainNode {
 mod tests {
     use super::*;
 
+    // Checkpoint participation gate: a synced node always participates; a syncing node participates
+    // ONLY if it holds the full window (so a macro-boundary finality-lag redrive can seal on a
+    // briefly-syncing node), else it defers to macroblock sync.
+    #[test]
+    fn checkpoint_participation_gate() {
+        let mb_end = 180u64;
+        assert!(checkpoint_participation_allowed(true, 0, mb_end));        // synced → always
+        assert!(checkpoint_participation_allowed(true, 50, mb_end));       // synced, behind → still
+        assert!(checkpoint_participation_allowed(false, 180, mb_end));     // syncing, has window → yes
+        assert!(checkpoint_participation_allowed(false, 250, mb_end));     // syncing, ahead of end → yes
+        assert!(!checkpoint_participation_allowed(false, 179, mb_end));    // syncing, missing last block → defer
+        assert!(!checkpoint_participation_allowed(false, 0, mb_end));      // syncing, no window → defer
+    }
+
+    // committee_for_height determinism: genesis era ⇒ None (caller uses the genesis committee), and
+    // an ABSENT N-2 snapshot ⇒ None — REJECT, never a per-node walk-back guess (which would fork).
+    #[test]
+    fn committee_for_height_genesis_and_absent_n2() {
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
+        assert!(BlockchainNode::committee_for_height(&storage, 1).is_none(), "genesis era ⇒ None");
+        assert!(BlockchainNode::committee_for_height(&storage, 90).is_none(), "epoch 1 ⇒ None");
+        assert!(BlockchainNode::committee_for_height(&storage, 180).is_none(), "epoch 2 ⇒ None");
+        // height 300 ⇒ epoch 4 ⇒ needs macroblock idx 2; absent ⇒ None (no guess), not a divergent set.
+        assert!(BlockchainNode::committee_for_height(&storage, 300).is_none(), "absent N-2 ⇒ None (no guess)");
+    }
+
     // ── B cutover: merkle reward-claim determinism + security ──
     // The producer's committed root and every node's apply-time recompute call the SAME
     // distribute_equal_rewards over the SAME consensus inputs. These pin the three properties
@@ -27421,6 +28181,7 @@ mod tests {
             beacon: [0u8; 32],
             epoch_commitment: [0u8; 32],
             reward_root: [0u8; 32],
+            registry_root: [0u8; 32],
             timestamp: 1000,
             proposer: node.to_string(),
             proposer_sig: Vec::new(),
@@ -27551,6 +28312,157 @@ mod tests {
         let forged = b"dilithium_sig_eqv_test_vote_forged_not_a_real_signature".to_vec();
         assert!(!BlockchainNode::verify_vote_equivocation_proof(node, &ba, &sa, &bb, &forged).await,
                 "a forged vote signature MUST NOT ban");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // BURN-ATTESTATION QUORUM — Phase-1 proof-of-burn consensus gate. Closes the
+    // Byzantine-producer fake-burn Sybil hole: a non-genesis NodeRegistration is
+    // valid only with ≥2f+1 distinct VALID genesis signatures over the canonical
+    // burn message. All sub-checks in ONE test — the consensus PK registry is
+    // process-global and these use the fixed genesis_node_00X ids, so a single
+    // registration avoids cross-test races.
+    // ═════════════════════════════════════════════════════════════════════════
+    fn burn_gen_genesis(_genesis_id: &str) -> (Vec<u8>, pqcrypto_mldsa::mldsa65::SecretKey) {
+        use pqcrypto_traits::sign::PublicKey as _;
+        // No CONSENSUS_PK_REGISTRY registration: the committee verifier resolves each attestor's PK
+        // from on-chain storage (load_vrf_public_key), not the RAM registry. Registering here would
+        // collide across tests (the registry is immutable per id) — the caller saves PKs to storage.
+        let (pk, sk) = pqcrypto_mldsa::mldsa65::keypair();
+        (pk.as_bytes().to_vec(), sk)
+    }
+    fn burn_sign(genesis_id: &str, pk: &[u8], sk: &pqcrypto_mldsa::mldsa65::SecretKey, msg: &str) -> String {
+        use pqcrypto_traits::sign::SignedMessage as _;
+        use base64::{Engine as _, engine::general_purpose};
+        let signed = pqcrypto_mldsa::mldsa65::sign(msg.as_bytes(), sk);
+        let sm = signed.as_bytes();
+        let mut c = Vec::new();
+        c.extend_from_slice(&(sm.len() as u32).to_le_bytes());
+        c.extend_from_slice(sm);
+        c.extend_from_slice(&(pk.len() as u32).to_le_bytes());
+        c.extend_from_slice(pk);
+        format!("dilithium_sig_{}_{}", genesis_id, general_purpose::STANDARD.encode(&c))
+    }
+    fn burn_reg_tx(reg_proof: &str, burn_tx: &str, amount: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
+        burn_reg_tx_id("super_test", reg_proof, burn_tx, amount, attestors)
+    }
+    fn burn_reg_tx_id(node_id: &str, reg_proof: &str, burn_tx: &str, amount: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
+        let mut tx = qnet_state::Transaction {
+            hash: String::new(), from: "walletA".to_string(), to: None, amount: 0, nonce: 0,
+            gas_price: 0, gas_limit: 0, timestamp: 1000, signature: None, public_key: None,
+            tx_type: qnet_state::TransactionType::NodeRegistration {
+                node_id: node_id.to_string(),
+                node_type: qnet_state::NodeType::Super,
+                wallet_address: "walletA".to_string(),
+                registration_proof: reg_proof.to_string(),
+                api_endpoint: String::new(),
+                burn_tx: burn_tx.to_string(),
+                burn_amount: amount,
+                burn_attestors: attestors,
+            },
+            data: None, dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    #[tokio::test]
+    async fn burn_attestation_quorum_accept_and_reject() {
+        const GATE: u64 = qnet_state::feature_gates::BURN_ATTESTATION_GATE_HEIGHT;
+        let (pk1, sk1) = burn_gen_genesis("genesis_node_001");
+        let (pk2, sk2) = burn_gen_genesis("genesis_node_002");
+        let (pk3, sk3) = burn_gen_genesis("genesis_node_003");
+        let (pk4, sk4) = burn_gen_genesis("genesis_node_004");
+        // On-chain PK source for the deterministic bound verifier (committee path resolves each
+        // attestor's key via load_vrf_public_key, NOT the RAM registry). At height 0 the committee
+        // is the genesis set; threshold = quorum_size(5) = n−f = 4.
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
+        storage.save_vrf_public_key("genesis_node_001", &hex::encode(&pk1)).unwrap();
+        storage.save_vrf_public_key("genesis_node_002", &hex::encode(&pk2)).unwrap();
+        storage.save_vrf_public_key("genesis_node_003", &hex::encode(&pk3)).unwrap();
+        storage.save_vrf_public_key("genesis_node_004", &hex::encode(&pk4)).unwrap();
+        let burn_tx = "solBurnSig123";
+        let amount = 1500u64;
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super);
+        let a1 = ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg));
+        let a2 = ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg));
+        let a3 = ("genesis_node_003".to_string(), burn_sign("genesis_node_003", &pk3, &sk3, &msg));
+        let a4 = ("genesis_node_004".to_string(), burn_sign("genesis_node_004", &pk4, &sk4, &msg));
+
+        // (1) 4 distinct valid committee sigs (n−f = quorum_size(5)) ⇒ ACCEPT.
+        let tx = burn_reg_tx("burn", burn_tx, amount, vec![a1.clone(), a2.clone(), a3.clone(), a4.clone()]);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx, GATE, &storage).await.is_ok(), "4-of-5 quorum must pass");
+
+        // (2a) only 3 distinct ⇒ REJECT (below n−f=4).
+        let tx2 = burn_reg_tx("burn", burn_tx, amount, vec![a1.clone(), a2.clone(), a3.clone()]);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx2, GATE, &storage).await.is_err(), "3/4 below quorum must reject");
+
+        // (2b) duplicate signer must not pad the count (a1 twice + a2 + a3 = 3 distinct < 4).
+        let txd = burn_reg_tx("burn", burn_tx, amount, vec![a1.clone(), a1.clone(), a2.clone(), a3.clone()]);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&txd, GATE, &storage).await.is_err(), "duplicate signer must not reach quorum");
+
+        // (2c) a MUTATED burn field ⇒ recomputed message differs ⇒ sigs invalid ⇒ REJECT.
+        let txm = burn_reg_tx("burn", burn_tx, amount + 1, vec![a1.clone(), a2.clone(), a3.clone(), a4.clone()]);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&txm, GATE, &storage).await.is_err(), "mutated amount must break the quorum");
+
+        // (2d) a non-committee signer id is not counted (filtered before sig check) ⇒ only 3 valid ⇒ REJECT.
+        let txn = burn_reg_tx("burn", burn_tx, amount, vec![a1.clone(), a2.clone(), a3.clone(), ("super_impostor".to_string(), a4.1.clone())]);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&txn, GATE, &storage).await.is_err(), "non-committee signer must not count");
+
+        // (3) gate active from genesis (BURN_ATTESTATION_GATE_HEIGHT=0): a bare non-genesis
+        // registration is REJECTED at h=0 — no Sybil-free window (genesis-exempt path is case (4)).
+        let txbare = burn_reg_tx("burn", "", 0, vec![]);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&txbare, 0, &storage).await.is_err(), "non-genesis bare reg rejected from genesis");
+
+        // (4) REAL genesis node_id exempt (protocol-minted) ⇒ ACCEPT; a non-genesis node_id claiming
+        // reg_proof="genesis" MUST be rejected — no free Sybil bypass of the burn quorum.
+        let txe = burn_reg_tx_id("genesis_node_001", "genesis", "", 0, vec![]);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&txe, GATE, &storage).await.is_ok(), "real genesis identity exempt");
+        let txf = burn_reg_tx_id("super_impostor", "genesis", "", 0, vec![]);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&txf, GATE, &storage).await.is_err(), "non-genesis reg_proof=genesis must reject");
+
+        // (5) missing burn_tx at the active height (the dodge) ⇒ REJECT even with valid sigs present.
+        let txnoburn = burn_reg_tx("burn", "", 0, vec![a1.clone(), a2.clone(), a3.clone(), a4.clone()]);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&txnoburn, GATE, &storage).await.is_err(), "missing burn_tx must reject");
+
+        // (6) on-chain burn→wallet uniqueness: a burn already committed-bound to a DIFFERENT wallet
+        // ⇒ REJECT even with a full valid quorum (Sybil amplification under a rotating committee).
+        storage.committed_burn_wallet_put(burn_tx, "walletZ").unwrap();
+        let txreuse = burn_reg_tx("burn", burn_tx, amount, vec![a1.clone(), a2.clone(), a3.clone(), a4.clone()]);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&txreuse, GATE, &storage).await.is_err(), "burn reused for a different wallet must reject");
+    }
+
+    // Fork-fix coverage: at a POST-genesis height with no locally-readable N-2 macroblock, verify
+    // MUST reject (node behind ⇒ resync), NEVER fall back to the genesis set — otherwise a lagging
+    // node accepts against 5-genesis while synced nodes validate against the real committee → fork.
+    // A full valid 4-of-5 genesis quorum (which WOULD pass under the buggy genesis-fallback) is used
+    // to prove the rejection is due to the missing committee, not a weak quorum.
+    #[tokio::test]
+    async fn burn_attestation_post_genesis_without_committee_rejects() {
+        let (pk1, sk1) = burn_gen_genesis("genesis_node_001");
+        let (pk2, sk2) = burn_gen_genesis("genesis_node_002");
+        let (pk3, sk3) = burn_gen_genesis("genesis_node_003");
+        let (pk4, sk4) = burn_gen_genesis("genesis_node_004");
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
+        storage.save_vrf_public_key("genesis_node_001", &hex::encode(&pk1)).unwrap();
+        storage.save_vrf_public_key("genesis_node_002", &hex::encode(&pk2)).unwrap();
+        storage.save_vrf_public_key("genesis_node_003", &hex::encode(&pk3)).unwrap();
+        storage.save_vrf_public_key("genesis_node_004", &hex::encode(&pk4)).unwrap();
+        let burn_tx = "solBurnSigPG";
+        let amount = 1500u64;
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super);
+        let attest = vec![
+            ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg)),
+            ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg)),
+            ("genesis_node_003".to_string(), burn_sign("genesis_node_003", &pk3, &sk3, &msg)),
+            ("genesis_node_004".to_string(), burn_sign("genesis_node_004", &pk4, &sk4, &msg)),
+        ];
+        let tx = burn_reg_tx("burn", burn_tx, amount, attest);
+        // height 300 ⇒ epoch 4 ⇒ N-2 = macroblock idx 2, ABSENT in this fresh storage ⇒ committee None,
+        // post-genesis ⇒ MUST reject (not genesis-fallback-accept).
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx, 300, &storage).await.is_err(),
+            "post-genesis without N-2 committee must REJECT, not fall back to the genesis set");
     }
 }
 

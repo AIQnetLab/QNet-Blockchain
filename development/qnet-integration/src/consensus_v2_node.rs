@@ -284,6 +284,7 @@ pub enum V2Event {
         eligible_producers: Vec<u8>,   // bincode Vec<EligibleProducer> for the macroblock body
         banned: Vec<String>,           // QC-bound cumulative ban set (binds stored banned_validators)
         reward_root: Hash,             // per-epoch reward merkle root ([0;32] off emission boundary)
+        registry_root: Hash,           // deterministic Super/genesis registry digest (snapshot-forge defence)
     },
     // A macroblock whose checkpoint QC the apply path already verified against the correct epoch
     // committee — fed here so a driver too far behind for gossip fast-forwards from committed
@@ -304,6 +305,7 @@ struct WindowContent {
     eligible: Vec<u8>,
     banned: Vec<String>,   // QC-bound cumulative ban set (folded into epoch_commitment)
     reward_root: Hash,     // per-epoch reward merkle root, QC-certified via Checkpoint.reward_root
+    registry_root: Hash,   // Super/genesis registry digest, QC-certified via Checkpoint.registry_root
 }
 
 /// Adopt the in-flight window's committee and, if we lead the current round, propose the
@@ -317,7 +319,7 @@ fn try_propose(
     match buf.get(&w) {
         Some(c) => {
             *committee = c.committee.clone(); // committee is per-window (epoch); QC/TC verify against it
-            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root)
+            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root)
         }
         None => Vec::new(),
     }
@@ -356,9 +358,10 @@ pub fn route_inbound(data: Vec<u8>) {
 pub fn signal_window_end(
     index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
     committee: Vec<String>, eligible_producers: Vec<u8>, banned: Vec<String>, reward_root: Hash,
+    registry_root: Hash,
 ) {
     if let Some(tx) = V2_TX.get() {
-        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root });
+        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root, registry_root });
     }
 }
 
@@ -483,7 +486,13 @@ pub async fn run(
                                             // emission boundary; off-boundary both sides are [0;32] and this is a
                                             // trivial match. Without this, a single Byzantine leader could get an
                                             // arbitrary reward_root 2f+1-certified (unbounded reward mint).
-                                            && cp.reward_root == c.reward_root)
+                                            && cp.reward_root == c.reward_root
+                                            // registry_root is QC-certified (folded into Checkpoint::hash). Enforce
+                                            // the independent match under a feature gate so a determinism slip can
+                                            // never halt the network before the root is proven stable live (mirror
+                                            // of the burn-attestation gate); the field is in the hash regardless.
+                                            && (!qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height)
+                                                || cp.registry_root == c.registry_root))
                                         // No locally-derived content for the proposer's claimed window ⇒
                                         // we cannot verify it, so we never sign it (fail-stop).
                                         .unwrap_or(false),
@@ -530,7 +539,7 @@ pub async fn run(
                         }
                         Err(_) => Vec::new(),
                     },
-                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned, reward_root } => {
+                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned, reward_root, registry_root } => {
                         // Buffer this window's content (head microblock's real timestamp rides in
                         // the QC-agreed checkpoint). Then propose the contiguous next window if we
                         // lead, and replay buffered inbound.
@@ -538,7 +547,7 @@ pub async fn run(
                         let head_ts = storage.load_microblock_auto_format(head_height)
                             .ok().flatten().map(|m| m.timestamp).unwrap_or(0);
                         window_buf.insert(index, WindowContent {
-                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root,
+                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root,
                         });
                         if window_buf.len() > MAX_WINDOW_BUF {
                             if let Some(&lo) = window_buf.keys().min() { window_buf.remove(&lo); }
@@ -588,7 +597,10 @@ pub async fn run(
                 // committed window deterministically. Recovery is logged once the gap closes.
                 const STUCK_WINDOWS: u64 = 3;   // beyond normal 2-chain finality lag
                 const STUCK_TICKS: u32 = 5;     // sustained (~20s at the 4s view timer) before acting
-                let chain_window = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed) / 90;
+                // CP units (head/CHECKPOINT_INTERVAL), matching driver.next_window() — a /90 MACRO
+                // count here vs a /K window index never tripped the guard (it was dead).
+                let chain_window = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed)
+                    / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
                 if chain_window > driver.next_window().saturating_add(STUCK_WINDOWS) {
                     stuck_ticks = stuck_ticks.saturating_add(1);
                     if stuck_ticks >= STUCK_TICKS {

@@ -5509,7 +5509,7 @@ export class WalletManager {
   // v6.0: Create a NodeRegistration TX client-side and submit it to the current producer.
   // Called after /api/v1/light-node/register returns registration_proof.
   // Signing message: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
-  async createAndSubmitNodeRegistrationTx(nodeId, walletAddress, registrationProof, password, dilithiumKeys) {
+  async createAndSubmitNodeRegistrationTx(nodeId, walletAddress, registrationProof, password, dilithiumKeys, burnTxHash, burnAmount, burnWallet) {
     const walletData = await this.loadWallet(password);
     if (!walletData || !walletData.secretKey) {
       throw new Error('Cannot sign NodeRegistration TX: wallet not loaded');
@@ -5541,6 +5541,14 @@ export class WalletManager {
       signature,
       public_key: publicKeyHex,
     };
+
+    // Option A: carry the Solana 1DEV burn so the server can build a burn-attested ON-CHAIN Light
+    // registration (without it the TX has an empty burn and is hard-rejected at the gate). The burn is
+    // already cryptographically committed by registration_proof = blake3(burn:node_id:wallet)[..32],
+    // so the server binds it by recomputing the proof — no extra signed field is needed.
+    if (burnTxHash) payload.burn_tx_hash = burnTxHash;
+    if (burnAmount) payload.burn_amount = burnAmount;
+    if (burnWallet) payload.burn_wallet = burnWallet;
 
     // Optionally add Dilithium3 signature for post-quantum security
     if (dilithiumKeys) {
@@ -5826,7 +5834,10 @@ export class WalletManager {
                 walletAddress,
                 registrationResult.registration_proof,
                 password,
-                dilithiumKeys
+                dilithiumKeys,
+                burnTxHash,   // Option A: server embeds the burn + committee attestation into the on-chain TX
+                burnAmount,
+                burnWallet
               );
               console.log('[Registration] NodeRegistration TX submitted:', txResult.tx_hash);
               if (txResult.tx_hash) {

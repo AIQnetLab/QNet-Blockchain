@@ -673,3 +673,6 @@ transactions_export.csv
 infrastructure/nginx/ssl/*.pem
 infrastructure/nginx/ssl/*.key
 infrastructure/nginx/ssl/*.crt
+
+# overnight audit scaffolding + findings (local, do not track)
+audit-overnight/

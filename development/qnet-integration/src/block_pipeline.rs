@@ -2174,6 +2174,85 @@ impl BlockPipeline {
                 }
             }
 
+            // Phase-1 burn-attestation gate (a block-validation rule, like the signature checks
+            // above — apply trusts validated blocks). When active at this height, a non-genesis
+            // NodeRegistration MUST carry ≥2f+1 distinct valid genesis attestations over its
+            // canonical burn message; without it a Byzantine producer could inject a fake-burn
+            // registration that every node would deterministically apply (free reward/producer-
+            // eligible node). Deterministic: pure TX bytes + binary-pinned genesis keys. Inert
+            // below the gate height (returns Ok), so the current relaunch is unaffected.
+            if mb.height > 0 {
+                use futures::future::join_all;
+                // Same-block burn reuse: two NodeRegistrations sharing a burn_tx (cross-block reuse is
+                // caught deterministically at verify via committed_burn_wallet). One burn backs one node.
+                {
+                    let mut seen_burns = std::collections::HashSet::new();
+                    let dup = decoded.microblock.transactions.iter().any(|t| {
+                        if let qnet_state::TransactionType::NodeRegistration { burn_tx, .. } = &t.tx_type {
+                            !burn_tx.is_empty() && !seen_burns.insert(burn_tx.clone())
+                        } else { false }
+                    });
+                    if dup {
+                        if is_warn() {
+                            println!("[WARN][PIPELINE] burn_reuse_in_block h={} action=reject_block", mb.height);
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue; // HARD REJECT — one burn cannot back two registrations
+                    }
+                }
+                let burn_storage = storage.clone();
+                let burn_futures: Vec<_> = decoded.microblock.transactions
+                    .iter()
+                    .filter(|tx| matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. }))
+                    .map(|tx| crate::node::BlockchainNode::verify_burn_attestation_quorum(tx, mb.height, &burn_storage))
+                    .collect();
+                if !burn_futures.is_empty() {
+                    let results = join_all(burn_futures).await;
+                    if let Some(reason) = results.iter().find_map(|r| r.as_ref().err()) {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] burn_attestation_invalid h={} producer={} from={} reason={} action=reject_block",
+                                mb.height, mb.producer, decoded.from_peer, reason
+                            );
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue; // HARD REJECT — registration without a valid genesis burn quorum
+                    }
+                }
+
+                // Proof-of-burn gate for NodeActivation. NodeActivation carries NO burn of its own, so an
+                // un-backed one would mint a node identity (super pseudonym / activation row → reward +
+                // producer eligibility) for FREE, bypassing the 1DEV-burn Sybil cost the registration gate
+                // above enforces. Require each activation's wallet to already hold a chain-confirmed burn-
+                // attested registration — committed in a PRIOR block (parent-continuity guarantees blocks
+                // < h are applied on every node before h is verified, so the lookup is deterministic) OR a
+                // NodeRegistration in THIS block. Same activation-height gate as the registration rule;
+                // genesis nodes never emit NodeActivation (genesis = NodeRegistration only).
+                if qnet_state::feature_gates::is_active("burn_attestation_required", mb.height) {
+                    let this_block_burned: std::collections::HashSet<String> = decoded.microblock.transactions.iter()
+                        .filter_map(|t| match &t.tx_type {
+                            qnet_state::TransactionType::NodeRegistration { wallet_address, burn_tx, .. }
+                                if !burn_tx.is_empty() => Some(wallet_address.clone()),
+                            _ => None,
+                        }).collect();
+                    let unbacked = decoded.microblock.transactions.iter().any(|t| {
+                        matches!(t.tx_type, qnet_state::TransactionType::NodeActivation { .. })
+                            && !this_block_burned.contains(&t.from)
+                            && !storage.wallet_is_burn_registered(&t.from)
+                    });
+                    if unbacked {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] activation_without_burn h={} producer={} action=reject_block",
+                                mb.height, mb.producer
+                            );
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue; // HARD REJECT — activation must be backed by a burn-attested registration
+                    }
+                }
+            }
+
             // All checks passed — forward to apply stage.
             // v32.5: cache populated only on apply-commit, never at verify —
             // uncommitted view-change candidates must not poison the RAM cache.
@@ -2472,6 +2551,47 @@ impl BlockPipeline {
                     p2p.record_apply_success(&block.from_peer);
                 }
 
+                // Materialise the committed burn→wallet binding (cbw) for this block's registrations
+                // NOW — after state-root acceptance (so a rejected block never binds) but BEFORE
+                // save_microblock makes h loadable. The verify stage's parent-continuity gate defers
+                // verify(h+1) until load_microblock(h) succeeds (after save below), so this write
+                // happens-before verify(h+1).cbw_get → within-window cross-microblock burn reuse is
+                // caught. First-wins; the durable cbw set is reconciled from node_registry by
+                // rebuild_committed_burn_wallet on snapshot/reorg/boot.
+                for tx in &block.microblock.transactions {
+                    if let qnet_state::TransactionType::NodeRegistration { wallet_address, burn_tx, .. } = &tx.tx_type {
+                        // Scope = ANY NodeRegistration with a non-empty burn (super + LIGHT), MATCHING
+                        // rebuild_committed_burn_wallet (srtr_+lrtr_) and registry_root. Light is now
+                        // burn-attested on-chain (Option A), so its burn must bind cbw too; scope parity
+                        // between this live writer and the rebuild is what prevents a fork. Empty-burn
+                        // (genesis / not-yet-attested) regs auto-skip.
+                        if !burn_tx.is_empty() {
+                            let _ = ctx.storage.committed_burn_wallet_put(burn_tx, wallet_address);
+                        }
+                    }
+                }
+
+                // Materialise this block's node_registry entries (node_/srtr_/lrtr_ + the registry_root
+                // LtHash delta) NOW — after state-root acceptance, BEFORE save_microblock makes h
+                // loadable — mirroring the producer (inline pre-save) and the cbw write above. The
+                // WindowEnd checkpoint compute is gated on h being loadable (post-save), so writing here
+                // makes head_ready transitively guarantee the registrations + seal exist: a checkpoint-
+                // head registration can never be omitted by a racing validator read (the pre-existing
+                // race when these were written post-save in the deferred-fx phase).
+                for (node_id, type_str, wallet, burn_tx) in &apply_result.deferred_registrations {
+                    // Single authoritative writer: stamps reg_height AND the backing burn co-resident,
+                    // so rebuild_committed_burn_wallet + registry_root are deterministic; updates the
+                    // registry_root LtHash accumulator in the SAME batch. burn empty (activations/genesis)
+                    // ⇒ binding skipped. Idempotent on re-apply (delta 0 on identical re-add).
+                    let _ = ctx.storage.save_node_registration_at_height_burn(node_id, type_str, wallet, 1.0, height, burn_tx);
+                }
+                // registry_root seal (LtHash): at a checkpoint head, after all of this block's
+                // registrations updated lt_state and BEFORE save_microblock — mirror of the producer.
+                // Fires once per checkpoint head incl. zero-registration heads.
+                if height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
+                    let _ = ctx.storage.seal_registry_root(height);
+                }
+
                 // State verified — save block.
                 // v15.6: RocksDB writes go through the blocking pool. Macroblock
                 // bursts trigger background compactions that can stall foreground
@@ -2644,8 +2764,15 @@ impl BlockPipeline {
                                 p2p.add_to_pool3(apply_result.deferred_pool3);
                             }
                         }
-                        for (node_id, type_str, wallet) in &apply_result.deferred_registrations {
-                            let _ = ctx.storage.save_node_registration_at_height(node_id, type_str, wallet, 1.0, height);
+                        // node_registry registrations are now written PRE-save (above, next to cbw +
+                        // the registry_root seal) so the WindowEnd checkpoint read can never race them.
+                        // L2: emission reward recompute OFF the apply write-lock and off the pipeline
+                        // foreground (blocking pool) — the O(recipients) merkle build never stalls apply.
+                        if let Some((epoch, total, committed_root, c_per, c_cnt)) = apply_result.deferred_emission_root.clone() {
+                            let st = ctx.storage.clone();
+                            tokio::task::spawn_blocking(move || {
+                                crate::node::BlockchainNode::persist_local_reward_root(&*st, epoch, total, &committed_root, c_per, c_cnt);
+                            });
                         }
                         for mb_idx in &apply_result.deferred_emission_mbs {
                             let mut reward_mgr = ctx.reward_manager.write().await;

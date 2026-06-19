@@ -352,6 +352,19 @@ pub enum TransactionType {
         /// Light nodes: always empty (privacy protection - mobile apps!)
         #[serde(default)]
         api_endpoint: String,
+        /// Phase-1 proof-of-burn carrier. The external Solana 1DEV burn is non-deterministic (live
+        /// RPC) and cannot be re-checked in apply, so the burn fact is brought ON-CHAIN as a genesis
+        /// quorum: `burn_attestors` carries ≥2f+1 distinct genesis Dilithium signatures over
+        /// `burn_attestation_message(burn_tx, wallet_address, burn_amount, node_type)`, re-verified
+        /// from these bytes at block validation (deterministic, snapshot-independent). Empty for
+        /// genesis identities (registration_proof=="genesis") and when the gate is inactive.
+        #[serde(default)]
+        burn_tx: String,
+        #[serde(default)]
+        burn_amount: u64,
+        /// (genesis_id, dilithium_sig) attestation quorum. Verified, never trusted blindly.
+        #[serde(default)]
+        burn_attestors: Vec<(String, String)>,
     },
     
     /// Create new account
@@ -863,6 +876,19 @@ impl Transaction {
     /// Consistent with `compute_gas_used() == 0` for every variant listed
     /// below (except NodeActivation which uses `gas_limits::NODE_ACTIVATION`
     /// for metering purposes but is still a system TX).
+    /// Canonical message a genesis node signs to attest a Phase-1 Solana 1DEV burn backing a node
+    /// registration. FIXED format (pipe-joined, node_type as a stable integer) so all genesis sign
+    /// identical bytes and every validator recomputes the identical message at block validation —
+    /// no float / locale / map-iteration input. Binds the burn tx, beneficiary wallet, amount and
+    /// node type, so a quorum signature is valid for exactly one (burn, wallet, amount, type) tuple.
+    pub fn burn_attestation_message(burn_tx: &str, wallet: &str, amount: u64, node_type: &NodeType) -> String {
+        let nt: u8 = match node_type {
+            NodeType::Super => 0,
+            NodeType::Light => 1,
+        };
+        format!("burn_attest:{}:{}:{}:{}", burn_tx, wallet, amount, nt)
+    }
+
     pub fn is_system_tx(&self) -> bool {
         matches!(
             &self.tx_type,
@@ -3416,6 +3442,22 @@ mod tests_v34_heartbeat {
         let mut accts: HashMap<String, Account> = HashMap::new();
         for sw in 0..9u64 { hb("super_y", sw * 1440 + 10).apply_to_state(&mut accts).unwrap(); }
         assert_eq!(accts.get("super_y").unwrap().heartbeat_slots.count_ones(), 9);
+    }
+
+    // Burn-attestation canonical message: FIXED, deterministic, type-distinct — every genesis signs
+    // identical bytes and every validator recomputes the identical message, so the quorum verdict is
+    // byte-identical network-wide. Drift here would split the genesis signatures ⇒ no quorum forms.
+    #[test]
+    fn burn_attestation_message_is_canonical_and_type_distinct() {
+        let m = Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super);
+        assert_eq!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super), "deterministic");
+        assert_eq!(m, "burn_attest:solSig:walletA:1500:0", "fixed format, Super=0");
+        // Every bound field (incl. node_type) changes the signed message.
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Light));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1501, &NodeType::Super));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletB", 1500, &NodeType::Super));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig2", "walletA", 1500, &NodeType::Super));
+        assert_eq!(Transaction::burn_attestation_message("x", "y", 0, &NodeType::Light), "burn_attest:x:y:0:1", "Light=1");
     }
 
     // Structural validation (the pure part; anchor/sig are checked at block validation).

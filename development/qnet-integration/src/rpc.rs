@@ -823,6 +823,17 @@ struct NodeRegistrationClientRequest {
     #[serde(default)]
     #[allow(dead_code)]
     api_endpoint: Option<String>,
+    /// Phase-1 burn proof: the Solana 1DEV burn backing this on-chain registration. The
+    /// registration_proof = blake3(burn_tx_hash:node_id:wallet_address)[..32] ALREADY commits to
+    /// burn_tx_hash (it is what the client signed), so the server binds the burn to the signed proof
+    /// by recomputing it — no new signed field needed. Required for Light to pass burn-attestation.
+    #[serde(default)]
+    burn_tx_hash: Option<String>,
+    #[serde(default)]
+    burn_amount: Option<u64>,
+    /// Solana address that performed the burn (committee verifies the on-chain burn against it).
+    #[serde(default)]
+    burn_wallet: Option<String>,
 }
 
 /// Query parameters for transaction history API
@@ -2611,7 +2622,10 @@ async fn handle_rpc(
         // Node transfer methods
         "device_migration" => device_migration(blockchain, request.params).await,
         "node_getTransferStatus" => node_get_transfer_status(blockchain, request.params).await,
-        
+
+        // Phase-1 burn attestation (genesis-side): verify the external Solana 1DEV burn + sign.
+        "node_attestBurn" => node_attest_burn(blockchain, request.params).await,
+
         _ => Err(RpcError {
             code: -32601,
             message: "Method not found".to_string(),
@@ -2634,6 +2648,39 @@ async fn handle_rpc(
     };
     
     Ok(warp::reply::json(&rpc_response))
+}
+
+/// Genesis-side burn-attestation RPC (PRODUCTION half of the burn-oracle). A joining super queries
+/// the 5 genesis; each independently verifies the external Solana 1DEV burn (live RPC — admission
+/// side, NEVER consensus) and returns a Dilithium signature over the canonical burn message. The
+/// super embeds ≥2f+1 of these in its NodeRegistration, which block validation then re-verifies
+/// deterministically (verify_burn_attestation_quorum). Non-genesis nodes return an error.
+async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>) -> Result<Value, RpcError> {
+    let params = params.unwrap_or(serde_json::Value::Null);
+    let burn_tx = params.get("burn_tx").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let solana_wallet = params.get("solana_wallet").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let qnet_wallet = params.get("qnet_wallet").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let amount = params.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
+    let node_type = match params.get("node_type").and_then(|v| v.as_str()).unwrap_or("super") {
+        "light" => qnet_state::NodeType::Light,
+        _ => qnet_state::NodeType::Super,
+    };
+    if burn_tx.is_empty() || solana_wallet.is_empty() || qnet_wallet.is_empty() {
+        return Err(RpcError { code: -32602, message: "burn_tx, solana_wallet, qnet_wallet required".to_string() });
+    }
+    // Cheap genesis gate first — only genesis nodes attest (avoids a wasted Solana lookup on others).
+    if !blockchain.is_genesis_attestor() {
+        return Err(RpcError { code: -32601, message: "not a genesis attestor".to_string() });
+    }
+    // Verify the external Solana 1DEV burn (live RPC; per-node, off the consensus path).
+    match verify_burn_transaction_exists(&burn_tx, &solana_wallet, amount, 1).await {
+        Ok(true) => {}
+        _ => return Err(RpcError { code: -32000, message: "burn not verified on Solana".to_string() }),
+    }
+    match blockchain.sign_burn_attestation(&burn_tx, &qnet_wallet, amount, node_type) {
+        Some((genesis_id, sig)) => Ok(serde_json::json!({ "genesis_id": genesis_id, "sig": sig })),
+        None => Err(RpcError { code: -32000, message: "attestation refused (dedup / not genesis)".to_string() }),
+    }
 }
 
 // RPC method implementations
@@ -9631,7 +9678,17 @@ async fn handle_claim_rewards(
         const MAX_BATCH: usize = 512; // bound the TX size; the wallet re-calls for any remainder
         for epoch in epochs.into_iter().filter(|e| *e > last_claimed) {
             if claim_entries.len() >= MAX_BATCH { break; }
-            if let Ok(Some(wallets)) = storage.load_epoch_reward_wallets(epoch) {
+            // Leaf set: persisted blob if present, else recompute deterministically from on-chain
+            // data (same pure fn as emission) — avoids storing a per-epoch O(recipients) blob.
+            let wallets = match storage.load_epoch_reward_wallets(epoch) {
+                Ok(Some(w)) => w,
+                _ => match storage.load_epoch_reward_root(epoch) {
+                    Ok(Some((_, _, _, total))) =>
+                        crate::node::BlockchainNode::compute_epoch_reward_distribution(&storage, epoch, total).0,
+                    _ => continue,
+                },
+            };
+            {
                 if let Some(idx) = wallets.iter().position(|(w, _)| w == &wallet_address) {
                     let amount = wallets[idx].1;
                     let leaves: Vec<String> = wallets.iter().map(|(w, a)| {
@@ -13468,6 +13525,50 @@ async fn handle_node_registration_client_submit(
     if let Some(dil_pk) = req.dilithium_public_key {
         reg_tx.dilithium_public_key = Some(dil_pk);
     }
+
+    // Option A: embed the Solana 1DEV burn so this ON-CHAIN Light registration passes burn-attestation
+    // (without it, burn_attestation_required=0 hard-rejects the empty-burn TX and light never lands on
+    // chain). The registration_proof the client signed = blake3(burn_tx:node_id:wallet)[..32], so
+    // recomputing it from the sent burn binds the burn to the signature — a swapped burn fails below.
+    // The round committee (genesis era = the 5 genesis) attests the verified Solana burn; ≥quorum sigs
+    // are embedded so verify_burn_attestation_quorum accepts on every node. The on-chain reg then
+    // populates lrtr_ + the burn→wallet cbw binding (light Sybil control under consensus).
+    if let (Some(burn_tx), Some(burn_amount), Some(solana_wallet)) = (
+        req.burn_tx_hash.as_deref().filter(|s| !s.is_empty()),
+        req.burn_amount.filter(|a| *a > 0),
+        req.burn_wallet.as_deref().filter(|s| !s.is_empty()),
+    ) {
+        let proof_input = format!("{}:{}:{}", burn_tx, req.node_id, req.wallet_address);
+        let proof_hash = blake3::hash(proof_input.as_bytes()).to_hex().to_string();
+        if proof_hash.get(..32) != Some(req.registration_proof.as_str()) {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "burn_tx_hash does not match the signed registration_proof"
+            })));
+        }
+        let attestors = crate::node::BlockchainNode::collect_burn_attestations(
+            burn_tx, solana_wallet, &req.wallet_address, burn_amount,
+            qnet_state::NodeType::Light, &**crate::node::get_storage(),
+        ).await;
+        let need = qnet_consensus::checkpoint_bft::quorum_size(
+            crate::genesis_constants::genesis_node_count());
+        if attestors.len() < need {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "burn-attestation quorum not yet reached; retry shortly",
+                "got": attestors.len(),
+                "need": need
+            })));
+        }
+        if let qnet_state::TransactionType::NodeRegistration {
+            burn_tx: bt, burn_amount: ba, burn_attestors: at, ..
+        } = &mut reg_tx.tx_type {
+            *bt = burn_tx.to_string();
+            *ba = burn_amount;
+            *at = attestors;
+        }
+    }
+
     // Recalculate hash with updated fields
     reg_tx.hash = reg_tx.calculate_hash();
 

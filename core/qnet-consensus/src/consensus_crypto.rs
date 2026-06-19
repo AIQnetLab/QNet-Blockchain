@@ -2094,6 +2094,46 @@ async fn verify_with_real_dilithium(
     }
 }
 
+/// Verify a consensus Dilithium3 signature against an EXPLICIT expected public key, bypassing the
+/// in-RAM CONSENSUS_PK_REGISTRY identity binding. Burn-attestation validation MUST be a pure
+/// function of on-chain state: the registry is RAM-resident + idle-evicted (non-deterministic across
+/// nodes → fork) and its Tier-3 path TOFV-accepts a first-seen PK (forge surface for non-genesis).
+/// Here the PK embedded in the signature MUST equal `expected_pk` (the caller's on-chain key:
+/// load_vrf_public_key, or a pinned genesis anchor); only then is the ML-DSA-65 math run. Same
+/// signature wire format as verify_with_real_dilithium; identity binding is the explicit PK match.
+pub async fn verify_consensus_signature_bound(
+    node_id: &str, message: &str, signature: &str, expected_pk: &[u8],
+) -> bool {
+    use pqcrypto_mldsa::mldsa65 as dilithium3;
+    if !signature.starts_with("dilithium_sig_") { return false; }
+    let part = &signature["dilithium_sig_".len()..];
+    let sep = match part.rfind('_') { Some(p) => p, None => return false };
+    if &part[..sep] != node_id { return false; } // sig carries its claimed id; must match
+    let bytes = match general_purpose::STANDARD.decode(&part[sep + 1..]) { Ok(b) => b, Err(_) => return false };
+    if bytes.len() < 8 { return false; }
+    // Combined format: [sig_len(4)] + [SignedMessage] + [pk_len(4)] + [pk(1952)] (same as verify path).
+    let signed_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    if signed_len <= 3309 || 4 + signed_len >= bytes.len() { return false; }
+    let pk_len_start = 4 + signed_len;
+    if pk_len_start + 4 > bytes.len() { return false; }
+    let pk_len = u32::from_le_bytes([
+        bytes[pk_len_start], bytes[pk_len_start + 1], bytes[pk_len_start + 2], bytes[pk_len_start + 3],
+    ]) as usize;
+    let pk_start = pk_len_start + 4;
+    if pk_len != dilithium3::public_key_bytes() || pk_start + pk_len != bytes.len() { return false; }
+    let signed_message_bytes = &bytes[4..4 + signed_len];
+    let public_key_bytes = &bytes[pk_start..pk_start + pk_len];
+    // On-chain identity binding: the embedded PK MUST be the node's registered key. Deterministic
+    // (expected_pk comes from finalized state) and forge-proof (wrong PK rejected before open).
+    if public_key_bytes != expected_pk { return false; }
+    let public_key = match dilithium3::PublicKey::from_bytes(public_key_bytes) { Ok(p) => p, Err(_) => return false };
+    let signed_message = match dilithium3::SignedMessage::from_bytes(signed_message_bytes) { Ok(s) => s, Err(_) => return false };
+    match dilithium3::open(&signed_message, &public_key) {
+        Ok(recovered) => ct_eq(recovered.as_slice(), message.as_bytes()),
+        Err(_) => false,
+    }
+}
+
 /// Constant-time byte slice comparison -- prevents timing side-channel attacks.
 /// Returns true only if slices are equal in length and content.
 /// FIX L-C2ct: Also constant-time for length to prevent length-based timing leaks.
