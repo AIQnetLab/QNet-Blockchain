@@ -88,7 +88,6 @@ pub static GLOBAL_VRF_INSTANCE: parking_lot::Mutex<Option<Arc<crate::crypto::vrf
     parking_lot::Mutex::new(None);
 
 use qnet_state::{State as StateManager, MicroBlock};
-use qnet_mempool::SimpleMempool;
 use qnet_consensus::lazy_rewards::{PhaseAwareRewardManager, NodeType as RewardNodeType};
 use qnet_consensus::reputation::Evidence;
 use qnet_sharding::MAX_SHARDS;
@@ -984,6 +983,60 @@ pub fn check_weak_subjectivity(chain_tip: u64) -> Result<(), String> {
     }
 }
 
+/// Snapshot-anchor weak-subjectivity floor (runtime). A cold-join snapshot to height H
+/// (macroblock A = H/90) verified its 2f+1 anchor QC + Pattern-C state ⇒ that anchor is the
+/// joiner's trusted floor: macroblocks <= A are trusted history, not re-validated via the N-2
+/// lineage walk nor via sub-anchor microblocks the snapshot legitimately omits. 0 for
+/// warm/genesis nodes ⇒ every gate below behaves identically to today.
+pub static SNAPSHOT_ANCHOR_MB: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_ANCHOR_HASH: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn store_anchor_hash(h: &[u8; 32]) {
+    for i in 0..4 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&h[i * 8..i * 8 + 8]);
+        SNAPSHOT_ANCHOR_HASH[i].store(u64::from_le_bytes(b), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+fn load_anchor_hash() -> [u8; 32] {
+    let mut h = [0u8; 32];
+    for i in 0..4 {
+        h[i * 8..i * 8 + 8]
+            .copy_from_slice(&SNAPSHOT_ANCHOR_HASH[i].load(std::sync::atomic::Ordering::SeqCst).to_le_bytes());
+    }
+    h
+}
+
+/// Effective WS FLOOR = max(embedded genesis WS, locally-adopted snapshot anchor) by index. Consensus
+/// validation reads `.0` as the below-which-we-don't-re-verify floor so the lineage walk stops at the
+/// joiner's verified anchor instead of reaching toward genesis for history it does not hold. NOTE: the
+/// returned `.1` for a runtime anchor is the END of an already-verified lineage, NOT an inductive
+/// trust root — verify_v2_macroblock roots the cold-join walk in the BINARY pin (genesis_constants::
+/// ws_checkpoint()) / the genesis committee, never in this self-reported hash.
+pub fn effective_ws_checkpoint() -> (u64, [u8; 32]) {
+    let gen = crate::genesis_constants::ws_checkpoint();
+    let anchor = SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst);
+    if anchor > gen.0 { (anchor, load_anchor_hash()) } else { gen }
+}
+
+/// Adopt the snapshot anchor as the trusted finality + WS floor, AFTER the genesis/pin-rooted lineage
+/// walk verified the macroblock chain up to it (verify_snapshot_consensus_binding) and Pattern-C bound
+/// its state. The checkpoint QC is 2f+1 ⇒ finality by definition, so the joiner lifts finality to the
+/// anchor height without replaying sub-anchor microblocks. `anchor_hash` is stored only as the local
+/// skip-reverify marker (the END of the verified lineage), never as the inductive root for a future
+/// joiner — that root stays the binary WS pin / genesis keys.
+pub fn adopt_snapshot_finality(snapshot_height: u64, anchor_hash: [u8; 32]) {
+    let anchor_mb = snapshot_height / 90;
+    if anchor_mb == 0 { return; }
+    store_anchor_hash(&anchor_hash);
+    SNAPSHOT_ANCHOR_MB.store(anchor_mb, std::sync::atomic::Ordering::SeqCst);
+    LAST_FINALIZED_CONSENSUS_ROUND.fetch_max(snapshot_height, std::sync::atomic::Ordering::SeqCst);
+    LAST_FINALIZED_HEIGHT.fetch_max(snapshot_height, std::sync::atomic::Ordering::SeqCst);
+    WEAK_SUBJECTIVITY_CHECKPOINT.fetch_max(snapshot_height, std::sync::atomic::Ordering::SeqCst);
+    println!("[INFO][SYNC] snapshot_finality_adopted h={} mb={}", snapshot_height, anchor_mb);
+}
+
 /// v9.0 BUG-30: Check if rollback to target_height is allowed by finality rules.
 /// LEGACY v14.8: Non-atomic finality check. Exists only for diagnostic paths
 /// that need to inspect the current finality boundary WITHOUT claiming the
@@ -1118,13 +1171,6 @@ impl Drop for ActiveConsensusGuard {
 pub(crate) fn checkpoint_participation_allowed(is_synchronized: bool, local_h: u64, mb_end_height: u64) -> bool {
     is_synchronized || local_h >= mb_end_height
 }
-
-// METRICS: Track retry statistics for monitoring certificate race condition
-// Used to tune retry interval and detect systemic issues
-static RETRY_TOTAL: AtomicU64 = AtomicU64::new(0);           // Total retry attempts
-static RETRY_SUCCESS: AtomicU64 = AtomicU64::new(0);         // Successful retries (validation passed)
-static RETRY_CERT_RACE: AtomicU64 = AtomicU64::new(0);       // Retries due to certificate race
-static RETRY_MISSING_PREV: AtomicU64 = AtomicU64::new(0);    // Retries due to missing previous block
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.10: FAILOVER METRICS - Track slot delay and timeout rounds for monitoring
@@ -10194,190 +10240,6 @@ impl BlockchainNode {
         Ok(())
     }
     
-    /// Validate received macroblock  
-    async fn validate_received_macroblock(
-        block: &crate::unified_p2p::ReceivedBlock,
-        storage: &Arc<Storage>,
-        p2p: Option<&Arc<SimplifiedP2P>>,
-        node_id: &str,
-        node_type: NodeType,
-    ) -> Result<(), String> {
-        // CRITICAL: Full validation to prevent consensus manipulation
-        
-        // PRODUCTION FIX: Decompress macroblock data if compressed
-        let decompressed_data = match zstd::decode_all(&block.data[..]) {
-            Ok(data) => {
-                // SECURITY: Bound decompressed size to prevent zstd bombs (max 50MB)
-                const MAX_DECOMPRESSED_SIZE: usize = 50 * 1024 * 1024;
-                if data.len() > MAX_DECOMPRESSED_SIZE {
-                    return Err(format!("Decompressed macroblock exceeds max size: {} > {}",
-                                       data.len(), MAX_DECOMPRESSED_SIZE));
-                }
-                // Successfully decompressed
-                println!("[INFO][BLOCKS] decompressed h={} raw={}B expanded={}B",
-                         block.height, block.data.len(), data.len());
-                data
-            },
-            Err(_) => {
-                // Not compressed - use as-is
-                block.data.clone()
-            }
-        };
-        
-        // 1. Deserialize macroblock (from decompressed data)
-        let macroblock: qnet_state::MacroBlock = bincode::deserialize(&decompressed_data)
-            .map_err(|e| format!("Failed to deserialize macroblock: {}", e))?;
-        
-        // 2. Basic structure validation
-        if block.data.len() < 200 {
-            return Err("Macroblock too small".to_string());
-        }
-        
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v3.38: MACROBLOCK WALL CLOCK VALIDATION
-        // ═══════════════════════════════════════════════════════════════════════════
-        // 1. NOT FROM FUTURE: timestamp <= local_time + tolerance
-        // 2. MONOTONICITY: timestamp > previous macroblock timestamp (live mode)
-        // ═══════════════════════════════════════════════════════════════════════════
-        {
-            let local_time = get_timestamp_safe();
-            
-            if macroblock.height > 0 && local_time > 0 {
-                // FUTURE CHECK: Macroblock cannot be from the future
-                const MACROBLOCK_FUTURE_TOLERANCE: u64 = 15;
-                if macroblock.timestamp > local_time + MACROBLOCK_FUTURE_TOLERANCE {
-                    let future_delta = macroblock.timestamp - local_time;
-                    METRIC_TIMESTAMP_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[ERR][TIMESTAMP] future_macroblock mb={} ts={} local={} delta=+{}s", 
-                             macroblock.height, macroblock.timestamp, local_time, future_delta);
-                    return Err(format!(
-                        "TIMESTAMP_INVALID:macroblock_future:mb={}:delta=+{}s", 
-                        macroblock.height, future_delta
-                    ));
-                }
-                
-                if is_debug() && macroblock.height % 10 == 0 {
-                    println!("[DBG][TIMESTAMP] macroblock_valid mb={} ts={} local={}", 
-                             macroblock.height, macroblock.timestamp, local_time);
-                }
-            }
-        }
-        
-        // 3. CRITICAL: Verify chain continuity with previous macroblock
-        if macroblock.height > 1 {
-            // Get hash of previous macroblock
-            let prev_macro_hash = storage.get_latest_macroblock_hash()
-                .map_err(|e| format!("Cannot get previous macroblock hash: {}", e))?;
-            
-            if macroblock.previous_hash != prev_macro_hash {
-                return Err(format!(
-                    "Macroblock chain break! Block #{} has invalid previous_hash",
-                    macroblock.height
-                ));
-            }
-            // FIX L-M3: Defensive logging for macroblock chain continuity verification
-            // get_latest_macroblock_hash() is safe here because macroblocks are processed in order
-            println!("[DBG][VALIDATION] macroblock_chain_check h={} prev_hash_ok=true", macroblock.height);
-        }
-        
-        // 4. Verify finality. v2 ⇒ the macroblock carries a checkpoint QC; legacy ⇒
-        //    commit/reveal threshold. (Chain continuity was checked at step 3 above.)
-        if macroblock.consensus_data.checkpoint_qc.is_some() {
-            // v34/H1: FULL canonical verify — was structural-quorum-only over the SELF-DECLARED
-            // `consensus_committee`, which accepted a forged macroblock carrying ZERO valid
-            // signatures (an attacker set committee+signers to their own keys; epoch_commitment
-            // matched their own set; no Dilithium sig was ever checked). Now identical to the
-            // broadcast path: deterministic N-2 committee + every Dilithium signature + all body
-            // fields bound to the QC-certified checkpoint, deferring on a missing N-2 anchor.
-            let p2p = p2p.ok_or_else(|| format!("[ERR][MB] v2_no_p2p h={}", macroblock.height))?;
-            Self::verify_v2_macroblock(&macroblock, macroblock.height, p2p, node_id, node_type, storage).await?;
-            println!("[INFO][VALIDATION] macroblock_validated_v2 h={}", macroblock.height);
-            return Ok(());
-        }
-
-        // 4. Verify consensus participation (BFT 2/3+1 threshold)  [legacy commit/reveal]
-        let committee_size = if !macroblock.consensus_data.commits.is_empty() {
-            macroblock.consensus_data.commits.len()
-        } else {
-            macroblock.consensus_data.reveals.len()
-        };
-
-        // FIX M2: Enforce minimum committee size from network state
-        // For genesis bootstrap (height <= 5), allow minimum 3
-        // For production (height > 5), require at least 5 or known active validators
-        let min_committee = if macroblock.height <= 5 { 3 } else { 5 };
-        if committee_size < min_committee {
-            return Err(format!(
-                "[ERR][MB] committee_too_small size={} min={} h={}",
-                committee_size, min_committee, macroblock.height
-            ));
-        }
-
-        let required_signatures = min_committee.max(committee_size * 2 / 3 + 1);
-        let reveal_count = macroblock.consensus_data.reveals.len();
-        if reveal_count < required_signatures {
-            return Err(format!(
-                "[ERR][MB] insufficient_consensus reveals={} required={} committee={}",
-                reveal_count,
-                required_signatures,
-                committee_size
-            ));
-        }
-
-        // п.3: finality-cert integrity. Count alone lets a peer fake the
-        // reveals map. Each reveal must hash to its commit
-        // (commit_hash = SHA3(reveal_data||nonce||salt)); a fabricated map
-        // cannot satisfy this. Beacon + content are already bound by signed
-        // microblocks, so this is the trustless-finality check for syncing /
-        // light nodes. SHADOW until the stand confirms zero false-positives on
-        // real macroblocks, then set MB_FINALITY_ENFORCE=true (per-commit
-        // signature verify against the committee registry lands on the stand).
-        const MB_FINALITY_ENFORCE: bool = false;
-        {
-            let mut bad = 0u32;
-            for (node_id, reveal_bytes) in macroblock.consensus_data.reveals.iter() {
-                let reveal: qnet_consensus::commit_reveal::Reveal =
-                    match bincode::deserialize(reveal_bytes) { Ok(r) => r, Err(_) => { bad += 1; continue; } };
-                let commit: qnet_consensus::commit_reveal::Commit =
-                    match macroblock.consensus_data.commits.get(node_id)
-                        .and_then(|b| bincode::deserialize(b).ok()) { Some(c) => c, None => { bad += 1; continue; } };
-                let mut h = Sha3_256::new();
-                h.update(&reveal.reveal_data);
-                h.update(&reveal.nonce);
-                h.update(b"qnet-commit-hash-v1");
-                if hex::encode(h.finalize()) != commit.commit_hash { bad += 1; }
-            }
-            if bad > 0 {
-                println!("[WARN][MB] finality_binding h={} bad={}/{} enforce={}",
-                         macroblock.height, bad, reveal_count, MB_FINALITY_ENFORCE);
-                if MB_FINALITY_ENFORCE {
-                    return Err(format!("MB_FINALITY:binding_fail h={} bad={}", macroblock.height, bad));
-                }
-            } else if is_debug() {
-                println!("[DBG][MB] finality_binding_ok h={} reveals={}", macroblock.height, reveal_count);
-            }
-        }
-
-        // 5. CRITICAL: Detect database substitution
-        // Check if we already have a macroblock at this height
-        if macroblock.height > 0 {
-            // Get stored macro hash to detect forks
-            let stored_macro_hash = storage.get_latest_macroblock_hash();
-            
-            if let Ok(_stored_hash) = stored_macro_hash {
-                // v12.0: Integrity check uses consensus hash from struct fields
-                let _block_hash = macroblock.hash();
-                if is_info() {
-                    println!("[INFO][VALIDATION] macroblock_integrity_check h={} hash={}",
-                             macroblock.height, hex::encode(&_block_hash[..8]));
-                }
-            }
-        }
-        
-        println!("[INFO][VALIDATION] macroblock_validated h={} reveals={} required={}",
-                 macroblock.height, reveal_count, required_signatures);
-        Ok(())
-    }
     
     /// Start the blockchain node
     pub async fn start(&mut self) -> Result<(), QNetError> {
@@ -13924,16 +13786,19 @@ impl BlockchainNode {
                                         clear_expected_producer_cache_above(rollback_to);
                                         complete_rollback_cleanup(rollback_to);
 
-                                        // v15.9: STATE RECONCILIATION (pipeline fork recovery path)
+                                        // STATE RECONCILIATION (pipeline fork recovery path). Rollback
+                                        // deleted microblocks from RocksDB but the in-memory StateManager
+                                        // (accounts DashMap + merkle) was mutated up to the forked tip, so
+                                        // it MUST be rebuilt to the canonical rollback_to state — reconcile
+                                        // restores the freshest snapshot ≤ target + replays (bounded). Only
+                                        // if reconcile cannot PROVE the rebuilt state canonical do we fall
+                                        // to a clean 2f+1-QC-bound fast-sync (genesis/pin-rooted, fail-closed)
+                                        // and let the tail re-sync verify-then-apply.
                                         if let Err(e) = Self::reconcile_state_after_rollback(
                                             &state,
                                             &storage,
                                             rollback_to,
                                         ).await {
-                                            // Reconcile could not PROVE the rebuilt state canonical.
-                                            // Never proceed on unverified state: discard it and reload a
-                                            // 2f+1-QC-bound snapshot (fast_sync verifies the binding,
-                                            // fail-closed), then the tail re-syncs verify-then-apply.
                                             println!(
                                                 "[WARN][STATE] reconcile_unproven target={} err={} action=clean_state_sync",
                                                 rollback_to, e,
@@ -17892,14 +17757,6 @@ impl BlockchainNode {
                                 // This ensures we have a valid snapshot before removing old blocks
                                 // INTERVAL: 14400 blocks = 4 hours (aligned with reward window)
                                 if microblock_height % 14_400 == 0 {
-                                    let storage_for_pruning = Arc::clone(&storage);
-                                    tokio::spawn(async move {
-                                        match storage_for_pruning.prune_old_blocks() {
-                                            Ok(_) => println!("[INFO][NODE] blocks_pruned"),
-                                            Err(e) => println!("[WARN][NODE] pruning_failed err={:?}", e),
-                                        }
-                                    });
-
                                     // v36: EIP-4444 body expiry. Super (incl. genesis) is the only tier
                                     // that stores block data — drop microblock bodies (heartbeats + TXs)
                                     // older than 6 epochs while keeping hashes, macroblocks, snapshots and
@@ -23618,7 +23475,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 Ok(Some(p)) => p,
                 _ => match crate::genesis_constants::get_genesis_anchor_pk(attestor_id) {
                     Some(p) => p,
-                    None => continue,
+                    None => {
+                        // vrf_pk unresolved (storage gap, e.g. an incomplete snapshot) ⇒ this attestor
+                        // cannot count toward the quorum. Surface it so a snapshot-completeness failure
+                        // is diagnosable rather than a silent sub-quorum drop.
+                        if is_warn() {
+                            println!("[WARN][BURN] attestor_pk_unresolved id={} reason=vrf_pk_absent", attestor_id);
+                        }
+                        continue;
+                    }
                 },
             };
             if qnet_consensus::consensus_crypto::verify_consensus_signature_bound(
@@ -24950,26 +24815,47 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         node_type: NodeType,
         storage: &Storage,
     ) -> Result<(), String> {
+        // v2 finality IS the 2f+1 checkpoint QC — a None-QC macroblock has no finality to verify and
+        // must never be trusted. Erroring here (rather than Ok) keeps the invariant LOCAL to the verifier:
+        // "verify_v2_macroblock Ok ⇒ a checkpoint QC was present and Dilithium-verified", so no current or
+        // future caller can accept a None-QC macroblock by trusting the verifier alone.
         let cp_qc = match macroblock.consensus_data.checkpoint_qc.as_ref() {
             Some(b) => b,
-            None => return Ok(()),
+            None => return Err(format!("v2_qc_absent mb={}", index)),
         };
         let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
             bincode::deserialize(cp_qc).map_err(|e| format!("v2_qc_decode mb={} err={}", index, e))?;
         if cp.window_head_height / 90 != index || cp.hash() != qc.checkpoint_hash {
             return Err(format!("v2_qc_unbound mb={}", index));
         }
-        // Weak-subjectivity window (P4) — INERT at ws=0 (fresh genesis). Re-verify QCs only for
-        // index >= the embedded WS checkpoint; below it is trusted history (no QC re-verify, closing
-        // the long-range committee-history attack at maturity). The WS point itself is pinned by hash.
-        // At ws=0 the index<ws branch is unreachable and the hash branch is gated on index>0, so a
-        // fresh-genesis chain (lineage from index 0) behaves exactly as before.
-        let ws = crate::genesis_constants::ws_checkpoint();
+        // Weak-subjectivity trust root — INERT at the fresh-genesis pin (0,zeros). The cold-join lineage
+        // walk re-verifies macroblock QCs UP from an EXOGENOUS root so a byzantine snapshot server cannot
+        // root the committee in its own peer-served data (the circular-anchor forge). Two roots:
+        //   • genesis (pin=0): the first two macroblocks (head ≤180) use the embedded genesis committee;
+        //   • mature (pin>0): the binary-pinned macroblock is trusted by HASH, and its immediate
+        //     predecessor by the macroblock previous_hash chain — together the two N-2 committee sources
+        //     that bootstrap forward QC verification of both parities. Below the pinned pair is trusted
+        //     history we neither hold nor re-verify (Err ⇒ resync above the floor).
+        // `pin` = the binary constant (the inductive ROOT — never the snapshot's own self-reported hash);
+        // `ws` = runtime floor (max of binary pin and the locally-adopted snapshot anchor).
+        let pin = crate::genesis_constants::ws_checkpoint();
+        let ws = effective_ws_checkpoint();
+        if pin.0 > 0 && index == pin.0 {
+            return if macroblock.hash()[..] == pin.1[..] { Ok(()) }
+                   else { Err(format!("v2_ws_pin_mismatch mb={}", index)) };
+        }
+        if pin.0 > 1 && index == pin.0 - 1 {
+            // Hash-chain trust: the pinned macroblock's previous_hash commits to this predecessor.
+            return match storage.get_macroblock_by_height(pin.0).ok().flatten()
+                .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok())
+            {
+                Some(p) if p.previous_hash[..] == macroblock.hash()[..] => Ok(()),
+                Some(_) => Err(format!("v2_ws_pin_pred_mismatch mb={}", index)),
+                None => Err(format!("v2_qc_defer_anchor mb={} need_pin={}", index, pin.0)), // pin not stored yet ⇒ retry
+            };
+        }
         if index < ws.0 {
             return Err(format!("v2_below_ws mb={} ws={}", index, ws.0));
-        }
-        if index > 0 && index == ws.0 && macroblock.hash()[..] != ws.1[..] {
-            return Err(format!("v2_ws_hash_mismatch mb={}", index));
         }
         if cp.window_mb_hashes != macroblock.micro_blocks
             || cp.state_root != macroblock.state_root
@@ -24981,7 +24867,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Decouple (P4): a standalone macroblock whose OWN 2f+1 QC verifies (below) needs its N-2
         // committee anchor only when that anchor is ABOVE the WS checkpoint; at/below WS the committee
         // is binary-trusted, so the lineage walk stops at WS, not genesis. INERT at ws=0 (n2=index-2>=1
-        // > 0 for every index with an anchor), i.e. identical to the prior unconditional defer.
+        // > 0 for every index with an anchor), i.e. identical to the prior unconditional defer. In the
+        // cold-join ASCENDING walk the N-2 anchor is not merely PRESENT but already VERIFIED (it was
+        // verify-then-saved earlier in the same walk), so presence here implies a genesis/pin-rooted
+        // committee source — never a peer-chosen one.
         if let Some(n2) = Self::v2_committee_anchor_index(index) {
             if n2 > ws.0 && storage.get_macroblock_by_height(n2).ok().flatten().is_none() {
                 return Err(format!("v2_qc_defer_anchor mb={} need_mb_n2={}", index, n2));
@@ -25141,185 +25030,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             crate::consensus_v2_node::signal_synced_checkpoint(cp_qc.clone());
         }
 
-        // v14.8: Structural validation of consensus_data.commits / reveals.
-        //
-        // The on-wire representation of commits/reveals is a bare byte blob keyed by
-        // node_id. We cannot reconstruct the exact commit_hash each node signed
-        // (that data is stripped before serialisation), so a full Dilithium3
-        // verify is not possible here. What we CAN do — and what closes the
-        // "synthetic self-assembly injected over the wire" hole — is refuse
-        // any macroblock whose commit/reveal payloads do not look like real
-        // Dilithium3 envelopes.
-        //
-        // Real envelopes we accept (see consensus_crypto.rs):
-        //   - "compact_bin:<base64>"  (microblock path; ~2.6 KB)
-        //   - "hybrid_bin:<base64>"   (macroblock consensus; ~5 KB)
-        //   - "compact:<json>" / "hybrid:<json>"   (legacy JSON forms)
-        //   - "dilithium_sig_<node>_<base64>"       (pure Dilithium form)
-        //   - raw Dilithium3 detached signature (~2420 bytes minimum)
-        //
-        // Synthetic strings such as `local_self_assembly_commit_{h}` are well
-        // under 100 bytes and would never match any of these shapes, so the
-        // minimum length check alone removes the attack surface.
-        //
-        // This is deliberately LOOSE structural validation, not a full crypto
-        // gate — genuine finality still flows from the live commit/reveal
-        // path in unified_p2p (which DOES verify every signature), and from
-        // the 2f+1 threshold being met before a macroblock gets produced.
-        //
-        // v15.7: Skip-marker macroblocks bypass this structural validation
-        // — they carry no commits/reveals by design. The certificate the
-        // skip marker carries was already verified above (2f+1 Dilithium3
-        // signatures over view-change votes), which is the equivalent
-        // BFT-supermajority gate.
-        if !macroblock.consensus_data.is_skip_marker && macroblock.consensus_data.checkpoint_qc.is_none() {
-            let commits = &macroblock.consensus_data.commits;
-            let reveals = &macroblock.consensus_data.reveals;
-
-            // v14.8.2: STRICT CANONICAL 2f+1 THRESHOLD — no attacker-controlled fallbacks.
-            //
-            // For any macroblock at index N ≥ 3, the validator committee that
-            // produced its commits/reveals is DEFINED BY macroblock N-2's
-            // `eligible_producers` snapshot (the N-2 rule — gives ~90 blocks
-            // for propagation while keeping the set Byzantine-finalised).
-            //
-            // The ONLY safe source for `committee_size` is that N-2 snapshot.
-            // Previous revisions of this code contained fallbacks:
-            //   • to mb N-1's eligible_producers (still adjacent — weak),
-            //   • to THIS macroblock's own eligible_producers (fully
-            //     attacker-controlled — the producer can put any number there),
-            //   • to a hard-coded genesis floor of 5 validators.
-            //
-            // Every fallback after N-2 is a chain-poisoning vector at scale.
-            // On a 1 000-Super-node network the real 2f+1 is 667; falling back
-            // to a 5-validator floor would let a 4-signer forgery get saved
-            // under our chosen floor of `max(threshold, 4) = 4`, which would
-            // then become the N-2 snapshot for future macroblocks — permanent
-            // chain corruption on cold-start sync.
-            //
-            // Canonical policy (this revision):
-            //   • N ≥ 3  → require mb N-2 on disk. If missing, return an
-            //              error with prefix `need_mb_prev:{N-2}` so the
-            //              caller can cooldown the current peer, request the
-            //              missing macroblock from a different peer, and
-            //              retry validation once it arrives.
-            //   • N = 1  → committee == hardcoded genesis count (baked-in,
-            //              not attacker-controlled). There is no prior
-            //              macroblock to consult.
-            //   • N = 2  → same as N = 1. mb 0 never exists; mb 1 is the
-            //              first and its own validators are still the
-            //              hardcoded genesis set.
-            //
-            // The hardcoded genesis source is `genesis_constants::genesis_node_count()`
-            // which reads `LEGACY_GENESIS_NODES.len()` baked into the binary.
-            // No runtime value, no network input, no fallback.
-            fn committee_size_from_mb(mb: &qnet_state::MacroBlock) -> Option<usize> {
-                mb.consensus_data.eligible_producers.as_ref()
-                    .and_then(|bytes| bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(bytes).ok())
-                    .map(|v| v.len())
-                    .filter(|n| *n > 0)
-            }
-
-            let committee_size: usize = if index <= 2 {
-                // Genesis epochs: committee is the hardcoded genesis set.
-                // For n=5 genesis nodes → committee_size=5 → 2f+1=4.
-                crate::genesis_constants::genesis_node_count()
-            } else {
-                // Canonical N-2 rule for N ≥ 3. Strict, no fallback.
-                match self.storage.get_macroblock_by_height(index - 2) {
-                    Ok(Some(raw)) => {
-                        match bincode::deserialize::<qnet_state::MacroBlock>(&raw) {
-                            Ok(mb_nm2) => match committee_size_from_mb(&mb_nm2) {
-                                Some(n) => n,
-                                None => {
-                                    return Err(QNetError::ValidationError(format!(
-                                        "Macroblock #{} validation rejected: N-2 mb#{} has empty eligible_producers",
-                                        index, index - 2
-                                    )));
-                                }
-                            },
-                            Err(e) => {
-                                return Err(QNetError::ValidationError(format!(
-                                    "Macroblock #{} validation rejected: N-2 mb#{} deserialize err={}",
-                                    index, index - 2, e
-                                )));
-                            }
-                        }
-                    }
-                    _ => {
-                        // N-2 not on disk. This is NOT a malicious-peer situation —
-                        // it's our own sync gap. Signal to the caller with a
-                        // structured prefix so it can cool the current peer, pull
-                        // N-2 from someone else, and retry.
-                        return Err(QNetError::SyncError(format!(
-                            "need_mb_prev:{} for validating mb#{}", index - 2, index
-                        )));
-                    }
-                }
-            };
-
-            // Canonical 2f+1 formula for Byzantine safety. committee_size is
-            // now trusted (either N-2 finalised snapshot or baked-in genesis),
-            // so no additional floor is needed.
-            let min_consensus_participants = ((committee_size * 2) + 2) / 3;
-
-            if is_debug() {
-                println!("[DBG][MB-VALIDATE] mb={} committee={} threshold={} commits={} reveals={} source={}",
-                         index, committee_size, min_consensus_participants,
-                         commits.len(), reveals.len(),
-                         if index <= 2 { "genesis_baked" } else { "n-2_snapshot" });
-            }
-
-            if commits.len() < min_consensus_participants {
-                return Err(QNetError::ValidationError(format!(
-                    "Macroblock #{} has {} commits < {} (canonical 2f+1, committee={})",
-                    index, commits.len(), min_consensus_participants, committee_size
-                )));
-            }
-            if reveals.len() < min_consensus_participants {
-                return Err(QNetError::ValidationError(format!(
-                    "Macroblock #{} has {} reveals < {} (canonical 2f+1, committee={})",
-                    index, reveals.len(), min_consensus_participants, committee_size
-                )));
-            }
-
-            // Minimum byte length for a real Dilithium3 signature payload.
-            // Pure detached signatures are ~2420 bytes; envelope wrappers
-            // add small overhead, never strip it. We use 500 as a deliberately
-            // generous floor: well below any real signature size, well above
-            // any synthetic placeholder string, leaving room for future
-            // compression-based envelope formats.
-            const MIN_SIG_BYTES: usize = 500;
-            let mut bad_commits = 0usize;
-            let mut bad_reveals = 0usize;
-            for (voter, sig) in commits.iter() {
-                if voter.is_empty() || voter.len() > 128 || sig.len() < MIN_SIG_BYTES {
-                    bad_commits += 1;
-                }
-            }
-            for (voter, sig) in reveals.iter() {
-                if voter.is_empty() || voter.len() > 128 || sig.len() < MIN_SIG_BYTES {
-                    bad_reveals += 1;
-                }
-            }
-            if bad_commits > 0 || bad_reveals > 0 {
-                // Even a single synthetic entry is enough evidence that this
-                // macroblock was not produced by a real 2f+1 consensus round.
-                // Reject outright — callers up the stack will drop the peer.
-                return Err(QNetError::ValidationError(format!(
-                    "Macroblock #{} has {} synthetic commits / {} reveals (structural)",
-                    index, bad_commits, bad_reveals
-                )));
-            }
-
-            // next_leader must be a non-empty node_id (well-formed macroblock).
-            if macroblock.consensus_data.next_leader.is_empty() {
-                return Err(QNetError::ValidationError(format!(
-                    "Macroblock #{} has empty next_leader", index
-                )));
-            }
+        // v2 finality is the 2f+1 checkpoint QC and nothing else. Skip-markers were rejected above, and
+        // the honest network NEVER produces a None-QC macroblock (consensus always seals a checkpoint QC).
+        // A None-QC macroblock reaching here is a forgery: the removed loose commit/reveal structural path
+        // did NO signature verification yet the macroblock was still saved below, letting a byzantine
+        // snapshot server inject a fabricated cold-join lineage (the N-2-derived committee would collapse
+        // to the attacker's eligible_producers). Reject so "stored ⇒ QC-verified" holds for the cold-join
+        // lineage walk — the same anchor_no_qc rule verify_snapshot_anchor_qc applies, now on every macroblock.
+        if macroblock.consensus_data.checkpoint_qc.is_none() {
+            return Err(QNetError::ValidationError(format!(
+                "v2_qc_required mb={} reason=no_checkpoint_qc", index
+            )));
         }
-        
+
         // v3.00: Check if macroblock already saved (e.g., by BFT participant during consensus)
         // CRITICAL: Do NOT return early — emission rewards still need processing!
         // process_macroblock_heartbeats_deterministic has built-in dedup via processed_set
@@ -25348,11 +25071,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // ahead of chain_height → stall-recovery rollback blocked by FINALITY_VIOLATION →
                 // deadlock. Finality must never outrun the locally-applied microblock tip.
                 let expected_start = if index == 1 { 1 } else { (index - 1) * 90 + 1 };
+                let anchor_trusted = SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst) >= index;
                 let mut all_present = true;
                 for h in expected_start..=index * 90 {
                     if self.storage.load_microblock(h)?.is_none() { all_present = false; break; }
                 }
-                if all_present {
+                if all_present || anchor_trusted {
                     if try_advance_finality(round, "MB-SYNC-DEDUP") {
                         println!("[INFO][MB-SYNC] finality_catchup mb={} round={} prev_round={}", index, round, prev_round);
                     }
@@ -25400,7 +25124,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let round = index * 90;
             let prev_round = LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst);
             if round > prev_round {
-                if missing_microblocks.is_empty() {
+                // mb <= snapshot anchor: trusted history — its 2f+1 QC already finalized it and the
+                // snapshot carries the state, so finality advances without the sub-anchor microblocks
+                // the snapshot legitimately omits. anchor==0 (warm node) ⇒ original present-guard.
+                let anchor_trusted = SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst) >= index;
+                if missing_microblocks.is_empty() || anchor_trusted {
                     if try_advance_finality(round, "MB-SYNC") {
                         println!("[INFO][MB-SYNC] finalized_round_updated mb={} round={} finality_h={}", index, round, round);
                     }

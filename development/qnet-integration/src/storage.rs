@@ -1287,91 +1287,6 @@ impl PersistentStorage {
     // v3.19: PRUNING - Remove old data to save disk space
     // ═══════════════════════════════════════════════════════════════════════════
     
-    /// v3.19: Prune old microblocks older than retention_blocks
-    /// Keeps only recent blocks for sync, deletes old ones to save disk
-    /// SAFE: Only prunes microblocks, not macroblocks (which contain finality data)
-    pub fn prune_old_microblocks(&self, current_height: u64, retention_blocks: u64) -> IntegrationResult<usize> {
-        use crate::node::is_info;
-        let microblocks_cf = self.db.cf_handle("microblocks")
-            .ok_or_else(|| IntegrationError::StorageError("microblocks CF not found".to_string()))?;
-        
-        if current_height <= retention_blocks {
-            return Ok(0);
-        }
-        
-        let prune_below = current_height - retention_blocks;
-        let mut deleted: usize = 0;
-        let mut batch = WriteBatch::default();
-        
-        let iter = self.db.iterator_cf(&microblocks_cf, rocksdb::IteratorMode::Start);
-        for item in iter {
-            match item {
-                Ok((key, _)) => {
-                    if let Ok(key_str) = std::str::from_utf8(&key) {
-                        if let Some(h_str) = key_str.strip_prefix("microblock_") {
-                            if let Ok(h) = h_str.parse::<u64>() {
-                                if h >= prune_below {
-                                    break;
-                                }
-                                batch.delete_cf(&microblocks_cf, &key);
-                                deleted += 1;
-                                if deleted % 1000 == 0 {
-                                    self.db.write(batch)?;
-                                    batch = WriteBatch::default();
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if crate::node::is_warn() {
-                        println!("[WARN][STORAGE] prune_iter_error: {}", e);
-                    }
-                    break;
-                }
-            }
-        }
-
-        // v9.1: Always flush remaining batch (was: only if deleted % 1000 != 0,
-        // which lost up to 999 deletes on iterator error mid-batch).
-        if !batch.is_empty() {
-            self.db.write(batch)?;
-        }
-        
-        if deleted > 0 {
-            self.db.compact_range_cf(&microblocks_cf, None::<&[u8]>, None::<&[u8]>);
-        }
-        
-        if is_info() {
-            println!("[INFO][STORAGE] pruned_microblocks deleted={} retention={} prune_below={}",
-                     deleted, retention_blocks, prune_below);
-        }
-        Ok(deleted)
-    }
-    
-    /// v3.19: Run full pruning cycle (call periodically, e.g., every hour)
-    /// retention_blocks: How many microblocks to keep (e.g., 86400 = ~1 day at 1 block/sec)
-    pub fn run_pruning_cycle(&self, current_height: u64, retention_blocks: u64) -> IntegrationResult<()> {
-        use crate::node::is_info;
-        if is_info() {
-            println!("[INFO][STORAGE] pruning_cycle_start retention_blocks={}",
-                     retention_blocks);
-        }
-        
-        let start = std::time::Instant::now();
-        
-        let microblocks_deleted = self.prune_old_microblocks(current_height, retention_blocks)?;
-        
-        self.compact_all()?;
-        
-        let elapsed = start.elapsed();
-        if is_info() {
-            println!("[INFO][STORAGE] pruning_cycle_done elapsed={:?} microblocks={}",
-                     elapsed, microblocks_deleted);
-        }
-        
-        Ok(())
-    }
     
     /// v3.19 / v3.41: Compact all column families to reclaim disk space
     /// CRITICAL: Without compaction after delete operations, RocksDB marks
@@ -6775,6 +6690,29 @@ impl Storage {
         Ok(added)
     }
 
+    /// Snapshot-completeness contract for vrf_pk. Every chain-confirmed NON-genesis super in the
+    /// restored roster MUST carry its VRF public key: unlike registry_root/cbw (which recompute from
+    /// accounts+registry), vrf_pk has NO recompute-from-state path, so a snapshot missing it would
+    /// silently drop that super from burn-attestation/consensus quorums. Genesis ids are re-seeded
+    /// from embedded constants at boot ⇒ exempt. Returns Err on the first gap so the caller fails the
+    /// snapshot closed and re-targets a complete source. Cold path only (one srtr_ prefix scan).
+    pub fn verify_snapshot_vrf_pk_complete(&self) -> IntegrationResult<()> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        for item in self.persistent.db.prefix_iterator_cf(&registry_cf, b"srtr_") {
+            let (key, _) = match item { Ok(kv) => kv, Err(_) => continue };
+            let key_str = match std::str::from_utf8(&key) { Ok(s) => s, Err(_) => continue };
+            let node_id = match key_str.strip_prefix("srtr_") { Some(id) => id, None => break };
+            if node_id.starts_with("genesis_node_") { continue; } // re-seeded from constants at boot
+            if self.load_vrf_public_key(node_id)?.is_none() {
+                return Err(IntegrationError::StorageError(format!(
+                    "snapshot_vrf_pk_incomplete node={} reason=vrf_pk_absent", node_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// One-time marker so the O(N) roster-index migration scan runs once, not on every restart.
     pub fn roster_index_built(&self) -> bool {
         match self.persistent.db.cf_handle("node_registry") {
@@ -8596,85 +8534,17 @@ impl Storage {
 
         if is_format_b {
             // ═══════════════════════════════════════════════════════════════════
-            // FORMAT B: save_state_snapshot — [0x02 | state_root(32) | total_supply(8) | height(8) | bincode(accounts)]
-            // This format comes from P2P download when peer serves state_snap_ data.
+            // FORMAT B (legacy P2P state_snap_ download): [0x02 | state_root(32) | total_supply(8) |
+            //   height(8) | bincode(accounts)] — carries ONLY the accounts CF.
             // ═══════════════════════════════════════════════════════════════════
-            if cursor + 48 > decompressed.len() {
-                return Err(IntegrationError::StorageError(format!(
-                    "Format B snapshot h={} truncated: need 48 bytes header, have {}", height, decompressed.len() - cursor
-                )));
-            }
-            let _state_root = &decompressed[cursor..cursor+32];
-            cursor += 32;
-            let _total_supply = u64::from_le_bytes(decompressed[cursor..cursor+8].try_into()
-                .map_err(|_| IntegrationError::StorageError("Invalid total_supply".to_string()))?);
-            cursor += 8;
-            let snap_height = u64::from_le_bytes(decompressed[cursor..cursor+8].try_into()
-                .map_err(|_| IntegrationError::StorageError("Invalid height".to_string()))?);
-            cursor += 8;
-
-            println!("[INFO][SNAPSHOT] format_B detected h={} snap_h={} supply={}", height, snap_height, _total_supply);
-
-            // Remaining bytes = bincode-serialized accounts HashMap
-            let accounts_cf = self.persistent.db.cf_handle("accounts")
-                .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
-
-            if cursor < decompressed.len() {
-                let accounts_data = &decompressed[cursor..];
-                // Deserialize bincode accounts: HashMap<String, AccountState> or Vec<(key, value)>
-                // save_state_snapshot uses bincode::serialize(&accounts) where accounts is the full map
-                match bincode::deserialize::<std::collections::HashMap<String, Vec<u8>>>(accounts_data) {
-                    Ok(accounts_map) => {
-                        let mut batch = WriteBatch::default();
-                        let mut account_count = 0u64;
-                        for (key, value) in &accounts_map {
-                            batch.put_cf(&accounts_cf, key.as_bytes(), value);
-                            account_count += 1;
-                        }
-                        self.persistent.db.write(batch)?;
-                        println!("[INFO][SNAPSHOT] format_B_restored h={} accounts={}", height, account_count);
-                        // v32.10: count check removed — Pattern C state_root binding is the
-                        // security gate. Early anchors legitimately have account_count=0.
-                    }
-                    Err(_) => {
-                        // Raw KV fallback (same body layout as Format A).
-                        let mut batch = WriteBatch::default();
-                        let mut account_count = 0u64;
-                        let mut c = cursor;
-                        while c + 4 <= decompressed.len() {
-                            let key_len = u32::from_le_bytes(
-                                match decompressed[c..c+4].try_into() { Ok(b) => b, Err(_) => break }
-                            ) as usize;
-                            c += 4;
-                            if c + key_len > decompressed.len() || key_len > 1_000_000 { break; }
-                            let key = &decompressed[c..c+key_len];
-                            c += key_len;
-                            if c + 4 > decompressed.len() { break; }
-                            let value_len = u32::from_le_bytes(
-                                match decompressed[c..c+4].try_into() { Ok(b) => b, Err(_) => break }
-                            ) as usize;
-                            c += 4;
-                            if c + value_len > decompressed.len() || value_len > 100_000_000 { break; }
-                            let value = &decompressed[c..c+value_len];
-                            c += value_len;
-                            batch.put_cf(&accounts_cf, key, value);
-                            account_count += 1;
-                        }
-                        self.persistent.db.write(batch)?;
-                        println!("[INFO][SNAPSHOT] format_B_kv_fallback h={} accounts={}", height, account_count);
-                        // v32.10: count check removed — see above.
-                    }
-                }
-            }
-
-            // Set chain_height so node syncs only blocks AFTER snapshot.
-            self.set_chain_height(height)?;
-            println!("[INFO][SNAPSHOT] format_B_chain_height_set h={}", height);
-
-            if crate::node::is_info() {
-                println!("[INFO][SNAPSHOT] format_B_load_complete h={}", height);
-            }
-            return Ok(());
+            // This snapshot-restore path is Super consensus machinery. Light nodes are pure mobile API
+            // clients — they store NO chain data and never cold-join, so they never reach here. A
+            // Format-B blob lacks node_registry (vrf_pk / srtr_ / lrtr_ / cbw), so it is incomplete for
+            // the consensus roster a Super must derive: reject closed and let the caller re-target a
+            // complete (Format A) source or fall back to verified block-sync.
+            return Err(IntegrationError::StorageError(format!(
+                "format_B_incomplete_for_consensus h={} reason=no_node_registry", height
+            )));
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -9143,6 +9013,11 @@ impl Storage {
         if self.storage_mode != StorageMode::Super || current_height <= retention_blocks {
             return Ok(0);
         }
+        // Body-only prune: deletes ONLY microblock_{h} bodies, KEEPING macroblock objects +
+        // microblock_hash_{h} (the cold-join lineage walk reads macroblock OBJECTS, never bodies), so it
+        // can never cross anything that walk needs — no WS-floor clamp required. (An earlier clamp tied to
+        // the FROZEN snapshot join-anchor wrongly froze pruning forever above the anchor → unbounded
+        // growth on snapshot-joined nodes; removed.)
         let prune_before = current_height - retention_blocks;
 
         let microblocks_cf = self.persistent.db.cf_handle("microblocks")
@@ -9173,6 +9048,16 @@ impl Storage {
         }
         batch.put_cf(&metadata_cf, WATERMARK_KEY, &prune_before.to_le_bytes());
         self.persistent.db.write(batch)?;
+        // Physically reclaim the aged-out body range (tombstones otherwise persist until natural
+        // compaction). Range-scoped ⇒ cost proportional to the pruned span, not the whole CF.
+        self.persistent.db.compact_range_cf(
+            &microblocks_cf,
+            Some(format!("microblock_{}", from).as_bytes()),
+            Some(format!("microblock_{}", prune_before).as_bytes()),
+        );
+        if crate::node::is_info() {
+            println!("[INFO][STORAGE] body_prune_compacted from={} to={}", from, prune_before);
+        }
 
         Ok(prune_before - from)
     }
@@ -9689,67 +9574,114 @@ impl Storage {
             return Ok(());
         }
 
-        // v32.13: macroblock fetch with bounded retry. Single-shot fetch
-        // failed under network/peer cascade load; joiners then fell back to
-        // slow block-by-block. Retry with exponential backoff covers
-        // transient peer unavailability (peers busy with their own view-change).
-        // 8 windows × repair-window(64) reaches deep lineages (height ~46k); true maturity is served
-        // by the weak-subjectivity checkpoint (P4) which removes the lineage walk entirely.
-        const MB_FETCH_MAX_ATTEMPTS: u32 = 8;
-        const MB_FETCH_BASE_DELAY_MS: u64 = 2_000;
-        let mut macroblock_bytes_opt: Option<Vec<u8>> = self.get_macroblock_by_height(mb_idx)
-            .map_err(|e| IntegrationError::Other(format!("mb_load_err mb={} err={:?}", mb_idx, e)))?;
+        // ── Genesis/pin-rooted inductive lineage walk (weak-subjectivity trust root) ───────────────
+        // A snapshot peer controls the bytes it serves, so the anchor's 2f+1 QC must NOT be trusted
+        // against a committee derived from peer-served data alone (that is circular — a byzantine server
+        // forges a self-consistent anchor + predecessors + QC). Instead we re-verify the macroblock
+        // lineage from an EXOGENOUS root up to the anchor: verify_v2_macroblock checks each macroblock's
+        // QC against the committee sampled from its already-verified N-2 predecessor, and a macroblock
+        // only stores after that verify passes (process_received_macroblock), so "contiguously present
+        // in storage" ⟺ "inductively verified". Roots: fresh/young chain ⇒ genesis (the first two
+        // macroblocks use the embedded genesis committee); mature chain ⇒ the binary WS pin (its
+        // macroblock by hash + predecessor by the previous_hash chain, handled in verify_v2_macroblock).
+        struct AnchorReset(u64);
+        impl Drop for AnchorReset {
+            fn drop(&mut self) {
+                // Restore the prior runtime floor on ANY early return; only a fully-verified anchor
+                // commits a new floor (adopt_snapshot_finality + mem::forget at the end). No provisional
+                // floor is set during the walk (the old mb_idx-3 shortcut was the circularity hole).
+                crate::node::SNAPSHOT_ANCHOR_MB.store(self.0, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let anchor_guard = AnchorReset(crate::node::SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst));
+
+        let base = crate::node::effective_ws_checkpoint();
+        if mb_idx < base.0 {
+            let _ = self.discard_snapshot_state(snapshot_height);
+            return Err(IntegrationError::Other(format!(
+                "snapshot_below_ws mb={} ws={} action=reject_snapshot", mb_idx, base.0
+            )));
+        }
+        // Bound the walk so a stale binary pin can't silently degrade into an unbounded genesis-to-tip
+        // re-verify (DoS-on-self + a wider trust window): beyond the bound the operator must ship a
+        // binary carrying a fresher pin. INERT for a young chain (mb_idx - base.0 small).
+        const MAX_WS_WALK_MB: u64 = 1024; // ~92k blocks (~1 day at 1 blk/s); rotate WS_CHECKPOINT to stay under
+        if mb_idx.saturating_sub(base.0) > MAX_WS_WALK_MB {
+            let _ = self.discard_snapshot_state(snapshot_height);
+            return Err(IntegrationError::Other(format!(
+                "snapshot_ws_walk_too_long mb={} ws={} max={} action=upgrade_binary_pin",
+                mb_idx, base.0, MAX_WS_WALK_MB
+            )));
+        }
+        // Where to begin filling: from genesis (1) on a fresh chain; just above the base when the base
+        // macroblock is already present (a prior adoption — fill only the new gap); else from the pinned
+        // pair (pin.0-1) so the binary-pin macroblock + its predecessor bootstrap forward verification.
+        let walk_from = if base.0 == 0 {
+            1
+        } else if self.get_macroblock_by_height(base.0).ok().flatten().is_some() {
+            base.0.saturating_add(1)
+        } else {
+            base.0.saturating_sub(1).max(1)
+        };
+
+        // Fill the contiguous lineage [walk_from ..= mb_idx] bottom-up. The cursor slides past
+        // already-stored (⇒ verified) macroblocks; each attempt re-requests from the lowest-missing so
+        // the repair window slides forward. Back off only when an attempt made NO progress.
+        const MB_FETCH_MAX_ATTEMPTS: u32 = 128; // server caps ~10 macroblocks/response ⇒ ≥ MAX_WS_WALK_MB/10 (+margin)
+        const MB_FETCH_BASE_DELAY_MS: u64 = 1_000;
+        let mut lineage_from = walk_from;
         let mut attempt = 0u32;
-        // Monotonic lineage cursor. Storing macroblock N requires its N-2 predecessor (Checkpoint-BFT
-        // anchor), so a fresh joiner must fill the lineage [first-missing ..= mb_idx]. The snapshot
-        // set chain_height=mb_idx*90 WITHOUT storing the macroblock objects, so
-        // get_latest_macroblock_index() (= chain_height/90) is mb_idx and the old `latest+1` start
-        // was > mb_idx → an empty request → mb never fetched (the root of "snapshot binding never
-        // worked"). We advance this cursor past contiguously-stored macroblocks each attempt so the
-        // repair window SLIDES forward toward mb_idx (a fixed from=1 capped reachability at ~64
-        // macroblocks). Warm nodes (already-stored) skip straight to mb_idx.
-        let mut lineage_from = 1u64;
-        while macroblock_bytes_opt.is_none() && attempt < MB_FETCH_MAX_ATTEMPTS {
-            attempt += 1;
-            while lineage_from < mb_idx
+        loop {
+            while lineage_from <= mb_idx
                 && self.get_macroblock_by_height(lineage_from).ok().flatten().is_some()
             {
                 lineage_from = lineage_from.saturating_add(1);
             }
+            if lineage_from > mb_idx { break; } // full contiguous lineage present ⇒ inductively verified
+            attempt += 1;
+            if attempt > MB_FETCH_MAX_ATTEMPTS { break; }
+            let before = lineage_from;
             if crate::node::is_info() {
                 println!(
-                    "[INFO][SYNC] verifier_fetching_macroblock mb={} from={} attempt={}/{} for_snapshot_h={}",
-                    mb_idx, lineage_from, attempt, MB_FETCH_MAX_ATTEMPTS, snapshot_height,
+                    "[INFO][SYNC] verifier_lineage_walk from={} to={} attempt={}/{} for_snapshot_h={}",
+                    lineage_from, mb_idx, attempt, MB_FETCH_MAX_ATTEMPTS, snapshot_height,
                 );
             }
             if let Err(e) = p2p.sync_macroblocks_repair(lineage_from, mb_idx).await {
                 if crate::node::is_warn() {
                     println!(
-                        "[WARN][SYNC] verifier_macroblock_fetch_retry mb={} from={} attempt={}/{} err={}",
-                        mb_idx, lineage_from, attempt, MB_FETCH_MAX_ATTEMPTS, e,
+                        "[WARN][SYNC] verifier_lineage_fetch_retry from={} to={} attempt={}/{} err={}",
+                        lineage_from, mb_idx, attempt, MB_FETCH_MAX_ATTEMPTS, e,
                     );
                 }
             }
-            macroblock_bytes_opt = self.get_macroblock_by_height(mb_idx)
-                .map_err(|e| IntegrationError::Other(format!("mb_reload_err mb={} err={:?}", mb_idx, e)))?;
-            if macroblock_bytes_opt.is_none() && attempt < MB_FETCH_MAX_ATTEMPTS {
+            // Re-slide to measure progress before deciding to back off.
+            while lineage_from <= mb_idx
+                && self.get_macroblock_by_height(lineage_from).ok().flatten().is_some()
+            {
+                lineage_from = lineage_from.saturating_add(1);
+            }
+            if lineage_from == before {
                 let backoff_ms = MB_FETCH_BASE_DELAY_MS.saturating_mul(1u64 << (attempt - 1).min(3));
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
             }
         }
-        let macroblock_bytes = match macroblock_bytes_opt {
-            Some(b) => b,
-            None => {
+
+        let macroblock_bytes = match self.get_macroblock_by_height(mb_idx)
+            .map_err(|e| IntegrationError::Other(format!("mb_reload_err mb={} err={:?}", mb_idx, e)))?
+        {
+            Some(b) if lineage_from > mb_idx => b, // anchor present AND lineage [walk_from..=mb_idx] contiguous
+            _ => {
                 if crate::node::is_warn() {
                     println!(
-                        "[WARN][SYNC] verifier_macroblock_unavailable mb={} attempts={} action=reject_snapshot",
-                        mb_idx, MB_FETCH_MAX_ATTEMPTS,
+                        "[WARN][SYNC] verifier_lineage_incomplete mb={} reached={} attempts={} action=reject_snapshot",
+                        mb_idx, lineage_from.saturating_sub(1), MB_FETCH_MAX_ATTEMPTS,
                     );
                 }
                 let _ = self.discard_snapshot_state(snapshot_height);
                 return Err(IntegrationError::Other(format!(
-                    "snapshot_binding_unavailable mb={} reason=mb_fetch_exhausted attempts={}",
-                    mb_idx, MB_FETCH_MAX_ATTEMPTS
+                    "snapshot_binding_unavailable mb={} reason=lineage_incomplete reached={}",
+                    mb_idx, lineage_from.saturating_sub(1)
                 )));
             }
         };
@@ -9859,6 +9791,31 @@ impl Storage {
             }
         }
 
+        // Materialize every derived index a forward producer/validator reads (registry_root LtHash, cbw,
+        // super/light reward roster) and contract-check vrf_pk — BEFORE committing the WS floor. Doing it
+        // here, while the AnchorReset guard is still armed, keeps floor adoption ATOMIC with whole-snapshot
+        // success: a rebuild/vrf failure discards the state AND the guard restores the prior floor on
+        // return, never leaving chain_height=0 with the finality/WS floor pinned (which would deadlock the
+        // block-sync fallback). vrf_pk has no recompute-from-state path, so it is a hard completeness gate.
+        if let Err(e) = self.rebuild_registry_lthash(snapshot_height)
+            .and_then(|_| self.rebuild_committed_burn_wallet(snapshot_height))
+            .and_then(|_| self.backfill_roster_indices())
+            .map(|_| ())
+            .and_then(|_| self.verify_snapshot_vrf_pk_complete())
+        {
+            if crate::node::is_warn() {
+                println!("[WARN][SYNC] snapshot_index_rebuild_failed mb={} err={:?} action=reject_snapshot", mb_idx, e);
+            }
+            let _ = self.discard_snapshot_state(snapshot_height);
+            return Err(IntegrationError::Other(format!(
+                "snapshot_index_rebuild_failed mb={} err={:?}", mb_idx, e
+            )));
+        }
+
+        // Anchor verified (2f+1 QC + Pattern-C state + registry binding + derived indices): commit it as
+        // the joiner's trusted finality + WS floor and keep it (don't let the guard restore the prior floor).
+        crate::node::adopt_snapshot_finality(snapshot_height, macroblock.hash());
+        std::mem::forget(anchor_guard);
         if crate::node::is_info() {
             println!(
                 "[INFO][SYNC] verifier_pass mb={} snapshot_h={} root={} pattern=C",
@@ -10296,14 +10253,17 @@ impl Storage {
         match self.download_and_load_snapshot(p2p).await {
             Ok(snapshot_height) => {
                 println!("[INFO][STORAGE] snapshot_loaded height={}", snapshot_height);
-                
-                // Now sync remaining blocks from snapshot to target
+
+                // Derived consensus/reward indices (registry_root LtHash, cbw, roster) and the vrf_pk
+                // completeness contract were materialized + checked inside verify_snapshot_consensus_binding
+                // BEFORE the WS floor was adopted (fail-closed there, atomic with floor adoption), so by
+                // here the snapshot is fully consistent and forward-ready.
+                println!("[INFO][STORAGE] snapshot_indices_rebuilt h={}", snapshot_height);
+
                 if target_height > snapshot_height {
-                    println!("[INFO][STORAGE] sync_remaining_start count={}", 
+                    println!("[INFO][STORAGE] sync_remaining_start count={}",
                             target_height - snapshot_height);
-                    // The node will handle syncing remaining blocks
                 }
-                
                 Ok(())
             },
             Err(e) => {

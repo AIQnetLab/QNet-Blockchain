@@ -18875,6 +18875,40 @@ impl SimplifiedP2P {
             rate_limit.requests.push(current_time);
         }
 
+        // Self-scoped TOTAL serve ceiling (anti distributed-flood). The per-(IP,id) burst above bounds
+        // any single source, but a spoofed flood across many keys could still pile up on one node. A
+        // committee member serves anchors generously as a first-class duty (the E fan-out routes joiners
+        // here), so the ceiling is high — but bounded so one node can never serve unboundedly. Genesis
+        // peers bypass (trusted). am_committee is observability only. (Separate from the burst entry
+        // above: never hold two DashMap entries of the same map at once → that one is already dropped.)
+        if !is_genesis_peer {
+            let am_committee = self.deterministic_eligible_ids()
+                .map(|c| c.contains(&self.node_id)).unwrap_or(false);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            const MB_ANCHOR_SERVE_TOTAL: usize = 5_000; // node-global anchor serves / minute
+            let mut serve = self.rate_limiter.entry("mb_anchor_serve_self".to_string()).or_insert_with(|| RateLimit {
+                requests: Vec::new(),
+                max_requests: MB_ANCHOR_SERVE_TOTAL,
+                window_seconds: 60,
+                blocked_until: 0,
+            });
+            let window = serve.window_seconds;
+            let cap = serve.max_requests;
+            serve.requests.retain(|&t| t > now.saturating_sub(window));
+            if serve.requests.len() >= cap {
+                if crate::node::is_warn() {
+                    println!("[WARN][ANCHOR] serve_ceiling_reached am_committee={} idx={}", am_committee as u8, index);
+                }
+                return;
+            }
+            serve.requests.push(now);
+            if crate::node::is_info() && serve.requests.len() % 500 == 0 {
+                println!("[INFO][ANCHOR] committee_serve am_committee={} served_1m={} idx={}",
+                         am_committee as u8, serve.requests.len(), index);
+            }
+        }
+
         if let Some(ref sync_tx) = self.macroblock_sync_request_tx {
             let _ = sync_tx.try_send((index, index, requester_id));
         }
@@ -19250,13 +19284,41 @@ impl SimplifiedP2P {
             return Err("No Super/Full nodes available for macroblock sync".to_string());
         }
         
-        // Sort: prefer LIVE genesis (reliable anchor sources), then by reputation.
+        // Committee fan-out (E): at scale, prefer the deterministic VRF-committee members among our
+        // connected Super peers so 100k joiners spread the anchor/macroblock fetch across the committee
+        // instead of stampeding the 5 genesis. Membership is on-chain deterministic (Sybil-safe), and
+        // WITHIN the committee tier we order by a per-joiner salt so different joiners pick different
+        // members (no thundering herd onto the lexicographically-first one). Genesis-liveness then
+        // reputation order the non-committee tail. INERT pre-committee (None ⇒ prior genesis+rep order).
+        let committee = self.deterministic_eligible_ids();
+        let salt = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.node_id.hash(&mut h);
+            h.finish()
+        };
+        let salted = |id: &str| -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            salt.hash(&mut h);
+            id.hash(&mut h);
+            h.finish()
+        };
         eligible_peers.sort_by(|a, b| {
-            let a_gen = working_genesis_ips.iter().any(|ip| ip == a.addr.split(':').next().unwrap_or(""));
-            let b_gen = working_genesis_ips.iter().any(|ip| ip == b.addr.split(':').next().unwrap_or(""));
-            b_gen.cmp(&a_gen).then_with(|| b.combined_reputation()
-                .partial_cmp(&a.combined_reputation())
-                .unwrap_or(std::cmp::Ordering::Equal))
+            let a_cm = committee.as_ref().map(|c| c.contains(&a.id)).unwrap_or(false);
+            let b_cm = committee.as_ref().map(|c| c.contains(&b.id)).unwrap_or(false);
+            // Committee members first; within the tier, per-joiner salted spread.
+            b_cm.cmp(&a_cm).then_with(|| {
+                if a_cm && b_cm {
+                    salted(&a.id).cmp(&salted(&b.id))
+                } else {
+                    let a_gen = working_genesis_ips.iter().any(|ip| ip == a.addr.split(':').next().unwrap_or(""));
+                    let b_gen = working_genesis_ips.iter().any(|ip| ip == b.addr.split(':').next().unwrap_or(""));
+                    b_gen.cmp(&a_gen).then_with(|| b.combined_reputation()
+                        .partial_cmp(&a.combined_reputation())
+                        .unwrap_or(std::cmp::Ordering::Equal))
+                }
+            })
         });
         
         // Create request message
@@ -19277,8 +19339,10 @@ impl SimplifiedP2P {
             None => return Err("Storage unavailable for macroblock sync".to_string()),
         };
         
-        let max_peers_to_try = 5.min(eligible_peers.len());
-        
+        // Widen the try-count (was 5) so a few slow/absent committee members don't serialize the joiner;
+        // still bounded (DoS-safe) and fans the fetch across more servers than the 5 genesis.
+        let max_peers_to_try = 8.min(eligible_peers.len());
+
         for (attempt, peer) in eligible_peers.iter().take(max_peers_to_try).enumerate() {
             if peer.id == self.node_id {
                 continue;
