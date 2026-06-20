@@ -83,6 +83,26 @@ pub fn take_fork_recovery_signal() -> Option<u64> {
     }
 }
 
+// Apply-stage circuit-breaker: consecutive apply failures (state_root_mismatch) with no
+// clean apply in between. Repeated failure means the local base is contaminated; the node
+// stops re-applying onto it (the wedge) and escalates to fail-closed fork recovery. Counted
+// across heights so a mismatch that hops to the next height cannot reset the count and dodge
+// the breaker. Cleared on any successful apply.
+static APPLY_MISMATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+const APPLY_MISMATCH_BREAKER: u64 = 3;
+
+/// Record an apply failure; returns true once it trips the breaker.
+fn record_apply_mismatch() -> bool {
+    APPLY_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1 >= APPLY_MISMATCH_BREAKER
+}
+
+/// Reset the breaker after a clean apply.
+fn clear_apply_mismatch() {
+    if APPLY_MISMATCH_COUNT.load(Ordering::Relaxed) != 0 {
+        APPLY_MISMATCH_COUNT.store(0, Ordering::Relaxed);
+    }
+}
+
 // Distinct-peer witness tracker for microblock minority-fork detection.
 // Height → set of distinct peer_ids that reported hash_chain_break there.
 // DETECTION threshold is f+1, NOT 2f+1: a node on a minority fork cannot
@@ -2239,6 +2259,7 @@ impl BlockPipeline {
                         matches!(t.tx_type, qnet_state::TransactionType::NodeActivation { .. })
                             && !this_block_burned.contains(&t.from)
                             && !storage.wallet_is_burn_registered(&t.from)
+                            && !storage.wallet_is_genesis_node(&t.from) // genesis self-activates w/o burn
                     });
                     if unbacked {
                         if is_warn() {
@@ -2542,11 +2563,22 @@ impl BlockPipeline {
                     // (e.g. a contaminated/orphaned base), not the peer's fault. Striking honest
                     // peers poisoned the pool and blocked cold-start recovery. Genuine forks are
                     // resolved by fork-choice; malice by on-chain analyze_chain_for_slashing.
+
+                    // Circuit-breaker: re-applying the same canonical block onto a contaminated
+                    // base mismatches forever (the wedge). On threshold, escalate to fork
+                    // recovery — which is fail-closed and ends in a clean QC-verified state-sync.
+                    if record_apply_mismatch() {
+                        FORK_RECOVERY_HEIGHT.store(height.saturating_sub(1).max(1), Ordering::SeqCst);
+                        if is_warn() {
+                            println!("[WARN][PIPELINE] apply_breaker_tripped h={} action=fork_recovery", height);
+                        }
+                    }
                     metrics.mark_apply_idle();
                     continue;
                 }
 
                 // v14.8: Successful apply — clear any past strikes for this peer.
+                clear_apply_mismatch();
                 if let Some(ref p2p) = ctx.unified_p2p {
                     p2p.record_apply_success(&block.from_peer);
                 }

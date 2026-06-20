@@ -345,7 +345,12 @@ impl SyncManager {
     /// Check if we're behind and need to sync.
     async fn check_desync(&self) {
         let snap = self.coordinator.snapshot();
-        let network_h = self.p2p.get_best_peer_height();
+        // D1: drive the desync decision off the QC-verified frontier (bootstrap-cross-checked),
+        // NOT the raw BEST_PEER_HEIGHT atomic. That scalar is monotonic (never decays) and is
+        // polluted by stale/frozen per-peer heights, so a phantom value could spuriously trigger
+        // or a stale-low one suppress sync. detect_network_height floors to the frontier — the same
+        // source the SyncToNetwork command path uses — so stale peers can no longer mis-drive it.
+        let network_h = self.detect_network_height().await;
         let local_h = snap.chain_height;
 
         if network_h > local_h + self.config.auto_sync_gap {
@@ -391,7 +396,18 @@ impl SyncManager {
     ///   would verify (missing previous_hash for genesis) — triggering a cycle
     ///   of deferred_full drops until genesis eventually arrives randomly.
     async fn execute_sync(&self, target: u64) {
-        let local_h = self.coordinator.chain_height();
+        let mut local_h = self.coordinator.chain_height();
+
+        // D1: never let an unverified scalar drive the bulk target. Floor it to the QC-verified
+        // finality frontier (authoritative); an unverified hint may only add the ≤2-macroblock
+        // unsealed tail above it. frontier==0 (fresh genesis, h<90) ⇒ target as-is so the
+        // 5-genesis bootstrap is never blocked. Mirrors detect_network_height; protects every
+        // caller (SyncTo / SyncToNetwork / check_desync / snapshot fast-path) uniformly.
+        let target = {
+            let frontier = crate::node::qc_verified_frontier_height();
+            if frontier == 0 { target }
+            else { std::cmp::max(frontier, std::cmp::min(target, frontier.saturating_add(180))) }
+        };
 
         if local_h >= target {
             if is_debug() {
@@ -423,6 +439,48 @@ impl SyncManager {
         if is_info() {
             println!("[INFO][SYNC] start local={} target={} gap={} peers={} mode=pipelined_credits",
                      local_h, target, target - local_h, peer_count);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // COLD-JOIN SNAPSHOT FAST-PATH (THE ROOT FIX). A fresh / far-behind node
+        // CANNOT converge block-by-block — the pipelined loop below only closes a
+        // SMALL gap; for a large one, block production outpaces the joiner and the
+        // gap grows without bound (a 6k-block joiner never catches up). The node MUST
+        // restore a remote state snapshot FIRST (jump to ~tip), then the loop syncs
+        // only the residual tail. This step existed in the legacy sync path but was
+        // LOST when SyncManager replaced it (the old fast_sync_with_snapshot call
+        // sites became dead/unreachable), so every real super-node fell to block-by-
+        // block and never onboarded. The snapshot DOWNLOAD + 2f+1-QC binding +
+        // microblock-hash backfill all already exist in storage and are correct
+        // (verify_snapshot_consensus_binding is QC-anchored, fail-close) — they were
+        // simply never INVOKED on the live cold-start engine. Fire on a cold join
+        // (local==0) or a large gap; on failure (no network snapshot yet — e.g. a
+        // sub-interval fresh genesis) fall through to the block-by-block path below.
+        // On success local_h is advanced so the genesis-h=0 fetch is skipped and the
+        // loop only fills the tail. Same proven call the legacy node.rs path used.
+        const SNAPSHOT_FAST_PATH_GAP: u64 = 1_500;
+        if local_h == 0 || target.saturating_sub(local_h) > SNAPSHOT_FAST_PATH_GAP {
+            match self.storage.fast_sync_with_snapshot(&self.p2p, target).await {
+                Ok(()) => {
+                    let restored = self.storage.get_chain_height().unwrap_or(local_h);
+                    if restored > local_h {
+                        local_h = restored;
+                        self.progress_height.store(restored, Ordering::Relaxed);
+                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(restored, Ordering::Release);
+                        if is_info() {
+                            println!("[INFO][SYNC] snapshot_restored h={} target={} tail={}",
+                                     restored, target, target.saturating_sub(restored));
+                        }
+                    } else if is_info() {
+                        println!("[INFO][SYNC] snapshot_no_advance local={} — fallback block_sync", local_h);
+                    }
+                }
+                Err(e) => {
+                    if is_info() {
+                        println!("[INFO][SYNC] snapshot_unavailable reason={:?} fallback=block_sync", e);
+                    }
+                }
+            }
         }
 
         // Adaptive-window + credit-based backpressure config. HONEST NOTE:

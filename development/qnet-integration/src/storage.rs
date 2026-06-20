@@ -6117,6 +6117,21 @@ impl Storage {
         }
     }
 
+    /// True iff `wallet` belongs to a GENESIS bootstrap node — its registration maps (wallet_ reverse
+    /// index) to a node_id the genesis constants recognise. Genesis nodes are protocol-minted and
+    /// activate WITHOUT a 1DEV burn (they ARE the bootstrap), so the NodeActivation burn-gate must
+    /// exempt them — mirroring exactly the registration burn-attestation gate's genesis exemption
+    /// (is_legacy_genesis_node). Without this, a genesis self-activation (empty burn) is wrongly dropped.
+    pub fn wallet_is_genesis_node(&self, wallet: &str) -> bool {
+        let cf = match self.persistent.db.cf_handle("node_registry") { Some(c) => c, None => return false };
+        match self.persistent.db.get_cf(&cf, format!("wallet_{}", wallet).as_bytes()) {
+            Ok(Some(v)) => serde_json::from_slice::<serde_json::Value>(&v).ok()
+                .and_then(|j| j["node_id"].as_str().map(|s| crate::genesis_constants::is_legacy_genesis_node(s)))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
     /// Rebuild the committed burn→wallet index (cbw_) DETERMINISTICALLY from the chain-confirmed
     /// node_ registry entries, considering ONLY registrations with reg_height <= up_to_height.
     /// cbw is a pure DERIVED index, never deleted per-block — so a snapshot/fast-sync join (restores
@@ -10811,6 +10826,11 @@ mod v32_9_pattern_c_tests {
         assert!(!storage.wallet_is_burn_registered("walletG"), "empty-burn registration ⇒ not a burn proof");
         // A raw activation from an unregistered wallet is rejected.
         assert!(!storage.wallet_is_burn_registered("walletX"), "no registration ⇒ activation rejected");
+        // Genesis exemption: genesis self-activates without a 1DEV burn, so the gate must let it through
+        // via wallet_is_genesis_node (mirrors the registration burn-gate's is_legacy_genesis_node).
+        assert!(storage.wallet_is_genesis_node("walletG"), "genesis wallet ⇒ activation exempt");
+        assert!(!storage.wallet_is_genesis_node("walletA"), "non-genesis super ⇒ NOT genesis-exempt");
+        assert!(!storage.wallet_is_genesis_node("walletX"), "unregistered ⇒ NOT genesis-exempt");
     }
 
     #[test]

@@ -3676,31 +3676,43 @@ impl BlockchainNode {
         // reject so the caller re-syncs from canonical instead of forking.
         // No binding at this boundary ⇒ cannot verify, accept with warning
         // (legitimate at pre-binding/early heights).
+        // Fail-closed by default: the ONLY accepted outcome is a recomputed state_root that
+        // equals the 2f+1-bound macroblock snapshot_root (Pattern C). Every other path —
+        // pre-finality height, missing/undecodable anchor, no binding, mismatch, recompute
+        // error — returns Err so the caller discards and resyncs from canonical QC state.
         let mb_idx = target_height / 90;
-        if mb_idx > 0 {
-            if let Ok(Some(mb_bytes)) = storage.get_macroblock_by_height(mb_idx) {
-                if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
-                    if let Some(expected_root) = mb.consensus_data.snapshot_root {
-                        match storage.compute_canonical_state_root(target_height) {
-                            Ok(computed) if computed == expected_root => {
-                                println!("[INFO][STATE] reconcile_verified mb={} target={} root={} pattern=C",
-                                         mb_idx, target_height, hex::encode(&computed[..8]));
-                            }
-                            Ok(computed) => {
-                                return Err(format!(
-                                    "reconcile_root_mismatch target={} mb={} expected={} computed={} action=resync",
-                                    target_height, mb_idx,
-                                    hex::encode(&expected_root[..8]), hex::encode(&computed[..8]),
-                                ));
-                            }
-                            Err(e) => {
-                                println!("[WARN][STATE] reconcile_verify_compute_err target={} err={:?}", target_height, e);
-                            }
-                        }
-                    } else {
-                        println!("[WARN][STATE] reconcile_unverified mb={} reason=no_snapshot_root_binding", mb_idx);
-                    }
-                }
+        if mb_idx == 0 {
+            // h<90: no finalized macroblock to prove canonicity ⇒ resync (block-sync from
+            // genesis is cheap pre-finality). Never accept unverified recovery state.
+            return Err(format!("reconcile_pre_finality target={} action=resync", target_height));
+        }
+        let mb_bytes = match storage.get_macroblock_by_height(mb_idx) {
+            Ok(Some(b)) => b,
+            _ => return Err(format!("reconcile_anchor_unavailable mb={} target={} action=resync", mb_idx, target_height)),
+        };
+        let mb = match bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
+            Ok(m) => m,
+            Err(e) => return Err(format!("reconcile_anchor_decode mb={} err={:?} action=resync", mb_idx, e)),
+        };
+        let expected_root = match mb.consensus_data.snapshot_root {
+            Some(r) => r,
+            None => return Err(format!("reconcile_no_binding mb={} target={} action=resync", mb_idx, target_height)),
+        };
+        match storage.compute_canonical_state_root(target_height) {
+            Ok(computed) if computed == expected_root => {
+                println!("[INFO][STATE] reconcile_verified mb={} target={} root={} pattern=C",
+                         mb_idx, target_height, hex::encode(&computed[..8]));
+            }
+            Ok(computed) => {
+                return Err(format!(
+                    "reconcile_root_mismatch target={} mb={} expected={} computed={} action=resync",
+                    target_height, mb_idx, hex::encode(&expected_root[..8]), hex::encode(&computed[..8]),
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "reconcile_verify_unavailable target={} mb={} err={:?} action=resync", target_height, mb_idx, e,
+                ));
             }
         }
         Ok(())
@@ -4219,7 +4231,11 @@ impl BlockchainNode {
             // activation cost. Mirrors select_consensus_committee (same beacon-seeded VRF, one
             // tier up). node_id is a total-order tiebreak for the (cryptographically
             // unreachable) SHA3-collision case.
-            eligible.sort_by(|a, b| {
+            // O(N) partial-select (quickselect) instead of a full O(N log N) sort of the whole
+            // pool — the committee-selection ceiling at 100k+ eligible. Yields the identical set
+            // (the MAX_VALIDATORS lowest VRF scores; node_id total-order tiebreak), then sort only
+            // the selected for deterministic order. Reached only when len > MAX_VALIDATORS.
+            eligible.select_nth_unstable_by(MAX_VALIDATORS, |a, b| {
                 vrf_scores[&a.node_id].cmp(&vrf_scores[&b.node_id])
                     .then_with(|| a.node_id.cmp(&b.node_id))
             });
@@ -13914,10 +13930,20 @@ impl BlockchainNode {
                                             &storage,
                                             rollback_to,
                                         ).await {
+                                            // Reconcile could not PROVE the rebuilt state canonical.
+                                            // Never proceed on unverified state: discard it and reload a
+                                            // 2f+1-QC-bound snapshot (fast_sync verifies the binding,
+                                            // fail-closed), then the tail re-syncs verify-then-apply.
                                             println!(
-                                                "[ERR][STATE] reconcile_after_pipeline_fork_failed target={} err={} action=resync_required",
+                                                "[WARN][STATE] reconcile_unproven target={} err={} action=clean_state_sync",
                                                 rollback_to, e,
                                             );
+                                            let tip = crate::node::qc_verified_frontier_height()
+                                                .max(p2p.get_best_peer_height());
+                                            match storage.fast_sync_with_snapshot(p2p, tip).await {
+                                                Ok(()) => println!("[INFO][STATE] clean_state_sync_ok target={}", tip),
+                                                Err(se) => println!("[WARN][STATE] clean_state_sync_failed err={:?} fallback=block_sync", se),
+                                            }
                                         } else {
                                             println!(
                                                 "[INFO][STATE] reconcile_after_pipeline_fork_ok target={}",
@@ -16505,7 +16531,11 @@ impl BlockchainNode {
                         }).collect();
                         txs.retain(|t| {
                             if matches!(t.tx_type, qnet_state::TransactionType::NodeActivation { .. }) {
-                                let backed = this_block_burned.contains(&t.from) || storage.wallet_is_burn_registered(&t.from);
+                                // Genesis nodes self-activate without a 1DEV burn (they ARE the bootstrap),
+                                // so exempt them — same genesis exemption the registration burn-gate uses.
+                                let backed = this_block_burned.contains(&t.from)
+                                    || storage.wallet_is_burn_registered(&t.from)
+                                    || storage.wallet_is_genesis_node(&t.from);
                                 if !backed && is_warn() { println!("[WARN][MB] drop_unbacked_activation h={}", next_block_height); }
                                 backed
                             } else { true }
