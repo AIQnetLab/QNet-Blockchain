@@ -9113,18 +9113,15 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             // preventing WAL cleanup even with set_max_total_wal_size.
             // ================================================================
             if last_flush.elapsed().as_secs() >= 300 {
-                match blockchain_for_pings.get_storage().flush_all() {
-                    Ok(()) => {
-                        if crate::node::is_debug() {
-                            println!("[DBG][STORAGE] periodic_flush_done interval=5m");
-                        }
-                    }
-                    Err(e) => {
-                        if crate::node::is_warn() {
-                            println!("[WARN][STORAGE] periodic_flush_failed err={}", e);
-                        }
-                    }
-                }
+                // Run the WAL-maintenance flush OFF the consensus runtime via spawn_blocking.
+                // flush_all_background (set_wait(false)) skips the wait-for-complete but CAN still
+                // briefly stall under an L0 backlog, so it must never run on a runtime worker — the
+                // old synchronous flush_all here stalled behind the 2-job pool and starved block
+                // application. Fire-and-forget; the helper logs any per-CF failure.
+                let storage_for_flush = blockchain_for_pings.get_storage();
+                tokio::task::spawn_blocking(move || {
+                    let _ = storage_for_flush.flush_all_background();
+                });
                 last_flush = std::time::Instant::now();
             }
             

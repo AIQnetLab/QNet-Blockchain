@@ -11661,9 +11661,34 @@ impl BlockchainNode {
             });
         }
 
+        // GALC: periodic genesis mint task (every node ticks; no-op for non-genesis / nothing-new). On
+        // genesis nodes it signs + broadcasts a partial for the latest finalized macroblock on the
+        // cadence; partials aggregate to a >=2f+1 capsule on every node, giving cold joiners a fresh
+        // genesis-signed walk root at any chain age without manual pin rotation.
+        {
+            let galc_storage = self.storage.clone();
+            let galc_p2p = self.unified_p2p.clone();
+            let galc_wallet = self.wallet_identity.clone();
+            let galc_node_id = self.node_id.clone();
+            tokio::spawn(async move {
+                // Restore a previously-adopted GALC root from disk (re-verified vs embedded genesis keys;
+                // a stale-network capsule is rejected by the network_id check) so a restarted/dormant-
+                // return node roots + serves from it immediately. No-op on fresh genesis.
+                crate::galc::load_persisted(&galc_storage).await;
+                let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(15));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    if let Some(ref p2p) = galc_p2p {
+                        crate::galc::mint_tick(&galc_storage, p2p, &galc_wallet, &galc_node_id).await;
+                    }
+                }
+            });
+        }
+
         // PRODUCTION v2.78: Start commitment TX submission loop (parallel with block production)
         self.start_commitment_tx_loop().await;
-        
+
         let is_running = self.is_running.clone();
         let mempool = self.mempool.clone();
         let mev_mempool = self.mev_mempool.clone();
@@ -17421,6 +17446,16 @@ impl BlockchainNode {
                     let save_result = storage_clone.save_block_with_delta(height_for_storage, &microblock_data);
                     
                     if let Ok(_) = save_result {
+                        // Publish the applied frontier the instant the block is durably stored, so
+                        // the invariant "block H in storage ⟺ LOCAL_BLOCKCHAIN_HEIGHT >= H" holds on
+                        // the producer path too (the apply-stage dedup fast-path relies on it). Without
+                        // this, a gossip-echo of our own block H arriving before the height publish
+                        // ~290 lines below would re-enter apply as a false non-duplicate (caught only
+                        // by the downstream state_root check). Idempotent with the height-bump below.
+                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                            height_for_storage,
+                            std::sync::atomic::Ordering::Release,
+                        );
                         if is_info() {
                             println!("[INFO][STORAGE] block_saved h={} state_root={}",
                                      height_for_storage, hex::encode(&microblock.state_root[..8]));
@@ -17747,9 +17782,17 @@ impl BlockchainNode {
                     let baseline_due = microblock_height % SNAPSHOT_INCREMENTAL_INTERVAL == 0
                         && microblock_height > 0;
                     if early_anchor || baseline_due {
-                        // Create snapshot synchronously (avoids Send issues with RocksDB)
-                        // This is fast enough to not block production
-                        match storage.create_incremental_snapshot(microblock_height).await {
+                        // Capture the hot in-memory account set at this exact height, then pin a frozen
+                        // DB view (sync flush + snapshot) HERE — before the next block mutates the CF.
+                        // With persist-before-evict the pinned accounts CF is the COMPLETE committed tree
+                        // leaf set, so a cold joiner's recompute reproduces the bound state_root past the
+                        // LRU cap; the heavy serialization runs off-reactor on the frozen view.
+                        let snapshot_accounts = state.read().await.get_all_accounts();
+                        let snap_res = match storage.prepare_snapshot_view(&snapshot_accounts) {
+                            Ok(view) => storage.create_incremental_snapshot(microblock_height, view).await,
+                            Err(e) => Err(e),
+                        };
+                        match snap_res {
                             Ok(_) => {
                                 println!("[INFO][NODE] snapshot_created h={} type=incremental", microblock_height);
                                 
@@ -24836,22 +24879,42 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         //     predecessor by the macroblock previous_hash chain — together the two N-2 committee sources
         //     that bootstrap forward QC verification of both parities. Below the pinned pair is trusted
         //     history we neither hold nor re-verify (Err ⇒ resync above the floor).
-        // `pin` = the binary constant (the inductive ROOT — never the snapshot's own self-reported hash);
-        // `ws` = runtime floor (max of binary pin and the locally-adopted snapshot anchor).
-        let pin = crate::genesis_constants::ws_checkpoint();
+        // `pin` = the inductive hash-trust ROOT = max-by-index of the binary WS pin and the adopted GALC
+        // capsule (both genesis-key-rooted; never the snapshot's own self-reported hash). It carries the
+        // committee_digest (pin.2). `ws` = runtime FLOOR (max of binary pin and the locally-adopted
+        // snapshot anchor) — the below-which-we-don't-re-verify gate, kept SEPARATE so a capsule never
+        // advances finality (that stays gated on the full snapshot binding).
+        let pin = crate::galc::effective_pin_checkpoint();
         let ws = effective_ws_checkpoint();
         if pin.0 > 0 && index == pin.0 {
-            return if macroblock.hash()[..] == pin.1[..] { Ok(()) }
-                   else { Err(format!("v2_ws_pin_mismatch mb={}", index)) };
+            // Hash-trust the pinned macroblock K AND bind its committee-derivation inputs (eligible_
+            // producers + beacon) to the pinned ANCHOR digest. MacroBlock::hash() omits consensus_data,
+            // so without this digest a hash-equal K with forged producers would be stored and poison the
+            // forward committee. Checking K's OWN fields here (not K-1's) needs only K ⇒ no K↔K-1
+            // deadlock, and it rejects a forged K at STORE time via ANY ingress (walk, standalone
+            // MacroblockAnchor, snapshot-anchor==pin.0), not only the contiguous walk.
+            if macroblock.hash()[..] != pin.1[..] {
+                return Err(format!("v2_ws_pin_mismatch mb={}", index));
+            }
+            if crate::galc::committee_fields_digest(macroblock) != pin.2 {
+                return Err(format!("v2_ws_pin_committee_mismatch mb={}", index));
+            }
+            return Ok(());
         }
         if pin.0 > 1 && index == pin.0 - 1 {
-            // Hash-chain trust: the pinned macroblock's previous_hash commits to this predecessor.
+            // Predecessor K-1: trusted by K's previous_hash chain (K is stored first, by hash above) AND
+            // bound to the pinned PRED digest over ITS OWN committee fields. Each branch checks only its
+            // own macroblock's digest, so neither needs the other's consensus_data ⇒ no deadlock.
             return match storage.get_macroblock_by_height(pin.0).ok().flatten()
                 .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok())
             {
-                Some(p) if p.previous_hash[..] == macroblock.hash()[..] => Ok(()),
+                Some(anchor) if anchor.previous_hash[..] == macroblock.hash()[..] => {
+                    if crate::galc::committee_fields_digest(macroblock) != pin.3 {
+                        Err(format!("v2_ws_pin_committee_mismatch mb={}", index))
+                    } else { Ok(()) }
+                }
                 Some(_) => Err(format!("v2_ws_pin_pred_mismatch mb={}", index)),
-                None => Err(format!("v2_qc_defer_anchor mb={} need_pin={}", index, pin.0)), // pin not stored yet ⇒ retry
+                None => Err(format!("v2_qc_defer_anchor mb={} need_pin={}", index, pin.0)),
             };
         }
         if index < ws.0 {

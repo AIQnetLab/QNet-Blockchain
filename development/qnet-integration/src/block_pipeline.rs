@@ -2391,27 +2391,34 @@ impl BlockPipeline {
             // path; if hung, watchdog will surface it.
             metrics.mark_apply_op(height, PIPELINE_OP_APPLY_DEDUP);
             let dedup_start = std::time::Instant::now();
-            // v15.6: Dedup check runs on the blocking pool. The RocksDB lookup
-            // on a hot row competes with the same column family the apply
-            // stage writes to a few microseconds later; running it on the
-            // async path made one slow read freeze the entire stage. The
-            // tokio::task::spawn_blocking handoff is cheap (single channel
-            // hop) and isolates this I/O from runtime liveness.
-            let storage_for_dedup = ctx.storage.clone();
-            let already_applied = match tokio::task::spawn_blocking(move || {
-                storage_for_dedup.load_microblock(height)
-                    .map(|opt| opt.is_some())
-                    .unwrap_or(false)
-            }).await {
-                Ok(v) => v,
-                Err(join_err) => {
-                    if is_warn() {
-                        println!(
-                            "[WARN][PIPELINE] apply_dedup_join_err h={} err={}",
-                            height, join_err
-                        );
+            // Apply is strictly sequential by height and publishes the applied frontier in
+            // LOCAL_BLOCKCHAIN_HEIGHT at commit. A block strictly ABOVE that frontier cannot be a
+            // duplicate, so the common path is answered with an O(1) atomic read — NO hot-path
+            // RocksDB lookup (a storage read here contends with the same CF the apply stage writes
+            // microseconds later, and one slow read under a maintenance-flush/compaction storm
+            // froze the whole stage). Only a re-delivery (height <= frontier) consults storage, off
+            // the hot path on the blocking pool.
+            let applied_tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                .load(std::sync::atomic::Ordering::Acquire);
+            let already_applied = if height > applied_tip {
+                false
+            } else {
+                let storage_for_dedup = ctx.storage.clone();
+                match tokio::task::spawn_blocking(move || {
+                    storage_for_dedup.load_microblock(height)
+                        .map(|opt| opt.is_some())
+                        .unwrap_or(false)
+                }).await {
+                    Ok(v) => v,
+                    Err(join_err) => {
+                        if is_warn() {
+                            println!(
+                                "[WARN][PIPELINE] apply_dedup_join_err h={} err={}",
+                                height, join_err
+                            );
+                        }
+                        false
                     }
-                    false
                 }
             };
             let dedup_elapsed = dedup_start.elapsed();
@@ -3063,22 +3070,35 @@ impl BlockPipeline {
                 }
             }
 
-            // Canonical boundary snapshot (raw accounts-CF dump via create_state_snapshot) at every
-            // SNAPSHOT_INCREMENTAL_INTERVAL, on EVERY node's apply path (not just the producer) so a
-            // cold joiner can fast-sync from any peer. This is the SAME representation the macroblock
-            // snapshot_root binds (compute_canonical_state_root over the accounts CF) → restore
-            // reproduces the bound root. Off-reactor; WARN-only, never blocks liveness.
+            // Canonical boundary snapshot at every SNAPSHOT_INCREMENTAL_INTERVAL, on EVERY node's apply
+            // path so a cold joiner can fast-sync from any peer. Pin a frozen DB view at `height`
+            // SYNCHRONOUSLY here — the serial apply loop has not started H+1, so the flush + snapshot
+            // capture exactly state_root@H. With persist-before-evict the pinned accounts CF is the
+            // COMPLETE committed tree leaf set (hot ∪ evicted), so a cold joiner's recompute reproduces
+            // the bound root past the LRU cap. The heavy serialization runs off-reactor on the frozen view.
             const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
             if height > 0 && height % SNAPSHOT_INCREMENTAL_INTERVAL == 0 {
-                let storage_for_snapshot = ctx.storage.clone();
-                let snapshot_height = height;
-                tokio::spawn(async move {
-                    if let Err(e) = storage_for_snapshot.create_state_snapshot(snapshot_height).await {
+                let snapshot_accounts = ctx.state.read().await.get_all_accounts();
+                match ctx.storage.prepare_snapshot_view(&snapshot_accounts) {
+                    Ok(view) => {
+                        let storage_for_snapshot = ctx.storage.clone();
+                        let snapshot_height = height;
+                        tokio::spawn(async move {
+                            if let Err(e) = storage_for_snapshot
+                                .create_state_snapshot(snapshot_height, view).await
+                            {
+                                if is_warn() {
+                                    println!("[WARN][PIPELINE] snapshot_create_failed h={} err={:?}", snapshot_height, e);
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
                         if is_warn() {
-                            println!("[WARN][PIPELINE] snapshot_create_failed h={} err={:?}", snapshot_height, e);
+                            println!("[WARN][PIPELINE] snapshot_prepare_failed h={} err={:?}", height, e);
                         }
                     }
-                });
+                }
             }
 
             // ────────────────────────────────────────────────────────────────

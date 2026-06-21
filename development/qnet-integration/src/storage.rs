@@ -264,6 +264,21 @@ pub struct PersistentStorage {
     db: Arc<DB>,
 }
 
+/// Owned, thread-movable RocksDB consistent snapshot. The held `Arc<DB>` keeps
+/// the database alive for the whole life of `snap`, which is what makes the
+/// 'static borrow sound. Lets a slow off-reactor snapshot serializer iterate a
+/// frozen point-in-time view, immune to concurrent block application — so the
+/// dump reproduces exactly the boundary state_root even as later blocks mutate
+/// the live DB.
+pub struct PinnedDbSnapshot {
+    // SAFETY: field order is load-bearing — `snap` MUST precede `db`. Rust drops fields in declaration
+    // order, so snap's Drop (release_snapshot, which derefs its lifetime-extended DB borrow) runs FIRST,
+    // while this struct's own Arc<DB> clone still pins the DB alive — making the unsafe 'static extension
+    // locally sound regardless of any external Arc. Do NOT reorder.
+    snap: rocksdb::SnapshotWithThreadMode<'static, DB>,
+    db: Arc<DB>,
+}
+
 /// v5.0: Snapshot manifest for chunked parallel download
 /// Each chunk is independently hashable and downloadable from different peers
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1279,10 +1294,51 @@ impl PersistentStorage {
         if let Err(e) = self.db.flush_opt(&flush_opts) {
             println!("[WARN][STORAGE] flush_default_failed err={}", e);
         }
-        
+
         Ok(())
     }
-    
+
+    /// WAL-maintenance flush for the periodic task: set_wait(false) skips the trailing
+    /// wait-for-flush-complete so the common case returns immediately after scheduling each CF's
+    /// memtable flush (WAL reclamation is preserved). NOTE: this is NOT a hard non-blocking
+    /// guarantee — RocksDB still applies WaitUntilFlushWouldNotStallWrites before the flush, so
+    /// under an L0/immutable-memtable backlog the call CAN briefly block. It is therefore safe ONLY
+    /// off the consensus runtime (the periodic caller dispatches it via spawn_blocking); NEVER call
+    /// it on a runtime worker. flush_all (set_wait(true)) stays for shutdown/OOM, where durability
+    /// must complete before exit.
+    pub fn flush_all_background(&self) -> IntegrationResult<()> {
+        use rocksdb::FlushOptions;
+
+        let mut flush_opts = FlushOptions::default();
+        flush_opts.set_wait(false); // skip wait-for-complete (may still briefly stall under L0 backlog)
+
+        // Must match flush_all's CF set so every CF's memtable is scheduled (WAL is reclaimable
+        // only when ALL CFs have flushed past it).
+        let cf_names = ["blocks", "transactions", "accounts", "metadata",
+                        "microblocks", "consensus", "sync_state",
+                        "pending_rewards", "node_registry", "ping_history",
+                        "failover_events", "snapshots", "tx_index",
+                        "tx_by_address", "attestations", "heartbeats", "poh_state",
+                        "contract_storage", "fcm_tokens", "mempool",
+                        "cross_shard_pending", "cross_shard_receipts"];
+
+        for cf_name in &cf_names {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                if let Err(e) = self.db.flush_cf_opt(&cf, &flush_opts) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][STORAGE] flush_cf_bg_failed cf={} err={}", cf_name, e);
+                    }
+                }
+            }
+        }
+        if let Err(e) = self.db.flush_opt(&flush_opts) {
+            if crate::node::is_warn() {
+                println!("[WARN][STORAGE] flush_default_bg_failed err={}", e);
+            }
+        }
+        Ok(())
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // v3.19: PRUNING - Remove old data to save disk space
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1522,6 +1578,58 @@ impl PersistentStorage {
         })
         .await
         .map_err(|e| IntegrationError::Other(format!("persist_accounts_join_err: {}", e)))?
+    }
+
+    // Sync best-effort batch write to the accounts CF. Called by the cache
+    // eviction sweep (persist-before-evict) so an unpersisted cold mutation
+    // is never lost. Same key/value layout as persist_accounts_batch; one
+    // atomic WriteBatch.
+    pub fn persist_accounts_sync(&self, accounts: &[(String, qnet_state::Account)]) -> IntegrationResult<usize> {
+        if accounts.is_empty() { return Ok(0); }
+        let accounts_cf = self.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let mut batch = WriteBatch::default();
+        for (addr, account) in accounts {
+            let bytes = bincode::serialize(account)
+                .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+            batch.put_cf(&accounts_cf, addr.as_bytes(), &bytes);
+        }
+        self.db.write(batch)?;
+        Ok(accounts.len())
+    }
+
+    // GALC held-capsule persistence (metadata CF). Tiny self-authenticating object; re-verified against
+    // the embedded genesis keys on reload, so a tampered/stale on-disk value cannot poison the root.
+    pub fn put_galc_held(&self, bytes: &[u8]) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.db.put_cf(&cf, b"galc_held", bytes)?;
+        Ok(())
+    }
+    pub fn get_galc_held(&self) -> IntegrationResult<Option<Vec<u8>>> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        Ok(self.db.get_cf(&cf, b"galc_held")?)
+    }
+
+    // (sync, called at a macroblock boundary under the apply context) Flush the
+    // hot in-memory account set to the accounts CF, then pin a consistent
+    // point-in-time DB view. With persist-before-evict keeping cold accounts in
+    // the CF, the pinned view holds the COMPLETE committed tree leaf set at this
+    // height; freezing it lets the off-reactor serializer reproduce state_root@H
+    // even as H+1.. mutate the live DB.
+    pub fn prepare_snapshot_view(
+        &self,
+        hot_accounts: &[(String, qnet_state::Account)],
+    ) -> IntegrationResult<PinnedDbSnapshot> {
+        self.persist_accounts_sync(hot_accounts)?;
+        let snap = self.db.snapshot();
+        // SAFETY: lifetime-extend the snapshot borrow to 'static. PinnedDbSnapshot
+        // stores the same Arc<DB>, which outlives `snap`, so the underlying handle
+        // is always valid; only the (runtime-erased) lifetime changes — layout-identical.
+        let snap: rocksdb::SnapshotWithThreadMode<'static, DB> =
+            unsafe { std::mem::transmute(snap) };
+        Ok(PinnedDbSnapshot { db: self.db.clone(), snap })
     }
 
     /// Load a single account from the persistent `accounts` CF. Used by
@@ -3201,7 +3309,14 @@ impl Storage {
     pub fn flush_all(&self) -> IntegrationResult<()> {
         self.persistent.flush_all()
     }
-    
+
+    /// WAL-maintenance flush for the periodic task (set_wait(false)); see
+    /// PersistentStorage::flush_all_background — MAY briefly block under an L0 backlog, so call it
+    /// ONLY off the consensus runtime. flush_all (synchronous) remains for shutdown/OOM durability.
+    pub fn flush_all_background(&self) -> IntegrationResult<()> {
+        self.persistent.flush_all_background()
+    }
+
     /// Get current storage health status
     pub fn get_storage_health(&self) -> IntegrationResult<StorageHealth> {
         let percentage = self.get_storage_usage_percentage()?;
@@ -7779,14 +7894,32 @@ impl Storage {
     /// per boundary feeds the receiver, snapshot_root, and the rollback
     /// reconciler alike. Runs on the blocking pool (seconds at 1M+
     /// accounts); a real delta path is future work.
-    pub async fn create_incremental_snapshot(&self, height: u64) -> IntegrationResult<()> {
+    // (sync, at a macroblock boundary) Flush the hot account set + pin a frozen
+    // DB view at this height. The caller invokes this synchronously in the apply
+    // path (before H+1 mutates the CF), then hands the view to the async
+    // create_*_snapshot serializer. Proxy to PersistentStorage.
+    pub fn prepare_snapshot_view(
+        &self,
+        hot_accounts: &[(String, qnet_state::Account)],
+    ) -> IntegrationResult<PinnedDbSnapshot> {
+        self.persistent.prepare_snapshot_view(hot_accounts)
+    }
+
+    pub fn put_galc_held(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_galc_held(bytes) }
+    pub fn get_galc_held(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_galc_held() }
+
+    pub async fn create_incremental_snapshot(
+        &self,
+        height: u64,
+        view: PinnedDbSnapshot,
+    ) -> IntegrationResult<()> {
         // v32.6: caller (node.rs) controls trigger heights — early anchor
         // at h=90 + baseline every 3600. This function only enforces
         // height>0; it always writes a full state snapshot when called.
         if height == 0 {
             return Ok(());
         }
-        self.create_state_snapshot(height).await
+        self.create_state_snapshot(height, view).await
     }
     
     /// Create full state snapshot at specified height
@@ -7806,9 +7939,12 @@ impl Storage {
     /// the blocking closure to keep that path linear and easy to reason
     /// about. The lookup is a single point read (microseconds) and does
     /// not need to be on the blocking pool.
-    pub async fn create_state_snapshot(&self, height: u64) -> IntegrationResult<()> {
-        // v10.1: Guard removed — caller (create_incremental_snapshot) already checks intervals.
-        // Previous bug: hardcoded 10_000 here blocked creation at h=43200 (43200 % 10000 = 3200).
+    pub async fn create_state_snapshot(
+        &self,
+        height: u64,
+        view: PinnedDbSnapshot,
+    ) -> IntegrationResult<()> {
+        // Caller (create_incremental_snapshot) already enforces trigger heights.
         if height == 0 {
             return Ok(()); // No snapshot at genesis
         }
@@ -7816,44 +7952,36 @@ impl Storage {
         println!("[INFO][STORAGE] state_snapshot_start height={}", height);
         let start_time = std::time::Instant::now();
 
-        // Pre-fetch boundary timestamp on the async path (single point read).
-        // Sourcing the timestamp from the boundary microblock — rather than
-        // wall-clock SystemTime — guarantees byte-equal snapshots across
-        // every honest node, which is a hard prerequisite for the
-        // `snapshot_root` consensus binding (node.rs:27389+) to converge.
+        // Canonical timestamp from the boundary microblock (not wall-clock) ⇒
+        // byte-equal snapshots across honest nodes. Single point read, off-closure.
         let timestamp: u64 = match self.load_microblock_auto_format(height) {
             Ok(Some(boundary_block)) => boundary_block.timestamp,
             _ => 0,
         };
 
-        let db = self.persistent.db.clone();
+        // All CF reads go through the pinned snapshot (view.snap): a frozen
+        // point-in-time view captured synchronously at this height, so the dump
+        // reproduces exactly state_root@H even while H+1.. mutate the live DB.
         let (account_count, rewards_count, contract_entries, registry_count, compressed_kb, uncompressed_kb) =
             tokio::task::spawn_blocking(move || -> IntegrationResult<(u64, u64, u64, u64, usize, usize)> {
-                // Get snapshot column family
+                let db = &view.db;
+                let snap = &view.snap;
                 let snapshots_cf = db.cf_handle("snapshots")
                     .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
 
-                // Collect state data for snapshot
                 let mut snapshot_data = Vec::new();
-
-                // 1. Add protocol version for compatibility check
                 snapshot_data.extend_from_slice(&crate::node::PROTOCOL_VERSION.to_le_bytes());
-
-                // 2. Add height marker
                 snapshot_data.extend_from_slice(&height.to_le_bytes());
-
-                // 3. Add canonical timestamp (sourced from boundary microblock above)
                 snapshot_data.extend_from_slice(&timestamp.to_le_bytes());
 
-                // 4. Serialize current state (accounts, balances, reputation)
+                // 4. Account state — the COMPLETE committed tree leaf set. The pinned view's accounts
+                //    CF holds every hot account (flushed at prepare) ∪ every cold account (persist-
+                //    before-evict), so recompute reproduces the QC-bound state_root even past the LRU
+                //    cap. Key-ordered iteration ⇒ byte-identical snapshots across nodes.
                 let accounts_cf = db.cf_handle("accounts")
                     .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
-
                 let mut account_count = 0u64;
-                let iter = db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start);
-
-                // Serialize account data
-                for item in iter {
+                for item in snap.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start) {
                     let (key, value) = item?;
                     snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
                     snapshot_data.extend_from_slice(&key);
@@ -7868,7 +7996,7 @@ impl Storage {
                     // Write marker for rewards section
                     snapshot_data.extend_from_slice(b"REWARDS_V1");
 
-                    let rewards_iter = db.iterator_cf(&rewards_cf, rocksdb::IteratorMode::Start);
+                    let rewards_iter = snap.iterator_cf(&rewards_cf, rocksdb::IteratorMode::Start);
                     for item in rewards_iter {
                         let (key, value) = item?;
                         snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -7886,7 +8014,7 @@ impl Storage {
                 let mut contract_entries = 0u64;
                 if let Some(cs_cf) = db.cf_handle("contract_storage") {
                     snapshot_data.extend_from_slice(b"CONTRACT_STORAGE_V1");
-                    let cs_iter = db.iterator_cf(&cs_cf, rocksdb::IteratorMode::Start);
+                    let cs_iter = snap.iterator_cf(&cs_cf, rocksdb::IteratorMode::Start);
                     for item in cs_iter {
                         let (key, value) = item?;
                         snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -7902,7 +8030,7 @@ impl Storage {
                 let mut registry_count = 0u64;
                 if let Some(nr_cf) = db.cf_handle("node_registry") {
                     snapshot_data.extend_from_slice(b"NODE_REGISTRY_V1");
-                    let nr_iter = db.iterator_cf(&nr_cf, rocksdb::IteratorMode::Start);
+                    let nr_iter = snap.iterator_cf(&nr_cf, rocksdb::IteratorMode::Start);
                     for item in nr_iter {
                         let (key, value) = item?;
                         snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -9595,17 +9723,25 @@ impl Storage {
         }
         let anchor_guard = AnchorReset(crate::node::SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst));
 
-        let base = crate::node::effective_ws_checkpoint();
+        // Walk root index = the highest trusted anchor: the finality floor (binary pin / adopted
+        // snapshot anchor) OR the adopted GALC capsule root, whichever is higher — so a held capsule
+        // starts the walk near the tip (bounded) instead of at genesis. base.1 is unused below.
+        let ws_floor = crate::node::effective_ws_checkpoint();
+        let pin = crate::galc::effective_pin_checkpoint();
+        let base: (u64, [u8; 32]) = if pin.0 > ws_floor.0 { (pin.0, pin.1) } else { ws_floor };
         if mb_idx < base.0 {
             let _ = self.discard_snapshot_state(snapshot_height);
             return Err(IntegrationError::Other(format!(
                 "snapshot_below_ws mb={} ws={} action=reject_snapshot", mb_idx, base.0
             )));
         }
-        // Bound the walk so a stale binary pin can't silently degrade into an unbounded genesis-to-tip
-        // re-verify (DoS-on-self + a wider trust window): beyond the bound the operator must ship a
-        // binary carrying a fresher pin. INERT for a young chain (mb_idx - base.0 small).
-        const MAX_WS_WALK_MB: u64 = 1024; // ~92k blocks (~1 day at 1 blk/s); rotate WS_CHECKPOINT to stay under
+        // Bound the walk so a stale root can't degrade into an unbounded genesis-to-tip re-verify
+        // (DoS-on-self CPU + a wider trust window). The GALC capsule normally keeps the root within a
+        // few macroblocks of the anchor (walk ≈ 0); this is the FALLBACK ceiling when no capsule is
+        // held, sized to ~2 weeks so the binary-pin rotation cadence is realistic. INERT for a young
+        // chain (mb_idx - base.0 small). At a 1000-node committee a full-bound walk is a one-time
+        // ~30 min QC re-verify; with a capsule it never approaches this.
+        const MAX_WS_WALK_MB: u64 = 13_440; // ~1.2M blocks (~2 weeks at 1 blk/s)
         if mb_idx.saturating_sub(base.0) > MAX_WS_WALK_MB {
             let _ = self.discard_snapshot_state(snapshot_height);
             return Err(IntegrationError::Other(format!(
@@ -9627,7 +9763,7 @@ impl Storage {
         // Fill the contiguous lineage [walk_from ..= mb_idx] bottom-up. The cursor slides past
         // already-stored (⇒ verified) macroblocks; each attempt re-requests from the lowest-missing so
         // the repair window slides forward. Back off only when an attempt made NO progress.
-        const MB_FETCH_MAX_ATTEMPTS: u32 = 128; // server caps ~10 macroblocks/response ⇒ ≥ MAX_WS_WALK_MB/10 (+margin)
+        const MB_FETCH_MAX_ATTEMPTS: u32 = 1500; // server caps ~10 macroblocks/response ⇒ ≥ MAX_WS_WALK_MB/10 (+margin)
         const MB_FETCH_BASE_DELAY_MS: u64 = 1_000;
         let mut lineage_from = walk_from;
         let mut attempt = 0u32;
@@ -10476,6 +10612,18 @@ impl qnet_state::AccountStore for Storage {
                     );
                 }
                 None
+            }
+        }
+    }
+
+    fn persist_accounts(&self, accounts: &[(String, qnet_state::Account)]) -> bool {
+        match self.persistent.persist_accounts_sync(accounts) {
+            Ok(_) => true,
+            Err(e) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][CACHE] evict_persist_failed count={} err={:?}", accounts.len(), e);
+                }
+                false
             }
         }
     }

@@ -3265,6 +3265,10 @@ impl SimplifiedP2P {
     pub(crate) fn is_control_lane_message(msg: &NetworkMessage) -> bool {
         matches!(msg,
             NetworkMessage::RequestMacroblockAnchor { .. }
+            // GALC capsule traffic: tiny self-authenticating control objects every cold joiner needs.
+            | NetworkMessage::RequestGenesisCheckpoint { .. }
+            | NetworkMessage::GenesisCheckpointSig { .. }
+            | NetworkMessage::GenesisCheckpoint { .. }
         )
     }
 
@@ -12843,6 +12847,30 @@ pub enum NetworkMessage {
         data: Vec<u8>,
         sender_id: String,
     },
+
+    /// GALC: one genesis node's partial signature over a checkpoint (mb_index, mb_hash,
+    /// committee_digest). Aggregated to >=2f+1 → a self-authenticating capsule. Control-lane.
+    GenesisCheckpointSig {
+        version: u16,
+        network_id: [u8; 32],
+        mb_index: u64,
+        mb_hash: [u8; 32],
+        committee_digest_anchor: [u8; 32],
+        committee_digest_pred: [u8; 32],
+        minted_at_height: u64,
+        genesis_id: String,
+        sig: String,
+    },
+
+    /// GALC: a complete >=2f+1-signed capsule (bincode of galc::GenesisCheckpoint). Relayed by any super.
+    GenesisCheckpoint {
+        data: Vec<u8>,
+    },
+
+    /// GALC: cold-joiner request for the latest held capsule. Control-lane.
+    RequestGenesisCheckpoint {
+        requester_id: String,
+    },
 }
 
 /// PRODUCTION: Active node info for gossip sync
@@ -14436,6 +14464,58 @@ impl SimplifiedP2P {
                     println!("[INFO][ANCHOR] anchor_recv idx={} from={} bytes={}", index, sender_id, data.len());
                 }
                 self.handle_macroblocks_batch(vec![(index, data)], index, index, sender_id);
+            }
+
+            NetworkMessage::GenesisCheckpointSig {
+                version, network_id, mb_index, mb_hash, committee_digest_anchor, committee_digest_pred,
+                minted_at_height, genesis_id, sig,
+            } => {
+                // GALC: aggregate a genesis partial. Cheap pre-filter (recent index, real genesis signer)
+                // BEFORE the async Dilithium verify (DoS). verify/aggregate/adopt are global — no self.
+                if version == crate::galc::GALC_VERSION
+                    && mb_index > crate::galc::GALC_MB.load(std::sync::atomic::Ordering::SeqCst)
+                    && crate::genesis_constants::is_legacy_genesis_node(&genesis_id)
+                {
+                    tokio::spawn(async move {
+                        if crate::galc::verify_partial(
+                            version, &network_id, mb_index, &mb_hash, &committee_digest_anchor,
+                            &committee_digest_pred, minted_at_height, &genesis_id, &sig,
+                        ).await {
+                            if let Some(cap) = crate::galc::add_partial(
+                                version, network_id, mb_index, mb_hash, committee_digest_anchor,
+                                committee_digest_pred, minted_at_height, genesis_id, sig,
+                            ) {
+                                crate::galc::adopt_verified(&cap);
+                            }
+                        }
+                    });
+                }
+            }
+
+            NetworkMessage::GenesisCheckpoint { data } => {
+                // GALC: a complete capsule. Cheap pre-screen (deserialize + recent-index) BEFORE the
+                // spawned post-quantum verify; receive_capsule further bounds concurrent verifies (DoS).
+                if let Ok(cap) = bincode::deserialize::<crate::galc::GenesisCheckpoint>(&data) {
+                    if cap.mb_index > crate::galc::GALC_MB.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::spawn(async move {
+                            if let Some(storage) = crate::node::try_get_storage() {
+                                crate::galc::receive_capsule(&cap, &storage).await;
+                            }
+                        });
+                    }
+                }
+            }
+
+            NetworkMessage::RequestGenesisCheckpoint { requester_id } => {
+                // GALC: serve the latest held capsule to a cold joiner (control-lane, tiny).
+                if let Some(cap) = crate::galc::held() {
+                    if let Ok(data) = bincode::serialize(&cap) {
+                        if crate::node::is_info() {
+                            println!("[INFO][GALC] serve_capsule mb={} to={}", cap.mb_index, requester_id);
+                        }
+                        self.send_network_message(from_peer, NetworkMessage::GenesisCheckpoint { data });
+                    }
+                }
             }
 
             NetworkMessage::RequestConsensusState { round, requester_id } => {
@@ -18165,7 +18245,12 @@ impl SimplifiedP2P {
             .as_secs();
 
         let cutoff = now - (15 * 60);  // 15 minutes ago
-        let network_height = self.get_max_peer_height();
+        // Liveness reference = the QC-verified finalized frontier (convergent — every healthy node
+        // agrees on it), NOT the peer-height median. That median is biased up by the producer's
+        // pre-finality tip (relay-raised onto every relaying peer), so an honest peer reporting its
+        // applied tip read ~200 below it and was false-evicted. A peer at/above the finalized
+        // frontier is caught up by construction; only one genuinely below finality trips the gate.
+        let network_height = crate::node::qc_verified_frontier_cached();
 
         // v33: snapshot the LIVE connected-peer height per node_id (refreshed every
         // HealthPing, ~15s — the authoritative committed tip) BEFORE the retain, so we
@@ -18191,13 +18276,20 @@ impl SimplifiedP2P {
             if v.last_seen <= cutoff {
                 return false;
             }
-            // v9.3: Remove if >2 macroblocks behind network (severely desynced).
-            // Don't apply during network bootstrap (network_height < 180).
-            // Don't remove self (local height updates asynchronously).
-            // v33: judge by the freshest known height, not just the lagging snapshot.
+            // Height-evict ONLY a node we directly measure (>2 macroblocks below the QC frontier).
+            // Don't apply during bootstrap (network_height <= 180) or to self (async local height).
+            // v33: judge by the freshest known height, not the lagging gossip snapshot.
+            // A node known only via a relayed ActiveNodeAnnouncement is NOT in connected_peers, so it
+            // has no first-hand height sample (live_known=false; its gossip block_height is 0 when the
+            // announcer wasn't a direct peer). Judging it by that sentinel 0 would false-evict a
+            // healthy super-node at scale, where most of the active set is reached only by gossip — so
+            // skip the height test for it and let the 15-min last_seen TTL (refreshed by continued
+            // announcements) reap it if it actually goes silent. A genuinely-stuck DIRECT peer
+            // (live_known, low height) still evicts.
+            let live_known = live_heights.contains_key(node_id);
             let live_h = live_heights.get(node_id).copied().unwrap_or(0);
             let effective_h = v.block_height.max(live_h);
-            if network_height > 180 && effective_h + 180 < network_height && *node_id != self.node_id {
+            if live_known && network_height > 180 && effective_h + 180 < network_height && *node_id != self.node_id {
                 if crate::node::is_info() {
                     println!("[INFO][P2P] evict_desynced node={} snap={} live={} net={}", node_id, v.block_height, live_h, network_height);
                 }

@@ -345,18 +345,30 @@ impl SyncManager {
     /// Check if we're behind and need to sync.
     async fn check_desync(&self) {
         let snap = self.coordinator.snapshot();
-        // D1: drive the desync decision off the QC-verified frontier (bootstrap-cross-checked),
-        // NOT the raw BEST_PEER_HEIGHT atomic. That scalar is monotonic (never decays) and is
-        // polluted by stale/frozen per-peer heights, so a phantom value could spuriously trigger
-        // or a stale-low one suppress sync. detect_network_height floors to the frontier — the same
-        // source the SyncToNetwork command path uses — so stale peers can no longer mis-drive it.
+        // Trigger sync ONLY off the QC-verified FINALIZED frontier — the convergent reference every
+        // healthy node shares — never the produced tip. detect_network_height both climbs the local
+        // frontier toward the network (its macroblock-lineage probe) and returns the bulk-sync
+        // TARGET (frontier + bounded unsealed tail). The tail ABOVE the frontier is delivered by
+        // block gossip in real time, so the normal intra-rotation production lead must NOT fire a
+        // redundant sync — only a node genuinely below finality (or still cold) catches up here.
         let network_h = self.detect_network_height().await;
+        let frontier = crate::node::qc_verified_frontier_cached();
         let local_h = snap.chain_height;
 
-        if network_h > local_h + self.config.auto_sync_gap {
+        // frontier>0 (steady/warm): behind ⟺ a QC-finalized macroblock sits above the applied tip
+        // (fell behind finality, or the probe just climbed the frontier ahead of us). frontier==0
+        // (fresh/pre-maturity, no local finality anchor): drive off the bootstrap-cross-checked
+        // target so a cold node still onboards.
+        let behind = if frontier > 0 {
+            frontier > local_h.saturating_add(self.config.auto_sync_gap)
+        } else {
+            network_h > local_h.saturating_add(self.config.auto_sync_gap)
+        };
+
+        if behind {
             if is_info() {
-                println!("[INFO][SYNC] desync_detected local={} network={} gap={}",
-                         local_h, network_h, network_h - local_h);
+                println!("[INFO][SYNC] desync_detected local={} frontier={} target={} gap={}",
+                         local_h, frontier, network_h, network_h.saturating_sub(local_h));
             }
             self.execute_sync(network_h).await;
         }
@@ -459,6 +471,22 @@ impl SyncManager {
         // On success local_h is advanced so the genesis-h=0 fetch is skipped and the
         // loop only fills the tail. Same proven call the legacy node.rs path used.
         const SNAPSHOT_FAST_PATH_GAP: u64 = 1_500;
+        // GALC cold/dormant-join: whenever the snapshot fast-path will run (fresh cold join OR a returning
+        // node behind by > the gap), request the latest genesis-signed checkpoint capsule so the lineage
+        // walk roots near the tip (bounded) at ANY chain age — NOT only at local_h==0 (a long-offline warm
+        // node also needs it). Cold join (local_h==0) first ensures block 0 (network_id). Best-effort +
+        // async-verified by the handler; falls back to the binary pin if unavailable.
+        if local_h == 0 || target.saturating_sub(local_h) > SNAPSHOT_FAST_PATH_GAP {
+            if local_h == 0 && self.storage.load_microblock(0).map(|o| o.is_none()).unwrap_or(true) {
+                let _ = self.p2p.sync_blocks(0, 0).await;
+                tokio::time::sleep(Duration::from_millis(800)).await;
+            }
+            let _ = self.p2p.broadcast_quic(&crate::unified_p2p::NetworkMessage::RequestGenesisCheckpoint {
+                requester_id: "cold_joiner".to_string(),
+            }).await;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+
         if local_h == 0 || target.saturating_sub(local_h) > SNAPSHOT_FAST_PATH_GAP {
             match self.storage.fast_sync_with_snapshot(&self.p2p, target).await {
                 Ok(()) => {

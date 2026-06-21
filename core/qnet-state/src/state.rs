@@ -786,6 +786,14 @@ pub trait AccountStore: Send + Sync {
     /// the caller treats both identically (cache miss falls through to
     /// the canonical "account not found" path).
     fn load_account(&self, address: &str) -> Option<Account>;
+
+    /// Durable batch write of accounts. Called by the eviction sweep BEFORE dropping entries from the
+    /// cache; returns true IFF the write durably succeeded. The evictor removes ONLY a successfully-
+    /// persisted batch, so a failed persist (I/O error, or no store) keeps the accounts resident —
+    /// never silently dropping a cold mutation not yet write-through-persisted (genesis /
+    /// producer-inline), which would diverge the persistent mirror from the committed tree. Default
+    /// false (a read-only store never persists ⇒ its accounts are never evicted).
+    fn persist_accounts(&self, _accounts: &[(String, Account)]) -> bool { false }
 }
 
 pub struct StateManager {
@@ -1052,14 +1060,38 @@ impl StateManager {
             .collect();
         sorted.sort_by_key(|(_, ts)| *ts);
 
+        // Persist-before-evict: snapshot the victims' current values and flush
+        // them to the durable store BEFORE dropping from the cache, so a cold
+        // mutation not yet write-through-persisted (genesis / producer-inline)
+        // is never lost — the persistent store stays a complete mirror of the
+        // committed tree. Persist-then-remove (not the reverse) leaves no window
+        // where a concurrent read sees the address as absent.
+        let victims: Vec<(String, Account)> = sorted.iter().take(target_evict)
+            .filter_map(|(addr, _)| self.accounts.get(addr).map(|e| (addr.clone(), e.value().clone())))
+            .collect();
+        // Evict a batch ONLY when it is safe to drop from RAM: if a durable store is wired, evict iff the
+        // persist succeeded (a failed write keeps the victims resident so a cold mutation is never lost
+        // and the persistent mirror never diverges from the committed tree — the next sweep retries). If
+        // NO store is wired (cache-only mode: tests/tooling) there is no durable mirror to diverge from,
+        // so eviction is the intended cache bound. Production always wires the store before raising cap.
+        let persisted = if victims.is_empty() {
+            true
+        } else {
+            match *self.disk_store.read() {
+                Some(ref store) => store.persist_accounts(&victims),
+                None => true,
+            }
+        };
         let mut evicted = 0usize;
-        for (addr, _) in sorted.iter().take(target_evict) {
-            self.accounts.remove(addr);
-            self.last_access.remove(addr);
-            evicted = evicted.saturating_add(1);
-        }
-        if evicted > 0 {
-            self.evictions_total.fetch_add(evicted as u64, std::sync::atomic::Ordering::Relaxed);
+        if persisted {
+            for (addr, _) in &victims {
+                self.accounts.remove(addr);
+                self.last_access.remove(addr);
+                evicted = evicted.saturating_add(1);
+            }
+            if evicted > 0 {
+                self.evictions_total.fetch_add(evicted as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         evicted
     }
@@ -2244,6 +2276,13 @@ mod cache_tests {
             self.load_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.data.read().get(address).cloned()
         }
+        fn persist_accounts(&self, accounts: &[(String, Account)]) -> bool {
+            let mut g = self.data.write();
+            for (addr, acct) in accounts {
+                g.insert(addr.clone(), acct.clone());
+            }
+            true
+        }
     }
 
     fn make_account(balance: u64) -> Account {
@@ -2304,6 +2343,66 @@ mod cache_tests {
         // Subsequent warm hits cache, no extra disk read.
         assert!(sm.warm_account("bob"));
         assert_eq!(store.loads(), 1);
+    }
+
+    /// Persist-before-evict: a cold mutation that never went through the
+    /// write-through path (genesis / producer-inline) must be flushed to the
+    /// durable store at eviction, so durable ∪ cache loses nothing — the
+    /// snapshot-completeness invariant at scale (past the LRU cap).
+    #[test]
+    fn test_persist_before_evict_no_data_loss() {
+        let sm = StateManager::new();
+        let store = MockStore::new();
+        sm.set_disk_store(store.clone() as Arc<dyn AccountStore>);
+        sm.set_cache_capacity(10);
+
+        for i in 0..25u64 {
+            let addr = format!("acct_{:03}", i);
+            sm.accounts.insert(addr.clone(), make_account(i));
+            sm.last_access.insert(addr, i); // ascending ⇒ lowest i evicted first
+        }
+        assert_eq!(sm.accounts.len(), 25);
+
+        let evicted = sm.evict_cold_accounts();
+        assert_eq!(evicted, 15, "must evict down to the cap");
+        assert_eq!(sm.accounts.len(), 10);
+
+        // No account lost: each is in the cache OR persisted on disk.
+        for i in 0..25u64 {
+            let addr = format!("acct_{:03}", i);
+            let in_cache = sm.accounts.contains_key(&addr);
+            let on_disk = store.data.read().contains_key(&addr);
+            assert!(in_cache || on_disk, "account {} lost on eviction", addr);
+        }
+        // The 15 oldest were evicted ⇒ must have been persisted before removal.
+        for i in 0..15u64 {
+            let addr = format!("acct_{:03}", i);
+            assert!(store.data.read().contains_key(&addr), "evicted {} must be persisted", addr);
+        }
+    }
+
+    /// A wired durable store whose write FAILS must NOT drop accounts from RAM — else the persistent
+    /// mirror diverges from the committed tree (snapshot state_root mismatch). Keep them resident.
+    struct FailingStore;
+    impl AccountStore for FailingStore {
+        fn load_account(&self, _address: &str) -> Option<Account> { None }
+        fn persist_accounts(&self, _accounts: &[(String, Account)]) -> bool { false } // always fails
+    }
+
+    #[test]
+    fn test_evict_keeps_accounts_when_persist_fails() {
+        let sm = StateManager::new();
+        sm.set_disk_store(Arc::new(FailingStore) as Arc<dyn AccountStore>);
+        sm.set_cache_capacity(10);
+        for i in 0..25u64 {
+            let addr = format!("acct_{:03}", i);
+            sm.accounts.insert(addr.clone(), make_account(i));
+            sm.last_access.insert(addr, i);
+        }
+        assert_eq!(sm.accounts.len(), 25);
+        let evicted = sm.evict_cold_accounts();
+        assert_eq!(evicted, 0, "must not evict when the durable persist fails");
+        assert_eq!(sm.accounts.len(), 25, "all accounts stay resident on persist failure");
     }
 
     #[test]

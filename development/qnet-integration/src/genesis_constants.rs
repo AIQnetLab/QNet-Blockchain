@@ -60,6 +60,21 @@ pub fn ws_checkpoint_index() -> u64 { WS_CHECKPOINT.0 }
 /// Full trusted (index, MacroBlock::hash()) weak-subjectivity checkpoint.
 pub fn ws_checkpoint() -> (u64, [u8; 32]) { WS_CHECKPOINT }
 
+/// Per-macroblock committee-fields digests for the WS pin = SHA3-256 over (eligible_producers ‖
+/// randomness_beacon) of the pinned macroblock K (ANCHOR) and its predecessor K-1 (PRED) — the two N-2
+/// committee-derivation sources that MacroBlock::hash() (body only) does NOT cover. Checked at K's and
+/// K-1's pin branches respectively so a hash-equal macroblock with forged producers/beacon is rejected
+/// at STORE time through any ingress (closing the forged-forward-committee forge). Rotated WITH
+/// WS_CHECKPOINT every release; zeros on fresh genesis ⇒ the pin branch is inert (never fires at
+/// index 0). A non-zero pin with zero digests fails closed (a real macroblock's digest is never zero).
+pub const WS_CHECKPOINT_DIGEST_ANCHOR: [u8; 32] = [0u8; 32];
+pub const WS_CHECKPOINT_DIGEST_PRED: [u8; 32] = [0u8; 32];
+
+/// Trusted (anchor=K, pred=K-1) committee-fields digests for the WS pin.
+pub fn ws_checkpoint_committee_digests() -> ([u8; 32], [u8; 32]) {
+    (WS_CHECKPOINT_DIGEST_ANCHOR, WS_CHECKPOINT_DIGEST_PRED)
+}
+
 /// Genesis node IP addresses (PRODUCTION)
 /// These IPs are authorized to run Genesis nodes
 pub const GENESIS_NODE_IPS: &[(&str, &str)] = &[
