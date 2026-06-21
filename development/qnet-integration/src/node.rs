@@ -39,7 +39,7 @@ const FAST_SYNC_THRESHOLD: u64 = 10; // Trigger fast sync if behind by 10+ block
 const FAST_SYNC_TIMEOUT_SECS: u64 = 60; // Fast sync timeout
 const BACKGROUND_SYNC_TIMEOUT_SECS: u64 = 30; // Background sync timeout
 const SNAPSHOT_FULL_INTERVAL: u64 = 43200; // Full snapshot every 12 hours (43,200 microblocks = 480 macroblocks)
-const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3600; // Incremental snapshot every 1 hour (3,600 microblocks = 40 macroblocks)
+pub const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3600; // Incremental snapshot every 1 hour (3,600 microblocks = 40 macroblocks)
 const API_HEALTH_CHECK_RETRIES: u32 = 5; // API health check attempts
 const API_HEALTH_CHECK_DELAY_SECS: u64 = 2; // Delay between health checks
 
@@ -1031,10 +1031,51 @@ pub fn adopt_snapshot_finality(snapshot_height: u64, anchor_hash: [u8; 32]) {
     if anchor_mb == 0 { return; }
     store_anchor_hash(&anchor_hash);
     SNAPSHOT_ANCHOR_MB.store(anchor_mb, std::sync::atomic::Ordering::SeqCst);
-    LAST_FINALIZED_CONSENSUS_ROUND.fetch_max(snapshot_height, std::sync::atomic::Ordering::SeqCst);
-    LAST_FINALIZED_HEIGHT.fetch_max(snapshot_height, std::sync::atomic::Ordering::SeqCst);
+    // Finality advance under FINALITY_MUTEX: try_advance_finality does a non-atomic load-check-store
+    // under the same lock, so an unlocked fetch_max here could be clobbered down by a concurrent stale
+    // round. adopt is sync (no .await, no re-entry), so the parking_lot guard is held microseconds.
+    {
+        let _g = crate::storage::lock_finality_state();
+        LAST_FINALIZED_CONSENSUS_ROUND.fetch_max(snapshot_height, std::sync::atomic::Ordering::SeqCst);
+        LAST_FINALIZED_HEIGHT.fetch_max(snapshot_height, std::sync::atomic::Ordering::SeqCst);
+    }
     WEAK_SUBJECTIVITY_CHECKPOINT.fetch_max(snapshot_height, std::sync::atomic::Ordering::SeqCst);
+    // Seed the apply frontier + QC frontier to the anchor so the joiner tails from anchor+1 (no genesis
+    // replay) and the bulk-sync target isn't collapsed to chain_height/90. fetch_max ⇒ only advances.
+    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(snapshot_height, std::sync::atomic::Ordering::SeqCst);
+    QC_VERIFIED_FRONTIER.fetch_max(anchor_mb.saturating_mul(90), std::sync::atomic::Ordering::SeqCst);
+    persist_snapshot_anchor(anchor_mb, &anchor_hash);
     println!("[INFO][SYNC] snapshot_finality_adopted h={} mb={}", snapshot_height, anchor_mb);
+}
+
+/// Persist the adopted anchor (anchor_mb LE ++ hash) so a warm restart reloads the trusted floor.
+fn persist_snapshot_anchor(anchor_mb: u64, anchor_hash: &[u8; 32]) {
+    if let Some(storage) = try_get_storage() {
+        let mut bytes = Vec::with_capacity(40);
+        bytes.extend_from_slice(&anchor_mb.to_le_bytes());
+        bytes.extend_from_slice(anchor_hash);
+        if let Err(e) = storage.put_snapshot_anchor(&bytes) {
+            if is_warn() { println!("[WARN][SYNC] snapshot_anchor_persist_failed mb={} err={}", anchor_mb, e); }
+        }
+    }
+}
+
+/// Reload the persisted snapshot anchor at boot, BEFORE the first live block, so a warm-restarted
+/// cold-joiner keeps its trusted floor (SNAPSHOT_ANCHOR_MB is a process static a restart resets to 0).
+/// Monotonic; no-op for warm/genesis nodes (no persisted anchor).
+pub fn reload_snapshot_anchor() {
+    let storage = match try_get_storage() { Some(s) => s, None => return };
+    let bytes = match storage.get_snapshot_anchor() { Ok(Some(b)) if b.len() == 40 => b, _ => return };
+    let mut mb = [0u8; 8]; mb.copy_from_slice(&bytes[0..8]);
+    let anchor_mb = u64::from_le_bytes(mb);
+    if anchor_mb == 0 { return; }
+    let mut hash = [0u8; 32]; hash.copy_from_slice(&bytes[8..40]);
+    let prev = SNAPSHOT_ANCHOR_MB.fetch_max(anchor_mb, std::sync::atomic::Ordering::SeqCst);
+    if anchor_mb > prev { store_anchor_hash(&hash); }
+    let anchor_h = anchor_mb.saturating_mul(90);
+    LAST_FINALIZED_HEIGHT.fetch_max(anchor_h, std::sync::atomic::Ordering::SeqCst);
+    LAST_FINALIZED_CONSENSUS_ROUND.fetch_max(anchor_h, std::sync::atomic::Ordering::SeqCst);
+    if is_info() { println!("[INFO][SYNC] snapshot_anchor_reloaded mb={} h={}", anchor_mb, anchor_h); }
 }
 
 /// v9.0 BUG-30: Check if rollback to target_height is allowed by finality rules.
@@ -1136,7 +1177,9 @@ pub async fn update_all_heights(
         let mut h = height_lock.write().await;
         *h = new_height;
     }
-    // Step 3: RAM (AtomicU64) — peer advertisement
+    // Step 3: RAM (AtomicU64) — peer advertisement. Plain store: this mirrors storage+RAM atomically
+    // INCLUDING the legitimate downward move of a fork-rollback (its sole caller), so it must lower.
+    // Cold-join frontier monotonicity below the anchor is enforced at adopt + apply-commit, not here.
     crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
         new_height, std::sync::atomic::Ordering::SeqCst
     );
@@ -3601,7 +3644,6 @@ impl BlockchainNode {
         // No usable snapshot above the genesis window ⇒ refuse a from-0 replay (it freezes the
         // node under the state lock and resets the per-mb baseline). Return Err so the caller
         // re-syncs from the canonical 2f+1 chain instead. A snapshot exists at every interval.
-        const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
         if restored_baseline.is_none() && target_height > SNAPSHOT_INCREMENTAL_INTERVAL {
             return Err(format!(
                 "reconcile_no_usable_snapshot target={} action=resync_required", target_height
@@ -7368,6 +7410,10 @@ impl BlockchainNode {
                     height,
                     std::sync::atomic::Ordering::Release
                 );
+                // Warm-restart cold-joiner: reload the persisted snapshot anchor on the main boot path,
+                // before the verify pipeline accepts blocks, so SNAPSHOT_ANCHOR_MB is set when anchor+1
+                // first arrives. No-op for fresh/genesis; consensus-listener boot reloads again as backstop.
+                reload_snapshot_anchor();
                 if is_debug() { println!("[DBG][NODE] p2p_height_init={}", height); }
                 
                 height
@@ -9220,7 +9266,7 @@ impl BlockchainNode {
                                             sync_from = new_local + 1;
                                             // Update RAM height to match storage
                                             *blockchain_for_sync.height.write().await = new_local;
-                                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(
                                                 new_local, std::sync::atomic::Ordering::Release
                                             );
                                             if is_info() {
@@ -14101,7 +14147,7 @@ impl BlockchainNode {
                                                     if new_local + 1 > sync_from_height {
                                                         sync_from_height = new_local + 1;
                                                         *height_clone.write().await = new_local;
-                                                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(
                                                             new_local, std::sync::atomic::Ordering::Release,
                                                         );
                                                         println!(
@@ -20786,7 +20832,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                              highest, round, safe_finality, chain_height);
                 }
             }
-            
+            // Warm-restart cold-joiner: reload the persisted snapshot anchor (the static resets on
+            // restart) so the verify-stage anchor floor + finality survive a restart. No-op otherwise.
+            reload_snapshot_anchor();
+
             // Option B (intra-window finality): the highest CHECKPOINT_INTERVAL boundary already
             // signalled this run. Lazily initialised to the last completed macroblock boundary on
             // the first event so a restart does not re-emit historical windows. Dormant (never

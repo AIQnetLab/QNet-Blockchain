@@ -23,10 +23,16 @@ use std::collections::HashMap;
 pub const GALC_VERSION: u16 = 1;
 const DOMAIN: &[u8] = b"QNET_GENESIS_CHECKPOINT_v1";
 
+/// Macroblocks per state snapshot (= node::SNAPSHOT_INCREMENTAL_INTERVAL / 90). The compile-assert pins
+/// the two cadences together so they can never drift.
+pub const SNAPSHOT_INCREMENTAL_INTERVAL_MB: u64 = 40;
+const _: () = assert!(SNAPSHOT_INCREMENTAL_INTERVAL_MB * 90 == crate::node::SNAPSHOT_INCREMENTAL_INTERVAL);
+
 /// Cadence (in macroblocks) at which genesis nodes mint a capsule for the latest FINALIZED macroblock.
-/// Deterministic K = (finalized_mb / GALC_MINT_INTERVAL) * GALC_MINT_INTERVAL ⇒ all genesis sign the
-/// SAME (K, hash, digests) and their sigs aggregate. Keeps the held capsule within ~INTERVAL of the tip.
-pub const GALC_MINT_INTERVAL: u64 = 10;
+/// DERIVED from the snapshot cadence so every capsule co-locates with a state-snapshot anchor ⇒ a cold
+/// joiner's snapshot anchor == the capsule root (lineage walk ≈ 0). Deterministic K = (finalized_mb /
+/// GALC_MINT_INTERVAL) * GALC_MINT_INTERVAL ⇒ all genesis sign the SAME (K, hash, digests) and aggregate.
+pub const GALC_MINT_INTERVAL: u64 = SNAPSHOT_INCREMENTAL_INTERVAL_MB;
 
 /// Self-authenticating genesis-signed weak-subjectivity checkpoint. `mb_hash` = MacroBlock::hash()@K
 /// (body only). `committee_digest_anchor/pred` = committee_fields_digest of K and K-1 respectively,

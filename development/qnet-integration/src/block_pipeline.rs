@@ -1558,8 +1558,13 @@ impl BlockPipeline {
             while let Some(decoded) = to_process.pop() {
             let mb = &decoded.microblock;
 
-            // 1. Hash chain continuity (except genesis)
-            if mb.height > 0 {
+            // 1. Hash chain continuity (except genesis + the snapshot-anchor successor). The snapshot
+            // anchor (anchor_h) is the QC-final chain root whose body is intentionally absent (snapshot =
+            // state, not microblocks), so a cold joiner's first live block anchor_h+1 has no parent to
+            // hash-chain against — admit it on the adopted finality; slot-ts/signature/state verify still
+            // run below. anchor_h+2.. chain normally (anchor_h+1's hash is cached at its apply-commit).
+            let anchor_h = crate::node::SNAPSHOT_ANCHOR_MB.load(Ordering::Acquire).saturating_mul(90);
+            if mb.height > 0 && !(anchor_h > 0 && mb.height == anchor_h + 1) {
                 metrics.mark_verify_op(mb.height, PIPELINE_OP_VERIFY_LOAD_PREV);
                 let parent_h = mb.height - 1;
 
@@ -2398,9 +2403,14 @@ impl BlockPipeline {
             // microseconds later, and one slow read under a maintenance-flush/compaction storm
             // froze the whole stage). Only a re-delivery (height <= frontier) consults storage, off
             // the hot path on the blocking pool.
+            let anchor_floor = crate::node::SNAPSHOT_ANCHOR_MB
+                .load(std::sync::atomic::Ordering::Acquire).saturating_mul(90);
             let applied_tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                 .load(std::sync::atomic::Ordering::Acquire);
-            let already_applied = if height > applied_tip {
+            let already_applied = if anchor_floor > 0 && height <= anchor_floor {
+                true // at/below the adopted snapshot anchor ⇒ already-final; the snapshot omits sub-anchor
+                     // bodies, so re-executing one would corrupt the bound state
+            } else if height > applied_tip {
                 false
             } else {
                 let storage_for_dedup = ctx.storage.clone();
@@ -3025,9 +3035,11 @@ impl BlockPipeline {
                 }
             }
 
-            // Update global atomic height (P2P heartbeat reports this)
-            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                height, std::sync::atomic::Ordering::Release,
+            // Publish the advertised apply frontier — fetch_max so a stale/low commit can never regress
+            // it below a higher published value (the snapshot anchor). P2P heartbeat + apply-dedup +
+            // verify gap-calc all read this atomic.
+            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(
+                height, std::sync::atomic::Ordering::AcqRel,
             );
 
             // Clear pending sync for this block
@@ -3076,8 +3088,7 @@ impl BlockPipeline {
             // capture exactly state_root@H. With persist-before-evict the pinned accounts CF is the
             // COMPLETE committed tree leaf set (hot ∪ evicted), so a cold joiner's recompute reproduces
             // the bound root past the LRU cap. The heavy serialization runs off-reactor on the frozen view.
-            const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3_600;
-            if height > 0 && height % SNAPSHOT_INCREMENTAL_INTERVAL == 0 {
+            if height > 0 && height % crate::node::SNAPSHOT_INCREMENTAL_INTERVAL == 0 {
                 let snapshot_accounts = ctx.state.read().await.get_all_accounts();
                 match ctx.storage.prepare_snapshot_view(&snapshot_accounts) {
                     Ok(view) => {

@@ -1611,6 +1611,19 @@ impl PersistentStorage {
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         Ok(self.db.get_cf(&cf, b"galc_held")?)
     }
+    // Adopted cold-join snapshot anchor (anchor_mb u64 LE ++ anchor hash [u8;32]) — persisted so a
+    // warm-restarted joiner reloads its trusted floor (the SNAPSHOT_ANCHOR_MB static resets on restart).
+    pub fn put_snapshot_anchor(&self, bytes: &[u8]) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.db.put_cf(&cf, b"snapshot_anchor", bytes)?;
+        Ok(())
+    }
+    pub fn get_snapshot_anchor(&self) -> IntegrationResult<Option<Vec<u8>>> {
+        let cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        Ok(self.db.get_cf(&cf, b"snapshot_anchor")?)
+    }
 
     // (sync, called at a macroblock boundary under the apply context) Flush the
     // hot in-memory account set to the accounts CF, then pin a consistent
@@ -7907,6 +7920,8 @@ impl Storage {
 
     pub fn put_galc_held(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_galc_held(bytes) }
     pub fn get_galc_held(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_galc_held() }
+    pub fn put_snapshot_anchor(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_snapshot_anchor(bytes) }
+    pub fn get_snapshot_anchor(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_snapshot_anchor() }
 
     pub async fn create_incremental_snapshot(
         &self,
@@ -9723,41 +9738,43 @@ impl Storage {
         }
         let anchor_guard = AnchorReset(crate::node::SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst));
 
-        // Walk root index = the highest trusted anchor: the finality floor (binary pin / adopted
-        // snapshot anchor) OR the adopted GALC capsule root, whichever is higher — so a held capsule
-        // starts the walk near the tip (bounded) instead of at genesis. base.1 is unused below.
+        // Security floor = ws_floor ONLY (binary pin / adopted snapshot anchor): a snapshot below the
+        // exogenous finality floor has no trusted root beneath it to re-verify from — reject. The GALC
+        // capsule is a walk SHORTENER, never a floor: a capsule ABOVE the anchor can't root the forward
+        // N-2 lineage walk DOWN to it, so it roots the walk ONLY when at-or-below the anchor; else ws_floor.
         let ws_floor = crate::node::effective_ws_checkpoint();
         let pin = crate::galc::effective_pin_checkpoint();
-        let base: (u64, [u8; 32]) = if pin.0 > ws_floor.0 { (pin.0, pin.1) } else { ws_floor };
-        if mb_idx < base.0 {
+        if mb_idx < ws_floor.0 {
             let _ = self.discard_snapshot_state(snapshot_height);
             return Err(IntegrationError::Other(format!(
-                "snapshot_below_ws mb={} ws={} action=reject_snapshot", mb_idx, base.0
+                "snapshot_below_ws mb={} ws={} action=reject_snapshot", mb_idx, ws_floor.0
             )));
         }
+        let walk_root: (u64, [u8; 32]) =
+            if pin.0 > ws_floor.0 && pin.0 <= mb_idx { (pin.0, pin.1) } else { ws_floor };
         // Bound the walk so a stale root can't degrade into an unbounded genesis-to-tip re-verify
         // (DoS-on-self CPU + a wider trust window). The GALC capsule normally keeps the root within a
         // few macroblocks of the anchor (walk ≈ 0); this is the FALLBACK ceiling when no capsule is
         // held, sized to ~2 weeks so the binary-pin rotation cadence is realistic. INERT for a young
-        // chain (mb_idx - base.0 small). At a 1000-node committee a full-bound walk is a one-time
+        // chain (mb_idx - walk_root.0 small). At a 1000-node committee a full-bound walk is a one-time
         // ~30 min QC re-verify; with a capsule it never approaches this.
         const MAX_WS_WALK_MB: u64 = 13_440; // ~1.2M blocks (~2 weeks at 1 blk/s)
-        if mb_idx.saturating_sub(base.0) > MAX_WS_WALK_MB {
+        if mb_idx.saturating_sub(walk_root.0) > MAX_WS_WALK_MB {
             let _ = self.discard_snapshot_state(snapshot_height);
             return Err(IntegrationError::Other(format!(
                 "snapshot_ws_walk_too_long mb={} ws={} max={} action=upgrade_binary_pin",
-                mb_idx, base.0, MAX_WS_WALK_MB
+                mb_idx, walk_root.0, MAX_WS_WALK_MB
             )));
         }
-        // Where to begin filling: from genesis (1) on a fresh chain; just above the base when the base
+        // Where to begin filling: from genesis (1) on a fresh chain; just above the walk_root when its
         // macroblock is already present (a prior adoption — fill only the new gap); else from the pinned
-        // pair (pin.0-1) so the binary-pin macroblock + its predecessor bootstrap forward verification.
-        let walk_from = if base.0 == 0 {
+        // pair (walk_root.0-1) so the root macroblock + its predecessor bootstrap forward verification.
+        let walk_from = if walk_root.0 == 0 {
             1
-        } else if self.get_macroblock_by_height(base.0).ok().flatten().is_some() {
-            base.0.saturating_add(1)
+        } else if self.get_macroblock_by_height(walk_root.0).ok().flatten().is_some() {
+            walk_root.0.saturating_add(1)
         } else {
-            base.0.saturating_sub(1).max(1)
+            walk_root.0.saturating_sub(1).max(1)
         };
 
         // Fill the contiguous lineage [walk_from ..= mb_idx] bottom-up. The cursor slides past
