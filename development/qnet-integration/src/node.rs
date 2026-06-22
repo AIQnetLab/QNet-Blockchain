@@ -863,6 +863,46 @@ pub fn window_content_from_accum(mb_idx: u64) -> Option<(Vec<[u8; 32]>, Vec<[u8;
     Some((mb_hashes, vrf_outputs))
 }
 
+/// v36: deterministic recent-Heartbeat liveness for Phase-2A producer eligibility.
+///
+/// Phase-2A previously read the recent-Heartbeat bit from `load_account(reg).heartbeat_slots`, i.e. the
+/// persisted `accounts` CF — which is written by a DETACHED best-effort persist (microblocks are the
+/// authoritative store). The eligible snapshot runs async, so each committee member read a different
+/// persist-lag prefix → divergent eligible_producers → the QC-bound epoch_commitment split → 2f+1 never
+/// formed → finality stall. Fix: derive the set from the COMMITTED block bodies (synchronously saved at
+/// apply, canonical + identical on every node), bounded to `scan_end`. Returns the supers that sent a
+/// Heartbeat whose ANCHOR fell in the current or previous subwindow (same epoch — mirrors the old bitmask
+/// recency) and that was included in a block at-or-below scan_end. A pure function of the canonical chain
+/// ≤ scan_end ⇒ identical on every committee member, with NO live-tip dependence. Scans ≤2 subwindows
+/// (~2880 blocks), off the production path; bodies are retained 6 epochs, far beyond this window.
+/// (current, previous) global subwindow indices (anchor/1440 = epoch*10 + subwindow) for `scan_end`. The
+/// previous counts ONLY within the SAME epoch — at a subwindow-0/epoch boundary it returns current==prev
+/// (no previous), mirroring the prior `heartbeat_epoch==hb_epoch` + `if cur_sub>0` bitmask recency. Pure
+/// ⇒ unit-tested for the off-by-one + cross-epoch boundary.
+fn recency_subwindow_indices(scan_end: u64) -> (u64, u64) {
+    let cur_idx = scan_end / 1440;
+    let cur_sub = (scan_end % 14400) / 1440; // 0..9 within the epoch
+    let prev_idx = if cur_sub > 0 { cur_idx.saturating_sub(1) } else { cur_idx };
+    (cur_idx, prev_idx)
+}
+
+fn recent_heartbeat_senders(storage: &crate::storage::Storage, scan_end: u64) -> std::collections::HashSet<String> {
+    let (cur_idx, prev_idx) = recency_subwindow_indices(scan_end);
+    let start = prev_idx.saturating_mul(1440);
+    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for h in start..=scan_end {
+        if let Ok(Some(block)) = storage.load_microblock_auto_format(h) {
+            for tx in &block.transactions {
+                if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, .. } = &tx.tx_type {
+                    let s = anchor_height / 1440;
+                    if s == cur_idx || s == prev_idx { set.insert(node_id.clone()); }
+                }
+            }
+        }
+    }
+    set
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCTION v2.50: Lock-free global storage with OnceCell + Arc
 // RocksDB does NOT support multiple connections - single instance shared immutably
@@ -4098,24 +4138,22 @@ impl BlockchainNode {
             // returning node's next HBC is always in range. Phase 1 builds the
             // registered-super-node set; Phase 2A is the single eligibility path.
             let scan_end = macroblock_index * 90;
-            const PHASE_2A_SCAN_BLOCKS: u64 = 14_400;
-            let scan_start = scan_end.saturating_sub(PHASE_2A_SCAN_BLOCKS);
 
-            // Phase 1: registered Super node IDs (necessary, not sufficient).
-            let mut registered_super_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for height in scan_start..=scan_end {
-                if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
-                    for tx in &block.transactions {
-                        if let qnet_state::TransactionType::NodeRegistration {
-                            node_id, node_type, ..
-                        } = &tx.tx_type {
-                            if *node_type == qnet_state::NodeType::Super {
-                                registered_super_nodes.insert(node_id.clone());
-                            }
-                        }
-                    }
-                }
-            }
+            // Phase 1: registered Super node IDs (necessary, not sufficient). Sourced from the
+            // deterministic, snapshot-carried srtr_ registry index — NOT a recent-block body scan.
+            // A body scan only saw registrations inside the last epoch, so a node whose NodeRegistration
+            // is older than that window (every genesis node: block 0; any super away beyond the L2
+            // carryover) could never re-enter the producer/committee set after a snapshot cold-join —
+            // it synced but stayed ineligible. The registry index holds EVERY chain-confirmed super
+            // regardless of registration age (the same source the reward roster uses), so a returning
+            // node re-enters through the Phase-2A heartbeat gate below WITHOUT re-registration. Phase-2A
+            // (recent on-chain Heartbeat) absorbs any registration-timing edge: a just-applied
+            // registration not yet heartbeated is filtered out, so eligible-set membership stays stable.
+            let registered_super_nodes: std::collections::HashSet<String> =
+                match storage.super_registrations_sorted() {
+                    Ok(regs) => regs.into_iter().map(|(node_id, _w)| node_id).collect(),
+                    Err(_) => std::collections::HashSet::new(),
+                };
 
             // v35: Phase-2A admits a registered Super node on UNFORGEABLE on-chain liveness —
             // a Heartbeat-TX in the current or previous subwindow (Account.heartbeat_slots),
@@ -4124,18 +4162,25 @@ impl BlockchainNode {
             {
                 let hb_epoch = scan_end / 14400;
                 let cur_sub = ((scan_end % 14400) / 1440) as u16;
+                // Deterministic recent-Heartbeat set from committed block bodies bounded to end_height
+                // (NOT the async-lagging accounts CF, whose per-node persist lag gave a divergent eligible
+                // set → epoch_commitment split → finality stall). Computed once; identical on every member.
+                let recent_hb = recent_heartbeat_senders(storage, scan_end);
                 let mut regs: Vec<&String> = registered_super_nodes.iter().collect();
                 regs.sort();
                 let mut added_tally = 0usize;
                 for reg in regs {
                     if eligible_ids.contains(reg) { continue; }
-                    let acct = match storage.load_account(reg).ok().flatten() {
-                        Some(a) if a.heartbeat_epoch == hb_epoch => a,
+                    // Determinism: the srtr_ candidate pool is read at the live applied tip, which under
+                    // async production can run ahead of end_height; bound each re-entry candidate to a
+                    // registration CONFIRMED by end_height so every committee member admits the SAME set
+                    // (an ahead-of-end_height registration is excluded identically everywhere). Genesis
+                    // nodes carry reg_height=0 ⇒ always pass.
+                    match storage.node_reg_height(reg) {
+                        Ok(Some(h)) if h <= scan_end => {}
                         _ => continue,
-                    };
-                    let mut recent = acct.heartbeat_slots & (1u16 << cur_sub.min(9));
-                    if cur_sub > 0 { recent |= acct.heartbeat_slots & (1u16 << (cur_sub - 1)); }
-                    if recent == 0 { continue; }
+                    }
+                    if !recent_hb.contains(reg) { continue; }
                     let rep = (reputation_map.get(reg).copied()
                         .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION)
                         .clamp(0.0, 100.0) * 100.0).round() as u32;
@@ -27730,6 +27775,24 @@ mod tests {
         assert!(checkpoint_participation_allowed(false, 250, mb_end));     // syncing, ahead of end → yes
         assert!(!checkpoint_participation_allowed(false, 179, mb_end));    // syncing, missing last block → defer
         assert!(!checkpoint_participation_allowed(false, 0, mb_end));      // syncing, no window → defer
+    }
+
+    // Phase-2A recency window (deterministic heartbeat eligibility): current subwindow + previous ONLY
+    // within the same epoch. The epoch boundary (subwindow 0) must NOT bridge to the prior epoch's
+    // subwindow 9 — that is the off-by-one that would change WHO is eligible vs the old bitmask gate.
+    #[test]
+    fn recency_subwindow_indices_boundary() {
+        // Mid-epoch: previous = current-1 (same epoch).
+        assert_eq!(recency_subwindow_indices(5 * 1440), (5, 4));
+        assert_eq!(recency_subwindow_indices(5 * 1440 + 100), (5, 4));
+        // Epoch start (subwindow 0): no previous within the epoch ⇒ prev == cur (degenerates to {cur}).
+        assert_eq!(recency_subwindow_indices(0), (0, 0));
+        assert_eq!(recency_subwindow_indices(14400), (10, 10));        // epoch1 sub0 ⇒ (10,10), NOT (10,9)
+        assert_eq!(recency_subwindow_indices(14400 + 50), (10, 10));
+        // Epoch1 subwindow 1: previous is sub0 of the SAME epoch (10), never the prior epoch's sub9 (9).
+        assert_eq!(recency_subwindow_indices(14400 + 1440), (11, 10));
+        // Epoch2 subwindow 0: again no bridge.
+        assert_eq!(recency_subwindow_indices(2 * 14400), (20, 20));
     }
 
     // committee_for_height determinism: genesis era ⇒ None (caller uses the genesis committee), and

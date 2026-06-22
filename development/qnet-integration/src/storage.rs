@@ -7016,7 +7016,26 @@ impl Storage {
             None => Ok(None),
         }
     }
-    
+
+    /// Chain-confirmed registration height of a node (None if unregistered or reg_height unstamped).
+    /// Used to bound the eligible-producer candidate set to registrations confirmed AS OF a macroblock
+    /// end_height: committee members at divergent live applied tips (production never waits for
+    /// consensus) must compute the SAME set, so an ahead-of-end_height registration must be excluded
+    /// identically on every node. Genesis nodes carry reg_height=0.
+    pub fn node_reg_height(&self, node_id: &str) -> IntegrationResult<Option<u64>> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let key = format!("node_{}", node_id);
+        match self.persistent.db.get_cf(&registry_cf, key.as_bytes())? {
+            Some(data) => {
+                let parsed: serde_json::Value = serde_json::from_slice(&data)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                Ok(parsed["reg_height"].as_u64())
+            }
+            None => Ok(None),
+        }
+    }
+
     /// v4.3: Get all nodes registered with a specific wallet address — O(1) via reverse index
     /// CRITICAL for mobile app: Returns nodes even when the node itself is offline!
     /// Data is read from blockchain storage (RocksDB), not from the node's memory.
@@ -9743,15 +9762,45 @@ impl Storage {
         // capsule is a walk SHORTENER, never a floor: a capsule ABOVE the anchor can't root the forward
         // N-2 lineage walk DOWN to it, so it roots the walk ONLY when at-or-below the anchor; else ws_floor.
         let ws_floor = crate::node::effective_ws_checkpoint();
-        let pin = crate::galc::effective_pin_checkpoint();
         if mb_idx < ws_floor.0 {
             let _ = self.discard_snapshot_state(snapshot_height);
             return Err(IntegrationError::Other(format!(
                 "snapshot_below_ws mb={} ws={} action=reject_snapshot", mb_idx, ws_floor.0
             )));
         }
+        // Root the walk at the genesis-signed GALC capsule when one is co-located at/below the
+        // snapshot anchor (walk ≈ 0). The capsule arrives + Dilithium-verifies asynchronously, so a
+        // binding that ran right after the cold-join orchestrator's best-effort request would race it
+        // and fall back to ws_floor → a full genesis-to-anchor re-verify (the slow-rejoin bug).
+        // Deterministically request + bounded-wait for a usable capsule before rooting; on timeout
+        // fall through to ws_floor (correct, only slower — never worse, no new launch requirement).
+        let usable = |k: u64| k > ws_floor.0 && k <= mb_idx;
+        let mut pin = crate::galc::effective_pin_checkpoint();
+        if !usable(pin.0) {
+            const GALC_WAIT_ATTEMPTS: u32 = 20;        // ≤ ~10s total
+            const GALC_WAIT_INTERVAL_MS: u64 = 500;
+            for i in 0..GALC_WAIT_ATTEMPTS {
+                // A capsule already adopted ABOVE the anchor (cadence put the freshest mint a step ahead
+                // of the negotiated snapshot) can never become usable by waiting — adoption is monotonic-up
+                // — so root at ws_floor now instead of burning the timeout; the next snapshot boundary
+                // re-aligns capsule and anchor.
+                if pin.0 > mb_idx { break; }
+                if i % 4 == 0 {                        // re-request every ~2s (a reply may be lost)
+                    let _ = p2p.broadcast_quic(&crate::unified_p2p::NetworkMessage::RequestGenesisCheckpoint {
+                        requester_id: "snapshot_binder".to_string(),
+                    }).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(GALC_WAIT_INTERVAL_MS)).await;
+                pin = crate::galc::effective_pin_checkpoint();
+                if usable(pin.0) { break; }
+            }
+            if crate::node::is_info() {
+                println!("[INFO][SYNC] galc_anchor_wait mb={} pin={} rooted={}",
+                         mb_idx, pin.0, if usable(pin.0) { "capsule" } else { "ws_floor" });
+            }
+        }
         let walk_root: (u64, [u8; 32]) =
-            if pin.0 > ws_floor.0 && pin.0 <= mb_idx { (pin.0, pin.1) } else { ws_floor };
+            if usable(pin.0) { (pin.0, pin.1) } else { ws_floor };
         // Bound the walk so a stale root can't degrade into an unbounded genesis-to-tip re-verify
         // (DoS-on-self CPU + a wider trust window). The GALC capsule normally keeps the root within a
         // few macroblocks of the anchor (walk ≈ 0); this is the FALLBACK ceiling when no capsule is
