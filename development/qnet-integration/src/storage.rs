@@ -9820,6 +9820,19 @@ impl Storage {
         // pair (walk_root.0-1) so the root macroblock + its predecessor bootstrap forward verification.
         let walk_from = if walk_root.0 == 0 {
             1
+        } else if walk_root.0 == mb_idx && walk_root.0 > ws_floor.0 {
+            // Capsule/pin co-located AT the snapshot anchor (strictly above the WS floor — so anchor-1
+            // is at/above the floor and re-verifiable, never below it). The forward committee derivation
+            // for the
+            // first two tail macroblocks (anchor+1, anchor+2) reads N-2 = {anchor-1, anchor}. The capsule
+            // binds BOTH digests (pin.2 anchor, pin.3 predecessor) and verify_v2_macroblock trusts the
+            // predecessor by the anchor's previous_hash chain (pin.0-1 branch), so descend to anchor-1 to
+            // fetch+verify it EVEN IF the anchor macroblock is already stored. Without this the predecessor
+            // is skipped (walk_root+1 ⇒ empty range) → anchor+1 hits v2_qc_no_committee, anchor+3 then
+            // defers on the resulting hole → post-snapshot finality wedges 2 mb past the anchor on a mature
+            // chain. The cursor skips already-present macroblocks, so this is a no-op extra storage read
+            // when the predecessor is already held; it costs one fetch only in the wedge case.
+            walk_root.0.saturating_sub(1).max(1)
         } else if self.get_macroblock_by_height(walk_root.0).ok().flatten().is_some() {
             walk_root.0.saturating_add(1)
         } else {

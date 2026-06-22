@@ -11934,7 +11934,13 @@ impl BlockchainNode {
                     let mut synced_from_network = false;
                     
                     if let Some(ref p2p) = unified_p2p {
-                        const MAX_SYNC_ATTEMPTS: u32 = 8; // 8 × 2s = 16s max wait
+                        // 20 × 2s = 40s. Long enough that (a) block-0 gets many fetch attempts from a
+                        // live network (the robust primary "a chain exists" probe → synced_from_network),
+                        // and (b) the window spans a sibling's first signed HealthPing (+30s), so a running
+                        // genesis authoritatively reports height>0 before the positive-proof mint decision
+                        // below → closes the empty-restart-into-live-but-block-silent residual. Only the
+                        // genuine first-ever mint waits the full window; a live rejoin breaks early on sync.
+                        const MAX_SYNC_ATTEMPTS: u32 = 20;
                         for attempt in 1..=MAX_SYNC_ATTEMPTS {
                             let _ = p2p.sync_blocks(0, 0).await;
                             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -12010,8 +12016,50 @@ impl BlockchainNode {
                         eprintln!("[FATAL][GEN] block0 corrupt and no peer served a replacement — refusing to mint fresh genesis (fork-safe). Halting.");
                         std::process::exit(1);
                     } else {
-                    // First-ever network start: no peers have genesis yet
-                    println!("[INFO][GEN] no existing genesis in network — creating new one");
+                        // POSITIVE proof of first-ever launch before minting (closes the partition race in
+                        // a negative "nobody reports a chain" check). Mint a fresh genesis ONLY when a
+                        // quorum (>=2) of OTHER genesis identities is CONNECTED *and* NONE reports a
+                        // populated chain (height>0) — i.e. the committee provably sits at height 0
+                        // together. Otherwise refuse + halt (crash-loop under --restart=always):
+                        //   • any genesis at height>0  → chain already live → rejoin via the block-0
+                        //     re-fetch on the next boot, never mint a forking fresh-timestamp genesis.
+                        //   • <2 genesis connected     → cannot PROVE a first-ever launch (partition, or
+                        //     siblings not up yet) → wait; minting in isolation could fork on heal, and a
+                        //     lone node_001 cannot form a committee anyway.
+                        // Identity is hardcoded-IP-derived and the height is signature-gated (CONSENSUS_PK
+                        // registry), so a keyless spoofer cannot fake a genesis identity or its height. At a
+                        // genuine first-ever launch NO block exists yet, so no sibling CAN report height>0
+                        // (gen_above_zero==0 is correct by construction) and the decision rests on
+                        // gen_connected>=2. For an empty node_001 restarting INTO a live network, gen_above_zero
+                        // is authoritative by the time we reach here: the 40s poll window above spans both
+                        // (a) many block-0 fetch attempts — a live chain is normally pulled directly →
+                        // synced_from_network short-circuits the mint — and (b) a sibling's first signed
+                        // HealthPing (+30s), so even a block-SILENT live network's genesis reports height>0
+                        // before this check ⇒ gen_above_zero>=1 ⇒ halt+rejoin, never a forking mint. A
+                        // coordinated first launch brings >=2 siblings up at height 0 within the window ⇒
+                        // mint proceeds; a partition leaving <2 genesis visible ⇒ halt (fail-closed).
+                        let (gen_connected, gen_above_zero) = match unified_p2p.as_ref() {
+                            Some(p) => {
+                                let peers = p.get_validated_active_peers();
+                                let connected: std::collections::HashSet<&str> = peers.iter()
+                                    .map(|pi| pi.id.as_str())
+                                    .filter(|id| id.starts_with("genesis_node_"))
+                                    .collect();
+                                let above: std::collections::HashSet<&str> = peers.iter()
+                                    .filter(|pi| pi.last_block_height > 0 && pi.id.starts_with("genesis_node_"))
+                                    .map(|pi| pi.id.as_str())
+                                    .collect();
+                                (connected.len(), above.len())
+                            }
+                            None => (0usize, 0usize),
+                        };
+                        if gen_above_zero >= 1 || gen_connected < 2 {
+                            eprintln!("[FATAL][GEN] node_001 empty: first-ever launch UNPROVEN (genesis_connected={} at_height>0={}) — refusing to mint fresh genesis (fork-safe). Halting to retry block-0 fetch / await a genesis quorum at height 0.",
+                                      gen_connected, gen_above_zero);
+                            std::process::exit(1);
+                        }
+                    // First-ever launch PROVEN: >=2 genesis siblings connected, all at height 0
+                    println!("[INFO][GEN] first-ever launch confirmed (genesis_quorum={} all_at_height_0) — creating new genesis", gen_connected);
                     
                     use crate::genesis::{GenesisConfig, create_genesis_block};
                     let genesis_config = GenesisConfig::default();
@@ -20908,6 +20956,29 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         }
                     },
                     _ = lag_timer.tick() => {
+                        // SYNC-ADOPT: a catching-up node (cold-join / fell behind) advances finality by
+                        // ADOPTING the committee's already-2f+1-verified checkpoint frontier, bounded by
+                        // the locally-applied microblock tip — NOT only via the local BFT2 driver, which
+                        // cannot finalize while this node is not a live committee member at these rounds.
+                        // QC_VERIFIED_FRONTIER is written ONLY after verify_v2_macroblock (full 2f+1
+                        // Dilithium check) saved the macroblock, so it transitively certifies all ancestors;
+                        // it is the same finality basis the MB-SYNC path uses. min(frontier, tip→mb) keeps
+                        // finality at/below the applied tip (the v4.4 no-outrun invariant). Without this a
+                        // snapshot-less joiner block-syncs microblocks forever while its finality marker
+                        // stays frozen at mb1 (the redrive below only re-arms the local driver, which never
+                        // finalizes here) → never "synced" → never eligible.
+                        {
+                            let mi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                            let qcf = QC_VERIFIED_FRONTIER.load(std::sync::atomic::Ordering::Relaxed);
+                            let tip_mb = (crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                                .load(std::sync::atomic::Ordering::Relaxed) / mi) * mi;
+                            let adoptable = qcf.min(tip_mb);
+                            if adoptable > LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst)
+                                && try_advance_finality(adoptable, "SYNC-ADOPT") && is_info() {
+                                println!("[INFO][MB] sync_adopt_finality adopted={} qc_frontier={} tip_mb={}",
+                                         adoptable, qcf, tip_mb);
+                            }
+                        }
                         // Re-drive the driver's FRONTIER checkpoint (intra OR macro) when finality
                         // lags the tip beyond the normal 2-chain trail. A checkpoint build is a
                         // one-shot on its block event; if it deferred once it is never retried, and
