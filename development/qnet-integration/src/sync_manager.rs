@@ -275,7 +275,13 @@ impl SyncManager {
         let hint = self.detect_network_height_hint().await;
         let frontier = crate::node::qc_verified_frontier_height();
         if frontier == 0 { hint }
-        else { std::cmp::max(frontier, std::cmp::min(hint, frontier.saturating_add(180))) }
+        // Floor at the QC frontier (never sync below finality); reach the hint. Fetched blocks are
+        // QC/Dilithium-verified on apply, so the hint scalar can't inject state — the old frontier+180
+        // ceiling wedged a far-behind follower below the snapshot-jump threshold, forcing a crawl it
+        // can never sustain. Anti-spoof: a lie-high hint is bounded by detect_network_height_hint's
+        // genesis cross-check (gap>100 ⇒ reject >median+50) and at worst chases a phantom tail that
+        // STALL_ABORTs; the QC floor blocks lie-low from pulling us below finality.
+        else { std::cmp::max(frontier, hint) }
     }
 
     /// Peer/bootstrap-HTTP height HINT (unverified scalar) — used only to pick the probe target and the
@@ -291,55 +297,55 @@ impl SyncManager {
             return best;
         }
 
-        // For large gaps or zero best-peer, always probe bootstrap nodes
-        // Fallback: HTTP probe to bootstrap nodes
-        let bootstrap_ips = crate::genesis_constants::get_genesis_ips();
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
-
-        let mut heights: Vec<u64> = Vec::new();
-        for ip in bootstrap_ips.iter().take(5) {
-            let url = format!("http://{}:8001/api/v1/block/latest", ip);
-            if let Ok(resp) = client.get(&url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(json) = resp.json::<serde_json::Value>().await {
-                        if let Some(h) = json.get("height").and_then(|v| v.as_u64()) {
-                            heights.push(h);
+        // Large gap / no best-peer: cross-check the unverified peer `best` against the genesis-attested
+        // median. Scale: thousands of cold-joiners must NOT each HTTP-probe the 5 genesis every desync
+        // check — cache the median for HINT_CACHE_TTL (advisory only; the bulk target is QC-floored, so
+        // a few seconds stale is harmless). The lock is never held across the .await probe.
+        const HINT_CACHE_TTL: Duration = Duration::from_secs(8);
+        static GENESIS_HINT_CACHE: std::sync::Mutex<Option<(Instant, u64)>> = std::sync::Mutex::new(None);
+        let median = match GENESIS_HINT_CACHE.lock().ok()
+            .and_then(|g| (*g).filter(|(at, _)| at.elapsed() < HINT_CACHE_TTL).map(|(_, h)| h))
+        {
+            Some(m) => m,
+            None => {
+                let bootstrap_ips = crate::genesis_constants::get_genesis_ips();
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5)).build().unwrap_or_default();
+                let mut heights: Vec<u64> = Vec::new();
+                for ip in bootstrap_ips.iter().take(5) {
+                    let url = format!("http://{}:8001/api/v1/block/latest", ip);
+                    if let Ok(resp) = client.get(&url).send().await {
+                        if resp.status().is_success() {
+                            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                                if let Some(h) = json.get("height").and_then(|v| v.as_u64()) { heights.push(h); }
+                            }
                         }
                     }
                 }
-            }
-        }
-
-        if heights.len() >= 2 {
-            heights.sort();
-            let median = heights[heights.len() / 2];
-
-            // FIX M-H16: If single peer reported a very high height, only trust it
-            // if bootstrap nodes confirm a similar range (within 50 blocks)
-            if best > local_h + 100 && median > 0 {
-                if best > median + 50 {
-                    if is_warn() {
-                        println!("[WARN][SYNC] peer_height_suspect peer={} bootstrap_median={}", best, median);
-                    }
-                    return median; // Trust bootstrap consensus over single peer
+                if heights.len() >= 2 {
+                    heights.sort();
+                    let m = heights[heights.len() / 2];
+                    if let Ok(mut g) = GENESIS_HINT_CACHE.lock() { *g = Some((Instant::now(), m)); }
+                    m
+                } else {
+                    // Too few genesis responses: trust a small-gap peer, else give up (delays, never corrupts).
+                    return if best > 0 && best <= local_h + 100 { best } else { heights.first().copied().unwrap_or(0) };
                 }
             }
+        };
 
-            // If we had a valid peer height and bootstrap confirms, use the higher
-            if best > 0 && best <= median + 50 {
-                return std::cmp::max(best, median);
+        // M-H16: a lone peer reporting >100 ahead is trusted only if the genesis median confirms it
+        // (within 50); else trust the genesis consensus over the single peer.
+        if best > local_h + 100 && median > 0 && best > median + 50 {
+            if is_warn() {
+                println!("[WARN][SYNC] peer_height_suspect peer={} bootstrap_median={}", best, median);
             }
-
-            median
-        } else if best > 0 && best <= local_h + 100 {
-            // Few bootstrap responses but peer gap is small -- trust peer
-            best
-        } else {
-            heights.first().copied().unwrap_or(0)
+            return median;
         }
+        if best > 0 && best <= median + 50 {
+            return std::cmp::max(best, median);
+        }
+        median
     }
 
     /// Check if we're behind and need to sync.
@@ -355,15 +361,12 @@ impl SyncManager {
         let frontier = crate::node::qc_verified_frontier_cached();
         let local_h = snap.chain_height;
 
-        // frontier>0 (steady/warm): behind ⟺ a QC-finalized macroblock sits above the applied tip
-        // (fell behind finality, or the probe just climbed the frontier ahead of us). frontier==0
-        // (fresh/pre-maturity, no local finality anchor): drive off the bootstrap-cross-checked
-        // target so a cold node still onboards.
-        let behind = if frontier > 0 {
-            frontier > local_h.saturating_add(self.config.auto_sync_gap)
-        } else {
-            network_h > local_h.saturating_add(self.config.auto_sync_gap)
-        };
+        // Behind ⟺ the network tip (network_h = QC-frontier-floored, bootstrap-validated) leads the
+        // applied tip beyond the jitter band. Keys on the NETWORK height, not the node's own frontier:
+        // a follower whose own frontier stalled would otherwise never see it fell behind (self-
+        // reference) and silently diverge while believing it is synced. network_h already carries the
+        // QC floor ⇒ never targets below finality; auto_sync_gap absorbs normal gossip lead.
+        let behind = network_h > local_h.saturating_add(self.config.auto_sync_gap);
 
         if behind {
             if is_info() {
@@ -410,15 +413,14 @@ impl SyncManager {
     async fn execute_sync(&self, target: u64) {
         let mut local_h = self.coordinator.chain_height();
 
-        // D1: never let an unverified scalar drive the bulk target. Floor it to the QC-verified
-        // finality frontier (authoritative); an unverified hint may only add the ≤2-macroblock
-        // unsealed tail above it. frontier==0 (fresh genesis, h<90) ⇒ target as-is so the
-        // 5-genesis bootstrap is never blocked. Mirrors detect_network_height; protects every
-        // caller (SyncTo / SyncToNetwork / check_desync / snapshot fast-path) uniformly.
+        // Floor the target at the QC-verified finality frontier (never sync below finality); reach the
+        // caller's bootstrap-validated target above it. Blocks are QC/Dilithium-verified on apply, so
+        // the target scalar can't inject state; removing the old frontier+180 ceiling lets a far-behind
+        // node see the real gap and take the snapshot fast-path below instead of an unsustainable crawl.
+        // frontier==0 (fresh genesis, h<90) ⇒ target as-is so the 5-genesis bootstrap is never blocked.
         let target = {
             let frontier = crate::node::qc_verified_frontier_height();
-            if frontier == 0 { target }
-            else { std::cmp::max(frontier, std::cmp::min(target, frontier.saturating_add(180))) }
+            if frontier == 0 { target } else { std::cmp::max(frontier, target) }
         };
 
         if local_h >= target {
