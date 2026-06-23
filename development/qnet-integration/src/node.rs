@@ -1146,6 +1146,9 @@ pub fn reset_floors_for_rebootstrap() {
     crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(0, std::sync::atomic::Ordering::SeqCst);
     QC_VERIFIED_FRONTIER.store(0, std::sync::atomic::Ordering::SeqCst);
     WEAK_SUBJECTIVITY_CHECKPOINT.store(0, std::sync::atomic::Ordering::SeqCst);
+    // Drop the apply-dedup floor too: a rejected-snapshot rollback that leaves a high anchor over the
+    // now-wiped state makes block_sync treat h<=anchor*90 as already-applied and skip-forever.
+    SNAPSHOT_ANCHOR_MB.store(0, std::sync::atomic::Ordering::SeqCst);
     {
         let _g = crate::storage::lock_finality_state();
         LAST_FINALIZED_HEIGHT.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -4694,7 +4697,10 @@ impl BlockchainNode {
             },
             data: Some(format!("node_registration:{}:{}:{}:{}", node_id, wallet_address, registration_proof, final_endpoint)),
             dilithium_signature: None,
-            dilithium_public_key: None,
+            // B1: announce the node's VRF pubkey on-chain (canonical carrier) so it rides the snapshot's
+            // node_registry copy → a snapshot-joiner has every super's vrf_pk for committee sampling + the
+            // snapshot vrf_pk-completeness gate. None when the local key isn't installed yet (no regression).
+            dilithium_public_key: crate::genesis_constants::get_vrf_public_key(node_id).map(|pk| hex::encode(&pk)),
             chain_id: 0,
         };
 
@@ -8750,6 +8756,13 @@ impl BlockchainNode {
                         .or_else(|| {
                             // v2 form: pull the digits right after "need_mb_n2="
                             err_str.split("need_mb_n2=").nth(1).map(|s| {
+                                s.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect::<String>()
+                            }).filter(|s| !s.is_empty()).and_then(|s| s.parse::<u64>().ok())
+                        })
+                        .or_else(|| {
+                            // "v2_qc_defer_anchor … need_pin={X}": lacking the GALC pin macroblock X to
+                            // verify this one → same targeted backfill as N-2 (else only coarse retries).
+                            err_str.split("need_pin=").nth(1).map(|s| {
                                 s.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect::<String>()
                             }).filter(|s| !s.is_empty()).and_then(|s| s.parse::<u64>().ok())
                         });
@@ -13420,6 +13433,10 @@ impl BlockchainNode {
                                 if let Some(missing_h) = scan_result.1 {
                                     println!("[WARN][SYNC] Cannot sync state machine to {} - missing block #{} (window={}..={})",
                                             canonical_height, missing_h, scan_from, st);
+                                    // B3: fan-out repair for the EXACT stuck block, independent of the bulk
+                                    // range path (which can serve a sparse batch and never refill this gap).
+                                    // Single-flight TTL-deduped, so re-scan each tick can't storm.
+                                    crate::block_pipeline::request_missing_parent(missing_h);
                                 }
                             }
                             (scan_result.0, st)

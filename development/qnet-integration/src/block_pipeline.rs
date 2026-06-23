@@ -2799,8 +2799,12 @@ impl BlockPipeline {
                                 );
                             }
                         }
-                        if let Err(e) = height_result {
-                            if is_warn() { println!("[WARN][PIPELINE] set_height_failed h={} err={}", height, e); }
+                        match height_result {
+                            // S2: publish the apply frontier the instant the block is durable + height-set,
+                            // BEFORE deferred side effects — a peer reading it never sees a stale frontier and
+                            // wrongly cools a syncing node. fetch_max keeps it monotone (never below the anchor).
+                            Ok(_) => { crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::AcqRel); }
+                            Err(e) => { if is_warn() { println!("[WARN][PIPELINE] set_height_failed h={} err={}", height, e); } }
                         }
                         // v15.4 DIAG: deferred-side-effects phase. Mostly
                         // RocksDB writes for registrations and reward
@@ -3035,14 +3039,8 @@ impl BlockPipeline {
                 }
             }
 
-            // Publish the advertised apply frontier — fetch_max so a stale/low commit can never regress
-            // it below a higher published value (the snapshot anchor). P2P heartbeat + apply-dedup +
-            // verify gap-calc all read this atomic.
-            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(
-                height, std::sync::atomic::Ordering::AcqRel,
-            );
-
-            // Clear pending sync for this block
+            // Apply frontier already published right after set_chain_height (above) so peers never read a
+            // stale value during the deferred-fx window.
             crate::unified_p2p::clear_block_pending_sync(height);
 
             // Chain-derived rotation-state catch-up. A node that synced

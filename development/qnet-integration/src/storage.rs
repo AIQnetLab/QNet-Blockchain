@@ -4766,9 +4766,13 @@ impl Storage {
                     // Already in MicroBlock format (legacy) - use as-is
                     microblocks.push((height, raw_data));
                 }
+            } else {
+                // Stop at the first gap: serve only the contiguous prefix so a requester never gets a
+                // sparse batch that hides a missing height (it applies the prefix, repairs the gap elsewhere).
+                break;
             }
         }
-        
+
         Ok(microblocks)
     }
     
@@ -10088,7 +10092,9 @@ impl Storage {
                 if !k.starts_with(b"rr_seal_") { break; }
                 batch.delete_cf(&meta_cf, &k);
             }
-            let _ = self.persistent.db.write(batch);
+            // Propagate the error: a swallowed failure would leave the persisted anchor on disk and a
+            // warm restart would heal chain_height up to it onto the wiped state (the stranded-anchor wedge).
+            self.persistent.db.write(batch)?;
         }
         if let Some(snapshots_cf) = self.persistent.db.cf_handle("snapshots") {
             for prefix in &["full_snap_", "state_snap_"] {
