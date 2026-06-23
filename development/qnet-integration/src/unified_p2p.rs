@@ -194,8 +194,14 @@ pub static BEST_PEER_HEIGHT: AtomicU64 = AtomicU64::new(0);
 /// direct or relayed. NEVER fed by served-block heights, so a follower's own sync progress cannot
 /// poison it; the genesis (always present) keep it at the true tip. Floors get_best_peer_height.
 pub static SIGNED_HEAD_MAX: AtomicU64 = AtomicU64::new(0);
-/// Per-origin last accepted signed-head ts: monotonic anti-replay + relay dedup (gossip each origin/ts once).
-static LAST_HEAD_TS: Lazy<DashMap<String, u64>> = Lazy::new(DashMap::new);
+/// Per-origin high-water (ts, height) of accepted signed heads: dedup + anti-replay + relay-once. Keyed on
+/// BOTH so a strictly-higher height always passes even if the origin's wall-clock ts regresses (cold
+/// restart / NTP step), keeping the dedup as monotonic as the height-keyed oracle it guards.
+static LAST_HEAD_TS: Lazy<DashMap<String, (u64, u64)>> = Lazy::new(DashMap::new);
+/// Latest locally-signed head, cached by the 15s emit tick so the block-serve path can co-send it over
+/// the proven serve channel — reaching freshly-joined peers the emit fan-out (get_connected_peers)
+/// misses. (from, ts, height, sig_hex, pk_hex).
+static LATEST_SIGNED_HEAD: Lazy<RwLock<Option<(String, u64, u64, String, String)>>> = Lazy::new(|| RwLock::new(None));
 
 // Pending-gap queue (multiple disjoint gaps, lock-free). The pre-v24
 // single Mutex<(u64,u64)> slot tracked only ONE gap, so a second gap
@@ -5797,6 +5803,12 @@ impl SimplifiedP2P {
                             (String::new(), String::new())
                         }
                     };
+
+                    // Cache the signed head for the block-serve co-send path (reaches cold-joiners the
+                    // get_connected_peers fan-out misses).
+                    if !sig_hex.is_empty() {
+                        *LATEST_SIGNED_HEAD.write() = Some((node_id.clone(), ts, current_height, sig_hex.clone(), pk_hex.clone()));
+                    }
 
                     for (peer_addr, peer_id, _peer_type) in &connected_peers {
                         let ping_msg = NetworkMessage::HealthPing {
@@ -13250,23 +13262,27 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::HealthPing { from, timestamp, height, signature, public_key } => {
-                // v9.1: Rate limit BEFORE Dilithium3 verification (~35ms CPU each).
-                // HealthPings arrive every 10s per peer → max 6/min is generous.
-                // Without this, an attacker floods pings to burn CPU on sig verification.
+                // Dedup BEFORE verify+rate-limit. The serve-envelope co-sends the cached head on every
+                // block-serve (hundreds/min during catch-up), but the origin re-signs only once per emit
+                // tick — between ticks every co-send repeats one (ts,height). Skip repeats here: O(1), no
+                // Dilithium verify, no rate-limit spend. So an honest co-send flood costs nothing and the
+                // count-limit is reached only by genuinely new heads. Key = claimed `from`; the marker is
+                // advanced ONLY after a successful verify below, so a spoofed future-ts (invalid sig)
+                // cannot poison a real origin's dedup floor.
+                let (last_head_ts, last_head_h) = LAST_HEAD_TS.get(&from).map(|e| *e.value()).unwrap_or((0, 0));
+                if timestamp <= last_head_ts && height <= last_head_h {
+                    return;
+                }
+
+                // v9.1: Rate limit a NEW head BEFORE Dilithium3 verify (~35ms CPU each) — bounds verify
+                // CPU under a spoofed-origin/distinct-ts flood. Honest new heads are ~1/emit-tick per
+                // peer, far under the cap; the count-limit gates verify CPU, never the monotonic oracle.
                 if self.is_consensus_rate_limited(from_peer, "health_ping", 60) {
                     return;
                 }
 
-                // v8.0: Separate signature verification from timestamp freshness.
-                // Dilithium signature proves the SENDER actually sent this height.
-                // Timestamp freshness (age_secs) is only anti-replay — it should NOT
-                // block height updates, because clock drift between nodes is common
-                // (especially on fresh/restarted nodes or across cloud regions).
-                //
-                // SECURITY MODEL (Ethereum-style):
-                //   - Signature valid → height is TRUSTED (sender proved it)
-                //   - Age > threshold → stale, but height still valid (clock drift ≠ forgery)
-                //   - No signature → height NOT trusted (legacy/unsigned)
+                // v8.0: signature, not freshness, authorizes the height. A valid Dilithium sig proves the
+                // SENDER sent this height; age_secs is anti-replay diagnostics only (clock drift ≠ forgery).
                 let now_ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -13280,23 +13296,19 @@ impl SimplifiedP2P {
                 };
 
                 if sig_verified {
-                    // Signature proves sender identity — ALWAYS update height.
-                    // Clock drift only means the message took a detour, not that
-                    // the height is wrong. This is critical for syncing nodes.
-                    self.update_peer_last_seen_with_height(&from, Some(height), true);
-                    // Authenticated head = the tip oracle (never a served-block height). Relay genesis
-                    // heads transitively (per-origin monotonic-ts dedup) so a deep follower learns the
-                    // real tip from any peer — no direct-genesis dependency, no HTTP fan-in. O(5N).
+                    // Authenticated head = the tip oracle (never a served-block height). Advance the dedup
+                    // marker (post-verify: anti-poison + anti-replay), then the monotonic oracle for any
+                    // verified peer. Relay genesis heads transitively (per-origin ts dedup) so a deep
+                    // follower learns the real tip from any peer — no direct-genesis dependency, no HTTP
+                    // fan-in. O(5N).
+                    LAST_HEAD_TS.insert(from.clone(), (timestamp.max(last_head_ts), height.max(last_head_h)));
                     SIGNED_HEAD_MAX.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
-                    let head_ts_new = timestamp > LAST_HEAD_TS.get(&from).map(|e| *e.value()).unwrap_or(0);
-                    if head_ts_new {
-                        LAST_HEAD_TS.insert(from.clone(), timestamp);
-                        if crate::genesis_constants::is_legacy_genesis_node(&from) {
-                            self.relay_signed_head(NetworkMessage::HealthPing {
-                                from: from.clone(), timestamp, height,
-                                signature: signature.clone(), public_key: public_key.clone(),
-                            }, &from, from_peer, 6);
-                        }
+                    self.update_peer_last_seen_with_height(&from, Some(height), true);
+                    if crate::genesis_constants::is_legacy_genesis_node(&from) {
+                        self.relay_signed_head(NetworkMessage::HealthPing {
+                            from: from.clone(), timestamp, height,
+                            signature: signature.clone(), public_key: public_key.clone(),
+                        }, &from, from_peer, 6);
                     }
                     if crate::node::is_debug() && height % 100 == 0 {
                         println!("[DBG][P2P] health_ping from={} h={} sig=verified age={}s", from, height, age_secs);
@@ -22095,6 +22107,17 @@ impl SimplifiedP2P {
         
         let transport = quic_transport.read().await;
         transport.send_with_ack(quic_addr, &message).await
+    }
+
+    /// Co-send our cached signed head to `addr` over the serve channel (the block-serve path that
+    /// provably reaches the requester). Lets a freshly-joined peer — which the HealthPing emit fan-out
+    /// (get_connected_peers) does not reach — learn the real network tip, so its SIGNED_HEAD_MAX
+    /// advances past its own frontier and it keeps syncing instead of falsely flipping synced.
+    pub fn cosend_signed_head(&self, addr: &str) {
+        let head = LATEST_SIGNED_HEAD.read().clone();
+        if let Some((from, timestamp, height, signature, public_key)) = head {
+            self.send_network_message(addr, NetworkMessage::HealthPing { from, timestamp, height, signature, public_key });
+        }
     }
 
     /// PRODUCTION v2.19.21: Send network message via QUIC (binary protocol)

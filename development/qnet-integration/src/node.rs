@@ -24894,10 +24894,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     tokio::time::sleep(std::time::Duration::from_millis(SYNC_BATCH_DELAY_MS)).await;
                 }
             }
-            
-            if is_info() { 
-                println!("[INFO][SYNC] sent blocks={} (shred={} batch={}) to={}", 
-                         total_blocks, large_blocks_count, small_blocks_count, requester_id); 
+
+            // Co-send our signed head over the serve channel so the requester (incl. a freshly-joined
+            // cold node the HealthPing emit fan-out misses) learns the real network tip and advances
+            // its SIGNED_HEAD_MAX, instead of stalling at its own frontier.
+            p2p.cosend_signed_head(&addr);
+
+            if is_info() {
+                println!("[INFO][SYNC] sent blocks={} (shred={} batch={}) to={}",
+                         total_blocks, large_blocks_count, small_blocks_count, requester_id);
             }
         }
         
