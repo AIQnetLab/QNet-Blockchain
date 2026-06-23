@@ -255,11 +255,15 @@ function transformTransaction(
     return null;
   }
 
-  // v3.53: Use TX-level timestamp first (most accurate), block timestamp as fallback
-  // API returns timestamp on both block and individual TX objects
+  // v3.54: the canonical time of a TX is the BLOCK timestamp (consensus-bound, slot-anchored =
+  // genesis_ts + height*SLOT), NOT the per-TX `timestamp`. The per-TX field is a client/bootstrap-set
+  // value: genesis bootstrap TXs (CreateAccount/NodeRegistration/system) carry a config-time stamp made
+  // hours before the genesis block is minted, which the old "tx-level first" rule surfaced as a wrong
+  // "16h ago" on genesis (live TXs happened to match block ts, so only genesis looked wrong). Prefer the
+  // block timestamp; fall back to the per-TX field only when the block timestamp is absent.
+  const blockTs = blockTimestamp || 0;
   const txTs = Number(tx.timestamp) || 0;
-  const fallbackTs = blockTimestamp || 0;
-  let rawTs = (txTs > 0 ? txTs : fallbackTs);
+  let rawTs = (blockTs > 0 ? blockTs : txTs);
   if (!Number.isFinite(rawTs) || rawTs < 0) {
     warn('[Sync] Invalid timestamp, fallback to 0:', rawTs);
     rawTs = 0;
