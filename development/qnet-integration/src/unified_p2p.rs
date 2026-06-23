@@ -190,6 +190,12 @@ static LAST_CANONICAL_VALIDATOR_COUNT: Lazy<Arc<AtomicU64>> =
 // Updated atomically when peer heartbeats arrive (update_peer_last_seen).
 // Replaces O(N) scan of active_full_super_nodes on every consensus tick.
 pub static BEST_PEER_HEIGHT: AtomicU64 = AtomicU64::new(0);
+/// Network-tip oracle: highest height from an authenticated (Dilithium-signed) HealthPing head,
+/// direct or relayed. NEVER fed by served-block heights, so a follower's own sync progress cannot
+/// poison it; the genesis (always present) keep it at the true tip. Floors get_best_peer_height.
+pub static SIGNED_HEAD_MAX: AtomicU64 = AtomicU64::new(0);
+/// Per-origin last accepted signed-head ts: monotonic anti-replay + relay dedup (gossip each origin/ts once).
+static LAST_HEAD_TS: Lazy<DashMap<String, u64>> = Lazy::new(DashMap::new);
 
 // Pending-gap queue (multiple disjoint gaps, lock-free). The pre-v24
 // single Mutex<(u64,u64)> slot tracked only ONE gap, so a second gap
@@ -314,9 +320,9 @@ const SOFT_LIMIT_PENDING_SYNC_BLOCKS: usize = 1600;
 
 // v30.A3: freshness window for peer height attestation. A peer's
 // last_block_height is consulted for `network_height` ONLY if its
-// last_height_attested_at falls within this window. Attestation is set by
-// authenticated signal paths (applied block, certified shred, signed
-// HealthPing) — NEVER by empty-batch echo or gossip-relayed claims.
+// last_height_attested_at falls within this window. Attestation is set ONLY by
+// the authenticated signed-head (signed HealthPing / verified handshake) — never
+// by served-block heights (an availability fact, not a tip) or empty-batch echo.
 // 120 s ≈ 1 macroblock (90 microblocks × 1 s slot + jitter): a peer that
 // hasn't emitted a signed height in 2 minutes is treated as height-unknown,
 // preventing stale or poisoned values from steering sync indefinitely.
@@ -1935,8 +1941,8 @@ pub struct PeerInfo {
     pub last_block_height: u64,
 
     // v30.A3: wall-clock secs of the last height-attesting event for this peer
-    // (signed HealthPing, applied block, certified shred). Heights that were
-    // populated via empty-batch echo or unauthenticated paths leave this at 0.
+    // (signed HealthPing / verified handshake ONLY — served-block heights no
+    // longer attest a tip). Unauthenticated paths leave this at 0.
     // `get_max_peer_height` filters on freshness against this — stale or
     // unattested entries are excluded from `network_height` consensus, which
     // collapses the empty-batch → cache-poisoning → permanent sync-mode loop.
@@ -8310,7 +8316,8 @@ impl SimplifiedP2P {
         // accidentally showed correct height via unwrap_or(local_height) fallback.
         let producer_id = if let Some(ref cert) = assembly.certificate {
             let pid = cert.node_id.clone();
-            self.update_peer_last_seen_with_height(&pid, Some(height), false);
+            // Liveness only: a reconstructed block height is an availability fact, not the peer tip.
+            self.update_peer_last_seen(&pid);
             pid
         } else {
             "shred_protocol".to_string()
@@ -8404,7 +8411,8 @@ impl SimplifiedP2P {
             // must update peer heights for correct network_height tracking
             let producer_id = if let Some(ref cert) = assembly.certificate {
                 let pid = cert.node_id.clone();
-                self.update_peer_last_seen_with_height(&pid, Some(height), false);
+                // Liveness only: a reconstructed block height is an availability fact, not the peer tip.
+                self.update_peer_last_seen(&pid);
                 pid
             } else {
                 "shred_protocol-rs".to_string()
@@ -8761,9 +8769,9 @@ impl SimplifiedP2P {
     /// This provides real-time network height without HTTP calls
     ///
     /// v30.A3: only entries attested within PEER_HEIGHT_ATTEST_TTL_SECS are
-    /// included. Attestation is set exclusively by authenticated paths
-    /// (applied block, certified shred, signed HealthPing); stale or
-    /// gossip-only entries are excluded — closes the empty-batch self-poison
+    /// included. Attestation is set exclusively by the authenticated signed-head
+    /// (signed HealthPing / verified handshake — served-block heights do not
+    /// attest a tip); stale or gossip-only entries are excluded — closes the empty-batch self-poison
     /// loop and rejects single-peer height claims as a network-wide signal.
     ///
     /// v30.A2: requires ≥ 2 distinct attested peers (besides local) before
@@ -12967,8 +12975,8 @@ impl SimplifiedP2P {
             // Legacy commit/reveal (pre-v2) — ignored: macroblock consensus is Checkpoint-BFT only.
             NetworkMessage::ConsensusCommit { .. } | NetworkMessage::ConsensusReveal { .. } => {}
             NetworkMessage::Block { height, data, block_type } => {
-                // CRITICAL FIX: Update last_seen AND height for the peer who sent the block
-                self.update_peer_last_seen_with_height(from_peer, Some(height), false);
+                // Liveness only: the relayed block height is an availability fact, not the peer tip.
+                self.update_peer_last_seen(from_peer);
                 
                 // Log only every 10th block
                 if height % 10 == 0 {
@@ -13245,7 +13253,7 @@ impl SimplifiedP2P {
                 // v9.1: Rate limit BEFORE Dilithium3 verification (~35ms CPU each).
                 // HealthPings arrive every 10s per peer → max 6/min is generous.
                 // Without this, an attacker floods pings to burn CPU on sig verification.
-                if self.is_consensus_rate_limited(from_peer, "health_ping", 12) {
+                if self.is_consensus_rate_limited(from_peer, "health_ping", 60) {
                     return;
                 }
 
@@ -13276,6 +13284,20 @@ impl SimplifiedP2P {
                     // Clock drift only means the message took a detour, not that
                     // the height is wrong. This is critical for syncing nodes.
                     self.update_peer_last_seen_with_height(&from, Some(height), true);
+                    // Authenticated head = the tip oracle (never a served-block height). Relay genesis
+                    // heads transitively (per-origin monotonic-ts dedup) so a deep follower learns the
+                    // real tip from any peer — no direct-genesis dependency, no HTTP fan-in. O(5N).
+                    SIGNED_HEAD_MAX.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
+                    let head_ts_new = timestamp > LAST_HEAD_TS.get(&from).map(|e| *e.value()).unwrap_or(0);
+                    if head_ts_new {
+                        LAST_HEAD_TS.insert(from.clone(), timestamp);
+                        if crate::genesis_constants::is_legacy_genesis_node(&from) {
+                            self.relay_signed_head(NetworkMessage::HealthPing {
+                                from: from.clone(), timestamp, height,
+                                signature: signature.clone(), public_key: public_key.clone(),
+                            }, &from, from_peer, 6);
+                        }
+                    }
                     if crate::node::is_debug() && height % 100 == 0 {
                         println!("[DBG][P2P] health_ping from={} h={} sig=verified age={}s", from, height, age_secs);
                     }
@@ -15823,8 +15845,26 @@ impl SimplifiedP2P {
         
         // Take K closest neighbors
         let k_neighbors: Vec<_> = peers.into_iter().take(k).collect();
-        
+
         for peer in k_neighbors {
+            self.send_network_message(&peer.addr, message.clone());
+        }
+    }
+
+    /// Relay a verified genesis signed-head to NON-genesis neighbors only, excluding the origin and
+    /// the immediate sender. The genesis mesh already exchanges heads via direct emit, so relaying back
+    /// to it is pure fan-in; restricting to non-genesis k-closest pushes the tip OUTWARD to deep
+    /// followers with zero fan-in onto the 5 genesis at thousands-of-joiner scale.
+    fn relay_signed_head(&self, message: NetworkMessage, origin_id: &str, sender_addr: &str, k: usize) {
+        let mut peers: Vec<_> = self.connected_peers_lockfree.iter()
+            .map(|r| r.value().clone())
+            .filter(|p| p.id != origin_id
+                && p.addr != sender_addr
+                && !crate::genesis_constants::is_legacy_genesis_node(&p.id))
+            .collect();
+        if peers.is_empty() { return; }
+        peers.sort_by_key(|p| p.bucket_index);
+        for peer in peers.into_iter().take(k) {
             self.send_network_message(&peer.addr, message.clone());
         }
     }
@@ -18343,7 +18383,10 @@ impl SimplifiedP2P {
     /// O(1) — reads global AtomicU64 updated on every heartbeat.
     /// Used to determine if THIS node is synced enough to participate in consensus.
     pub fn get_best_peer_height(&self) -> u64 {
+        // Floor by the authenticated signed-head tip: served-block heights (BEST_PEER_HEIGHT) can only
+        // attest a peer HAD block N (an availability fact <= our own crawl), never its true head.
         BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+            .max(SIGNED_HEAD_MAX.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// v9.5: Recalculate BEST_PEER_HEIGHT from scratch by scanning all connected peers.
@@ -18808,21 +18851,9 @@ impl SimplifiedP2P {
     /// 
     /// v2.104: FIXED - On backpressure, cleanup stale entries first instead of dropping
     pub fn handle_blocks_batch(&self, blocks: Vec<(u64, Vec<u8>)>, from_height: u64, to_height: u64, sender_id: String) {
-        // v30.A1: attest sender height ONLY from real delivered blocks. The
-        // previous implementation echoed the request's `to_height` back into
-        // `last_block_height`, so empty batches (peer has nothing in range)
-        // raised the cached height to the requester's own asking ceiling — a
-        // self-amplifying loop that locks the network into permanent SYNC mode
-        // (every poll re-requests the same window, empty responses keep
-        // re-confirming the phantom ceiling). With this fix:
-        //   * non-empty batch → attest max(block.height) — the only authentic
-        //     proof of peer height is a block the sender actually possesses;
-        //   * empty batch → no height attestation, refresh liveness only.
-        if let Some(max_block_h) = blocks.iter().map(|(h, _)| *h).max() {
-            self.update_peer_last_seen_with_height(&sender_id, Some(max_block_h), false);
-        } else {
-            self.update_peer_last_seen(&sender_id);
-        }
+        // Liveness only: a delivered block proves the sender HAD that height (an availability fact
+        // bounded by our own request window), never its tip. The network tip comes from signed heads.
+        self.update_peer_last_seen(&sender_id);
         
         // v2.104: BACKPRESSURE - Check queue size and cleanup if needed
         let queue_size = get_pending_sync_count();

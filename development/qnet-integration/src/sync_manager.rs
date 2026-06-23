@@ -292,8 +292,11 @@ impl SyncManager {
         let local_h = self.coordinator.chain_height();
         let best = self.p2p.get_best_peer_height();
 
-        // If single peer reports height >100 blocks ahead, verify against bootstrap
-        if best > 0 && best <= local_h + 100 {
+        // best is floored by the authenticated signed-head tip (get_best_peer_height). Once any signed
+        // head exists, trust it directly — it is unforgeable (Dilithium) and the QC frontier floors the
+        // bulk target, so no genesis HTTP fan-in is needed. The probe below is the cold-start fallback
+        // only, before the first head arrives (SIGNED_HEAD_MAX == 0).
+        if best > 0 && crate::unified_p2p::SIGNED_HEAD_MAX.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             return best;
         }
 
