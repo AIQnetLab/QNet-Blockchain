@@ -1084,6 +1084,18 @@ pub fn adopt_snapshot_finality(snapshot_height: u64, anchor_hash: [u8; 32]) {
     // replay) and the bulk-sync target isn't collapsed to chain_height/90. fetch_max ⇒ only advances.
     crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(snapshot_height, std::sync::atomic::Ordering::SeqCst);
     QC_VERIFIED_FRONTIER.fetch_max(anchor_mb.saturating_mul(90), std::sync::atomic::Ordering::SeqCst);
+    // Install the contiguous apply-frontier WITH the floor (atomic adoption). The apply-dedup gate
+    // treats height<=SNAPSHOT_ANCHOR_MB*90 as already-final, so chain_height must never trail the
+    // anchor — otherwise sync re-requests sub-anchor bodies that apply forever dup-skips → wedge. The
+    // bound snapshot legitimately replaces sub-anchor bodies, so the anchor IS the contiguous base.
+    // Raise-only; the clean fast_sync path already sets this, recovery/catch-up adopts did not.
+    if let Some(storage) = try_get_storage() {
+        if storage.get_chain_height().unwrap_or(0) < snapshot_height {
+            if let Err(e) = storage.set_chain_height(snapshot_height) {
+                if is_warn() { println!("[WARN][SYNC] adopt_set_chain_height_fail h={} err={}", snapshot_height, e); }
+            }
+        }
+    }
     persist_snapshot_anchor(anchor_mb, &anchor_hash);
     println!("[INFO][SYNC] snapshot_finality_adopted h={} mb={}", snapshot_height, anchor_mb);
 }
@@ -1115,7 +1127,30 @@ pub fn reload_snapshot_anchor() {
     let anchor_h = anchor_mb.saturating_mul(90);
     LAST_FINALIZED_HEIGHT.fetch_max(anchor_h, std::sync::atomic::Ordering::SeqCst);
     LAST_FINALIZED_CONSENSUS_ROUND.fetch_max(anchor_h, std::sync::atomic::Ordering::SeqCst);
+    // Heal the contiguous frontier up to the reloaded floor: a node whose chain_height was driven
+    // below the anchor by a pre-restart rollback would otherwise re-wedge (durable chain_height <
+    // reloaded anchor ⇒ sub-anchor re-request loop). Raise-only; runs once at boot before live blocks.
+    if storage.get_chain_height().unwrap_or(0) < anchor_h {
+        let _ = storage.set_chain_height(anchor_h);
+    }
     if is_info() { println!("[INFO][SYNC] snapshot_anchor_reloaded mb={} h={}", anchor_mb, anchor_h); }
+}
+
+/// Zero the runtime height + finality floors for a CLEAN re-bootstrap after discard_snapshot_state
+/// wiped all state (a snapshot rejected AFTER a prior one was already adopted). Keeps the invariant
+/// chain_height >= SNAPSHOT_ANCHOR_MB*90 consistent at 0: discard sets chain_height=0, the snapshot-bind
+/// AnchorReset guard caps SNAPSHOT_ANCHOR_MB to the now-0 chain_height, and this drops the other floors
+/// so no stale high floor strands the re-sync onto empty state. The genesis-rooted GALC capsule + binary
+/// WS pin are INDEPENDENT and intentionally untouched, so the clean block-sync re-verifies safely.
+pub fn reset_floors_for_rebootstrap() {
+    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(0, std::sync::atomic::Ordering::SeqCst);
+    QC_VERIFIED_FRONTIER.store(0, std::sync::atomic::Ordering::SeqCst);
+    WEAK_SUBJECTIVITY_CHECKPOINT.store(0, std::sync::atomic::Ordering::SeqCst);
+    {
+        let _g = crate::storage::lock_finality_state();
+        LAST_FINALIZED_HEIGHT.store(0, std::sync::atomic::Ordering::SeqCst);
+        LAST_FINALIZED_CONSENSUS_ROUND.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// v9.0 BUG-30: Check if rollback to target_height is allowed by finality rules.
@@ -13894,9 +13929,18 @@ impl BlockchainNode {
                             // diverged → competing forks (the rollback storm); it also over-deleted one
                             // good block (the extra -1). A node behind the fork (local_h ≤ fork_h)
                             // deletes nothing here (guard below) — it pulls the canonical chain via sync.
-                            let rollback_to = fork_h;
-                            println!("[WARN][FORK] pipeline_detected fork_h={} local_h={} rollback_to={}",
-                                     fork_h, local_h, rollback_to);
+                            // Never roll the contiguous frontier below the adopted snapshot/finality
+                            // floor: the anchor is 2f+1-QC-final and the snapshot holds sub-anchor state,
+                            // so a target below it is not a real reorg point. Clamping up means a target
+                            // ≥ local_h makes the destructive delete below no-op (rollback_to < local_h
+                            // guard) and the node re-syncs cleanly instead of stranding chain_height under
+                            // a higher monotonic anchor (the wedge). Complements the LAST_FINALIZED guard
+                            // inside begin_finality_guarded_rollback.
+                            let anchor_floor = SNAPSHOT_ANCHOR_MB
+                                .load(std::sync::atomic::Ordering::Acquire).saturating_mul(90);
+                            let rollback_to = fork_h.max(anchor_floor);
+                            println!("[WARN][FORK] pipeline_detected fork_h={} local_h={} rollback_to={} anchor_floor={}",
+                                     fork_h, local_h, rollback_to, anchor_floor);
 
                             if let Some(p2p) = &unified_p2p {
                                 // 1. Rollback local chain to before fork point

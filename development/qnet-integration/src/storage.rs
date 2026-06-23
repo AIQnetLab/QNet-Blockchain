@@ -9752,7 +9752,16 @@ impl Storage {
                 // Restore the prior runtime floor on ANY early return; only a fully-verified anchor
                 // commits a new floor (adopt_snapshot_finality + mem::forget at the end). No provisional
                 // floor is set during the walk (the old mb_idx-3 shortcut was the circularity hole).
-                crate::node::SNAPSHOT_ANCHOR_MB.store(self.0, std::sync::atomic::Ordering::SeqCst);
+                // CAP by the live chain_height: discard_snapshot_state zeroes chain_height on a full
+                // state wipe (a snapshot rejected after a prior one was adopted), so a blind restore of
+                // the higher prior anchor would strand the dedup floor above an empty chain (the cross-
+                // attempt invariant break). A non-wiping early return leaves chain_height == prior, so the
+                // prior anchor is restored unchanged.
+                let chain_mb = crate::node::try_get_storage()
+                    .and_then(|s| s.get_chain_height().ok())
+                    .map(|h| h / 90)
+                    .unwrap_or(self.0);
+                crate::node::SNAPSHOT_ANCHOR_MB.store(self.0.min(chain_mb), std::sync::atomic::Ordering::SeqCst);
             }
         }
         let anchor_guard = AnchorReset(crate::node::SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst));
@@ -10056,6 +10065,11 @@ impl Storage {
     /// Roll back a rejected snapshot: wipe all state it wrote + reset height to 0 so the
     /// orphaned state can never pollute the fallback block-sync. Node re-bootstraps clean.
     fn discard_snapshot_state(&self, height: u64) -> IntegrationResult<()> {
+        // Drop the runtime floors + chain_height FIRST, before any CF wipe: if a later wipe write fails
+        // mid-way, the node is left with LOW floors (clean re-bootstrap from genesis trust) rather than a
+        // high anchor stranded over partially-wiped state. reset_floors is infallible (atomic stores).
+        crate::node::reset_floors_for_rebootstrap();
+        self.set_chain_height(0)?;
         for cf in &["accounts", "pending_rewards", "node_registry", "contract_storage"] {
             self.clear_cf(cf)?;
         }
@@ -10066,6 +10080,9 @@ impl Storage {
             use rocksdb::{IteratorMode, Direction};
             let mut batch = rocksdb::WriteBatch::default();
             batch.delete_cf(&meta_cf, Self::REGISTRY_LT_STATE_KEY);
+            // Drop the persisted snapshot anchor too: leaving it would make a warm restart re-load a
+            // high anchor (reload_snapshot_anchor) and heal chain_height up to it onto the wiped state.
+            batch.delete_cf(&meta_cf, b"snapshot_anchor");
             for item in self.persistent.db.iterator_cf(&meta_cf, IteratorMode::From(b"rr_seal_", Direction::Forward)) {
                 let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
                 if !k.starts_with(b"rr_seal_") { break; }
@@ -10073,7 +10090,6 @@ impl Storage {
             }
             let _ = self.persistent.db.write(batch);
         }
-        self.set_chain_height(0)?;
         if let Some(snapshots_cf) = self.persistent.db.cf_handle("snapshots") {
             for prefix in &["full_snap_", "state_snap_"] {
                 let _ = self.persistent.db.delete_cf(&snapshots_cf, format!("{}{}", prefix, height).as_bytes());

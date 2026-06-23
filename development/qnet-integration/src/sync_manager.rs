@@ -593,7 +593,13 @@ impl SyncManager {
         }
 
         while self.active.load(Ordering::Relaxed) {
-            let apply_tip = self.storage.get_chain_height().unwrap_or(local_h);
+            // Floor the apply-frontier by the adopted snapshot anchor. The apply-dedup gate treats
+            // height<=SNAPSHOT_ANCHOR_MB*90 as already-final (bound snapshot replaces sub-anchor
+            // bodies), so requesting sub-anchor blocks would loop forever (fetched → dup-skipped →
+            // never saved → re-requested). Tailing from anchor+1 keeps this coordinator and the apply
+            // stage agreeing on "done", and self-heals a frontier transiently stranded below the anchor.
+            let apply_tip = self.storage.get_chain_height().unwrap_or(local_h)
+                .max(crate::node::SNAPSHOT_ANCHOR_MB.load(Ordering::Relaxed).saturating_mul(90));
 
             // Sync complete?
             if apply_tip >= target {
