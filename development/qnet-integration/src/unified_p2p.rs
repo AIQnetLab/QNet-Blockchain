@@ -4243,6 +4243,46 @@ impl SimplifiedP2P {
 
     /// QUANTUM OPTIMIZATION: Lock-free peer addition for millions of nodes
     /// Uses DashMap for concurrent operations without blocking
+    /// Upsert a handshake-verified peer (with its attested tip) into connected_peers_lockfree so an
+    /// OUTBOUND (client-dialed) cold-join peer counts toward network-height/quorum exactly like an
+    /// inbound one. Without this, outbound genesis/committee peers stay absent from the map and the
+    /// attested-peer count is stuck at 0 → the joiner never reports synchronized.
+    pub fn attest_connected_peer(&self, node_id: &str, ip: &str, node_type_str: &str, height: u64, verified: bool) {
+        if node_id == self.node_id || ip.is_empty() { return; }
+        let addr = format!("{}:8001", ip);
+        if !self.connected_peers_lockfree.contains_key(&addr) {
+            let node_type = match node_type_str.to_lowercase().as_str() {
+                "light" => NodeType::Light,
+                _ => NodeType::Super, // super / genesis / unknown → Super (only consensus-capable type)
+            };
+            let region = match crate::genesis_constants::get_genesis_region_by_ip(ip).unwrap_or("Europe") {
+                "NorthAmerica" => Region::NorthAmerica,
+                "Asia" => Region::Asia,
+                "SouthAmerica" => Region::SouthAmerica,
+                "Africa" => Region::Africa,
+                "Oceania" => Region::Oceania,
+                _ => Region::Europe,
+            };
+            let now = self.current_timestamp();
+            let reputation = self.get_node_reputation_from_blockchain(node_id);
+            self.add_peer_lockfree(PeerInfo {
+                id: node_id.to_string(), addr, node_type, region,
+                last_seen: now, is_stable: true, latency_ms: 0, connection_count: 1,
+                bandwidth_usage: 0, node_id_hash: Vec::new(), bucket_index: 0,
+                reputation, consensus_score: reputation, network_score: 100.0,
+                reputation_score: None, successful_pings: 0, failed_pings: 0,
+                last_block_height: height,
+                // Attest the tip ONLY when the handshake proof was verified; advisory-admit (PK unknown)
+                // peers are usable for transport but must not count toward the network-height quorum.
+                last_height_attested_at: if verified && height > 0 { now } else { 0 },
+                is_outbound: true,
+            });
+        }
+        if verified && height > 0 {
+            self.update_peer_last_seen_with_height(node_id, Some(height), true);
+        }
+    }
+
     pub fn add_peer_lockfree(&self, mut peer_info: PeerInfo) -> bool {
         // PRODUCTION v2.21.4: Check global peer limit FIRST
         // This prevents phantom peer accumulation across all buckets
@@ -13854,11 +13894,13 @@ impl SimplifiedP2P {
                         //     squatter's `register_consensus_pk_from_chain`
                         //     call is rejected as a mismatch (Fix #2/#3).
 
+                        // Disk persistence is owned by the on-chain apply path (authoritative, low-frequency,
+                        // guarantees snapshot completeness). This high-frequency gossip path only seeds RAM
+                        // once — no per-claim disk write (avoids write amplification at scale).
                         if !crate::genesis_constants::has_vrf_key(&node_id) {
                             if let Some(ref pk_bytes) = pk_for_verify {
                                 crate::genesis_constants::register_vrf_public_key(&node_id, pk_bytes);
                                 let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(&node_id, pk_bytes);
-                                // Persist to RocksDB for restart survival
                                 if let Some(ref storage) = self.storage {
                                     let pk_hex = hex::encode(pk_bytes);
                                     if let Err(e) = storage.save_vrf_public_key(&node_id, &pk_hex) {
@@ -20027,7 +20069,6 @@ impl SimplifiedP2P {
         let timeout_check = Duration::from_secs(timeout_secs);
         let sent_to_peers_clone = sent_to_peers.clone();
         let from_h_clone = from_height;
-        let to_h_clone = to_height;
         tokio::spawn(async move {
             tokio::time::sleep(timeout_check).await;
             let storage = match crate::node::try_get_storage() {
@@ -20037,19 +20078,12 @@ impl SimplifiedP2P {
             let delivered = storage.load_microblock(from_h_clone)
                 .map(|opt| opt.is_some())
                 .unwrap_or(false);
+            // No failure strike: each peer got a DISTINCT shard, so one missing block must not cool down
+            // every peer (microblock-availability gap, not misbehavior). Dead peers drop on real I/O errors.
             if delivered {
                 for peer_tag in &sent_to_peers_clone {
                     let peer_id = peer_tag.split('[').next().unwrap_or(peer_tag);
                     record_sync_peer_success(peer_id);
-                }
-            } else {
-                for peer_tag in &sent_to_peers_clone {
-                    let peer_id = peer_tag.split('[').next().unwrap_or(peer_tag);
-                    record_sync_peer_failure(peer_id);
-                }
-                if crate::node::is_debug() {
-                    println!("[DBG][SYNC] dispatch_undelivered h={}-{} peers=[{}]",
-                             from_h_clone, to_h_clone, sent_to_peers_clone.join(","));
                 }
             }
         });

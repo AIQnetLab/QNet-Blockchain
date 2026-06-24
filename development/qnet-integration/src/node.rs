@@ -2448,7 +2448,11 @@ pub(crate) fn qc_verified_frontier_height() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     let storage = match try_get_storage() { Some(s) => s, None => return QC_VERIFIED_FRONTIER.load(Relaxed) };
     let local_mb = storage.get_latest_macroblock_index().unwrap_or(0); // = chain_height/90 (own progress)
-    let hint_mb = try_get_p2p().map(|p| p.get_best_peer_height() / MB).unwrap_or(0);
+    // Hint = MAX of the served-availability oracle and the attested network-tip oracle, so the frontier
+    // probe keeps pace with the applied microblock tip (a forged-high hint self-limits at the QC gate).
+    let hint_mb = try_get_p2p()
+        .map(|p| p.get_best_peer_height().max(p.get_cached_network_height().unwrap_or(0)) / MB)
+        .unwrap_or(0);
     // Fire-and-forget the bulk lineage extension (throttled) — NEVER block the production hot path on
     // peer I/O. The local scan below reports the frontier from whatever has already been QC-stored;
     // the spawned walk extends it for the next call. Skip-present + windowed; fetches objects + N-2
@@ -5156,18 +5160,18 @@ impl BlockchainNode {
                                              &node_id[..16.min(node_id.len())]);
                                 }
                             }
-                            if !crate::genesis_constants::has_vrf_key(node_id) {
-                                if let Ok(pk_bytes) = hex::decode(pk_hex) {
-                                    crate::genesis_constants::register_vrf_public_key(node_id, &pk_bytes);
-                                    // v14.8: Mirror to consensus-layer registry. The TX was
-                                    // signature-validated by the chain before reaching this
-                                    // code path, so the (node_id, pk) binding is authenticated.
-                                    let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, &pk_bytes);
-                                    if let Err(e) = storage.save_vrf_public_key(node_id, pk_hex) {
-                                        if crate::node::is_warn() {
-                                            println!("[WARN][STORAGE] vrf_pk_save_failed node={} err={}", node_id, e);
-                                        }
+                            if let Ok(pk_bytes) = hex::decode(pk_hex) {
+                                // Persist to disk unconditionally so the registry CF — and every snapshot of
+                                // it — stays vrf-complete even when the key already arrived in RAM via gossip.
+                                if let Err(e) = storage.save_vrf_public_key(node_id, pk_hex) {
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][STORAGE] vrf_pk_save_failed node={} err={}", node_id, e);
                                     }
+                                }
+                                if !crate::genesis_constants::has_vrf_key(node_id) {
+                                    crate::genesis_constants::register_vrf_public_key(node_id, &pk_bytes);
+                                    // TX was chain signature-validated before here ⇒ (node_id, pk) authenticated.
+                                    let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, &pk_bytes);
                                     if is_info() {
                                         println!("[INFO][VRF-KEY] on_chain_registered node={} pk_hash={}",
                                                  node_id, &pk_hex[..16]);
@@ -14254,7 +14258,8 @@ impl BlockchainNode {
                                 let sync_start_time = FAST_SYNC_START_TIME.load(Ordering::Relaxed);
 
                                 if sync_start_time == 0 {
-                                    println!("[WARN][SYNC] deadlock start_time=0 action=clearing");
+                                    // Self-heal an inconsistent flag (syncing set, start unrecorded); not a fault.
+                                    if is_debug() { println!("[DBG][SYNC] sync_flag_reset reason=start_time_zero"); }
                                     FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
                                     SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
                                 } else {
@@ -22905,6 +22910,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         self.storage.get_latest_snapshot_height()
             .map_err(|e| QNetError::StorageError(e.to_string()))
     }
+
+    pub fn get_highest_snapshot_height_le(&self, ceiling: u64) -> Result<Option<u64>, QNetError> {
+        self.storage.get_highest_snapshot_height_le(ceiling)
+            .map_err(|e| QNetError::StorageError(e.to_string()))
+    }
     
     /// Get snapshot IPFS CID if available
     pub fn get_snapshot_ipfs_cid(&self, height: u64) -> Result<Option<String>, QNetError> {
@@ -25410,8 +25420,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     if try_advance_finality(round, "MB-SYNC-DEDUP") {
                         println!("[INFO][MB-SYNC] finality_catchup mb={} round={} prev_round={}", index, round, prev_round);
                     }
-                } else if is_warn() {
-                    println!("[WARN][MB-SYNC] dedup_skip_finality mb={} round={} reason=missing_microblocks — finality stays at {}",
+                } else if is_debug() {
+                    println!("[DBG][MB-SYNC] dedup_skip_finality mb={} round={} reason=missing_microblocks finality_at={}",
                              index, round, prev_round);
                 }
             }
@@ -25429,8 +25439,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
             
-            if !missing_microblocks.is_empty() {
-                println!("[WARN][MB-SYNC] Macroblock #{} references {} missing microblocks (first: {})", 
+            if !missing_microblocks.is_empty() && is_debug() {
+                // Expected during sync: macroblock headers arrive ahead of the microblocks the bulk
+                // pipeline backfills bottom-up. A real stall surfaces via behind=/deadlock logs, not here.
+                println!("[DBG][MB-SYNC] mb={} references {} missing microblocks (first {})",
                          index, missing_microblocks.len(), missing_microblocks[0]);
             }
             
@@ -25462,8 +25474,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     if try_advance_finality(round, "MB-SYNC") {
                         println!("[INFO][MB-SYNC] finalized_round_updated mb={} round={} finality_h={}", index, round, round);
                     }
-                } else {
-                    println!("[WARN][MB-SYNC] skip_finality_update mb={} round={} missing_microblocks={} — finality stays at {}",
+                } else if is_debug() {
+                    println!("[DBG][MB-SYNC] skip_finality_update mb={} round={} missing_microblocks={} finality_at={}",
                              index, round, missing_microblocks.len(), prev_round);
                 }
             }
@@ -26488,8 +26500,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         if let Ok(json) = resp.json::<serde_json::Value>().await {
                             if json["success"].as_bool() == Some(true) {
                                 println!("[INFO][ACTIVATION] device_registered_on_genesis node={}", node_id_for_log);
-                            } else {
-                                println!("[WARN][ACTIVATION] device_register_rejected node={} err={}",
+                            } else if is_debug() {
+                                // Transient until the joiner's registration finalizes network-side; auto-retried.
+                                println!("[DBG][ACTIVATION] device_register_rejected node={} err={}",
                                     node_id_for_log, json["error"].as_str().unwrap_or("unknown"));
                             }
                         }

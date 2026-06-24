@@ -2038,7 +2038,14 @@ impl BlockchainActivationRegistry {
                             transaction.dilithium_public_key = Some(local_node_id);
                         }
                         Err(e) => {
-                            println!("[WARN][ACTIVATION] dilithium_sign_failed err={}", e);
+                            // Pre-install signing attempt is benign — the TX is re-signed after
+                            // initialize_wallet_identity; only a real signer error is a fault.
+                            let es = e.to_string();
+                            if es.contains("identity_not_installed") {
+                                if crate::node::is_debug() { println!("[DBG][ACTIVATION] sign_deferred reason=identity_not_installed"); }
+                            } else {
+                                println!("[WARN][ACTIVATION] dilithium_sign_failed err={}", es);
+                            }
                         }
                     }
                 }

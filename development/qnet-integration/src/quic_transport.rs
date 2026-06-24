@@ -1704,8 +1704,10 @@ impl QuicTransport {
                 return;
             }
             Err(_) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][QUIC] uni_read_timeout peer={} timeout={}ms",
+                // Idle broadcast uni-stream whose body lands after the read window — normal under load,
+                // not a fault (bulk sync payloads arrive in one write_all+finish). DBG to avoid spam.
+                if crate::node::is_debug() {
+                    println!("[DBG][QUIC] uni_read_timeout peer={} timeout={}ms",
                         get_privacy_id_for_addr(&peer_addr.to_string()),
                         adaptive_timeout.as_millis());
                 }
@@ -1981,18 +1983,18 @@ impl QuicTransport {
             .map_err(|e| format!("Connection failed: {}", e))?;
         
         // Perform client handshake
-        let (remote_node_id, remote_cert_serial, remote_node_type, remote_block_height) = self.perform_client_handshake(&connection).await?;
+        let (remote_node_id, remote_cert_serial, remote_node_type, remote_block_height, remote_verified) = self.perform_client_handshake(&connection).await?;
 
         // v9.7: Immediately update BEST_PEER_HEIGHT from handshake
         if remote_block_height > 0 {
             crate::unified_p2p::BEST_PEER_HEIGHT.fetch_max(remote_block_height, std::sync::atomic::Ordering::Relaxed);
-            // Best-effort per-peer height attestation (resolves only if the peer is already registered,
-            // e.g. a reconnect). On a first connect the peer is not yet in connected_peers, so this
-            // no-ops and the first signed HealthPing supplies the attested height. The cold-join "evict
-            // all sources" stall is fixed by the eviction self_synced guard + genesis exemption, not here.
+            // Upsert this outbound (client-dialed) peer with its attested tip. The signed handshake binds
+            // (node_id, height); without this the peer never enters connected_peers and the attested-peer
+            // count stays 0 — so an outbound cold-joiner never reports synchronized.
             if remote_node_id != self.node_id {
                 if let Some(p2p) = crate::node::try_get_p2p() {
-                    p2p.update_peer_last_seen_with_height(&remote_node_id, Some(remote_block_height), true);
+                    let ip = connection.remote_address().ip().to_string();
+                    p2p.attest_connected_peer(&remote_node_id, &ip, &remote_node_type, remote_block_height, remote_verified);
                 }
             }
         }
@@ -2072,7 +2074,7 @@ impl QuicTransport {
     /// Perform client-side handshake
     /// v2.24: Added timeout to prevent hanging connections
     /// v9.7: Returns (node_id, cert_serial, node_type, block_height)
-    async fn perform_client_handshake(&self, conn: &Connection) -> Result<(String, String, String, u64), String> {
+    async fn perform_client_handshake(&self, conn: &Connection) -> Result<(String, String, String, u64, bool), String> {
         // v2.24: Timeout for entire handshake
         let handshake_timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
 
@@ -2137,7 +2139,9 @@ impl QuicTransport {
             // On Err the connection is aborted — caller drops the conn after
             // we return Err. On Ok(false) the peer is treated as legacy
             // (Phase 2.A backward compatibility) but logged for audit.
-            match verify_handshake_proof(
+            // verified=true only on Ok(true) (Dilithium proof verified). Ok(false)=advisory admit
+            // (PK unknown) → peer is usable for transport but its height must NOT be attested.
+            let verified = match verify_handshake_proof(
                 &peer_handshake.node_id,
                 peer_handshake.timestamp,
                 peer_handshake.block_height,
@@ -2148,16 +2152,15 @@ impl QuicTransport {
                         println!("[INFO][HANDSHAKE] dilithium_proof_verified side=client node={} h={}",
                                  peer_handshake.node_id, peer_handshake.block_height);
                     }
+                    true
                 }
                 Ok(false) => {
-                    // v19.1: Advisory admit (same three-state semantics as
-                    // server side). Every consensus message that flows
-                    // over this connection still goes through full
-                    // Dilithium3 verification before being honoured.
+                    // Advisory admit: consensus messages over this connection still get full Dilithium3 verify.
                     if crate::node::is_warn() {
                         println!("[WARN][HANDSHAKE] advisory_admit side=client node={} reason=pk_unknown_or_no_proof hint=will_authenticate_via_VrfKeyAnnounce_or_consensus_msg",
                                  peer_handshake.node_id);
                     }
+                    false
                 }
                 Err(e) => {
                     if crate::node::is_warn() {
@@ -2166,10 +2169,10 @@ impl QuicTransport {
                     }
                     return Err(format!("handshake_proof_invalid: {}", e));
                 }
-            }
+            };
 
-            // v9.7: Return height from handshake
-            Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type, peer_handshake.block_height))
+            // v9.7: Return height + verification verdict from handshake
+            Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type, peer_handshake.block_height, verified))
         }).await.map_err(|_| "Handshake timeout".to_string())?
     }
 

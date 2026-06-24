@@ -6840,36 +6840,6 @@ impl Storage {
         Ok(added)
     }
 
-    /// Snapshot-completeness contract for vrf_pk. Every chain-confirmed NON-genesis super in the
-    /// restored roster MUST carry its VRF public key: unlike registry_root/cbw (which recompute from
-    /// accounts+registry), vrf_pk has NO recompute-from-state path, so a snapshot missing it would
-    /// silently drop that super from burn-attestation/consensus quorums. Genesis ids are re-seeded
-    /// from embedded constants at boot ⇒ exempt. Returns Err on the first gap so the caller fails the
-    /// snapshot closed and re-targets a complete source. Cold path only (one srtr_ prefix scan).
-    pub fn verify_snapshot_vrf_pk_complete(&self) -> IntegrationResult<()> {
-        self.verify_snapshot_vrf_pk_complete_cf("node_registry")
-    }
-
-    /// vrf_pk completeness over an explicit registry CF (live or "node_registry_stage"). Reads
-    /// vrf_pk_ directly from the same CF so the staged copy is self-contained.
-    pub fn verify_snapshot_vrf_pk_complete_cf(&self, registry_cf_name: &str) -> IntegrationResult<()> {
-        let registry_cf = self.persistent.db.cf_handle(registry_cf_name)
-            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
-        for item in self.persistent.db.prefix_iterator_cf(&registry_cf, b"srtr_") {
-            let (key, _) = match item { Ok(kv) => kv, Err(_) => continue };
-            let key_str = match std::str::from_utf8(&key) { Ok(s) => s, Err(_) => continue };
-            let node_id = match key_str.strip_prefix("srtr_") { Some(id) => id, None => break };
-            if node_id.starts_with("genesis_node_") { continue; } // re-seeded from constants at boot
-            let vk = format!("vrf_pk_{}", node_id);
-            if self.persistent.db.get_cf(&registry_cf, vk.as_bytes())?.is_none() {
-                return Err(IntegrationError::StorageError(format!(
-                    "snapshot_vrf_pk_incomplete node={} reason=vrf_pk_absent", node_id
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// One-time marker so the O(N) roster-index migration scan runs once, not on every restart.
     pub fn roster_index_built(&self) -> bool {
         match self.persistent.db.cf_handle("node_registry") {
@@ -7733,6 +7703,9 @@ impl Storage {
 
             let mut batch = WriteBatch::default();
             for h in to_delete {
+                // Keep the genesis early anchor (h=90) as a universal cold-join floor: it is always
+                // committee-verifiable (genesis committee), so a capsule-less joiner can always fast-sync to it.
+                if *h == crate::node::SNAPSHOT_EARLY_ANCHOR_HEIGHT { continue; }
                 let key = format!("{}{}", prefix, h);
                 batch.delete_cf(&snapshots_cf, key.as_bytes());
                 removed += 1;
@@ -9519,6 +9492,28 @@ impl Storage {
     /// Get the latest snapshot height available for fast sync.
     /// Prefers full snapshots (latest_full_snap) over state snapshots (latest_state_snap),
     /// falls back to numerical scan over all snapshot_* keys.
+    /// Highest RETAINED snapshot height ≤ ceiling — cold-join verifiable-anchor negotiation. A joiner
+    /// clamps to its exogenously-verifiable anchor (GALC pin / h=90); a peer whose latest snapshot is
+    /// ABOVE that pin must still offer the highest one ≤ it. None ⇒ peer retains no snapshot ≤ ceiling.
+    pub fn get_highest_snapshot_height_le(&self, ceiling: u64) -> IntegrationResult<Option<u64>> {
+        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        let mut best = 0u64;
+        let iter = self.persistent.db.iterator_cf(&snapshots_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            if let Ok((key, _)) = item {
+                let key_str = String::from_utf8_lossy(&key);
+                let h_opt = key_str.strip_prefix("full_snap_").or_else(|| key_str.strip_prefix("state_snap_"));
+                if let Some(h_str) = h_opt {
+                    if let Ok(h) = h_str.parse::<u64>() {
+                        if h <= ceiling && h > best { best = h; }
+                    }
+                }
+            }
+        }
+        Ok(if best > 0 { Some(best) } else { None })
+    }
+
     pub fn get_latest_snapshot_height(&self) -> IntegrationResult<Option<u64>> {
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
@@ -9664,11 +9659,21 @@ impl Storage {
         let mut best_height = 0u64;
         let mut peer_heights: Vec<(String, u64)> = Vec::new();
 
+        // Exogenously-verifiable anchor ceiling: a cold joiner can verify a snapshot anchor WITHOUT already
+        // holding the committee's keys ONLY via the genesis-anchored GALC pin (verify_v2_macroblock hash-
+        // trusts index==pin.0, no committee-key resolution) or — before any pin — the genesis-committee
+        // early anchor h=90. A snapshot ABOVE the pin would force the full-QC path whose non-genesis keys a
+        // cold joiner has not learned → reject. Negotiate the highest snapshot ≤ ceiling; bounded tail replays.
+        let verifiable_ceiling = {
+            let pin_mb = crate::galc::effective_pin_checkpoint().0;
+            if pin_mb > 0 { pin_mb.saturating_mul(90) } else { crate::node::SNAPSHOT_EARLY_ANCHOR_HEIGHT }
+        };
+
         let queries: Vec<_> = peers.iter().map(|peer| {
             let addr = peer.addr.clone();
             let storage_ref = self;
             async move {
-                let result = storage_ref.query_peer_snapshot(&addr).await;
+                let result = storage_ref.query_peer_snapshot(&addr, verifiable_ceiling).await;
                 (addr, result)
             }
         }).collect();
@@ -9677,6 +9682,7 @@ impl Storage {
 
         for (addr, result) in results {
             if let Ok(Some((height, cid))) = result {
+                if height > verifiable_ceiling { continue; } // defense: peer ignored the ceiling param
                 if height > best_height {
                     best_height = height;
                 }
@@ -9719,6 +9725,17 @@ impl Storage {
             return Err(IntegrationError::Other(format!(
                 "snapshot_peer_filter_empty target_height={} candidates={}",
                 target_height, peer_heights.len(),
+            )));
+        }
+
+        // Forward-only: never adopt a snapshot at/below our own chain height (promote sets chain_height,
+        // so a ≤-local snapshot would REGRESS the node). The verifiable-ceiling clamp can yield a
+        // below-local anchor for a node already past it (e.g. capsule-less + advanced via replay) — fall
+        // to block replay instead, which continues forward.
+        let local_h = self.get_chain_height().unwrap_or(0);
+        if target_height <= local_h {
+            return Err(IntegrationError::Other(format!(
+                "snapshot_not_forward target={} local={} action=block_replay", target_height, local_h
             )));
         }
 
@@ -10094,21 +10111,13 @@ impl Storage {
             }
         }
 
-        // Completeness gate over the STAGED registry: vrf_pk has no recompute-from-state path, so a
-        // missing key is a hard reject. The derived-index REBUILDS (registry_lthash, cbw, roster) run at
-        // promote against live, never on the staging copy.
-        if let Err(e) = self.verify_snapshot_vrf_pk_complete_cf("node_registry_stage") {
-            if crate::node::is_warn() {
-                println!("[WARN][SYNC] snapshot_vrf_incomplete mb={} err={:?} action=reject_snapshot", mb_idx, e);
-            }
-            let _ = self.discard_snapshot_state(snapshot_height);
-            return Err(IntegrationError::Other(format!(
-                "snapshot_vrf_incomplete mb={} err={:?}", mb_idx, e
-            )));
-        }
+        // No vrf_pk completeness gate: registry authenticity is bound by registry_root above; vrf_pk is in
+        // no consensus root and self-heals via on-chain apply + VrfKeyAnnounce gossip. A super missing its
+        // key is excluded only from QC verification (n−f quorum unaffected), never from the committee
+        // sample — so a missing key must NOT reject otherwise-authentic state (would brick every joiner).
 
-        // Staging verified (2f+1 QC + Pattern-C state + registry binding + vrf completeness). Return the
-        // anchor hash; promote commits the floors and copies staging→live atomically.
+        // Staging verified (2f+1 QC + Pattern-C state + registry binding). Return the anchor hash;
+        // promote commits the floors and copies staging→live atomically.
         std::mem::forget(anchor_guard);
         if crate::node::is_info() {
             println!(
@@ -10249,9 +10258,10 @@ impl Storage {
     }
 
     /// Query peer for available snapshots
-    async fn query_peer_snapshot(&self, peer_addr: &str) -> IntegrationResult<Option<(u64, String)>> {
-        // Query peer's /api/v1/snapshot endpoint
-        let url = format!("http://{}/api/v1/snapshot/latest", peer_addr);
+    async fn query_peer_snapshot(&self, peer_addr: &str, max_height: u64) -> IntegrationResult<Option<(u64, String)>> {
+        // Ask for the highest snapshot ≤ our exogenously-verifiable ceiling (not just the peer's latest,
+        // which may be above our pin and therefore unverifiable cold).
+        let url = format!("http://{}/api/v1/snapshot/latest?max_height={}", peer_addr, max_height);
         
         match reqwest::get(&url).await {
             Ok(response) => {

@@ -1337,7 +1337,18 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_block_by_height);
-    
+
+    // Cold-join genesis fetch: serves the canonical stored block-0 bytes verbatim (bincode MicroBlock)
+    // so a joiner's binary fetch decodes byte-identically — no JSON reformatting that would diverge hash.
+    let genesis_block = api_v1
+        .and(warp::path("genesis"))
+        .and(warp::path("block"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_genesis_block);
+
     let block_by_hash = api_v1
         .and(warp::path("block"))
         .and(warp::path("hash"))
@@ -1366,6 +1377,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::addr::remote())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
         .and(blockchain_filter.clone())
         .and_then(handle_snapshot_latest);
 
@@ -2319,6 +2331,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(microblocks_range)
         .or(block_latest)
         .or(block_by_height)
+        .or(genesis_block)
         .or(block_by_hash)
         .or(macroblock_by_index)
         .or(snapshot_latest)
@@ -4167,6 +4180,31 @@ async fn handle_block_latest(
     }
 }
 
+/// Serve the raw stored block-0 bytes for a cold-join binary fetch (octet-stream, no reformat).
+async fn handle_genesis_block(
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<warp::reply::Response, Rejection> {
+    use warp::Reply;
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response.into_response());
+    }
+    let storage = blockchain.get_storage();
+    match storage.load_microblock(0) {
+        Ok(Some(bytes)) => {
+            let resp = warp::http::Response::builder()
+                .header("content-type", "application/octet-stream")
+                .body(warp::hyper::Body::from(bytes))
+                .unwrap_or_else(|_| warp::http::Response::new(warp::hyper::Body::empty()));
+            Ok(resp)
+        }
+        _ => Ok(warp::reply::with_status(
+            warp::reply::json(&json!({"error": "genesis_block_unavailable"})),
+            warp::http::StatusCode::NOT_FOUND,
+        ).into_response()),
+    }
+}
+
 async fn handle_block_by_height(
     height: u64,
     remote_addr: Option<std::net::SocketAddr>,
@@ -4357,12 +4395,19 @@ async fn handle_macroblock_by_index(
 /// Used by new nodes to find snapshots for fast sync
 async fn handle_snapshot_latest(
     remote_addr: Option<std::net::SocketAddr>,
+    query: std::collections::HashMap<String, String>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
         return Ok(rate_limit_response);
     }
-    match blockchain.get_latest_snapshot_height() {
+    // Cold-join verifiable-anchor negotiation: a joiner clamps to its exogenously-verifiable ceiling and
+    // asks for the highest snapshot ≤ it (not just our latest, which may be above the joiner's pin).
+    let height_result = match query.get("max_height").and_then(|s| s.parse::<u64>().ok()) {
+        Some(ceiling) => blockchain.get_highest_snapshot_height_le(ceiling),
+        None => blockchain.get_latest_snapshot_height(),
+    };
+    match height_result {
         Ok(Some(height)) => {
             // Get IPFS CID if available
             let ipfs_cid = blockchain.get_snapshot_ipfs_cid(height)
@@ -11770,9 +11815,10 @@ async fn handle_register_device(
                 node_type.eq_ignore_ascii_case("super")
             }
             _ => {
-                // SECURITY: Reject device registration for nodes not found in storage
-                if is_warn() {
-                    println!("[WARN][DEVICE] register_rejected node={} reason=not_registered_in_storage", node_id);
+                // Reject device registration for nodes not in storage. Expected transient during a
+                // cold-join (joiner's own registration not yet applied locally) ⇒ DBG, auto-retried.
+                if crate::node::is_debug() {
+                    println!("[DBG][DEVICE] register_rejected node={} reason=not_registered_in_storage", node_id);
                 }
                 false
             }
