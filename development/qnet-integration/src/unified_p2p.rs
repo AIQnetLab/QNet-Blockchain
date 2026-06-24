@@ -4456,6 +4456,49 @@ impl SimplifiedP2P {
     }
 
     /// Connect to bootstrap peers OR use internet-wide peer discovery
+    /// Cold-join committee dialing: proactively connect to a salted K-subset of the round committee at
+    /// the network frontier so a joiner pulls anchors/blocks from the committee, not just the 5 genesis.
+    /// Additive + idempotent: genesis-era committee is None ⇒ no-op (genesis bootstrap dialing unchanged);
+    /// already-known members are skipped. The per-joiner salt spreads many joiners across the committee.
+    pub fn dial_committee_for_cold_join(&self) {
+        let target = crate::node::qc_verified_frontier_cached();
+        if target == 0 { return; } // no attested tip yet ⇒ genesis-only, unchanged
+        let storage = match crate::node::try_get_storage() { Some(s) => s, None => return };
+        let committee = match crate::node::BlockchainNode::committee_for_height(storage, target) {
+            Some(c) => c,
+            None => return, // genesis era / N-2 macroblock absent ⇒ additive no-op
+        };
+        const COLD_JOIN_COMMITTEE_DIAL_K: usize = 24;
+        use sha3::{Digest, Sha3_256};
+        let salt = { let mut h = Sha3_256::new(); h.update(self.node_id.as_bytes()); h.finalize() };
+        let mut ranked: Vec<(u64, String)> = committee.into_iter()
+            .filter(|id| *id != self.node_id)
+            .map(|id| {
+                let mut h = Sha3_256::new(); h.update(&salt); h.update(id.as_bytes());
+                let d = h.finalize();
+                (u64::from_le_bytes(d[0..8].try_into().unwrap_or([0u8; 8])), id)
+            })
+            .collect();
+        ranked.sort_by_key(|(k, _)| *k);
+        let mut addrs: Vec<String> = Vec::new();
+        for (_, id) in ranked.into_iter().take(COLD_JOIN_COMMITTEE_DIAL_K) {
+            if self.peer_id_to_addr.contains_key(&id) { continue; } // already known/connected
+            let addr = if id.starts_with("genesis_node_") {
+                match Self::resolve_genesis_node_address(&id) { Some(a) => a, None => continue }
+            } else {
+                match crate::genesis_constants::get_node_endpoint_ip(&id) { Some(ip) => format!("{}:8001", ip), None => continue }
+            };
+            if self.connected_peers_lockfree.contains_key(&addr) { continue; }
+            addrs.push(addr);
+        }
+        if !addrs.is_empty() {
+            if crate::node::is_info() {
+                println!("[INFO][SYNC] committee_dial count={} target_mb={}", addrs.len(), target / 90);
+            }
+            self.connect_to_bootstrap_peers(&addrs);
+        }
+    }
+
     pub fn connect_to_bootstrap_peers(&self, peers: &[String]) {
         if peers.is_empty() {
             if crate::node::is_info() { println!("[INFO][P2P] No bootstrap peers provided - using internet-wide peer discovery"); }
@@ -18312,14 +18355,28 @@ impl SimplifiedP2P {
         // really at the tip 3148) and false-evicted healthy nodes → active-set churn
         // and a quorum risk at scale. A genuinely-behind node still evicts because its
         // live height is also behind.
+        // Only a FRESH, authenticated height counts. A gossip-inserted peer carries sentinel
+        // last_block_height=0 / attested_at=0 until its own signed signal lands; judging it by that 0
+        // false-evicts a healthy peer (a cold-joiner's genesis sources before the first HealthPing). So
+        // a peer with no fresh attestation is "height unknown" (live_known=false) → skip its height test.
         let mut live_heights: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         for e in self.connected_peers_lockfree.iter() {
             let p = e.value();
+            if p.last_block_height == 0 { continue; }
+            if now.saturating_sub(p.last_height_attested_at) > PEER_HEIGHT_ATTEST_TTL_SECS { continue; }
             let slot = live_heights.entry(p.id.clone()).or_insert(0);
             if p.last_block_height > *slot {
                 *slot = p.last_block_height;
             }
         }
+
+        // A node still catching up has no trustworthy first-hand peer heights and DEPENDS on its peers —
+        // never height-evict while we are ourselves below the frontier (the 15-min last_seen TTL still
+        // reaps genuinely dead peers). Closes the cold-join "evict all sources → stall" failure.
+        let self_synced = {
+            let local = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            network_height <= 180 || local.saturating_add(180) >= network_height
+        };
 
         // v2.51: Lock-free cleanup — stale by time
         let before = self.active_full_super_nodes.len();
@@ -18338,10 +18395,15 @@ impl SimplifiedP2P {
             // skip the height test for it and let the 15-min last_seen TTL (refreshed by continued
             // announcements) reap it if it actually goes silent. A genuinely-stuck DIRECT peer
             // (live_known, low height) still evicts.
+            // Genesis/bootstrap nodes are the anchored sync sources of last resort — never height-evict
+            // them (the 15-min TTL above still reaps a genuinely dead one).
+            if crate::genesis_constants::is_legacy_genesis_node(node_id) {
+                return true;
+            }
             let live_known = live_heights.contains_key(node_id);
             let live_h = live_heights.get(node_id).copied().unwrap_or(0);
             let effective_h = v.block_height.max(live_h);
-            if live_known && network_height > 180 && effective_h + 180 < network_height && *node_id != self.node_id {
+            if self_synced && live_known && network_height > 180 && effective_h + 180 < network_height && *node_id != self.node_id {
                 if crate::node::is_info() {
                     println!("[INFO][P2P] evict_desynced node={} snap={} live={} net={}", node_id, v.block_height, live_h, network_height);
                 }

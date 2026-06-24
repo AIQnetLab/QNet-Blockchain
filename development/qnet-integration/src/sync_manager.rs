@@ -516,6 +516,11 @@ impl SyncManager {
             }
         }
 
+        // Cold-join committee dialing: pull the residual tail from the round committee, not just the 5
+        // genesis. Idempotent + no-op until the N-2 macroblock for the target is present (genesis era /
+        // early cold-join) and a near-no-op at small scale (committee ≈ already-connected peers).
+        self.p2p.dial_committee_for_cold_join();
+
         // Adaptive-window + credit-based backpressure config. HONEST NOTE:
         // initial choices, not yet measured under load — safe bounds (never
         // exceed pipeline capacity) but may leave throughput on the table;

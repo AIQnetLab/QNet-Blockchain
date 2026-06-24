@@ -3080,13 +3080,18 @@ impl BlockPipeline {
                 }
             }
 
-            // Canonical boundary snapshot at every SNAPSHOT_INCREMENTAL_INTERVAL, on EVERY node's apply
-            // path so a cold joiner can fast-sync from any peer. Pin a frozen DB view at `height`
-            // SYNCHRONOUSLY here — the serial apply loop has not started H+1, so the flush + snapshot
-            // capture exactly state_root@H. With persist-before-evict the pinned accounts CF is the
-            // COMPLETE committed tree leaf set (hot ∪ evicted), so a cold joiner's recompute reproduces
-            // the bound root past the LRU cap. The heavy serialization runs off-reactor on the frozen view.
-            if height > 0 && height % crate::node::SNAPSHOT_INCREMENTAL_INTERVAL == 0 {
+            // Canonical boundary snapshot on EVERY node's apply path (deterministic, role-independent)
+            // so a cold joiner can fast-sync from any peer — at the early anchor (h=90, first bindable
+            // boundary) AND every SNAPSHOT_INCREMENTAL_INTERVAL thereafter. Pin a frozen DB view at
+            // `height` SYNCHRONOUSLY here — the serial apply loop has not started H+1, so the snapshot
+            // captures exactly state_root@H. With persist-before-evict the pinned accounts CF is the
+            // COMPLETE committed leaf set, so a cold joiner's recompute reproduces the bound root. The
+            // heavy serialization runs off-reactor on the frozen view.
+            if height > 0
+                && (height == crate::node::SNAPSHOT_EARLY_ANCHOR_HEIGHT
+                    || height % crate::node::SNAPSHOT_INCREMENTAL_INTERVAL == 0)
+                && crate::node::should_materialize_snapshot(&ctx.node_id, height)
+            {
                 let snapshot_accounts = ctx.state.read().await.get_all_accounts();
                 match ctx.storage.prepare_snapshot_view(&snapshot_accounts) {
                     Ok(view) => {

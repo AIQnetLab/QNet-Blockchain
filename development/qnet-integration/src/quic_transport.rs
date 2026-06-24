@@ -1986,6 +1986,15 @@ impl QuicTransport {
         // v9.7: Immediately update BEST_PEER_HEIGHT from handshake
         if remote_block_height > 0 {
             crate::unified_p2p::BEST_PEER_HEIGHT.fetch_max(remote_block_height, std::sync::atomic::Ordering::Relaxed);
+            // Best-effort per-peer height attestation (resolves only if the peer is already registered,
+            // e.g. a reconnect). On a first connect the peer is not yet in connected_peers, so this
+            // no-ops and the first signed HealthPing supplies the attested height. The cold-join "evict
+            // all sources" stall is fixed by the eviction self_synced guard + genesis exemption, not here.
+            if remote_node_id != self.node_id {
+                if let Some(p2p) = crate::node::try_get_p2p() {
+                    p2p.update_peer_last_seen_with_height(&remote_node_id, Some(remote_block_height), true);
+                }
+            }
         }
 
         // CRITICAL: Prevent self-connect

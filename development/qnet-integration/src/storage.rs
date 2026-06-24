@@ -833,6 +833,13 @@ impl PersistentStorage {
                 ColumnFamilyDescriptor::new("poh_state", create_hot_cf_opts()),
                 ColumnFamilyDescriptor::new("contract_storage", create_cf_opts()),
                 ColumnFamilyDescriptor::new("fcm_tokens", create_cf_opts()),
+                // Cold-join staging: a downloaded snapshot is restored HERE, verified, then
+                // promoted into the live state CFs. Live state is never mutated before the
+                // consensus binding passes, so a rejected snapshot leaves no orphaned state.
+                ColumnFamilyDescriptor::new("accounts_stage", create_cf_opts()),
+                ColumnFamilyDescriptor::new("node_registry_stage", create_cf_opts()),
+                ColumnFamilyDescriptor::new("pending_rewards_stage", create_cf_opts()),
+                ColumnFamilyDescriptor::new("contract_storage_stage", create_cf_opts()),
                 // v15.9: PERSISTENT MEMPOOL
                 // ────────────────────────────────────────────────────────────
                 // Pending transactions are mirrored from the in-RAM mempool
@@ -876,6 +883,7 @@ impl PersistentStorage {
             "sync_state", "pending_rewards", "node_registry", "ping_history", "failover_events",
             "snapshots", "tx_index", "tx_by_address", "attestations", "heartbeats", "poh_state",
             "contract_storage", "fcm_tokens", "mempool", "cross_shard_pending", "cross_shard_receipts",
+            "accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage",
         ];
         let open_descriptors = || -> Vec<ColumnFamilyDescriptor> {
             let mut cfs = build_column_families();
@@ -6271,8 +6279,18 @@ impl Storage {
     /// them, so the recompute must too. LtHash is order-independent, so the scan order is irrelevant and
     /// the result is byte-identical to the incrementally-maintained accumulator at the same bound.
     fn compute_lt_state(&self, up_to_height: u64) -> crate::registry_lthash::LtHash {
+        self.compute_lt_state_cf("node_registry", up_to_height)
+    }
+
+    /// registry_root over an explicit registry CF: full from-scratch scan, NO seal — for cold-join
+    /// staging verify ("node_registry_stage"), where no per-head seal exists.
+    pub fn compute_registry_root_staged(&self, registry_cf_name: &str, up_to_height: u64) -> [u8; 32] {
+        self.compute_lt_state_cf(registry_cf_name, up_to_height).root()
+    }
+
+    fn compute_lt_state_cf(&self, registry_cf_name: &str, up_to_height: u64) -> crate::registry_lthash::LtHash {
         use rocksdb::{IteratorMode, Direction};
-        let registry_cf = match self.persistent.db.cf_handle("node_registry") { Some(cf) => cf, None => return crate::registry_lthash::LtHash::new() };
+        let registry_cf = match self.persistent.db.cf_handle(registry_cf_name) { Some(cf) => cf, None => return crate::registry_lthash::LtHash::new() };
         let mut lt = crate::registry_lthash::LtHash::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for prefix in [b"srtr_".as_ref(), b"lrtr_".as_ref()] {
@@ -6829,14 +6847,21 @@ impl Storage {
     /// from embedded constants at boot ⇒ exempt. Returns Err on the first gap so the caller fails the
     /// snapshot closed and re-targets a complete source. Cold path only (one srtr_ prefix scan).
     pub fn verify_snapshot_vrf_pk_complete(&self) -> IntegrationResult<()> {
-        let registry_cf = self.persistent.db.cf_handle("node_registry")
+        self.verify_snapshot_vrf_pk_complete_cf("node_registry")
+    }
+
+    /// vrf_pk completeness over an explicit registry CF (live or "node_registry_stage"). Reads
+    /// vrf_pk_ directly from the same CF so the staged copy is self-contained.
+    pub fn verify_snapshot_vrf_pk_complete_cf(&self, registry_cf_name: &str) -> IntegrationResult<()> {
+        let registry_cf = self.persistent.db.cf_handle(registry_cf_name)
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
         for item in self.persistent.db.prefix_iterator_cf(&registry_cf, b"srtr_") {
             let (key, _) = match item { Ok(kv) => kv, Err(_) => continue };
             let key_str = match std::str::from_utf8(&key) { Ok(s) => s, Err(_) => continue };
             let node_id = match key_str.strip_prefix("srtr_") { Some(id) => id, None => break };
             if node_id.starts_with("genesis_node_") { continue; } // re-seeded from constants at boot
-            if self.load_vrf_public_key(node_id)?.is_none() {
+            let vk = format!("vrf_pk_{}", node_id);
+            if self.persistent.db.get_cf(&registry_cf, vk.as_bytes())?.is_none() {
                 return Err(IntegrationError::StorageError(format!(
                     "snapshot_vrf_pk_incomplete node={} reason=vrf_pk_absent", node_id
                 )));
@@ -8622,10 +8647,16 @@ impl Storage {
     ///   Format A (create_state_snapshot): [0x02 | protocol_version:u32 | height:u64 | timestamp:u64 | KV pairs...]
     ///   Format B (save_state_snapshot):   [0x02 | state_root:[u8;32] | total_supply:u64 | height:u64 | bincode(accounts)]
     /// Detection: after 0x02, read 4 bytes as u32. protocol_version < 10_000 → Format A. Otherwise → Format B.
-    pub async fn load_state_snapshot(&self, height: u64) -> IntegrationResult<()> {
+    /// stage=true restores into the *_stage CFs (verify-then-promote cold-join: live state stays
+    /// untouched until the binding passes); stage=false restores directly into live CFs.
+    pub async fn load_state_snapshot(&self, height: u64, stage: bool) -> IntegrationResult<()> {
         if crate::node::is_info() {
-            println!("[INFO][SNAPSHOT] full_snap_loading h={}", height);
+            println!("[INFO][SNAPSHOT] full_snap_loading h={} stage={}", height, stage);
         }
+        let accounts_cf_name = if stage { "accounts_stage" } else { "accounts" };
+        let rewards_cf_name = if stage { "pending_rewards_stage" } else { "pending_rewards" };
+        let contract_cf_name = if stage { "contract_storage_stage" } else { "contract_storage" };
+        let registry_cf_name = if stage { "node_registry_stage" } else { "node_registry" };
 
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
@@ -8729,7 +8760,7 @@ impl Storage {
         cursor += 16;
         
         // Restore accounts
-        let accounts_cf = self.persistent.db.cf_handle("accounts")
+        let accounts_cf = self.persistent.db.cf_handle(accounts_cf_name)
             .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
         
         let mut batch = WriteBatch::default();
@@ -8779,7 +8810,7 @@ impl Storage {
         if cursor + 10 <= decompressed.len() && &decompressed[cursor..cursor+10] == b"REWARDS_V1" {
             cursor += 10; // Skip marker
             
-            if let Some(rewards_cf) = self.persistent.db.cf_handle("pending_rewards") {
+            if let Some(rewards_cf) = self.persistent.db.cf_handle(rewards_cf_name) {
                 let mut rewards_batch = WriteBatch::default();
                 
                 // Read until REWARDS_END marker
@@ -8818,7 +8849,7 @@ impl Storage {
         let mut contract_count = 0u64;
         if cursor + 19 <= decompressed.len() && &decompressed[cursor..cursor+19] == b"CONTRACT_STORAGE_V1" {
             cursor += 19;
-            if let Some(cs_cf) = self.persistent.db.cf_handle("contract_storage") {
+            if let Some(cs_cf) = self.persistent.db.cf_handle(contract_cf_name) {
                 let mut cs_batch = WriteBatch::default();
                 while cursor < decompressed.len() {
                     if cursor + 20 <= decompressed.len() && &decompressed[cursor..cursor+20] == b"CONTRACT_STORAGE_END" {
@@ -8848,7 +8879,7 @@ impl Storage {
         let mut registry_count = 0u64;
         if cursor + 16 <= decompressed.len() && &decompressed[cursor..cursor+16] == b"NODE_REGISTRY_V1" {
             cursor += 16;
-            if let Some(nr_cf) = self.persistent.db.cf_handle("node_registry") {
+            if let Some(nr_cf) = self.persistent.db.cf_handle(registry_cf_name) {
                 let mut nr_batch = WriteBatch::default();
                 while cursor < decompressed.len() {
                     if cursor + 17 <= decompressed.len() && &decompressed[cursor..cursor+17] == b"NODE_REGISTRY_END" {
@@ -8871,26 +8902,20 @@ impl Storage {
                     registry_count += 1;
                 }
                 self.persistent.db.write(nr_batch)?;
-                // State fast-sync writes node_ entries directly (not via the apply funnel). The
-                // snapshot carries the srtr_/lrtr_ index keys (whole-CF copy), but reconcile to be
-                // safe — idempotent skip-if-present — so a fast-synced node never reads an empty
-                // roster index and diverges on reward_root.
-                let _ = self.backfill_roster_indices();
-                // cbw lives in the 'metadata' CF, which the snapshot does NOT carry — without this a
-                // snapshot-joined node has NO burn→wallet binding for any pre-snapshot registration and
-                // would ACCEPT a reused-burn block that from-genesis nodes REJECT (fork + Sybil). Rebuild
-                // it deterministically from the snapshot-carried node_registry, bounded by the snapshot
-                // height (registrations are committed at-or-below it).
-                match self.rebuild_committed_burn_wallet(height) {
-                    Ok(n) if crate::node::is_info() => println!("[INFO][SNAPSHOT] cbw_rebuilt bindings={}", n),
-                    Err(e) => println!("[WARN][SNAPSHOT] cbw_rebuild_failed err={}", e),
-                    _ => {}
-                }
-                // registry_root LtHash: the accumulator + per-head seals live in 'metadata' (NOT snapshot-
-                // carried); recompute from the snapshot-carried node_registry at the snapshot height and
-                // seal it so the immediate snapshot-verify read is O(1). Same discipline as cbw.
-                if let Err(e) = self.rebuild_registry_lthash(height) {
-                    println!("[WARN][SNAPSHOT] registry_lthash_rebuild_failed err={}", e);
+                // Derived indices (roster srtr_/lrtr_, cbw burn→wallet, registry_lthash) live in
+                // metadata, NOT in the snapshot blob. Rebuild them deterministically from the restored
+                // node_registry, bounded by the snapshot height. In stage mode this runs at promote
+                // (against live), never on the staging copy.
+                if !stage {
+                    let _ = self.backfill_roster_indices();
+                    match self.rebuild_committed_burn_wallet(height) {
+                        Ok(n) if crate::node::is_info() => println!("[INFO][SNAPSHOT] cbw_rebuilt bindings={}", n),
+                        Err(e) => println!("[WARN][SNAPSHOT] cbw_rebuild_failed err={}", e),
+                        _ => {}
+                    }
+                    if let Err(e) = self.rebuild_registry_lthash(height) {
+                        println!("[WARN][SNAPSHOT] registry_lthash_rebuild_failed err={}", e);
+                    }
                 }
             }
         }
@@ -8913,11 +8938,13 @@ impl Storage {
             );
         }
 
-        // v10.1: CRITICAL — set chain_height so node syncs only blocks AFTER snapshot.
-        // Without this, chain_height stays 0 → node re-downloads ALL blocks from genesis.
-        // Every L1 (Ethereum, Solana, Near) does this: snapshot = trusted state at height H.
-        self.set_chain_height(height)?;
-        println!("[INFO][SNAPSHOT] format_A_chain_height_set h={}", height);
+        // Live restore advances chain_height to the snapshot height so catch-up fetches only
+        // blocks AFTER it. Stage mode leaves chain_height untouched — it is advanced by promote
+        // once the binding passes.
+        if !stage {
+            self.set_chain_height(height)?;
+            println!("[INFO][SNAPSHOT] format_A_chain_height_set h={}", height);
+        }
 
         Ok(())
     }
@@ -9578,7 +9605,12 @@ impl Storage {
     /// root. Deterministic — a fresh StateMerkleTree full-recomputes (no
     /// incremental cache), matching every node's finalize().
     pub fn recompute_account_merkle_root(&self) -> IntegrationResult<[u8; 32]> {
-        let accounts_cf = self.persistent.db.cf_handle("accounts")
+        self.recompute_account_merkle_root_cf("accounts")
+    }
+
+    /// Account merkle over an explicit CF: "accounts" (live) or "accounts_stage" (cold-join verify).
+    pub fn recompute_account_merkle_root_cf(&self, cf_name: &str) -> IntegrationResult<[u8; 32]> {
+        let accounts_cf = self.persistent.db.cf_handle(cf_name)
             .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
         let mut updates: Vec<(String, qnet_state::Account)> = Vec::new();
         for item in self.persistent.db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start) {
@@ -9652,13 +9684,12 @@ impl Storage {
                 // rather than the validator committee.
                 if !cid.is_empty() && std::env::var("IPFS_ENABLED").unwrap_or_default() == "1" {
                     if let Ok(_) = self.download_snapshot_from_ipfs(&cid, height).await {
-                        // An IPFS CID is content-addressed but NOT consensus-bound — a byzantine
-                        // advertiser can serve a self-consistent FORGED snapshot. Route it through the
-                        // SAME 2f+1-QC anchor binding as the chunked/legacy paths (discards orphaned
-                        // state on any failure → falls back to verified block-sync). No bypass.
-                        self.verify_snapshot_consensus_binding(p2p, height).await?;
-                        println!("[INFO][SYNC] snapshot_from_ipfs h={} bound=ok", height);
-                        return Ok(height);
+                        // An IPFS CID is content-addressed but NOT consensus-bound — route it through the
+                        // SAME staged 2f+1-QC anchor binding + promote as the chunked/legacy paths.
+                        if let Ok(h) = self.verify_and_promote_staged(p2p, height).await {
+                            println!("[INFO][SYNC] snapshot_from_ipfs h={} bound=ok", h);
+                            return Ok(h);
+                        }
                     }
                 }
                 peer_heights.push((addr, height));
@@ -9691,25 +9722,57 @@ impl Storage {
             )));
         }
 
+        // Per-boundary cooldown: a boundary we already failed on (or anything ≤ it) is not re-attempted
+        // until a STRICTLY higher one appears — degrade to block replay instead of re-arming the same
+        // failing snapshot every desync tick.
+        if target_height <= crate::node::LAST_SNAPSHOT_ATTEMPT_BOUNDARY.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(IntegrationError::Other(format!(
+                "snapshot_boundary_cooldown h={} action=block_replay", target_height
+            )));
+        }
+
         println!(
             "[INFO][SYNC] snapshot_download h={} capable_peers={}/{} discovery=two_phase",
             target_height, peer_addrs.len(), peer_heights.len(),
         );
 
-        // Chunked parallel download first, fallback to single-peer. verify_snapshot_consensus_binding
-        // re-checks the applied state against the 2f+1-bound macroblock root and, on ANY failure
-        // (root unfetchable / no binding / mismatch), wipes the applied state so the orphaned
-        // snapshot can never pollute the fallback block-sync.
+        // Chunked parallel download first (restores into staging), fallback to single-peer. Then
+        // verify-then-promote: the staged snapshot is bound to the 2f+1 macroblock root and only on
+        // success copied into live state; ANY failure drops staging and falls to block replay.
         match self.download_snapshot_chunked(p2p, &peer_addrs, target_height).await {
-            Ok(()) => {
-                self.verify_snapshot_consensus_binding(p2p, target_height).await?;
-                Ok(target_height)
-            }
+            Ok(()) => self.verify_and_promote_staged(p2p, target_height).await,
             Err(e) => {
                 println!("[WARN][SYNC] chunked_download_failed err={} fallback=legacy", e);
                 self.download_snapshot_legacy(p2p, &peer_addrs[0], target_height).await?;
-                self.verify_snapshot_consensus_binding(p2p, target_height).await?;
-                Ok(target_height)
+                self.verify_and_promote_staged(p2p, target_height).await
+            }
+        }
+    }
+
+    /// Verify a STAGED snapshot against its 2f+1 anchor and, on success, promote it into live state.
+    /// On any failure drop staging and return Err so the caller falls to block replay. Pre-anchor
+    /// (mb_idx==0) cold-join is handled by replay, never a snapshot.
+    async fn verify_and_promote_staged(
+        &self,
+        p2p: &crate::unified_p2p::SimplifiedP2P,
+        height: u64,
+    ) -> IntegrationResult<u64> {
+        if height / 90 == 0 {
+            let _ = self.discard_snapshot_state(height);
+            return Err(IntegrationError::Other(format!(
+                "snapshot_below_anchor h={} action=block_replay", height
+            )));
+        }
+        match self.verify_snapshot_consensus_binding(p2p, height).await {
+            Ok(anchor) => {
+                self.promote_snapshot_staging(height, anchor).await?;
+                Ok(height)
+            }
+            Err(e) => {
+                let _ = self.discard_snapshot_state(height);
+                // Latch this boundary so it is not re-attempted until a strictly higher one appears.
+                crate::node::LAST_SNAPSHOT_ATTEMPT_BOUNDARY.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
             }
         }
     }
@@ -9726,18 +9789,19 @@ impl Storage {
     // (no graceful-degradation accept) so the caller falls to byzantine-safe
     // block-by-block sync — costs 1 RTT, no attacker state contamination.
     // O(1)/bootstrap.
+    /// Verifies a STAGED snapshot (in the *_stage CFs) against the 2f+1-bound macroblock lineage.
+    /// Returns the anchor macroblock hash on success (caller promotes); on ANY failure drops the
+    /// staging CFs and returns Err so live state is never touched and the caller falls to block-sync.
     async fn verify_snapshot_consensus_binding(
         &self,
         p2p: &crate::unified_p2p::SimplifiedP2P,
         snapshot_height: u64,
-    ) -> IntegrationResult<()> {
-        // Genesis-window snapshots (mb_idx < 1) cannot be bound to a
-        // consensus-finalised macroblock — there is nothing earlier to
-        // anchor against. Accept silently; this only fires for snapshots
-        // very early in the chain's lifetime.
+    ) -> IntegrationResult<[u8; 32]> {
+        // Genesis-window snapshots (mb_idx < 1) cannot be bound to a consensus-finalised macroblock —
+        // nothing earlier to anchor against. The caller routes pre-anchor cold-join to block replay.
         let mb_idx = snapshot_height / 90;
         if mb_idx == 0 {
-            return Ok(());
+            return Ok([0u8; 32]);
         }
 
         // ── Genesis/pin-rooted inductive lineage walk (weak-subjectivity trust root) ───────────────
@@ -9857,6 +9921,12 @@ impl Storage {
         // the repair window slides forward. Back off only when an attempt made NO progress.
         const MB_FETCH_MAX_ATTEMPTS: u32 = 1500; // server caps ~10 macroblocks/response ⇒ ≥ MAX_WS_WALK_MB/10 (+margin)
         const MB_FETCH_BASE_DELAY_MS: u64 = 1_000;
+        // Wall-clock budget: a mature-chain walk with no usable GALC capsule can run ~30min and starve
+        // block replay (same task). Cap it; on timeout the incomplete-lineage path below drops staging,
+        // latches the boundary (no re-arm), and the caller falls through to block replay. Kept under
+        // STALL_ABORT(120s); a young chain (capsule co-located) finishes in ~0 well before it.
+        const WALK_BUDGET_SECS: u64 = 90;
+        let walk_deadline = std::time::Instant::now() + std::time::Duration::from_secs(WALK_BUDGET_SECS);
         let mut lineage_from = walk_from;
         let mut attempt = 0u32;
         loop {
@@ -9868,6 +9938,13 @@ impl Storage {
             if lineage_from > mb_idx { break; } // full contiguous lineage present ⇒ inductively verified
             attempt += 1;
             if attempt > MB_FETCH_MAX_ATTEMPTS { break; }
+            if std::time::Instant::now() >= walk_deadline {
+                if crate::node::is_warn() {
+                    println!("[WARN][SYNC] verifier_walk_budget_exceeded reached={} mb={} action=block_replay",
+                        lineage_from.saturating_sub(1), mb_idx);
+                }
+                break;
+            }
             let before = lineage_from;
             if crate::node::is_info() {
                 println!(
@@ -9966,12 +10043,10 @@ impl Storage {
             )));
         }
 
-        // Pattern C: snapshot bytes were applied to the accounts CF by
-        // load_state_snapshot() upstream. Rebuild the SAME account merkle the
-        // consensus committed (finalize_merkle) from the restored accounts and
-        // compare to the QC-bound mb.state_root; a forged snapshot yields a
-        // different root.
-        let computed = self.recompute_account_merkle_root()
+        // Pattern C: snapshot bytes are staged in accounts_stage. Recompute the SAME account merkle the
+        // consensus committed (finalize_merkle) from the STAGED accounts and compare to the QC-bound
+        // mb.state_root; a forged snapshot yields a different root.
+        let computed = self.recompute_account_merkle_root_cf("accounts_stage")
             .map_err(|e| IntegrationError::Other(format!("merkle_recompute_err h={} err={:?}", snapshot_height, e)))?;
 
         if computed != expected_root {
@@ -10000,7 +10075,7 @@ impl Storage {
             }).map(|(cp, _)| cp);
             match cp_opt {
                 Some(cp) => {
-                    let computed_rr = self.compute_registry_root(cp.window_head_height);
+                    let computed_rr = self.compute_registry_root_staged("node_registry_stage", cp.window_head_height);
                     if computed_rr != cp.registry_root {
                         self.discard_snapshot_state(snapshot_height)?;
                         return Err(IntegrationError::Other(format!(
@@ -10019,30 +10094,21 @@ impl Storage {
             }
         }
 
-        // Materialize every derived index a forward producer/validator reads (registry_root LtHash, cbw,
-        // super/light reward roster) and contract-check vrf_pk — BEFORE committing the WS floor. Doing it
-        // here, while the AnchorReset guard is still armed, keeps floor adoption ATOMIC with whole-snapshot
-        // success: a rebuild/vrf failure discards the state AND the guard restores the prior floor on
-        // return, never leaving chain_height=0 with the finality/WS floor pinned (which would deadlock the
-        // block-sync fallback). vrf_pk has no recompute-from-state path, so it is a hard completeness gate.
-        if let Err(e) = self.rebuild_registry_lthash(snapshot_height)
-            .and_then(|_| self.rebuild_committed_burn_wallet(snapshot_height))
-            .and_then(|_| self.backfill_roster_indices())
-            .map(|_| ())
-            .and_then(|_| self.verify_snapshot_vrf_pk_complete())
-        {
+        // Completeness gate over the STAGED registry: vrf_pk has no recompute-from-state path, so a
+        // missing key is a hard reject. The derived-index REBUILDS (registry_lthash, cbw, roster) run at
+        // promote against live, never on the staging copy.
+        if let Err(e) = self.verify_snapshot_vrf_pk_complete_cf("node_registry_stage") {
             if crate::node::is_warn() {
-                println!("[WARN][SYNC] snapshot_index_rebuild_failed mb={} err={:?} action=reject_snapshot", mb_idx, e);
+                println!("[WARN][SYNC] snapshot_vrf_incomplete mb={} err={:?} action=reject_snapshot", mb_idx, e);
             }
             let _ = self.discard_snapshot_state(snapshot_height);
             return Err(IntegrationError::Other(format!(
-                "snapshot_index_rebuild_failed mb={} err={:?}", mb_idx, e
+                "snapshot_vrf_incomplete mb={} err={:?}", mb_idx, e
             )));
         }
 
-        // Anchor verified (2f+1 QC + Pattern-C state + registry binding + derived indices): commit it as
-        // the joiner's trusted finality + WS floor and keep it (don't let the guard restore the prior floor).
-        crate::node::adopt_snapshot_finality(snapshot_height, macroblock.hash());
+        // Staging verified (2f+1 QC + Pattern-C state + registry binding + vrf completeness). Return the
+        // anchor hash; promote commits the floors and copies staging→live atomically.
         std::mem::forget(anchor_guard);
         if crate::node::is_info() {
             println!(
@@ -10050,7 +10116,7 @@ impl Storage {
                 mb_idx, snapshot_height, hex::encode(&computed[..8]),
             );
         }
-        Ok(())
+        Ok(macroblock.hash())
     }
 
     /// Wipe every key of a CF (cold-start rollback helper).
@@ -10066,43 +10132,120 @@ impl Storage {
         Ok(())
     }
 
-    /// Roll back a rejected snapshot: wipe all state it wrote + reset height to 0 so the
-    /// orphaned state can never pollute the fallback block-sync. Node re-bootstraps clean.
-    fn discard_snapshot_state(&self, height: u64) -> IntegrationResult<()> {
-        // Drop the runtime floors + chain_height FIRST, before any CF wipe: if a later wipe write fails
-        // mid-way, the node is left with LOW floors (clean re-bootstrap from genesis trust) rather than a
-        // high anchor stranded over partially-wiped state. reset_floors is infallible (atomic stores).
-        crate::node::reset_floors_for_rebootstrap();
-        self.set_chain_height(0)?;
-        for cf in &["accounts", "pending_rewards", "node_registry", "contract_storage"] {
-            self.clear_cf(cf)?;
-        }
-        // The registry_root LtHash accumulator + per-head seals live in 'metadata' (not cleared above)
-        // and are meaningless once the roster is wiped — drop them so a stale value is never read before
-        // the clean re-bootstrap's rebuild_registry_lthash (cbw is likewise rebuilt on next boot).
-        if let Some(meta_cf) = self.persistent.db.cf_handle("metadata") {
-            use rocksdb::{IteratorMode, Direction};
-            let mut batch = rocksdb::WriteBatch::default();
-            batch.delete_cf(&meta_cf, Self::REGISTRY_LT_STATE_KEY);
-            // Drop the persisted snapshot anchor too: leaving it would make a warm restart re-load a
-            // high anchor (reload_snapshot_anchor) and heal chain_height up to it onto the wiped state.
-            batch.delete_cf(&meta_cf, b"snapshot_anchor");
-            for item in self.persistent.db.iterator_cf(&meta_cf, IteratorMode::From(b"rr_seal_", Direction::Forward)) {
-                let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
-                if !k.starts_with(b"rr_seal_") { break; }
-                batch.delete_cf(&meta_cf, &k);
+    /// Rebuild the per-key contract_storage CF from the (verified) accounts CF. contract_storage
+    /// mirrors Account.contract_storage, which is bound by state_root, so deriving it here binds it
+    /// transitively — the untrusted staged contract_storage is never promoted.
+    fn rebuild_contract_storage_from_accounts(&self) -> IntegrationResult<()> {
+        let accounts_cf = self.persistent.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let mut n = 0u64;
+        for item in self.persistent.db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start) {
+            let (_k, v) = item?;
+            let acct: qnet_state::Account = match bincode::deserialize(&v) { Ok(a) => a, Err(_) => continue };
+            if acct.is_contract && !acct.contract_storage.is_empty() {
+                self.persistent.save_contract_storage(&acct.address, &acct.contract_storage)?;
+                n += 1;
             }
-            // Propagate the error: a swallowed failure would leave the persisted anchor on disk and a
-            // warm restart would heal chain_height up to it onto the wiped state (the stranded-anchor wedge).
-            self.persistent.db.write(batch)?;
+        }
+        if n > 0 && crate::node::is_info() {
+            println!("[INFO][SNAPSHOT] contract_storage_rebuilt contracts={}", n);
+        }
+        Ok(())
+    }
+
+    /// Drop a rejected staged snapshot: truncate the *_stage CFs + the staged blob ONLY. Live state,
+    /// chain_height and the finality floors are NEVER touched, so a reject degrades cleanly to block
+    /// replay from the current committed height (no orphaned state, no wipe of replay progress).
+    fn discard_snapshot_state(&self, height: u64) -> IntegrationResult<()> {
+        for cf in &["accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage"] {
+            let _ = self.clear_cf(cf);
         }
         if let Some(snapshots_cf) = self.persistent.db.cf_handle("snapshots") {
             for prefix in &["full_snap_", "state_snap_"] {
                 let _ = self.persistent.db.delete_cf(&snapshots_cf, format!("{}{}", prefix, height).as_bytes());
             }
         }
-        println!("[WARN][SYNC] snapshot_state_discarded h={} action=clean_rollback", height);
+        println!("[WARN][SYNC] snapshot_staging_dropped h={} action=degrade_to_replay", height);
         Ok(())
+    }
+
+    /// Promote a VERIFIED staged snapshot into live state, crash-atomically. Marker
+    /// `promote_pending = [height(8)|anchor(32)]` is written first and cleared only after the copy +
+    /// floor commit complete; a crash mid-copy re-runs idempotently from the intact staging on boot
+    /// (recover_pending_snapshot_promote). The ONLY place a snapshot mutates live state.
+    pub async fn promote_snapshot_staging(&self, height: u64, anchor_hash: [u8; 32]) -> IntegrationResult<()> {
+        let meta = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata CF not found".to_string()))?;
+        let mut marker = height.to_le_bytes().to_vec();
+        marker.extend_from_slice(&anchor_hash);
+        self.persistent.db.put_cf(&meta, b"promote_pending", &marker)?;
+
+        // Swap staging→live for the CONSENSUS-BOUND CFs only: accounts (state_root) + node_registry
+        // (registry_root). The binder verified exactly these against the 2f+1 anchor.
+        for (stage, live) in [("accounts_stage", "accounts"), ("node_registry_stage", "node_registry")] {
+            self.clear_cf(live)?;
+            let (s, l) = match (self.persistent.db.cf_handle(stage), self.persistent.db.cf_handle(live)) {
+                (Some(s), Some(l)) => (s, l),
+                _ => continue,
+            };
+            let mut batch = WriteBatch::default();
+            let mut n = 0u64;
+            for item in self.persistent.db.iterator_cf(&s, rocksdb::IteratorMode::Start) {
+                let (k, v) = item?;
+                batch.put_cf(&l, &k, &v);
+                n += 1;
+                if n % 10_000 == 0 { self.persistent.db.write(std::mem::take(&mut batch))?; }
+            }
+            self.persistent.db.write(batch)?;
+        }
+        // pending_rewards + contract_storage are NOT consensus-bound by the snapshot, so the staged
+        // copies are untrusted and never promoted. Clear them, then DERIVE from verified state:
+        // contract_storage from the restored accounts (it mirrors Account.contract_storage, which IS
+        // bound by state_root); pending_rewards re-derives from the roster on the emission path
+        // (Checkpoint.reward_root is the QC authority). Closes the forged-snapshot reward/contract surface.
+        self.clear_cf("pending_rewards")?;
+        self.clear_cf("contract_storage")?;
+        self.rebuild_contract_storage_from_accounts()?;
+        // Derived indices over the now-live registry (byte-identical to a from-genesis node at this
+        // height). Propagate errors BEFORE committing height/floors/marker-delete: a failed rebuild must
+        // NOT finalize the anchor with a stale cbw/registry_lthash (silent fork). On Err the marker +
+        // staging survive, so recover_pending_snapshot_promote retries on next boot.
+        self.backfill_roster_indices()?;
+        self.rebuild_committed_burn_wallet(height)?;
+        self.rebuild_registry_lthash(height)?;
+        // Commit height + finality/WS floors + durable anchor (adopt_snapshot_finality persists it).
+        self.set_chain_height(height)?;
+        crate::node::adopt_snapshot_finality(height, anchor_hash);
+        // Advertise the verified blob so this node can serve the snapshot it joined from.
+        if let Some(snaps) = self.persistent.db.cf_handle("snapshots") {
+            let _ = self.persistent.db.put_cf(&snaps, b"latest_full_snap", &height.to_le_bytes());
+        }
+        self.persistent.db.delete_cf(&meta, b"promote_pending")?;
+        // Clear staging CFs ONLY (keep the blob for serving).
+        for cf in &["accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage"] {
+            let _ = self.clear_cf(cf);
+        }
+        println!("[INFO][SYNC] snapshot_promoted h={} anchor_mb={}", height, height / 90);
+        Ok(())
+    }
+
+    /// Boot recovery: if a promote was interrupted, the marker is still present and staging is intact —
+    /// re-run the promote idempotently. On failure clear staging + marker and fall to block replay.
+    pub async fn recover_pending_snapshot_promote(&self) {
+        let meta = match self.persistent.db.cf_handle("metadata") { Some(c) => c, None => return };
+        let bytes = match self.persistent.db.get_cf(&meta, b"promote_pending") {
+            Ok(Some(b)) if b.len() == 40 => b,
+            _ => return,
+        };
+        let height = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+        let mut anchor = [0u8; 32];
+        anchor.copy_from_slice(&bytes[8..40]);
+        println!("[WARN][SYNC] promote_recovery h={} replay=staged", height);
+        if let Err(e) = self.promote_snapshot_staging(height, anchor).await {
+            println!("[WARN][SYNC] promote_recovery_failed h={} err={} action=block_sync", height, e);
+            let _ = self.discard_snapshot_state(height);
+            let _ = self.persistent.db.delete_cf(&meta, b"promote_pending");
+        }
     }
 
     /// Query peer for available snapshots
@@ -10120,6 +10263,10 @@ impl Storage {
                         data["height"].as_u64(),
                         data["ipfs_cid"].as_str()
                     ) {
+                        // A peer with no snapshot answers height=0/available:false — it is NOT a target.
+                        // Treating it as Some((0,…)) let the quorum picker resolve target=0 → a phantom
+                        // h=0 download. Exclude it from negotiation entirely.
+                        if height == 0 { return Ok(None); }
                         return Ok(Some((height, cid.to_string())));
                     }
                 }
@@ -10391,7 +10538,7 @@ impl Storage {
             self.persistent.db.put_cf(&snapshots_cf, key.as_bytes(), &assembled)?;
         }
 
-        self.load_state_snapshot(height).await?;
+        self.load_state_snapshot(height, true).await?;
 
         let elapsed = start_time.elapsed();
         println!("[INFO][SYNC] chunked_download_done h={} chunks={} total={}MB elapsed={:.1}s",
@@ -10417,6 +10564,14 @@ impl Storage {
         }
         let data = response.bytes().await
             .map_err(|e| IntegrationError::Other(format!("Download error: {}", e)))?;
+        // Defense: a peer with no snapshot may answer 200 with a JSON error body. The real frame is
+        // [sha3(32)|len(8)|zstd]; reject anything shorter than the 41-byte header or that looks like
+        // JSON, so an error body is never stored as full_snap_ and then fails the integrity check.
+        if data.len() < 41 || data.first() == Some(&b'{') {
+            return Err(IntegrationError::Other(format!(
+                "legacy_snapshot_not_binary h={} len={}", height, data.len()
+            )));
+        }
         // Defense: cap legacy blob size at MAX_SNAPSHOT_SIZE.
         if data.len() as u64 > Self::MAX_SNAPSHOT_SIZE {
             return Err(IntegrationError::Other(format!(
@@ -10430,7 +10585,7 @@ impl Storage {
             let key = format!("full_snap_{}", height);
             self.persistent.db.put_cf(&snapshots_cf, key.as_bytes(), &data)?;
         }
-        self.load_state_snapshot(height).await?;
+        self.load_state_snapshot(height, true).await?;
         if crate::node::is_info() {
             println!("[INFO][SYNC] legacy_snapshot_applied h={}", height);
         }

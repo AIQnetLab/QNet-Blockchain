@@ -177,6 +177,12 @@ const REWARD_NETWORK_STATS_CACHE_TTL_SECS: u64 = 30;
 /// Protects against DDoS attacks by limiting requests per IP address
 static API_RATE_LIMITER: Lazy<ApiRateLimiter> = Lazy::new(|| ApiRateLimiter::new());
 
+/// Node-global concurrency bound on snapshot BYTE serving (full + chunk), independent of the per-IP
+/// limiter. Caps total in-flight snapshot serves so a flood of cold-joiners (or a spoofed-IP attacker)
+/// cannot exhaust a holder's memory/IO. Over the bound → immediate busy reply; the joiner retries
+/// another holder. Sized for thousands of nodes.
+static SNAPSHOT_SERVE_SEM: Lazy<tokio::sync::Semaphore> = Lazy::new(|| tokio::sync::Semaphore::new(16));
+
 // ============================================================================
 // SECURITY: WebSocket Connection Rate Limiting
 // ============================================================================
@@ -4409,6 +4415,15 @@ async fn handle_snapshot_download(
             "Content-Disposition", ""
         ));
     }
+    let _serve_permit = match SNAPSHOT_SERVE_SEM.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            let body = serde_json::to_vec(&json!({"error": "snapshot serve busy"})).unwrap_or_default();
+            return Ok(warp::reply::with_header(
+                warp::reply::with_header(body, "Content-Type", "application/json"),
+                "Content-Disposition", ""));
+        }
+    };
     match blockchain.get_snapshot_data(height) {
         Ok(Some(data)) => {
             // Return binary data with appropriate headers
@@ -4492,6 +4507,15 @@ async fn handle_snapshot_chunk(
             "Content-Disposition", ""
         ));
     }
+    let _serve_permit = match SNAPSHOT_SERVE_SEM.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            let body = serde_json::to_vec(&json!({"error": "snapshot serve busy"})).unwrap_or_default();
+            return Ok(warp::reply::with_header(
+                warp::reply::with_header(body, "Content-Type", "application/json"),
+                "Content-Disposition", ""));
+        }
+    };
     match blockchain.get_storage().get_snapshot_chunk(height, chunk_index as u64) {
         Ok(Some(data)) => {
             Ok(warp::reply::with_header(

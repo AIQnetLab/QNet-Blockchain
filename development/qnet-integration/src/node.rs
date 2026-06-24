@@ -40,6 +40,30 @@ const FAST_SYNC_TIMEOUT_SECS: u64 = 60; // Fast sync timeout
 const BACKGROUND_SYNC_TIMEOUT_SECS: u64 = 30; // Background sync timeout
 const SNAPSHOT_FULL_INTERVAL: u64 = 43200; // Full snapshot every 12 hours (43,200 microblocks = 480 macroblocks)
 pub const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3600; // Incremental snapshot every 1 hour (3,600 microblocks = 40 macroblocks)
+pub const SNAPSHOT_EARLY_ANCHOR_HEIGHT: u64 = 90; // First consensus-bindable boundary (mb_idx=1): a young chain has a servable snapshot well before the 3600 interval
+
+/// Active-node count mirrored from the production loop, read O(1) off the hot apply path by the
+/// snapshot-holder predicate. 0 = unknown ⇒ all-hold (a count-read gap can never make NOBODY hold).
+pub static SNAPSHOT_HOLDER_ACTIVE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Which nodes MATERIALIZE the full snapshot at a boundary. Small networks (and the early h=90 anchor)
+/// = every node holds (current behavior, guaranteed cold-join coverage). At scale a deterministic
+/// ~1-in-SAMPLE_DENOM sample holds, rotating per snapshot interval, so storage/CPU is O(N/denom) not
+/// O(N); holders advertise via latest_full_snap and joiners discover them by peer fan-out (unchanged).
+pub fn should_materialize_snapshot(node_id: &str, height: u64) -> bool {
+    const THRESHOLD: u64 = 50;   // ≤ this many active nodes ⇒ every node holds
+    const SAMPLE_DENOM: u64 = 5; // above THRESHOLD ⇒ ~1-in-5 hold
+    if height == SNAPSHOT_EARLY_ANCHOR_HEIGHT { return true; } // first anchor always universal
+    let n = SNAPSHOT_HOLDER_ACTIVE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    if n <= THRESHOLD { return true; }
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(b"QNET_SNAP_HOLDER_V1:");
+    h.update(node_id.as_bytes());
+    h.update(&(height / SNAPSHOT_INCREMENTAL_INTERVAL).to_le_bytes());
+    let d = h.finalize();
+    u64::from_le_bytes(d[0..8].try_into().unwrap_or([0u8; 8])) % SAMPLE_DENOM == 0
+}
 const API_HEALTH_CHECK_RETRIES: u32 = 5; // API health check attempts
 const API_HEALTH_CHECK_DELAY_SECS: u64 = 2; // Delay between health checks
 
@@ -1032,6 +1056,12 @@ pub static SNAPSHOT_ANCHOR_MB: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_ANCHOR_HASH: [AtomicU64; 4] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Highest snapshot boundary a cold-join attempt has already FAILED on. A failed boundary (and any
+/// ≤ it) is not re-attempted until a STRICTLY higher boundary is advertised — so a node degrades to
+/// block replay instead of re-arming the same failing snapshot every desync tick (the non-destructive
+/// thrash). Reset only by progress: a strictly higher boundary or a successful promote.
+pub static LAST_SNAPSHOT_ATTEMPT_BOUNDARY: AtomicU64 = AtomicU64::new(0);
+
 fn store_anchor_hash(h: &[u8; 32]) {
     for i in 0..4 {
         let mut b = [0u8; 8];
@@ -1127,6 +1157,10 @@ pub fn reload_snapshot_anchor() {
     let anchor_h = anchor_mb.saturating_mul(90);
     LAST_FINALIZED_HEIGHT.fetch_max(anchor_h, std::sync::atomic::Ordering::SeqCst);
     LAST_FINALIZED_CONSENSUS_ROUND.fetch_max(anchor_h, std::sync::atomic::Ordering::SeqCst);
+    // Restore the WS security floor (= anchor height) so a crash right after promote is fail-LOW and
+    // healed here, never fail-high (a lower WS floor would let the binder accept a snapshot below the
+    // adopted finality).
+    WEAK_SUBJECTIVITY_CHECKPOINT.fetch_max(anchor_h, std::sync::atomic::Ordering::SeqCst);
     // Heal the contiguous frontier up to the reloaded floor: a node whose chain_height was driven
     // below the anchor by a pre-restart rollback would otherwise re-wedge (durable chain_height <
     // reloaded anchor ⇒ sub-anchor re-request loop). Raise-only; runs once at boot before live blocks.
@@ -1134,26 +1168,6 @@ pub fn reload_snapshot_anchor() {
         let _ = storage.set_chain_height(anchor_h);
     }
     if is_info() { println!("[INFO][SYNC] snapshot_anchor_reloaded mb={} h={}", anchor_mb, anchor_h); }
-}
-
-/// Zero the runtime height + finality floors for a CLEAN re-bootstrap after discard_snapshot_state
-/// wiped all state (a snapshot rejected AFTER a prior one was already adopted). Keeps the invariant
-/// chain_height >= SNAPSHOT_ANCHOR_MB*90 consistent at 0: discard sets chain_height=0, the snapshot-bind
-/// AnchorReset guard caps SNAPSHOT_ANCHOR_MB to the now-0 chain_height, and this drops the other floors
-/// so no stale high floor strands the re-sync onto empty state. The genesis-rooted GALC capsule + binary
-/// WS pin are INDEPENDENT and intentionally untouched, so the clean block-sync re-verifies safely.
-pub fn reset_floors_for_rebootstrap() {
-    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(0, std::sync::atomic::Ordering::SeqCst);
-    QC_VERIFIED_FRONTIER.store(0, std::sync::atomic::Ordering::SeqCst);
-    WEAK_SUBJECTIVITY_CHECKPOINT.store(0, std::sync::atomic::Ordering::SeqCst);
-    // Drop the apply-dedup floor too: a rejected-snapshot rollback that leaves a high anchor over the
-    // now-wiped state makes block_sync treat h<=anchor*90 as already-applied and skip-forever.
-    SNAPSHOT_ANCHOR_MB.store(0, std::sync::atomic::Ordering::SeqCst);
-    {
-        let _g = crate::storage::lock_finality_state();
-        LAST_FINALIZED_HEIGHT.store(0, std::sync::atomic::Ordering::SeqCst);
-        LAST_FINALIZED_CONSENSUS_ROUND.store(0, std::sync::atomic::Ordering::SeqCst);
-    }
 }
 
 /// v9.0 BUG-30: Check if rollback to target_height is allowed by finality rules.
@@ -7499,9 +7513,16 @@ impl BlockchainNode {
                 // Warm-restart cold-joiner: reload the persisted snapshot anchor on the main boot path,
                 // before the verify pipeline accepts blocks, so SNAPSHOT_ANCHOR_MB is set when anchor+1
                 // first arrives. No-op for fresh/genesis; consensus-listener boot reloads again as backstop.
+                // Complete any snapshot promote interrupted by a crash BEFORE reloading the anchor
+                // (idempotent: re-copies from the intact staging, then clears the marker).
+                if let Some(s) = try_get_storage() { s.recover_pending_snapshot_promote().await; }
                 reload_snapshot_anchor();
+                // A recovered promote may have advanced chain_height — re-read so the rest of boot
+                // (integrity checks, p2p height) uses the promoted height, not the pre-recovery value.
+                let height = try_get_storage().and_then(|s| s.get_chain_height().ok()).unwrap_or(height);
+                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::Release);
                 if is_debug() { println!("[DBG][NODE] p2p_height_init={}", height); }
-                
+
                 height
             }
             Err(e) => {
@@ -14253,8 +14274,15 @@ impl BlockchainNode {
                                 }
                             }
 
-                            // Start fast sync if not already running
-                            if !FAST_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+                            // Single cold-join owner: SyncManager (sync_manager.rs) fully drives
+                            // snapshot fast-sync + genesis + block replay. This legacy production-loop
+                            // catch-up defers to it both while SyncManager is in the Syncing phase
+                            // (coordinator_is_syncing) AND during the pre-SyncStart init-sync window
+                            // (SYNC_IN_PROGRESS, set before the init task spawns) — so the two never
+                            // drive a cold-join concurrently.
+                            if !crate::node::coordinator_is_syncing()
+                                && !SYNC_IN_PROGRESS.load(Ordering::SeqCst)
+                                && !FAST_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
                                 FAST_SYNC_START_TIME.store(current_time, Ordering::Relaxed);
                                 LAST_SYNC_PROGRESS_TIME.store(current_time, Ordering::Relaxed);
                                 println!("[INFO][SYNC] fast_sync_start gap={}", height_difference);
@@ -14571,6 +14599,8 @@ impl BlockchainNode {
                     
                     // Cache the result
                     CACHED_NODE_COUNT.store(count, std::sync::atomic::Ordering::Relaxed);
+                    // Mirror to the module-level atomic the snapshot-holder predicate reads (O(1), hot apply path).
+                    SNAPSHOT_HOLDER_ACTIVE_COUNT.store(count, std::sync::atomic::Ordering::Relaxed);
                     LAST_COUNT_UPDATE.store(current_time, std::sync::atomic::Ordering::Relaxed);
                     count
                 } else {
@@ -15875,8 +15905,13 @@ impl BlockchainNode {
                         // CRITICAL: Strict synchronization check for consensus participation
                         // New nodes MUST catch up before producing blocks
                         let is_synchronized = if microblock_height > 10 {
-                            // Normal operation: allow max 10 blocks behind
+                            // Within 10 of the expected height AND at/above the QC-verified finalized
+                            // frontier (the committed verified floor). Height-alone would let a node
+                            // producing on an unverified replayed tip flip synced; the frontier floor
+                            // binds "synced" to verified state. frontier==0 (fresh genesis) bypasses.
+                            let frontier = qc_verified_frontier_cached();
                             current_stored_height + 10 >= microblock_height
+                                && (frontier == 0 || current_stored_height >= frontier)
                         } else {
                             // Genesis phase: STRICT check to prevent attacks
                             // Must have actual blocks, not just height 0
@@ -17981,7 +18016,7 @@ impl BlockchainNode {
                     let early_anchor = microblock_height == 90;
                     let baseline_due = microblock_height % SNAPSHOT_INCREMENTAL_INTERVAL == 0
                         && microblock_height > 0;
-                    if early_anchor || baseline_due {
+                    if (early_anchor || baseline_due) && should_materialize_snapshot(&node_id, microblock_height) {
                         // Capture the hot in-memory account set at this exact height, then pin a frozen
                         // DB view (sync flush + snapshot) HERE — before the next block mutates the CF.
                         // With persist-before-evict the pinned accounts CF is the COMPLETE committed tree
@@ -24584,7 +24619,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if current_height < snapshot_height.saturating_sub(1000) {
                     println!("[INFO][SYNC] snapshot_found h={} loading=true", snapshot_height);
                     
-                    if let Err(e) = self.storage.load_state_snapshot(snapshot_height).await {
+                    // Local own snapshot (trusted, self-created) → load directly into live state.
+                    if let Err(e) = self.storage.load_state_snapshot(snapshot_height, false).await {
                         println!("[WARN][SYNC] Failed to load snapshot: {}, falling back to normal sync", e);
                     } else {
                         // Update our height to snapshot height
