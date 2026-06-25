@@ -122,7 +122,7 @@ impl ConsensusDriver {
         &mut self, window: u64, mb_hashes: Vec<Hash>,
         state_root: Hash, beacon: Hash, head_ts: u64,
         committee: Vec<NodeId>, eligible_producers: Vec<u8>, banned: Vec<NodeId>, reward_root: Hash,
-        registry_root: Hash,
+        registry_root: Hash, total_supply: u64,
     ) -> Vec<Effect> {
         self.set_committee(committee.clone());
         let round = self.eng.current_index;
@@ -140,7 +140,7 @@ impl ConsensusDriver {
         let head_height = window.saturating_mul(self.cp_interval);
         let cp = Checkpoint {
             index: round, parent_qc: self.eng.high_qc.clone(), window_head_height: head_height,
-            window_mb_hashes: mb_hashes, state_root, beacon, epoch_commitment: epoch_c, reward_root, registry_root, timestamp: head_ts,
+            window_mb_hashes: mb_hashes, state_root, beacon, epoch_commitment: epoch_c, reward_root, registry_root, total_supply, timestamp: head_ts,
             proposer: self.node_id.clone(), proposer_sig: Vec::new(),
         };
         self.last_proposed_round = round;
@@ -313,7 +313,7 @@ mod tests {
         for index in 1..=8u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32]);
+                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
@@ -341,7 +341,7 @@ mod tests {
         for index in 1..=6u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32]);
+                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
@@ -360,7 +360,7 @@ mod tests {
         let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
         let cp = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 10, window_mb_hashes: vec![[1u8; 32]],
-            state_root: [1u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], timestamp: 0, proposer: "n1".into(), proposer_sig: vec![9, 9],
+            state_root: [1u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![9, 9],
         };
         // forged proposer_sig fails node verify ⇒ never reaches the driver
         assert!(!verify_msg(&c, &ConsensusMsg::Proposal(cp)));
@@ -383,7 +383,7 @@ mod tests {
         fn step(nodes: &mut Vec<Node>, c: &[NodeId], w: u64) {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32]);
+                let effs = nodes[k].d.build_proposal(w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(nodes, c, seed);
@@ -427,7 +427,7 @@ mod tests {
             let cp = Checkpoint {
                 index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
-                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], timestamp: 0,
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], total_supply: 0, timestamp: 0,
                 proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
             };
             let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();

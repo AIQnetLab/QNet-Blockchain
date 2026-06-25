@@ -3319,7 +3319,28 @@ impl Storage {
     pub fn load_account(&self, address: &str) -> IntegrationResult<Option<qnet_state::Account>> {
         self.persistent.load_account(address)
     }
-    
+
+    /// Load every account from the `accounts` CF as (address, Account) pairs. Used by the cold-join
+    /// in-mem state rehydrate to seed the merkle + accounts DashMap from the promoted CF. One-time
+    /// full materialization — fine for a cold-join; a streaming variant is the scale follow-up.
+    pub fn load_all_accounts(&self) -> IntegrationResult<Vec<(String, qnet_state::Account)>> {
+        let cf = self.persistent.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let mut out: Vec<(String, qnet_state::Account)> = Vec::new();
+        for item in self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = item.map_err(|e| IntegrationError::StorageError(format!("accounts_iter_err: {}", e)))?;
+            let addr = String::from_utf8(k.to_vec())
+                .map_err(|e| IntegrationError::StorageError(format!("accounts_addr_utf8_err: {}", e)))?;
+            let account: qnet_state::Account = bincode::deserialize(&v)
+                .map_err(|e| IntegrationError::SerializationError(format!("accounts_decode_err: {}", e)))?;
+            out.push((addr, account));
+        }
+        if crate::node::is_info() {
+            println!("[INFO][STATE] load_all_accounts count={}", out.len());
+        }
+        Ok(out)
+    }
+
     // ========================================================================
     // GRACEFUL DEGRADATION & STORAGE HEALTH
     // ========================================================================
@@ -6749,6 +6770,29 @@ impl Storage {
         Ok(out)
     }
 
+    /// Every CHAIN-CONFIRMED node_id->wallet binding in the node_registry CF (super/genesis AND light,
+    /// all types). Used to rebuild the in-mem `registered_nodes` NodeRegistration-dedup map on cold-join:
+    /// the CF is snapshot-bound (registry_root in the QC Checkpoint), so deriving the dedup set from it is
+    /// sound. Mirrors the `node_` decode used by backfill_roster_indices / rebuild_committed_burn_wallet
+    /// (key `node_<id>`, JSON value, `wallet` field). Skips entries WITHOUT `reg_height` (non-deterministic
+    /// RPC/discovery cache writes) so the set is identical to a from-genesis node — distinct from
+    /// load_all_node_registrations, which is the startup P2P-registry restore and includes unconfirmed rows.
+    pub fn load_confirmed_node_registrations(&self) -> IntegrationResult<Vec<(String, String)>> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let mut out: Vec<(String, String)> = Vec::new();
+        for item in self.persistent.db.prefix_iterator_cf(&registry_cf, b"node_") {
+            let (k, v) = match item { Ok(kv) => kv, Err(_) => continue };
+            let key = match std::str::from_utf8(&k) { Ok(s) => s, Err(_) => continue };
+            let node_id = match key.strip_prefix("node_") { Some(id) => id, None => continue };
+            let parsed: serde_json::Value = match serde_json::from_slice(&v) { Ok(p) => p, Err(_) => continue };
+            if parsed["reg_height"].as_u64().is_none() { continue; } // chain-confirmed only
+            let wallet = parsed["wallet"].as_str().unwrap_or("");
+            if !wallet.is_empty() { out.push((node_id.to_string(), wallet.to_string())); }
+        }
+        Ok(out)
+    }
+
     /// Legacy full-CF scan source of truth for the Light roster. Kept as the backfill builder and
     /// the determinism-test oracle for `light_roster_sorted` (index reader); NOT on any hot path.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -9659,6 +9703,31 @@ impl Storage {
         let mut best_height = 0u64;
         let mut peer_heights: Vec<(String, u64)> = Vec::new();
 
+        // A1: settle the GALC pin BEFORE the ceiling is read. The pin is read here, but the capsule arrives
+        // + Dilithium-verifies asynchronously, so a cold join (pin==0) must request + bounded-wait for it
+        // first — else it clamps to the genesis h=90 anchor and replays the whole chain. Fail-open: on
+        // timeout (e.g. fresh genesis <h3600 with no capsule yet) proceed with pin==0 → ws_floor ceiling.
+        // Skip the wait on a young network: the first capsule only mints at mb == GALC_MINT_INTERVAL
+        // (h3600), so below that NO capsule can exist and the wait is pure dead-time. Tip proxy =
+        // the observed network height (max peer head); fail-open path (ws_floor / early-anchor) is
+        // unchanged. Once tip>=h3600 this behaves exactly as before.
+        let tip_mb = p2p.get_cached_network_height().unwrap_or(0) / 90;
+        if crate::galc::effective_pin_checkpoint().0 == 0 && tip_mb >= crate::galc::GALC_MINT_INTERVAL {
+            const GALC_PIN_WAIT_ATTEMPTS: u32 = 20;       // ≤ ~10s
+            const GALC_PIN_WAIT_INTERVAL_MS: u64 = 500;
+            for i in 0..GALC_PIN_WAIT_ATTEMPTS {
+                if crate::galc::effective_pin_checkpoint().0 > 0 { break; }
+                if i % 4 == 0 {                            // re-request every ~2s (a reply may be lost)
+                    let _ = p2p.broadcast_quic(&crate::unified_p2p::NetworkMessage::RequestGenesisCheckpoint {
+                        requester_id: "snapshot_ceiling".to_string(),
+                    }).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(GALC_PIN_WAIT_INTERVAL_MS)).await;
+            }
+        } else if crate::galc::effective_pin_checkpoint().0 == 0 && crate::node::is_debug() {
+            println!("[DBG][SYNC] galc_pin_wait_skipped tip_mb={} first_capsule_mb={}", tip_mb, crate::galc::GALC_MINT_INTERVAL);
+        }
+
         // Exogenously-verifiable anchor ceiling: a cold joiner can verify a snapshot anchor WITHOUT already
         // holding the committee's keys ONLY via the genesis-anchored GALC pin (verify_v2_macroblock hash-
         // trusts index==pin.0, no committee-key resolution) or — before any pin — the genesis-committee
@@ -9870,7 +9939,11 @@ impl Storage {
         // fall through to ws_floor (correct, only slower — never worse, no new launch requirement).
         let usable = |k: u64| k > ws_floor.0 && k <= mb_idx;
         let mut pin = crate::galc::effective_pin_checkpoint();
-        if !usable(pin.0) {
+        // Skip the wait on a young network: the first capsule only mints at mb == GALC_MINT_INTERVAL,
+        // so a snapshot anchored below it can never have a usable capsule — waiting is pure dead-time.
+        // Tip proxy = the anchor itself (mb_idx). Fall straight through to ws_floor (fail-open path
+        // below is unchanged); behaves exactly as before once mb_idx>=GALC_MINT_INTERVAL.
+        if !usable(pin.0) && mb_idx >= crate::galc::GALC_MINT_INTERVAL {
             const GALC_WAIT_ATTEMPTS: u32 = 20;        // ≤ ~10s total
             const GALC_WAIT_INTERVAL_MS: u64 = 500;
             for i in 0..GALC_WAIT_ATTEMPTS {
@@ -10240,7 +10313,14 @@ impl Storage {
 
     /// Boot recovery: if a promote was interrupted, the marker is still present and staging is intact —
     /// re-run the promote idempotently. On failure clear staging + marker and fall to block replay.
-    pub async fn recover_pending_snapshot_promote(&self) {
+    /// `state`: when present (main boot path) the in-mem StateManager is rehydrated from the promoted
+    /// CFs after a successful promote — same fail-closed semantics as the live cold-join. The boot
+    /// TIER-1 restore runs BEFORE this recovery (no promoted state yet), so it would NOT rehydrate the
+    /// recovered snapshot; doing it here closes that gap.
+    pub async fn recover_pending_snapshot_promote(
+        &self,
+        state: Option<&std::sync::Arc<tokio::sync::RwLock<crate::StateManager>>>,
+    ) {
         let meta = match self.persistent.db.cf_handle("metadata") { Some(c) => c, None => return };
         let bytes = match self.persistent.db.get_cf(&meta, b"promote_pending") {
             Ok(Some(b)) if b.len() == 40 => b,
@@ -10254,6 +10334,14 @@ impl Storage {
             println!("[WARN][SYNC] promote_recovery_failed h={} err={} action=block_sync", height, e);
             let _ = self.discard_snapshot_state(height);
             let _ = self.persistent.db.delete_cf(&meta, b"promote_pending");
+            return;
+        }
+        // Rehydrate the in-mem state from the recovered CFs (fail-closed). On mismatch the helper
+        // clears the in-mem state; block replay from the promoted chain_height then rebuilds it.
+        if let Some(state) = state {
+            if let Err(e) = self.rehydrate_inmem_state_from_promoted_cf(state, height).await {
+                println!("[WARN][SYNC] promote_recovery_rehydrate_failed h={} err={} action=block_replay", height, e);
+            }
         }
     }
 
@@ -10639,9 +10727,14 @@ impl Storage {
     }
 
     /// Fast sync with snapshot for new nodes
-    pub async fn fast_sync_with_snapshot(&self, p2p: &crate::unified_p2p::SimplifiedP2P, target_height: u64) -> IntegrationResult<()> {
+    pub async fn fast_sync_with_snapshot(
+        &self,
+        p2p: &crate::unified_p2p::SimplifiedP2P,
+        target_height: u64,
+        state: &std::sync::Arc<tokio::sync::RwLock<crate::StateManager>>,
+    ) -> IntegrationResult<()> {
         println!("[INFO][STORAGE] fast_sync_start target_height={}", target_height);
-        
+
         // Light nodes do not perform fast-sync at all — they are pure
         // mobile API clients with zero on-device chain storage. All
         // chain reads happen via the Super-node REST API at request
@@ -10650,7 +10743,7 @@ impl Storage {
             println!("[INFO][STORAGE] fast_sync_skipped role=light_api_client");
             return Ok(());
         }
-        
+
         // Try to find and load a snapshot
         match self.download_and_load_snapshot(p2p).await {
             Ok(snapshot_height) => {
@@ -10661,6 +10754,13 @@ impl Storage {
                 // BEFORE the WS floor was adopted (fail-closed there, atomic with floor adoption), so by
                 // here the snapshot is fully consistent and forward-ready.
                 println!("[INFO][STORAGE] snapshot_indices_rebuilt h={}", snapshot_height);
+
+                // CRITICAL: promote only swapped the on-disk CFs. The in-mem StateManager (merkle +
+                // accounts DashMap) the apply pipeline reads is still empty — without rehydrating it the
+                // first tail block (anchor+1) computes a near-empty state_root → state_root_mismatch →
+                // rollback → apply circuit-breaker wedge. Fail-closed: on any rehydrate failure return
+                // Err so the caller falls back to block-sync from a clean base.
+                self.rehydrate_inmem_state_from_promoted_cf(state, snapshot_height).await?;
 
                 if target_height > snapshot_height {
                     println!("[INFO][STORAGE] sync_remaining_start count={}",
@@ -10675,7 +10775,111 @@ impl Storage {
             }
         }
     }
-    
+
+    /// Cold-join: rehydrate the IN-MEM StateManager (merkle + accounts DashMap) from the just-promoted
+    /// `accounts` CF, mirroring the boot TIER-1 restore (node.rs). promote_snapshot_staging only swaps
+    /// the on-disk CFs; the apply pipeline reads this in-mem state, so without this the first tail block
+    /// computes a near-empty state_root → mismatch → wedge. FAIL-CLOSED: if the rehydrated merkle does
+    /// not match the anchor's 2f+1-bound state_root we clear the in-mem state and return Err so the
+    /// caller falls back to block-replay from a clean base — never proceed with a mismatched state.
+    pub async fn rehydrate_inmem_state_from_promoted_cf(
+        &self,
+        state: &std::sync::Arc<tokio::sync::RwLock<crate::StateManager>>,
+        anchor_height: u64,
+    ) -> IntegrationResult<()> {
+        // load_all_accounts materializes a Vec — acceptable for a one-time cold-join; a streaming
+        // variant is the scale follow-up (millions of accounts), not a blocker here.
+        let accounts = self.load_all_accounts()?;
+        // Emission watermark: highest emission macroblock already minted at/below the anchor. Derived
+        // with the SAME formula the apply path uses (node.rs apply_block_to_state) so the rehydrated
+        // node never re-mints an epoch the bound state already includes (>=2 epochs ⇒ double-mint).
+        const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+        const MICROBLOCKS_PER_MB: u64 = 90;
+        let current_epoch = anchor_height / EMISSION_BLOCK_INTERVAL;
+        let last_minted_emission_mb = if current_epoch >= 2 {
+            let rewarding_epoch = current_epoch.saturating_sub(2);
+            rewarding_epoch.saturating_add(1).saturating_mul(EMISSION_BLOCK_INTERVAL) / MICROBLOCKS_PER_MB
+        } else {
+            0
+        };
+
+        // Anchor's committed state_root + QC-bound total_supply: the macroblock at anchor_height/90
+        // carries BOTH — state_root directly (the SAME value verify_snapshot_consensus_binding checked
+        // the staged accounts against) and total_supply via the embedded (Checkpoint, QC) in
+        // consensus_data.checkpoint_qc. total_supply is in Checkpoint::hash() ⇒ qc.checkpoint_hash binds
+        // it ⇒ 2f+1 certify it. We read this QC-bound value instead of summing balances: a balance sum
+        // is correct ONLY pre-emission (epoch<2); at epoch>=2 emission mints supply credited later via
+        // claim TXs, so minted>sum. total_supply is consensus-critical (emission cap) but NOT in
+        // state_root (account-only), so it is bound separately here through the checkpoint.
+        let mb_idx = anchor_height / MICROBLOCKS_PER_MB;
+        let (anchor_state_root, total_supply): ([u8; 32], u64) = match self.get_macroblock_by_height(mb_idx)? {
+            Some(bytes) => {
+                let mb: qnet_state::MacroBlock = bincode::deserialize(&bytes)
+                    .map_err(|e| IntegrationError::StorageError(format!("rehydrate_anchor_decode_fail {}", e)))?;
+                // Extract the QC-bound total_supply from the embedded checkpoint. Pre-emission anchors
+                // (epoch<2) MAY lack a checkpoint_qc (legacy/genesis) — fall back to the balance sum,
+                // which is exact while minted==sum-of-balances.
+                let ts = match &mb.consensus_data.checkpoint_qc {
+                    // A PRESENT checkpoint_qc MUST decode — a corrupt QC is fail-closed (Err →
+                    // block-replay), never a silent fall-back to a balance sum that is wrong post-emission.
+                    Some(b) => {
+                        let (cp, _) = bincode::deserialize::<(qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate)>(b)
+                            .map_err(|e| IntegrationError::StorageError(format!("rehydrate_checkpoint_decode_fail mb={} {}", mb_idx, e)))?;
+                        cp.total_supply
+                    }
+                    // No checkpoint_qc ⇒ only legacy/genesis pre-emission anchors (epoch<2), where the
+                    // balance sum is exact (minted==sum-of-balances). Post-emission anchors always carry it.
+                    None => accounts.iter().map(|(_, a)| a.balance).fold(0u64, |acc, b| acc.saturating_add(b)),
+                };
+                (mb.state_root, ts)
+            }
+            None => {
+                return Err(IntegrationError::StorageError(format!(
+                    "rehydrate_anchor_missing mb={} h={}", mb_idx, anchor_height
+                )));
+            }
+        };
+
+        let sg = state.write().await;
+        sg.restore_accounts(accounts)
+            .map_err(|e| IntegrationError::StorageError(format!("rehydrate_restore_fail {}", e)))?;
+        // FAIL-CLOSED merkle assert BEFORE seeding chain_state — a mismatch then leaves no partial
+        // chain_state to roll back (clear() resets accounts+merkle; chain_state was never mutated).
+        let computed = sg.finalize_merkle();
+        if computed != anchor_state_root {
+            println!("[ERR][STATE] rehydrate_merkle_mismatch expected={} computed={} action=clear_block_replay",
+                     hex::encode(&anchor_state_root[..8]), hex::encode(&computed[..8]));
+            sg.clear();
+            return Err(IntegrationError::StorageError(format!(
+                "rehydrate_merkle_mismatch h={} expected={} computed={}",
+                anchor_height, hex::encode(&anchor_state_root[..8]), hex::encode(&computed[..8])
+            )));
+        }
+        // Verified — seed chain_state now that the bound merkle is confirmed.
+        {
+            let mut cs = sg.chain_state.write();
+            cs.height = anchor_height;
+            cs.total_supply = total_supply;
+            cs.last_minted_emission_mb = last_minted_emission_mb;
+        }
+        // Rebuild the in-mem NodeRegistration-dedup map from the snapshot-bound node_registry CF (the CF
+        // is bound by registry_root in the QC Checkpoint). restore_accounts seeds account leaves but NOT
+        // this off-merkle map; without it a cold-joiner has an EMPTY registered_nodes for all reg_height<=
+        // anchor entries, so a tail block with a duplicate NodeRegistration is admitted here (empty map ⇒
+        // not "already registered") while from-genesis nodes reject it → registry_root divergence. Done
+        // AFTER the fail-closed merkle assert so a rejected snapshot never seeds the map. Byte-identical
+        // to a from-genesis node for all reg_height<=anchor bindings.
+        let regs = self.load_confirmed_node_registrations()?;
+        let reg_count = regs.len();
+        for (node_id, wallet) in regs {
+            sg.seed_registered_node(&node_id, &wallet);
+        }
+        println!("[INFO][STATE] rebuild_registered_nodes count={}", reg_count);
+        println!("[INFO][STATE] rehydrate_ok h={} root={} total_supply={} watermark_mb={}",
+                 anchor_height, hex::encode(&anchor_state_root[..8]), total_supply, last_minted_emission_mb);
+        Ok(())
+    }
+
     // =========================================================================
     // SMART CONTRACT STORAGE METHODS
     // =========================================================================

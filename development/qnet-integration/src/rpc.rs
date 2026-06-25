@@ -2691,15 +2691,55 @@ async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>
     if !blockchain.is_genesis_attestor() {
         return Err(RpcError { code: -32601, message: "not a genesis attestor".to_string() });
     }
-    // Verify the external Solana 1DEV burn (live RPC; per-node, off the consensus path).
-    match verify_burn_transaction_exists(&burn_tx, &solana_wallet, amount, 1).await {
-        Ok(true) => {}
-        _ => return Err(RpcError { code: -32000, message: "burn not verified on Solana".to_string() }),
-    }
-    match blockchain.sign_burn_attestation(&burn_tx, &qnet_wallet, amount, node_type) {
-        Some((genesis_id, sig)) => Ok(serde_json::json!({ "genesis_id": genesis_id, "sig": sig })),
+    // Recompute the Phase-1 cost from THIS attestor's own Solana supply read (NOT the caller's hint) so
+    // a forged hint can't lower the binding cost. Then require the ACTUAL on-Solana burn to cover it.
+    let (total_burned, current_supply) = match fetch_solana_1dev_supply().await {
+        Ok(v) => v,
+        Err(e) => return Err(RpcError { code: -32000, message: format!("solana_supply_unavailable: {}", e) }),
+    };
+    let cost = qnet_state::Transaction::phase1_activation_cost(total_burned, current_supply);
+    // Verify the external Solana 1DEV burn exists AND covers `cost` (live RPC; per-node, off consensus).
+    // Capture the ACTUAL on-Solana burned amount so the attestor signs verified truth, not the caller's hint.
+    let actual_burned = match verify_burn_transaction_exists(&burn_tx, &solana_wallet, cost, 1).await {
+        Ok((true, actual)) => actual,
+        _ => return Err(RpcError { code: -32000, message: format!("burn not verified on Solana or below cost {} 1DEV", cost) }),
+    };
+    // Surface any divergence between the caller's declared amount and the verified on-chain amount.
+    println!("[INFO][BURN] attest_amount declared={} actual_burned={} cost={}", amount, actual_burned, cost);
+    // Sign over the ACTUAL on-Solana burned amount (NOT the caller's hint) + the locally-recomputed cost;
+    // return BOTH the signed cost AND the signed amount so the collector agrees on the on-chain truth and
+    // the registrant embeds the committee-certified amount (closes the over-burn quorum footgun: the
+    // embedded burn_amount must equal the amount the counted 2f+1 attestors actually signed).
+    match blockchain.sign_burn_attestation(&burn_tx, &qnet_wallet, actual_burned, node_type, cost) {
+        Some((genesis_id, sig)) => Ok(serde_json::json!({ "genesis_id": genesis_id, "sig": sig, "cost": cost, "amount": actual_burned })),
         None => Err(RpcError { code: -32000, message: "attestation refused (dedup / not genesis)".to_string() }),
     }
+}
+
+/// Read the live 1DEV (total_burned, current_supply) from Solana via getTokenSupply on the configured
+/// 1DEV mint. total_supply is the fixed 1B 1DEV genesis cap; total_burned = cap − current. Used ONLY on
+/// the attestor admission path (live RPC, per-node, NEVER consensus) to recompute the Phase-1 cost.
+pub(crate) async fn fetch_solana_1dev_supply() -> Result<(u64, u64), String> {
+    const ONEDEV_TOTAL_SUPPLY: u64 = 1_000_000_000; // 1B 1DEV genesis cap
+    let network_config = crate::network_config::get_network_config();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "getTokenSupply",
+        "params": [network_config.solana.onedev_mint]
+    });
+    let client = reqwest::Client::new();
+    let resp = client.post(&network_config.solana.rpc_url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send().await
+        .map_err(|e| format!("rpc: {}", e))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
+    // amount is the raw supply in 6-decimal base units; convert to whole 1DEV.
+    let amount_str = json["result"]["value"]["amount"].as_str()
+        .ok_or_else(|| "missing result.value.amount".to_string())?;
+    let raw: u64 = amount_str.parse().map_err(|_| "amount not a u64".to_string())?;
+    let current_supply = raw / 1_000_000;
+    let total_burned = ONEDEV_TOTAL_SUPPLY.saturating_sub(current_supply);
+    Ok((total_burned, current_supply))
 }
 
 // RPC method implementations
@@ -7205,13 +7245,13 @@ async fn handle_light_node_register(
         // STEP 2: Verify burn actually happened on Solana with sufficient amount
         // v4.7: CRITICAL — pass xor_wallet (Solana address) to verify feePayer == sender
         match verify_burn_transaction_exists(burn_tx, xor_wallet, burn_amount, 1).await {
-            Ok(true) => {
-                println!("[INFO][LIGHT] burn_verified tx={}... sender={} amount={}", 
+            Ok((true, _actual_burned)) => {
+                println!("[INFO][LIGHT] burn_verified tx={}... sender={} amount={}",
                     &burn_tx[..16.min(burn_tx.len())],
                     &xor_wallet[..16.min(xor_wallet.len())],
                     burn_amount);
             }
-            Ok(false) => {
+            Ok((false, _)) => {
                 println!("[WARN][LIGHT] burn_not_found tx={}...", &burn_tx[..16.min(burn_tx.len())]);
                 return Ok(warp::reply::json(&json!({
                     "success": false,
@@ -11181,13 +11221,13 @@ async fn handle_register_node(
             // STEP 2: Verify burn actually happened on Solana with sufficient amount
             // v4.7: CRITICAL — pass xor_wallet (Solana address) to verify feePayer == sender
             match verify_burn_transaction_exists(burn_tx, xor_wallet, burn_amount, 1).await {
-                Ok(true) => {
+                Ok((true, _actual_burned)) => {
                     println!("[INFO][REGISTER] burn_verified tx={}... sender={} amount={}",
                         &burn_tx[..16.min(burn_tx.len())],
                         &xor_wallet[..16.min(xor_wallet.len())],
                         burn_amount);
                 }
-                Ok(false) => {
+                Ok((false, _)) => {
                     println!("[WARN][REGISTER] burn_not_found tx={}...", &burn_tx[..16.min(burn_tx.len())]);
                     return Ok(warp::reply::json(&json!({
                         "success": false,
@@ -12253,7 +12293,7 @@ async fn handle_generate_activation_code(
 
     // CRITICAL: Verify burn transaction actually exists on Solana/QNet blockchain
     match verify_burn_transaction_exists(&request.burn_tx_hash, &request.wallet_address, request.burn_amount, request.phase).await {
-        Ok(false) => {
+        Ok((false, _)) => {
             println!("❌ Burn transaction verification failed");
             let error_response = json!({
                 "success": false,
@@ -12272,8 +12312,8 @@ async fn handle_generate_activation_code(
             });
             return Ok(warp::reply::json(&error_response));
         }
-        Ok(true) => {
-            println!("[INFO][GENERATE] burn_tx_verified_on_solana tx={}...", 
+        Ok((true, _actual_burned)) => {
+            println!("[INFO][GENERATE] burn_tx_verified_on_solana tx={}...",
                 &request.burn_tx_hash[..16.min(request.burn_tx_hash.len())]);
         }
     }
@@ -12845,12 +12885,14 @@ fn extract_burn_amount_from_token_balances(tx_data: &serde_json::Value) -> Resul
 }
 
 /// Verify burn transaction actually exists on blockchain
+/// Returns (valid, actual_burned) where actual_burned is the ACTUAL on-Solana burned amount in whole
+/// 1DEV units (0 on any false/early-exit path). Callers needing only validity use `.0`.
 pub(crate) async fn verify_burn_transaction_exists(
     burn_tx_hash: &str,
     wallet_address: &str,  // v4.7: MUST be the Solana address that signed the burn TX
     burn_amount: u64,
     phase: u8,
-) -> Result<bool, String> {
+) -> Result<(bool, u64), String> {
     println!("[INFO][BURN] verify_burn_tx tx={}... wallet={}... amount={} phase={}",
         &burn_tx_hash[..16.min(burn_tx_hash.len())],
         &wallet_address[..16.min(wallet_address.len())],
@@ -12872,7 +12914,7 @@ pub(crate) async fn verify_burn_transaction_exists(
                 burn_tx_hash,
                 {
                     "encoding": "jsonParsed",
-                    "commitment": "confirmed",
+                    "commitment": "finalized",
                     "maxSupportedTransactionVersion": 0
                 }
             ]
@@ -12940,7 +12982,7 @@ pub(crate) async fn verify_burn_transaction_exists(
         if let Some(result) = rpc_response["result"].as_object() {
             if !result.contains_key("transaction") {
                 println!("❌ Transaction not found on Solana");
-                return Ok(false);
+                return Ok((false, 0));
             }
             
             // PRODUCTION: Verify burn details
@@ -12952,7 +12994,7 @@ pub(crate) async fn verify_burn_transaction_exists(
                 if let Some(err) = meta.get("err") {
                     if !err.is_null() {
                         println!("❌ Transaction failed on Solana: {:?}", err);
-                        return Ok(false);
+                        return Ok((false, 0));
                     }
                 }
             }
@@ -13017,25 +13059,27 @@ pub(crate) async fn verify_burn_transaction_exists(
                 false
             };
             
-            // Also check outer instructions for parsed burn
+            // Also check outer instructions for parsed burn. A plain `transfer` is NOT a burn — it only
+            // counts when its destination is the incinerator (covered by has_incinerator below). Accepting
+            // a bare transfer would let tokens moved to an attacker-controlled wallet pass as a burn.
             let has_outer_burn = if let Some(instructions) = result_value["transaction"]["message"]["instructions"].as_array() {
                 instructions.iter().any(|ix| {
                     ix["parsed"]["type"].as_str() == Some("burn") ||
-                    ix["parsed"]["type"].as_str() == Some("burnChecked") ||
-                    ix["parsed"]["type"].as_str() == Some("transfer")
+                    ix["parsed"]["type"].as_str() == Some("burnChecked")
                 })
             } else {
                 false
             };
-            
+
+            // Accept only a real SPL burn (burn/burnChecked) OR a transfer TO the incinerator address.
             if !has_incinerator && !has_token_burn && !has_outer_burn {
                 println!("[ERROR][BURN] no_burn_indicator tx={}... accounts={:?}",
                     &burn_tx_hash[..16.min(burn_tx_hash.len())],
                     &account_keys[..account_keys.len().min(5)]);
                 return Err(format!(
                     "Transaction {} does not contain a valid SPL Token burn instruction. \
-                     A genuine token burn (createBurnInstruction / burnChecked) is required for node activation. \
-                     Token transfers to other addresses are not accepted.",
+                     A genuine token burn (createBurnInstruction / burnChecked) or transfer to the \
+                     incinerator is required for node activation. Token transfers to other addresses are not accepted.",
                     &burn_tx_hash[..16.min(burn_tx_hash.len())]
                 ));
             } else {
@@ -13050,7 +13094,7 @@ pub(crate) async fn verify_burn_transaction_exists(
             
             if actual_burned_amount == 0 {
                 println!("❌ No token burn detected in transaction");
-                return Ok(false);
+                return Ok((false, 0));
             }
             
             // Convert burn_amount from request (1DEV units) to SPL token units (with decimals)
@@ -13077,15 +13121,17 @@ pub(crate) async fn verify_burn_transaction_exists(
                 // Not an error - user can burn more than required (but loses extra tokens)
             }
             
-            println!("✅ Burn amount verified: {} units ({:.2} 1DEV)", 
-                     actual_burned_amount, 
+            println!("✅ Burn amount verified: {} units ({:.2} 1DEV)",
+                     actual_burned_amount,
                      actual_burned_amount as f64 / ONEDEV_DECIMALS as f64);
-            
-            return Ok(true);
+
+            // Report the ACTUAL on-Solana burned amount in whole 1DEV units (consensus-attested truth).
+            let actual_burned_1dev = actual_burned_amount / ONEDEV_DECIMALS;
+            return Ok((true, actual_burned_1dev));
         }
-        
+
         println!("❌ Invalid Solana RPC response format");
-        Ok(false)
+        Ok((false, 0))
     } else {
         // Phase 2: Verify QNC transfer to Pool 3 on QNet blockchain
         // Phase 2 activates after 90% of 1DEV supply burned — NOT REACHED YET
@@ -13613,9 +13659,17 @@ async fn handle_node_registration_client_submit(
                 "error": "burn_tx_hash does not match the signed registration_proof"
             })));
         }
-        let attestors = crate::node::BlockchainNode::collect_burn_attestations(
+        // Local Phase-1 cost hint (advisory only); each attestor recomputes + signs its own value.
+        let cost_hint = match fetch_solana_1dev_supply().await {
+            Ok((tb, cs)) => qnet_state::Transaction::phase1_activation_cost(tb, cs),
+            Err(_) => 0,
+        };
+        // The client-declared burn_amount is now only a hint; the embedded burn_amount is the
+        // committee-certified agreed_amount (== what the counted 2f+1 signed), so an honest over-burn
+        // still verifies. Exact-burn (declared == actual) ⇒ agreed_amount == burn_amount (unchanged).
+        let (attestors, agreed_cost, agreed_amount) = crate::node::BlockchainNode::collect_burn_attestations(
             burn_tx, solana_wallet, &req.wallet_address, burn_amount,
-            qnet_state::NodeType::Light, &**crate::node::get_storage(),
+            qnet_state::NodeType::Light, cost_hint, &**crate::node::get_storage(),
         ).await;
         let need = qnet_consensus::checkpoint_bft::quorum_size(
             crate::genesis_constants::genesis_node_count());
@@ -13624,14 +13678,17 @@ async fn handle_node_registration_client_submit(
                 "success": false,
                 "error": "burn-attestation quorum not yet reached; retry shortly",
                 "got": attestors.len(),
-                "need": need
+                "need": need,
+                "cost": agreed_cost,
+                "amount": agreed_amount
             })));
         }
         if let qnet_state::TransactionType::NodeRegistration {
-            burn_tx: bt, burn_amount: ba, burn_attestors: at, ..
+            burn_tx: bt, burn_amount: ba, burn_cost: bc, burn_attestors: at, ..
         } = &mut reg_tx.tx_type {
             *bt = burn_tx.to_string();
-            *ba = burn_amount;
+            *ba = agreed_amount;
+            *bc = agreed_cost;
             *at = attestors;
         }
     }

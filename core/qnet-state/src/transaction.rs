@@ -353,16 +353,20 @@ pub enum TransactionType {
         #[serde(default)]
         api_endpoint: String,
         /// Phase-1 proof-of-burn carrier. The external Solana 1DEV burn is non-deterministic (live
-        /// RPC) and cannot be re-checked in apply, so the burn fact is brought ON-CHAIN as a genesis
-        /// quorum: `burn_attestors` carries ≥2f+1 distinct genesis Dilithium signatures over
-        /// `burn_attestation_message(burn_tx, wallet_address, burn_amount, node_type)`, re-verified
-        /// from these bytes at block validation (deterministic, snapshot-independent). Empty for
-        /// genesis identities (registration_proof=="genesis") and when the gate is inactive.
+        /// RPC) and cannot be re-checked in apply, so the burn fact is brought ON-CHAIN as a committee
+        /// quorum: `burn_attestors` carries ≥2f+1 distinct committee Dilithium signatures over
+        /// `burn_attestation_message(burn_tx, wallet_address, burn_amount, node_type, burn_cost)`,
+        /// re-verified from these bytes at block validation (deterministic, snapshot-independent).
+        /// Empty for genesis identities (registration_proof=="genesis") and when the gate is inactive.
         #[serde(default)]
         burn_tx: String,
         #[serde(default)]
         burn_amount: u64,
-        /// (genesis_id, dilithium_sig) attestation quorum. Verified, never trusted blindly.
+        /// Required Phase-1 cost the committee attested (whole 1DEV). Carried so the verifier rebuilds
+        /// the exact signed message + asserts burn_amount >= burn_cost with NO Solana re-read.
+        #[serde(default)]
+        burn_cost: u64,
+        /// (committee_id, dilithium_sig) attestation quorum. Verified, never trusted blindly.
         #[serde(default)]
         burn_attestors: Vec<(String, String)>,
     },
@@ -876,17 +880,37 @@ impl Transaction {
     /// Consistent with `compute_gas_used() == 0` for every variant listed
     /// below (except NodeActivation which uses `gas_limits::NODE_ACTIVATION`
     /// for metering purposes but is still a system TX).
-    /// Canonical message a genesis node signs to attest a Phase-1 Solana 1DEV burn backing a node
-    /// registration. FIXED format (pipe-joined, node_type as a stable integer) so all genesis sign
+    /// Canonical message a committee member signs to attest a Phase-1 Solana 1DEV burn backing a node
+    /// registration. FIXED format (pipe-joined, node_type as a stable integer) so all signers produce
     /// identical bytes and every validator recomputes the identical message at block validation —
-    /// no float / locale / map-iteration input. Binds the burn tx, beneficiary wallet, amount and
-    /// node type, so a quorum signature is valid for exactly one (burn, wallet, amount, type) tuple.
-    pub fn burn_attestation_message(burn_tx: &str, wallet: &str, amount: u64, node_type: &NodeType) -> String {
+    /// no float / locale / map-iteration input. Binds the burn tx, beneficiary wallet, amount, node
+    /// type AND the required Phase-1 cost, so a quorum signature is valid for exactly one
+    /// (burn, wallet, amount, type, cost) tuple. The `cost` lives INSIDE the 2f+1-signed message so
+    /// every validator agrees on it by signature-verification, never by re-reading Solana.
+    pub fn burn_attestation_message(burn_tx: &str, wallet: &str, amount: u64, node_type: &NodeType, cost: u64) -> String {
         let nt: u8 = match node_type {
             NodeType::Super => 0,
             NodeType::Light => 1,
         };
-        format!("burn_attest:{}:{}:{}:{}", burn_tx, wallet, amount, nt)
+        format!("burn_attest:{}:{}:{}:{}:{}", burn_tx, wallet, amount, nt, cost)
+    }
+
+    /// Deterministic Phase-1 super/light activation cost in whole 1DEV, computed with INTEGER math so
+    /// every node agrees (the f64 burn_percentage diverges across nodes). Mirrors the off-chain
+    /// formula `max(1500 - 150*floor(burn_pct/10), 300)`: base 1500, −150 per complete 10% of the
+    /// 1DEV supply burned, floored at 300. Universal Light=Super in Phase 1.
+    /// `burn_pct_tenths` = burn% to one decimal; `tiers` = each complete 10% (capped at 8 → floor 300).
+    /// Bucketing to 10% means members reading Solana at slightly different times still agree on the
+    /// cost except exactly at a 10% boundary (there the registration just retries — a liveness hiccup,
+    /// not a fork).
+    pub fn phase1_activation_cost(total_burned: u64, current_supply: u64) -> u64 {
+        // burn% = burned / ORIGINAL supply; original = burned + current(remaining). Denominator is their
+        // SUM, not the remaining alone (else 50% burned would read as 100%). current_supply is the live
+        // Solana getTokenSupply (remaining); the sum reconstructs the original cap.
+        let original = total_burned.saturating_add(current_supply);
+        let burn_pct_tenths = if original == 0 { 0 } else { total_burned * 1000 / original };
+        let tiers = burn_pct_tenths / 100; // each complete 10%
+        1500u64.saturating_sub(150 * tiers.min(8)).max(300)
     }
 
     pub fn is_system_tx(&self) -> bool {
@@ -3444,20 +3468,35 @@ mod tests_v34_heartbeat {
         assert_eq!(accts.get("super_y").unwrap().heartbeat_slots.count_ones(), 9);
     }
 
-    // Burn-attestation canonical message: FIXED, deterministic, type-distinct — every genesis signs
-    // identical bytes and every validator recomputes the identical message, so the quorum verdict is
-    // byte-identical network-wide. Drift here would split the genesis signatures ⇒ no quorum forms.
+    // Burn-attestation canonical message: FIXED, deterministic, type-distinct — every committee member
+    // signs identical bytes and every validator recomputes the identical message, so the quorum verdict
+    // is byte-identical network-wide. Drift here would split the signatures ⇒ no quorum forms.
     #[test]
     fn burn_attestation_message_is_canonical_and_type_distinct() {
-        let m = Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super);
-        assert_eq!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super), "deterministic");
-        assert_eq!(m, "burn_attest:solSig:walletA:1500:0", "fixed format, Super=0");
-        // Every bound field (incl. node_type) changes the signed message.
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Light));
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1501, &NodeType::Super));
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletB", 1500, &NodeType::Super));
-        assert_ne!(m, Transaction::burn_attestation_message("solSig2", "walletA", 1500, &NodeType::Super));
-        assert_eq!(Transaction::burn_attestation_message("x", "y", 0, &NodeType::Light), "burn_attest:x:y:0:1", "Light=1");
+        let m = Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1500);
+        assert_eq!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1500), "deterministic");
+        assert_eq!(m, "burn_attest:solSig:walletA:1500:0:1500", "fixed format, Super=0, cost suffix");
+        // Every bound field (incl. node_type and cost) changes the signed message.
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Light, 1500));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1501, &NodeType::Super, 1500));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletB", 1500, &NodeType::Super, 1500));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig2", "walletA", 1500, &NodeType::Super, 1500));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1350), "cost is bound");
+        assert_eq!(Transaction::burn_attestation_message("x", "y", 0, &NodeType::Light, 300), "burn_attest:x:y:0:1:300", "Light=1");
+    }
+
+    // Phase-1 cost formula: integer-deterministic, matching max(1500 - 150*floor(burn_pct/10), 300).
+    #[test]
+    fn phase1_activation_cost_tiers() {
+        // Args are (total_burned, current_remaining) as Solana reports them; the fn reconstructs the
+        // original cap = burned + remaining. Original 1DEV cap = 1B.
+        let orig = 1_000_000_000u64;
+        assert_eq!(Transaction::phase1_activation_cost(0, orig), 1500, "0% burned ⇒ base 1500");
+        assert_eq!(Transaction::phase1_activation_cost(orig / 10, orig - orig / 10), 1350, "10% ⇒ −150");
+        assert_eq!(Transaction::phase1_activation_cost(orig / 2, orig - orig / 2), 750, "50% ⇒ −750");
+        assert_eq!(Transaction::phase1_activation_cost(orig * 8 / 10, orig - orig * 8 / 10), 300, "80% ⇒ floor 300");
+        assert_eq!(Transaction::phase1_activation_cost(orig * 95 / 100, orig - orig * 95 / 100), 300, "95% ⇒ floored 300");
+        assert_eq!(Transaction::phase1_activation_cost(0, 0), 1500, "zero original ⇒ base (no div-by-zero)");
     }
 
     // Structural validation (the pure part; anchor/sig are checked at block validation).

@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 
 use crate::storage::Storage;
 use crate::unified_p2p::SimplifiedP2P;
@@ -171,6 +172,10 @@ pub struct SyncManager {
     active: Arc<AtomicBool>,
     progress_height: Arc<AtomicU64>,
     target_height_atomic: Arc<AtomicU64>,
+    // SAME StateManager handle the apply pipeline uses (ApplyContext.state). Cold-join snapshot
+    // rehydration seeds this in-mem state from the promoted accounts CF — without it the first
+    // tail block applies over an empty merkle and trips state_root_mismatch → wedge.
+    state: Arc<RwLock<crate::StateManager>>,
 }
 
 impl SyncManager {
@@ -181,6 +186,7 @@ impl SyncManager {
         p2p: Arc<SimplifiedP2P>,
         pipeline: PipelineIngest,
         coordinator: CoordinatorHandle,
+        state: Arc<RwLock<crate::StateManager>>,
     ) -> (Self, SyncHandle) {
         let (command_tx, command_rx) = mpsc::channel(32);
         let active = Arc::new(AtomicBool::new(false));
@@ -197,6 +203,7 @@ impl SyncManager {
             active: active.clone(),
             progress_height: progress_height.clone(),
             target_height_atomic: target_height_atomic.clone(),
+            state,
         };
 
         let handle = SyncHandle {
@@ -493,7 +500,7 @@ impl SyncManager {
         }
 
         if local_h == 0 || target.saturating_sub(local_h) > SNAPSHOT_FAST_PATH_GAP {
-            match self.storage.fast_sync_with_snapshot(&self.p2p, target).await {
+            match self.storage.fast_sync_with_snapshot(&self.p2p, target, &self.state).await {
                 Ok(()) => {
                     let restored = self.storage.get_chain_height().unwrap_or(local_h);
                     if restored > local_h {

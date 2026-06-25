@@ -285,6 +285,7 @@ pub enum V2Event {
         banned: Vec<String>,           // QC-bound cumulative ban set (binds stored banned_validators)
         reward_root: Hash,             // per-epoch reward merkle root ([0;32] off emission boundary)
         registry_root: Hash,           // deterministic Super/genesis registry digest (snapshot-forge defence)
+        total_supply: u64,             // QC-bound total minted supply (cold-joiner reads this, not balance sum)
     },
     // A macroblock whose checkpoint QC the apply path already verified against the correct epoch
     // committee — fed here so a driver too far behind for gossip fast-forwards from committed
@@ -306,6 +307,7 @@ struct WindowContent {
     banned: Vec<String>,   // QC-bound cumulative ban set (folded into epoch_commitment)
     reward_root: Hash,     // per-epoch reward merkle root, QC-certified via Checkpoint.reward_root
     registry_root: Hash,   // Super/genesis registry digest, QC-certified via Checkpoint.registry_root
+    total_supply: u64,     // total minted supply, QC-certified via Checkpoint.total_supply
 }
 
 /// Adopt the in-flight window's committee and, if we lead the current round, propose the
@@ -319,7 +321,7 @@ fn try_propose(
     match buf.get(&w) {
         Some(c) => {
             *committee = c.committee.clone(); // committee is per-window (epoch); QC/TC verify against it
-            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root)
+            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root, c.total_supply)
         }
         None => Vec::new(),
     }
@@ -358,10 +360,10 @@ pub fn route_inbound(data: Vec<u8>) {
 pub fn signal_window_end(
     index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
     committee: Vec<String>, eligible_producers: Vec<u8>, banned: Vec<String>, reward_root: Hash,
-    registry_root: Hash,
+    registry_root: Hash, total_supply: u64,
 ) {
     if let Some(tx) = V2_TX.get() {
-        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root, registry_root });
+        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root, registry_root, total_supply });
     }
 }
 
@@ -492,7 +494,14 @@ pub async fn run(
                                             // never halt the network before the root is proven stable live (mirror
                                             // of the burn-attestation gate); the field is in the hash regardless.
                                             && (!qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height)
-                                                || cp.registry_root == c.registry_root))
+                                                || cp.registry_root == c.registry_root)
+                                            // total_supply is QC-certified (folded into Checkpoint::hash). It is the
+                                            // apply-accumulated emission total — a deterministic accumulator both
+                                            // sides reproduce from the same window-head state — so it MUST match
+                                            // before we sign (epoch 0: both 0, trivial). Same gate as registry_root
+                                            // so a slip never halts before the field is proven stable live.
+                                            && (!qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height)
+                                                || cp.total_supply == c.total_supply))
                                         // No locally-derived content for the proposer's claimed window ⇒
                                         // we cannot verify it, so we never sign it (fail-stop).
                                         .unwrap_or(false),
@@ -539,7 +548,7 @@ pub async fn run(
                         }
                         Err(_) => Vec::new(),
                     },
-                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned, reward_root, registry_root } => {
+                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned, reward_root, registry_root, total_supply } => {
                         // Buffer this window's content (head microblock's real timestamp rides in
                         // the QC-agreed checkpoint). Then propose the contiguous next window if we
                         // lead, and replay buffered inbound.
@@ -547,7 +556,7 @@ pub async fn run(
                         let head_ts = storage.load_microblock_auto_format(head_height)
                             .ok().flatten().map(|m| m.timestamp).unwrap_or(0);
                         window_buf.insert(index, WindowContent {
-                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root,
+                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root, total_supply,
                         });
                         if window_buf.len() > MAX_WINDOW_BUF {
                             if let Some(&lo) = window_buf.keys().min() { window_buf.remove(&lo); }

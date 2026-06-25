@@ -229,7 +229,7 @@ mod tests {
         Checkpoint {
             index, parent_qc, window_head_height: index * 10,
             window_mb_hashes: vec![hh(index as u8)], state_root: hh(index as u8),
-            beacon: hh(0), epoch_commitment: hh(0), reward_root: hh(0), registry_root: hh(0), timestamp: 0, proposer: c[li].clone(), proposer_sig: Vec::new(),
+            beacon: hh(0), epoch_commitment: hh(0), reward_root: hh(0), registry_root: hh(0), total_supply: 0, timestamp: 0, proposer: c[li].clone(), proposer_sig: Vec::new(),
         }
     }
 

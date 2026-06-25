@@ -4725,10 +4725,11 @@ impl BlockchainNode {
                 registration_proof: registration_proof.to_string(),
                 api_endpoint: final_endpoint.clone(),
                 // Phase-1 burn-attestation carrier. Empty here: genesis (registration_proof=="genesis")
-                // is exempt; a burn-backed super fills these (burn_tx/amount + 2f+1 genesis quorum)
+                // is exempt; a burn-backed super fills these (burn_tx/amount/cost + 2f+1 committee quorum)
                 // via the attestation collection path before broadcasting.
                 burn_tx: String::new(),
                 burn_amount: 0,
+                burn_cost: 0,
                 burn_attestors: Vec::new(),
             },
             data: Some(format!("node_registration:{}:{}:{}:{}", node_id, wallet_address, registration_proof, final_endpoint)),
@@ -7537,7 +7538,7 @@ impl BlockchainNode {
                 // first arrives. No-op for fresh/genesis; consensus-listener boot reloads again as backstop.
                 // Complete any snapshot promote interrupted by a crash BEFORE reloading the anchor
                 // (idempotent: re-copies from the intact staging, then clears the marker).
-                if let Some(s) = try_get_storage() { s.recover_pending_snapshot_promote().await; }
+                if let Some(s) = try_get_storage() { s.recover_pending_snapshot_promote(Some(&state)).await; }
                 reload_snapshot_anchor();
                 // A recovered promote may have advanced chain_height — re-read so the rest of boot
                 // (integrity checks, p2p height) uses the promoted height, not the pre-recovery value.
@@ -8580,6 +8581,9 @@ impl BlockchainNode {
                 p2p.clone(),
                 pipeline_ingest.clone(),
                 coordinator_handle.clone(),
+                // SAME handle the apply pipeline uses (apply_ctx.state above) — cold-join
+                // snapshot rehydrate must seed the in-mem state the pipeline reads.
+                blockchain.state.clone(),
             );
             blockchain.sync_handle = Some(sync_handle.clone());
             tokio::spawn(sync_manager.run());
@@ -9392,7 +9396,7 @@ impl BlockchainNode {
                                              local_height, network_height, gap, large_gap_threshold);
                                 }
 
-                                match blockchain_for_sync.storage.fast_sync_with_snapshot(p2p, network_height).await {
+                                match blockchain_for_sync.storage.fast_sync_with_snapshot(p2p, network_height, &blockchain_for_sync.state).await {
                                     Ok(()) => {
                                         // v10.1: Snapshot sets chain_height in storage.
                                         // Read it back and update RAM height + global atomics.
@@ -11901,6 +11905,7 @@ impl BlockchainNode {
             unified_p2p.clone(),
             node_id.clone(),
             node_type,
+            self.state.clone(),
         );
         
         // ARCHITECTURE: Network sync monitoring handled by existing mechanisms:
@@ -13990,7 +13995,7 @@ impl BlockchainNode {
                                             );
                                             let tip = crate::node::qc_verified_frontier_height()
                                                 .max(p2p.get_best_peer_height());
-                                            match storage.fast_sync_with_snapshot(p2p, tip).await {
+                                            match storage.fast_sync_with_snapshot(p2p, tip, &state).await {
                                                 Ok(()) => println!("[INFO][STATE] clean_state_sync_ok target={}", tip),
                                                 Err(se) => println!("[WARN][STATE] clean_state_sync_failed err={:?} fallback=block_sync", se),
                                             }
@@ -14236,6 +14241,9 @@ impl BlockchainNode {
                                 let p2p_clone = p2p.clone();
                                 let storage_clone = storage.clone();
                                 let height_clone = height.clone();
+                                // SAME StateManager handle the apply pipeline uses — cold-join snapshot
+                                // rehydrate must seed it (else first tail block trips state_root_mismatch).
+                                let state_clone = state.clone();
 
                                 tokio::spawn(async move {
                                     let _guard = FastSyncGuard { storage: storage_clone.clone() };
@@ -14258,7 +14266,7 @@ impl BlockchainNode {
                                         }
                                         let mut snapshot_loaded = false;
                                         for attempt in 1..=max_retries {
-                                            match storage_clone.fast_sync_with_snapshot(&p2p_clone, network_height).await {
+                                            match storage_clone.fast_sync_with_snapshot(&p2p_clone, network_height, &state_clone).await {
                                                 Ok(()) => {
                                                     let new_local = storage_clone.get_chain_height().unwrap_or(sync_from_height);
                                                     if new_local + 1 > sync_from_height {
@@ -20882,6 +20890,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         p2p: Option<Arc<SimplifiedP2P>>,
         node_id: String,
         node_type: NodeType,
+        state: Arc<RwLock<StateManager>>,
     ) {
         // Subscribe to block events (event-based, not polling!)
         let mut block_event_rx = self.block_event_tx.subscribe();
@@ -21056,6 +21065,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     let storage_cp = storage.clone();
                                     let p2p_cp = p2p_ref.clone();
                                     let node_id_cp = node_id.clone();
+                                    let state_cp = state.clone();
                                     tokio::spawn(async move {
                                         // Epoch committee — the SAME N-2 sample the macroblock uses (must match
                                         // peers, else content_ok diverges and the checkpoint never reaches 2f+1).
@@ -21092,9 +21102,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // registry_root as of this intra head — deterministic, enforced (gated)
                                         // by content_ok like every checkpoint; the field is in the QC hash regardless.
                                         let registry_root = storage_cp.compute_registry_root(b);
+                                        // QC-bound total minted supply as of this intra head — the apply-accumulated
+                                        // value (deterministic, lockstep with apply through height b). A cold-joiner
+                                        // reads this from the checkpoint instead of summing balances.
+                                        let total_supply = state_cp.read().await.get_total_supply();
                                         crate::consensus_v2_node::signal_window_end(
                                             cp_index, b, h_vec, state_root, beacon, committee, Vec::new(), Vec::new(), [0u8; 32],
-                                            registry_root,
+                                            registry_root, total_supply,
                                         );
                                         if crate::node::is_info() {
                                             println!("[INFO][BFT2] intra_checkpoint_signalled cp_index={} head={} k={}", cp_index, b, k);
@@ -21343,6 +21357,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 let storage_cons = storage.clone();
                                 let p2p_cons = p2p_ref.clone();
                                 let node_id_cons = node_id.clone();
+                                let state_cons = state.clone();
                                 let mb_idx = macroblock_index;
 
                                 tokio::spawn(async move {
@@ -21517,11 +21532,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // via Checkpoint.registry_root so an untrusted-snapshot joiner can verify the
                                         // restored node_registry (source of cbw + attestor VRF keys). reg_height<=end_height.
                                         let registry_root = storage_cons.compute_registry_root(end_height);
+                                        // QC-bound total minted supply as of the window head — apply-accumulated,
+                                        // deterministic across nodes (lockstep with apply through end_height). The
+                                        // cold-joiner reads this checkpoint value instead of summing balances.
+                                        let total_supply = state_cons.read().await.get_total_supply();
                                         active_guard.signalled = true; // content delivered → keep the lock held
                                         crate::consensus_v2_node::signal_window_end(
                                             end_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL,
                                             end_height, mb_hashes, state_root, beacon, committee, eligible_bytes, banned_for_epoch, reward_root,
-                                            registry_root,
+                                            registry_root, total_supply,
                                         );
                                         return;
                                     }
@@ -23590,10 +23609,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// Phase-1 proof-of-burn consensus gate. The external Solana 1DEV burn is non-deterministic
     /// (live RPC) and cannot be re-checked in apply, so a Byzantine producer could otherwise inject
     /// a NodeRegistration with a fabricated burn that every honest node applies — minting a free
-    /// reward/producer-eligible node. This gate brings the burn fact ON-CHAIN as a genesis quorum:
-    /// a non-genesis NodeRegistration is valid only if it carries ≥2f+1 distinct valid genesis
-    /// Dilithium signatures over the canonical burn message. Returns Ok(()) when the rule is INACTIVE
-    /// at `height`, the registration is a genesis identity (exempt), or the quorum verifies.
+    /// reward/producer-eligible node. This gate brings the burn fact ON-CHAIN as a committee quorum:
+    /// a non-genesis NodeRegistration is valid only if it carries ≥2f+1 distinct valid committee
+    /// Dilithium signatures over the canonical burn message — which embeds the required Phase-1 cost,
+    /// so the bound burn_amount must meet the attested cost (no under-paid Sybil node). Returns Ok(())
+    /// when the rule is INACTIVE at `height`, the registration is a genesis identity (exempt), or the
+    /// quorum verifies. Cost lives INSIDE the 2f+1-signed message: validators agree on it by signature,
+    /// never by re-reading Solana — fully deterministic (a 10% bucket boundary costs a retry, not a fork).
     ///
     /// DETERMINISM: a pure function of the TX bytes + the binary-pinned GENESIS_CONSENSUS_PKS
     /// (installed at startup on every node) — NO live RPC, NO node-local state — so the verdict is
@@ -23605,11 +23627,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         height: u64,
         storage: &crate::storage::Storage,
     ) -> Result<(), QNetError> {
-        let (node_id, node_type, wallet, reg_proof, burn_tx, burn_amount, attestors) = match &tx.tx_type {
+        let (node_id, node_type, wallet, reg_proof, burn_tx, burn_amount, burn_cost, attestors) = match &tx.tx_type {
             qnet_state::TransactionType::NodeRegistration {
-                node_id, node_type, wallet_address, registration_proof, burn_tx, burn_amount, burn_attestors, ..
+                node_id, node_type, wallet_address, registration_proof, burn_tx, burn_amount, burn_cost, burn_attestors, ..
             } => (node_id.as_str(), node_type, wallet_address.as_str(), registration_proof.as_str(),
-                  burn_tx.as_str(), *burn_amount, burn_attestors),
+                  burn_tx.as_str(), *burn_amount, *burn_cost, burn_attestors),
             _ => return Ok(()), // only NodeRegistration is gated
         };
 
@@ -23631,6 +23653,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Err(QNetError::ValidationError(
                 "burn_attestation_required: NodeRegistration missing burn_tx".to_string()));
         }
+        // Cost gate: the committee-attested Phase-1 cost MUST be present (old no-cost format is rejected
+        // while the gate is active), meet the protocol floor, and be covered by the bound amount. The
+        // cost is part of the 2f+1-signed message below, so this binds the registration to the cost the
+        // committee agreed on — it never re-reads Solana (determinism).
+        if burn_cost < 300 {
+            return Err(QNetError::ValidationError(
+                "burn_attestation_required: burn_cost below 300 1DEV floor (missing or under-priced)".to_string()));
+        }
+        if burn_amount < burn_cost {
+            return Err(QNetError::ValidationError(
+                "burn_attestation_required: bound burn_amount below attested cost".to_string()));
+        }
         // On-chain burn→wallet uniqueness: a burn already committed-bound to a DIFFERENT wallet in an
         // earlier block cannot back a second node (Sybil amplification under a rotating committee).
         // Deterministic read of committed state ≤ H; same-block reuse is caught by the block-level
@@ -23642,8 +23676,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         }
 
-        // Recompute the exact message the committee signed; count DISTINCT valid committee sigs.
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, wallet, burn_amount, node_type);
+        // Recompute the exact message the committee signed (incl. the attested cost); count DISTINCT
+        // valid committee sigs.
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, wallet, burn_amount, node_type, burn_cost);
 
         // Attestor set = the deterministic consensus committee for THIS registration's epoch.
         // Post-genesis: the N-2 VRF committee (committee_for_height). Genesis era (no N-2 snapshot
@@ -23729,7 +23764,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// to attest a reused burn for a second node, so with ≤f Byzantine genesis a reused burn can
     /// never reach the on-chain 2f+1 quorum verified by verify_burn_attestation_quorum.
     pub fn sign_burn_attestation(
-        &self, burn_tx: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType,
+        &self, burn_tx: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType, cost: u64,
     ) -> Option<(String, String)> {
         if !self.is_genesis_attestor() { return None; }
         // One burn → one wallet, PERSISTED (survives process restart; the prior in-memory map was
@@ -23739,19 +23774,27 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             Ok(Some(_)) => {}                                 // same wallet ⇒ idempotent re-attest
             _ => { let _ = self.storage.attested_burn_put(burn_tx, qnet_wallet); }
         }
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, qnet_wallet, amount, &node_type);
+        // Sign the cost the caller computed + verified against the real on-Solana burn. Bound INTO the
+        // message so the on-chain verifier trusts it by signature, never by re-reading Solana.
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, qnet_wallet, amount, &node_type, cost);
         let sig = self.wallet_identity.as_ref()?.sign_consensus(&self.node_id, msg.as_bytes()).ok()?;
         Some((self.node_id.clone(), sig))
     }
 
-    /// Super-side: gather ≥2f+1 genesis burn-attestations for this node's Phase-1 Solana burn so the
-    /// NodeRegistration passes the burn-attestation gate. Queries each genesis JSON-RPC endpoint
-    /// (node_attestBurn); each independently re-verifies the Solana burn and signs. Best-effort with
-    /// a per-request timeout — returns the distinct genesis sigs gathered (caller checks the count).
+    /// Super-side: gather ≥2f+1 committee burn-attestations for this node's Phase-1 Solana burn so the
+    /// NodeRegistration passes the burn-attestation gate. Queries each committee JSON-RPC endpoint
+    /// (node_attestBurn); each independently re-verifies the Solana burn AND recomputes the Phase-1
+    /// cost, then signs over its OWN observed (amount, cost) pair. Returns (distinct sigs, agreed_cost,
+    /// agreed_amount): only sigs agreeing on ONE (cost, amount) pair are kept (each signed message embeds
+    /// BOTH, so a mismatched signer can't be in the same quorum). The registrant embeds agreed_amount as
+    /// NodeRegistration.burn_amount so the on-chain value is exactly what the counted 2f+1 signed —
+    /// closing the over-burn footgun (declared < actual would otherwise fail every signature). At a 10%
+    /// burn-boundary signers may split → fewer than `need` agree → caller retries (liveness hiccup, never
+    /// a fork). caller checks the count.
     pub async fn collect_burn_attestations(
         burn_tx: &str, solana_wallet: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType,
-        storage: &crate::storage::Storage,
-    ) -> Vec<(String, String)> {
+        cost: u64, storage: &crate::storage::Storage,
+    ) -> (Vec<(String, String)>, u64, u64) {
         let nt = match node_type { qnet_state::NodeType::Light => "light", _ => "super" };
         // Attestor set = the consensus committee for the current tip (genesis era ⇒ the genesis set,
         // the only members then). need = quorum_size(committee) — exactly what the verifier requires,
@@ -23764,16 +23807,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         };
         let need = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
         let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30)).build() { Ok(c) => c, Err(_) => return Vec::new() };
+            .timeout(std::time::Duration::from_secs(30)).build() { Ok(c) => c, Err(_) => return (Vec::new(), cost, amount) };
+        // Carry the cost+amount as advisory hints; each attestor RECOMPUTES the cost from its own Solana
+        // read and reads the ACTUAL on-Solana burned amount, signing ONLY its own (cost, amount) pair
+        // (returned below), so a forged hint cannot lower the binding cost nor the embedded amount.
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "node_attestBurn",
             "params": { "burn_tx": burn_tx, "solana_wallet": solana_wallet,
-                        "qnet_wallet": qnet_wallet, "amount": amount, "node_type": nt }
+                        "qnet_wallet": qnet_wallet, "amount": amount, "node_type": nt, "cost": cost }
         });
-        let mut out: Vec<(String, String)> = Vec::new();
+        // Group sigs by the (cost, amount) PAIR each attestor signed; the embedded registration cost AND
+        // amount are exactly what the quorum shares, so keep only the pair-bucket that first reaches
+        // `need` distinct members. Returning the agreed amount lets the registrant embed committee truth.
+        let mut by_pair: std::collections::BTreeMap<(u64, u64), Vec<(String, String)>> = std::collections::BTreeMap::new();
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for member_id in &committee {
-            if out.len() >= need { break; }
             // Endpoint IP: chain-registered api_endpoint, else the pinned genesis IP for genesis members.
             let ip = crate::genesis_constants::get_node_endpoint_ip(member_id)
                 .or_else(|| crate::genesis_constants::genesis_ip_for_node_id(member_id).map(|s| s.to_string()));
@@ -23784,11 +23832,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let result = match json.get("result") { Some(r) => r, None => continue };
             let gid = result.get("genesis_id").and_then(|v| v.as_str()).unwrap_or("");
             let sig = result.get("sig").and_then(|v| v.as_str()).unwrap_or("");
+            let signed_cost = result.get("cost").and_then(|v| v.as_u64()).unwrap_or(0);
+            // The attestor signed over the ACTUAL on-Solana burned amount; embed exactly that.
+            let signed_amount = result.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
             // Count only a committee member's signed response (the verifier enforces membership too).
-            if gid.is_empty() || sig.is_empty() || !committee.iter().any(|m| m == gid) { continue; }
-            if seen.insert(gid.to_string()) { out.push((gid.to_string(), sig.to_string())); }
+            if gid.is_empty() || sig.is_empty() || signed_cost == 0 || signed_amount == 0
+                || !committee.iter().any(|m| m == gid) { continue; }
+            if !seen.insert(gid.to_string()) { continue; } // distinct only
+            let bucket = by_pair.entry((signed_cost, signed_amount)).or_default();
+            bucket.push((gid.to_string(), sig.to_string()));
+            if bucket.len() >= need {
+                return (bucket.clone(), signed_cost, signed_amount);
+            }
         }
-        out
+        // No (cost, amount) bucket reached quorum — return the largest bucket + its pair so the caller can
+        // log got/need and retry (e.g. a 10% boundary split, or attestors disagreeing on the amount).
+        by_pair.into_iter().max_by_key(|(_, v)| v.len())
+            .map(|((c, a), v)| (v, c, a)).unwrap_or_else(|| (Vec::new(), cost, amount))
     }
 
     /// PRODUCTION v2.19.25: Validate and add transaction received from P2P network
@@ -26016,13 +26076,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         match crate::rpc::verify_burn_transaction_exists(
                             &env_burn_tx, &solana_from_mnemonic, env_burn_amount, 1,
                         ).await {
-                            Ok(true) => {
+                            Ok((true, _)) => {
                                 if is_info() {
                                     println!("[INFO][ACTIVATION] burn_verified_onchain tx={}...",
                                         &env_burn_tx[..16.min(env_burn_tx.len())]);
                                 }
                             }
-                            Ok(false) => return Err(QNetError::ValidationError(format!(
+                            Ok((false, _)) => return Err(QNetError::ValidationError(format!(
                                 "burn_not_found_on_solana tx={} amount={} — no real 1DEV burn backs this activation",
                                 env_burn_tx, env_burn_amount,
                             ))),
@@ -26263,18 +26323,27 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             NodeType::Super => qnet_state::NodeType::Super,
                             NodeType::Light => qnet_state::NodeType::Light,
                         };
-                        let attestors = Self::collect_burn_attestations(
-                            &b_tx, &solana_wallet, &wallet_address, b_amt, qnt, &self.storage).await;
+                        // Local Phase-1 cost (advisory hint only); each attestor recomputes + signs its own.
+                        let cost_hint = match crate::rpc::fetch_solana_1dev_supply().await {
+                            Ok((tb, cs)) => qnet_state::Transaction::phase1_activation_cost(tb, cs),
+                            Err(_) => 0,
+                        };
+                        // QNET_BURN_AMOUNT (b_amt) is now only an operator hint; the embedded burn_amount
+                        // is the committee-certified agreed_amount (== what the counted 2f+1 signed), so an
+                        // honest over-burn (declared < actual) still verifies. For the exact-burn case
+                        // (declared == actual) agreed_amount == b_amt ⇒ identical registration as before.
+                        let (attestors, agreed_cost, agreed_amount) = Self::collect_burn_attestations(
+                            &b_tx, &solana_wallet, &wallet_address, b_amt, qnt, cost_hint, &self.storage).await;
                         let need = qnet_consensus::checkpoint_bft::quorum_size(
                             crate::genesis_constants::genesis_node_count());
                         if attestors.len() < need {
-                            eprintln!("[WARN][REG] burn_attest_incomplete got={}/{} — registration will be rejected until quorum reached",
-                                      attestors.len(), need);
+                            eprintln!("[WARN][REG] burn_attest_incomplete got={}/{} cost={} amount={} declared={} — registration rejected until quorum reached",
+                                      attestors.len(), need, agreed_cost, agreed_amount, b_amt);
                         }
                         if let qnet_state::TransactionType::NodeRegistration {
-                            burn_tx: bt, burn_amount: ba, burn_attestors: at, ..
+                            burn_tx: bt, burn_amount: ba, burn_cost: bc, burn_attestors: at, ..
                         } = &mut registration_tx.tx_type {
-                            *bt = b_tx; *ba = b_amt; *at = attestors;
+                            *bt = b_tx; *ba = agreed_amount; *bc = agreed_cost; *at = attestors;
                         }
                     }
                 }
@@ -28197,6 +28266,7 @@ mod tests {
             epoch_commitment: [0u8; 32],
             reward_root: [0u8; 32],
             registry_root: [0u8; 32],
+            total_supply: 0,
             timestamp: 1000,
             proposer: node.to_string(),
             proposer_sig: Vec::new(),
@@ -28357,10 +28427,17 @@ mod tests {
         c.extend_from_slice(pk);
         format!("dilithium_sig_{}_{}", genesis_id, general_purpose::STANDARD.encode(&c))
     }
+    // Default: cost == amount (the at-cost case). Use burn_reg_tx_cost to set an explicit cost.
     fn burn_reg_tx(reg_proof: &str, burn_tx: &str, amount: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
-        burn_reg_tx_id("super_test", reg_proof, burn_tx, amount, attestors)
+        burn_reg_tx_full("super_test", reg_proof, burn_tx, amount, amount, attestors)
+    }
+    fn burn_reg_tx_cost(reg_proof: &str, burn_tx: &str, amount: u64, cost: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
+        burn_reg_tx_full("super_test", reg_proof, burn_tx, amount, cost, attestors)
     }
     fn burn_reg_tx_id(node_id: &str, reg_proof: &str, burn_tx: &str, amount: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
+        burn_reg_tx_full(node_id, reg_proof, burn_tx, amount, amount, attestors)
+    }
+    fn burn_reg_tx_full(node_id: &str, reg_proof: &str, burn_tx: &str, amount: u64, cost: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
         let mut tx = qnet_state::Transaction {
             hash: String::new(), from: "walletA".to_string(), to: None, amount: 0, nonce: 0,
             gas_price: 0, gas_limit: 0, timestamp: 1000, signature: None, public_key: None,
@@ -28372,6 +28449,7 @@ mod tests {
                 api_endpoint: String::new(),
                 burn_tx: burn_tx.to_string(),
                 burn_amount: amount,
+                burn_cost: cost,
                 burn_attestors: attestors,
             },
             data: None, dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
@@ -28398,15 +28476,16 @@ mod tests {
         storage.save_vrf_public_key("genesis_node_004", &hex::encode(&pk4)).unwrap();
         let burn_tx = "solBurnSig123";
         let amount = 1500u64;
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super);
+        let cost = 1500u64; // default helper sets cost==amount; the signed message must carry it
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super, cost);
         let a1 = ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg));
         let a2 = ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg));
         let a3 = ("genesis_node_003".to_string(), burn_sign("genesis_node_003", &pk3, &sk3, &msg));
         let a4 = ("genesis_node_004".to_string(), burn_sign("genesis_node_004", &pk4, &sk4, &msg));
 
-        // (1) 4 distinct valid committee sigs (n−f = quorum_size(5)) ⇒ ACCEPT.
+        // (1) 4 distinct valid committee sigs (n−f = quorum_size(5)) over the cost-bearing message ⇒ ACCEPT.
         let tx = burn_reg_tx("burn", burn_tx, amount, vec![a1.clone(), a2.clone(), a3.clone(), a4.clone()]);
-        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx, GATE, &storage).await.is_ok(), "4-of-5 quorum must pass");
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx, GATE, &storage).await.is_ok(), "4-of-5 quorum at-cost must pass");
 
         // (2a) only 3 distinct ⇒ REJECT (below n−f=4).
         let tx2 = burn_reg_tx("burn", burn_tx, amount, vec![a1.clone(), a2.clone(), a3.clone()]);
@@ -28445,6 +28524,36 @@ mod tests {
         storage.committed_burn_wallet_put(burn_tx, "walletZ").unwrap();
         let txreuse = burn_reg_tx("burn", burn_tx, amount, vec![a1.clone(), a2.clone(), a3.clone(), a4.clone()]);
         assert!(BlockchainNode::verify_burn_attestation_quorum(&txreuse, GATE, &storage).await.is_err(), "burn reused for a different wallet must reject");
+
+        // (7) AT-COST reduced tier (e.g. burn_pct ⇒ cost 1350): a 4-of-5 quorum over the cost-bearing
+        // message with burn_amount >= cost ⇒ ACCEPT. The committee attested 1350, the joiner paid 1350.
+        let burn_tx7 = "solBurnSig7";
+        let cost7 = 1350u64;
+        let msg7 = qnet_state::Transaction::burn_attestation_message(burn_tx7, "walletA", cost7, &qnet_state::NodeType::Super, cost7);
+        let q7: Vec<(String, String)> = vec![
+            ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg7)),
+            ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg7)),
+            ("genesis_node_003".to_string(), burn_sign("genesis_node_003", &pk3, &sk3, &msg7)),
+            ("genesis_node_004".to_string(), burn_sign("genesis_node_004", &pk4, &sk4, &msg7)),
+        ];
+        let tx7 = burn_reg_tx_cost("burn", burn_tx7, cost7, cost7, q7);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx7, GATE, &storage).await.is_ok(), "at-cost reduced-tier quorum must pass");
+
+        // (8) UNDER-COST: committee attested cost=1500 but burn_amount=300 (joiner tried to pay ~300 for
+        // a 1500 node). amount < burn_cost ⇒ REJECT even though all 4 sigs over the message are valid —
+        // closes the core Sybil hole (a cheap burn buying a full node).
+        let burn_tx8 = "solBurnSig8";
+        let cost8 = 1500u64;
+        let under = 300u64;
+        let msg8 = qnet_state::Transaction::burn_attestation_message(burn_tx8, "walletA", under, &qnet_state::NodeType::Super, cost8);
+        let q8: Vec<(String, String)> = vec![
+            ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg8)),
+            ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg8)),
+            ("genesis_node_003".to_string(), burn_sign("genesis_node_003", &pk3, &sk3, &msg8)),
+            ("genesis_node_004".to_string(), burn_sign("genesis_node_004", &pk4, &sk4, &msg8)),
+        ];
+        let tx8 = burn_reg_tx_cost("burn", burn_tx8, under, cost8, q8);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx8, GATE, &storage).await.is_err(), "under-cost burn must reject (amount < attested cost)");
     }
 
     // Fork-fix coverage: at a POST-genesis height with no locally-readable N-2 macroblock, verify
@@ -28466,7 +28575,7 @@ mod tests {
         storage.save_vrf_public_key("genesis_node_004", &hex::encode(&pk4)).unwrap();
         let burn_tx = "solBurnSigPG";
         let amount = 1500u64;
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super);
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super, amount);
         let attest = vec![
             ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg)),
             ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg)),

@@ -1186,6 +1186,15 @@ impl StateManager {
         self.registered_nodes.insert(node_id.to_string(), wallet_address.to_string());
     }
 
+    /// Cold-join: seed one chain-confirmed node_id->wallet binding into `registered_nodes` from the
+    /// snapshot-bound node_registry CF (the integration layer reads the CF and calls this per entry).
+    /// Same insert as mark_node_registered; named distinctly so the cold-join rehydrate intent is
+    /// explicit. The crate boundary forbids qnet-state reading the integration Storage type, so the
+    /// read lives integration-side and only the inserter is here.
+    pub fn seed_registered_node(&self, node_id: &str, wallet_address: &str) {
+        self.registered_nodes.insert(node_id.to_string(), wallet_address.to_string());
+    }
+
     /// Get the wallet address for a registered node (None if not registered)
     pub fn get_node_wallet(&self, node_id: &str) -> Option<String> {
         self.registered_nodes.get(node_id).map(|v| v.clone())
