@@ -32,8 +32,8 @@ use crate::node::{is_info, is_warn, is_debug};
 
 /// Unified node state. Exactly ONE variant is active at any time.
 /// Replaces: SYNC_IN_PROGRESS, FAST_SYNC_IN_PROGRESS, NODE_IS_SYNCHRONIZED,
-/// PRODUCTION_UNLOCKED, SYNC_TARGET_HEIGHT, LAST_BLOCK_PRODUCED_TIME,
-/// LAST_BLOCK_PRODUCED_HEIGHT
+/// PRODUCTION_UNLOCKED, LAST_BLOCK_PRODUCED_TIME, LAST_BLOCK_PRODUCED_HEIGHT.
+/// Syncing.target_height is the single sync-target source (coordinator_sync_target).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConsensusPhase {
     /// Loading genesis from file or downloading via HTTP.
@@ -117,7 +117,6 @@ pub struct ConsensusSnapshot {
     pub last_block_time: u64,
     pub last_block_height: u64,
     pub peer_count: u32,
-    pub network_height: u64,
 }
 
 impl ConsensusSnapshot {
@@ -149,12 +148,6 @@ impl ConsensusSnapshot {
             | ConsensusPhase::Producing { .. }
             | ConsensusPhase::Validating { .. }
         )
-    }
-
-    /// Gap between local and network height
-    #[inline]
-    pub fn sync_gap(&self) -> u64 {
-        self.network_height.saturating_sub(self.chain_height)
     }
 }
 
@@ -224,13 +217,6 @@ pub enum ConsensusEvent {
     /// Fork resolution completed
     ForkResolved {
         new_height: u64,
-    },
-
-    // === Network info updates ===
-    /// Peer count or network height changed
-    NetworkUpdate {
-        peer_count: u32,
-        network_height: u64,
     },
 
     /// Graceful shutdown
@@ -314,7 +300,6 @@ impl ConsensusCoordinator {
             last_block_time: 0,
             last_block_height: 0,
             peer_count: 0,
-            network_height: 0,
         }));
 
         let chain_height_atomic = Arc::new(AtomicU64::new(0));
@@ -441,22 +426,18 @@ impl ConsensusCoordinator {
                 if is_warn() {
                     println!("[WARN][COORD] sync_failed err={}", error);
                 }
-                // FIX L-M24: Return to Synchronized but schedule a fast retry.
-                // Instead of waiting for the 30s check_desync interval, we set
-                // the network_height to trigger an immediate auto-sync on the
-                // next NetworkUpdate (which arrives every few seconds).
-                let retry_target = snap.network_height;
-                snap.phase = ConsensusPhase::Synchronized {
-                    height: snap.chain_height,
-                };
-                // If we know the network is ahead, immediately re-enter syncing
-                // so the sync manager picks it up on its next iteration
-                if retry_target > snap.chain_height + 20 {
-                    if is_info() {
-                        println!("[INFO][COORD] sync_retry_scheduled local={} target={}", snap.chain_height, retry_target);
-                    }
+                // A stalled/failed catch-up is synchronized ONLY if the chain reached the
+                // QC-verified network frontier (node::qc_verified_frontier_cached — the single
+                // authoritative oracle the rest of the system uses; O(1), monotonic, QC-gated so
+                // a forged-high tip self-limits). Else stay Syncing so repair keeps driving — a
+                // failure is never recorded as synced (no production while behind). Frontier 0 =
+                // pre-macroblock bootstrap ⇒ synced (never block genesis).
+                let frontier = crate::node::qc_verified_frontier_cached();
+                if frontier == 0 || snap.chain_height >= frontier {
+                    snap.phase = ConsensusPhase::Synchronized { height: snap.chain_height };
+                } else {
                     snap.phase = ConsensusPhase::Syncing {
-                        target_height: retry_target,
+                        target_height: frontier,
                         current_height: snap.chain_height,
                         source_peer: None,
                     };
@@ -531,28 +512,6 @@ impl ConsensusCoordinator {
                 snap.phase = ConsensusPhase::Synchronized {
                     height: new_height,
                 };
-            }
-
-            // === Network ===
-            ConsensusEvent::NetworkUpdate { peer_count, network_height } => {
-                snap.peer_count = peer_count;
-                if network_height > snap.network_height {
-                    snap.network_height = network_height;
-                }
-
-                // Auto-detect if we need to sync (gap > 20 blocks and not already syncing)
-                let gap = network_height.saturating_sub(snap.chain_height);
-                if gap > 20 && matches!(snap.phase, ConsensusPhase::Synchronized { .. }) {
-                    if is_info() {
-                        println!("[INFO][COORD] auto_sync_detected gap={} local={} network={}",
-                                 gap, snap.chain_height, network_height);
-                    }
-                    snap.phase = ConsensusPhase::Syncing {
-                        target_height: network_height,
-                        current_height: snap.chain_height,
-                        source_peer: None,
-                    };
-                }
             }
 
             ConsensusEvent::Shutdown => unreachable!("handled above"),
@@ -689,24 +648,4 @@ mod tests {
         let _ = coord_task.await;
     }
 
-    #[tokio::test]
-    async fn test_auto_sync_on_gap() {
-        let (coord, handle) = ConsensusCoordinator::new(64);
-        let coord_task = tokio::spawn(coord.run());
-
-        handle.send(ConsensusEvent::GenesisLoaded { timestamp: 1000 }).await;
-        tokio::task::yield_now().await;
-
-        // Network far ahead
-        handle.send(ConsensusEvent::NetworkUpdate {
-            peer_count: 5, network_height: 100,
-        }).await;
-        tokio::task::yield_now().await;
-
-        // Should auto-start syncing (gap > 20)
-        assert!(handle.is_syncing());
-
-        handle.send(ConsensusEvent::Shutdown).await;
-        let _ = coord_task.await;
-    }
 }

@@ -1148,7 +1148,7 @@ pub fn get_runtime_stats() -> RuntimeStats {
 // All nodes MUST support QUIC (port 10876 = P2P port + 1000)
 
 // v2.24.3: Global QUIC transport for static sync methods
-// Set during SimplifiedP2P initialization, used by download_block_range_static
+// Set during SimplifiedP2P initialization, used by static sync/repair helpers
 // ARCHITECTURE: Enables QUIC-based sync without passing &self to static methods
 // SCALABILITY: Single shared transport handles 100K+ nodes efficiently
 pub static GLOBAL_QUIC_TRANSPORT: Lazy<parking_lot::RwLock<Option<Arc<tokio::sync::RwLock<crate::quic_transport::QuicTransport>>>>> =
@@ -11611,350 +11611,6 @@ impl SimplifiedP2P {
         Err("Could not determine IP address".into())
     }
 
-    /// Download missing microblocks in parallel for faster synchronization
-    /// v11.0: SEQUENTIAL SYNC WITH PREFETCH — replaces parallel flood
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// ARCHITECTURE:
-    /// Instead of spawning 10 workers downloading random chunks simultaneously
-    /// (which floods PENDING_SYNC_BLOCKS and causes buffer eviction deadlocks),
-    /// use a SLIDING WINDOW approach:
-    ///
-    /// 1. Download blocks in sequential waves of WAVE_SIZE (50 blocks)
-    /// 2. Each wave: send requests to 3 peers in parallel (existing sync_blocks)
-    /// 3. Wait for wave to complete (poll storage every 200ms)
-    /// 4. Advance window, start next wave
-    /// 5. Prefetch: start next wave while current wave processes
-    ///
-    /// RESULT: Blocks arrive in near-order, sync_order_buffer drains continuously,
-    /// PENDING_SYNC_BLOCKS stays small, no eviction cascades.
-    /// ═══════════════════════════════════════════════════════════════════════════
-    pub async fn parallel_download_microblocks(&self, storage: &Arc<crate::storage::Storage>, current_height: u64, target_height: u64) {
-        if target_height <= current_height { return; }
-
-        let gap = target_height - current_height;
-
-        // Adaptive wave size based on gap
-        // v14.2: Larger waves for faster catch-up (previous 20/50/100 too small).
-        // Network latency is the bottleneck, not batch size. Bigger waves = fewer
-        // round-trips = faster convergence during recovery.
-        let wave_size: u64 = if gap > 10000 { 500 } else if gap > 1000 { 250 } else if gap > 100 { 100 } else { 50 };
-        // Max concurrent waves (prefetch ahead)
-        let max_prefetch_waves: u64 = 2;
-
-        // Select peers once for entire sync session
-        let filtered_peers = self.get_sync_peers_filtered_by_height(20, target_height);
-        let peers: Vec<String> = if filtered_peers.is_empty() {
-            if crate::node::is_info() {
-                println!("[INFO][SYNC] no_peers_at_h={} fallback=any", target_height);
-            }
-            self.get_sync_peers_filtered(20).iter().map(|p| p.addr.clone()).collect()
-        } else {
-            filtered_peers.iter().map(|p| p.addr.clone()).collect()
-        };
-
-        if peers.is_empty() {
-            if crate::node::is_warn() {
-                println!("[WARN][SYNC] no_sync_peers available");
-            }
-            return;
-        }
-
-        if crate::node::is_info() {
-            println!("[INFO][SYNC] sequential_sync start h={} target={} gap={} wave={} peers={}",
-                     current_height, target_height, gap, wave_size, peers.len());
-        }
-
-        let start_time = std::time::Instant::now();
-        // v11.1: Start from h=0 when genesis block is missing
-        let genesis_in_storage = current_height > 0
-            || storage.load_microblock(0).unwrap_or(None).is_some();
-        let mut wave_start = if genesis_in_storage { current_height + 1 } else { 0 };
-        let mut consecutive_empty_waves = 0u32;
-        let mut total_downloaded = 0u64;
-
-        while wave_start <= target_height {
-            let wave_end = std::cmp::min(wave_start + wave_size - 1, target_height);
-
-            // Check which blocks in this wave are actually missing
-            let mut wave_missing: Vec<(u64, u64)> = Vec::new();
-            let mut range_start: Option<u64> = None;
-            let mut range_end: u64 = 0;
-
-            for h in wave_start..=wave_end {
-                if storage.load_microblock(h).unwrap_or(None).is_none() {
-                    match range_start {
-                        None => { range_start = Some(h); range_end = h; }
-                        Some(_) => { range_end = h; }
-                    }
-                } else if let Some(rs) = range_start.take() {
-                    wave_missing.push((rs, range_end));
-                }
-            }
-            if let Some(rs) = range_start {
-                wave_missing.push((rs, range_end));
-            }
-
-            if wave_missing.is_empty() {
-                // All blocks in this wave already present — skip
-                wave_start = wave_end + 1;
-                continue;
-            }
-
-            // Download missing ranges in this wave (sequential, small batches)
-            for (range_from, range_to) in &wave_missing {
-                Self::download_block_range_static(&peers, &**storage, *range_from, *range_to).await;
-            }
-
-            // Wait for blocks to arrive (poll storage, max 15s per wave)
-            let wave_timeout = std::time::Duration::from_secs(15);
-            let wave_poll_start = std::time::Instant::now();
-            let mut wave_received = false;
-
-            while wave_poll_start.elapsed() < wave_timeout {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-                // Check if first missing block arrived
-                let first_missing = wave_missing.first().map(|(f, _)| *f).unwrap_or(wave_start);
-                if storage.load_microblock(first_missing).unwrap_or(None).is_some() {
-                    // Count how many arrived
-                    let mut count = 0u64;
-                    for h in wave_start..=wave_end {
-                        if storage.load_microblock(h).unwrap_or(None).is_some() {
-                            count += 1;
-                        }
-                    }
-                    total_downloaded += count;
-
-                    // Good enough if 80% arrived (remainder picked up by integrity check)
-                    let wave_total = wave_end - wave_start + 1;
-                    if count >= wave_total * 4 / 5 || count == wave_total {
-                        wave_received = true;
-                        break;
-                    }
-                }
-            }
-
-            if !wave_received {
-                consecutive_empty_waves += 1;
-                if crate::node::is_warn() {
-                    println!("[WARN][SYNC] wave_timeout h={}-{} empty_streak={}", wave_start, wave_end, consecutive_empty_waves);
-                }
-                if consecutive_empty_waves >= 5 {
-                    if crate::node::is_warn() {
-                        println!("[WARN][SYNC] sequential_sync_stalled at={} after 5 empty waves", wave_start);
-                    }
-                    break;
-                }
-                // Retry same wave with brief delay
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
-
-            consecutive_empty_waves = 0;
-            wave_start = wave_end + 1;
-
-            // Prefetch: fire-and-forget request for NEXT wave while we process current
-            if wave_start <= target_height {
-                let prefetch_end = std::cmp::min(wave_start + wave_size * max_prefetch_waves - 1, target_height);
-                let request = NetworkMessage::RequestBlocks {
-                    from_height: wave_start,
-                    to_height: prefetch_end,
-                    requester_id: self.node_id.clone(),
-                };
-                // Send to best peer (fire-and-forget, no wait)
-                if let Some(peer_addr) = peers.first() {
-                    self.send_network_message(peer_addr, request);
-                }
-            }
-
-            // Brief yield to let block processing catch up
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        let duration = start_time.elapsed();
-        let blocks_per_sec = if duration.as_secs_f64() > 0.0 {
-            total_downloaded as f64 / duration.as_secs_f64()
-        } else { 0.0 };
-
-        if crate::node::is_info() {
-            println!("[INFO][SYNC] sequential_sync_done downloaded={} time={:.1}s speed={:.1}blk/s",
-                     total_downloaded, duration.as_secs_f64(), blocks_per_sec);
-        }
-
-        // Integrity check: verify contiguous chain
-        let mut missing_count = 0u64;
-        let mut first_gap: Option<u64> = None;
-        let check_end = std::cmp::min(target_height, current_height + 500); // Check nearest 500
-        for height in (current_height + 1)..=check_end {
-            if storage.load_microblock(height).unwrap_or(None).is_none() {
-                missing_count += 1;
-                if first_gap.is_none() { first_gap = Some(height); }
-            }
-        }
-
-        if missing_count > 0 {
-            if crate::node::is_warn() {
-                println!("[WARN][SYNC] integrity_gaps={} first_gap={} range={}-{}",
-                         missing_count, first_gap.unwrap_or(0), current_height + 1, check_end);
-            }
-            // Patch gaps sequentially (critical blocks only — nearest 100)
-            let patch_end = std::cmp::min(check_end, current_height + 100);
-            for height in (current_height + 1)..=patch_end {
-                if storage.load_microblock(height).unwrap_or(None).is_none() {
-                    Self::download_block_range_static(&peers, &**storage, height, height).await;
-                }
-            }
-        } else if crate::node::is_info() {
-            println!("[INFO][SYNC] integrity_ok range={}-{}", current_height + 1, check_end);
-        }
-    }
-    
-    /// Download a range of blocks (helper for parallel sync)
-    /// v2.24.3: ARCHITECTURE FIX - Use QUIC RequestBlocks instead of HTTP
-    /// 
-    /// SCALABILITY: Designed for 100K+ nodes
-    /// - QUIC binary protocol: 10x faster than HTTP JSON
-    /// - Persistent connections: No TCP handshake per request
-    /// - Multiplexed streams: Parallel requests on single connection
-    /// - Backpressure: Built-in flow control prevents overload
-    async fn download_block_range_static(
-        peers: &[String], 
-        storage: &crate::storage::Storage, 
-        start_height: u64, 
-        end_height: u64
-    ) {
-        if peers.is_empty() { return; }
-        
-        // v2.24.3: Request blocks via QUIC (response comes async via handle_blocks_batch)
-        // Strategy: Send RequestBlocks to best peer, then poll storage for arrival
-        
-        let mut consecutive_failures = 0u32;
-        let mut total_failures = 0u32;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 30;
-        const MAX_TOTAL_FAILURES: u32 = 150;
-        // v10.1: Reduced from 100ms to 50ms — balanced between speed and storage load.
-        // 100ms was too slow (100s for 1000 blocks). 10ms was too aggressive
-        // (1000 RocksDB lookups/sec across 10 workers). 50ms = 200 lookups/sec.
-        const POLL_INTERVAL_MS: u64 = 50;
-        const REQUEST_TIMEOUT_SECS: u64 = 30;
-        
-        Self::send_quic_block_request_static(peers, start_height, end_height).await;
-        
-        let mut height = start_height;
-        let mut last_request_time = std::time::Instant::now();
-        let mut backoff_secs: u64 = 5;
-        
-        while height <= end_height {
-            if storage.load_microblock(height).unwrap_or(None).is_some() {
-                consecutive_failures = 0;
-                height += 1;
-                backoff_secs = 5;
-                continue;
-            }
-            
-            let poll_start = std::time::Instant::now();
-            let mut block_received = false;
-            
-            while poll_start.elapsed().as_secs() < REQUEST_TIMEOUT_SECS {
-                tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
-                
-                if storage.load_microblock(height).unwrap_or(None).is_some() {
-                    block_received = true;
-                    // v9.0: Release ordering pairs with Acquire loads in consensus paths
-                    LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Release);
-                    break;
-                }
-            }
-            
-            if block_received {
-                consecutive_failures = 0;
-                height += 1;
-                backoff_secs = 5;
-                continue;
-            }
-            
-            consecutive_failures += 1;
-            total_failures += 1;
-            
-            // v4.4: Abort after MAX_TOTAL_FAILURES to prevent infinite resource burn.
-            // Caller (main sync loop) will retry the entire range later.
-            if total_failures >= MAX_TOTAL_FAILURES {
-                if crate::node::is_warn() {
-                    println!("[ERR][SYNC] Range {}-{} exceeded {} total failures at block {} — aborting sync range",
-                             start_height, end_height, MAX_TOTAL_FAILURES, height);
-                }
-                return;
-            }
-            
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                if crate::node::is_info() {
-                    println!("[WARN][SYNC] Range {}-{} hit {} failures at block {} - backoff {}s (total_fails={})",
-                             start_height, end_height, MAX_CONSECUTIVE_FAILURES, height, backoff_secs, total_failures);
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                consecutive_failures = 0;
-                // v4.4: Exponential backoff capped at 60s
-                backoff_secs = (backoff_secs * 2).min(60);
-            }
-            
-            if last_request_time.elapsed().as_secs() >= 3 {
-                if crate::node::is_info() {
-                    println!("[INFO][SYNC] Re-requesting blocks {}-{} via QUIC", height, end_height);
-                }
-                Self::send_quic_block_request_static(peers, height, end_height).await;
-                last_request_time = std::time::Instant::now();
-            }
-        }
-    }
-    
-    /// v2.24.3: Send QUIC RequestBlocks to peers (static helper)
-    /// ARCHITECTURE: Fire-and-forget request, response handled by handle_blocks_batch
-    async fn send_quic_block_request_static(peers: &[String], from_height: u64, to_height: u64) {
-        use crate::quic_transport::QUIC_PORT_OFFSET;
-        
-        // Get global QUIC transport (set during node initialization)
-        let quic_transport = GLOBAL_QUIC_TRANSPORT.read().clone();
-        
-        let node_id = GLOBAL_NODE_ID.read().clone();
-        
-        if let Some(ref transport_arc) = quic_transport {
-            // Create RequestBlocks message
-            let request = NetworkMessage::RequestBlocks {
-                from_height,
-                to_height,
-                requester_id: node_id,
-            };
-            
-            // Repair fan-out: send to ALL selected holders, not the first to ack at the
-            // transport level. A transport ack only means the request was delivered — not
-            // that the peer served data (it may leader-shed or lack the range). Returning on
-            // first ack stranded a behind node on one unhelpful peer; the first DATA response
-            // now wins and duplicates are deduped on apply.
-            let mut sent = 0u32;
-            for peer_addr in peers.iter().take(3) {
-                let parts: Vec<&str> = peer_addr.split(':').collect();
-                if parts.len() != 2 { continue; }
-                let ip = match parts[0].parse::<std::net::IpAddr>() { Ok(ip) => ip, Err(_) => continue };
-                let port = match parts[1].parse::<u16>() { Ok(p) => p, Err(_) => continue };
-                let quic_addr = std::net::SocketAddr::new(ip, port.saturating_add(QUIC_PORT_OFFSET));
-                let transport = transport_arc.read().await;
-                match transport.broadcast_to(quic_addr, &request).await {
-                    Ok(_) => { sent += 1; }
-                    Err(e) => if crate::node::is_warn() {
-                        println!("[WARN][SYNC] repair_send_fail peer={} err={}", get_privacy_id_for_addr(peer_addr), e);
-                    },
-                }
-            }
-            if sent == 0 && crate::node::is_warn() {
-                println!("[WARN][SYNC] repair_send_none h={}-{}", from_height, to_height);
-            }
-        } else {
-            // Fallback: No QUIC transport available
-            if crate::node::is_info() {
-                println!("[WARN][SYNC] QUIC transport not available for sync request");
-            }
-        }
-    }
 }
 
 // NOTE: base64_bytes modules REMOVED in v2.26
@@ -19691,13 +19347,6 @@ impl SimplifiedP2P {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         
-        // Range-sharded parallel sync. Sending the same range to all N peers
-        // wastes N× bandwidth for 1× data; instead split [from..to] into N
-        // sub-ranges (one per peer) fetched in parallel → ~N× throughput.
-        // Fallback to full-range parallel when the range is too small to
-        // shard (<3× peer count) for redundancy vs a flaky peer. The
-        // (height desc, reputation desc) sort above gives every node a
-        // stable peer ordering. Up to MAX_PARALLEL_SYNC_PEERS=8.
         // v14.2: Exclude peers in active cool-down (they failed a recent sync).
         // Keeps wave retries from hitting the same stalled peer repeatedly.
         let cooling_down_before = live_peers.len();
@@ -19714,143 +19363,206 @@ impl SimplifiedP2P {
                      cooling_down_before - live_peers.len(), live_peers.len());
         }
 
-        const MAX_PARALLEL_SYNC_PEERS: usize = 8;
-        let max_peers_to_try = MAX_PARALLEL_SYNC_PEERS.min(live_peers.len());
-        let requested_count_for_split = to_height.saturating_sub(from_height).saturating_add(1);
-
-        // Shard only if we have enough blocks to split meaningfully (≥3 per peer)
-        let should_shard = max_peers_to_try >= 2 && requested_count_for_split >= (max_peers_to_try as u64) * 3;
-
-        let mut sent_to_peers: Vec<String> = Vec::new();
-        if should_shard {
-            // Range-shard: give each peer a distinct sub-range
-            let shard_size = requested_count_for_split / max_peers_to_try as u64;
-            let remainder = requested_count_for_split % max_peers_to_try as u64;
-            let mut shard_start = from_height;
-            let mut peer_idx = 0usize;
-            for peer in live_peers.iter() {
-                if peer.id == self.node_id {
-                    continue;
-                }
-                if peer_idx >= max_peers_to_try {
-                    break;
-                }
-                // Last peer absorbs remainder
-                let extra = if peer_idx as u64 == (max_peers_to_try as u64).saturating_sub(1) { remainder } else { 0 };
-                let shard_end = std::cmp::min(shard_start + shard_size - 1 + extra, to_height);
-                let request = NetworkMessage::RequestBlocks {
-                    from_height: shard_start,
-                    to_height: shard_end,
-                    requester_id: self.node_id.clone(),
-                };
-                self.send_network_message(&peer.addr, request);
-                sent_to_peers.push(format!("{}[{}-{}]", peer.id, shard_start, shard_end));
-                shard_start = shard_end + 1;
-                peer_idx += 1;
-                if shard_start > to_height {
-                    break;
-                }
-            }
-        } else {
-            // Small range: redundant parallel (same range to each peer) for speed over efficiency
-            let request = NetworkMessage::RequestBlocks {
-                from_height,
-                to_height,
-                requester_id: self.node_id.clone(),
-            };
-            for peer in live_peers.iter().take(max_peers_to_try) {
-                if peer.id == self.node_id {
-                    continue;
-                }
-                self.send_network_message(&peer.addr, request.clone());
-                sent_to_peers.push(peer.id.clone());
-            }
-        }
-
-        if sent_to_peers.is_empty() {
+        // Drop self from the candidate set once (never request blocks from ourselves).
+        live_peers.retain(|p| p.id != self.node_id);
+        if live_peers.is_empty() {
             return Err("No valid peers to sync from".to_string());
         }
 
-        if crate::node::is_info() {
-            let mode = if should_shard { "sharded" } else { "redundant" };
-            println!("[INFO][SYNC] parallel_request mode={} h={}-{} peers=[{}]",
-                     mode, from_height, to_height, sent_to_peers.join(","));
-        }
-        
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v14.2: TIMEOUTS ALIGNED WITH REAL NETWORK LATENCY
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Previous table (2-18s) was sized for dial-up-era networks. Modern inter-datacentre
-        // latency is <100ms; 20-block batch over QUIC completes in <200ms on healthy paths.
-        // Long timeouts mean a single stalled peer blocks sync for seconds instead of the
-        // sub-second failover expected in L1-grade protocols.
-        //
-        // New table: tight upper bounds that trigger peer rotation quickly. The storage poll
-        // loop (200ms interval) still catches responses that arrive during the wait window.
-        //
-        // MAX_BATCH_BLOCKS raised from 100 → 500 to reduce per-block overhead during catch-up.
-        // At 500 blocks × ~500 bytes = 250KB per request — well under QUIC stream limits (10MB).
-        // ═══════════════════════════════════════════════════════════════════════════
-        const MAX_BATCH_BLOCKS: u64 = 500;
-        let requested_count = to_height.saturating_sub(from_height).saturating_add(1);
-        let actual_batch_size = requested_count.min(MAX_BATCH_BLOCKS);
-        let timeout_secs = match actual_batch_size {
-            1       => 1,    // Single block - 1 sec (was 2)
-            2..=10  => 1,    // Small batch - 1 sec (was 4)
-            11..=50 => 2,    // Medium batch - 2 sec (was 8-12)
-            51..=200 => 3,   // Large batch - 3 sec (was 18)
-            _       => 5,    // Max batch (201-500) - 5 sec
+        // Committee fan-out (E): at scale, prefer the deterministic VRF-committee members among
+        // our connected Super peers so 100k joiners spread the block fetch across the committee
+        // instead of stampeding the 5 genesis. Within the committee tier order by a per-joiner
+        // salt so different joiners pick different members (no thundering herd). The prior
+        // (height desc, reputation desc) order survives as the tie-break for the non-committee
+        // tail. INERT pre-committee (None ⇒ prior height/reputation order). Mirrors the macroblock
+        // path so both fetch lanes share one peer-spread doctrine.
+        let committee = self.deterministic_eligible_ids();
+        let salt = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.node_id.hash(&mut h);
+            h.finish()
         };
-        
-        // ═══════════════════════════════════════════════════════════════════════
-        // v14.9: FIRE-AND-FORGET DISPATCH (was: 200ms poll loop, blocking caller)
-        // ═══════════════════════════════════════════════════════════════════════
-        // Previous behaviour: poll storage every 200ms, return on FIRST arrival.
-        // Problem — returned after 200ms with count=1/N, caller then re-issued
-        // request for remaining N-1 blocks. At 1-sec block time this recycling
-        // capped catch-up at ~2 blk/s.
-        //
-        // New behaviour: requests have been dispatched above (shred/redundant/
-        // sharded). They're already in flight via QUIC streams. Return Ok()
-        // immediately — the caller (SyncManager v14.9 pipelined window) waits
-        // on `pipeline.apply_notify()` for actual apply signals instead of
-        // polling storage. Peer reputation (success/failure) is updated from
-        // the dispatch result, not from poll outcomes.
-        //
-        // A small success schedule (spawned, does not block caller) probes
-        // storage once after `timeout_secs` to record delivery outcome for
-        // peer reputation tracking. Non-blocking — SyncManager is NOT waiting
-        // on this task.
-        // ═══════════════════════════════════════════════════════════════════════
-        let _ = requested_count; // kept in scope for backward trace; unused now
-        let timeout_check = Duration::from_secs(timeout_secs);
-        let sent_to_peers_clone = sent_to_peers.clone();
-        let from_h_clone = from_height;
-        tokio::spawn(async move {
-            tokio::time::sleep(timeout_check).await;
-            let storage = match crate::node::try_get_storage() {
-                Some(s) => s,
-                None => return,
-            };
-            let delivered = storage.load_microblock(from_h_clone)
-                .map(|opt| opt.is_some())
-                .unwrap_or(false);
-            // No failure strike: each peer got a DISTINCT shard, so one missing block must not cool down
-            // every peer (microblock-availability gap, not misbehavior). Dead peers drop on real I/O errors.
-            if delivered {
-                for peer_tag in &sent_to_peers_clone {
-                    let peer_id = peer_tag.split('[').next().unwrap_or(peer_tag);
-                    record_sync_peer_success(peer_id);
+        let salted = |id: &str| -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            salt.hash(&mut h);
+            id.hash(&mut h);
+            h.finish()
+        };
+        live_peers.sort_by(|a, b| {
+            let a_cm = committee.as_ref().map(|c| c.contains(&a.id)).unwrap_or(false);
+            let b_cm = committee.as_ref().map(|c| c.contains(&b.id)).unwrap_or(false);
+            b_cm.cmp(&a_cm).then_with(|| {
+                if a_cm && b_cm {
+                    salted(&a.id).cmp(&salted(&b.id))
+                } else {
+                    let height_cmp = b.last_block_height.cmp(&a.last_block_height);
+                    if height_cmp != std::cmp::Ordering::Equal {
+                        height_cmp
+                    } else {
+                        b.combined_reputation().partial_cmp(&a.combined_reputation())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    }
                 }
-            }
+            })
         });
 
-        if crate::node::is_debug() {
-            println!("[DBG][SYNC] dispatched h={}-{} peers=[{}] timeout={}s mode=fire_and_forget",
-                     from_height, to_height, sent_to_peers.join(","), timeout_secs);
+        // Per-batch timeout: how long one dispatch round waits for responses to ingest before
+        // the storage re-scan. Tight upper bounds (modern inter-DC QUIC completes a batch in
+        // <200ms) so a stalled peer yields to the next peer in rotation quickly; the wrapper's
+        // 45s hard timeout caps the whole loop.
+        const MAX_BATCH_BLOCKS: u64 = 500;
+        const MAX_PARALLEL_SYNC_PEERS: usize = 8;
+        let round_timeout = |span: u64| -> Duration {
+            let secs = match span.min(MAX_BATCH_BLOCKS) {
+                0..=10  => 1,
+                11..=50 => 2,
+                51..=200 => 3,
+                _       => 5,
+            };
+            Duration::from_secs(secs)
+        };
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // DELIVERY-VERIFIED PULL (replaces v14.9 fire-and-forget)
+        // ═══════════════════════════════════════════════════════════════════════
+        // Fire-and-forget returned Ok the moment requests were SENT: a dead QUIC
+        // stream silently dropped its shard's sub-range and the gap was never
+        // re-targeted → ordered apply stalled at the hole. This loop closes the
+        // gap: dispatch the still-missing contiguous sub-ranges (sharded across a
+        // rotating peer window for throughput + committee fan-out), wait one
+        // batch timeout for the existing handle_blocks_batch→ingest path to land
+        // them, then re-scan storage (O(range) cheap load_microblock probes — the
+        // Dilithium/QC verify stays in the apply pipeline, never duplicated here).
+        // Bounded rounds + the wrapper's 45s timeout guarantee termination; on
+        // exhaustion with gaps remaining we return Err so the caller re-invokes.
+        // ═══════════════════════════════════════════════════════════════════════
+        let storage = match crate::node::try_get_storage() {
+            Some(s) => s,
+            None => return Err("Storage unavailable for sync".to_string()),
+        };
+        let max_rounds = (live_peers.len().saturating_mul(2)).clamp(1, 8);
+        let mut delivered_any = false;
+
+        for round in 0..max_rounds {
+            // Re-scan: collect the contiguous sub-ranges still missing in storage.
+            let mut missing: Vec<(u64, u64)> = Vec::new();
+            let mut run_start: Option<u64> = None;
+            for h in from_height..=to_height {
+                let present = storage.load_microblock(h)
+                    .map(|opt| opt.is_some())
+                    .unwrap_or(false);
+                if present {
+                    if let Some(s) = run_start.take() {
+                        missing.push((s, h - 1));
+                    }
+                } else if run_start.is_none() {
+                    run_start = Some(h);
+                }
+            }
+            if let Some(s) = run_start.take() {
+                missing.push((s, to_height));
+            }
+
+            if missing.is_empty() {
+                if crate::node::is_info() {
+                    println!("[INFO][SYNC] delivered h={}-{} rounds={}",
+                             from_height, to_height, round);
+                }
+                if delivered_any {
+                    // Each peer got a DISTINCT shard, so credit only on success.
+                    for p in live_peers.iter().take(MAX_PARALLEL_SYNC_PEERS) {
+                        record_sync_peer_success(&p.id);
+                    }
+                }
+                return Ok(());
+            }
+
+            // Rotate the peer window each round so a dead peer's shard is re-targeted
+            // to a different server (round-robin over the salted/committee order).
+            let window = MAX_PARALLEL_SYNC_PEERS.min(live_peers.len());
+            // Step by `window` when peers > window (cover disjoint subsets each round), else by 1
+            // (window == all peers: rotate the ORDER so the first shard moves to a different peer
+            // and a transiently-dead first peer's range is re-targeted next round).
+            let step = if window >= live_peers.len() { 1 } else { window };
+            let offset = (round * step) % live_peers.len();
+            let round_peers: Vec<&PeerInfo> = (0..window)
+                .map(|i| &live_peers[(offset + i) % live_peers.len()])
+                .collect();
+
+            // Shard the missing heights across the round's peers (one distinct
+            // sub-range per peer for ~N× throughput). Flatten the missing
+            // intervals into a height list, then split contiguously.
+            let total_missing: u64 = missing.iter().map(|&(a, b)| b - a + 1).sum();
+            let peers_n = round_peers.len().max(1) as u64;
+            // Cap each shard at the server's per-response batch (handle_block_request serves
+            // <=100/req) so one shard == one served batch; the overflow tail is picked up by the
+            // next round's re-scan rather than wasted on a truncated response.
+            let shard_size = ((total_missing + peers_n - 1) / peers_n).min(100); // ceil, server-cap
+            let mut sent_to_peers: Vec<String> = Vec::new();
+            let mut peer_idx = 0usize;
+            let mut budget = shard_size;
+            let mut shard_lo: Option<u64> = None;
+            let mut shard_hi: u64 = 0;
+            let flush = |unified: &Self, peer: &PeerInfo, lo: u64, hi: u64, tags: &mut Vec<String>| {
+                let request = NetworkMessage::RequestBlocks {
+                    from_height: lo,
+                    to_height: hi,
+                    requester_id: unified.node_id.clone(),
+                };
+                unified.send_network_message(&peer.addr, request);
+                tags.push(format!("{}[{}-{}]", peer.id, lo, hi));
+            };
+            'outer: for &(a, b) in &missing {
+                for h in a..=b {
+                    if shard_lo.is_none() {
+                        shard_lo = Some(h);
+                    }
+                    shard_hi = h;
+                    budget = budget.saturating_sub(1);
+                    if budget == 0 {
+                        if let (Some(lo), Some(peer)) = (shard_lo, round_peers.get(peer_idx)) {
+                            flush(self, peer, lo, shard_hi, &mut sent_to_peers);
+                        }
+                        shard_lo = None;
+                        peer_idx += 1;
+                        budget = shard_size;
+                        if peer_idx >= round_peers.len() {
+                            break 'outer; // peers exhausted this round; leftover retried next round
+                        }
+                    }
+                }
+            }
+            // Flush the final partial shard.
+            if let (Some(lo), Some(peer)) = (shard_lo, round_peers.get(peer_idx)) {
+                flush(self, peer, lo, shard_hi, &mut sent_to_peers);
+            }
+
+            if sent_to_peers.is_empty() {
+                return Err("No valid peers to sync from".to_string());
+            }
+            delivered_any = true;
+
+            if crate::node::is_info() {
+                println!("[INFO][SYNC] request h={}-{} round={}/{} missing={} peers=[{}]",
+                         from_height, to_height, round + 1, max_rounds,
+                         missing.len(), sent_to_peers.join(","));
+            }
+
+            // Wait one batch timeout for responses to ingest, then loop to re-scan.
+            tokio::time::sleep(round_timeout(total_missing)).await;
+
+            if crate::node::is_debug() {
+                println!("[DBG][SYNC] retry h={}-{} round={} total_missing={}",
+                         from_height, to_height, round + 1, total_missing);
+            }
         }
 
-        Ok(())
+        // Rounds exhausted with gaps remaining: honest "not fully delivered" — the
+        // caller's loop/TTL re-invokes (and the wrapper's window clamp re-narrows).
+        Err(format!("sync_blocks incomplete h={}-{} after {} rounds",
+                    from_height, to_height, max_rounds))
     }
     
     /// ═══════════════════════════════════════════════════════════════════════════
