@@ -1988,6 +1988,11 @@ impl QuicTransport {
         // v9.7: Immediately update BEST_PEER_HEIGHT from handshake
         if remote_block_height > 0 {
             crate::unified_p2p::BEST_PEER_HEIGHT.fetch_max(remote_block_height, std::sync::atomic::Ordering::Relaxed);
+            // A verified handshake height is Dilithium-authenticated → also raise the unforgeable signed-head
+            // floor, so an outbound (client) cold-joiner lights it without any inbound HealthPing.
+            if remote_verified {
+                crate::unified_p2p::SIGNED_HEAD_MAX.fetch_max(remote_block_height, std::sync::atomic::Ordering::Relaxed);
+            }
             // Upsert this outbound (client-dialed) peer with its attested tip. The signed handshake binds
             // (node_id, height); without this the peer never enters connected_peers and the attested-peer
             // count stays 0 — so an outbound cold-joiner never reports synchronized.

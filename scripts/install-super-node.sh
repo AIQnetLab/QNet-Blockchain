@@ -76,6 +76,12 @@ docker stop "$NODE_NAME" 2>/dev/null && docker rm "$NODE_NAME" 2>/dev/null || tr
 ACTIVATION_ARG=""
 [ -n "$QNET_ACTIVATION_CODE" ] && ACTIVATION_ARG="-e QNET_ACTIVATION_CODE=$QNET_ACTIVATION_CODE"
 
+# Optional: exact 1DEV burn tx hash for precise on-chain burn verification.
+# Without it the node falls back to scanning recent Solana signatures (slower,
+# and fails if the burn is older than the scan window or the RPC is unreachable).
+BURN_ARG=""
+[ -n "$QNET_BURN_TX_HASH" ] && BURN_ARG="-e QNET_BURN_TX_HASH=$QNET_BURN_TX_HASH"
+
 docker run -d \
   --name "$NODE_NAME" \
   --restart=always \
@@ -86,6 +92,7 @@ docker run -d \
   -e DOCKER_ENV=1 \
   -e QNET_MAX_STORAGE_GB="$MAX_STORAGE_GB" \
   $ACTIVATION_ARG \
+  $BURN_ARG \
   -p 9876:9876 \
   -p 9877:9877 \
   -p 8001:8001 \

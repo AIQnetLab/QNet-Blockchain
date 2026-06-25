@@ -1518,6 +1518,12 @@ impl BlockPipeline {
         const GOSSIP_HORIZON: u64 = 200;
         let mut horizon_cache_h: u64 = 0;
         let mut horizon_cache_age: u32 = 0;
+        // During active sync the dispatcher fills its in-flight window up to
+        // MAX_INFLIGHT (== DEFERRED_MAX). Admit that far ahead so served blocks
+        // land in the deferred buffer instead of being dropped + refetched; on
+        // the live gossip path keep the tight horizon so far-future spam cannot
+        // grow the buffer. Refreshed alongside horizon_cache_h.
+        let mut horizon_cache_syncing = false;
 
         'outer: while let Some(decoded) = rx.recv().await {
             // v15.4 DIAG: a fresh block has just arrived — between recv()
@@ -1536,17 +1542,22 @@ impl BlockPipeline {
             // amortises storage reads while keeping the horizon close to real.
             if horizon_cache_age == 0 {
                 horizon_cache_h = storage.get_chain_height().unwrap_or(0);
+                horizon_cache_syncing = coordinator.snapshot().is_syncing();
             }
             horizon_cache_age = (horizon_cache_age + 1) & 0xF;
 
             // Apply horizon filter at the entry point — never enters deferred
-            // buffer. Drops are non-failure (sync will refetch).
-            if decoded.microblock.height > horizon_cache_h.saturating_add(GOSSIP_HORIZON) {
+            // buffer. Drops are non-failure (sync will refetch). Sync widens the
+            // horizon to DEFERRED_MAX so the dispatcher's in-flight window is
+            // admitted, not dropped — closes the apply-horizon/dispatch mismatch
+            // that throttled cold-join catch-up to a rolling-200 crawl.
+            let horizon = if horizon_cache_syncing { DEFERRED_MAX as u64 } else { GOSSIP_HORIZON };
+            if decoded.microblock.height > horizon_cache_h.saturating_add(horizon) {
                 metrics.future_dropped.fetch_add(1, Ordering::Relaxed);
                 if is_debug() {
                     println!(
-                        "[DBG][PIPELINE] gossip_horizon_drop h={} local_tip={} horizon={}",
-                        decoded.microblock.height, horizon_cache_h, GOSSIP_HORIZON,
+                        "[DBG][PIPELINE] horizon_drop h={} local_tip={} horizon={} syncing={}",
+                        decoded.microblock.height, horizon_cache_h, horizon, horizon_cache_syncing,
                     );
                 }
                 continue;

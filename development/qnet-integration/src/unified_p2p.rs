@@ -5243,13 +5243,13 @@ impl SimplifiedP2P {
                     if crate::node::is_info() {
                         println!("[INFO][P2P] cleanup_inactive removed={}", peers_to_remove.len());
                     }
-                    // v9.5: Recalculate BEST_PEER_HEIGHT after bulk peer removal.
-                    // Without this, disconnected peer's height sticks → sync gate blocks voting.
+                    // Monotonic refresh after peer removal: only RAISE BEST_PEER_HEIGHT, never lower it from
+                    // currently-connected (served-low) peers — lowering re-collapses the target for a joiner.
                     let new_best = connected_peers_lockfree.iter()
                         .map(|e| e.value().last_block_height)
                         .max()
                         .unwrap_or(0);
-                    BEST_PEER_HEIGHT.store(new_best, std::sync::atomic::Ordering::Relaxed);
+                    BEST_PEER_HEIGHT.fetch_max(new_best, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 // ═══════════════════════════════════════════════════════════════════════
@@ -5317,21 +5317,14 @@ impl SimplifiedP2P {
                     }
                 }
 
-                // v9.5: Periodic BEST_PEER_HEIGHT refresh (safety net every 5 minutes).
-                // Covers edge cases where height becomes stale without peer removal
-                // (e.g., peer stops sending heartbeats but TCP stays alive).
+                // Monotonic-only refresh: raise BEST_PEER_HEIGHT toward connected peers, never lower it (the
+                // old downward "correction" re-collapsed the target). Stale-high is bounded by the QC floor.
                 {
                     let current_best = connected_peers_lockfree.iter()
                         .map(|e| e.value().last_block_height)
                         .max()
                         .unwrap_or(0);
-                    let stored = BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                    if current_best < stored {
-                        BEST_PEER_HEIGHT.store(current_best, std::sync::atomic::Ordering::Relaxed);
-                        if crate::node::is_info() {
-                            println!("[INFO][P2P] best_peer_height_corrected old={} new={}", stored, current_best);
-                        }
-                    }
+                    BEST_PEER_HEIGHT.fetch_max(current_best, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 // CRITICAL v2.24: QUIC health check and cleanup
@@ -8830,276 +8823,39 @@ impl SimplifiedP2P {
     /// This method NEVER makes network calls - only reads cache
     /// v2.26.1: Added fallback to max(peer.last_block_height) from HealthPing data
     pub fn get_cached_network_height(&self) -> Option<u64> {
-        // Check cache actor first
-        let height_cache_guard = CACHE_ACTOR.height_cache.read();
-        if let Some(cached_data) = height_cache_guard.as_ref() {
-            let age = Instant::now().duration_since(cached_data.timestamp);
-            // CRITICAL: Cache TTL reduced to 1 second for 1 block/sec target
-            // 5 seconds was too long and caused producer selection mismatches
-            if age.as_secs() < 1 {
-                return Some(cached_data.data);
-            }
-        }
-        
-        // Fallback to old cache
-        let cache = CACHED_BLOCKCHAIN_HEIGHT.lock();
-        let age = Instant::now().duration_since(cache.1);
-        // CRITICAL: Same 1 second TTL for consistency
-        if age.as_secs() < 1 && cache.0 > 0 {
-            return Some(cache.0);
-        }
-        
-        // v2.26.1: Fallback to max(peer heights) from HealthPing data
-        // This ensures network_height is always accurate even without active sync
-        let max_peer_height = self.get_max_peer_height();
-        if max_peer_height > 0 && max_peer_height != u64::MAX && max_peer_height < 2_000_000_000 {
-            return Some(max_peer_height);
-        }
-        
-        None // No valid cache available
+        // Single source: the canonical best known head (no 1s cache, no TTL-median fallback).
+        Some(self.get_max_peer_height())
     }
     
-    /// v2.26.1: Get consensus network height from connected peers (from HealthPing data)
-    /// Uses median for Byzantine fault tolerance (same logic as sync_blockchain_height)
-    /// This provides real-time network height without HTTP calls
-    ///
-    /// v30.A3: only entries attested within PEER_HEIGHT_ATTEST_TTL_SECS are
-    /// included. Attestation is set exclusively by the authenticated signed-head
-    /// (signed HealthPing / verified handshake — served-block heights do not
-    /// attest a tip); stale or gossip-only entries are excluded — closes the empty-batch self-poison
-    /// loop and rejects single-peer height claims as a network-wide signal.
-    ///
-    /// v30.A2: requires ≥ 2 distinct attested peers (besides local) before
-    /// reporting a non-local network height. With a single attesting peer the
-    /// answer is local height — there is no Byzantine majority to act on, so
-    /// the sync state machine waits instead of chasing one peer's claim.
+    /// Single network-height source: highest head among CURRENTLY-connected peers,
+    /// floored by local and the QC-verified frontier (rationale in the body).
     pub fn get_max_peer_height(&self) -> u64 {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let stale_threshold = now_secs.saturating_sub(PEER_HEIGHT_ATTEST_TTL_SECS);
-
-        // SAFETY: drop u64::MAX (corrupted/uninitialized) and unreasonably large
-        // values. A peer reporting u64::MAX would otherwise cascade into every
-        // receiver's network_height.
-        let mut peer_heights: Vec<u64> = self.connected_peers_lockfree.iter()
-            .filter(|e| {
-                let v = e.value();
-                let h = v.last_block_height;
-                h > 0 && h != u64::MAX && h < 2_000_000_000
-                    && v.last_height_attested_at >= stale_threshold
-            })
+        // Highest height announced by CURRENTLY-connected peers, re-derived each call so a poison peer's
+        // claim drops when it disconnects (never monotonic-stuck). NO attestation-TTL filter and NO
+        // <2-peer collapse-to-local — that median-of-fresh gate returned local whenever a client-only
+        // joiner's handshake attestations expired (the cold-join wedge). Floored by local + QC frontier;
+        // safety is per-block QC/Dilithium verify on apply (a lie-high tip only chases a phantom the QC
+        // gate refuses and the sync STALL_ABORTs). Sanity filter drops corrupted u64::MAX values.
+        let peer_max = self.connected_peers_lockfree.iter()
             .map(|e| e.value().last_block_height)
-            .collect();
-
-        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-
-        // v30.A2: anti-single-source. Without ≥ 2 attested peers, fall back
-        // to local height. One peer can be poisoned / malicious / partitioned;
-        // a 2f+1 view (where f=0 for tiny clusters) requires at least 2.
-        if peer_heights.len() < 2 {
-            return local_height;
-        }
-
-        if local_height > 0 {
-            peer_heights.push(local_height);
-        }
-
-        peer_heights.sort();
-        if peer_heights.len() >= 3 {
-            // Median for Byzantine fault tolerance
-            peer_heights[peer_heights.len() / 2]
-        } else {
-            // Max if less than 3 peers
-            *peer_heights.iter().max().unwrap_or(&0)
-        }
+            .filter(|&h| h < 2_000_000_000)
+            .max()
+            .unwrap_or(0);
+        let local = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        peer_max.max(local).max(crate::node::qc_verified_frontier_cached())
     }
     
     /// Sync blockchain height with peers for consensus
     /// PRODUCTION v2.19.21: Now async with parallel peer queries (fixes runtime deadlock)
     pub async fn sync_blockchain_height(&self) -> Result<u64, String> {
-        // RACE CONDITION FIX: Check cached height first to prevent excessive queries
-        // IMPROVED: Check both cache systems for compatibility
-        {
-            // Try new cache actor first
-            if let Some(cached_data) = CACHE_ACTOR.height_cache.read().as_ref() {
-                let age = Instant::now().duration_since(cached_data.timestamp);
-                // QUANTUM: Minimal cache for decentralized quantum blockchain
-                let cache_duration = if cached_data.data == 0 {
-                    1 // Network forming: 1 second cache (still prevents tight loops)
-                } else {
-                    0 // Normal operation: NO CACHE for real-time consensus
-                };
-                
-                if age.as_secs() < cache_duration {
-                    if crate::node::is_info() {
-                        println!("[INFO][SYNC] Using actor cache height: {} (epoch: {}, age: {}s)",
-                                cached_data.data, cached_data.epoch, age.as_secs());
-                    }
-                    return Ok(cached_data.data);
-                }
-            }
-            
-            // Fallback to old cache
-            let cache = CACHED_BLOCKCHAIN_HEIGHT.lock();
-            let age = Instant::now().duration_since(cache.1);
-            // QUANTUM: Same minimal cache for old system
-            let cache_duration = if cache.0 == 0 { 1 } else { 0 };
-            if age.as_secs() < cache_duration {
-                return Ok(cache.0);
-            }
-        }
-        
-        let validated_peers = self.get_validated_active_peers(); // Use cached version for performance
-        
-        if validated_peers.is_empty() {
-            // IMPROVED: For Genesis nodes during network bootstrap, use local height
-            // This prevents network height = 0 during initial network formation
-            if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
-               std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
-                // Genesis nodes trust their own height during bootstrap
-                if crate::node::is_info() {
-                    println!("[INFO][SYNC] Genesis bootstrap mode - using local height as network consensus");
-                }
-                // Return a special marker that indicates bootstrap mode
-                return Err("BOOTSTRAP_MODE".to_string());
-            }
-            // Regular nodes without peers start from 0
-            return Ok(0);
-        }
-        
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v14.2: STALENESS FILTER — exclude peers whose height hasn't updated recently.
-        // ═══════════════════════════════════════════════════════════════════════════
-        // Peer `last_block_height` is refreshed only on inbound heartbeat/broadcast.
-        // If a peer crashed or was isolated, its height stays frozen while the network
-        // advances. Using a stale height for `median_height` / `consensus_height` feeds
-        // incorrect data into sync, leader selection, and fork-detection logic.
-        //
-        // Rule: trust `last_block_height` ONLY if `last_seen` is within PEER_HEIGHT_TTL
-        // (120s for 1 block/sec — ≈120 block margin). Stale entries are excluded from
-        // the consensus calculation entirely. If ALL entries are stale, we fall through
-        // to the empty-peers branch below (which either returns 0 or BOOTSTRAP_MODE).
-        //
-        // Determinism note: each node filters by its own clock+last_seen, so consensus_height
-        // from this function is ALREADY node-local (sync decisions only). BFT-critical
-        // paths use the deterministic macroblock snapshot, not this value.
-        // ═══════════════════════════════════════════════════════════════════════════
-        // v30.A3: unified attestation TTL with get_max_peer_height.
-        // The freshness gate consults last_height_attested_at (set ONLY by
-        // authenticated paths), not last_seen — a peer can be alive and
-        // chatty without ever signing a height claim (e.g., during an
-        // attack-driven echo storm). Without this gate, a poisoned cache
-        // value persisted by past sync-loop iterations would keep steering
-        // the sync state machine forever.
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let stale_threshold = now_secs.saturating_sub(PEER_HEIGHT_ATTEST_TTL_SECS);
-        let mut stale_filtered = 0usize;
-
-        let mut peer_heights: Vec<u64> = validated_peers.iter()
-            .filter(|p| {
-                let h = p.last_block_height;
-                if h == 0 || h == u64::MAX || h >= 2_000_000_000 {
-                    return false;
-                }
-                if p.last_height_attested_at < stale_threshold {
-                    stale_filtered += 1;
-                    return false;
-                }
-                true
-            })
-            .map(|p| p.last_block_height)
-            .collect();
-
-        if stale_filtered > 0 && crate::node::is_info() {
-            println!("[INFO][SYNC] stale_heights_excluded count={} ttl={}s total_peers={}",
-                     stale_filtered, PEER_HEIGHT_ATTEST_TTL_SECS, validated_peers.len());
-        }
-
-        // Log peer heights for debugging (only attested entries)
-        for peer in validated_peers.iter().filter(|p| p.last_block_height > 0 && p.last_height_attested_at >= stale_threshold) {
-            if crate::node::is_info() {
-                let age = now_secs.saturating_sub(peer.last_height_attested_at);
-                println!("[INFO][SYNC] peer_height id={} h={} age={}s", peer.id, peer.last_block_height, age);
-            }
-        }
-
-        // v30.A2: prefer ≥2 freshly-attested peers for the HEAD target (anti-poisoning).
-        // Escape hatch: a network-wide stall makes ALL heights stale → this branch would
-        // deadlock sync forever. Fall back to the max height across validated peers as a
-        // RECOVERY target — fetched blocks are crypto-verified on apply, so a stale/wrong
-        // claim fails verification and never corrupts state. Freshness gates the HEAD
-        // choice; verification gates safety; gap-fill must never be blocked by staleness.
-        if peer_heights.len() < 2 {
-            let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-            let recovery_target = validated_peers.iter()
-                .map(|p| p.last_block_height)
-                .filter(|&h| h > 0 && h < 2_000_000_000)
-                .max()
-                .unwrap_or(0);
-            if recovery_target > local_h {
-                if crate::node::is_warn() {
-                    println!("[WARN][SYNC] stall_recovery_target h={} attested={} reason=all_peers_stale",
-                             recovery_target, peer_heights.len());
-                }
-                return Ok(recovery_target);
-            }
-            if crate::node::is_info() {
-                println!("[INFO][SYNC] insufficient_attested_peers count={} required=2 — staying at local height",
-                         peer_heights.len());
-            }
-            return Ok(0);
-        }
-        
-        // Use consensus height (majority)
-        peer_heights.sort();
-        let consensus_height = if peer_heights.len() >= 3 {
-            // Use median for byzantine fault tolerance
-            peer_heights[peer_heights.len() / 2]
-        } else {
-            // Use maximum height - safe since we checked empty above
-            peer_heights.into_iter().max().unwrap_or(0)
-        };
-        
-        // SAFETY: Never cache u64::MAX or absurdly large heights.
-        let consensus_height = if consensus_height == u64::MAX || consensus_height > 2_000_000_000 {
-            if crate::node::is_warn() {
-                println!("[WARN][SYNC] consensus_height_invalid={} — falling back to local_height", consensus_height);
-            }
-            // Return local height so the node doesn't freeze; it will retry next cycle.
-            let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-            return Ok(local_h);
-        } else {
-            consensus_height
-        };
-        
-        if crate::node::is_info() {
-            println!("[INFO][SYNC] Consensus blockchain height: {}", consensus_height);
-        }
-        
-        // RACE CONDITION FIX: Update cached height
-        // IMPROVED: Update both cache systems for smooth transition
-        {
-            // Update new cache actor
-            let epoch = CACHE_ACTOR.increment_epoch();
-            *CACHE_ACTOR.height_cache.write() = Some(CachedData {
-                data: consensus_height,
-                epoch,
-                timestamp: Instant::now(),
-                topology_hash: 0, // Not relevant for height
-            });
-            
-            // Also update old cache for backward compatibility
-            *CACHED_BLOCKCHAIN_HEIGHT.lock() = (consensus_height, Instant::now());
-            // v14.8.5: lock-free mirror for the stuck-chain watchdog
-            CACHED_NETWORK_HEIGHT.store(consensus_height, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        Ok(consensus_height)
+        // Deprecated thin alias over the single network-height source
+        // (get_max_peer_height: re-derived from connected peers ∨ local ∨ QC
+        // frontier; no peer-attestation TTL gate, no <2-peer collapse, no median
+        // oracle). The legacy staleness-filtered consensus-height oracle was
+        // removed to leave ONE source of truth. The result is a sync HINT only —
+        // fetched blocks are QC/Dilithium-verified on apply and the bulk target is
+        // QC-frontier-floored, so an over/under-reported hint cannot inject state.
+        Ok(self.get_max_peer_height())
     }
     
     /// Determine if this node is the elected microblock producer for the current slot.
@@ -18415,10 +18171,9 @@ impl SimplifiedP2P {
         // A node still catching up has no trustworthy first-hand peer heights and DEPENDS on its peers —
         // never height-evict while we are ourselves below the frontier (the 15-min last_seen TTL still
         // reaps genuinely dead peers). Closes the cold-join "evict all sources → stall" failure.
-        let self_synced = {
-            let local = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-            network_height <= 180 || local.saturating_add(180) >= network_height
-        };
+        // Only a node that is itself synchronized (per the coordinator FSM — the single sync-status
+        // source) may height-evict a peer it measures behind; the bootstrap window is always exempt.
+        let self_synced = network_height <= 180 || crate::node::coordinator_is_synchronized();
 
         // v2.51: Lock-free cleanup — stale by time
         let before = self.active_full_super_nodes.len();
@@ -18510,11 +18265,13 @@ impl SimplifiedP2P {
     /// was >= current BEST_PEER_HEIGHT). Also called periodically (every 30s) as safety net.
     /// O(N) where N = connected peers, but runs infrequently.
     pub fn recalculate_best_peer_height(&self) {
+        // Monotonic: only RAISE. Never lower the best-known head from currently-connected (served-low)
+        // peers — lowering re-collapses the target. Stale-high is bounded by the QC frontier floor.
         let new_best = self.connected_peers_lockfree.iter()
             .map(|entry| entry.value().last_block_height)
             .max()
             .unwrap_or(0);
-        BEST_PEER_HEIGHT.store(new_best, std::sync::atomic::Ordering::Relaxed);
+        BEST_PEER_HEIGHT.fetch_max(new_best, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get node reputation by ID

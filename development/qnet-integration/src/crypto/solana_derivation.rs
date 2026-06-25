@@ -133,6 +133,20 @@ pub fn bip39_seed64(mnemonic: &str) -> [u8; 64] {
     bip39_mnemonic_to_seed(mnemonic)
 }
 
+/// Structural BIP39 guard: reject a seed whose word count is not a valid BIP39
+/// length (12/15/18/21/24) — a paste/typo that would otherwise silently derive
+/// a valid-but-wrong identity (non-genesis nodes have no anchor to catch it).
+/// A correctly-formed mnemonic always has a valid count, so this never rejects
+/// a real seed, and derivation reads the original bytes unchanged (genesis-safe).
+/// Per-word wordlist+checksum validation needs the 2048-word list (follow-up).
+pub fn validate_bip39_structure(mnemonic: &str) -> Result<(), String> {
+    let n = mnemonic.split_whitespace().count();
+    match n {
+        12 | 15 | 18 | 21 | 24 => Ok(()),
+        _ => Err(format!("bip39_word_count={} (expected 12/15/18/21/24)", n)),
+    }
+}
+
 /// PBKDF2-HMAC-SHA512 implementation (RFC 8018).
 fn pbkdf2_hmac_sha512(password: &[u8], salt: &[u8], iterations: u32, output: &mut [u8]) {
     let hlen = 64usize; // SHA-512 output = 64 bytes

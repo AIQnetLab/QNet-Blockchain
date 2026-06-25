@@ -203,7 +203,6 @@ pub fn clear_emergency_producer() {
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
 
 /// Signed NodeRegistration awaiting on-chain inclusion: (node_id, tx_bytes, attempts_left). The
 /// periodic registration loop rebroadcasts it (one per ~60s cycle, bounded budget) so a single
@@ -224,14 +223,15 @@ lazy_static::lazy_static! {
         parking_lot::RwLock::new(None);
 }
 
-/// Check if node is synchronized via coordinator (preferred) or legacy flags (fallback).
-/// Use this instead of reading NODE_IS_SYNCHRONIZED directly.
+/// Check if node is synchronized via the coordinator FSM — the single source of
+/// truth. Before the coordinator is installed during boot the node is, by
+/// definition, not yet synchronized.
 #[inline]
 pub fn coordinator_is_synchronized() -> bool {
     if let Some(ref handle) = *GLOBAL_COORDINATOR.read() {
         handle.snapshot().is_synchronized()
     } else {
-        NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed)
+        false
     }
 }
 
@@ -252,9 +252,7 @@ pub fn coordinator_is_production_ready() -> bool {
     if let Some(ref handle) = *GLOBAL_COORDINATOR.read() {
         handle.snapshot().is_production_ready()
     } else {
-        NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed)
-            && !SYNC_IN_PROGRESS.load(Ordering::Relaxed)
-            && !FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+        false
     }
 }
 
@@ -2493,6 +2491,21 @@ pub(crate) fn qc_verified_frontier_cached() -> u64 {
     QC_VERIFIED_FRONTIER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// SINGLE source of truth for "how far behind am I" — every behind/target/gap decision reads THIS so
+/// no two consumers can disagree. Returns (applied, target, gap): applied = own applied tip; target =
+/// highest known head from monotonic, never-decaying signals (QC-verified frontier ∨ authenticated
+/// best-peer/signed-head). NEVER gated by a peer-attestation TTL quorum a client-only joiner can't
+/// sustain; safety stays in per-block QC/Dilithium verify on apply. The authoritative "am I synced"
+/// boolean is the coordinator FSM (coordinator_is_synchronized) — this returns the raw gap only.
+pub fn network_status() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let applied = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Relaxed);
+    // Target = re-derived connected-peer tip (poison drops on disconnect), already floored by QC frontier
+    // + local inside get_max_peer_height. No monotonic-stuck atomic gates "am I synced".
+    let target = try_get_p2p().map(|p| p.get_max_peer_height()).unwrap_or(applied);
+    (applied, target, target.saturating_sub(applied))
+}
+
 // CRITICAL: Track certificate requests to prevent DDoS (request flooding)
 // Maps certificate_serial -> last_request_timestamp
 // v2.96: Using DashMap for lock-free operations
@@ -3005,6 +3018,11 @@ impl BlockchainNode {
         let key_dir = std::path::PathBuf::from("/app/data/keys");
         let km = DilithiumKeyManager::new(self.node_id.clone(), &key_dir)
             .map_err(|e| format!("[ERR][NODE] key_manager_init err={}", e))?;
+        // Fail-closed structural guard: a wrong-length seed must refuse boot, not
+        // silently derive a valid-but-wrong identity. Derivation below reads
+        // wallet_seed unchanged, so a valid mnemonic is unaffected (genesis-safe).
+        crate::crypto::solana_derivation::validate_bip39_structure(wallet_seed)
+            .map_err(|e| format!("[ERR][NODE] wallet_seed_invalid {}", e))?;
         let (pk, sk) = km.get_keypair_from_mnemonic(wallet_seed)
             .map_err(|e| format!("[ERR][NODE] keypair err={}", e))?;
         let pk_bytes = PkTrait::as_bytes(&pk).to_vec();
@@ -9093,7 +9111,6 @@ impl BlockchainNode {
             SYNC_TARGET_HEIGHT.store(0, Ordering::SeqCst);
             let frontier = crate::node::qc_verified_frontier_height();
             if frontier == 0 || stored_h >= frontier {
-                NODE_IS_SYNCHRONIZED.store(true, Ordering::SeqCst);
                 coordinator_for_sync.try_send(crate::consensus_state::ConsensusEvent::SyncComplete {
                     height: stored_h,
                 });
@@ -10579,9 +10596,8 @@ impl BlockchainNode {
                         last_alert_at = None;  // chain advanced — clear alert state
                         continue;
                     }
-                    // No local progress — check whether the network is ahead.
-                    let net_h = crate::unified_p2p::CACHED_NETWORK_HEIGHT
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                    // No local progress — check whether the network is ahead (canonical single source).
+                    let (_, net_h, _) = crate::node::network_status();
                     let behind = net_h.saturating_sub(h);
 
                     if behind < WATCHDOG_BEHIND_THRESHOLD {
@@ -11154,9 +11170,6 @@ impl BlockchainNode {
                             } else {
                                 if is_info() { println!("[INFO][NODE] in_sync h={}", local_height); }
                             }
-                        }
-                        Err(e) if e == "BOOTSTRAP_MODE" => {
-                            println!("[INFO][NODE] Bootstrap mode - starting production immediately");
                         }
                         Err(e) => {
                             println!("[WARN][NODE] Failed to get network height: {}, starting anyway", e);
@@ -13232,84 +13245,6 @@ impl BlockchainNode {
                             println!("[INFO][ACTIVE] registration_skipped_unsynced our_h={} best_h={} gap={}",
                                      reg_our_h, reg_best_h, reg_best_h.saturating_sub(reg_our_h));
                         }
-
-                        // v9.8: DESYNC MONITOR — detect post-sync desynchronization.
-                        // Uses live peer heights from DashMap instead of BEST_PEER_HEIGHT atomic
-                        // which can be 0 if handshake didn't complete. get_max_peer_height() is
-                        // always current (reads connected_peers_lockfree directly).
-                        // 50 blocks (not 20): avoid flapping from normal propagation jitter.
-                        let desync_net_h = if let Some(ref p2p) = unified_p2p {
-                            let live_h = p2p.get_max_peer_height();
-                            // Cap the desync chase on the QC frontier (cached, O(1)); the fast-sync path
-                            // re-probes the frontier and drives the remainder. frontier==0 ⇒ unchanged.
-                            let frontier = crate::node::qc_verified_frontier_cached();
-                            let target = if frontier == 0 { live_h }
-                                else { std::cmp::max(frontier, std::cmp::min(live_h, frontier.saturating_add(180))) };
-                            if target > reg_our_h { target } else { 0 }
-                        } else { 0 };
-                        if coordinator_is_synchronized() && desync_net_h > 0 && reg_our_h + 50 < desync_net_h {
-                            NODE_IS_SYNCHRONIZED.store(false, std::sync::atomic::Ordering::SeqCst);
-                            let gap = desync_net_h.saturating_sub(reg_our_h);
-                            if is_warn() { println!("[WARN][DESYNC] detected our={} best={} gap={}", reg_our_h, desync_net_h, gap); }
-
-                            // v11.0: Re-enter sync with CHUNKED sequential download
-                            // Old approach: single sync_blocks(from, to) for entire gap → only first 100 blocks sent
-                            SYNC_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
-                            SYNC_TARGET_HEIGHT.store(desync_net_h, std::sync::atomic::Ordering::SeqCst);
-                            if let Some(ref p2p) = unified_p2p {
-                                let p2p_clone = p2p.clone();
-                                let storage_for_desync = storage.clone();
-                                let from_h = reg_our_h + 1;
-                                let to_h = desync_net_h;
-                                tokio::spawn(async move {
-                                    // Guard: clear SYNC_IN_PROGRESS on exit (panic/error safety)
-                                    struct DesyncGuard;
-                                    impl Drop for DesyncGuard {
-                                        fn drop(&mut self) {
-                                            SYNC_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                                        }
-                                    }
-                                    let _guard = DesyncGuard;
-
-                                    // v15.8: 1000-block sharded chunks (was 100).
-                                    // sync_blocks fans the request out to the
-                                    // parallel-peer pool; bigger chunks mean fewer
-                                    // request roundtrips for a given backlog and
-                                    // therefore faster catch-up after a desync
-                                    // event without changing per-peer payload
-                                    // assumptions.
-                                    const SYNC_CHUNK_SIZE: u64 = 1_000;
-                                    let mut current = from_h;
-                                    let mut consecutive_fails = 0u32;
-                                    while current <= to_h {
-                                        let chunk_end = std::cmp::min(current + SYNC_CHUNK_SIZE.saturating_sub(1), to_h);
-                                        if let Err(e) = p2p_clone.sync_blocks(current, chunk_end).await {
-                                            consecutive_fails += 1;
-                                            if crate::node::is_warn() {
-                                                println!("[WARN][DESYNC] chunk_err h={}-{} fails={} err={}", current, chunk_end, consecutive_fails, e);
-                                            }
-                                            if consecutive_fails >= 10 {
-                                                if crate::node::is_warn() {
-                                                    println!("[WARN][DESYNC] abort fails=10 h={}", current);
-                                                }
-                                                break;
-                                            }
-                                        } else {
-                                            consecutive_fails = 0;
-                                        }
-                                        // Advance based on actual storage height (not just request range)
-                                        let actual_h = storage_for_desync.get_chain_height().unwrap_or(0);
-                                        if actual_h >= chunk_end {
-                                            current = chunk_end + 1;
-                                        } else {
-                                            current = actual_h + 1;
-                                        }
-                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                    }
-                                    // _guard drops here → SYNC_IN_PROGRESS = false
-                                });
-                            }
-                        }
                     }
                 }
                 
@@ -14114,8 +14049,7 @@ impl BlockchainNode {
                                     };
                                     // Floor the Syncing target on QC-verified finality (frontier==0 ⇒ hint, genesis-safe).
                                     let frontier = qc_verified_frontier_height();
-                                    let network_height = if frontier == 0 { hint }
-                                        else { std::cmp::max(frontier, std::cmp::min(hint, frontier.saturating_add(180))) };
+                                    let network_height = if frontier == 0 { hint } else { std::cmp::max(frontier, hint) };
                                     if crate::node::is_info() { println!("[INFO][SYNC] sync_target={} frontier={} hint={}", network_height, frontier, hint); }
                                     let height_gap = network_height.saturating_sub(microblock_height);
                                     
@@ -14235,11 +14169,7 @@ impl BlockchainNode {
                     // over-reported one can't overshoot it. frontier==0 (h<90) ⇒ fall back to the hint
                     // so the genesis bootstrap (0..89, no macroblock yet) is never blocked.
                     let frontier = qc_verified_frontier_height();
-                    let network_height = if frontier == 0 {
-                        cached_height
-                    } else {
-                        std::cmp::max(frontier, std::cmp::min(cached_height, frontier.saturating_add(180)))
-                    };
+                    let network_height = if frontier == 0 { cached_height } else { std::cmp::max(frontier, cached_height) };
 
                     if network_height > microblock_height {
                         let height_difference = network_height.saturating_sub(microblock_height);
@@ -15664,42 +15594,6 @@ impl BlockchainNode {
                 // the separate 800ms producer sleep is unnecessary. The attestation-based
                 // competing-producer yield in the production loop remains as a secondary
                 // safety net; round-based fork-choice is the primary path.
-                
-                // CRITICAL FIX v9.8: Network-aware NODE_IS_SYNCHRONIZED check.
-                // Previous bug: compared LOCAL stored vs LOCAL height only — never checked network.
-                // A node 5000 blocks behind network would declare synchronized=true if stored==local.
-                // Now: local_ok (storage vs RAM) AND network_ok (storage vs peer heights).
-                {
-                    let current_stored_height = storage.get_chain_height().unwrap_or(0);
-                    let local_ok = if microblock_height > 10 {
-                        // Normal operation: allow max 10 blocks behind
-                        current_stored_height + 10 >= microblock_height
-                    } else {
-                        // Genesis phase: must be within 1 block
-                        current_stored_height + 1 >= microblock_height
-                    };
-
-                    // v9.8: Check against actual network height from connected peers.
-                    // get_max_peer_height() reads DashMap directly (always fresh), unlike
-                    // BEST_PEER_HEIGHT atomic which can be 0 if handshake didn't complete.
-                    // When no peers connected: returns local_height → network_ok=true (correct:
-                    // can't know network state without peers, trust local).
-                    let network_ok = if let Some(ref p2p) = unified_p2p {
-                        let net_h = p2p.get_max_peer_height();
-                        // net_h includes local_height, so if no peers → net_h == local_height.
-                        // Only flag desync when peers report genuinely higher height.
-                        net_h == 0 || net_h <= current_stored_height + 10
-                    } else {
-                        true // No P2P yet — trust local
-                    };
-
-                    // QC floor: never declare synced below the verified finality frontier even if peers
-                    // under-report (the stale-low-median false-complete). frontier==0 ⇒ genesis pre-mb.
-                    let frontier = crate::node::qc_verified_frontier_cached();
-                    let qc_ok = frontier == 0 || current_stored_height >= frontier;
-                    let is_synchronized = local_ok && network_ok && qc_ok;
-                    NODE_IS_SYNCHRONIZED.store(is_synchronized, Ordering::SeqCst);
-                }
                 
                 if is_my_turn_to_produce {
                     // v3.35: BFT-based competing producer check (replaces v3.32 flag)
@@ -18257,10 +18151,12 @@ impl BlockchainNode {
                                 };
                                 
                                 if let Some(network_height) = network_height {
-                                // Cap the bg-sync target on the QC-verified frontier (frontier==0 ⇒ unchanged, genesis-safe).
+                                // Floor the bg-sync target on the QC-verified frontier (frontier==0 ⇒ unchanged,
+                                // genesis-safe). No upper cap: a far-behind joiner must target the true tip, not
+                                // frontier+window — the apply-horizon now admits the full in-flight window.
                                 let frontier = qc_verified_frontier_height();
                                 let network_height = if frontier == 0 { network_height }
-                                    else { std::cmp::max(frontier, std::cmp::min(network_height, frontier.saturating_add(180))) };
+                                    else { network_height.max(frontier) };
                                 if network_height > current_height {
                                     let height_difference = network_height.saturating_sub(current_height);
 
