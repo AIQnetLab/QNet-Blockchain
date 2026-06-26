@@ -24329,6 +24329,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         sender_id: self.node_id.clone(),
                     };
                     p2p.send_network_message(&addr, empty_response);
+                    // Co-send signed head even on an empty serve so a behind follower's SIGNED_HEAD_MAX
+                    // still refreshes — breaks the request-vs-behind loop.
+                    p2p.cosend_signed_head(&addr);
                     if is_info() { println!("[INFO][SYNC] empty_batch_sent to={} addr={}", requester_id, addr); }
                 } else {
                     if is_warn() { println!("[WARN][SYNC] empty_batch_no_addr id={} from={}", requester_id, from_peer_addr); }

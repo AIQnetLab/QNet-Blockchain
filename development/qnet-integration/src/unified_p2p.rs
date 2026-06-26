@@ -203,72 +203,6 @@ static LAST_HEAD_TS: Lazy<DashMap<String, (u64, u64)>> = Lazy::new(DashMap::new)
 /// misses. (from, ts, height, sig_hex, pk_hex).
 static LATEST_SIGNED_HEAD: Lazy<RwLock<Option<(String, u64, u64, String, String)>>> = Lazy::new(|| RwLock::new(None));
 
-// Pending-gap queue (multiple disjoint gaps, lock-free). The pre-v24
-// single Mutex<(u64,u64)> slot tracked only ONE gap, so a second gap
-// overwrote the first → lost detection events under packet-loss pile-up.
-// Now a DashMap keyed by gap_from_height; the consumer drains all entries
-// per tick (one sync_blocks per range, same-range dups absorbed by key).
-// Drained on consume + swept by cleanup_old_gap_entries. O(1) insert,
-// O(K) drain (K<50 typical).
-pub static PENDING_GAP_SYNC_QUEUE: Lazy<DashMap<u64, u64>> = Lazy::new(DashMap::new);
-
-/// Insert (or update) a pending gap-sync range. `gap_from` is the key, so
-/// same-start duplicates upsert the upper bound to the larger value (the
-/// later sender knew about more missing blocks).
-pub fn set_pending_gap_sync(from: u64, to: u64) {
-    if from == 0 || to < from {
-        return;
-    }
-    PENDING_GAP_SYNC_QUEUE
-        .entry(from)
-        .and_modify(|t| { if to > *t { *t = to; } })
-        .or_insert(to);
-}
-
-/// Drain and return ALL pending gap ranges. Called once per sync-loop tick
-/// in node.rs; the consumer issues a sync request for each range.
-pub fn drain_pending_gap_sync() -> Vec<(u64, u64)> {
-    let mut out: Vec<(u64, u64)> = Vec::with_capacity(PENDING_GAP_SYNC_QUEUE.len());
-    let keys: Vec<u64> = PENDING_GAP_SYNC_QUEUE.iter().map(|e| *e.key()).collect();
-    for from in keys {
-        if let Some((_, to)) = PENDING_GAP_SYNC_QUEUE.remove(&from) {
-            out.push((from, to));
-        }
-    }
-    out
-}
-
-/// Backwards-compatible single-pair drain.
-///
-/// Some callers (node.rs sync loop) read one gap per iteration. This
-/// helper preserves that contract — returning the lowest-`from` pending
-/// range or `(0, 0)` when the queue is empty. The full multi-gap API is
-/// `drain_pending_gap_sync` above; new code should prefer that.
-pub fn take_pending_gap_sync() -> (u64, u64) {
-    // Find the lowest `from` key without iterating twice.
-    let mut min_key: Option<u64> = None;
-    for entry in PENDING_GAP_SYNC_QUEUE.iter() {
-        let k = *entry.key();
-        match min_key {
-            Some(cur) if cur <= k => {}
-            _ => min_key = Some(k),
-        }
-    }
-    match min_key {
-        Some(k) => PENDING_GAP_SYNC_QUEUE
-            .remove(&k)
-            .map(|(from, to)| (from, to))
-            .unwrap_or((0, 0)),
-        None => (0, 0),
-    }
-}
-
-/// Prune stale gap entries whose target is below the active retention
-/// window. Called from the existing timeout-state cleanup sweep.
-pub fn cleanup_old_gap_entries(min_height: u64) {
-    PENDING_GAP_SYNC_QUEUE.retain(|_, to| *to >= min_height);
-}
-
 // CRITICAL FIX: Deduplicate failover messages to prevent spam
 // Store processed failover events: (block_height, failed_producer, new_producer)
 // SCALABILITY: Use DashSet for lock-free concurrent access with millions of nodes
@@ -6987,27 +6921,21 @@ impl SimplifiedP2P {
             // Log at most once per 2 seconds to avoid spam
             if now > last_log + 2 {
                 GAP_SYNC_COOLDOWN.store(now, std::sync::atomic::Ordering::Relaxed);
-                
-                let from_height = local_height.saturating_add(1);
-                // saturating_sub: guard against height=0 (impossible in practice but safe)
-                let to_height = height.saturating_sub(1);
-                
-                // Signal gap to global pending queue (processed by node.rs sync loop)
-                // FIX R22-CC4: Atomic pair write via Mutex — no torn reads possible
-                set_pending_gap_sync(from_height, to_height);
-                
+                // Unsigned shred height: only nudge the authenticated desync check (it re-reads the
+                // signed-head oracle); never seed sync off it.
+                crate::sync_manager::nudge_sync_check();
                 if crate::node::is_info() {
-                    println!("[INFO][GAP] detected local={} incoming={} gap={} pending_sync={}-{}", 
-                            local_height, height, gap, from_height, to_height);
+                    println!("[INFO][GAP] detected local={} incoming={} gap={} nudge_desync",
+                            local_height, height, gap);
                 }
             }
         } else if gap > 50 {
-            // Large gap - log warning, regular sync will handle
-            if height % 10 == 0 {
-                if crate::node::is_warn() {
-                    println!("[WARN][GAP] large_gap local={} incoming={} gap={} (regular_sync)", 
-                            local_height, height, gap);
-                }
+            // Far-gap shred is unsigned (pre-reconstruction): only NUDGE the authenticated desync check.
+            // SIGNED_HEAD_MAX advances solely on a Dilithium-verified head, so a forged height can't drive sync.
+            crate::sync_manager::nudge_sync_check();
+            if height % 50 == 0 && crate::node::is_warn() {
+                println!("[WARN][GAP] large_gap local={} incoming={} gap={} nudge_desync",
+                        local_height, height, gap);
             }
         }
         
@@ -8842,6 +8770,9 @@ impl SimplifiedP2P {
             .max()
             .unwrap_or(0);
         let local = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        // .max(local)/.max(frontier) = SYNC-TARGET floor only (never sync below own tip / finality). The
+        // BEHIND boolean must read the un-floored authenticated tip (detect_network_height), NEVER this —
+        // flooring the behind decision by local is the self-referential keep-up wedge.
         peer_max.max(local).max(crate::node::qc_verified_frontier_cached())
     }
     
@@ -23338,15 +23269,8 @@ impl SimplifiedP2P {
         crate::node::STICKY_LEADER_PER_VIEW
             .retain(|lr, _| *lr >= min_leadership_round);
 
-        // v24: drain stale entries from the multi-gap pending-sync queue under
-        // the same active-window contract. The queue is fed by gossip
-        // gap detection; an entry whose upper bound is below the active
-        // retention window has been superseded by either successful sync
-        // (then key is removed) or the chain advancing past it (then the
-        // sync would no longer help). One O(K) sweep where K = queue len,
-        // bounded by recent stall events (<<100 even at 100K validators).
+        // Retention floor shared by the shred-chunk forward-dedup prune below.
         let min_gap_height = min_mb.saturating_mul(90);
-        cleanup_old_gap_entries(min_gap_height);
 
         // v25: prune stale entries from the validator-liveness tracker. A
         // validator whose last observed miss is older than the active
