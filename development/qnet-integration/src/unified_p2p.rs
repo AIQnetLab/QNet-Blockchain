@@ -119,7 +119,6 @@ struct CachedData<T: Clone> {
 // Actor-based cache manager for better concurrency
 struct CacheActor {
     peers_cache: Arc<RwLock<Option<CachedData<Vec<PeerInfo>>>>>,
-    height_cache: Arc<RwLock<Option<CachedData<u64>>>>,
     epoch_counter: Arc<RwLock<u64>>,
 }
 
@@ -127,7 +126,6 @@ impl CacheActor {
     fn new() -> Self {
         Self {
             peers_cache: Arc::new(RwLock::new(None)),
-            height_cache: Arc::new(RwLock::new(None)),
             epoch_counter: Arc::new(RwLock::new(0)),
         }
     }
@@ -198,10 +196,30 @@ pub static SIGNED_HEAD_MAX: AtomicU64 = AtomicU64::new(0);
 /// BOTH so a strictly-higher height always passes even if the origin's wall-clock ts regresses (cold
 /// restart / NTP step), keeping the dedup as monotonic as the height-keyed oracle it guards.
 static LAST_HEAD_TS: Lazy<DashMap<String, (u64, u64)>> = Lazy::new(DashMap::new);
-/// Latest locally-signed head, cached by the 15s emit tick so the block-serve path can co-send it over
-/// the proven serve channel — reaching freshly-joined peers the emit fan-out (get_connected_peers)
-/// misses. (from, ts, height, sig_hex, pk_hex).
-static LATEST_SIGNED_HEAD: Lazy<RwLock<Option<(String, u64, u64, String, String)>>> = Lazy::new(|| RwLock::new(None));
+/// Latest locally-signed head, cached by the 15s emit tick. Co-sent on the serve channel and, by the
+/// transport, over the live inbound connection in reply to a behind peer's HealthPing — the durable,
+/// NAT-proof tip feed to a client-dialed follower the emit fan-out misses. (from, ts, height, sig, pk).
+pub(crate) static LATEST_SIGNED_HEAD: Lazy<RwLock<Option<(String, u64, u64, String, String)>>> = Lazy::new(|| RwLock::new(None));
+/// Min height lead before we reply our signed head to a pinging peer — suppresses chatter between
+/// at-tip peers; only genuine followers (behind by more than one rotation) get the reply.
+pub(crate) const HEAD_REPLY_MIN_GAP: u64 = 8;
+/// Re-sign LATEST_SIGNED_HEAD at most every N blocks on finality advance — per-block signing is wasted
+/// at scale; the 15s emit tick is the backstop.
+pub(crate) const HEAD_RESIGN_INTERVAL: u64 = 30;
+/// Cached round-committee membership for the anti-forgery head clamp. members = committee node_ids for
+/// the CURRENT epoch (empty in the genesis era); genesis_ids = the 5 genesis, ALWAYS unioned so the
+/// corroboration anchor never lapses to empty at 100k scale (a genesis-disconnected follower still
+/// corroborates via committee links). Whole-set swap, recomputed once/epoch on finality advance.
+pub(crate) struct CommitteeSnapshot {
+    pub epoch: u64,
+    pub members: std::collections::HashSet<String>,
+    pub genesis_ids: std::collections::HashSet<String>,
+}
+pub(crate) static CURRENT_COMMITTEE: Lazy<RwLock<std::sync::Arc<CommitteeSnapshot>>> = Lazy::new(|| {
+    let genesis_ids: std::collections::HashSet<String> = (1..=crate::genesis_constants::genesis_node_count())
+        .map(|i| format!("genesis_node_{:03}", i)).collect();
+    RwLock::new(std::sync::Arc::new(CommitteeSnapshot { epoch: 0, members: std::collections::HashSet::new(), genesis_ids }))
+});
 
 // CRITICAL FIX: Deduplicate failover messages to prevent spam
 // Store processed failover events: (block_height, failed_producer, new_producer)
@@ -267,6 +285,9 @@ const SOFT_LIMIT_PENDING_SYNC_BLOCKS: usize = 1600;
 // hasn't emitted a signed height in 2 minutes is treated as height-unknown,
 // preventing stale or poisoned values from steering sync indefinitely.
 const PEER_HEIGHT_ATTEST_TTL_SECS: u64 = 120;
+// Max a real head may sit above the genesis-attested median (1 macroblock): covers attest-staleness +
+// genesis spread; a head beyond it is a forged over-claim and is overruled by the median.
+const HEAD_OVERCLAIM_MARGIN: u64 = 90;
 
 /// v3.0: Check if block is already pending in sync queue
 pub fn is_block_pending_sync(height: u64) -> bool {
@@ -4177,11 +4198,12 @@ impl SimplifiedP2P {
 
     /// QUANTUM OPTIMIZATION: Lock-free peer addition for millions of nodes
     /// Uses DashMap for concurrent operations without blocking
-    /// Upsert a handshake-verified peer (with its attested tip) into connected_peers_lockfree so an
-    /// OUTBOUND (client-dialed) cold-join peer counts toward network-height/quorum exactly like an
-    /// inbound one. Without this, outbound genesis/committee peers stay absent from the map and the
-    /// attested-peer count is stuck at 0 → the joiner never reports synchronized.
-    pub fn attest_connected_peer(&self, node_id: &str, ip: &str, node_type_str: &str, height: u64, verified: bool) {
+    /// Upsert a handshake-verified peer into connected_peers_lockfree so BOTH directions land in the
+    /// relay/quorum set: an OUTBOUND (client-dialed) peer counts toward network-height, and an INBOUND
+    /// (server-side / NAT client-dialed) peer becomes reachable by relay_signed_head. `is_outbound`
+    /// drives the eclipse/reputation/subnet caps; inbound is attested with height 0 + verified=false so
+    /// it never counts toward the height quorum until its first signed HealthPing.
+    pub fn attest_connected_peer(&self, node_id: &str, ip: &str, node_type_str: &str, height: u64, verified: bool, is_outbound: bool) {
         if node_id == self.node_id || ip.is_empty() { return; }
         let addr = format!("{}:8001", ip);
         if !self.connected_peers_lockfree.contains_key(&addr) {
@@ -4209,7 +4231,7 @@ impl SimplifiedP2P {
                 // Attest the tip ONLY when the handshake proof was verified; advisory-admit (PK unknown)
                 // peers are usable for transport but must not count toward the network-height quorum.
                 last_height_attested_at: if verified && height > 0 { now } else { 0 },
-                is_outbound: true,
+                is_outbound,
             });
         }
         if verified && height > 0 {
@@ -4222,12 +4244,19 @@ impl SimplifiedP2P {
         // This prevents phantom peer accumulation across all buckets
         let current_count = self.connected_peers_lockfree.len();
         if current_count >= MAX_CONNECTED_PEERS {
-            // LRU eviction: find and remove oldest peer
+            // LRU eviction: find and remove oldest peer, but NEVER a committee/genesis link — they are the
+            // anti-forgery corroboration anchor; membership-derived so a rotated-out member auto-unpins at
+            // the next epoch swap (no stale-pin flag).
+            let cc = CURRENT_COMMITTEE.read().clone();
             let mut oldest_addr: Option<String> = None;
             let mut oldest_time = u64::MAX;
             for entry in self.connected_peers_lockfree.iter() {
-                if entry.value().last_seen < oldest_time {
-                    oldest_time = entry.value().last_seen;
+                let p = entry.value();
+                let pinned = cc.members.contains(&p.id) || cc.genesis_ids.contains(&p.id)
+                    || crate::genesis_constants::get_genesis_id_by_ip(p.addr.split(':').next().unwrap_or("")).is_some();
+                if pinned { continue; }
+                if p.last_seen < oldest_time {
+                    oldest_time = p.last_seen;
                     oldest_addr = Some(entry.key().clone());
                 }
             }
@@ -5081,18 +5110,7 @@ impl SimplifiedP2P {
                     // Update both cache systems
                     if consensus_height > 0 {
                         if crate::node::is_info() { println!("[INFO][SYNC] Background: network height {} (from {} peers)", consensus_height, peer_heights.len()); }
-                        
-                        // Update new cache actor
-                        let epoch = CACHE_ACTOR.increment_epoch();
-                        let mut height_cache_guard = CACHE_ACTOR.height_cache.write();
-                        *height_cache_guard = Some(CachedData {
-                            data: consensus_height,
-                            epoch,
-                            timestamp: Instant::now(),
-                            topology_hash: 0,
-                        });
-                        
-                        // Also update old cache for backward compatibility
+
                         *CACHED_BLOCKCHAIN_HEIGHT.lock() = (consensus_height, Instant::now());
                         // v14.8.5: lock-free mirror for the stuck-chain watchdog
                         CACHED_NETWORK_HEIGHT.store(consensus_height, std::sync::atomic::Ordering::Relaxed);
@@ -8769,6 +8787,8 @@ impl SimplifiedP2P {
             .filter(|&h| h < 2_000_000_000)
             .max()
             .unwrap_or(0);
+        // Anti-forgery: clamp peer_max against the committee/genesis median (single chokepoint, as get_best).
+        let peer_max = self.clamp_overclaim(peer_max);
         let local = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
         // .max(local)/.max(frontier) = SYNC-TARGET floor only (never sync below own tip / finality). The
         // BEHIND boolean must read the un-floored authenticated tip (detect_network_height), NEVER this —
@@ -10176,10 +10196,26 @@ impl SimplifiedP2P {
                     }
                 }
             }
-            
+
+            // Data-availability fan-out + Byzantine participation count must also include connected
+            // non-genesis Super peers (shred tree, repair, peer count) — mirrors the regular-node
+            // branch. The VRF/committee set derives separately from on-chain eligible_producers, so
+            // this never alters election determinism.
+            let genesis_ids: std::collections::HashSet<String> =
+                genesis_peers.iter().map(|p| p.id.clone()).collect();
+            for entry in self.connected_peers_lockfree.iter() {
+                let peer = entry.value();
+                if matches!(peer.node_type, NodeType::Super)
+                    && !genesis_ids.contains(&peer.id)
+                    && peer.id != self.node_id
+                {
+                    genesis_peers.push(peer.clone());
+                }
+            }
+
             return genesis_peers;
         }
-        
+
         // QUANTUM: For decentralized quantum blockchain, minimize cache to ensure consensus consistency
         // Cache only for DOS protection, not for consensus decisions
         let validation_interval = Duration::from_millis(500); // 0.5 second cache - quantum-speed consensus
@@ -10279,85 +10315,48 @@ impl SimplifiedP2P {
     
     /// Internal method without caching (v2.51: fully lock-free)
     fn get_validated_active_peers_internal(&self) -> Vec<PeerInfo> {
-        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
-            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-            .unwrap_or(false);
-        
-        let peer_count = self.connected_peers_lockfree.len();
-        
-        if is_genesis {
-            // GENESIS NODES: Use REAL connectivity validation
-            let validated_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
-                .filter(|entry| {
-                    let peer = entry.value();
-                    let is_consensus_capable = matches!(peer.node_type, NodeType::Super);
-                    
-                    if is_consensus_capable {
-                        let peer_ip = peer.addr.split(':').next().unwrap_or("");
-                        let is_genesis_peer = is_genesis_node_ip(peer_ip);
-                        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-                        
-                        if is_genesis_peer && is_bootstrap_node {
-                            true // Bootstrap trust for Genesis peers
-                        } else {
-                            self.is_peer_actually_connected(&peer.addr)
-                        }
-                    } else {
-                        false
-                    }
-                })
-                .map(|entry| entry.value().clone())
-                .collect();
-            
-            let total_network_nodes = std::cmp::min(validated_peers.len() + 1, 5);
-            if crate::node::is_info() {
-                println!("[INFO][P2P] genesis_validated peers={}/{} total_nodes={}", 
-                         validated_peers.len(), peer_count, total_network_nodes);
+        // Genesis nodes early-return from get_validated_active_peers before reaching this internal
+        // path, so only non-genesis Super nodes run here: deterministic Genesis peers + DHT-discovered
+        // Super peers (the prior genesis branch here was unreachable).
+        let mut all_validated_peers = Vec::new();
+        let genesis_ips = get_genesis_bootstrap_ips();
+        let mut genesis_peer_ids = std::collections::HashSet::new();
+
+        for (i, ip) in genesis_ips.iter().enumerate() {
+            let node_id = format!("genesis_node_{:03}", i + 1);
+            let peer_addr = format!("{}:8001", ip);
+            genesis_peer_ids.insert(node_id.clone());
+
+            let peer_data = self.connected_peers_lockfree
+                .iter()
+                .find(|entry| entry.value().id == node_id)
+                .map(|entry| entry.value().clone());
+
+            if let Some(real_peer) = peer_data {
+                all_validated_peers.push(real_peer);
+            } else if let Some(peer_info) = self.try_create_peer_from_quic(&node_id, &peer_addr) {
+                all_validated_peers.push(peer_info);
             }
-            
-            validated_peers
-        } else {
-            // REGULAR NODES: Deterministic Genesis peers + DHT discovered peers
-            let mut all_validated_peers = Vec::new();
-            let genesis_ips = get_genesis_bootstrap_ips();
-            let mut genesis_peer_ids = std::collections::HashSet::new();
-            
-            for (i, ip) in genesis_ips.iter().enumerate() {
-                let node_id = format!("genesis_node_{:03}", i + 1);
-                let peer_addr = format!("{}:8001", ip);
-                genesis_peer_ids.insert(node_id.clone());
-                
-                let peer_data = self.connected_peers_lockfree
-                    .iter()
-                    .find(|entry| entry.value().id == node_id)
-                    .map(|entry| entry.value().clone());
-                
-                if let Some(real_peer) = peer_data {
-                    all_validated_peers.push(real_peer);
-                } else if let Some(peer_info) = self.try_create_peer_from_quic(&node_id, &peer_addr) {
-                    all_validated_peers.push(peer_info);
-                }
-            }
-            
-            // Add DHT-discovered peers (excluding Genesis)
-            let dht_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
-                .filter(|entry| {
-                    let peer = entry.value();
-                    let is_genesis = genesis_peer_ids.contains(&peer.id);
-                    let is_consensus_capable = matches!(peer.node_type, NodeType::Super);
-                    !is_genesis && is_consensus_capable
-                })
-                .map(|entry| entry.value().clone())
-                .collect();
-            
-            all_validated_peers.extend(dht_peers);
-            
-            if crate::node::is_debug() {
-                println!("[DBG][P2P] validated_peers genesis={} dht={} total={}", 
-                         genesis_ips.len(), all_validated_peers.len() - genesis_ips.len(), all_validated_peers.len());
-            }
-            all_validated_peers
         }
+
+        // Add DHT-discovered peers (excluding Genesis)
+        let dht_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+            .filter(|entry| {
+                let peer = entry.value();
+                let is_genesis = genesis_peer_ids.contains(&peer.id);
+                let is_consensus_capable = matches!(peer.node_type, NodeType::Super);
+                !is_genesis && is_consensus_capable
+            })
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        all_validated_peers.extend(dht_peers);
+
+        if crate::node::is_debug() {
+            println!("[DBG][P2P] validated_peers genesis={} dht={} total={}",
+                     genesis_ips.len(), all_validated_peers.len() - genesis_ips.len(), all_validated_peers.len());
+        }
+        all_validated_peers
     }
     
     /// CRITICAL: Force peer cache refresh for Byzantine safety checks (Producer nodes)
@@ -12488,6 +12487,21 @@ impl SimplifiedP2P {
                                 println!("[INFO][P2P] {} block #{} queued for processing", block_type, height);
                             }
 
+                            // Per-block crawl escalation: a gossiped block above our tip nudges the
+                            // authenticated desync check so a deep follower jumps to bulk instead of
+                            // crawling one block per relay. Nudge-only (never a sync target), cooldown-gated.
+                            {
+                                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                                if height > local_h.saturating_add(HEAD_REPLY_MIN_GAP) {
+                                    static BLOCK_NUDGE_COOLDOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                                    if now > BLOCK_NUDGE_COOLDOWN.load(std::sync::atomic::Ordering::Relaxed) + 2 {
+                                        BLOCK_NUDGE_COOLDOWN.store(now, std::sync::atomic::Ordering::Relaxed);
+                                        crate::sync_manager::nudge_sync_check();
+                                    }
+                                }
+                            }
+
                             // GOSSIP RE-BROADCAST v2.19.18: Forward received blocks to other peers
                             // This improves block propagation reliability across the network
                             // Only re-broadcast microblocks (macroblocks have their own consensus)
@@ -12724,13 +12738,15 @@ impl SimplifiedP2P {
                 if sig_verified {
                     // Authenticated head = the tip oracle (never a served-block height). Advance the dedup
                     // marker (post-verify: anti-poison + anti-replay), then the monotonic oracle for any
-                    // verified peer. Relay genesis heads transitively (per-origin ts dedup) so a deep
-                    // follower learns the real tip from any peer — no direct-genesis dependency, no HTTP
-                    // fan-in. O(5N).
+                    // verified peer.
                     LAST_HEAD_TS.insert(from.clone(), (timestamp.max(last_head_ts), height.max(last_head_h)));
-                    SIGNED_HEAD_MAX.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
+                    let prev_max = SIGNED_HEAD_MAX.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
                     self.update_peer_last_seen_with_height(&from, Some(height), true);
-                    if crate::genesis_constants::is_legacy_genesis_node(&from) {
+                    // Relay outward only a head that jumps the known tip by >= HEAD_REPLY_MIN_GAP. Heads
+                    // arrive in ~emit-interval jumps, so this quenches the gossip wave at caught-up nodes
+                    // (no relay when already near the head) while a lagging node still learns the real tip
+                    // and re-arms within one gap. fetch_max above stays unconditional (oracle never lags).
+                    if height > prev_max.saturating_add(HEAD_REPLY_MIN_GAP) {
                         self.relay_signed_head(NetworkMessage::HealthPing {
                             from: from.clone(), timestamp, height,
                             signature: signature.clone(), public_key: public_key.clone(),
@@ -17837,14 +17853,59 @@ impl SimplifiedP2P {
             .collect()
     }
     
-    /// v9.5: Get the highest reported height among all connected peers.
-    /// O(1) — reads global AtomicU64 updated on every heartbeat.
-    /// Used to determine if THIS node is synced enough to participate in consensus.
+    /// Corroborated network head: median last_block_height over CURRENTLY-connected peers in the round
+    /// committee union the 5 genesis, fresh (< TTL). The committee/genesis PRODUCE the tip so their median
+    /// IS the head; a random registered forger is NOT in the set so it is ignored, and >=3 in-set
+    /// corroborators are required so one compromised member cannot shift the median. 0 if none — the clamp
+    /// then trusts raw (bootstrap / fully-isolated; genesis-union + link-pin keep cmed>0 the norm at any
+    /// scale). Genesis era => members empty => the set IS the 5 genesis (byte-identical to the old median).
+    pub fn fresh_consensus_median_height(&self) -> u64 {
+        let cc = CURRENT_COMMITTEE.read().clone();
+        let now = self.current_timestamp();
+        let mut hs: Vec<u64> = self.connected_peers_lockfree.iter()
+            .filter(|e| {
+                let p = e.value();
+                let in_set = cc.members.contains(&p.id) || cc.genesis_ids.contains(&p.id)
+                    || crate::genesis_constants::get_genesis_id_by_ip(p.addr.split(':').next().unwrap_or("")).is_some();
+                in_set && p.last_block_height > 0
+                    && now.saturating_sub(p.last_height_attested_at) < PEER_HEIGHT_ATTEST_TTL_SECS
+            })
+            .map(|e| e.value().last_block_height)
+            .collect();
+        if hs.len() < 3 { return 0; } // need >=3 corroborators so a lone forged member can't shift the median
+        hs.sort_unstable();
+        hs[hs.len() / 2]
+    }
+
+    /// Anti-forgery clamp for the height oracle — single source for get_best/get_max_peer_height. A
+    /// verified head binds AUTHORSHIP not truth, so a registered peer could sign an absurd height; overrule
+    /// a raw more than one macroblock above the committee/genesis median (the corroborated tip). cmed==0
+    /// (bootstrap / no in-set corroborator) => trust raw; the genesis-union + link-pin keep cmed>0 the norm.
+    pub fn clamp_overclaim(&self, raw: u64) -> u64 {
+        let cmed = self.fresh_consensus_median_height();
+        if cmed > 0 && raw > cmed.saturating_add(HEAD_OVERCLAIM_MARGIN) { cmed } else { raw }
+    }
+
+    /// v9.5: Highest reported height among connected peers — the tip oracle for the behind-decision,
+    /// production-unlock and fork-resync, over-claim-clamped against the committee/genesis median.
     pub fn get_best_peer_height(&self) -> u64 {
-        // Floor by the authenticated signed-head tip: served-block heights (BEST_PEER_HEIGHT) can only
-        // attest a peer HAD block N (an availability fact <= our own crawl), never its true head.
-        BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
-            .max(SIGNED_HEAD_MAX.load(std::sync::atomic::Ordering::Relaxed))
+        let raw = BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+            .max(SIGNED_HEAD_MAX.load(std::sync::atomic::Ordering::Relaxed));
+        self.clamp_overclaim(raw)
+    }
+
+    /// Re-sign LATEST_SIGNED_HEAD on finality advance so a cold-joiner's replied/co-sent head is fresh to
+    /// within one rotation, not one 15s tick. Throttled (per-block Dilithium signing is wasted at scale);
+    /// the 15s emit tick stays the backstop. height+sig kept consistent (verified over from:ts:height).
+    pub fn refresh_signed_head_throttled(&self, height: u64) {
+        if height == 0 || (height % HEAD_RESIGN_INTERVAL != 0 && height % 90 != 0) { return; }
+        let id_guard = self.wallet_identity.read();
+        let identity = match &*id_guard { Some(i) => i, None => return };
+        let ts = self.current_timestamp();
+        let payload = format!("QNET_HEALTH_PING_V1:{}:{}:{}", self.node_id, ts, height);
+        if let Ok(sig) = identity.sign(payload.as_bytes()) {
+            *LATEST_SIGNED_HEAD.write() = Some((self.node_id.clone(), ts, height, hex::encode(&sig), hex::encode(&identity.dilithium_pk)));
+        }
     }
 
     /// v9.5: Recalculate BEST_PEER_HEIGHT from scratch by scanning all connected peers.
@@ -25005,6 +25066,21 @@ impl SimplifiedP2P {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The live-conn signed-head reply fires ONLY for a genuine follower (behind by >= HEAD_REPLY_MIN_GAP),
+    /// so an at-tip / within-gap peer triggers no chatter while a real follower always gets the tip feed.
+    #[test]
+    fn head_reply_gap_gate_only_fires_for_genuine_followers() {
+        let our = 1000u64;
+        // Within-gap peers: no reply.
+        assert!(!(our >= (our - 1).saturating_add(HEAD_REPLY_MIN_GAP)), "at-tip peer must NOT trigger a reply");
+        assert!(!(our >= (our - (HEAD_REPLY_MIN_GAP - 1)).saturating_add(HEAD_REPLY_MIN_GAP)), "within-gap peer must NOT trigger");
+        // Exactly at the gap boundary, and a deep follower: reply fires.
+        let at_gap = our - HEAD_REPLY_MIN_GAP;
+        assert!(our >= at_gap.saturating_add(HEAD_REPLY_MIN_GAP), "follower behind by exactly the gap MUST trigger");
+        let deep = our.saturating_sub(5000);
+        assert!(our >= deep.saturating_add(HEAD_REPLY_MIN_GAP), "deep follower MUST trigger");
+    }
 
     /// The ingest failover-round authority must mirror the producer's own round check exactly:
     /// a block at relative `block_round` is authorised iff its ABSOLUTE round (block_round +

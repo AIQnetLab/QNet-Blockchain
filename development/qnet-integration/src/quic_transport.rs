@@ -261,6 +261,16 @@ static HANDSHAKE_FAIL_TRACKER: once_cell::sync::Lazy<
 static IP_GATE_REJECTS: AtomicU64 = AtomicU64::new(0);
 pub fn ip_gate_reject_count() -> u64 { IP_GATE_REJECTS.load(Ordering::Relaxed) }
 
+/// Live inbound (client-dialed) connections indexed by the peer's advertised QUIC listen addr
+/// (ip : API_PORT + QUIC_PORT_OFFSET). A NAT/client-dialed peer's connection lives under its
+/// EPHEMERAL source addr in the per-transport pool, so a send targeting its listen port misses and
+/// re-dials a port NAT cannot accept inbound. connect() consults this to REUSE the live inbound conn
+/// — the only way to push shreds/blocks to such a peer. Keyed by addr like all existing addressing,
+/// so it inherits (does not worsen) the one-peer-per-advertised-addr assumption.
+static INBOUND_CONN_BY_LISTEN_ADDR: once_cell::sync::Lazy<
+    DashMap<SocketAddr, Arc<QuicConnection>>
+> = once_cell::sync::Lazy::new(DashMap::new);
+
 #[inline]
 fn unix_secs_now() -> u64 {
     std::time::SystemTime::now()
@@ -1270,6 +1280,13 @@ impl QuicTransport {
                     });
 
                     connections_clone.insert(peer_addr, quic_conn.clone());
+                    // Index the inbound conn by the peer's advertised QUIC listen addr so a send that
+                    // targets the listen port (which a NAT/client-dialed peer cannot accept inbound)
+                    // reuses THIS live conn in connect() instead of re-dialing an unreachable port.
+                    INBOUND_CONN_BY_LISTEN_ADDR.insert(
+                        SocketAddr::new(peer_addr.ip(), 8001u16.saturating_add(crate::p2p_transport::QUIC_PORT_OFFSET)),
+                        quic_conn.clone(),
+                    );
                     // v2.96: Promote IP to known tier after successful handshake
                     known_ips_clone.insert(peer_ip_clone, ());
                     if is_info() { println!("[INFO][QUIC] conn_stored peer={} node={} type={} ip_tier=known", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type); }
@@ -1287,7 +1304,14 @@ impl QuicTransport {
                         pid_map.insert(remote_node_id.clone(), peer_api_addr.clone());
                         if is_info() { println!("[INFO][QUIC] peer_mapped node_id={} addr={}", remote_node_id, peer_api_addr); }
                     }
-                    
+
+                    // Register the inbound (client-dialed) peer for signed-head relay reachability:
+                    // is_outbound=false keeps eclipse/reputation/subnet caps; height 0 until its first
+                    // signed HealthPing attests the tip (so it is not quorum-counted early).
+                    if let Some(p2p) = crate::node::try_get_p2p() {
+                        p2p.attest_connected_peer(&remote_node_id, &peer_addr.ip().to_string(), &remote_node_type, 0, false, false);
+                    }
+
                     {
                         let mut s = stats_clone.write().await;
                         s.connections_established += 1;
@@ -1543,6 +1567,10 @@ impl QuicTransport {
         if connections.remove(&peer_addr).is_some() {
             if is_info() { println!("[INFO][QUIC] conn_removed_on_close peer={}", get_privacy_id_for_addr(&peer_addr.to_string())); }
         }
+        // Drop the listen-addr index entry only if it still points at THIS closing conn (a sibling
+        // conn from the same IP must keep its own live entry).
+        let listen_key = SocketAddr::new(peer_addr.ip(), 8001u16.saturating_add(crate::p2p_transport::QUIC_PORT_OFFSET));
+        INBOUND_CONN_BY_LISTEN_ADDR.remove_if(&listen_key, |_, v| Arc::ptr_eq(v, &quic_conn));
     }
     
     /// Handle bidirectional stream (v2.95: length-prefixed protocol for ACK support)
@@ -1644,6 +1672,31 @@ impl QuicTransport {
         let _ = send.finish();
     }
     
+    /// Reply our cached signed head over the LIVE inbound conn (no dial) to a behind pinger — the
+    /// NAT-durable tip feed: it writes on the same accepted QUIC connection the follower's pull uses,
+    /// so it traverses the NAT mapping the follower created (cosend/relay to its listen port cannot).
+    async fn maybe_reply_signed_head(conn: &Arc<QuicConnection>, peer_height: u64) {
+        // The inbound conn already passed the QUIC handshake ML-DSA identity gate and the reply is OUR
+        // OWN signed head, so no per-ping verify here (the follower re-verifies on ingest — I1). Gate only
+        // on the lead: reply iff we are >= HEAD_REPLY_MIN_GAP ahead — suppresses at-tip chatter, O(1)/conn.
+        let head = crate::unified_p2p::LATEST_SIGNED_HEAD.read().clone();
+        let (h_from, h_ts, h_height, h_sig, h_pk) = match head { Some(h) => h, None => return };
+        if h_height < peer_height.saturating_add(crate::unified_p2p::HEAD_REPLY_MIN_GAP) { return; }
+        // Re-emit OUR signed head over THIS live conn (same framing as try_broadcast_once, no dial).
+        let reply = crate::unified_p2p::NetworkMessage::HealthPing { from: h_from, timestamp: h_ts, height: h_height, signature: h_sig, public_key: h_pk };
+        if let Ok(wire) = Self::serialize_message(&reply) {
+            // Bounded like try_broadcast_once so a stalled stream never pins this per-stream task's permit.
+            let _ = tokio::time::timeout(Duration::from_secs(MESSAGE_TIMEOUT_SECS), async {
+                if let Ok(mut send) = conn.connection.open_uni().await {
+                    let len = (wire.len() as u32).to_be_bytes();
+                    let _ = send.write_all(&len).await;
+                    let _ = send.write_all(&wire).await;
+                    let _ = send.finish();
+                }
+            }).await;
+        }
+    }
+
     /// Handle unidirectional stream (broadcast/fire-and-forget messages)
     /// v2.95.2: Updated to read length-prefixed messages (matches try_send_once)
     async fn handle_uni_stream(
@@ -1738,12 +1791,18 @@ impl QuicTransport {
             }
         };
         
+        // Live-conn signed-head reply: serve our cached head back over THIS inbound conn to a behind
+        // pinger (NAT-durable). Capture the pinger height before the handler moves `msg`.
+        let hp_peer_height = if let NetworkMessage::HealthPing { height, .. } = msg { Some(height) } else { None };
         // Call handler
         if let Some(ref h) = handler {
             h(peer_addr, msg);
         }
+        if let Some(ph) = hp_peer_height {
+            Self::maybe_reply_signed_head(&conn, ph).await;
+        }
     }
-    
+
     /// Parse binary message with per-type size enforcement
     fn parse_message(data: &[u8]) -> Result<NetworkMessage, String> {
         if data.len() < 6 {
@@ -1824,6 +1883,16 @@ impl QuicTransport {
                          get_privacy_id_for_addr(&peer_addr.to_string()));
             }
             self.connections.remove(&peer_addr);
+        }
+
+        // NAT reuse: no outbound conn to this listen addr. Before dialing (which a NAT/client-dialed
+        // peer cannot accept), reuse a live conn the peer opened TO us, indexed by its advertised
+        // listen addr — the only durable channel to push shreds/blocks to such a peer.
+        if let Some(conn) = INBOUND_CONN_BY_LISTEN_ADDR.get(&peer_addr).map(|r| r.value().clone()) {
+            if crate::quic_transport::is_connection_alive(&conn) {
+                return Ok(conn);
+            }
+            INBOUND_CONN_BY_LISTEN_ADDR.remove(&peer_addr);
         }
 
         // v2.96: Per-peer reconnect cooldown — reject if last attempt was < COOLDOWN ago.
@@ -1999,7 +2068,7 @@ impl QuicTransport {
             if remote_node_id != self.node_id {
                 if let Some(p2p) = crate::node::try_get_p2p() {
                     let ip = connection.remote_address().ip().to_string();
-                    p2p.attest_connected_peer(&remote_node_id, &ip, &remote_node_type, remote_block_height, remote_verified);
+                    p2p.attest_connected_peer(&remote_node_id, &ip, &remote_node_type, remote_block_height, remote_verified, true);
                 }
             }
         }

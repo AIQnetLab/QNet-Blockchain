@@ -2888,6 +2888,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reg_onchain = node.get_storage().is_node_registration_onchain(&node.get_node_id());
         if already_persisted && reg_onchain {
             if is_info() { println!("[INFO][NODE] activation_persisted reg_onchain=true skip=fallback_call"); }
+        } else if !qnet_integration::node::coordinator_is_synchronized() {
+            // Defer to the sync-gated activation path (single source of truth). A registration whose
+            // burn-attestors are collected pre-sync (local height ~0 → committee_for_height None →
+            // genesis-set fallback) is rejected post-genesis; sending only once synced binds it to the
+            // true N-2 committee. The sync-gated path re-sends until the registration lands on-chain.
+            if is_info() { println!("[INFO][NODE] activation_send_deferred reason=not_synced path=sync_gated"); }
         } else if let Err(e) = node.save_activation_code(&activation_code, node_type).await {
             if is_warn() { println!("[WARN][NODE] activation_code_save_failed err={}", e); }
         }

@@ -1248,7 +1248,31 @@ pub fn try_advance_finality(round: u64, context: &str) -> bool {
     }
     LAST_FINALIZED_CONSENSUS_ROUND.store(round, std::sync::atomic::Ordering::SeqCst);
     LAST_FINALIZED_HEIGHT.store(round, std::sync::atomic::Ordering::SeqCst);
+    // Release the finality mutex BEFORE the post-advance refresh so the invariant above (no storage I/O
+    // under the lock) holds. On real advance: refresh the committee clamp anchor (once/epoch) + re-sign head.
+    drop(_finality_guard);
+    if let Some(storage) = try_get_storage() {
+        refresh_current_committee(&storage, round);
+    }
+    if let Some(p2p) = try_get_p2p() {
+        p2p.refresh_signed_head_throttled(round);
+    }
     true
+}
+
+/// Refresh the cached committee membership (anti-forgery head-clamp anchor) once per epoch. members =
+/// committee node_ids (empty in the genesis era); genesis_ids always present so the 5 genesis stay an
+/// anchor at any scale. O(R<=1000) recompute under the finality mutex, no-op when the epoch is unchanged.
+fn refresh_current_committee(storage: &Storage, h: u64) {
+    let epoch = h.saturating_sub(1) / 90 + 1;
+    if epoch == crate::unified_p2p::CURRENT_COMMITTEE.read().epoch { return; }
+    let members: std::collections::HashSet<String> = BlockchainNode::committee_for_height(storage, h)
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default();
+    let genesis_ids: std::collections::HashSet<String> = (1..=crate::genesis_constants::genesis_node_count())
+        .map(|i| format!("genesis_node_{:03}", i)).collect();
+    *crate::unified_p2p::CURRENT_COMMITTEE.write() =
+        std::sync::Arc::new(crate::unified_p2p::CommitteeSnapshot { epoch, members, genesis_ids });
 }
 
 /// v10.2: Atomic height update helper — DISK FIRST, RAM SECOND.
@@ -10904,8 +10928,13 @@ impl BlockchainNode {
                 println!("[INFO][HEARTBEAT-LOOP] heartbeat emission loop started (spread, unforgeable)");
             }
 
-            // v34: last (epoch, subwindow) for which this node emitted a Heartbeat TX (dedup).
-            let mut last_hb_subwindow: Option<(u64, u64)> = None;
+            // v36: (epoch, subwindow, emit_height) of this node's last Heartbeat emission. Dedup keys on
+            // ON-CHAIN INCLUSION (own heartbeat_slots bit), not emission — a heartbeat that missed
+            // inclusion is re-anchored and retried until the subwindow is recorded, so a transient
+            // desync can never permanently drop a liveness subwindow (producer/reward eligibility).
+            let mut last_hb_emit: Option<(u64, u64, u64)> = None;
+            // Re-anchor cadence: well under HB_ANCHOR_MAX_LAG (90) so a retried heartbeat never goes stale.
+            const HB_REEMIT_INTERVAL: u64 = 60;
 
             while *is_running.read().await {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -10914,30 +10943,40 @@ impl BlockchainNode {
 
                 // v34: emit ONE unforgeable Heartbeat TX per ~1440-block subwindow (10/epoch) for
                 // super/genesis nodes. Anchored to a recent block hash so it cannot be pre-signed or
-                // backfilled (verified in validate_received_microblock). Replaces self-attested
-                // liveness with on-chain liveness tallied in Account.heartbeat_slots (popcount ≥ 9).
-                // Skip while syncing/behind: a heartbeat anchored to our lagging local height would
-                // be stale at the network tip, and a producer including it would reject the block.
+                // backfilled (verified in validate_received_microblock). Liveness is tallied on-chain
+                // in Account.heartbeat_slots (popcount ≥ 9). Skip while syncing: a heartbeat anchored
+                // to our lagging height would be stale at the tip and the producer would reject it.
                 if !matches!(node_type, NodeType::Light) && current_height >= 2 && !coordinator_is_syncing() {
-                    let hb_epoch = current_height / EMISSION_BLOCK_INTERVAL;
-                    let pos = current_height % EMISSION_BLOCK_INTERVAL;
+                    // Derive epoch/subwindow from the ANCHOR (current_height-2) the heartbeat commits and
+                    // the apply tallies, so the inclusion check tests exactly the bit the emit will set.
+                    let anchor_h = current_height - 2;
+                    let hb_epoch = anchor_h / EMISSION_BLOCK_INTERVAL;
+                    let pos = anchor_h % EMISSION_BLOCK_INTERVAL;
                     let hb_subwindow = pos / 1440;
-                    // Emit at a per-node offset inside the subwindow, not at its boundary, so
-                    // 100k+ nodes spread (~70/block) instead of bursting in one block. Dedup
-                    // makes a late wake (pos already past offset) still emit once in-window.
+                    // Emit at a per-node offset inside the subwindow (not its boundary) so 100k+ nodes
+                    // spread (~70/block) instead of bursting in one block.
                     let hb_offset = Self::heartbeat_offset(&node_id, hb_subwindow);
-                    if last_hb_subwindow != Some((hb_epoch, hb_subwindow)) && (pos % 1440) >= hb_offset {
-                        if let Some(hb_tx) = Self::create_heartbeat_tx_static(&storage, &node_id, current_height).await {
-                            if let Ok(hb_bytes) = bincode::serialize(&hb_tx) {
-                                let hb_gp = hb_tx.gas_price;
-                                if mempool.add_binary_transaction(hb_bytes.clone(), hb_tx.hash.clone(), hb_gp) {
-                                    if let Some(ref p2p) = unified_p2p {
-                                        let _ = p2p.broadcast_transaction(hb_bytes);
-                                    }
-                                    last_hb_subwindow = Some((hb_epoch, hb_subwindow));
-                                    if is_info() {
-                                        println!("[INFO][HEARTBEAT] emitted node={} epoch={} subwindow={} at_h={}",
-                                                 node_id, hb_epoch, hb_subwindow, current_height);
+                    if (pos % 1440) >= hb_offset {
+                        // Done once our own heartbeat for this subwindow is recorded on-chain.
+                        let included = storage.load_account(&node_id).ok().flatten()
+                            .map(|a| a.heartbeat_epoch == hb_epoch
+                                  && (a.heartbeat_slots & (1u16 << hb_subwindow.min(9))) != 0)
+                            .unwrap_or(false);
+                        let first = !matches!(last_hb_emit, Some((e, s, _)) if e == hb_epoch && s == hb_subwindow);
+                        let reanchor = matches!(last_hb_emit, Some((_, _, h)) if current_height.saturating_sub(h) >= HB_REEMIT_INTERVAL);
+                        if !included && (first || reanchor) {
+                            if let Some(hb_tx) = Self::create_heartbeat_tx_static(&storage, &node_id, current_height).await {
+                                if let Ok(hb_bytes) = bincode::serialize(&hb_tx) {
+                                    let hb_gp = hb_tx.gas_price;
+                                    if mempool.add_binary_transaction(hb_bytes.clone(), hb_tx.hash.clone(), hb_gp) {
+                                        if let Some(ref p2p) = unified_p2p {
+                                            let _ = p2p.broadcast_transaction(hb_bytes);
+                                        }
+                                        last_hb_emit = Some((hb_epoch, hb_subwindow, current_height));
+                                        if is_info() {
+                                            println!("[INFO][HEARTBEAT] emitted node={} epoch={} subwindow={} at_h={}",
+                                                     node_id, hb_epoch, hb_subwindow, current_height);
+                                        }
                                     }
                                 }
                             }
@@ -13897,8 +13936,9 @@ impl BlockchainNode {
                                     let mut stall_count = 0u32; // Track consecutive no-progress iterations
 
                                     loop {
-                                        // Re-read current network height (may have advanced)
-                                        let target = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
+                                        // Re-read current network height (may have advanced) via the clamped
+                                        // chokepoint so a forged head can't inflate the bulk target.
+                                        let target = p2p_clone.get_best_peer_height();
                                         let target = std::cmp::max(target, network_height); // At least initial target
 
                                         // Sync cursor SLAVED to the real applied chain height: always request
@@ -14012,7 +14052,7 @@ impl BlockchainNode {
                                                 // v32.1: re-verify network tip via authoritative peer-quorum height
                                                 // before declaring sync complete. BEST_PEER_HEIGHT alone can lag
                                                 // attestation TTL; pull live quorum max so we don't exit early.
-                                                let best_atomic = crate::unified_p2p::BEST_PEER_HEIGHT.load(Ordering::Relaxed);
+                                                let best_atomic = p2p_clone.get_best_peer_height();
                                                 let quorum_max = p2p_clone.get_max_peer_height();
                                                 let new_target = best_atomic.max(quorum_max);
                                                 if current_from + 3 >= new_target {

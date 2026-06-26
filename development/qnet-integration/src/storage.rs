@@ -10760,7 +10760,13 @@ impl Storage {
                 // first tail block (anchor+1) computes a near-empty state_root → state_root_mismatch →
                 // rollback → apply circuit-breaker wedge. Fail-closed: on any rehydrate failure return
                 // Err so the caller falls back to block-sync from a clean base.
-                self.rehydrate_inmem_state_from_promoted_cf(state, snapshot_height).await?;
+                if let Err(e) = self.rehydrate_inmem_state_from_promoted_cf(state, snapshot_height).await {
+                    // Rehydrate rejected the promoted snapshot (state_root mismatch) and cleared in-mem
+                    // state. promote already advanced on-disk chain_height to the snapshot; reset it so
+                    // the fallback block-sync restarts from genesis, not an orphaned mid-chain height.
+                    let _ = self.reset_chain_height();
+                    return Err(e);
+                }
 
                 if target_height > snapshot_height {
                     println!("[INFO][STORAGE] sync_remaining_start count={}",
