@@ -1952,13 +1952,13 @@ pub enum ReputationEvent {
     // DEPRECATED CONSENSUS EVENTS - DO NOT USE!
     // Reputation now computed from blockchain via DeterministicReputationState
     // ═══════════════════════════════════════════════════════════════════════
-    #[deprecated(note = "Use DeterministicReputationState.process_block() - reputation from blockchain")]
+    #[deprecated(note = "RAM telemetry only; consensus reputation is the on-chain equivocation ban-set")]
     FullRotationComplete,
-    #[deprecated(note = "Use SlashingEvent in MacroBlock - requires cryptographic proof")]
+    #[deprecated(note = "RAM telemetry only; slashing is the on-chain equivocation ban-set (cryptographic proof)")]
     InvalidBlock,
-    #[deprecated(note = "Use MacroBlockConsensusData.participants - recorded in blockchain")]
+    #[deprecated(note = "RAM telemetry only; participation/liveness is the on-chain heartbeat gate")]
     ConsensusParticipation,
-    #[deprecated(note = "Use SlashingEvent in MacroBlock - requires cryptographic proof")]
+    #[deprecated(note = "RAM telemetry only; slashing is the on-chain equivocation ban-set (cryptographic proof)")]
     MaliciousBehavior,
     
     // ═══════════════════════════════════════════════════════════════════════

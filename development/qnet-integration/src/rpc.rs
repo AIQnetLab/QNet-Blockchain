@@ -24,39 +24,26 @@ use tokio::sync::broadcast;
 // v2.96: HELPER FUNCTIONS FOR BLOCKCHAIN CONSENSUS DATA
 // ============================================================================
 
-/// Get node reputation from latest MacroBlock snapshot (blockchain consensus)
-/// This ensures ALL nodes return SAME value regardless of local state
+/// Node consensus reputation = binary {INITIAL_REPUTATION | 0}: the floor for every
+/// node, 0 for a cryptographically-proven equivocation offender. Read from the latest
+/// macroblock's anchored ban-set — a pure function of the committed chain, identical on
+/// every node. Macroblock bytes may be zstd-compressed.
 async fn get_reputation_from_snapshot(blockchain: &Arc<BlockchainNode>, node_id: &str) -> f64 {
     use qnet_consensus::deterministic_reputation::INITIAL_REPUTATION;
-    
-    // Get latest MacroBlock index
-    let current_height = blockchain.get_height().await;
-    let mb_index = current_height / 90; // 90 microblocks per macroblock
-    
-    // Try to load snapshot from latest macroblock
+    let mb_index = blockchain.get_height().await / 90;
     if mb_index > 0 {
-        match blockchain.get_storage().get_macroblock_by_height(mb_index) {
-            Ok(Some(mb_bytes)) => {
-                match bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
-                    Ok(macroblock) => {
-                        if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
-                            // Deserialize snapshot and get reputation
-                            match bincode::deserialize::<std::collections::HashMap<String, f64>>(snapshot_data) {
-                                Ok(reputation_map) => {
-                                    return *reputation_map.get(node_id).unwrap_or(&INITIAL_REPUTATION);
-                                }
-                                Err(_) => {}
-                            }
-                        }
+        if let Ok(Some(raw)) = blockchain.get_storage().get_macroblock_by_height(mb_index) {
+            let bytes = zstd::decode_all(&raw[..]).unwrap_or(raw);
+            if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&bytes) {
+                if let Some(ref ser) = mb.consensus_data.banned_validators {
+                    if let Ok(banned) = bincode::deserialize::<Vec<String>>(ser) {
+                        if banned.iter().any(|b| b == node_id) { return 0.0; }
                     }
-                    Err(_) => {}
                 }
             }
-            _ => {}
         }
     }
-    
-    INITIAL_REPUTATION // Initial reputation or fallback (70.0 from consensus config)
+    INITIAL_REPUTATION
 }
 
 // ============================================================================

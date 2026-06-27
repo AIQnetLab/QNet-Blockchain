@@ -1,1008 +1,115 @@
-# QNET Deterministic Reputation System v2.61
+# QNet Reputation & Liveness
 
-## Overview
+## Model: binary consensus reputation
 
-QNET uses a **deterministic blockchain-based reputation system** that eliminates P2P gossip vulnerabilities.
-All nodes compute identical reputation scores from on-chain data.
+Consensus reputation is **binary {70 | 0}** — a pure deterministic fold of the committed
+chain, identical on every node:
 
-**NEW in v2.61:** Strict sync check (N-1) for emergency producer selection!
+- Every node starts at `INITIAL_REPUTATION = 70`.
+- A node drops to `0` **only** on a cryptographically-proven equivocation (block double-sign
+  or same-round checkpoint double-vote). The ban is **permanent**.
+- The only consensus use is the admission gate: a node is eligible iff `reputation >= 70`
+  (`MIN_REPUTATION_BP = 7000`) — i.e. not equivocation-banned.
 
-**NEW in v2.40:** Block-based consensus phases eliminate cascade jailing!
+There is **no graduated score, jail, decay, or recovery** on the consensus path. Producer and
+committee selection is **uniform-VRF** among all eligible nodes — the reputation value never
+ranks anyone — so a gradient would feed nothing.
 
-**NEW in v4.0:** Dilithium3-VRF Secret Leader Election replaces deterministic selection — unpredictable, verifiable, post-quantum!
+### Why binary (design rationale)
 
-**NEW in v2.27:** Epoch-based validator sets eliminate gossip race conditions!
+- **Uniform-VRF** makes a graduated value useless for ranking and prevents validator-set
+  entrenchment at scale (a rank-by-reputation top-N locks out ~99% of nodes at 100k+).
+- **Proof-of-burn** economics (no locked stake): there is nothing to slash for downtime; the
+  Sybil cost is the one-time burn, and exclusion of failing nodes is delivered for free by the
+  liveness gate.
+- A mutable per-node "who failed / who was slow" counter is **timing-dependent** (nodes detect
+  timeouts at different moments) → divergent state → fork. It is therefore deliberately absent;
+  consensus eligibility must be a pure function of finalized chain state.
 
-**NEW in v2.24:** Reputation snapshots ensure 100% synchronization across all nodes!
+## What gates consensus (four layers, none is a reputation score)
 
-**Architecture Comparison:**
-| Feature | OLD (P2P Gossip) | NEW (Deterministic) |
-|---------|------------------|---------------------|
-| Data Source | P2P messages | Blockchain data |
-| Sybil Resistance | ❌ Vulnerable | ✅ Resistant |
-| Node Agreement | ❌ Can disagree | ✅ Always identical |
-| Evidence | ❌ Ephemeral keys | ✅ Cryptographic proof |
-| Synchronization | ❌ Gossip lag | ✅ Block-based |
-| Long-Range Attack | ❌ Vulnerable | ✅ Finality Checkpoints |
-| **Producer Selection** | ❌ Gossip races | ✅ MacroBlock snapshot (v2.27) |
+| Threat | Defense |
+|--------|---------|
+| Sybil / many identities | Proof-of-burn cost per node + 2f+1 committee burn-attestation binding each registration to a real on-chain burn |
+| Double-sign / equivocation | Cryptographic proof (Dilithium3) → permanent ban; ban-set anchored per-macroblock in `consensus_data.banned_validators`, re-verified each epoch (O(window), pruning-safe) |
+| Invalid block | Rejected at validation (sig/hash) before apply; if it reached a QC, requires proof = permanent-ban class |
+| Censorship by a producer | Uniform-VRF rotation (30 blocks/producer) + 2f+1 timeout-round failover; next producer from the same eligible pool |
+| Slot timeout / silent producer | Failover skips it, **no penalty** — missed-block attribution is deterministically unsound post-failover |
+| Offline / lagging node | Heartbeat-liveness gate: a non-heartbeating node deterministically drops from the eligible set within ~2 subwindows |
+| Absentee committee member | Carryover only with a signed on-chain commit in >=1 of the last 3 macroblocks |
+| VRF grinding | Selection entropy = SHA3 of the finalized N-2 macroblock; reputation is forbidden in the entropy |
 
----
+## Liveness: unforgeable on-chain heartbeats
 
-## Epoch-Based Validator Set (v2.27)
+Super/Genesis liveness (which also gates per-epoch rewards) is proven by on-chain `Heartbeat`
+transactions, not by RAM gossip:
 
-Producer selection now uses **MacroBlock snapshots** instead of gossip registry:
+- Each node emits ~10 tiny Dilithium-signed `Heartbeat` TXs per 4-hour epoch (one per
+  ~1440-block subwindow). Each TX is anchored to a recent canonical block hash (cannot be
+  pre-signed) and must be included within ~90 blocks of its anchor (cannot be backfilled). It is
+  verified at block validation against the node's registry public key.
+- A per-node subwindow bitmask lives in account-state (part of `state_root`). Reward eligibility
+  = `popcount(bitmask) >= 9` of 10 — recomputed identically by every node from the chain, with no
+  central tallier and no end-of-epoch scan.
+- Producer eligibility (Phase-2A) additionally requires a heartbeat in the current or previous
+  subwindow, so an offline/lagging node drops out automatically.
 
-### Data Structure
+Heartbeat network load scales linearly and stays negligible:
 
-```rust
-// Stored in MacroBlock.consensus_data.eligible_producers
-pub struct EligibleProducer {
-    pub node_id: String,      // Node identifier
-    pub reputation: f64,      // 0.0 - 1.0 (from reputation system)
-}
-```
+| Nodes | Heartbeats / 4h | Rate | Bandwidth |
+|-------|-----------------|------|-----------|
+| 1,000 | 10,000 | 0.7/s | 2.8 Kbit/s |
+| 10,000 | 100,000 | 7/s | 28 Kbit/s |
+| 100,000 | 1,000,000 | 70/s | 280 Kbit/s |
 
-### Epoch Flow
+Light nodes have a fixed 70 reputation, never produce blocks, and prove liveness via a
+deterministic per-window ping (shard-assigned, 1 ping per 4h).
 
-| Blocks | Source | Description |
-|--------|--------|-------------|
-| 1-90 | `genesis_constants.rs` | Static Genesis nodes |
-| 91-180 | MacroBlock #1 | Snapshot from block 90 |
-| 181-270 | MacroBlock #2 | Snapshot from block 180 |
-| ... | ... | Each epoch uses previous MacroBlock |
+## Slashing (equivocation only)
 
-### Benefits
+| Offense | Result | Evidence |
+|---------|--------|----------|
+| Double-sign (2 valid sigs, same height) | Permanent ban (rep 0) | `EquivocationProof` TX, re-verified (Dilithium3) |
+| Same-round checkpoint double-vote | Permanent ban | `VoteEquivocationProof` TX, re-verified |
+| Invalid block | Rejected before apply | Block validation (sig/hash) |
 
-1. **Determinism**: All nodes read same snapshot from blockchain
-2. **No Race Conditions**: Gossip propagation delays don't affect selection
-3. **Scalability**: MAX_VALIDATORS_PER_EPOCH = 1000 with deterministic sampling
-4. **Emergency Failover**: Uses same snapshot for consistency
+**Not slashable — missed blocks.** There is no deterministic post-facto "who should have
+produced" (no `original_producer` field, failover overwrites slot ownership, partitions cause
+false positives). Missed-block liveness is handled by the heartbeat gate + no-penalty failover,
+never by a slashing counter.
 
----
+The ban-set is a pure fold: `bans(N) = bans(N-1) ∪ {verified proofs in window N}`, anchored in
+the macroblock body and re-verified every epoch through `epoch_commitment` (the eligible set
+excludes banned). A stale or forged copy self-heals via `content_ok` fail-stop instead of forking.
 
-## Timing Constants
+## Finality checkpoints
 
-```
-Block interval:        1 second (microblock)
-Blocks per rotation:   30 blocks = 30 seconds
-Blocks per macroblock: 90 blocks = 90 seconds (1.5 minutes)
-Finality depth:        2 macroblocks = 180 blocks = 3 minutes
-```
-
-**Macroblock formula:** `macroblock_index = block_height / 90`
-
-Example:
-- Block 89 → Macroblock 0
-- Block 90 → Macroblock 1  
-- Block 180 → Macroblock 2
-
----
-
-## Constants
-
-```rust
-// Thresholds
-INITIAL_REPUTATION = 70.0       // Starting reputation (consensus threshold)
-MIN_CONSENSUS_REPUTATION = 70.0 // Minimum to participate in consensus
-MAX_REPUTATION = 100.0          // Maximum cap
-JAIL_THRESHOLD = 10.0           // Below = cannot recover
-
-// Rewards  
-REWARD_FULL_ROTATION = +2.0     // Completing FULL 30/30 block rotation as producer
-                                // ⚠️ Partial rotation = NO REWARD!
-REWARD_CONSENSUS_PARTICIPATION = +1.0  // Participating in macroblock (commit+reveal)
-
-// Penalties
-PENALTY_INVALID_BLOCK = -20.0   // Producing invalid block
-PENALTY_DOUBLE_SIGN = -50.0     // Signing two blocks at same height
-PENALTY_MISSED_BLOCK = -2.0     // Missing assigned block production
-PENALTY_MISSED_CONSENSUS = -1.0 // Commit without reveal
-
-// Passive Recovery (for nodes with 10-69% reputation)
-PASSIVE_RECOVERY_INTERVAL = 14400  // 4 hours
-PASSIVE_RECOVERY_AMOUNT = +1.0     // Per interval
-PASSIVE_RECOVERY_MIN = 10.0        // Minimum to recover
-PASSIVE_RECOVERY_MAX = 70.0        // Maximum from passive recovery
-```
-
----
-
-## State Transitions
-
-### Node States
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        NODE STATE DIAGRAM                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│    ┌──────────────┐                                                     │
-│    │   NEW NODE   │──────────────────────────────────────┐              │
-│    │   (70%)      │                                      │              │
-│    └──────┬───────┘                                      │              │
-│           │                                              │              │
-│           │ Block production / Consensus                 │              │
-│           ▼                                              │              │
-│    ┌──────────────┐    Slashing     ┌──────────────┐    │              │
-│    │   ACTIVE     │◄───────────────►│  PENALIZED   │    │              │
-│    │  (70-100%)   │   (-20%)        │  (50-69%)    │    │              │
-│    └──────┬───────┘                 └──────┬───────┘    │              │
-│           │                                │              │              │
-│           │ +2% per rotation              │ Passive      │              │
-│           │ +1% per consensus             │ Recovery     │              │
-│           │                               │ +1%/4h       │              │
-│           ▼                               ▼              │              │
-│    ┌──────────────┐                ┌──────────────┐     │              │
-│    │    MAX       │                │  RECOVERING  │     │              │
-│    │   (100%)     │                │  (10-69%)    │     │              │
-│    └──────────────┘                └──────┬───────┘     │              │
-│                                           │              │              │
-│                                           │ Multiple     │              │
-│                                           │ offenses     │              │
-│                                           ▼              │              │
-│    ┌──────────────┐    Jail        ┌──────────────┐     │              │
-│    │  PERMANENT   │◄───────────────│   JAILED     │     │              │
-│    │    BAN       │  (5+ offenses  │   (0%)       │     │              │
-│    │   (0%)       │   or critical) └──────┬───────┘     │              │
-│    └──────────────┘                       │              │              │
-│                                           │ Jail expires │              │
-│                                           ▼              │              │
-│                                    ┌──────────────┐     │              │
-│                                    │ POST-JAIL    │◄────┘              │
-│                                    │  (10-30%)    │                     │
-│                                    └──────────────┘                     │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Jail System
-
-### Jail Durations (Progressive)
-
-| Offense # | Duration | Exit Reputation |
-|-----------|----------|-----------------|
-| 1st | 1 hour | 30% |
-| 2nd | 24 hours | 25% |
-| 3rd | 7 days | 20% |
-| 4th | 30 days | 15% |
-| 5th | 90 days | 12% |
-| 6+ | 1 year | 10% |
-
-### How Nodes Exit Jail
+Long-range protection: a macroblock is final once `FINALITY_DEPTH = 2` macroblocks carry
+`FINALITY_THRESHOLD = 0.67` (2f+1) committee signatures.
 
 ```rust
-// In process_macroblock():
-if current_timestamp >= jail_end {
-    // 1. Remove from active_jails
-    self.active_jails.remove(&node_id);
-    
-    // 2. Restore reputation based on offense count
-    let restore_rep = match offense_count {
-        1 => 30.0,
-        2 => 25.0,
-        3 => 20.0,
-        4 => 15.0,
-        5 => 12.0,
-        _ => 10.0,
-    };
-    self.reputations.insert(node_id, restore_rep);
-    
-    // 3. Reset passive recovery timer
-    self.last_passive_recovery.insert(node_id, current_timestamp);
-}
-```
-
----
-
-## Recovery Mechanisms
-
-### 1. Passive Recovery (10-69% → 70%)
-
-**Who qualifies:**
-- Reputation between 10% and 69%
-- Not jailed
-- Not permanently banned
-- Online (connected via P2P with recent heartbeat)
-
-**IMPORTANT:** "Online" ≠ "in consensus"!
-- Nodes with rep < 70% **cannot** participate in consensus (commit/reveal)
-- But they **can** stay connected via P2P and respond to heartbeats
-- This allows them to passively recover by proving they're online
-
-**How it works:**
-```rust
-// Get online nodes from P2P (connected with heartbeat in last 5 min)
-let online_nodes = p2p.get_online_node_ids();
-
-// Every macroblock, check online nodes with 10-69%:
-for node_id in online_nodes {
-    if current_rep >= 10.0 && current_rep < 70.0 {
-        if current_timestamp >= last_recovery + 14400 { // 4 hours
-            new_rep = (current_rep + 1.0).min(70.0);
-        }
-    }
-}
-```
-
-**Recovery Time Examples:**
-| Exit Reputation | Time to 70% |
-|-----------------|-------------|
-| 30% (1st offense) | 160 hours (6.7 days) |
-| 25% (2nd offense) | 180 hours (7.5 days) |
-| 20% (3rd offense) | 200 hours (8.3 days) |
-| 15% (4th offense) | 220 hours (9.2 days) |
-| 12% (5th offense) | 232 hours (9.7 days) |
-| 10% (6+ offense) | 240 hours (10 days) |
-
-### 2. Active Recovery (70%+ → 100%)
-
-Once at 70%, nodes can grow reputation through:
-- **Block Production:** +2% per FULL 30/30 block rotation
-  - ⚠️ **CRITICAL:** Partial rotation (failover) = NO REWARD!
-  - Producer must complete ALL 30 blocks without failover
-- **Consensus Participation:** +1% per macroblock (commit + reveal)
-
-**Time to 100%:**
-- Consistent producer: ~15 rotations = 450 blocks = ~7.5 minutes
-- Consensus only: ~30 macroblocks = ~45 minutes
-
----
-
-## Light Nodes
-
-**Fixed 70% reputation** - Light nodes:
-- ✅ Always have 70% reputation
-- ❌ Never participate in consensus (excluded by `NodeType::Light`)
-- ✅ Can receive rewards via ping service
-- ✅ Pings tracked for uptime rewards
-
-### Light Node Ping System (1 ping per 4 hours)
-
-Light nodes are **pinged by Genesis nodes** once per 4-hour window:
-
-**How it works:**
-1. Genesis nodes run `start_light_node_ping_service()` (see `rpc.rs:5557`)
-2. Service checks every 60 seconds for Light nodes to ping
-3. Light nodes are assigned to **shards** (0-255) based on node_id hash
-4. Each Genesis node only pings Light nodes in **its shard** (1/256 of total)
-5. **Deterministic pinger selection:** Primary + 2 Backups per Light node
-6. Light node responds to ping → creates `LightNodeAttestation`
-7. Attestation is gossiped to all nodes
-
-> **Note:** The Light ping path is **not yet unforgeable** (hardening pending). Light eligibility = ≥1 valid attestation per epoch, scheduled in a deterministic slot per node per window as described above.
-
-**Timing:**
-- Slot duration: 1 minute (240 slots per 4h window)
-- Each Light node has 1 deterministic slot for ping
-- FCM/UnifiedPush/Polling methods supported
-
-```rust
-// PingRequirements for Light nodes:
-NodeType::Light => Self {
-    pings_per_4h_window: 1,      // 1 ping per 4 hours
-    success_rate_threshold: 1.0, // 100% (binary: respond or not)
-    timeout_seconds: 60,         // 60 seconds to respond
-}
-```
-
-**Reward eligibility:**
-- ✅ At least 1 successful attestation in 4h window → eligible for QNC reward
-- ❌ No attestation → no reward for that window
-
-```rust
-// In can_produce_blocks():
-match node_type {
-    NodeType::Light => false, // Never produce blocks
-    NodeType::Full | NodeType::Super => reputation >= 70.0,
-}
-```
-
----
-
-## QNC Token Rewards (v2.21.1)
-
-### Liveness via Unforgeable On-Chain Heartbeats (v34)
-
-**Critical Change:** Super/Genesis node liveness (which gates per-epoch rewards) is now proven by **unforgeable on-chain `Heartbeat` transactions**, NOT by the self-attested `HeartbeatCommitment` (HBC) count.
-
-- Each Super/Genesis node emits **~10 tiny on-chain `Heartbeat` TXs per 4-hour epoch** (one per ~1440-block subwindow). Each TX is **Dilithium-signed**, **anchored to a recent canonical block hash** (cannot be pre-signed), and **must be included within ~90 blocks of its anchor** (cannot be backfilled). It is verified at block validation against the node's registry public key.
-- A per-node **subwindow bitmask** lives in account-state (part of `state_root`). Reward eligibility = `popcount(bitmask) >= 9` of 10 per epoch — the **same 9/10 threshold, now UNFORGEABLE**. Every node recomputes it identically from the chain; there is **no central tallier and no end-of-epoch scan**.
-- **HBC is still sent once per epoch** and still drives node **onboarding / eligible-producer discovery**, but its self-reported `heartbeat_count` is **no longer trusted for reward eligibility** — the on-chain counter overrides it.
-
-The RAM-based gossip heartbeat flow documented below predates this change. It still describes onboarding/discovery signaling, but reward eligibility for Super/Genesis is now decided by the on-chain subwindow bitmask, not by the gossiped/self-reported count.
-
-### Full Heartbeat System Audit (A to Z)
-
-#### Step 1: Service Start
-**Location:** `rpc.rs:1890`
-```rust
-// In start_rpc_server(), after all routes setup:
-p2p.start_heartbeat_service(move || {
-    blockchain_for_heartbeat.get_height().await
-});
-```
-
-#### Step 2: Heartbeat Service Loop
-**Location:** `unified_p2p.rs:10097` - `start_heartbeat_service()`
-
-```rust
-// Thread with infinite loop, checks every 30 seconds
-std::thread::spawn(move || {
-    loop {
-        // Calculate 10 deterministic heartbeat times for this node
-        let heartbeat_times = calculate_heartbeat_times_for_node(&node_id);
-        
-        for (index, heartbeat_time) in heartbeat_times.iter().enumerate() {
-            // Check if heartbeat is due (within 60 second window)
-            if now >= *heartbeat_time && now < *heartbeat_time + 60 {
-                // v2.21.1 FIX: Check reputation before sending!
-                if our_reputation < 70.0 {
-                    continue; // Skip - not eligible
-                }
-                // Send heartbeat...
-            }
-        }
-        std::thread::sleep(Duration::from_secs(30));
-    }
-});
-```
-
-#### Step 3: Deterministic Timing
-**Location:** `unified_p2p.rs:11192` - `calculate_heartbeat_times_for_node()`
-
-```rust
-// Each node has 10 deterministic times based on node_id hash
-// Spread evenly across 4h window (every 24 minutes on average)
-fn calculate_heartbeat_times_for_node(node_id: &str) -> Vec<u64> {
-    let hash = DefaultHasher::new().hash(node_id);
-    let current_4h_window = now - (now % (4 * 60 * 60));
-    
-    // 10 times, each offset by hash + index
-    (0..10).map(|i| {
-        let slot = (hash + i as u64) % 240; // 240 minutes in 4h
-        current_4h_window + slot * 60
-    }).collect()
-}
-```
-
-#### Step 4: Heartbeat Message
-**Location:** `unified_p2p.rs:10170`
-
-```rust
-NetworkMessage::NodeHeartbeat {
-    node_id: String,           // Who is sending
-    node_type: String,         // "full" or "super"
-    timestamp: u64,            // Unix timestamp
-    block_height: u64,         // Current blockchain height
-    signature: String,         // Ed25519 ephemeral signature
-    heartbeat_index: u8,       // 0-9 (which of 10 heartbeats)
-    gossip_hop: u8,            // TTL counter (max 3)
-}
-```
-
-#### Step 5: Gossip to Network
-**Location:** `unified_p2p.rs:10184`
-```rust
-// Send to K closest peers by XOR distance (DHT routing)
-p2p.gossip_to_k_neighbors(heartbeat_msg, 3);
-```
-
-#### Step 6: Receive & Validate
-**Location:** `unified_p2p.rs:8988` - `NodeHeartbeat` handler
-
-```rust
-// Validation checks:
-// 1. Gossip TTL: max 3 hops
-// 2. Timestamp: within ±5 minutes
-// 3. Dedupe: not already received for this 4h window
-// 4. v2.21.1 FIX: Reputation >= 70%
-// 5. Ed25519 signature verification
-```
-
-#### Step 7: Store in RAM
-**Location:** `unified_p2p.rs:9108`
-
-```rust
-// Storage structure:
-heartbeat_history: Arc<RwLock<HashMap<String, HeartbeatRecord>>>
-
-// Key format: "{node_id}:{heartbeat_index}" (e.g., "node_001:5")
-// Value:
-pub struct HeartbeatRecord {
-    pub node_id: String,
-    pub timestamp: u64,
-    pub heartbeat_index: u8,      // 0-9
-    pub signature: String,
-    pub verified: bool,           // Always true after validation
-}
-```
-
-#### Step 8: Count for Rewards
-**Location:** `unified_p2p.rs:11099` - `get_heartbeats_for_window()`
-
-```rust
-// Filter heartbeats by 4h window
-pub fn get_heartbeats_for_window(&self, window_start: u64) -> Vec<(String, u8, u64)> {
-    let window_end = window_start + (4 * 60 * 60);
-    heartbeats.values()
-        .filter(|h| h.timestamp >= window_start && h.timestamp < window_end)
-        .map(|h| (h.node_id.clone(), h.heartbeat_index, h.timestamp))
-        .collect()
-}
-```
-
-#### Step 9: Eligibility Check
-**Location:** `unified_p2p.rs:11131` - `get_eligible_full_super_nodes()`
-
-```rust
-// Count heartbeats per node, then filter:
-.filter(|(node_id, node_type, count)| {
-    // v2.21.1 FIX: Check reputation!
-    let reputation = self.get_node_reputation(node_id);
-    if reputation < 70.0 {
-        return false;
-    }
-    
-    // Eligibility thresholds:
-    match node_type.as_str() {
-        "super" => *count >= 9,  // 90% success rate
-        "full" => *count >= 8,   // 80% success rate
-        _ => false,
-    }
-})
-```
-
-> **v34:** For Super/Genesis nodes this gossip-derived `count` is **no longer authoritative**. Reward eligibility is decided by the on-chain subwindow bitmask (`popcount(bitmask) >= 9` of 10), recomputed identically by every node from the chain. This filter remains for onboarding/discovery only.
-
-#### Step 10: Process Rewards
-**Location:** `node.rs:622` - `process_reward_window()`
-
-```rust
-// Called every 4 hours by system
-// 1. Get eligible Full/Super nodes
-let eligible_full_super = p2p.get_eligible_full_super_nodes(window_start);
-
-// 2. Register and record pings for each
-for (node_id, node_type, count) in eligible_full_super {
-    reward_manager.register_node(node_id, reward_type, wallet);
-    for _ in 0..count {
-        reward_manager.record_ping_attempt(&node_id, true, 0);
-    }
-}
-
-// 3. Calculate and emit rewards
-reward_manager.force_process_window();
-```
-
-#### Step 11: Cleanup
-**Location:** `unified_p2p.rs:10393` - `cleanup_old_heartbeats()`
-
-```rust
-// Remove heartbeats older than 24 hours
-let cutoff = now - (24 * 60 * 60);
-history.retain(|_, record| record.timestamp >= cutoff);
-```
-
-### v2.41 On-Chain Heartbeat Recording
-
-**Critical Change:** Heartbeats are now recorded in MacroBlock for deterministic rewards!
-
-#### Flow (v2.41.1):
-```
-1. Full/Super send heartbeats → Gossip → heartbeat_history (RAM)
-2. MacroBlock creation:
-   - Regular MacroBlock (#1-159): reward_heartbeats = None
-   - EMISSION MacroBlock (#160, #320...): collect heartbeats → blockchain!
-3. EMISSION = every 160th MacroBlock (14400 microblocks / 90 = 160)
-4. MacroBlock sync:
-   - Regular: don't process rewards
-   - EMISSION: process_macroblock_heartbeats() → calculate rewards
-5. All nodes read SAME data from blockchain = deterministic!
-```
-
-**Location:** `node.rs:15547` - MacroBlock sync
-
-```rust
-const EMISSION_MACROBLOCK_INTERVAL: u64 = 160; // 4 hours
-let is_emission_macroblock = index > 0 && index % EMISSION_MACROBLOCK_INTERVAL == 0;
-
-if is_emission_macroblock {
-    if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
-        // Deserialize and process rewards
-        reward_manager.process_macroblock_heartbeats(&summary_data);
-    }
-}
-```
-
-**Strict Node ID Validation (v2.41.1):**
-- Valid formats: `light_*`, `full_*`, `super_*`, `genesis_node_*`
-- Invalid formats: **REJECTED** (no default assignments!)
-
-### Requirements Summary
-
-| Node Type | Pings/4h | Required | Success Rate | Timeout | Reputation |
-|-----------|----------|----------|--------------|---------|------------|
-| Super | 10 on-chain Heartbeat TXs | 9+ | 90% | 30 sec | >= 70% |
-| Full | 10 heartbeats | 8+ | 80% | 30 sec | >= 70% |
-| Light | 1 ping (by Genesis) | 1 | 100% | 60 sec | Fixed 70% |
-
-> **v34:** Super/Genesis eligibility (the 9-of-10 requirement) is now proven by the **on-chain subwindow bitmask** (`popcount >= 9`), not by self-reported heartbeat counts. Light nodes are pinged by **Genesis** nodes; their path is not yet unforgeable.
-
-### Scalability Analysis
-
-**Heartbeat loop (30 sec interval):**
-- Loop only CHECKS timer, doesn't send every 30 sec
-- Real heartbeat sent only when `now >= heartbeat_time`
-- 10 heartbeats spread across 4h = every ~24 minutes
-- CPU cost: ~0% (just comparing timestamps)
-
-**Network load for heartbeats:**
-| Nodes | Heartbeats/4h | Rate | Bandwidth |
-|-------|---------------|------|-----------|
-| 1,000 | 10,000 | 0.7/sec | 2.8 Kbit/s |
-| 10,000 | 100,000 | 7/sec | 28 Kbit/s |
-| 100,000 | 1,000,000 | 70/sec | 280 Kbit/s |
-
-**Light node sharding (256 shards):**
-- Each Genesis node pings only 1/256 of Light nodes
-- 1M Light nodes → each Genesis node pings ~3,906 nodes
-- 3,906 / 240 slots = ~16 pings/minute per Genesis node
-
-### 3-Layer Reputation Protection (v2.21.1)
-
-| Layer | Location | Check | Attack Prevented |
-|-------|----------|-------|------------------|
-| 1️⃣ Sender | `start_heartbeat_service` | Own rep >= 70% | Low-rep node flooding |
-| 2️⃣ Receiver | `NodeHeartbeat` handler | Sender rep >= 70% | Sybil replay attacks |
-| 3️⃣ Reward | `get_eligible_full_super_nodes` | Node rep >= 70% | Edge cases, races |
-
----
-
-## Failover Helpers
-
-**No special reputation bonus** for failover participation:
-- Emergency producer selection based on existing reputation
-- Reward comes via normal block production (+2% per rotation)
-- Prevents gaming of failover system
-
----
-
-## Slashing & Jailing (v2.40)
-
-### Architecture: Cryptographic Proof Only
-
-Slashing is applied **ONLY** for offenses with cryptographic proof.
-This prevents false positives from network delays or P2P gossip inconsistencies.
-
-### Slashable Offenses
-
-| Type | Penalty | Evidence Required | Detection |
-|------|---------|-------------------|-----------|
-| DoubleSign | -100% + Permanent Ban | 2 signatures at same height | On-chain analysis |
-| InvalidBlock | -20% | Invalid signature/hash | Block validation |
-| ChainFork | -100% + Permanent Ban | Conflicting blocks | On-chain analysis |
-
-### NOT Slashable (v2.38+)
-
-| Type | Reason | Alternative |
-|------|--------|-------------|
-| MissedBlocks | Cannot prove "who should have produced" | Reputation decay (no reward) |
-
-### Automatic Jails: REMOVED (v2.40)
-
-| Before (v2.39) | After (v2.40) |
-|----------------|---------------|
-| Commit without reveal = 1h jail | **No jail** |
-| Cascade jail effect | **Impossible** |
-| Timing issues = offense | **Timing issues = NOT offense** |
-
-**Why removed:**
-- Block-based phases mean nodes may miss reveal window due to network latency
-- This is NOT a provable offense (cannot determine if malicious or network issue)
-- Alternative: -1% reputation penalty (`PENALTY_MISSED_CONSENSUS`)
-- Node can still participate in next consensus (89% > 70% threshold)
-
-### Macroblock Finality & Participation (Checkpoint-BFT v2)
-
-Macroblock finality no longer uses commit/reveal phases. Each 90-block window is
-finalized by a single checkpoint and one 2f+1 quorum certificate. Reputation
-tracks committee participation against that single signing event:
-
-```
-Window per 90-block epoch:
-├── Blocks N*90+1 .. (N+1)*90:  Production (microblocks)
-└── Block (N+1)*90 (boundary):  Checkpoint — committee signs the window content
-                                 (90 mb hashes + state_root + VRF beacon + epoch)
-
-Macroblock is final once >= 2f+1 committee signatures form the Quorum Certificate.
-```
-
-**Participation accounting:**
-| Action | Reputation effect |
-|--------|-------------------|
-| Signed a valid checkpoint (in committee) | positive participation |
-| Failed content_ok / withheld signature | no automatic jail (timing != offense) |
-
-### Collection Flow (v2.38)
-
-```
-                    ON-CHAIN SLASHING ANALYSIS
-                    
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  MacroBlock     │────►│ analyze_chain_  │────►│ SlashingEvent   │
-│  Creation       │     │ for_slashing()  │     │ (if proof)      │
-└─────────────────┘     └─────────────────┘     └────────┬────────┘
-                                                         │
-                        Checks for:                      │
-                        - Double-sign (2 sigs @ height)  │
-                        - Invalid blocks                 │
-                                                         ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ All nodes apply │◄────│ process_        │◄────│ MacroBlock      │
-│ same penalties  │     │ macroblock()    │     │ ConsensusData   │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-
-Result: DETERMINISTIC - all nodes analyzing same chain = same result!
-```
-
-### Emergency Failover (NOT Slashing)
-
-```
-Emergency notification → Failover only (chain continues)
-                       → NO immediate slashing
-                       → Producer recorded in block.producer
-                       → Reputation: no reward for missed rotation
-```
-
----
-
-## Network Impact
-
-### Storage
-- Reputation: `HashMap<node_id, f64>` (~100 bytes/node)
-- Jails: `HashMap<node_id, (timestamp, count)>` (~50 bytes/node)
-- Bans: `HashSet<node_id>` (~30 bytes/node)
-- **1000 nodes ≈ 180 KB RAM**
-
-### Network Traffic
-- **ZERO** for reputation queries (local blockchain data)
-- SlashingEvent: ~200 bytes in macroblock
-- Overhead: <1% of macroblock size
-
-### Performance
-- `get_reputation()`: O(1)
-- `process_block()`: O(1)
-- `process_macroblock()`: O(n) where n = participants (~5-20)
-- `apply_passive_recovery()`: O(m) where m = online nodes
-
----
-
-## Initialization
-
-### Genesis Nodes
-```rust
-fn init_genesis_nodes(&mut self, genesis_ids: &[String]) {
-    for id in genesis_ids {
-        self.reputations.insert(id.clone(), INITIAL_REPUTATION); // 70%
-    }
-}
-```
-
-### New Nodes
-- Start with 70% (INITIAL_REPUTATION)
-- Immediately eligible for consensus if Full/Super type
-
----
-
-## Finality Checkpoints (v2.1)
-
-**Protection against long-range attacks:**
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    FINALITY TIMELINE                             │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  Block 0────────Block 90────────Block 180────────Block 270      │
-│         │               │                │                │      │
-│         ▼               ▼                ▼                ▼      │
-│    Macroblock 0    Macroblock 1    Macroblock 2    Macroblock 3 │
-│         │               │                │                │      │
-│         │               │                ▼                │      │
-│         │               │          FINAL (2/3+)           │      │
-│         │               ▼                                 │      │
-│         │         Checkpoint created                      │      │
-│         ▼         (collecting sigs)                       │      │
-│    NOT FINAL                                              │      │
-│                                                                  │
-│  After 2 macroblocks with 2/3+ signatures = IRREVERSIBLE        │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Key structures:**
-```rust
-pub const FINALITY_DEPTH: u64 = 2;        // 2 macroblocks = 180 blocks = 3 min
-pub const FINALITY_THRESHOLD: f64 = 0.67; // 2/3+1 signatures required
+pub const FINALITY_DEPTH: u64 = 2;
+pub const FINALITY_THRESHOLD: f64 = 0.67;
 
 pub struct FinalityCheckpoint {
     pub macroblock_index: u64,
     pub macroblock_hash: [u8; 32],
-    pub signatures: HashMap<String, Vec<u8>>,  // 2/3+ validators
+    pub signatures: HashMap<String, Vec<u8>>, // 2f+1 validators
     pub is_final: bool,
 }
 ```
 
-**Usage:**
-```rust
-// Check if block is finalized
-let is_final = finality_manager.is_height_finalized(block_height);
+## Off-consensus telemetry
 
-// Get last finalized height
-let final_height = finality_manager.last_finalized_height();
-```
+A richer reputation/uptime score may be kept for explorer/operator display, but it is RAM-local
+and must **never** feed eligibility, `epoch_commitment`, or any QC-bound field.
 
----
+## Code locations
 
-## Full Reputation Snapshot (v2.24)
-
-### Problem: Reputation Drift
-
-Before v2.24, nodes could have different reputation values due to:
-- Out-of-order block processing
-- Failed deserialization of some blocks
-- Different blockchain heights
-
-### Solution: Deterministic Snapshots
-
-Every macroblock now contains a **FULL reputation snapshot** stored in blockchain:
-
-```rust
-/// Complete reputation snapshot (stored in ConsensusData)
-pub struct FullReputationSnapshot {
-    pub reputations: HashMap<String, f64>,       // Node reputations (0-100%)
-    pub active_jails: HashMap<String, (u64, u32)>, // Jail end time + offense count
-    pub permanent_bans: HashSet<String>,          // Permanently banned nodes
-    pub offense_counts: HashMap<String, u32>,     // Progressive jail counter
-    pub last_passive_recovery: HashMap<String, u64>, // Recovery timers
-    pub processed_rotations: HashSet<u64>,        // Duplicate protection
-}
-```
-
-### How It Works
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    SNAPSHOT FLOW                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  Producer creates macroblock:                                        │
-│    → rep_state.create_snapshot()                                    │
-│    → Serialize ALL reputation state to bincode                       │
-│    → Store in ConsensusData.reputation_snapshot                     │
-│                                                                      │
-│  All nodes receive macroblock:                                       │
-│    → rep_state.apply_snapshot(snapshot_data)                        │
-│    → OVERWRITE local state with blockchain values                   │
-│    → All nodes now have IDENTICAL reputation!                        │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Security: Cannot Forge Reputation
-
-| Attack Vector | Protection |
-|--------------|------------|
-| Modify snapshot | Macroblock signed by 2/3+ validators |
-| Fake jails | Evidence verified in SlashingEvent |
-| Skip bans | permanent_bans in snapshot are authoritative |
-| Inflate reputation | Snapshot overwrites any local manipulation |
-
-### Storage Impact
-
-| Nodes | Snapshot Size | Per Macroblock |
-|-------|--------------|----------------|
-| 100 | ~15 KB | Negligible |
-| 1,000 | ~150 KB | 0.1% overhead |
-| 10,000 | ~1.5 MB | 1% overhead |
-
----
-
-## Scalability (1000+ nodes)
-
-**Built-in chunked processing for 10,000+ nodes:**
-
-```rust
-// Constants for scalability
-pub const PROCESSING_CHUNK_SIZE: usize = 1000;           // Chunk size
-pub const MAX_SLASHING_EVENTS_PER_MACROBLOCK: usize = 100; // DoS protection
-pub const MAX_AUTO_JAILS_PER_MACROBLOCK: usize = 50;       // Spam protection
-```
-
-| Operation | 100 nodes | 1,000 nodes | 10,000 nodes | 100,000 nodes |
-|-----------|-----------|-------------|--------------|---------------|
-| `get_reputation()` | O(1) ~1μs | O(1) ~1μs | O(1) ~1μs | O(1) ~1μs |
-| `process_block()` | O(1) ~5μs | O(1) ~5μs | O(1) ~5μs | O(1) ~5μs |
-| `process_macroblock()` | ~1ms | ~10ms | ~50ms | ~500ms (chunked) |
-| `apply_passive_recovery()` | ~0.5ms | ~5ms | ~25ms | ~250ms (chunked) |
-| RAM usage | ~10 KB | ~100 KB | ~1 MB | ~10 MB |
-
-**Chunked processing:**
-```rust
-// All operations process in chunks of 1000
-pub fn apply_passive_recovery(&mut self, online_nodes: &[String], ts: u64) {
-    for chunk in online_nodes.chunks(PROCESSING_CHUNK_SIZE) {
-        self.apply_passive_recovery_chunk(chunk, ts);
-    }
-}
-```
-
-**Statistics API:**
-```rust
-let stats = rep_state.get_stats();
-// ReputationStats {
-//     total_nodes: 10000,
-//     consensus_eligible: 8500,  // rep >= 70%
-//     recovering: 1200,          // rep 10-69%
-//     low_rep: 300,              // rep < 10%
-//     active_jails: 50,
-//     permanent_bans: 10,
-// }
-
-let memory = rep_state.estimate_memory_bytes(); // ~1MB for 10K nodes
-```
-
----
-
-## Comparison with Other Blockchains
-
-| Blockchain | Slashing | Recovery | On-Chain | Finality |
-|------------|----------|----------|----------|----------|
-| Ethereum 2.0 | ✅ Yes | ✅ Withdrawal queue | ✅ Yes | ✅ 2 epochs |
-| Cosmos/Tendermint | ✅ Yes | ✅ Unjail tx | ✅ Yes | ✅ Instant |
-| Polkadot | ✅ Yes | ✅ Unbonding | ✅ Yes | ✅ GRANDPA |
-| Solana | ❌ Soft | ❌ N/A | ❌ No | ❌ Probabilistic |
-| **QNET** | ✅ Yes | ✅ Passive + Active | ✅ Yes | ✅ 2 macroblocks |
-
----
-
-## Code Locations
-
-| Component | File | Function |
-|-----------|------|----------|
-| State | `deterministic_reputation.rs` | `DeterministicReputationState` |
-| Block Processing | `node.rs` | `process_received_blocks()` |
-| Macroblock | `node.rs` | line ~2920 |
-| Slashing Collector | `unified_p2p.rs` | `slashing_collector` |
-| Report Invalid | `unified_p2p.rs` | `report_invalid_block()` |
-| Finality | `macro_consensus.rs` | `FinalityManager` |
-
----
-
-## Tests
-
-Run audit: `python tests/reputation_audit.py`
-
-| Test | Status |
-|------|--------|
-| Initial Reputation | ✅ |
-| Block Production Reward | ✅ |
-| Consensus Participation | ✅ |
-| Commit Without Reveal | ✅ |
-| Slashing Invalid Block | ✅ |
-| Double Sign Ban | ✅ |
-| Automatic Jail | ✅ |
-| Jail Exit & Recovery | ✅ |
-| Progressive Jail | ✅ |
-| Reputation Caps | ✅ |
-| Finality Checkpoint | ✅ |
-| Invalid Evidence | ✅ |
-| Deterministic Consistency | ✅ |
-| Memory Efficiency | ✅ |
-| Light Nodes | ✅ |
-| **SHRED Protocol Retransmit** | ✅ |
-
----
-
-## SHRED Protocol Retransmit (v2.21.3)
-
-### Overview
-
-The SHRED Protocol Retransmit mechanism enables efficient recovery of missing block chunks
-without downloading entire blocks. This significantly reduces bandwidth usage and improves
-block propagation reliability.
-
-### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    SHRED RETRANSMIT FLOW                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  1. Node receives chunks for block #100                                 │
-│     └── Got: 9/12 data chunks + 3/6 parity                              │
-│     └── Missing: chunks 3, 7, 11                                        │
-│                                                                         │
-│  2. After 3 seconds timeout:                                            │
-│     └── RequestMissingChunks { block: 100, indices: [3, 7, 11] }        │
-│     └── Sent to 3-10 peers (adaptive based on network size)             │
-│                                                                         │
-│  3. Peers with cached chunks respond:                                   │
-│     └── MissingChunksResponse { block: 100, chunks: [...] }             │
-│                                                                         │
-│  4. Node reconstructs block:                                            │
-│     └── Reed-Solomon if needed                                          │
-│     └── Block saved to storage                                          │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Constants
-
-```rust
-SHRED_CHUNK_TIMEOUT_SECS = 3    // Timeout before requesting missing chunks
-SHRED_CHUNK_CACHE_SIZE = 100   // Cache last 100 blocks' chunks for retransmit
-SHRED_CHUNK_MAX_RETRIES = 2    // Maximum retransmit attempts per block
-```
-
-### Adaptive Peer Selection
-
-The number of peers to request chunks from scales with network size:
-
-| Network Size | Request Peers | Success Probability* |
-|--------------|---------------|---------------------|
-| 5-10 nodes | 3 | 87.5% |
-| 11-100 nodes | 5 | 96.9% |
-| 101-1,000 nodes | 6 | 98.4% |
-| 1,001-10,000 nodes | 7 | 99.2% |
-| 10,001-100,000 nodes | 8 | 99.6% |
-| >100,000 nodes | 10 | 99.9% |
-
-*Assuming 50% of peers have the chunk cached
-
-### Bandwidth Savings
-
-| Scenario | Full Block Download | Retransmit | Savings |
-|----------|---------------------|------------|---------|
-| 2 missing chunks | 12KB | 2KB | 83% |
-| 3 missing chunks | 12KB | 3KB | 75% |
-| 5 missing chunks | 12KB | 5KB | 58% |
-
-### NetworkMessage Types
-
-```rust
-// Request missing chunks
-RequestMissingChunks {
-    block_height: u64,
-    missing_indices: Vec<usize>,
-    requester_id: String,
-    timestamp: u64,
-}
-
-// Response with chunks
-MissingChunksResponse {
-    block_height: u64,
-    chunks: Vec<(usize, Vec<u8>, bool)>,  // (index, data, is_parity)
-    original_block_size: usize,
-    is_macroblock: bool,
-    sender_id: String,
-}
-```
-
-### Macroblock Support
-
-✅ Retransmit works for both microblocks and macroblocks:
-- `is_macroblock` flag preserved in cache and responses
-- Larger macroblock chunks handled correctly
-- Reed-Solomon parity works for both block types
-
-### Privacy
-
-All peer addresses in logs use pseudonyms via `get_privacy_id_for_addr()`:
-- Real IPs are never logged
-- Pseudonyms generated from hash of IP address
-- Genesis node IDs preserved for identification
-
-
+| Component | File | Symbol |
+|-----------|------|--------|
+| Consensus reputation fold {70\|0} | `node.rs` | `compute_consensus_reputation_map` |
+| Equivocation ban-set | `node.rs` | `compute_cumulative_ban_set` |
+| Eligible producers + heartbeat gate | `node.rs` | `create_eligible_producers_snapshot` |
+| Parameters | `deterministic_reputation.rs` | `INITIAL_REPUTATION`, `MIN_CONSENSUS_REPUTATION` |
+| Finality | `macro_consensus.rs` | `FinalityManager`, `FinalityCheckpoint` |

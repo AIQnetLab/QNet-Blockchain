@@ -150,11 +150,6 @@ pub struct ConsensusData {
     // Stored in blockchain for all nodes to compute identical reputation
     // ═══════════════════════════════════════════════════════════════════
     
-    /// Serialized slashing events with cryptographic proof
-    /// Format: bincode serialized Vec<SlashingEventData>
-    #[serde(default)]
-    pub slashing_events_data: Option<Vec<u8>>,
-
     /// v2 SCALE ANCHOR: cumulative equivocation ban-set as of THIS macroblock.
     /// Format: bincode serialized Vec<String> (sorted node_ids).
     ///
@@ -168,23 +163,6 @@ pub struct ConsensusData {
     #[serde(default)]
     pub banned_validators: Option<Vec<u8>>,
 
-    /// Serialized automatic jails (computed deterministically)
-    /// Format: bincode serialized Vec<AutomaticJailData>
-    #[serde(default)]
-    pub automatic_jails_data: Option<Vec<u8>>,
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // REPUTATION SNAPSHOT (v2.24.0)
-    // Snapshot stored in macroblock for consistency across all nodes
-    // All nodes MUST have identical reputation after applying macroblock
-    // ═══════════════════════════════════════════════════════════════════
-    
-    /// Reputation snapshot at macroblock finalization
-    /// Format: bincode serialized HashMap<String, f64>
-    /// This ensures ALL nodes have IDENTICAL reputation (no drift!)
-    #[serde(default)]
-    pub reputation_snapshot: Option<Vec<u8>>,
-    
     // ═══════════════════════════════════════════════════════════════════
     // ELIGIBLE PRODUCERS SNAPSHOT (v2.27.0)
     // Epoch-based validator set for deterministic producer selection
@@ -353,38 +331,6 @@ pub struct EligibleProducer {
     /// Reputation at snapshot time as fixed-point centipercent (u32): 70.00% = 7000, max = 10000.
     /// Integer (not f64) so this consensus-committed value is bit-identical on every node.
     pub reputation: u32,
-}
-
-/// Slashing event data for blockchain storage (simplified for serialization)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SlashingEventData {
-    /// Node being slashed
-    pub offender: String,
-    /// Penalty amount (reputation points)
-    pub penalty: f64,
-    /// Block height when detected
-    pub detected_at_height: u64,
-    /// Reporter node
-    pub reporter: String,
-    /// Offense type code (0=DoubleSign, 1=InvalidBlock, 2=ChainFork, 3=MissedBlocks)
-    pub offense_type: u8,
-    /// SHA3 hash of evidence
-    pub evidence_hash: [u8; 32],
-    /// Is permanent ban
-    pub is_permanent_ban: bool,
-}
-
-/// Automatic jail data for blockchain storage
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AutomaticJailData {
-    /// Node being jailed
-    pub node_id: String,
-    /// Jail duration in seconds
-    pub jail_duration: u64,
-    /// Offense count (for progressive jail)
-    pub offense_count: u32,
-    /// Reason code
-    pub reason: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

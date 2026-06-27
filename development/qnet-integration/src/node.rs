@@ -3712,39 +3712,13 @@ impl BlockchainNode {
         result
     }
 
-    /// PRODUCTION v2.40: Compute automatic jails
-    /// 
-    /// ARCHITECTURE DECISION: NO JAIL for commit-without-reveal!
-    /// 
-    /// Reason: Block-based phase transitions mean nodes may miss reveal window
-    /// due to legitimate network conditions (latency, clock skew). This is NOT
-    /// a provable offense. Instead:
-    /// - Nodes that didn't reveal simply don't get consensus reward (+1%)
-    /// - They get small penalty (-1%) via PENALTY_MISSED_CONSENSUS
-    /// - This is sufficient deterrent without cascade jail problems
-    /// 
-    /// Automatic jails — ONLY for cryptographically provable severe offenses:
-    /// - Double-signing (2 signatures on conflicting blocks at same height)
-    /// - Invalid block production (signature/hash verification failure)
-    ///
-    /// commit_no_reveal is NOT jailed: it's a distributed timing issue (race condition
-    /// between INITIATOR's reveal-phase early exit at BFT threshold and PARTICIPANT's
-    /// reveal broadcast timing), not a Byzantine attack. The soft penalty of -1% reputation
-    /// per missed reveal (applied in process_macroblock) is sufficient.
-    fn compute_automatic_jails(
-        _commit_participants: &std::collections::HashSet<String>,
-        _reveal_participants: &std::collections::HashSet<String>,
-        _timestamp: u64
-    ) -> Vec<qnet_consensus::deterministic_reputation::AutomaticJail> {
-        Vec::new()
-    }
-    
     // Slashing only for cryptographically provable offenses:
     //   SLASHABLE: double-sign (2 valid sigs, same producer+height),
     //   invalid block (fails hash/sig), chain fork (conflicting signed blocks).
-    //   NOT SLASHABLE: missed blocks — no deterministic "who should have
-    //   produced" post-facto (no original_producer field, takeover overwrites
-    //   it, false positives from network issues). Handled via reputation decay.
+    //   NOT SLASHABLE: missed blocks — no deterministic "who should have produced"
+    //   post-facto (no original_producer field, takeover overwrites it, false positives
+    //   from partitions). Liveness handled instead by the heartbeat-eligibility gate
+    //   (non-heartbeating node drops out) + slot-timeout failover with no penalty.
     
     // Rebuild in-memory state to match the chain tip at target_height after a
     // rollback. Rollback deletes microblocks from storage but leaves the

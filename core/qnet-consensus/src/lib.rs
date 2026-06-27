@@ -39,19 +39,8 @@ pub use commit_reveal::{CommitRevealConsensus, ConsensusConfig, ConsensusPhase, 
 pub use errors::ConsensusError;
 pub use reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
 pub use kademlia::{KademliaDht, KademliaNode, generate_node_id};
-pub use deterministic_reputation::{
-    // Slashing/jail primitives kept on-chain (part of MacroBlockConsensusData).
-    SlashingEvent, SlashingType, AutomaticJail,
-    // Reputation parameters (display/consensus thresholds + slashing economics).
-    INITIAL_REPUTATION, MAX_REPUTATION, MIN_CONSENSUS_REPUTATION,
-    REWARD_FULL_ROTATION, REWARD_CONSENSUS_PARTICIPATION,
-    PENALTY_INVALID_BLOCK, PENALTY_DOUBLE_SIGN, PENALTY_MISSED_BLOCK,
-    PROCESSING_CHUNK_SIZE, MAX_SLASHING_EVENTS_PER_MACROBLOCK, MAX_AUTO_JAILS_PER_MACROBLOCK,
-};
-pub use macro_consensus::{
-    MacroBlockConsensusData, MissedBlockTracker, MacroConsensusResult,
-    FinalityCheckpoint, FinalityManager, FINALITY_DEPTH, FINALITY_THRESHOLD,
-};
+pub use deterministic_reputation::{INITIAL_REPUTATION, MIN_CONSENSUS_REPUTATION};
+pub use macro_consensus::{FinalityCheckpoint, FinalityManager, FINALITY_DEPTH, FINALITY_THRESHOLD};
 // v15.10 STAGE-2B — per-shard committee primitives
 pub use sharded_consensus::{
     ShardCommittee, ShardCommitteeAssignment, ShardCommitteeCache,
