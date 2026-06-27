@@ -2650,6 +2650,9 @@ impl BlockPipeline {
                 // Fires once per checkpoint head incl. zero-registration heads.
                 if height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
                     let _ = ctx.storage.seal_registry_root(height);
+                    // Same head: seal total_supply as-of this height (apply-deterministic on both paths)
+                    // so the checkpoint reads a height-bound value, never the live counter.
+                    let _ = ctx.storage.seal_total_supply(height, state_guard.get_total_supply());
                 }
 
                 // State verified — save block.

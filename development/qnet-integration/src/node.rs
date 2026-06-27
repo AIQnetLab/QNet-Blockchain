@@ -204,15 +204,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
-/// Signed NodeRegistration awaiting on-chain inclusion: (node_id, tx_bytes, attempts_left). The
-/// periodic registration loop rebroadcasts it (one per ~60s cycle, bounded budget) so a single
-/// join-time broadcast that is dropped while the node is poorly connected still reaches a producer.
-/// One-shot send does not scale to thousands of joining super-nodes. Cleared when the budget runs out
-/// (by then, with serving open, the node is well-connected and inclusion has long since happened).
+/// Signed NodeRegistration awaiting on-chain inclusion: (node_id, tx_bytes, backoff_tick). The periodic
+/// loop rebroadcasts it (burst then trickle, the third field is the backoff tick) so a join-time
+/// broadcast dropped while poorly connected still reaches a producer, scaling to thousands of joiners.
+/// Cleared when is_node_registration_onchain becomes true.
 pub static PENDING_NODE_REGISTRATION: std::sync::Mutex<Option<(String, Vec<u8>, u32)>> =
     std::sync::Mutex::new(None);
-/// Rebroadcast budget for a pending NodeRegistration (~1 per 60s ⇒ ~30 min of retries).
-pub const PENDING_REGISTRATION_MAX_REBROADCASTS: u32 = 30;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // L1 ARCHITECTURE: Global coordinator handle for phase-aware decisions
@@ -3432,6 +3429,21 @@ impl BlockchainNode {
     // handles pre-image recording, state_root verify, rollback, deferred
     // side-effect persistence.
 
+    /// Emission macroblock index minted at height `h` (0 = none). Shared by the validator apply
+    /// (apply_block_to_state) and the producer-inline apply so total_supply mints byte-identically
+    /// on both paths — the producer of an emission block must NOT skip the mint (else its supply
+    /// diverges and the checkpoint never reaches 2f+1).
+    pub fn emission_mb_index(h: u64) -> u64 {
+        const EMISSION_BLOCK_INTERVAL: u64 = 14400;
+        const MICROBLOCKS_PER_MB: u64 = 90;
+        let current_epoch = h / EMISSION_BLOCK_INTERVAL;
+        if current_epoch >= 2 {
+            current_epoch.saturating_sub(2).saturating_add(1).saturating_mul(EMISSION_BLOCK_INTERVAL) / MICROBLOCKS_PER_MB
+        } else {
+            0
+        }
+    }
+
     /// Apply a block's transactions to state. This is the SINGLE source of truth
     /// for state mutation ordering. All 7 phases are executed in deterministic order:
     ///
@@ -3478,21 +3490,10 @@ impl BlockchainNode {
                 continue;
             }
 
-            // Calculate emission MB index for double-emission check
-            let current_epoch = h / EMISSION_BLOCK_INTERVAL;
-            let emission_mb_index = if current_epoch >= 2 {
-                let rewarding_epoch = current_epoch.saturating_sub(2);
-                let rewarding_epoch_end_block = rewarding_epoch.saturating_add(1).saturating_mul(EMISSION_BLOCK_INTERVAL);
-                rewarding_epoch_end_block / MICROBLOCKS_PER_MB
-            } else {
-                0
-            };
-
-            // emit_rewards is watermark-idempotent (mints once per emission mb).
-            // apply_block_to_state is the SINGLE apply path every node runs for every
-            // block (live and bulk-sync), so this is the sole deterministic mint —
-            // no node-local race, no sync-skip. The macroblock recompute path no
-            // longer mints supply.
+            // emit_rewards is watermark-idempotent (mints once per emission mb). The SAME mint runs
+            // on the producer-inline path via Self::emission_mb_index, so total_supply is byte-identical
+            // on every node and is never read live into the checkpoint.
+            let emission_mb_index = Self::emission_mb_index(h);
             match state_guard.emit_rewards(tx.amount, emission_mb_index) {
                 Ok(minted) if minted > 0 => {
                     if is_info() {
@@ -3778,11 +3779,20 @@ impl BlockchainNode {
         // Decode the snapshot bytes already fetched by find_snapshot_at_or_before (canonical
         // full_snap_ or legacy state_snap_). Restoring from the freshest snapshot ≤ target
         // bounds replay to ≤ SNAPSHOT_INCREMENTAL_INTERVAL instead of a full genesis replay.
-        let restored_baseline: Option<(u64, Vec<(String, qnet_state::Account)>)> =
+        let restored_baseline: Option<(u64, u64, Vec<(String, qnet_state::Account)>)> =
             match snap_choice {
                 Some((snap_height, snap_data)) => {
+                    // total_supply is a counter, not derivable from accounts. Take it from the anchor
+                    // macroblock's QC-bound checkpoint (apply-bound, same source as cold-join), NOT from
+                    // the snapshot blob. None ⇒ anchor/QC unavailable ⇒ from-0 full replay (watermark from 0).
                     match storage.decode_snapshot_accounts(&snap_data) {
-                        Ok(accounts) => Some((snap_height, accounts)),
+                        Ok(accounts) => match storage.anchor_root_and_supply(snap_height / 90, &accounts) {
+                            Some((_, ts)) => Some((snap_height, ts, accounts)),
+                            None => {
+                                println!("[WARN][STATE] reconcile_anchor_unavailable snap_h={} action=full_replay", snap_height);
+                                None
+                            }
+                        },
                         Err(e) => {
                             println!("[WARN][STATE] reconcile_decode_failed snap_h={} err={:?}", snap_height, e);
                             None
@@ -3816,9 +3826,10 @@ impl BlockchainNode {
         // production scale. Pre-loading also lets the replay loop run
         // without any `await` points, which is what makes the lock
         // window deterministic.
+        // restored_baseline.0 is a microblock height (snapshots keyed by height) ⇒ replay floor = h+1.
         let replay_from: u64 = restored_baseline
             .as_ref()
-            .map(|(h, _)| h.saturating_add(1))
+            .map(|(h, _, _)| h.saturating_add(1))
             .unwrap_or(0);
         let replay_to = target_height;
         let mut blocks_to_replay: Vec<MicroBlock> = Vec::new();
@@ -3859,17 +3870,22 @@ impl BlockchainNode {
             let sg = state.write().await;
 
             match restored_baseline {
-                Some((snap_height, accounts)) => {
+                Some((snap_height, snap_total_supply, accounts)) => {
                     if let Err(e) = (*sg).restore_accounts(accounts) {
                         return Err(format!("restore_accounts_failed err={:?}", e));
                     }
                     {
                         let mut cs = sg.chain_state.write();
+                        // snap_height is a MICROBLOCK HEIGHT (snapshots keyed by height). Restore chain height,
+                        // total_supply baseline + watermark so the state and the replay floor (replay_from =
+                        // snap_height+1) are consistent — replay mints ONLY the gap (snap, target].
                         cs.height = snap_height;
+                        cs.total_supply = snap_total_supply;
+                        cs.last_minted_emission_mb = Self::emission_mb_index(snap_height);
                     }
                     println!(
-                        "[INFO][STATE] reconcile_snapshot_restored snap_h={} target={}",
-                        snap_height, target_height,
+                        "[INFO][STATE] reconcile_snapshot_restored snap_h={} total_supply={} target={}",
+                        snap_height, snap_total_supply, target_height,
                     );
                     mode = "incremental";
                 }
@@ -3892,6 +3908,11 @@ impl BlockchainNode {
             let mut applied = 0u64;
             for mb in &blocks_to_replay {
                 let _ = Self::apply_block_to_state(&sg, mb, storage, None, None);
+                // Re-seal total_supply at checkpoint heads (see startup replay): a post-reconcile finality
+                // redrive reads get_total_supply_at(head), which does NOT recompute on miss → defer forever.
+                if mb.height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
+                    let _ = storage.seal_total_supply(mb.height, sg.get_total_supply());
+                }
                 applied = applied.saturating_add(1);
             }
             replayed = applied;
@@ -7174,10 +7195,15 @@ impl BlockchainNode {
                                 Ok(_) => {
                                     // Restore chain_state from snapshot (total_supply + height)
                                     if snap_total_supply > 0 {
+                                        // snapshot_height is a MICROBLOCK HEIGHT (snapshots keyed by height). Restore
+                                        // chain height, the TIER-2 replay floor (restored_snapshot_height) AND the
+                                        // emission watermark from it — so the replay mints ONLY the gap (snap, tip]
+                                        // and never re-applies pre-snapshot history or re-mints counted emissions.
                                         {
                                             let mut cs = state_guard.chain_state.write();
                                             cs.total_supply = snap_total_supply;
                                             cs.height = snapshot_height;
+                                            cs.last_minted_emission_mb = Self::emission_mb_index(snapshot_height);
                                         }
                                         println!("[INFO][STATE] snapshot_restored height={} accounts={} total_supply={} size={}KB",
                                                  snapshot_height, accounts.len(), snap_total_supply, accounts_data.len() / 1024);
@@ -7285,6 +7311,13 @@ impl BlockchainNode {
                                 println!("[INFO][STATE] fork_flag_persisted pending_rewards_in_merkle=true (startup replay h={})", h);
                             }
 
+                            // Re-seal total_supply at checkpoint heads: a post-restart finality redrive reads
+                            // get_total_supply_at(head), which (unlike registry_root) does NOT recompute on miss
+                            // → without this re-seal that checkpoint would defer forever. Mirrors the live pipeline.
+                            if h % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
+                                let _ = storage.seal_total_supply(h, state_guard.get_total_supply());
+                            }
+
                             replayed += 1;
 
                             // Progress logging for long replays
@@ -7341,7 +7374,11 @@ impl BlockchainNode {
                                 println!("[INFO][STATE] replay_verified merkle_root={} h={}",
                                          hex::encode(&final_merkle[..8]), pre_snapshot_chain_height);
                             } else {
-                                eprintln!("[WARN][STATE] replay_merkle_drift expected={} computed={} h={} — node will attempt to accept new blocks",
+                                // Post-replay state divergence — should be impossible once the replay floor is
+                                // correct (CRIT-1). If it ever fires, the node's checkpoint content will not
+                                // match peers (content_ok) so it CANNOT finalize/sign — it stalls locally
+                                // (no network fork) until an operator restart/resync rebuilds canonical state.
+                                eprintln!("[ERR][STATE] replay_merkle_drift expected={} computed={} h={} — node cannot finalize until resync",
                                           hex::encode(&last_block.state_root[..8]),
                                           hex::encode(&final_merkle[..8]),
                                           pre_snapshot_chain_height);
@@ -10617,41 +10654,39 @@ impl BlockchainNode {
                             // (see v9.7 sync re-check block) and from the periodic registration
                             // loop ONLY when NODE_IS_SYNCHRONIZED == true.
                             // ══════════════════════════════════════════════════════════════
+                            // Single-owner on-chain registration driver: a non-genesis node with an
+                            // activation code must land its NodeRegistration on-chain before producing.
+                            // Arm ONLY when synced (so burn-attestors bind the true N-2 committee, not the
+                            // pre-sync genesis fallback that a post-genesis producer rejects); the periodic
+                            // rebroadcast then re-sends until it lands. If not yet synced, keep waiting in
+                            // THIS loop (sync runs in parallel) — never break into production unregistered.
                             if !is_bootstrap_node {
-                                static EARLY_ACTIVATION_DONE: std::sync::atomic::AtomicBool =
-                                    std::sync::atomic::AtomicBool::new(false);
-
-                                // v32.13: atomic claim before await — closes
-                                // check-then-act race that allowed concurrent
-                                // loop iterations to both enter the branch
-                                // during the 5-15s save_activation_code await
-                                // (root cause of duplicate NodeRegistration
-                                // broadcast → CPU spike → cascade).
-                                let claimed = EARLY_ACTIVATION_DONE.compare_exchange(
-                                    false, true,
-                                    std::sync::atomic::Ordering::SeqCst,
-                                    std::sync::atomic::Ordering::SeqCst,
-                                ).is_ok();
-                                if claimed {
-                                    let activation_code = std::env::var("QNET_ACTIVATION_CODE").unwrap_or_default();
-                                    if !activation_code.is_empty() && coordinator_is_synchronized() {
-                                        println!("[INFO][ACTIVATION] node_synced broadcasting=NodeRegistration");
-                                        match self.save_activation_code(&activation_code, self.node_type).await {
-                                            Ok(_) => {
-                                                println!("[INFO][ACTIVATION] activation_complete tx_broadcast=true");
-                                            }
-                                            Err(e) => {
-                                                println!("[WARN][ACTIVATION] activation_fail err={} — will retry", e);
-                                                // Release claim so next iteration can retry.
-                                                EARLY_ACTIVATION_DONE.store(false, std::sync::atomic::Ordering::SeqCst);
+                                let activation_code = std::env::var("QNET_ACTIVATION_CODE").unwrap_or_default();
+                                if !activation_code.is_empty()
+                                    && !self.get_storage().is_node_registration_onchain(&self.get_node_id())
+                                {
+                                    if coordinator_is_synchronized() {
+                                        // Arm only when PENDING is empty (don't stack); the rebroadcast drives it.
+                                        let pending_empty = PENDING_NODE_REGISTRATION.lock()
+                                            .map(|g| g.is_none()).unwrap_or(true);
+                                        if pending_empty {
+                                            println!("[INFO][ACTIVATION] node_synced arming=NodeRegistration");
+                                            if let Err(e) = self.save_activation_code(&activation_code, self.node_type).await {
+                                                // Arm failed (e.g. transient burn-attestation RPC blip) — PENDING is
+                                                // still empty, so the rebroadcast cannot drive it. Retry in THIS loop
+                                                // rather than break into production with the registration unsent
+                                                // (the single fragile arm moment that left the 6th validator-only).
+                                                println!("[WARN][ACTIVATION] activation_fail err={} — retry", e);
+                                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                                wait_time += 5;
+                                                continue;
                                             }
                                         }
                                     } else {
-                                        // Not ready — release claim for next iteration.
-                                        EARLY_ACTIVATION_DONE.store(false, std::sync::atomic::Ordering::SeqCst);
-                                        if !activation_code.is_empty() {
-                                            println!("[INFO][ACTIVATION] deferred — node not yet synced");
-                                        }
+                                        println!("[INFO][ACTIVATION] await_sync_before_registration");
+                                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                        wait_time += 5;
+                                        continue;
                                     }
                                 }
                             }
@@ -12844,19 +12879,38 @@ impl BlockchainNode {
                     // registration is a nonce/dedup no-op; the attempt budget bounds it.
                     if let Some(ref p2p) = unified_p2p {
                         let resend = if let Ok(mut guard) = PENDING_NODE_REGISTRATION.lock() {
-                            let out = if let Some((id, bytes, attempts)) = guard.as_mut() {
-                                if *attempts > 0 { *attempts -= 1; Some((id.clone(), bytes.clone(), *attempts)) } else { None }
-                            } else { None };
-                            if matches!(guard.as_ref(), Some((_, _, 0))) { *guard = None; }
+                            // Stops once on-chain. Otherwise a tick-based backoff: burst for the first few
+                            // cycles (a legitimate registration lands here) then trickle every BACKOFF_CYCLES,
+                            // so a permanently-rejected registration (bad burn) decays to a negligible steady
+                            // rate instead of hammering genesis forever — bounds mass-join amplification while
+                            // keeping liveness (the synced-built bytes are still re-delivered until inclusion).
+                            let mut out = None;
+                            let mut clear = false;
+                            if let Some((id, bytes, tick)) = guard.as_mut() {
+                                let onchain = crate::node::try_get_storage()
+                                    .map(|s| s.is_node_registration_onchain(id)).unwrap_or(false);
+                                if onchain {
+                                    if is_info() { println!("[INFO][REG] registration_onchain id={} stop_rebroadcast", id); }
+                                    clear = true;
+                                } else {
+                                    const BACKOFF_CYCLES: u32 = 30; // ~30 periodic cycles between sends after the burst
+                                    let t = *tick;
+                                    *tick = tick.saturating_add(1);
+                                    if t < 4 || t % BACKOFF_CYCLES == 0 {
+                                        out = Some((id.clone(), bytes.clone()));
+                                    }
+                                }
+                            }
+                            if clear { *guard = None; }
                             out
                         } else { None };
-                        if let Some((reg_id, reg_bytes, attempts_left)) = resend {
+                        if let Some((reg_id, reg_bytes)) = resend {
                             let _ = p2p.broadcast_transaction(reg_bytes.clone());
                             let tx_msg = crate::unified_p2p::NetworkMessage::Transaction { data: reg_bytes };
                             for ip in &crate::unified_p2p::get_genesis_bootstrap_ips() {
                                 p2p.send_network_message(&format!("{}:8001", ip), tx_msg.clone());
                             }
-                            if is_info() { println!("[INFO][REG] registration_rebroadcast id={} attempts_left={}", reg_id, attempts_left); }
+                            if is_info() { println!("[INFO][REG] registration_rebroadcast id={} await=on-chain", reg_id); }
                         }
                     }
 
@@ -16615,6 +16669,8 @@ impl BlockchainNode {
                     // that fails apply on EVERY node would still be written by the producer ALONE, so its
                     // node_registry / cbw / registry_root diverge from the network.
                     let mut applied_reg_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    // total_supply as-of this head, captured under the same lock that minted it (A2 seal below).
+                    let producer_supply_head: u64;
                     {
                         let state_guard = state.write().await;
 
@@ -16653,6 +16709,21 @@ impl BlockchainNode {
                             // v7.0: Parse emission TX accruals for block-level application
                             if tx.tx_type == qnet_state::TransactionType::RewardDistribution
                                && tx.from == "system_emission" {
+                                // Mint total_supply for THIS emission block — mirror apply_block_to_state
+                                // (watermark-idempotent). The producer applies its own block inline, so
+                                // without this it stays one emission short → checkpoint total_supply
+                                // diverges from peers → macroblock never reaches 2f+1.
+                                let emb = Self::emission_mb_index(next_block_height);
+                                match state_guard.emit_rewards(tx.amount, emb) {
+                                    Ok(m) if m > 0 => {
+                                        if is_info() {
+                                            println!("[INFO][STATE] emission_minted_inline mb={} amount={} total={} QNC h={}",
+                                                     emb, tx.amount / 1_000_000_000,
+                                                     state_guard.get_total_supply() / 1_000_000_000, next_block_height);
+                                        }
+                                    }
+                                    _ => {}
+                                }
                                 if let Some(ref data) = tx.data {
                                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
                                         if parsed.get("v").and_then(|v| v.as_u64()) == Some(2) {
@@ -16745,6 +16816,7 @@ impl BlockchainNode {
                         // 4. Finalize Merkle and get state_root
                         let computed_state_root = state_guard.finalize_merkle();
                         microblock.state_root = computed_state_root;
+                        producer_supply_head = state_guard.get_total_supply();
                         
                         if is_debug() {
                             println!("[DBG][STATE] state_root computed h={} root={}",
@@ -16815,6 +16887,7 @@ impl BlockchainNode {
                     // reg_height None) does NOT touch lt_state, so this is the block's final accumulator.
                     if next_block_height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
                         let _ = storage.seal_registry_root(next_block_height);
+                        let _ = storage.seal_total_supply(next_block_height, producer_supply_head);
                     }
 
                     // QUANTUM VTS: Mix microblock into VTS chain for cryptographic time proof
@@ -20499,7 +20572,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         p2p: Option<Arc<SimplifiedP2P>>,
         node_id: String,
         node_type: NodeType,
-        state: Arc<RwLock<StateManager>>,
+        // total_supply for checkpoint content is now read height-bound via storage seals
+        // (get_total_supply_at), not from live state — so this handle is no longer read here.
+        _state: Arc<RwLock<StateManager>>,
     ) {
         // Subscribe to block events (event-based, not polling!)
         let mut block_event_rx = self.block_event_tx.subscribe();
@@ -20674,7 +20749,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     let storage_cp = storage.clone();
                                     let p2p_cp = p2p_ref.clone();
                                     let node_id_cp = node_id.clone();
-                                    let state_cp = state.clone();
                                     tokio::spawn(async move {
                                         // Epoch committee — the SAME N-2 sample the macroblock uses (must match
                                         // peers, else content_ok diverges and the checkpoint never reaches 2f+1).
@@ -20711,10 +20785,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // registry_root as of this intra head — deterministic, enforced (gated)
                                         // by content_ok like every checkpoint; the field is in the QC hash regardless.
                                         let registry_root = storage_cp.compute_registry_root(b);
-                                        // QC-bound total minted supply as of this intra head — the apply-accumulated
-                                        // value (deterministic, lockstep with apply through height b). A cold-joiner
-                                        // reads this from the checkpoint instead of summing balances.
-                                        let total_supply = state_cp.read().await.get_total_supply();
+                                        // QC-bound total minted supply as of this intra head — read from the
+                                        // height-sealed ts_seal_{b} (NOT the live counter). None ⇒ not yet sealed ⇒ defer.
+                                        let total_supply = match storage_cp.get_total_supply_at(b) {
+                                            Some(t) => t,
+                                            None => return,
+                                        };
                                         crate::consensus_v2_node::signal_window_end(
                                             cp_index, b, h_vec, state_root, beacon, committee, Vec::new(), Vec::new(), [0u8; 32],
                                             registry_root, total_supply,
@@ -20966,7 +21042,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 let storage_cons = storage.clone();
                                 let p2p_cons = p2p_ref.clone();
                                 let node_id_cons = node_id.clone();
-                                let state_cons = state.clone();
                                 let mb_idx = macroblock_index;
 
                                 tokio::spawn(async move {
@@ -21141,10 +21216,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         // via Checkpoint.registry_root so an untrusted-snapshot joiner can verify the
                                         // restored node_registry (source of cbw + attestor VRF keys). reg_height<=end_height.
                                         let registry_root = storage_cons.compute_registry_root(end_height);
-                                        // QC-bound total minted supply as of the window head — apply-accumulated,
-                                        // deterministic across nodes (lockstep with apply through end_height). The
-                                        // cold-joiner reads this checkpoint value instead of summing balances.
-                                        let total_supply = state_cons.read().await.get_total_supply();
+                                        // QC-bound total minted supply as of the window head — read from the
+                                        // height-sealed ts_seal_{end_height} (NOT the live counter, which races the
+                                        // in-block mint). None ⇒ this head not yet applied+sealed ⇒ defer.
+                                        let total_supply = match storage_cons.get_total_supply_at(end_height) {
+                                            Some(t) => t,
+                                            None => return,
+                                        };
                                         active_guard.signalled = true; // content delivered → keep the lock held
                                         crate::consensus_v2_node::signal_window_end(
                                             end_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL,
@@ -25155,52 +25233,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         println!("[INFO][REWARDS] SYNC pending_persisted count={}", updated_count);
                                     }
                                     
-                                    // v3.00: Fully async snapshot — DashMap iterate + serialize in spawn_blocking
-                                    // SCALABILITY: At 1M+ accounts — Tokio blocked for 0ms
-                                    let state = self.state.read().await;
-                                    let state_root = (*state).finalize_merkle();
-                                    let snap_supply = (*state).get_total_supply();
-                                    let accounts_arc = (*state).accounts.clone(); // Arc bump — O(1)
-                                    drop(state);
+                                    // state_snap_ RETIRED: local restart + reconcile now restore from the
+                                    // apply-bound full_snap_ (created on the block_pipeline apply path at h=90 +
+                                    // every SNAPSHOT_INCREMENTAL_INTERVAL) with total_supply from the QC-bound
+                                    // checkpoint. This macroblock-handler capture read LIVE (drifting) state off
+                                    // the apply path and was accounts+supply-only (incomplete) — one redundant,
+                                    // drift-prone artifact removed; full_snap_ is the single snapshot.
 
-                                    if accounts_arc.len() > 0 {
-                                        let storage_bg = self.storage.clone();
-                                        let snap_index = index;
-                                        tokio::spawn(async move {
-                                            let state_data = match tokio::task::spawn_blocking(move || {
-                                                // v15.8: CANONICAL KEY ORDERING — every node serialises
-                                                // the same account map in the same order, so the bytes
-                                                // are byte-stable across the validator committee. This
-                                                // is what lets the macroblock-bound `snapshot_root`
-                                                // value converge under 2f+1 consensus.
-                                                let mut accounts: Vec<(String, qnet_state::Account)> =
-                                                    accounts_arc.iter()
-                                                        .map(|e| (e.key().clone(), e.value().clone()))
-                                                        .collect();
-                                                accounts.sort_by(|a, b| a.0.cmp(&b.0));
-                                                bincode::serialize(&accounts)
-                                            }).await {
-                                                Ok(Ok(data)) => data,
-                                                Ok(Err(e)) => {
-                                                    eprintln!("[ERR][REWARDS] bg_serialize_fail mb={} err={}", snap_index, e);
-                                                    return;
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("[ERR][REWARDS] bg_spawn_fail mb={} err={}", snap_index, e);
-                                                    return;
-                                                }
-                                            };
-
-                                            if !state_data.is_empty() {
-                                                if let Err(e) = storage_bg.save_state_snapshot(snap_index, state_root, snap_supply, state_data.clone()).await {
-                                                    eprintln!("[ERR][REWARDS] bg_snapshot_fail mb={} err={}", snap_index, e);
-                                                } else {
-                                                    println!("[INFO][REWARDS] SYNC bg_snapshot_saved mb={} size={}KB", snap_index, state_data.len() / 1024);
-                                                }
-                                            }
-                                        });
-                                    }
-                                    
                                     // Mark as processed
                                     let reward_manager_arc = self.get_reward_manager();
                                     let mut reward_mgr = reward_manager_arc.write().await;
@@ -26019,10 +26058,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                              &wallet_address[..16.min(wallet_address.len())],
                              &tx_hash[..16.min(tx_hash.len())]);
                 }
-                // Track for bounded rebroadcast: the periodic registration loop re-sends this so a
-                // dropped join-time broadcast still reaches a producer for inclusion.
+                // Arm the backoff rebroadcast: the periodic loop re-sends this until it lands on-chain
+                // (burst then trickle). The third field is the backoff tick counter — start at 0.
                 if let Ok(mut pend) = PENDING_NODE_REGISTRATION.lock() {
-                    *pend = Some((self.node_id.clone(), tx_bytes.clone(), PENDING_REGISTRATION_MAX_REBROADCASTS));
+                    *pend = Some((self.node_id.clone(), tx_bytes.clone(), 0));
                 }
                 // Deliver with the same guarantee as NodeActivation: producer-direct gossip + direct
                 // fan-out to every genesis node. A fresh joiner usually has no producer info yet, so a
@@ -26038,10 +26077,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     if is_info() { println!("[INFO][REG] registration_tx_broadcast hash={} genesis={}", &tx_hash[..16.min(tx_hash.len())], genesis_ips.len()); }
                 }
             } else {
-                eprintln!("[WARN][REG] onchain_tx_failed node={}", self.node_id);
+                // TX did not enter the local mempool (pool full / already-present race) ⇒ PENDING is NOT
+                // armed and the rebroadcast has nothing to send. Return Err so the onboarding driver retries
+                // the arm instead of breaking into production unregistered (the M-1 validator-only failure).
+                eprintln!("[WARN][REG] onchain_tx_failed node={} — will retry", self.node_id);
+                return Err(QNetError::NetworkError(format!("registration_tx_not_submitted node={}", self.node_id)));
             }
         }
-        
+
         // v4.9: USER SUPER NODE MIGRATION TRACKING
         // Register device_id on a genesis node's RocksDB via lightweight REST API.
         // Flow: Super node starts → POST /api/v1/register-device → genesis stores device_id.

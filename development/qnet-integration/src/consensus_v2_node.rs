@@ -516,13 +516,15 @@ pub async fn run(
                                         match &msg {
                                             ConsensusMsg::Proposal(cp) => match window_buf.get(&(cp.window_head_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL)) {
                                                 Some(c) => println!(
-                                                    "[WARN][BFT2] proposal_content_rejected idx={} eq state_root={} mb_hashes={} beacon={} epoch_commit={} reward_root={}",
+                                                    "[WARN][BFT2] proposal_content_rejected idx={} eq state_root={} mb_hashes={} beacon={} epoch_commit={} reward_root={} registry_root={} total_supply={}",
                                                     msg_index(&msg),
                                                     cp.state_root == c.state_root,
                                                     cp.window_mb_hashes == c.mb_hashes,
                                                     cp.beacon == c.beacon,
                                                     qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee, &c.banned) == cp.epoch_commitment,
                                                     cp.reward_root == c.reward_root,
+                                                    cp.registry_root == c.registry_root,
+                                                    cp.total_supply == c.total_supply,
                                                 ),
                                                 None => println!(
                                                     "[WARN][BFT2] proposal_content_rejected idx={} window_buf_MISS win={}",
