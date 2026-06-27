@@ -22,7 +22,19 @@ export const fetchCache = 'force-no-store';
 export async function GET() {
   try {
     // ALL DATA FROM DATABASE - no node requests!
-    const [heightResult, supplyResult, nodesResult] = await Promise.all([
+    // Active-node counts use the PREVIOUS sealed epoch (the current epoch is partial → flickers).
+    // prevEpoch = floor(height/14400) - 1; window = [pe*14400, pe*14400+14400).
+    const prevEpochCte = `
+      WITH h AS (
+        SELECT COALESCE(
+          (SELECT last_height FROM sync_state WHERE id = 1),
+          (SELECT MAX(height) FROM blocks),
+          0
+        ) AS height
+      ),
+      ep AS (SELECT GREATEST(FLOOR(height / 14400)::bigint - 1, 0) AS pe FROM h)`;
+
+    const [heightResult, supplyResult, superNodesResult, lightNodesResult] = await Promise.all([
       // Get current height from sync_state or blocks table
       pool.query(`
         SELECT COALESCE(
@@ -40,12 +52,20 @@ export async function GET() {
           AND from_address = 'system_emission'
       `),
       
-      // Count ACTIVE nodes - those who sent heartbeats in last epoch (14400 blocks)
-      pool.query(`
-        SELECT COUNT(DISTINCT from_address) as active_nodes
-        FROM transactions 
-        WHERE tx_type IN ('HeartbeatCommitment', 'PingCommitmentWithSampling', 'PingAttestation')
-          AND block >= (SELECT COALESCE(MAX(height), 0) - 14400 FROM blocks)
+      // Active SERVER/super nodes = distinct senders of the v35 'Heartbeat' TX in the previous sealed epoch.
+      pool.query(`${prevEpochCte}
+        SELECT COUNT(DISTINCT t.from_address) AS active_super
+        FROM transactions t, ep
+        WHERE t.tx_type = 'Heartbeat'
+          AND t.block >= ep.pe * 14400 AND t.block < ep.pe * 14400 + 14400
+      `),
+
+      // Active LIGHT nodes = sealed eligible_count summed over the per-genesis bitmaps of the previous epoch.
+      pool.query(`${prevEpochCte}
+        SELECT COALESCE(SUM((t.tx_type_data->>'eligible_count')::bigint), 0) AS active_light
+        FROM transactions t, ep
+        WHERE t.tx_type = 'LightNodeEligibilityBitmap'
+          AND t.block >= ep.pe * 14400 AND t.block < ep.pe * 14400 + 14400
       `)
     ]);
     
@@ -64,14 +84,16 @@ export async function GET() {
     // Deterministic formatting (no locale differences)
     const circulatingFormatted = circulatingSupply.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
     
-    // Real count from heartbeats - 0 if no activity
-    const activeNodes = Number(nodesResult.rows[0]?.active_nodes || 0);
+    // Server (super/genesis) nodes active in the previous sealed epoch; light nodes counted separately.
+    const activeNodes = Number(superNodesResult.rows[0]?.active_super || 0);
+    const activeLightNodes = Number(lightNodesResult.rows[0]?.active_light || 0);
     
     const response = NextResponse.json({
       success: true,
       source: 'database',
       data: {
         activeNodes: activeNodes,
+        activeLightNodes: activeLightNodes,
         currentRound: rewardEpoch,
         height: height,
         blocksUntilReward: blocksUntilReward,

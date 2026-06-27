@@ -882,9 +882,10 @@ export async function getAllNodesByWallet(walletAddress) {
     
     return { success: true, nodes: [], totalNodes: 0 };
   } catch (error) {
-    // Silent fail - no nodes found is not an error, just return empty
-    // Battery optimization: don't spam logs
-    return { success: true, nodes: [], totalNodes: 0 };
+    // Distinguish a network/HTTP failure from a genuinely empty wallet: a failed
+    // lookup must NOT read as "no nodes" (that collapses the node view on a transient
+    // hiccup). success:false → the caller keeps its last-known node state.
+    return { success: false, nodes: [], totalNodes: 0, error: error.message };
   }
 }
 

@@ -156,7 +156,7 @@ const DISPLAY_TYPE_TO_DB: Record<string, string[]> = {
   'Transfer': ['Transfer', 'BatchTransfers'],
   'Reward': ['RewardDistribution', 'BatchRewardClaims', 'SystemReward', 'SystemRewards', 'SystemEmission', 'Emission', 'Reward'],
   'Swap': ['Swap'],
-  'Heartbeat': ['HeartbeatCommitment', 'PingCommitmentWithSampling', 'LightNodeEligibilityBitmap', 'BitmapCommitment', 'PingAttestation'],
+  'Heartbeat': ['Heartbeat', 'HeartbeatCommitment', 'PingCommitmentWithSampling', 'LightNodeEligibilityBitmap', 'BitmapCommitment', 'PingAttestation'],
   'Registration': ['NodeRegistration', 'Registration'],
   'Activation': ['NodeActivation', 'BatchNodeActivations'],
   'Contract': ['ContractDeploy', 'ContractCall'],

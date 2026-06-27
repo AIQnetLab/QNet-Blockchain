@@ -36,6 +36,7 @@ const useAnimateOnScroll = () => {
 
 interface NetworkStats {
   activeNodes: number;
+  activeLightNodes?: number;
   currentRound: number;
   height: number;
   blocksUntilReward: number;
@@ -120,7 +121,7 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
             <div className="stat-card">
               <div className="stat-number">{stats?.activeNodes || '—'}</div>
               <div className="stat-label">ACTIVE NODES</div>
-              <div className="stat-trend">Live data</div>
+              <div className="stat-trend">{stats ? `+${(stats.activeLightNodes ?? 0).toLocaleString()} light (prev epoch)` : 'Live data'}</div>
             </div>
             <div className="stat-card">
               <div className="stat-number">~100k</div>

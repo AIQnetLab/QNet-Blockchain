@@ -68,6 +68,8 @@ CREATE INDEX IF NOT EXISTS idx_transactions_to ON transactions(to_address);
 CREATE INDEX IF NOT EXISTS idx_transactions_block_timestamp ON transactions(block DESC, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_transactions_tx_type ON transactions(tx_type);
 CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
+-- Active-node stats: per-epoch windowed scan over a single tx_type (Heartbeat / LightNodeEligibilityBitmap).
+CREATE INDEX IF NOT EXISTS idx_transactions_tx_type_block ON transactions(tx_type, block);
 
 -- Sync state table
 CREATE TABLE IF NOT EXISTS sync_state (

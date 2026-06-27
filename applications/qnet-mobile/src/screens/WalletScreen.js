@@ -1220,8 +1220,15 @@ const WalletScreen = () => {
           ...status,
           cachedAt: Date.now()
         })).catch(() => {});
+        // Resolve the node name from chain when the local cache is empty: a
+        // server-activated super node is never activated in-app, so its pseudonym
+        // was never cached locally — take it from the on-chain status response.
+        if (status.nodeId && !nodePseudonym && activatedNodeType !== 'light') {
+          setNodePseudonym(status.nodeId);
+          AsyncStorage.setItem(`node_pseudonym_${activationCode}`, status.nodeId).catch(() => {});
+        }
       }
-      
+
       if (activatedNodeType !== 'light') {
         await loadNodePseudonym(activationCode);
       }
@@ -1252,10 +1259,12 @@ const WalletScreen = () => {
         );
         setAllUserNodes(realNodes);
         
-        // AUTO-LINK: If we found server nodes that aren't activated locally, link them automatically
+        // AUTO-LINK: link server nodes found on-chain. Also fires when the type is
+        // already set but the pseudonym is unresolved (server-activated super whose
+        // name was never cached locally) so the node name resolves from the chain.
         const serverNodes = realNodes.filter(n => n.node_type !== 'light' && n.status === 'active');
-        
-        if (serverNodes.length > 0 && !activatedNodeType) {
+
+        if (serverNodes.length > 0 && (!activatedNodeType || !nodePseudonym)) {
           // Priority 1: Check for Genesis nodes first (bootstrap nodes)
           const genesisNodes = serverNodes.filter(n => 
             n.node_id && n.node_id.startsWith('genesis_node_')
@@ -5897,7 +5906,7 @@ const WalletScreen = () => {
                               : lightNodeStatus.needsReactivation
                                 ? styles.statusBadgeInactive                                   // Red   — OFFLINE
                                 : styles.statusBadgeActivated)                                 // Green — ONLINE
-                        : (!nodePseudonym || !serverNodeStatus?.success
+                        : (!serverNodeStatus?.success
                             ? styles.statusBadgeActive                                         // Yellow — CODE RECEIVED
                             : serverNodeStatus.isOnline
                               ? styles.statusBadgeActivated                                    // Green — ONLINE
@@ -5907,7 +5916,7 @@ const WalletScreen = () => {
                         styles.statusBadgeText,
                         (activatedNodeType === 'light'
                           ? (!nodePseudonym || !lightNodeStatus)
-                          : (!nodePseudonym || !serverNodeStatus?.success)) && styles.statusBadgeTextActive,
+                          : (!serverNodeStatus?.success)) && styles.statusBadgeTextActive,
                         ((activatedNodeType === 'light' && lightNodeStatus?.needsReactivation) ||
                          (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)) && {color: '#ff3b30'}
                       ]}>
@@ -5917,7 +5926,7 @@ const WalletScreen = () => {
                               : !lightNodeStatus
                                 ? 'CHECKING...'
                                 : lightNodeStatus.needsReactivation ? 'OFFLINE' : 'ONLINE')
-                          : (!nodePseudonym || !serverNodeStatus?.success
+                          : (!serverNodeStatus?.success
                               ? 'CODE RECEIVED'
                               : serverNodeStatus.isOnline ? 'ONLINE' : 'OFFLINE')}
                       </Text>
@@ -5999,21 +6008,25 @@ const WalletScreen = () => {
                   <View style={styles.rewardItem}>
                     <Text style={styles.rewardLabel}>Node:</Text>
                     <Text style={[styles.rewardValue, {
-                      color: !nodePseudonym 
-                        ? '#ff3b30'  // Red - not activated
+                      color: (!nodePseudonym && activatedNodeType === 'light')
+                        ? '#ff3b30'  // Red - light not activated
                         : (activatedNodeType === 'light' && lightNodeStatus?.needsReactivation)
                           ? '#ff9500'  // Orange - Light node needs reactivation
                           : (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)
                             ? '#ff3b30'  // Red - Server offline
-                            : '#34c759'  // Green - active
+                            : (activatedNodeType !== 'light' && !serverNodeStatus?.success)
+                              ? '#ff9500'  // Orange - connecting (status not loaded yet)
+                              : '#34c759'  // Green - active
                     }]}>
-                      {!nodePseudonym 
-                        ? 'Inactive' 
+                      {(!nodePseudonym && activatedNodeType === 'light')
+                        ? 'Inactive'
                         : (activatedNodeType === 'light' && lightNodeStatus?.needsReactivation)
                           ? 'Needs Reactivation'
                           : (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)
                             ? 'Server Offline'
-                            : 'Active'}
+                            : (activatedNodeType !== 'light' && !serverNodeStatus?.success)
+                              ? 'Connecting…'
+                              : 'Active'}
                     </Text>
                   </View>
                   
@@ -6042,10 +6055,13 @@ const WalletScreen = () => {
                       {activatedNodeType !== 'light' && serverNodeStatus.reputation != null && (
                         <View style={styles.rewardItem}>
                           <Text style={styles.rewardLabel}>Reputation:</Text>
+                          {/* Consensus reputation is binary: a node is in good standing
+                              or permanently banned (cryptographically-proven equivocation).
+                              Show the standing, not a number that never changes. */}
                           <Text style={[styles.rewardValue, {
-                            color: (serverNodeStatus.reputation || 0) >= 70 ? '#34c759' : '#ff9500'
+                            color: (serverNodeStatus.reputation || 0) >= 70 ? '#34c759' : '#ff3b30'
                           }]}>
-                            {(serverNodeStatus.reputation || 0).toFixed(1).replace(/\.0+$/, '')}
+                            {(serverNodeStatus.reputation || 0) >= 70 ? 'Good standing' : 'Banned'}
                           </Text>
                         </View>
                       )}

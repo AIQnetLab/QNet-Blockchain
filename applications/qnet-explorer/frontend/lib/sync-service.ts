@@ -207,6 +207,7 @@ interface TransactionFromNode {
   data: string | null;
   status: string;
   is_quantum_signed: boolean;
+  tx_type_data?: Record<string, unknown> | null;
 }
 
 // Map transaction type to string
@@ -236,6 +237,19 @@ function mapTxType(type: string | object | undefined): string {
   }
   const keys = Object.keys(type as object);
   return keys[0] || 'Transfer';
+}
+
+// Extract small, queryable structured fields into tx_type_data. LightNodeEligibilityBitmap
+// carries the per-genesis sealed light-eligible count; store {genesis_id, epoch, eligible_count}
+// ONLY (never bitmap_compressed — large blob that would blow the row size cap).
+function extractTxTypeData(rawType: string | object | undefined): Record<string, unknown> | null {
+  if (rawType && typeof rawType === 'object') {
+    const body = (rawType as Record<string, unknown>).LightNodeEligibilityBitmap as Record<string, unknown> | undefined;
+    if (body && typeof body === 'object') {
+      return { genesis_id: body.genesis_id, epoch: body.epoch, eligible_count: body.eligible_count };
+    }
+  }
+  return null;
 }
 
 // Transform node transaction to DB format
@@ -319,6 +333,7 @@ function transformTransaction(
     dilithium_signature: tx.dilithium_signature ? String(tx.dilithium_signature) : null,
     dilithium_public_key: tx.dilithium_public_key ? String(tx.dilithium_public_key) : null,
     tx_type: mapTxType((tx.tx_type || tx.type) as string | object | undefined),
+    tx_type_data: extractTxTypeData((tx.tx_type || tx.type) as string | object | undefined),
     data: tx.data ? (String(tx.data).length > 100000 ? String(tx.data).substring(0, 100000) : String(tx.data)) : null,
     status: String(tx.status || 'confirmed'),
     is_quantum_signed: isQuantumSigned
@@ -553,7 +568,7 @@ async function processSingleBlock(height: number): Promise<number> {
           dilithium_signature: tx.dilithium_signature,
           dilithium_public_key: tx.dilithium_public_key,
           tx_type: typeof tx.tx_type === 'string' ? tx.tx_type : JSON.stringify(tx.tx_type),
-          tx_type_data: typeof tx.tx_type === 'object' ? (tx.tx_type as Record<string, unknown>) : null,
+          tx_type_data: tx.tx_type_data ?? null,
           data: tx.data,
           status: tx.status,
           is_quantum_signed: tx.is_quantum_signed
@@ -991,7 +1006,7 @@ async function saveBlocksBatch(blocks: { height: number; block: BlockData }[]): 
           dilithium_signature: tx.dilithium_signature,
           dilithium_public_key: tx.dilithium_public_key,
           tx_type: typeof tx.tx_type === 'string' ? tx.tx_type : JSON.stringify(tx.tx_type),
-          tx_type_data: typeof tx.tx_type === 'object' ? (tx.tx_type as Record<string, unknown>) : null,
+          tx_type_data: tx.tx_type_data ?? null,
           data: tx.data,
           status: tx.status,
           is_quantum_signed: tx.is_quantum_signed
@@ -1235,7 +1250,7 @@ async function verifyDataIntegrity(): Promise<void> {
             dilithium_signature: restored.dilithium_signature,
             dilithium_public_key: restored.dilithium_public_key,
             tx_type: typeof restored.tx_type === 'string' ? restored.tx_type : JSON.stringify(restored.tx_type),
-            tx_type_data: typeof restored.tx_type === 'object' ? (restored.tx_type as Record<string, unknown>) : null,
+            tx_type_data: restored.tx_type_data ?? null,
             data: restored.data,
             status: restored.status,
             is_quantum_signed: restored.is_quantum_signed
