@@ -370,7 +370,7 @@ pub enum TransactionType {
         #[serde(default)]
         burn_attestors: Vec<(String, String)>,
     },
-    
+
     /// Create new account
     CreateAccount {
         address: String,

@@ -2993,7 +2993,10 @@ pub struct BlockApplyResult {
     pub reward_accruals: Vec<(String, u64)>,
     pub deferred_pool3: u64,
     // (node_id, type_str, wallet, burn_tx). burn_tx empty for non-NodeRegistration (activations).
-    pub deferred_registrations: Vec<(String, String, String, String)>,
+    // (node_id, type, wallet, burn, consensus_pubkey_hex). The 5th = the registrant's on-chain
+    // vrf/consensus pubkey (tx.dilithium_public_key) → registry_root binds sha3 of it for light-client
+    // committee verification. Empty for activation/pseudonym rows (the NodeRegistration row is authoritative).
+    pub deferred_registrations: Vec<(String, String, String, String, String)>,
     pub deferred_emission_mbs: Vec<u64>,
     pub deferred_reward_clears: Vec<(String, u64)>,
     /// (epoch, total, committed_root, c_per, c_cnt) — emission reward recompute the caller runs
@@ -3445,13 +3448,12 @@ impl BlockchainNode {
     }
 
     /// Apply a block's transactions to state. This is the SINGLE source of truth
-    /// for state mutation ordering. All 7 phases are executed in deterministic order:
+    /// for state mutation ordering. The phases execute in deterministic order:
     ///
-    ///   Phase 1: emit_rewards for emission TXs + parse reward accruals
-    ///   Phase 2: apply_transaction_lazy + gas_refund (only on success)
+    ///   Phase 1: emit_rewards for emission TXs (merkle reward_root deferred to block_pipeline)
+    ///   Phase 2: apply_transaction_lazy + gas_refund (only on success) + apply_merkle_claims
     ///   Phase 3: credit_producer_fees_once
-    ///   Phase 4: accrue_pending_rewards
-    ///   Phase 5: finalize_merkle
+    ///   Phase 5: finalize_merkle  (rewards are merkle-only — no eager pending-rewards accrual)
     ///   Phase 6: update chain_state.height
     ///
     /// Parameters:
@@ -3587,7 +3589,11 @@ impl BlockchainNode {
                             qnet_state::NodeType::Super => "super",
                             qnet_state::NodeType::Light => "light",
                         };
-                        result.deferred_registrations.push((node_id.clone(), type_str.to_string(), wallet_address.clone(), burn_tx.clone()));
+                        // Bind the consensus pubkey ONLY for consensus participants (super/genesis): light
+                        // nodes are mobile clients, never in the committee, so their key is irrelevant to QC
+                        // verification — keep light rows' vrf empty (semantic + matches the registry recompute).
+                        let reg_vrf = if matches!(node_type, qnet_state::NodeType::Super) { tx.dilithium_public_key.clone().unwrap_or_default() } else { String::new() };
+                        result.deferred_registrations.push((node_id.clone(), type_str.to_string(), wallet_address.clone(), burn_tx.clone(), reg_vrf));
                     }
                     qnet_state::TransactionType::NodeActivation { node_type, .. } => {
                         let type_str = match node_type {
@@ -3595,7 +3601,7 @@ impl BlockchainNode {
                             qnet_state::account::NodeType::Light => "light",
                         };
                         let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
-                        result.deferred_registrations.push((activation_id, type_str.to_string(), tx.from.clone(), String::new()));
+                        result.deferred_registrations.push((activation_id, type_str.to_string(), tx.from.clone(), String::new(), String::new()));
                         // Super activation self-registers under its canonical region-independent
                         // pseudonym (the id used to sign heartbeats/blocks) so reward crediting
                         // resolves node_id→wallet even if the NodeRegistration TX is lost. Light
@@ -3603,7 +3609,7 @@ impl BlockchainNode {
                         if matches!(node_type, qnet_state::account::NodeType::Super) {
                             let pseudonym = crate::rpc::generate_super_node_pseudonym(&tx.from);
                             crate::unified_p2p::add_registered_super_node(pseudonym.clone());
-                            result.deferred_registrations.push((pseudonym, "super".to_string(), tx.from.clone(), String::new()));
+                            result.deferred_registrations.push((pseudonym, "super".to_string(), tx.from.clone(), String::new(), String::new()));
                         }
                     }
                     _ => {}
@@ -3685,18 +3691,8 @@ impl BlockchainNode {
             }
         }
 
-        // ── Phase 4: Apply reward accruals (affects merkle root) ──
-        if !result.reward_accruals.is_empty() {
-            for (wallet, delta) in &result.reward_accruals {
-                if let Some(ref mut snap) = block_snapshot {
-                    snap.record_pre_images(&[wallet.clone()], &state_guard.accounts);
-                }
-                if let Err(e) = state_guard.accrue_pending_rewards(wallet, *delta) {
-                    eprintln!("[WARN][REWARDS] accrue_fail wallet={}... err={}",
-                             &wallet[..wallet.len().min(16)], e);
-                }
-            }
-        }
+        // Rewards are merkle-only: emission writes a per-epoch reward_root (Phase 1) credited later by
+        // proof-verified claim TXs (apply_merkle_claims) — there is NO eager pending-rewards accrual.
 
         // ── Phase 5: Finalize merkle tree ──
         result.merkle_root = state_guard.finalize_merkle();
@@ -16649,8 +16645,6 @@ impl BlockchainNode {
                         let state_guard = state.write().await;
 
                         // 1. Apply all transactions
-                        // v7.0: Also collect reward accruals from emission TXs for state application
-                        let mut producer_reward_accruals: Vec<(String, u64)> = Vec::new();
                         for tx in &txs {
                             // Index Light eligibility bitmaps via the SHARED helper (byte-identical to
                             // the validator apply path) so the producer of a bitmap block stamps its own
@@ -16698,23 +16692,8 @@ impl BlockchainNode {
                                     }
                                     _ => {}
                                 }
-                                if let Some(ref data) = tx.data {
-                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                                        if parsed.get("v").and_then(|v| v.as_u64()) == Some(2) {
-                                            if let Some(accruals) = parsed.get("accruals").and_then(|v| v.as_object()) {
-                                                for (wallet, amount_val) in accruals {
-                                                    if let Some(amount) = amount_val.as_u64() {
-                                                        if amount > 0 {
-                                                            producer_reward_accruals.push((wallet.clone(), amount));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
                             }
-                            
+
                             if let Err(e) = state_guard.apply_transaction_lazy(tx) {
                                 if is_warn() {
                                     println!("[WARN][STATE] producer_tx_apply_failed hash={} err={}", tx.hash, e);
@@ -16739,14 +16718,9 @@ impl BlockchainNode {
                         // producer crediting claims in its OWN block matches validators (no state_root split).
                         Self::apply_merkle_claims(&state_guard, &*storage, &txs, None);
 
-                        // v7.0: Apply reward accruals BEFORE finalize_merkle
+                        // Merkle-only rewards: no eager accrual (emission writes the reward_root; claims
+                        // credit later by proof). fork_was_active retained only for the legacy flag log below.
                         let fork_was_active = qnet_state::is_pending_rewards_in_merkle();
-                        for (wallet, delta) in &producer_reward_accruals {
-                            if let Err(e) = state_guard.accrue_pending_rewards(wallet, *delta) {
-                                eprintln!("[WARN][REWARDS] producer_accrue_fail wallet={}... err={}",
-                                         &wallet[..wallet.len().min(16)], e);
-                            }
-                        }
                         // v7.1: Persist fork flag on first activation
                         if !fork_was_active && qnet_state::is_pending_rewards_in_merkle() {
                             if let Err(e) = storage.save_fork_flag("pending_rewards_in_merkle", true) {
@@ -16815,8 +16789,12 @@ impl BlockchainNode {
                                     qnet_state::NodeType::Super => "super",
                                     qnet_state::NodeType::Light => "light",
                                 };
-                                let _ = storage.save_node_registration_at_height_burn(
-                                    rid, rtype_str, rwallet, 1.0, next_block_height, rburn);
+                                // vrf bound for consensus participants ONLY (super/genesis); light = None,
+                                // byte-identical to the peer-apply deferred path (else the producer's own
+                                // registry_root row diverges from synced validators → fork).
+                                let rvrf = if matches!(rtype, qnet_state::NodeType::Super) { tx.dilithium_public_key.as_ref().and_then(|s| hex::decode(s).ok()) } else { None };
+                                let _ = storage.save_node_registration_at_height_burn_vrf(
+                                    rid, rtype_str, rwallet, 1.0, next_block_height, rburn, rvrf.as_deref());
                                 // Incremental cbw binding for the producer's own block (before save below),
                                 // mirroring peer-apply. Scope = any non-empty burn (super + LIGHT), MATCHING
                                 // rebuild_committed_burn_wallet (srtr_+lrtr_). Empty-burn regs auto-skip.

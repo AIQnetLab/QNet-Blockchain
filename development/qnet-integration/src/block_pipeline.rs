@@ -2638,12 +2638,14 @@ impl BlockPipeline {
                 // makes head_ready transitively guarantee the registrations + seal exist: a checkpoint-
                 // head registration can never be omitted by a racing validator read (the pre-existing
                 // race when these were written post-save in the deferred-fx phase).
-                for (node_id, type_str, wallet, burn_tx) in &apply_result.deferred_registrations {
+                for (node_id, type_str, wallet, burn_tx, vrf_pk_hex) in &apply_result.deferred_registrations {
                     // Single authoritative writer: stamps reg_height AND the backing burn co-resident,
                     // so rebuild_committed_burn_wallet + registry_root are deterministic; updates the
                     // registry_root LtHash accumulator in the SAME batch. burn empty (activations/genesis)
-                    // ⇒ binding skipped. Idempotent on re-apply (delta 0 on identical re-add).
-                    let _ = ctx.storage.save_node_registration_at_height_burn(node_id, type_str, wallet, 1.0, height, burn_tx);
+                    // ⇒ binding skipped. Idempotent on re-apply (delta 0 on identical re-add). vrf_pk binds
+                    // sha3 into registry_root for light-client committee verification.
+                    let vrf = if vrf_pk_hex.is_empty() { None } else { hex::decode(vrf_pk_hex).ok() };
+                    let _ = ctx.storage.save_node_registration_at_height_burn_vrf(node_id, type_str, wallet, 1.0, height, burn_tx, vrf.as_deref());
                 }
                 // registry_root seal (LtHash): at a checkpoint head, after all of this block's
                 // registrations updated lt_state and BEFORE save_microblock — mirror of the producer.

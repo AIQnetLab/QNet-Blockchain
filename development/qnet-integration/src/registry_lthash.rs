@@ -94,12 +94,14 @@ impl LtHash {
 /// Canonical per-row lane vector — the ONE shared helper used by BOTH the incremental delta and the
 /// from-scratch recompute, so they can never drift. seed = sha3-256(domain ‖ len-prefixed fields);
 /// the seed seeds SHAKE256, whose 2048-byte stream is split into 1024 little-endian u16 lanes.
-/// Fields are EXACTLY the chain-confirmed identity {node_id, wallet, reg_height, burn} — never the
-/// raw node_ JSON (which carries a non-deterministic timestamp + mutable reputation). Genesis/light-
-/// not-yet-attested rows carry burn="" and are hashed with the empty burn (consistently included).
-pub fn row_lanes(node_id: &str, wallet: &str, reg_height: u64, burn: &str) -> [u16; LANES] {
+/// Fields = the chain-confirmed identity {node_id, wallet, reg_height, burn, vrf_pk_sha3}. vrf_pk_sha3
+/// is sha3-256 of the node's consensus pubkey (super/genesis), so registry_root binds the QC signer
+/// keys — a light client verifies a served committee pubkey against the QC-signed root. Light/keyless
+/// rows pass empty (consistently length-prefixed, like burn). Must be co-resident (written in the
+/// registration batch from the NodeRegistration TX) so every node hashes the same bytes.
+pub fn row_lanes(node_id: &str, wallet: &str, reg_height: u64, burn: &str, vrf_pk_sha3: &[u8]) -> [u16; LANES] {
     let mut seed = Sha3_256::new();
-    Digest::update(&mut seed, b"qnet-registry-row-v2");
+    Digest::update(&mut seed, b"qnet-registry-row-v3");
     Digest::update(&mut seed, (node_id.len() as u32).to_le_bytes());
     Digest::update(&mut seed, node_id.as_bytes());
     Digest::update(&mut seed, (wallet.len() as u32).to_le_bytes());
@@ -107,6 +109,8 @@ pub fn row_lanes(node_id: &str, wallet: &str, reg_height: u64, burn: &str) -> [u
     Digest::update(&mut seed, reg_height.to_le_bytes());
     Digest::update(&mut seed, (burn.len() as u32).to_le_bytes());
     Digest::update(&mut seed, burn.as_bytes());
+    Digest::update(&mut seed, (vrf_pk_sha3.len() as u32).to_le_bytes());
+    Digest::update(&mut seed, vrf_pk_sha3);
     let seed = seed.finalize();
 
     let mut xof = Shake256::default();
@@ -128,9 +132,9 @@ mod tests {
 
     #[test]
     fn add_is_order_independent() {
-        let a = row_lanes("super_a", "wA", 10, "bA");
-        let b = row_lanes("super_b", "wB", 20, "bB");
-        let c = row_lanes("light_c", "wC", 30, "");
+        let a = row_lanes("super_a", "wA", 10, "bA", b"kA");
+        let b = row_lanes("super_b", "wB", 20, "bB", b"kB");
+        let c = row_lanes("light_c", "wC", 30, "", b"");
         let mut s1 = LtHash::new();
         s1.add(&a); s1.add(&b); s1.add(&c);
         let mut s2 = LtHash::new();
@@ -140,8 +144,8 @@ mod tests {
 
     #[test]
     fn add_then_remove_is_noop() {
-        let a = row_lanes("super_a", "wA", 10, "bA");
-        let b = row_lanes("super_b", "wB", 20, "bB");
+        let a = row_lanes("super_a", "wA", 10, "bA", b"kA");
+        let b = row_lanes("super_b", "wB", 20, "bB", b"kB");
         let mut s = LtHash::new();
         s.add(&a); s.add(&b);
         let before = s.root();
@@ -153,8 +157,8 @@ mod tests {
     #[test]
     fn remove_old_add_new_replaces_a_row() {
         // Re-registration: subtract the OLD row, add the NEW row → only NEW remains.
-        let old = row_lanes("super_a", "walletOLD", 10, "burnA");
-        let new = row_lanes("super_a", "walletNEW", 50, "burnA");
+        let old = row_lanes("super_a", "walletOLD", 10, "burnA", b"kA");
+        let new = row_lanes("super_a", "walletNEW", 50, "burnA", b"kA");
         let mut live = LtHash::new();
         live.add(&old);            // first registration
         live.remove(&old); live.add(&new); // re-registration delta
@@ -167,17 +171,28 @@ mod tests {
     #[test]
     fn distinct_rosters_differ() {
         let mut s1 = LtHash::new();
-        s1.add(&row_lanes("super_a", "wA", 10, "bA"));
+        s1.add(&row_lanes("super_a", "wA", 10, "bA", b"kA"));
         let mut s2 = LtHash::new();
-        s2.add(&row_lanes("super_a", "wATTACKER", 10, "bA")); // rebound wallet
+        s2.add(&row_lanes("super_a", "wATTACKER", 10, "bA", b"kA")); // rebound wallet
         assert_ne!(s1.root(), s2.root(), "a forged burn→wallet binding must change the root");
+    }
+
+    #[test]
+    fn vrf_pk_binds_root() {
+        // The consensus signer key is committed: swapping it changes the root, so a light
+        // client cannot be fed a forged committee pubkey that still matches registry_root.
+        let mut s1 = LtHash::new();
+        s1.add(&row_lanes("super_a", "wA", 10, "bA", b"key_honest"));
+        let mut s2 = LtHash::new();
+        s2.add(&row_lanes("super_a", "wA", 10, "bA", b"key_forged"));
+        assert_ne!(s1.root(), s2.root(), "a swapped consensus pubkey must change the root");
     }
 
     #[test]
     fn serialize_roundtrip() {
         let mut s = LtHash::new();
-        s.add(&row_lanes("super_a", "wA", 10, "bA"));
-        s.add(&row_lanes("light_b", "wB", 20, "bB"));
+        s.add(&row_lanes("super_a", "wA", 10, "bA", b"kA"));
+        s.add(&row_lanes("light_b", "wB", 20, "bB", b""));
         let bytes = s.to_bytes();
         let restored = LtHash::from_bytes(&bytes);
         assert_eq!(s.root(), restored.root(), "state must round-trip through bytes");

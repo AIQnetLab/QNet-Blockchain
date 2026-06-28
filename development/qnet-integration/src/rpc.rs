@@ -1355,6 +1355,28 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_by_index);
+
+    // Light-client QC proof: /macroblock/{idx}/proof (cacheable, immutable per index)
+    let macroblock_proof = api_v1
+        .and(warp::path("macroblock"))
+        .and(warp::path::param::<u64>())
+        .and(warp::path("proof"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_macroblock_proof);
+
+    // Light-client registry dump as of a height: /registry/height/{h}
+    let registry_height = api_v1
+        .and(warp::path("registry"))
+        .and(warp::path("height"))
+        .and(warp::path::param::<u64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_registry_height);
     
     // Snapshot endpoints - For P2P Fast Sync (v2.19.12)
     // GET /api/v1/snapshot/latest - Get latest snapshot info
@@ -2321,6 +2343,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(genesis_block)
         .or(block_by_hash)
         .or(macroblock_by_index)
+        .or(macroblock_proof)
+        .or(registry_height)
         .or(snapshot_latest)
         .or(snapshot_download)
         .or(snapshot_manifest)
@@ -4412,6 +4436,99 @@ async fn handle_macroblock_by_index(
             Ok(warp::reply::json(&error_response))
         }
     }
+}
+
+/// Light-client QC proof for macroblock {index}: the checkpoint fields, the QC (signers + sigs), the
+/// committee + its consensus pubkeys, and the N-2 eligible_producers + beacon (so the client derives the
+/// committee). Immutable per index ⇒ cacheable/CDN. The client recomputes Checkpoint::hash, derives the
+/// committee, binds pubkeys to the QC-signed registry_root, and verifies a sampled set of QC signatures.
+async fn handle_macroblock_proof(
+    index: u64,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rl) = check_api_rate_limit(remote_addr, "read_only") { return Ok(rl); }
+    let mb = match blockchain.get_macroblock(index).await {
+        Ok(Some(m)) => m,
+        _ => return Ok(warp::reply::json(&json!({"error": "macroblock_not_found", "index": index}))),
+    };
+    let qc_bytes = match &mb.consensus_data.checkpoint_qc {
+        Some(b) => b,
+        None => return Ok(warp::reply::json(&json!({"error": "no_checkpoint_qc", "index": index}))),
+    };
+    let (cp, qc): (qnet_consensus::checkpoint_bft::Checkpoint, qnet_consensus::checkpoint_bft::QuorumCertificate) =
+        match bincode::deserialize(qc_bytes) {
+            Ok(v) => v,
+            Err(_) => return Ok(warp::reply::json(&json!({"error": "qc_decode_failed", "index": index}))),
+        };
+    let storage = blockchain.get_storage();
+    let committee = BlockchainNode::committee_for_height(&storage, mb.height).unwrap_or_default();
+    let mut committee_pubkeys = serde_json::Map::new();
+    for nid in &committee {
+        if let Some(pk) = qnet_consensus::consensus_crypto::get_consensus_pk(nid) {
+            committee_pubkeys.insert(nid.clone(), json!(hex::encode(&pk)));
+        }
+    }
+    let epoch = (mb.height.saturating_sub(1)) / 90 + 1;
+    // This macroblock's OWN epoch-transition data, ALL bound into checkpoint.epoch_commitment (QC-signed):
+    // the raw eligible_producers bincode (the light client hashes these exact bytes AND parses node_ids
+    // for the NEXT epoch's committee) and the cumulative ban set. The client anchors them via
+    // epoch_commitment(eligible_raw, committee, banned)==cp.epoch_commitment, then carries the verified
+    // eligible+beacon forward to derive M+2's committee — never trusting a server-supplied committee.
+    let eligible_raw = mb.consensus_data.eligible_producers.as_ref().map(hex::encode).unwrap_or_default();
+    // None ⇒ genuinely no bans (empty is correct). Some(corrupted) ⇒ serving empty would make the
+    // client's epoch_commitment mismatch and fail-close; signal an error so it retries another node.
+    let banned: Vec<String> = match mb.consensus_data.banned_validators.as_ref() {
+        None => Vec::new(),
+        Some(b) => match bincode::deserialize::<Vec<String>>(b) {
+            Ok(v) => v,
+            Err(_) => return Ok(warp::reply::json(&json!({"error": "banned_decode_failed", "index": index}))),
+        },
+    };
+    let checkpoint = json!({
+        "index": cp.index,
+        "parent_qc": cp.parent_qc.as_ref().map(|p| json!({
+            "checkpoint_hash": hex::encode(p.checkpoint_hash), "index": p.index })),
+        "window_head_height": cp.window_head_height,
+        "window_mb_hashes": cp.window_mb_hashes.iter().map(hex::encode).collect::<Vec<_>>(),
+        "state_root": hex::encode(cp.state_root),
+        "beacon": hex::encode(cp.beacon),
+        "epoch_commitment": hex::encode(cp.epoch_commitment),
+        "reward_root": hex::encode(cp.reward_root),
+        "registry_root": hex::encode(cp.registry_root),
+        "total_supply": cp.total_supply,
+        "timestamp": cp.timestamp,
+        "proposer": cp.proposer,
+    });
+    let qc_json = json!({
+        "signers": qc.signers,
+        // sigs are the ASCII "dilithium_sig_<id>_<b64>" strings; lossless from_utf8 drops any non-UTF8
+        // element to "" (client rejects it) rather than silently corrupting bytes with U+FFFD.
+        "sigs": qc.sigs.iter().map(|s| String::from_utf8(s.clone()).unwrap_or_default()).collect::<Vec<_>>(),
+    });
+    Ok(warp::reply::json(&json!({
+        "index": index,
+        "epoch": epoch,
+        "checkpoint": checkpoint,
+        "qc": qc_json,
+        "committee": committee,
+        "committee_pubkeys": serde_json::Value::Object(committee_pubkeys),
+        "eligible_raw": eligible_raw,
+        "banned": banned,
+    })))
+}
+
+/// Light-client registry dump as of {height}: the chain-confirmed roster (node_id, wallet, reg_height,
+/// burn, vrf_pk_sha3) + the LtHash registry_root over them — byte-identical to the QC-signed
+/// registry_root sealed at that height. The client recomputes the root and binds committee pubkeys to it.
+async fn handle_registry_height(
+    height: u64,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rl) = check_api_rate_limit(remote_addr, "read_only") { return Ok(rl); }
+    let (entries, root) = blockchain.get_storage().registry_entries_as_of(height);
+    Ok(warp::reply::json(&json!({"registry_root": root, "entries": entries})))
 }
 
 // =========================================================================
@@ -8538,14 +8655,15 @@ async fn handle_server_node_status(
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
     
-    // Can query by activation_code or node_id
+    // Query by node_id, wallet (the robust wallet-bridge), or activation_code.
     let activation_code = params.get("activation_code").cloned();
     let node_id = params.get("node_id").cloned();
-    
-    if activation_code.is_none() && node_id.is_none() {
+    let wallet = params.get("wallet").cloned();
+
+    if activation_code.is_none() && node_id.is_none() && wallet.is_none() {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "activation_code or node_id parameter required"
+            "error": "node_id, wallet, or activation_code parameter required"
         })));
     }
     
@@ -8556,8 +8674,15 @@ async fn handle_server_node_status(
         // Get active Super nodes
         let active_nodes = p2p.get_active_full_super_nodes();
         
-        // Find node by activation_code or node_id
-        let target_node_id = if let Some(code) = &activation_code {
+        // Resolve node_id: prefer explicit node_id, then the wallet-bridge (on-chain reverse index —
+        // resolves ANY registered node regardless of online/offline/banned, and needs no RAM activation
+        // registry), and only last fall back to activation_code resolution.
+        let target_node_id = if let Some(nid) = &node_id {
+            Some(nid.clone())
+        } else if let Some(w) = &wallet {
+            blockchain.get_storage().get_nodes_by_wallet(w).ok()
+                .and_then(|v| v.into_iter().next().map(|(id, _, _)| id))
+        } else if let Some(code) = &activation_code {
             // CRITICAL FIX v2.76: Genesis node activation code mapping
             // Genesis nodes use QNET-BOOT-000X-STRAP format
             // Map to genesis_node_00X for network identification
@@ -8589,7 +8714,7 @@ async fn handle_server_node_status(
                 }
             }
         } else {
-            node_id.clone()
+            None
         };
         
         if let Some(ref target_id) = target_node_id {
@@ -8629,28 +8754,14 @@ async fn handle_server_node_status(
                 // This ensures ALL nodes return same value (on-chain consensus)
                 // Prevents manipulation of local RocksDB to show fraudulent rewards
                 // Memory can be lost on restart, blockchain is source of truth
-                let pending_rewards = {
-                    // Get wallet from blockchain (on-chain registration with Genesis fallback)
-                    let wallet_from_blockchain = blockchain.get_node_wallet(found_id).await;
-                    
-                    match wallet_from_blockchain {
-                        Some(wallet) => {
-                            // Read pending_rewards from BLOCKCHAIN state (not RocksDB!)
-                            if is_info() {
-                                println!("[INFO][API] node_status wallet_source=blockchain node={}", found_id);
-                            }
-                            let state = blockchain.get_state_manager();
-                            let state_guard = state.read().await;
-                            (*state_guard).get_pending_rewards(&wallet)
+                // Merkle reward_root claimable (single-source; legacy pending removed).
+                let pending_rewards = match blockchain.get_node_wallet(found_id).await {
+                    Some(wallet) => wallet_claimable_qnc(&blockchain, &wallet).await,
+                    None => {
+                        if is_warn() {
+                            println!("[WARN][API] node_status node_not_registered_onchain node={}", found_id);
                         }
-                        None => {
-                            // Node not registered on-chain = no pending rewards
-                            if is_warn() {
-                                println!("[WARN][API] node_status node_not_registered_onchain node={}", found_id);
-                                println!("[INFO][API] hint: NodeRegistration TX must be in block before rewards visible");
-                            }
-                            0
-                        }
+                        0
                     }
                 };
                 
@@ -8678,14 +8789,9 @@ async fn handle_server_node_status(
                 let registry = p2p.get_light_node_registry();
                 if let Some(node) = registry.get(target_id) {
                     let block_height = blockchain.get_height().await;
-                    let pending_rewards = {
-                        if let Some(wallet) = blockchain.get_node_wallet(target_id).await {
-                            let state = blockchain.get_state_manager();
-                            let state_guard = state.read().await;
-                            (*state_guard).get_pending_rewards(&wallet)
-                        } else {
-                            0
-                        }
+                    let pending_rewards = match blockchain.get_node_wallet(target_id).await {
+                        Some(wallet) => wallet_claimable_qnc(&blockchain, &wallet).await,
+                        None => 0,
                     };
                     return Ok(warp::reply::json(&json!({
                         "success": true,
@@ -8706,14 +8812,39 @@ async fn handle_server_node_status(
             }
         }
 
-        // Node not found in any registry
+        // Resolved on-chain but not in the live roster ⇒ OFFLINE: report its REAL on-chain reputation
+        // (a non-equivocating offline node is Good standing, NOT "Banned") so the wallet shows true
+        // standing and earned rewards stay visible/claimable (reward is wallet-scoped, status-independent).
+        // Truly-unresolved (no node_id) ⇒ not-found.
+        if let Some(ref off_id) = target_node_id {
+            let reputation = get_reputation_from_snapshot(&blockchain, off_id).await;
+            // Merkle reward_root claimable (wallet-scoped, status-independent) for the resolved node.
+            let pending_rewards = match blockchain.get_node_wallet(off_id).await {
+                Some(w) => wallet_claimable_qnc(&blockchain, &w).await,
+                None => 0,
+            };
+            return Ok(warp::reply::json(&json!({
+                "success": true,
+                "node_id": off_id,
+                "is_online": false,
+                "last_seen": 0,
+                "heartbeat_count": 0,
+                "required_heartbeats": 9,
+                "is_reward_eligible": false,
+                "reputation": reputation,
+                "current_block_height": blockchain.get_height().await,
+                "needs_attention": true,
+                "pending_rewards": pending_rewards,
+                "message": "Node registered but offline this window."
+            })));
+        }
         return Ok(warp::reply::json(&json!({
             "success": true,
             "node_id": target_node_id,
             "is_online": false,
             "last_seen": 0,
             "heartbeat_count": 0,
-            "required_heartbeats": 8,
+            "required_heartbeats": 9,
             "is_reward_eligible": false,
             "reputation": 0,
             "needs_attention": true,
@@ -9835,164 +9966,49 @@ async fn handle_claim_rewards(
                 Err(e) => Ok(warp::reply::json(&json!({ "success": false, "error": format!("{}", e) }))),
             };
         }
-        // No unclaimed merkle reward for this wallet → fall through to the legacy pending path.
+        // No unclaimed merkle reward for this wallet — merkle reward_root is the SOLE reward source
+        // (the legacy Account.pending_rewards accrual path was removed), so there is nothing to claim.
     }
 
-    // v2.96: CRITICAL SECURITY FIX - Check pending rewards from BLOCKCHAIN (not memory/RocksDB)!
-    // This is the ONLY source of truth that all nodes agree on
-    let reward_amount = {
-        let state = blockchain.get_state_manager();
-        let state_guard = state.read().await;
-        let amount = (*state_guard).get_pending_rewards(&wallet_address);
-
-        if amount == 0 {
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "No pending rewards available"
-            })));
-        }
-
-        amount
-    };
-    
-    // Check minimum claim amount (1 QNC = 1_000_000_000 smallest units)
-    const MIN_CLAIM_AMOUNT: u64 = 1_000_000_000;
-    if reward_amount < MIN_CLAIM_AMOUNT {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": format!("Minimum claim amount is 1 QNC (current: {:.9} QNC)", 
-                           reward_amount as f64 / 1_000_000_000.0)
-        })));
-    }
-    
-    // PRODUCTION: Create RewardDistribution transaction for blockchain transparency
-    // CRITICAL: Rewards come from system_rewards_pool (emission), NOT from node_id
-    // Node_id has no balance - rewards are minted from system pool
-    let mut tx = qnet_state::Transaction {
-        hash: String::new(), // will be calculated
-        from: "system_rewards_pool".to_string(), // FIXED: Rewards come from system pool (like emission)
-        to: Some(claim_request.wallet_address.clone()), // User's wallet receiving rewards
-        amount: reward_amount,
-        nonce: 0, // will be set by state
-        gas_price: 0, // No gas for reward claims (Ed25519 + Dilithium both FREE!)
-        gas_limit: 0, // No gas for reward claims
-        timestamp: chrono::Utc::now().timestamp() as u64,
-        signature: Some(claim_request.quantum_signature.clone()), // User's Ed25519 signature
-        public_key: Some(claim_request.public_key.clone()), // User's Ed25519 public key
-        tx_type: qnet_state::TransactionType::RewardDistribution,
-        data: Some(format!("reward_claim:{}:{}:{}", claim_request.node_id, reward_amount,
-            "quantum")), // v5.0: Dilithium3 mandatory — always quantum
-        // v2.70: Pass through Dilithium signature if provided (quantum-safe claim)
-        dilithium_signature: claim_request.dilithium_signature.clone(),
-        dilithium_public_key: claim_request.dilithium_public_key.clone(),
-        chain_id: 0,
-    };
-
-    // v2.90: CRITICAL - Calculate BLAKE3 hash BEFORE submit!
-    // ARCHITECTURE: submit_transaction() calls tx.validate() FIRST (line 16789)
-    // tx.validate() checks: self.hash != self.calculate_hash() (line 431)
-    // If hash not set, validation fails with "Invalid transaction hash"
-    // Then submit_transaction() uses this hash for mempool (line 16977)
-    tx.hash = tx.calculate_hash();
-    
-    // Submit transaction to blockchain
-    match blockchain.submit_transaction(tx.clone()).await {
-        Ok(tx_hash) => {
-            println!("[INFO][CLAIM] tx_submitted node={} hash={}", claim_request.node_id, tx_hash);
-            
-            // CRITICAL: Mark rewards as claimed in reward_manager AFTER successful blockchain submission
-            let claim_result = {
-                let reward_manager_arc = blockchain.get_reward_manager();
-                let mut reward_manager = reward_manager_arc.write().await;
-                reward_manager.claim_rewards(&claim_request.node_id, &claim_request.wallet_address)
-            };
-            
-            if let Some(ref reward) = claim_result.reward {
-                // PRODUCTION v2.43.1: Save claim history to storage for /rewards/history API
-                let current_height = blockchain.get_height().await;
-                let current_epoch = (current_height / 14400).saturating_add(1);
-                let current_time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                
-                let storage = blockchain.get_storage();
-                
-                // v2.75: CRITICAL - Delete pending reward from RocksDB to prevent double-claim after restart
-                if let Err(e) = storage.delete_pending_reward(&claim_request.node_id) {
-                    eprintln!("[WARN][CLAIM] failed_to_delete_pending node={} err={}", claim_request.node_id, e);
-                } else {
-                    println!("[INFO][CLAIM] pending_deleted_from_storage node={}", claim_request.node_id);
-                }
-                
-                let epoch_key = format!("rewards:{}:epoch:{}", claim_request.node_id, current_epoch);
-                
-                // Write pool breakdown for history API
-                let _ = storage.save_contract_state(&epoch_key, "claimed", &reward.total_reward.to_string());
-                let _ = storage.save_contract_state(&epoch_key, "pool1", &reward.pool1_base_emission.to_string());
-                let _ = storage.save_contract_state(&epoch_key, "pool2", &reward.pool2_transaction_fees.to_string());
-                let _ = storage.save_contract_state(&epoch_key, "pool3", &reward.pool3_activation_bonus.to_string());
-                let _ = storage.save_contract_state(&epoch_key, "claim_time", &current_time.to_string());
-                let _ = storage.save_contract_state(&epoch_key, "tx_hash", &tx_hash);
-                
-                // Update last claim time
-                let _ = storage.save_contract_state(
-                    &format!("rewards:{}", claim_request.node_id), 
-                    "last_claim", 
-                    &current_time.to_string()
-                );
-                
-                println!("[REWARDS] 📊 History saved: epoch={} pool1={} pool2={} pool3={}", 
-                    current_epoch, 
-                    reward.pool1_base_emission,
-                    reward.pool2_transaction_fees,
-                    reward.pool3_activation_bonus
-                );
-                
-                // PRODUCTION v2.43.1: Broadcast RewardClaimed event via WebSocket
-                broadcast_ws_event(WsEvent::RewardClaimed {
-                    node_id: claim_request.node_id.clone(),
-                    wallet_address: claim_request.wallet_address.clone(),
-                    amount_qnc: reward.total_reward as f64 / 1_000_000_000.0,
-                    tx_hash: tx_hash.clone(),
-                    epoch: current_epoch,
-                });
-            }
-            
-            if let Some(reward) = claim_result.reward {
-                Ok(warp::reply::json(&json!({
-                    "success": true,
-                    "message": "Reward claim transaction submitted to blockchain",
-                    "tx_hash": tx_hash,
-                    "reward": {
-                        "total_qnc": reward.total_reward as f64 / 1_000_000_000.0,
-                        "pool1_base": reward.pool1_base_emission as f64 / 1_000_000_000.0,
-                        "pool2_fees": reward.pool2_transaction_fees as f64 / 1_000_000_000.0,
-                        "pool3_activation": reward.pool3_activation_bonus as f64 / 1_000_000_000.0,
-                        "phase": format!("{:?}", reward.current_phase)
-                    },
-                    "next_claim_time": claim_result.next_claim_time
-                })))
-            } else {
-                Ok(warp::reply::json(&json!({
-                    "success": true,
-                    "message": "Reward claim transaction submitted",
-                    "tx_hash": tx_hash
-                })))
-            }
-        }
-        Err(e) => {
-            println!("[REWARDS] ❌ Failed to submit reward claim transaction: {}", e);
-            Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": format!("Failed to submit transaction: {}", e)
-            })))
-        }
-    }
+    Ok(warp::reply::json(&json!({ "success": false, "error": "No claimable rewards" })))
 }
 
 // GET /api/v1/rewards/pending/{node_id} - Get pending rewards for a node
 // v2.64: Uses REAL heartbeat data from P2P, not fallback values
+/// A wallet's UNCLAIMED reward total (QNC base units): the authoritative claimable, summed over every
+/// reward-root epoch beyond its claim watermark — same enumeration the merkle claim path submits — plus
+/// any residual legacy Account.pending_rewards. Status-independent: reward is wallet-scoped, so it is
+/// returned in full whether the node is online, offline, or banned.
+async fn wallet_claimable_qnc(blockchain: &BlockchainNode, wallet: &str) -> u64 {
+    let storage = blockchain.get_storage();
+    let last_claimed = {
+        let state = blockchain.get_state_manager();
+        let g = state.read().await;
+        g.get_last_claimed_epoch(wallet)
+    };
+    let mut total = 0u64; // merkle reward_root is the SOLE reward source (legacy accrual removed)
+    // Mirror handle_claim_rewards: one claim TX covers at most MAX_BATCH unclaimed epochs (the wallet
+    // re-claims for any remainder), so the shown figure equals what the next claim actually pays — no
+    // display-vs-claimable divergence.
+    const MAX_BATCH: usize = 512;
+    let mut counted = 0usize;
+    for epoch in storage.load_reward_epochs().unwrap_or_default().into_iter().filter(|e| *e > last_claimed) {
+        if counted >= MAX_BATCH { break; }
+        let wallets = match storage.load_epoch_reward_wallets(epoch) {
+            Ok(Some(w)) => w,
+            _ => match storage.load_epoch_reward_root(epoch) {
+                Ok(Some((_, _, _, t))) => crate::node::BlockchainNode::compute_epoch_reward_distribution(&storage, epoch, t).0,
+                _ => continue,
+            },
+        };
+        if let Some((_, amt)) = wallets.iter().find(|(w, _)| w == wallet) {
+            total = total.saturating_add(*amt);
+            counted += 1;
+        }
+    }
+    total
+}
+
 async fn handle_get_pending_rewards(
     node_id: String,
     remote_addr: Option<std::net::SocketAddr>,
@@ -10040,12 +10056,12 @@ async fn handle_get_pending_rewards(
     // v3.34: TOTAL from StateManager (source of truth), BREAKDOWN from reward_manager
     // Previously read everything from reward_manager which could diverge from blockchain state
     let (pending_amount, pool1, pool2, pool3, phase, is_claimable) = {
-        // 1. Get authoritative TOTAL from blockchain state
+        // 1. Authoritative TOTAL = merkle reward-root claimable (the real lazy-reward mechanism) +
+        //    residual legacy pending. Reading only Account.pending_rewards undercounted to 0 because the
+        //    accrued reward lives in the per-epoch reward_roots, claimed by merkle proof — not that field.
         let blockchain_total = {
             if let Some(wallet) = blockchain.get_node_wallet(&node_id).await {
-                let state = blockchain.get_state_manager();
-                let state_guard = state.read().await;
-                state_guard.get_pending_rewards(&wallet)
+                wallet_claimable_qnc(&blockchain, &wallet).await
             } else {
                 0
             }
@@ -10131,6 +10147,7 @@ async fn handle_get_pending_rewards(
         "node_type": node_type,
         "phase": phase,
         "pending_rewards": total_qnc,
+        "pending_rewards_nano": pending_amount, // exact base units (client divides by 1e9 for display)
         "pools": {
             "pool1_base_emission": pool1_qnc,
             "pool2_tx_fees": pool2_qnc,
@@ -10426,18 +10443,10 @@ async fn handle_get_rewards_by_wallet(
     };
     
     for node_id in nodes {
-        // v3.34: TOTAL from StateManager (source of truth), breakdown from reward_manager
+        // Merkle reward_root claimable (single-source; legacy pending removed) for this node's wallet.
         let blockchain_total = {
-            if let Some(wallet) = blockchain.get_node_wallet(&node_id).await {
-                let state = blockchain.get_state_manager();
-                let state_guard = state.read().await;
-                state_guard.get_pending_rewards(&wallet)
-            } else {
-                // For the wallet we're querying — check directly
-                let state = blockchain.get_state_manager();
-                let state_guard = state.read().await;
-                state_guard.get_pending_rewards(&wallet_address)
-            }
+            let w = blockchain.get_node_wallet(&node_id).await.unwrap_or_else(|| wallet_address.clone());
+            wallet_claimable_qnc(&blockchain, &w).await
         };
         
         let reward_manager = blockchain.get_reward_manager();
@@ -10555,21 +10564,16 @@ async fn handle_get_pending_rewards_batch(
     let current_height = blockchain.get_height().await;
     let current_epoch = (current_height / 14400).saturating_add(1);
     
-    // v3.34: Read authoritative totals from StateManager
-    let state_arc = blockchain.get_state_manager();
-    let state_guard = state_arc.read().await;
-    
     let mut results = Vec::new();
     let mut total_pending = 0.0f64;
-    
+
     for node_id in &request.node_ids {
         let pending = reward_manager.get_pending_reward(node_id).cloned();
-        
-        // v3.34: Get authoritative total from blockchain state
-        let blockchain_total = if let Some(wallet) = blockchain.get_node_wallet(node_id).await {
-            state_guard.get_pending_rewards(&wallet)
-        } else {
-            0
+
+        // Merkle reward_root claimable (single-source; legacy pending removed).
+        let blockchain_total = match blockchain.get_node_wallet(node_id).await {
+            Some(wallet) => wallet_claimable_qnc(&blockchain, &wallet).await,
+            None => 0,
         };
         
         let (total, pool1, pool2, pool3) = if let Some(ref reward) = pending {
@@ -10600,9 +10604,7 @@ async fn handle_get_pending_rewards_batch(
             }
         }));
     }
-    
-    drop(state_guard);
-    
+
     Ok(warp::reply::json(&json!({
         "success": true,
         "current_epoch": current_epoch,
@@ -12024,14 +12026,8 @@ async fn handle_activations_by_wallet(
         // Merge both sources into unified list
         let mut nodes: Vec<(String, qnet_consensus::lazy_rewards::NodeType, u64)> = Vec::new();
         
-        // v3.34: ARCHITECTURE — 1 wallet = 1 node (strictly enforced)
-        // Read pending_rewards from StateManager (blockchain state = source of truth)
-        // per-wallet == per-node since mapping is always 1:1
-        let blockchain_pending = {
-            let state_arc = blockchain.get_state_manager();
-            let state_guard = state_arc.read().await;
-            state_guard.get_pending_rewards(&wallet_address)
-        };
+        // Merkle reward_root claimable (single-source; legacy pending removed). 1 wallet = 1 node.
+        let blockchain_pending = wallet_claimable_qnc(&blockchain, &wallet_address).await;
         
         // Add nodes from storage first (primary source)
         for (node_id, node_type_str, _rep) in &storage_nodes {

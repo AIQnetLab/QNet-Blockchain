@@ -9,6 +9,9 @@ import * as Keychain from 'react-native-keychain';
 // v3.35: Centralized node configuration (no duplication!)
 // v4.10: Added getSolanaRpcUrl for centralized Solana RPC management
 import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl } from '../config/nodes';
+// Post-quantum BFT light-client: trustless committee-QC state-root verification
+// (replaces the MITM-bypassable 2/3 peer-poll). MITM-proof at any network size.
+import { verifyMacroblockStateRoot } from '../crypto/QcLightClient';
 
 export class WalletManager {
   constructor() {
@@ -3497,11 +3500,15 @@ export class WalletManager {
             data.state_root
           );
           
-          // Step 2: Verify state_root matches latest block (multi-node consensus)
+          // Step 2: Verify state_root is certified by a ≥quorum committee QC,
+          // verified inductively from the binary-pinned trust anchor (MITM-proof).
+          // Replaces the old verifyStateRootFromMultipleNodes 2/3 peer-poll, which a
+          // MITM could satisfy by returning matching fake roots from controlled nodes.
           if (proofValid) {
-            verified = await this.verifyStateRootFromMultipleNodes(
+            verified = await verifyMacroblockStateRoot(
               data.state_root,
-              data.block_height
+              data.block_height,
+              () => this.getRandomBootstrapNode()
             );
           }
         }
@@ -3663,14 +3670,16 @@ export class WalletManager {
   }
 
   /**
-   * Verify state_root by querying multiple nodes (Byzantine fault tolerance)
-   * At least 2/3 nodes must agree on state_root for the block
-   * 
-   * v3.11: state_root is in MacroBlock, not MicroBlock
-   * MacroBlock index = floor(blockHeight / 90)
-   * 
-   * v3.12: FIXED - Use discovered nodes, NOT hardcoded Genesis!
-   * This prevents overloading Genesis nodes and is truly decentralized
+   * DEPRECATED + UNUSED (kept for reference). Superseded by the trustless
+   * committee-QC light client: QcLightClient.verifyMacroblockStateRoot().
+   *
+   * SECURITY: this 2/3 multi-node poll is MITM-bypassable — an attacker on the
+   * path (or controlling the polled subset) can return matching FAKE state_roots
+   * and pass the vote. It verifies agreement, not authenticity. The replacement
+   * verifies a ≥quorum post-quantum committee QC inductively from a pinned anchor,
+   * so a forged root cannot be certified without breaking ML-DSA-65 / SHA3.
+   *
+   * No remaining callers. Safe to delete in a later cleanup.
    */
   async verifyStateRootFromMultipleNodes(stateRoot, blockHeight) {
     try {

@@ -6147,8 +6147,9 @@ impl Storage {
     /// registrations on reorg (no per-block delete, no absence window). First-wins by (reg_height,
     /// node_id): the earliest canonical registration of a burn owns it. Atomic: the old cbw_ region is
     /// cleared and the rebuilt set written in ONE WriteBatch (no reader observes an empty intermediate).
-    /// Burns only ever back Super/genesis registrations, so this scans the `srtr_` roster index
-    /// (O(supers)) and never the millions of light node_ entries.
+    /// Scans BOTH roster indices — `srtr_` (super/genesis) and `lrtr_` (light, also burn-attested
+    /// on-chain) — so cbw covers every burn-backed registration (see the in-loop note). Rebuild is
+    /// O(registrations) but rare (boot/snapshot/reorg); the per-block path is incremental O(1).
     pub fn rebuild_committed_burn_wallet(&self, up_to_height: u64) -> IntegrationResult<u32> {
         use rocksdb::{IteratorMode, Direction};
         let registry_cf = self.persistent.db.cf_handle("node_registry")
@@ -6258,10 +6259,43 @@ impl Storage {
                 if h > up_to_height { continue; } // orphan/above-bound exclusion
                 let wallet = parsed["wallet"].as_str().unwrap_or("");
                 let burn = parsed["burn"].as_str().unwrap_or("");
-                lt.add(&crate::registry_lthash::row_lanes(&node_id, wallet, h, burn));
+                let vrf = parsed["vrf_pk_sha3"].as_str().and_then(|s| hex::decode(s).ok()).unwrap_or_default();
+                lt.add(&crate::registry_lthash::row_lanes(&node_id, wallet, h, burn, &vrf));
             }
         }
         lt
+    }
+
+    /// Light-client registry dump as of `up_to_height`: the chain-confirmed roster
+    /// (node_id, wallet, reg_height, burn, vrf_pk_sha3) with reg_height <= up_to_height, plus the
+    /// LtHash root over them — byte-identical to the QC-signed registry_root sealed at that height.
+    /// The light client recomputes the root and binds each committee pubkey to it. Read-only, cacheable.
+    pub fn registry_entries_as_of(&self, up_to_height: u64) -> (Vec<serde_json::Value>, String) {
+        use rocksdb::{IteratorMode, Direction};
+        let registry_cf = match self.persistent.db.cf_handle("node_registry") { Some(cf) => cf, None => return (Vec::new(), String::new()) };
+        let mut lt = crate::registry_lthash::LtHash::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for prefix in [b"srtr_".as_ref(), b"lrtr_".as_ref()] {
+            for item in self.persistent.db.iterator_cf(&registry_cf, IteratorMode::From(prefix, Direction::Forward)) {
+                let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+                if !k.starts_with(prefix) { break; }
+                let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s.to_string(), Err(_) => continue };
+                if !seen.insert(node_id.clone()) { continue; }
+                let nk = format!("node_{}", node_id);
+                let val = match self.persistent.db.get_cf(&registry_cf, nk.as_bytes()) { Ok(Some(v)) => v, _ => continue };
+                let parsed: serde_json::Value = match serde_json::from_slice(&val) { Ok(p) => p, Err(_) => continue };
+                let h = match parsed["reg_height"].as_u64() { Some(h) => h, None => continue };
+                if h > up_to_height { continue; }
+                let wallet = parsed["wallet"].as_str().unwrap_or("").to_string();
+                let burn = parsed["burn"].as_str().unwrap_or("").to_string();
+                let vrf = parsed["vrf_pk_sha3"].as_str().unwrap_or("").to_string();
+                let vrf_bytes = hex::decode(&vrf).unwrap_or_default();
+                lt.add(&crate::registry_lthash::row_lanes(&node_id, &wallet, h, &burn, &vrf_bytes));
+                out.push(serde_json::json!({"node_id": node_id, "wallet": wallet, "reg_height": h, "burn": burn, "vrf_pk_sha3": vrf}));
+            }
+        }
+        (out, hex::encode(lt.root()))
     }
 
     /// QC-certified digest of the chain-confirmed registry BURN-IDENTITY (SUPER+genesis AND LIGHT),
@@ -6377,7 +6411,9 @@ impl Storage {
                 let wallet = parsed["wallet"].as_str().unwrap_or("");
                 if h <= up_to_height {
                     let burn = parsed["burn"].as_str().unwrap_or("");
-                    lt.add(&crate::registry_lthash::row_lanes(&node_id, wallet, h, burn));
+                    let vrf = parsed["vrf_pk_sha3"].as_str()
+                        .and_then(|s| hex::decode(s).ok()).unwrap_or_default();
+                    lt.add(&crate::registry_lthash::row_lanes(&node_id, wallet, h, burn, &vrf));
                 } else {
                     // orphan of a discarded block — prune both index keys + node_ + the wallet reverse
                     // index (one wallet backs one node, so this wallet_ belongs to the orphan).
@@ -6547,13 +6583,13 @@ impl Storage {
     /// Stores BOTH forward index (node_id → data) AND reverse index (wallet → node_id)
     /// for O(1) lookups in both directions.
     pub fn save_node_registration(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64) -> IntegrationResult<()> {
-        self.save_node_registration_inner(node_id, node_type, wallet, reputation, None, None)
+        self.save_node_registration_inner(node_id, node_type, wallet, reputation, None, None, None)
     }
 
     /// Block-apply registration: stamps the deterministic `reg_height` so the entry is recognised as
     /// chain-confirmed. Only such entries enter the reward roster (RPC-cache writes have no height).
     pub fn save_node_registration_at_height(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: u64) -> IntegrationResult<()> {
-        self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height), None)
+        self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height), None, None)
     }
 
     /// Chain-apply registration that also persists the backing `burn_tx` co-resident with `reg_height`
@@ -6562,10 +6598,17 @@ impl Storage {
     /// (rebuild_committed_burn_wallet), and the registry digest (registry_root) hashes them. Genesis /
     /// non-burn callers use save_node_registration_at_height (burn empty). burn empty ⇒ binding skipped.
     pub fn save_node_registration_at_height_burn(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: u64, burn_tx: &str) -> IntegrationResult<()> {
-        self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height), Some(burn_tx))
+        self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height), Some(burn_tx), None)
     }
 
-    fn save_node_registration_inner(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: Option<u64>, burn_tx: Option<&str>) -> IntegrationResult<()> {
+    /// As above, but also binds the node's consensus pubkey (vrf_pk) into registry_root via the
+    /// co-resident row. Used by the block-apply path (the on-chain NodeRegistration TX carries the key).
+    /// Keyless callers (genesis/tests) use the plain variant (vrf None).
+    pub fn save_node_registration_at_height_burn_vrf(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: u64, burn_tx: &str, vrf_pk: Option<&[u8]>) -> IntegrationResult<()> {
+        self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height), Some(burn_tx), vrf_pk)
+    }
+
+    fn save_node_registration_inner(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: Option<u64>, burn_tx: Option<&str>, vrf_pk: Option<&[u8]>) -> IntegrationResult<()> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
         let metadata_cf = self.persistent.db.cf_handle("metadata")
@@ -6619,6 +6662,23 @@ impl Storage {
                 }
             }
         }
+        // vrf_pk_sha3: consensus-signer-key commitment, IMMUTABLE once stamped (same invariant as
+        // wallet/burn/reg_height). sha3-256 of the node's consensus pubkey carried by the chain-apply
+        // (NodeRegistration TX); co-resident here so the registry_root row field is byte-identical on
+        // every node. A later RPC-cache write (vrf_pk None) preserves the stamped key. Light rows: "".
+        let vrf_sha3_hex: String = match prior.as_ref().and_then(|p| p["vrf_pk_sha3"].as_str()) {
+            Some(pv) if !pv.is_empty() => pv.to_string(),
+            _ => match vrf_pk {
+                Some(pk) if !pk.is_empty() => {
+                    use sha3::{Digest, Sha3_256};
+                    let mut h = Sha3_256::new();
+                    Digest::update(&mut h, pk);
+                    hex::encode(h.finalize())
+                }
+                _ => String::new(),
+            },
+        };
+        if !vrf_sha3_hex.is_empty() { data["vrf_pk_sha3"] = json!(vrf_sha3_hex); }
         batch.put_cf(&registry_cf, key.as_bytes(), data.to_string().as_bytes());
 
         // Reverse index: wallet → node_id (O(1) lookup by wallet). Uses the FINAL (preserved) wallet.
@@ -6667,14 +6727,19 @@ impl Storage {
             let in_scope = node_id.starts_with("super_") || node_id.starts_with("genesis_node_") || node_type == "light";
             if in_scope {
                 let mut lt = self.registry_lt_load();
+                // vrf_pk_sha3 is immutable, so old-row == new-row key bytes; decode both from their
+                // own JSON for symmetry with the from-scratch rebuild.
+                let final_vrf = hex::decode(&vrf_sha3_hex).unwrap_or_default();
                 if let (Some(ph), Some(p)) = (prior_height, prior.as_ref()) {
                     let pw = p["wallet"].as_str().unwrap_or("");
                     let pb = p["burn"].as_str().unwrap_or("");
-                    lt.remove(&crate::registry_lthash::row_lanes(node_id, pw, ph, pb));
+                    let prior_vrf = p["vrf_pk_sha3"].as_str()
+                        .and_then(|s| hex::decode(s).ok()).unwrap_or_default();
+                    lt.remove(&crate::registry_lthash::row_lanes(node_id, pw, ph, pb, &prior_vrf));
                 }
                 let nh = data["reg_height"].as_u64().unwrap_or(0);
                 let nb = data["burn"].as_str().unwrap_or("");
-                lt.add(&crate::registry_lthash::row_lanes(node_id, &final_wallet, nh, nb));
+                lt.add(&crate::registry_lthash::row_lanes(node_id, &final_wallet, nh, nb, &final_vrf));
                 batch.put_cf(&metadata_cf, Self::REGISTRY_LT_STATE_KEY, lt.to_bytes().as_ref());
             }
         }

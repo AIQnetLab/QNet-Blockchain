@@ -739,12 +739,12 @@ export async function initializePushService() {
  * Used for monitoring server nodes from mobile app
  * v3.35: Added retry logic with different nodes
  */
-export async function checkServerNodeStatus(activationCode, nodeId = null, maxRetries = 3) {
+export async function checkServerNodeStatus(activationCode, nodeId = null, walletAddress = null, maxRetries = 3) {
   // GENESIS NODE SUPPORT: Convert Genesis activation code to node_id
   // Genesis codes: QNET-BOOT-001-STRAP → genesis_node_001
   let queryParams = '';
   const genesisMatch = activationCode?.match(/^QNET-BOOT-00([1-5])-STRAP$/);
-  
+
   if (genesisMatch) {
     // Genesis node: use node_id format for API query
     const bootstrapId = genesisMatch[1].padStart(3, '0');
@@ -755,10 +755,14 @@ export async function checkServerNodeStatus(activationCode, nodeId = null, maxRe
     // If nodeId is provided directly, use it
     console.log(`[Push] Using provided nodeId: ${nodeId}`);
     queryParams = `node_id=${encodeURIComponent(nodeId)}`;
+  } else if (walletAddress) {
+    // Wallet-bridge: resolve the node on-chain by wallet (works for server-activated supers and
+    // offline/banned nodes — no dependence on the RAM activation registry that misses them).
+    queryParams = `wallet=${encodeURIComponent(walletAddress)}`;
   } else if (activationCode) {
     queryParams = `activation_code=${encodeURIComponent(activationCode)}`;
   } else {
-    return { success: false, error: 'activation_code or node_id required' };
+    return { success: false, error: 'node_id, wallet, or activation_code required' };
   }
   
   let lastError = null;
@@ -821,6 +825,13 @@ export async function checkServerNodeStatus(activationCode, nodeId = null, maxRe
           needsAttention: result.needs_attention,
           message: result.message,
           // Rewards info (QNC tokens in smallest units)
+          // TODO(trustless): pending_rewards is an UNPROVEN /node/status value (a
+          // malicious node can inflate it). To make it MITM-proof, source it from the
+          // QC-certified account path: extend the /balance/proof endpoint to return
+          // pending_rewards and fold it into the merkle leaf (verifyMerkleProof already
+          // hashes a pending_rewards slot, currently pinned 0), then gate the displayed
+          // figure on QcLightClient.verifyMacroblockStateRoot like the balance. Node-side
+          // change required; out of scope for this light-client module.
           pendingRewards: result.pending_rewards,
         };
       }
@@ -889,6 +900,32 @@ export async function getAllNodesByWallet(walletAddress) {
   }
 }
 
+/**
+ * Claimable reward total for a node from the dedicated, STATUS-INDEPENDENT endpoint.
+ * Reads the merkle reward-root claimable (the real lazy reward) by node_id — returns the true accrued
+ * amount whether the node is online, offline, or banned. Use this for "Pending Rewards", NOT the
+ * node-status response (which derives 0 from a failed status lookup).
+ */
+export async function getPendingRewards(nodeId) {
+  try {
+    const apiUrl = getRandomBootstrapNode();
+    const response = await fetch(`${apiUrl}/api/v1/rewards/pending/${encodeURIComponent(nodeId)}`, { method: 'GET' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const r = await response.json();
+    return {
+      success: true,
+      // Base units (nanoQNC) so the UI's /1e9 display + claim gating match /node/status semantics.
+      pendingRewards: (r.pending_rewards_nano != null) ? r.pending_rewards_nano : Math.round((r.pending_rewards || 0) * 1e9),
+      isClaimable: !!r.is_claimable,
+      isEligible: !!r.is_eligible,
+      currentEpoch: r.current_epoch,
+      heartbeats: r.heartbeats,
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
 export default {
   // Push provider detection
   PushType,
@@ -917,5 +954,8 @@ export default {
   
   // Get all nodes by wallet (unified view)
   getAllNodesByWallet,
+
+  // Status-independent claimable rewards by node_id
+  getPendingRewards,
 };
 

@@ -28,6 +28,7 @@ import {
   reactivateNode, 
   checkServerNodeStatus,
   getAllNodesByWallet,
+  getPendingRewards,
   refreshFcmTokenOnServer,
   isTokenRefreshNeeded,
 } from '../services/PushService';
@@ -1204,17 +1205,33 @@ const WalletScreen = () => {
   // Load Server node (Super/Genesis) network status
   // This single API call returns ALL info: status, heartbeats, rewards
   const loadServerNodeStatus = async () => {
-    if (!activationCode) return;
-    
+    if (!activationCode && !wallet) return;
+
     try {
       // For all node types: pass nodePseudonym as nodeId for API lookup
       // Light nodes use pseudonym (light_mobile_XXX), Genesis use genesis_node_XXX
       const nodeId = nodePseudonym || null;
-      
-      const status = await checkServerNodeStatus(activationCode, nodeId);
-      
+      // QNet address only: a node's reward wallet is an EON address; never fall back to a Solana addr
+      // for node resolution (it would query a wallet that backs no node).
+      const walletAddress = wallet?.qnetAddress || null;
+
+      // Resolve by node_id if cached, else by WALLET (on-chain, resolves a server-activated super and
+      // offline/banned nodes), with activation_code only as the last resort.
+      const status = await checkServerNodeStatus(activationCode, nodeId, walletAddress);
+
+      // Claimable comes from the dedicated STATUS-INDEPENDENT endpoint (merkle reward-root) by the
+      // resolved node_id, so earned rewards show + can be claimed even when the node is offline/banned.
+      const resolvedId = status?.nodeId || nodeId;
+      if (resolvedId) {
+        const pr = await getPendingRewards(resolvedId);
+        // On a transient fetch failure keep the last-known claimable rather than collapsing to the
+        // (legacy, ~0) /node/status value — never show a smaller number on a network hiccup.
+        if (pr.success) status.pendingRewards = pr.pendingRewards;
+        else if (serverNodeStatus?.pendingRewards != null) status.pendingRewards = serverNodeStatus.pendingRewards;
+      }
+
       setServerNodeStatus(status);
-      
+
       if (status.success) {
         AsyncStorage.setItem('qnet_cached_server_status', JSON.stringify({
           ...status,
