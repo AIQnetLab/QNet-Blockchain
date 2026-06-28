@@ -14286,8 +14286,9 @@ impl SimplifiedP2P {
                     // Check if already in pending or verified
                     if cert_manager.remote_certificates.contains_key(&cert_serial) ||
                        cert_manager.pending_certificates.contains_key(&cert_serial) {
-                        if crate::node::is_info() {
-                            println!("[WARN][P2P] Certificate {} already cached, skipping", cert_serial);
+                        // Expected dedup of a re-offered cert — a no-op, not a warning (DBG only).
+                        if crate::node::is_debug() {
+                            println!("[DBG][P2P] cert_already_cached serial={} (dedup skip)", cert_serial);
                         }
                         return;
                     }

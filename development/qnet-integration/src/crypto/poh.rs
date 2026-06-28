@@ -64,6 +64,9 @@ const HASHES_PER_SLOT: u64 = HASHES_PER_TICK * 100; // 500,000
 
 /// Maximum drift allowed between PoH time and wall clock (5%)
 const MAX_DRIFT_PERCENT: f64 = 0.05;
+/// Drift is cosmetic (PoH count is an embedded proof, never a timing/consensus gate); log it at most
+/// once per this many slots (~5 min) instead of every slot, so non-nominal hardware doesn't spam.
+const POH_DRIFT_LOG_SLOTS: u64 = 300;
 
 // ============================================================================
 // DATA STRUCTURES
@@ -328,23 +331,20 @@ impl PoH {
                 POH_HASH_COUNT.inc_by(HASHES_PER_TICK as f64);
                 POH_CURRENT_SLOT.set(new_slot as f64);
                 
-                // Check drift on slot change
-                if new_slot > old_slot {
+                // Drift = this node's PoH-count vs wall mapping (hardware-dependent). Sampled every
+                // POH_DRIFT_LOG_SLOTS (~5 min): non-nominal hardware drifts every slot, but the rate
+                // is purely informational — PoH count is an embedded VDF proof, NEVER a consensus or
+                // production-timing gate, so it cannot desync the node.
+                if new_slot > old_slot && new_slot % POH_DRIFT_LOG_SLOTS == 0 {
                     let elapsed = start_time.elapsed();
                     let expected = Duration::from_secs(new_slot);
-                    
-                    if elapsed > expected {
-                        let drift = (elapsed - expected).as_secs_f64() / expected.as_secs_f64();
-                        if drift > MAX_DRIFT_PERCENT {
-                            println!("[PoH] ⚠️ Clock drift: {:.2}% slow (slot {})", 
-                                    drift * 100.0, new_slot);
-                        }
+                    let (drift, dir) = if elapsed > expected {
+                        ((elapsed - expected).as_secs_f64() / expected.as_secs_f64(), "slow")
                     } else {
-                        let drift = (expected - elapsed).as_secs_f64() / expected.as_secs_f64();
-                        if drift > MAX_DRIFT_PERCENT {
-                            println!("[PoH] ⚠️ Clock drift: {:.2}% fast (slot {})", 
-                                    drift * 100.0, new_slot);
-                        }
+                        ((expected - elapsed).as_secs_f64() / expected.as_secs_f64(), "fast")
+                    };
+                    if drift > MAX_DRIFT_PERCENT {
+                        println!("[PoH] ⚠️ Clock drift: {:.2}% {} (slot {})", drift * 100.0, dir, new_slot);
                     }
                 }
                 

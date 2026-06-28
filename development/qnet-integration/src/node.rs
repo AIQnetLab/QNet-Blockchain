@@ -776,10 +776,15 @@ pub fn observe_clock_drift(block_ts: u64, local_now: u64) {
     // median ring, so a drifted node already converges with the network on
     // the slot-offset computation without any process-exit gate.
     let ema_secs = next / 1000;
-    if ema_secs > 10 && is_warn() {
+    // Sampled (1 per PACING_LOG_EVERY blocks, ~5 min): the lag is informational — block_ts is
+    // slot-anchored/deterministic, so it cannot fork; logging every block just spams.
+    const PACING_LOG_EVERY: u64 = 300;
+    static PACING_LOG_CTR: AtomicU64 = AtomicU64::new(0);
+    if ema_secs > 10 && is_warn()
+        && PACING_LOG_CTR.fetch_add(1, Ordering::Relaxed) % PACING_LOG_EVERY == 0 {
         println!(
-            "[WARN][PACING] ema={}s peak={}s wall={} block_ts={} — chain off real-time schedule",
-            ema_secs, abs_drift_secs, local_now, block_ts
+            "[WARN][PACING] ema={}s peak={}s wall={} block_ts={} — chain off real-time schedule (sampled 1/{})",
+            ema_secs, abs_drift_secs, local_now, block_ts, PACING_LOG_EVERY
         );
     }
 }

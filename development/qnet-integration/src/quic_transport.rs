@@ -1750,8 +1750,10 @@ impl QuicTransport {
         ).await {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][QUIC] uni_read_failed peer={} err={:?}",
+                // One-way broadcast uni-stream read error (mostly a benign early stream close) — the
+                // payload still arrives from other peers / repair, so this is DBG, not a node fault.
+                if crate::node::is_debug() {
+                    println!("[DBG][QUIC] uni_read_failed peer={} err={:?}",
                         get_privacy_id_for_addr(&peer_addr.to_string()), e);
                 }
                 return;
