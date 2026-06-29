@@ -5299,25 +5299,40 @@ impl BlockchainNode {
         }
     }
 
-    /// Stamp `reg_height = 0` for every genesis NodeRegistration TX in block 0.
-    /// `super_registrations_sorted` (the reward roster) only counts entries with a stamped
-    /// reg_height. Synced peers stamp all five genesis nodes via the block-apply path
-    /// (deferred_registrations → save_node_registration_at_height, height 0, reputation 1.0).
-    /// The block CREATOR, however, applies block 0 through cache_node_registrations_from_transactions
-    /// → save_node_registration (NO height), so its roster would hold only its own self-registered
-    /// genesis id (count=1) while peers compute count=5 — a persistent per-epoch reward divergence.
-    /// This backfill makes the creator/restarted node byte-identical to synced peers. Idempotent.
-    fn stamp_genesis_registration_heights(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
+    /// Single canonical writer of ONE chain-confirmed NodeRegistration's registry row: stamps
+    /// reg_height + burn + vrf_pk co-resident (save_node_registration_at_height_burn_vrf) plus the
+    /// backing cbw binding. The ONE place producer-inline and genesis derive the row, so registry_root
+    /// is byte-identical on every node. vrf bound for consensus signers (super/genesis) only; light None.
+    fn write_registration_row(
+        storage: &crate::storage::Storage,
+        node_id: &str,
+        node_type: &qnet_state::NodeType,
+        wallet: &str,
+        burn_tx: &str,
+        dilithium_pk: Option<&String>,
+        height: u64,
+    ) {
+        let type_str = match node_type {
+            qnet_state::NodeType::Super => "super",
+            qnet_state::NodeType::Light => "light",
+        };
+        let vrf = if matches!(node_type, qnet_state::NodeType::Super) {
+            dilithium_pk.and_then(|s| hex::decode(s).ok())
+        } else { None };
+        let _ = storage.save_node_registration_at_height_burn_vrf(node_id, type_str, wallet, 1.0, height, burn_tx, vrf.as_deref());
+        if !burn_tx.is_empty() {
+            let _ = storage.committed_burn_wallet_put(burn_tx, wallet);
+        }
+    }
+
+    /// Apply block-0 genesis NodeRegistration TXs through the SAME canonical row writer as a peer-
+    /// applying validator (reg_height 0, burn, vrf co-resident), so the creator's registry_root and
+    /// reward roster are byte-identical to synced peers. Replaces the old height-only backfill that
+    /// dropped vrf_pk and diverged the creator's registry_root. Idempotent (immutable once stamped).
+    fn apply_genesis_registrations(storage: &crate::storage::Storage, transactions: &[qnet_state::Transaction]) {
         for tx in transactions {
-            if let qnet_state::TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } = &tx.tx_type {
-                let type_str = match node_type {
-                    qnet_state::NodeType::Super => "super",
-                    qnet_state::NodeType::Light => "light",
-                };
-                // height 0 + reputation 1.0 == the values synced peers write via deferred_registrations.
-                if let Err(e) = storage.save_node_registration_at_height(node_id, type_str, wallet_address, 1.0, 0) {
-                    eprintln!("[WARN][REG] genesis_reg_height_stamp_fail node={} err={}", node_id, e);
-                }
+            if let qnet_state::TransactionType::NodeRegistration { node_id, node_type, wallet_address, burn_tx, .. } = &tx.tx_type {
+                Self::write_registration_row(storage, node_id, node_type, wallet_address, burn_tx, tx.dilithium_public_key.as_ref(), 0);
             }
         }
     }
@@ -7900,10 +7915,10 @@ impl BlockchainNode {
         let genesis_timestamp = match storage.load_microblock_auto_format(0) {
             Ok(Some(genesis_block)) => {
                 if is_info() { println!("[INFO][GEN] loaded_ts={}", genesis_block.timestamp); }
-                // Self-heal the reward roster on restart: stamp reg_height=0 for the genesis
-                // registrations so a former creator (which only cached them without a height)
-                // matches synced peers. Idempotent for peers that already stamped them.
-                Self::stamp_genesis_registration_heights(&storage, &genesis_block.transactions);
+                // Apply genesis registrations canonically (reg_height 0 + vrf co-resident) so a former
+                // creator — which only cached them without height/vrf — is byte-identical to synced peers.
+                // Idempotent (immutable once stamped).
+                Self::apply_genesis_registrations(&storage, &genesis_block.transactions);
                 genesis_block.timestamp
             }
             Ok(None) => {
@@ -11890,8 +11905,8 @@ impl BlockchainNode {
                                                 // CRITICAL FIX v3.2: Cache NodeRegistration TXs from genesis block
                                                 // Without this, genesis creator can't find wallet addresses for rewards!
                                                 Self::cache_node_registrations_from_transactions(&storage, &genesis_microblock.transactions);
-                                                // Stamp reg_height=0 so the creator's reward roster matches synced peers (count=5, not 1).
-                                                Self::stamp_genesis_registration_heights(&storage, &genesis_microblock.transactions);
+                                                // Apply genesis registrations canonically (reg_height 0 + vrf) so the creator is byte-identical to synced peers.
+                                                Self::apply_genesis_registrations(&storage, &genesis_microblock.transactions);
                                                 println!("[INFO][GEN] Cached {} NodeRegistration TXs from genesis block",
                                                     genesis_microblock.transactions.iter()
                                                         .filter(|tx| matches!(tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. }))
@@ -16784,22 +16799,9 @@ impl BlockchainNode {
                             qnet_state::TransactionType::NodeRegistration {
                                 node_id: rid, node_type: rtype, wallet_address: rwallet, burn_tx: rburn, ..
                             } => {
-                                let rtype_str = match rtype {
-                                    qnet_state::NodeType::Super => "super",
-                                    qnet_state::NodeType::Light => "light",
-                                };
-                                // vrf bound for consensus participants ONLY (super/genesis); light = None,
-                                // byte-identical to the peer-apply deferred path (else the producer's own
-                                // registry_root row diverges from synced validators → fork).
-                                let rvrf = if matches!(rtype, qnet_state::NodeType::Super) { tx.dilithium_public_key.as_ref().and_then(|s| hex::decode(s).ok()) } else { None };
-                                let _ = storage.save_node_registration_at_height_burn_vrf(
-                                    rid, rtype_str, rwallet, 1.0, next_block_height, rburn, rvrf.as_deref());
-                                // Incremental cbw binding for the producer's own block (before save below),
-                                // mirroring peer-apply. Scope = any non-empty burn (super + LIGHT), MATCHING
-                                // rebuild_committed_burn_wallet (srtr_+lrtr_). Empty-burn regs auto-skip.
-                                if !rburn.is_empty() {
-                                    let _ = storage.committed_burn_wallet_put(rburn, rwallet);
-                                }
+                                // Single canonical derivation (vrf super-only + cbw), byte-identical to the
+                                // peer-apply path — else the producer's own registry_root row diverges → fork.
+                                Self::write_registration_row(&storage, rid, rtype, rwallet, rburn, tx.dilithium_public_key.as_ref(), next_block_height);
                             }
                             qnet_state::TransactionType::NodeActivation { node_type: ntype, phase, .. } => {
                                 // Mirror apply_block_to_state EXACTLY, including its FIRST-MATCH-WINS arm
@@ -27569,6 +27571,37 @@ mod tests {
         assert!(BlockchainNode::committee_for_height(&storage, 180).is_none(), "epoch 2 ⇒ None");
         // height 300 ⇒ epoch 4 ⇒ needs macroblock idx 2; absent ⇒ None (no guess), not a divergent set.
         assert!(BlockchainNode::committee_for_height(&storage, 300).is_none(), "absent N-2 ⇒ None (no guess)");
+    }
+
+    // Regression guard for the genesis registry_root fork: the block CREATOR (apply_genesis_registrations)
+    // must write vrf_pk co-resident, byte-identical to the peer-apply path — else its registry_root
+    // diverges from synced peers and proposal_content never reaches 2f+1. Pins creator == peer == vrf-bound.
+    #[test]
+    fn genesis_apply_writes_vrf_byte_identical_to_peer() {
+        let pk_hex = "a1b2c3d4e5f60718"; // genesis consensus key bytes (any valid hex)
+        let mut gtx = BlockchainNode::create_node_registration_tx_with_timestamp(
+            "genesis_node_001", qnet_state::NodeType::Super, "walletG", "genesis", "", Some(0));
+        gtx.dilithium_public_key = Some(pk_hex.to_string());
+
+        // Creator path (the fix): reg_height 0 + vrf via the shared canonical writer.
+        let _dc = tempfile::TempDir::new().expect("tempdir");
+        let creator = crate::storage::Storage::new(_dc.path().to_str().unwrap()).expect("storage");
+        BlockchainNode::apply_genesis_registrations(&creator, std::slice::from_ref(&gtx));
+
+        // Peer-apply path: the deferred consumer writes the same row (super ⇒ vrf from the TX pubkey).
+        let _dp = tempfile::TempDir::new().expect("tempdir");
+        let peer = crate::storage::Storage::new(_dp.path().to_str().unwrap()).expect("storage");
+        let vrf = hex::decode(pk_hex).unwrap();
+        peer.save_node_registration_at_height_burn_vrf("genesis_node_001", "super", "walletG", 1.0, 0, "", Some(vrf.as_slice())).unwrap();
+        assert_eq!(creator.compute_registry_root(0), peer.compute_registry_root(0),
+                   "genesis creator path must be byte-identical to the peer-apply path");
+
+        // vrf is actually bound: a vrf-less write yields a DIFFERENT root (proves the regression is closed).
+        let _dn = tempfile::TempDir::new().expect("tempdir");
+        let novrf = crate::storage::Storage::new(_dn.path().to_str().unwrap()).expect("storage");
+        novrf.save_node_registration_at_height_burn("genesis_node_001", "super", "walletG", 1.0, 0, "").unwrap();
+        assert_ne!(creator.compute_registry_root(0), novrf.compute_registry_root(0),
+                   "vrf_pk must be bound into registry_root (creator != vrf-less)");
     }
 
     // ── B cutover: merkle reward-claim determinism + security ──
