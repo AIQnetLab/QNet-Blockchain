@@ -8767,6 +8767,7 @@ async fn handle_server_node_status(
                 
                 return Ok(warp::reply::json(&json!({
                     "success": true,
+                    "registered": true,
                     "node_id": found_id,
                     "node_type": node_type,
                     "is_online": is_online,
@@ -8817,38 +8818,63 @@ async fn handle_server_node_status(
         // standing and earned rewards stay visible/claimable (reward is wallet-scoped, status-independent).
         // Truly-unresolved (no node_id) ⇒ not-found.
         if let Some(ref off_id) = target_node_id {
-            let reputation = get_reputation_from_snapshot(&blockchain, off_id).await;
-            // Merkle reward_root claimable (wallet-scoped, status-independent) for the resolved node.
-            let pending_rewards = match blockchain.get_node_wallet(off_id).await {
-                Some(w) => wallet_claimable_qnc(&blockchain, &w).await,
-                None => 0,
-            };
-            return Ok(warp::reply::json(&json!({
-                "success": true,
-                "node_id": off_id,
-                "is_online": false,
-                "last_seen": 0,
-                "heartbeat_count": 0,
-                "required_heartbeats": 9,
-                "is_reward_eligible": false,
-                "reputation": reputation,
-                "current_block_height": blockchain.get_height().await,
-                "needs_attention": true,
-                "pending_rewards": pending_rewards,
-                "message": "Node registered but offline this window."
-            })));
+            // A node is registered IFF it has an on-chain reward wallet (get_node_wallet is
+            // registry-backed, NO fallback). Registered+offline ⇒ its REAL reputation (offline ≠
+            // banned), rewards stay visible/claimable (wallet-scoped). A node_id that resolves to NO
+            // on-chain registration (e.g. a stale cached pseudonym on a fresh genesis) ⇒
+            // registered:false + reputation:null — never "Banned", never a phantom "registered".
+            match blockchain.get_node_wallet(off_id).await {
+                Some(w) => {
+                    let reputation = get_reputation_from_snapshot(&blockchain, off_id).await;
+                    let pending_rewards = wallet_claimable_qnc(&blockchain, &w).await;
+                    return Ok(warp::reply::json(&json!({
+                        "success": true,
+                        "registered": true,
+                        "node_id": off_id,
+                        "is_online": false,
+                        "last_seen": 0,
+                        "heartbeat_count": 0,
+                        "required_heartbeats": 9,
+                        "is_reward_eligible": false,
+                        "reputation": reputation,
+                        "current_block_height": blockchain.get_height().await,
+                        "needs_attention": true,
+                        "pending_rewards": pending_rewards,
+                        "message": "Node registered but offline this window."
+                    })));
+                }
+                None => {
+                    return Ok(warp::reply::json(&json!({
+                        "success": true,
+                        "registered": false,
+                        "node_id": off_id,
+                        "is_online": false,
+                        "reputation": null,
+                        "current_block_height": blockchain.get_height().await,
+                        "needs_attention": true,
+                        "pending_rewards": 0,
+                        "message": "Node not registered on-chain yet."
+                    })));
+                }
+            }
         }
+        // Truly unresolved (no on-chain node for this wallet/activation_code) ⇒ NOT REGISTERED,
+        // which is DISTINCT from banned. reputation=null (absent, not 0) + registered=false so the
+        // wallet shows "not activated", never "Banned" — reputation 0 means proven equivocation ONLY.
         return Ok(warp::reply::json(&json!({
             "success": true,
+            "registered": false,
             "node_id": target_node_id,
             "is_online": false,
             "last_seen": 0,
             "heartbeat_count": 0,
             "required_heartbeats": 9,
             "is_reward_eligible": false,
-            "reputation": 0,
+            "reputation": null,
+            "current_block_height": blockchain.get_height().await,
             "needs_attention": true,
-            "message": "Node not found in active network. It may be offline or not yet registered."
+            "pending_rewards": 0,
+            "message": "Node not registered on-chain yet."
         })));
     }
     

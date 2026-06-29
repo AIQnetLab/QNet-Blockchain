@@ -6029,6 +6029,8 @@ const WalletScreen = () => {
                         ? '#ff3b30'  // Red - light not activated
                         : (activatedNodeType === 'light' && lightNodeStatus?.needsReactivation)
                           ? '#ff9500'  // Orange - Light node needs reactivation
+                          : (activatedNodeType !== 'light' && serverNodeStatus?.success && serverNodeStatus?.registered === false)
+                            ? '#ff9500'  // Orange - not registered on-chain yet (NOT banned)
                           : (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)
                             ? '#ff3b30'  // Red - Server offline
                             : (activatedNodeType !== 'light' && !serverNodeStatus?.success)
@@ -6039,6 +6041,8 @@ const WalletScreen = () => {
                         ? 'Inactive'
                         : (activatedNodeType === 'light' && lightNodeStatus?.needsReactivation)
                           ? 'Needs Reactivation'
+                          : (activatedNodeType !== 'light' && serverNodeStatus?.success && serverNodeStatus?.registered === false)
+                            ? 'Not Activated'
                           : (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)
                             ? 'Server Offline'
                             : (activatedNodeType !== 'light' && !serverNodeStatus?.success)
