@@ -412,7 +412,8 @@ impl SyncManager {
     ///   - Storage dedup: re-requested blocks are O(1) skipped at handle_blocks_batch.
     ///   - `apply_notify` is a Tokio `Notify` — O(1) wake, safe at any scale.
     ///   - 15s hard safety-net timeout guards against silent peer stalls.
-    ///   - 120s STALL_ABORT breaks the loop if apply_tip doesn't advance.
+    ///   - 120s STALL_ABORT resets the progress window (does NOT break) — this loop is the single
+    ///     non-terminating owner of gap progress; the frontier-reserve pass keeps re-driving F+1.
     ///
     /// Genesis priority (fresh node bootstrap):
     ///   If local_h == 0 and storage lacks h=0, we issue a targeted sync_blocks(0,0)
@@ -607,6 +608,8 @@ impl SyncManager {
             }
         }
 
+        // Frontier-reserve stall counter: re-dial the committee after a run of unfilled F+1 fetches.
+        let mut frontier_misses: u32 = 0;
         while self.active.load(Ordering::Relaxed) {
             // Floor the apply-frontier by the adopted snapshot anchor. The apply-dedup gate treats
             // height<=SNAPSHOT_ANCHOR_MB*90 as already-final (bound snapshot replaces sub-anchor
@@ -628,12 +631,51 @@ impl SyncManager {
                 self.progress_height.store(apply_tip, Ordering::Relaxed);
                 self.coordinator.try_send(ConsensusEvent::SyncProgress { height: apply_tip });
                 consecutive_failures = 0;
+                frontier_misses = 0; // progress ⇒ peer set is fine; re-dial committee only on genuine stall
             } else if last_progress_at.elapsed() > STALL_ABORT {
                 if is_warn() {
-                    println!("[WARN][SYNC] stalled_abort h={} target={} stuck_for={}s",
+                    println!("[WARN][SYNC] stall h={} target={} stuck_for={}s — frontier-repair continues",
                              apply_tip, target, last_progress_at.elapsed().as_secs());
                 }
-                break;
+                // Do NOT abort: this loop is the single non-terminating owner of gap progress. A break
+                // here (with the legacy driver still gated on Syncing) would leave NO driver. Reset the
+                // window so the warn re-arms; the frontier pass below keeps re-driving F+1.
+                last_progress_at = Instant::now();
+            }
+
+            // ─────────────────────────────────────────────────────────────────
+            // FRONTIER RESERVE — top-L1 liveness invariant: the contiguous-frontier successor F+1 is
+            // ALWAYS fetched here, on a path no speculative buffer occupancy or bulk window can starve;
+            // the sole guarantee of convergence from ANY gap. Runs BEFORE the bulk credit gate and
+            // bypasses the bulk overlap-dedup; the bulk dispatch below is optimistic prefetch only.
+            // ─────────────────────────────────────────────────────────────────
+            {
+                const FRONTIER_SCAN: u64 = 512; // bounded lowest-missing probe (breaks at first hole)
+                let scan_hi = std::cmp::min(apply_tip.saturating_add(FRONTIER_SCAN), target);
+                let mut lowest_missing = None;
+                let mut h = apply_tip + 1;
+                while h <= scan_hi {
+                    if self.storage.load_microblock(h).map(|o| o.is_none()).unwrap_or(true) {
+                        lowest_missing = Some(h);
+                        break;
+                    }
+                    h += 1;
+                }
+                if let Some(l) = lowest_missing {
+                    frontier_misses = frontier_misses.saturating_add(1);
+                    if frontier_misses % 8 == 0 {
+                        // Persistent frontier gap ⇒ refresh committee body-holders (peer set too narrow).
+                        self.p2p.dial_committee_for_cold_join();
+                    }
+                    let end = std::cmp::min(l.saturating_add(RANGE_CHUNK - 1), target);
+                    if is_info() {
+                        println!("[INFO][SYNC] frontier_fetch l={} end={} apply_tip={} target={} reserved",
+                                 l, end, apply_tip, target);
+                    }
+                    let _ = self.p2p.sync_blocks_frontier(l, end).await;
+                } else {
+                    frontier_misses = 0;
+                }
             }
 
             // ─────────────────────────────────────────────────────────────────

@@ -9640,14 +9640,26 @@ impl Storage {
             println!("[DBG][SYNC] galc_pin_wait_skipped tip_mb={} first_capsule_mb={}", tip_mb, crate::galc::GALC_MINT_INTERVAL);
         }
 
-        // Exogenously-verifiable anchor ceiling: a cold joiner can verify a snapshot anchor WITHOUT already
-        // holding the committee's keys ONLY via the genesis-anchored GALC pin (verify_v2_macroblock hash-
-        // trusts index==pin.0, no committee-key resolution) or — before any pin — the genesis-committee
-        // early anchor h=90. A snapshot ABOVE the pin would force the full-QC path whose non-genesis keys a
-        // cold joiner has not learned → reject. Negotiate the highest snapshot ≤ ceiling; bounded tail replays.
+        // Exogenously-verifiable anchor ceiling — genesis-rooted, no peer-tip trust. A cold joiner verifies a
+        // snapshot anchor against two trusted extents: the GALC pin (genesis-signed) and its OWN highest
+        // CONTIGUOUS-present macroblock — present ⟹ inductively QC-verified from genesis (stored only after
+        // verify_v2). Take the higher + a budget-bounded fetch-walk above it. This lifts the ceiling with the
+        // node's own verified lineage instead of collapsing to h=90 on a late capsule (the cold-join wedge).
+        // Snapshot BYTES stay bound to the anchor's 2f+1 snapshot_root on promote, so a high ceiling never
+        // weakens trust. Negotiate the highest snapshot ≤ ceiling; bounded tail replays.
         let verifiable_ceiling = {
+            const MAX_BINDING_WALK_MB: u64 = 15; // ≈ WALK_BUDGET_SECS / per-mb fetch
             let pin_mb = crate::galc::effective_pin_checkpoint().0;
-            if pin_mb > 0 { pin_mb.saturating_mul(90) } else { crate::node::SNAPSHOT_EARLY_ANCHOR_HEIGHT }
+            let mut frontier_mb = self.get_chain_height().unwrap_or(0) / 90;
+            while self.get_macroblock_by_height(frontier_mb.saturating_add(1)).ok().flatten().is_some() {
+                frontier_mb = frontier_mb.saturating_add(1);
+            }
+            let base_mb = pin_mb.max(frontier_mb);
+            if base_mb == 0 {
+                crate::node::SNAPSHOT_EARLY_ANCHOR_HEIGHT
+            } else {
+                base_mb.saturating_add(MAX_BINDING_WALK_MB).saturating_mul(90)
+            }
         };
 
         let queries: Vec<_> = peers.iter().map(|peer| {
@@ -9720,15 +9732,9 @@ impl Storage {
             )));
         }
 
-        // Per-boundary cooldown: a boundary we already failed on (or anything ≤ it) is not re-attempted
-        // until a STRICTLY higher one appears — degrade to block replay instead of re-arming the same
-        // failing snapshot every desync tick.
-        if target_height <= crate::node::LAST_SNAPSHOT_ATTEMPT_BOUNDARY.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(IntegrationError::Other(format!(
-                "snapshot_boundary_cooldown h={} action=block_replay", target_height
-            )));
-        }
-
+        // Snapshot is the preferred cold-join path: a transient binding/download failure is retried each
+        // desync tick (~15s backoff), never permanently latched. Forward-only guard above is the only
+        // suppression; convergence relies on the frontier-reserved dispatcher, not on disabling the jump.
         println!(
             "[INFO][SYNC] snapshot_download h={} capable_peers={}/{} discovery=two_phase",
             target_height, peer_addrs.len(), peer_heights.len(),
@@ -9767,9 +9773,8 @@ impl Storage {
                 Ok(height)
             }
             Err(e) => {
+                // Drop staging; snapshot path stays available for retry (no permanent latch).
                 let _ = self.discard_snapshot_state(height);
-                // Latch this boundary so it is not re-attempted until a strictly higher one appears.
-                crate::node::LAST_SNAPSHOT_ATTEMPT_BOUNDARY.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
                 Err(e)
             }
         }

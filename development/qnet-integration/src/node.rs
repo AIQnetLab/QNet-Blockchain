@@ -1069,12 +1069,6 @@ pub static SNAPSHOT_ANCHOR_MB: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_ANCHOR_HASH: [AtomicU64; 4] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
-/// Highest snapshot boundary a cold-join attempt has already FAILED on. A failed boundary (and any
-/// ≤ it) is not re-attempted until a STRICTLY higher boundary is advertised — so a node degrades to
-/// block replay instead of re-arming the same failing snapshot every desync tick (the non-destructive
-/// thrash). Reset only by progress: a strictly higher boundary or a successful promote.
-pub static LAST_SNAPSHOT_ATTEMPT_BOUNDARY: AtomicU64 = AtomicU64::new(0);
-
 fn store_anchor_hash(h: &[u8; 32]) {
     for i in 0..4 {
         let mut b = [0u8; 8];
@@ -25945,8 +25939,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         let need = qnet_consensus::checkpoint_bft::quorum_size(
                             crate::genesis_constants::genesis_node_count());
                         if attestors.len() < need {
-                            eprintln!("[WARN][REG] burn_attest_incomplete got={}/{} cost={} amount={} declared={} — registration rejected until quorum reached",
-                                      attestors.len(), need, agreed_cost, agreed_amount, b_amt);
+                            // Sub-quorum ⇒ ABORT the arm (return Err) so the single-owner onboarding driver
+                            // re-collects fresh attestations against the current committee next tick. Arming a
+                            // sub-quorum TX would rebroadcast fixed bytes every validator rejects forever (the
+                            // permanent-wedge anti-pattern). Likely transient cause surfaced for the operator.
+                            eprintln!("[WARN][REG] burn_attest_sub_quorum got={}/{} declared={} — retrying arm (check committee :8001 + Solana burn-RPC reachability)",
+                                      attestors.len(), need, b_amt);
+                            return Err(QNetError::NetworkError(format!(
+                                "burn_attest_sub_quorum got={} need={}", attestors.len(), need)));
                         }
                         if let qnet_state::TransactionType::NodeRegistration {
                             burn_tx: bt, burn_amount: ba, burn_cost: bc, burn_attestors: at, ..

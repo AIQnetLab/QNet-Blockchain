@@ -115,20 +115,18 @@ if [ "$(id -u)" = "0" ]; then\n\
   # RocksDB recreates LOCK on open — safe to remove before startup.\n\
   rm -f "$DATA_DIR/LOCK"\n\
   \n\
-  # Check for corrupted RocksDB (missing MANIFEST files)\n\
-  if [ -d "$DATA_DIR" ] && [ "$(ls -A $DATA_DIR 2>/dev/null)" ]; then\n\
-    if ls "$DATA_DIR"/MANIFEST-* >/dev/null 2>&1; then\n\
-      MANIFEST_FILE=$(ls "$DATA_DIR"/MANIFEST-* | head -1)\n\
-      if [ ! -f "$MANIFEST_FILE" ]; then\n\
-        echo "⚠️  Corrupted RocksDB detected: Missing MANIFEST file"\n\
-        echo "🧹 Cleaning corrupted database for fresh start..."\n\
-        rm -rf "$DATA_DIR"/*\n\
-        echo "✅ Database cleaned successfully"\n\
-      else\n\
-        echo "✅ RocksDB appears healthy"\n\
-      fi\n\
+  # RocksDB integrity: a valid store has BOTH a MANIFEST-* and CURRENT. The old\n\
+  # [ ! -f "$MANIFEST_FILE" ] test was dead (a matched glob always exists). Conservative:\n\
+  # wipe ONLY when DB files exist but MANIFEST/CURRENT is missing (genuine FS corruption);\n\
+  # a healthy DB always has both, so this never wipes a good store.\n\
+  if [ -d "$DATA_DIR" ] && [ "$(ls -A "$DATA_DIR" 2>/dev/null)" ]; then\n\
+    if ls "$DATA_DIR"/MANIFEST-* >/dev/null 2>&1 && [ -f "$DATA_DIR/CURRENT" ]; then\n\
+      echo "RocksDB healthy"\n\
+    elif ls "$DATA_DIR"/*.sst >/dev/null 2>&1 || ls "$DATA_DIR"/MANIFEST-* >/dev/null 2>&1; then\n\
+      echo "Corrupted RocksDB (MANIFEST/CURRENT missing) - cleaning for fresh start"\n\
+      rm -rf "$DATA_DIR"/*\n\
     else\n\
-      echo "🆕 No existing database - starting fresh"\n\
+      echo "No RocksDB present - starting fresh"\n\
     fi\n\
   else\n\
     echo "🆕 Creating new data directory"\n\

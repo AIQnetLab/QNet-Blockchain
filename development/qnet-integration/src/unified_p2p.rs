@@ -19264,6 +19264,32 @@ impl SimplifiedP2P {
         }
     }
 
+    /// Frontier-reserved fetch: the contiguous apply-frontier successor must be requestable on a budget
+    /// the bulk window/in_flight can never starve. Bypasses sync_blocks' SYNC_INFLIGHT overlap-dedup (a
+    /// bulk range covering the frontier must NOT swallow it) — the SyncManager loop single-flights it per
+    /// tick. Own bounded concurrency + timeout; sync_blocks_inner is delivery-verified + committee-fanned,
+    /// so on Ok the range has LANDED in storage (== applied: save_microblock writes the key ONLY on the
+    /// apply-success path, so the SyncManager frontier scan reads the true apply-frontier). Committee
+    /// peers are pre-dialed for cold-join.
+    pub async fn sync_blocks_frontier(&self, from_height: u64, to_height: u64) -> Result<(), String> {
+        if from_height > to_height { return Ok(()); }
+        const MAX_CONCURRENT_FRONTIER: usize = 2;
+        const FRONTIER_HARD_TIMEOUT_SECS: u64 = 20;
+        static FRONTIER_CONCURRENCY: Lazy<tokio::sync::Semaphore> =
+            Lazy::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_FRONTIER));
+        let _permit = match FRONTIER_CONCURRENCY.acquire().await {
+            Ok(p) => p,
+            Err(_) => return Err("frontier_semaphore_closed".to_string()),
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(FRONTIER_HARD_TIMEOUT_SECS),
+            self.sync_blocks_inner(from_height, to_height),
+        ).await {
+            Ok(res) => res,
+            Err(_) => Err(format!("frontier_hard_timeout {}s", FRONTIER_HARD_TIMEOUT_SECS)),
+        }
+    }
+
     async fn sync_blocks_inner(&self, from_height: u64, to_height: u64) -> Result<(), String> {
 
         // v13.1: Guard against inverted ranges at the source.
