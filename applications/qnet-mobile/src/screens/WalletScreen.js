@@ -880,7 +880,6 @@ const WalletScreen = () => {
   const [currentBlockHeight, setCurrentBlockHeight] = useState(0); // Cached network block height
   const [activatedNodeType, setActivatedNodeType] = useState(null); // Track which node type is activated
   const [activationCode, setActivationCode] = useState(null); // Store the activation code
-  const [nodeRewards, setNodeRewards] = useState(null); // Store validator metrics data
   const [processingValidation, setProcessingValidation] = useState(false); // Track validation processing
   const [activationPricing, setActivationPricing] = useState(null); // Dynamic pricing info
   const [nodePseudonym, setNodePseudonym] = useState(''); // Pseudonym/alias for the node
@@ -1068,7 +1067,6 @@ const WalletScreen = () => {
       // Also load specific node data if activated (runs in PARALLEL with loadAllUserNodes)
       if (activatedNodeType && activationCode) {
         if (activatedNodeType === 'light') {
-          loadNodeRewards();
           loadLightNodeStatus();
         }
         promises.push(loadServerNodeStatus());
@@ -1582,24 +1580,6 @@ const WalletScreen = () => {
     }
   };
   
-  // Load node rewards data
-  const loadNodeRewards = async () => {
-    if (!activatedNodeType || !activationCode || !wallet) return;
-    
-    try {
-      const rewards = await walletManager.getNodeRewards(activatedNodeType, activationCode, wallet.publicKey);
-      setNodeRewards(rewards);
-      
-      // No auto-ping - user can manually ping via UI if needed
-      
-      // Load system-generated pseudonym
-      await loadNodePseudonym(activationCode);
-    } catch (error) {
-      // console.error('Failed to load node rewards:', error);
-      setNodeRewards(null);
-    }
-  };
-  
   // Load system-generated node pseudonym (read-only)
   const loadNodePseudonym = async (activationCode) => {
     if (!activationCode) return;
@@ -1802,7 +1782,6 @@ const WalletScreen = () => {
             [{ text: 'OK', onPress: () => {
               setShowActivationInput(false);
               setActivationInputCode('');
-              loadNodeRewards();
             }}]
           );
         } else {
@@ -1812,7 +1791,6 @@ const WalletScreen = () => {
             [{ text: 'OK', onPress: () => {
               setShowActivationInput(false);
               setActivationInputCode('');
-              loadNodeRewards();
             }}]
           );
         }
@@ -2157,75 +2135,6 @@ const WalletScreen = () => {
       setTxResult({ success: false, error: error.message || 'Transaction failed' });
     } finally {
       setSendingTransaction(false);
-    }
-  };
-  
-  // Claim rewards for Light nodes (local tracking)
-  const handleProcessValidation = async () => {
-    if (!nodeRewards || nodeRewards.unclaimed <= 0 || processingValidation) return;
-    
-    setProcessingValidation(true);
-    try {
-      // Get correct wallet address based on activation phase
-      const walletAddress = await getWalletAddressForClaim();
-      const result = await walletManager.claimRewards(activatedNodeType, activationCode, walletAddress, password);
-      
-      if (result.success) {
-        // v2.80: Rich content with clickable transaction hash
-        const richContent = (
-          <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
-            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 16 }]}>
-              Successfully claimed {result.amount} QNC rewards from your {activatedNodeType} node.
-            </Text>
-            <Text style={[styles.modalContent, { textAlign: 'center', marginBottom: 8, fontSize: 12, color: '#888' }]}>
-              Transaction:
-            </Text>
-            <TouchableOpacity 
-              onPress={() => {
-                const explorerUrl = `https://explorer.qnet.network/tx/${result.txHash}`;
-                Linking.openURL(explorerUrl).catch(() => {
-                  Clipboard.setString(result.txHash);
-                  showAlert('Copied', 'Transaction hash copied to clipboard');
-                });
-              }}
-              style={{ backgroundColor: 'rgba(0, 255, 255, 0.1)', padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#00ffff40' }}
-            >
-              <Text style={{ color: '#00ffff', fontSize: 12, fontFamily: 'monospace', textAlign: 'center' }}>
-                {result.txHash?.slice(0, 20)}...{result.txHash?.slice(-20)}
-              </Text>
-              <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
-                Tap to open in Explorer
-              </Text>
-            </TouchableOpacity>
-          </View>
-        );
-        
-        showAlert(
-          'Rewards Claimed!',
-          '', // Empty - using richContent
-          [
-            { text: 'Copy Hash', style: 'default', onPress: () => {
-              Clipboard.setString(result.txHash);
-              showAlert('Copied', 'Transaction hash copied to clipboard');
-            }},
-            { text: 'OK', onPress: () => {
-              // Reload rewards
-              loadNodeRewards();
-              // Reload balance
-              if (wallet && wallet.publicKey) {
-                loadBalance(wallet.publicKey);
-              }
-            }}
-          ],
-          richContent
-        );
-      } else {
-        showAlert('Cannot Claim', result.message);
-      }
-    } catch (error) {
-      showAlert('Error', 'Failed to claim rewards: ' + error.message);
-    } finally {
-      setProcessingValidation(false);
     }
   };
   
@@ -2733,7 +2642,6 @@ const WalletScreen = () => {
       // Clear activation and node state from previous wallet
       setActivatedNodeType(null);
       setActivationCode(null);
-      setNodeRewards(null);
       setNodePseudonym('');
       setNodeStatus(null);
       setLightNodeStatus(null);
@@ -2875,7 +2783,6 @@ const WalletScreen = () => {
     setSeedConfirmWords({});
     setActivatedNodeType(null);
     setActivationCode(null);
-    setNodeRewards(null);
     setNodePseudonym('');
     setNodeStatus(null);
     setLightNodeStatus(null);
@@ -3146,7 +3053,6 @@ const WalletScreen = () => {
                   setLightNodeStatus(null);
                   setServerNodeStatus(null);
                   setNodePseudonym('');
-                  setNodeRewards(null);
                   // Clear ALL node-related AsyncStorage (both light and super)
                   const keysAll = await AsyncStorage.getAllKeys();
                   const nodeKeys = keysAll.filter(k =>
@@ -3836,7 +3742,6 @@ const WalletScreen = () => {
               setLightNodeStatus(null);
               setServerNodeStatus(null);
               setNodePseudonym('');
-              setNodeRewards(null);
               // Clear ALL node-related AsyncStorage (both light and super)
               const keysAll = await AsyncStorage.getAllKeys();
               const nodeKeys = keysAll.filter(k =>
@@ -5795,7 +5700,6 @@ const WalletScreen = () => {
                     // Reload all node data
                     await loadAllUserNodes();
                     if (activatedNodeType === 'light') {
-                      await loadNodeRewards();
                       await loadLightNodeStatus();
                     }
                     if (activatedNodeType) {
@@ -6073,16 +5977,14 @@ const WalletScreen = () => {
                         </Text>
                       </View>
 
-                      {activatedNodeType !== 'light' && serverNodeStatus.reputation != null && (
+                      {/* Reputation is binary: good standing (already implied by Active/ONLINE) or
+                          permanent ban for cryptographically-proven equivocation. Surface ONLY the
+                          bad state — no constant "Good standing" row that duplicates the status. */}
+                      {activatedNodeType !== 'light' && serverNodeStatus.reputation != null && serverNodeStatus.reputation < 70 && (
                         <View style={styles.rewardItem}>
                           <Text style={styles.rewardLabel}>Reputation:</Text>
-                          {/* Consensus reputation is binary: a node is in good standing
-                              or permanently banned (cryptographically-proven equivocation).
-                              Show the standing, not a number that never changes. */}
-                          <Text style={[styles.rewardValue, {
-                            color: (serverNodeStatus.reputation || 0) >= 70 ? '#34c759' : '#ff3b30'
-                          }]}>
-                            {(serverNodeStatus.reputation || 0) >= 70 ? 'Good standing' : 'Banned'}
+                          <Text style={[styles.rewardValue, { color: '#ff3b30' }]}>
+                            ⚠ Banned (equivocation)
                           </Text>
                         </View>
                       )}

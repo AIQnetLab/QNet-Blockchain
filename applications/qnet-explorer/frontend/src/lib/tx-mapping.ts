@@ -34,13 +34,15 @@ export function mapTxType(type: string | object | undefined, fromAddress?: strin
     emission: 'Reward',
     reward: 'Reward',
 
-    // Heartbeat (all node activity attestations)
+    // Heartbeat (super-node liveness attestation)
     heartbeatcommitment: 'Heartbeat',
-    pingcommitmentwithsampling: 'Heartbeat',
-    lightnodeeligibilitybitmap: 'Heartbeat',
-    bitmapcommitment: 'Heartbeat',
-    pingattestation: 'Heartbeat',
     heartbeat: 'Heartbeat',
+
+    // Light eligibility (ping/bitmap attestations)
+    lightnodeeligibilitybitmap: 'Light Eligibility',
+    bitmapcommitment: 'Light Eligibility',
+    pingattestation: 'Light Eligibility',
+    pingcommitmentwithsampling: 'Light Eligibility',
 
     // Smart Contracts
     contractdeploy: 'Contract',

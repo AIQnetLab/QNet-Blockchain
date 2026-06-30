@@ -27,6 +27,7 @@ interface TransactionData {
   is_quantum_signed?: boolean;
   dilithium_signature?: string;
   dilithium_public_key?: string;
+  tx_type_data?: Record<string, unknown> | null;
 }
 
 // Truncate
@@ -51,6 +52,17 @@ const formatTime = (ts: number | string | undefined): string => {
   const min = String(date.getMinutes()).padStart(2, '0');
   const ss = String(date.getSeconds()).padStart(2, '0');
   return `${dd}.${mm}.${yyyy}, ${hh}:${min}:${ss}`;
+};
+
+// snake_case/genesis_id → "Genesis Id" for the data card labels
+const humanizeKey = (key: string): string =>
+  key.replace(/[_-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+// Render any tx_type_data value as a string (objects/arrays → JSON)
+const formatDataValue = (val: unknown): string => {
+  if (val === null || val === undefined) return 'N/A';
+  if (typeof val === 'object') return JSON.stringify(val);
+  return String(val);
 };
 
 // Copy button
@@ -218,6 +230,21 @@ export default function TransactionPage() {
           </div>
         </div>
       </div>
+
+      {/* Type-specific public data (bitmap epoch/eligible_count, reward pool, etc.) */}
+      {tx.tx_type_data && Object.keys(tx.tx_type_data).length > 0 && (
+        <div className="block-card">
+          <h2 className="card-title">Transaction Data</h2>
+          <div className="details-grid">
+            {Object.entries(tx.tx_type_data).map(([key, value]) => (
+              <div className="detail-row" key={key}>
+                <span className="detail-label">{humanizeKey(key)}</span>
+                <span className="detail-value">{formatDataValue(value)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

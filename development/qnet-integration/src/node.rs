@@ -8537,6 +8537,11 @@ impl BlockchainNode {
             // delivers real push notifications immediately after a node restart.
             // (restore_light_nodes_from_storage defaults to Polling for privacy.)
             p2p.update_device_tokens_from_storage(&*blockchain.storage);
+
+            // Rebuild the per-epoch light-eligibility map so a mid-epoch restart keeps this genesis
+            // shard's attestations for the boundary bitmap TX (else those light nodes lose the reward).
+            let boot_h = blockchain.storage.get_chain_height().unwrap_or(0);
+            p2p.rebuild_light_eligible_from_storage(boot_h);
         }
 
         // v32.15: populate REGISTERED_SUPER_NODES from on-chain state. Drives
@@ -11064,9 +11069,15 @@ impl BlockchainNode {
                         // v7.0: Full confirmation + retry tracking (same as HeartbeatCommitment)
                         let should_send = if let Some(status) = bitmap_tracker.get(&current_epoch) {
                             if status.is_confirmed() {
-                                if is_info() {
-                                    println!("[INFO][LIGHT-BITMAP] Already confirmed epoch={} block={}",
-                                             current_epoch, status.confirmed_at_height.unwrap_or(0));
+                                // Skip-markers carry a sentinel tx_hash (no real TX emitted) — don't log as a confirmed TX.
+                                if status.tx_hash.starts_with("no_") {
+                                    if is_debug() {
+                                        println!("[DBG][LIGHT-BITMAP] epoch={} skipped (no eligible light in shard) — no TX emitted", current_epoch);
+                                    }
+                                } else if is_info() {
+                                    println!("[INFO][LIGHT-BITMAP] confirmed epoch={} block={} hash={}",
+                                             current_epoch, status.confirmed_at_height.unwrap_or(0),
+                                             &status.tx_hash[..status.tx_hash.len().min(16)]);
                                 }
                                 false
                             } else {

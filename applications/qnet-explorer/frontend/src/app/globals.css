@@ -2441,6 +2441,11 @@ a[href*="play.google.com"] img {
   color: #ff80b0;
 }
 
+.type-badge.type-light-eligibility {
+  background: rgba(120,200,255,0.15);
+  color: #80c0ff;
+}
+
 .type-badge.type-contract {
   background: rgba(240,130,130,0.15);
   color: #f09090;

@@ -60,12 +60,18 @@ export async function GET() {
           AND t.block >= ep.pe * 14400 AND t.block < ep.pe * 14400 + 14400
       `),
 
-      // Active LIGHT nodes = sealed eligible_count summed over the per-genesis bitmaps of the previous epoch.
+      // Active LIGHT nodes = MAX over the last 3 sealed epochs of (per-epoch SUM of eligible_count across genesis shards).
+      // Per-epoch SUM across shards = that epoch's light total (each light is in exactly one shard); MAX de-flickers a light
+      // that missed only the most-recent epoch's ping window.
       pool.query(`${prevEpochCte}
-        SELECT COALESCE(SUM((t.tx_type_data->>'eligible_count')::bigint), 0) AS active_light
-        FROM transactions t, ep
-        WHERE t.tx_type = 'LightNodeEligibilityBitmap'
-          AND t.block >= ep.pe * 14400 AND t.block < ep.pe * 14400 + 14400
+        SELECT COALESCE(MAX(epoch_light), 0) AS active_light FROM (
+          SELECT FLOOR(t.block / 14400)::bigint AS epoch,
+                 SUM((t.tx_type_data->>'eligible_count')::bigint) AS epoch_light
+          FROM transactions t, ep
+          WHERE t.tx_type = 'LightNodeEligibilityBitmap'
+            AND t.block >= GREATEST(ep.pe - 2, 0) * 14400 AND t.block < (ep.pe + 1) * 14400
+          GROUP BY FLOOR(t.block / 14400)
+        ) per_epoch
       `)
     ]);
     

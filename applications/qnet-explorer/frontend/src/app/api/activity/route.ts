@@ -93,7 +93,7 @@ export async function GET(request: NextRequest) {
     const typesParam = searchParams.get('types');
     let displayTypes: string[] | undefined = undefined;
     if (typesParam) {
-      displayTypes = typesParam.split(',').filter(t => /^[a-zA-Z]+$/.test(t.trim())).map(t => t.trim());
+      displayTypes = typesParam.split(',').map(t => t.trim()).filter(t => /^[a-zA-Z ]+$/.test(t));
       if (displayTypes.length === 0) displayTypes = undefined;
     }
 

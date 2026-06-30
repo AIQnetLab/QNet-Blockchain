@@ -18077,11 +18077,41 @@ impl SimplifiedP2P {
     fn record_light_epoch_eligible(&self, block_height: u64, light_node_id: &str) {
         const EPOCH_BLOCKS: u64 = 14400;
         let epoch = block_height / EPOCH_BLOCKS;
-        let mut map = self.epoch_light_eligible.write();
-        map.entry(epoch).or_default().insert(light_node_id.to_string());
-        if map.len() > 3 {
-            let keep_from = epoch.saturating_sub(2);
-            map.retain(|e, _| *e >= keep_from);
+        let (inserted, new_epoch) = {
+            let mut map = self.epoch_light_eligible.write();
+            let new_epoch = !map.contains_key(&epoch);
+            let inserted = map.entry(epoch).or_default().insert(light_node_id.to_string());
+            if map.len() > 3 {
+                let keep_from = epoch.saturating_sub(2);
+                map.retain(|e, _| *e >= keep_from);
+            }
+            (inserted, new_epoch)
+        };
+        // Persist for genesis restart resilience (bitmap is built from RAM); prune old persisted epochs
+        // only on the first attestation of a new epoch — O(roster) once/epoch, not per ping.
+        if inserted {
+            if let Some(storage) = crate::node::try_get_storage() {
+                let _ = storage.save_light_epoch_eligible(epoch, light_node_id);
+                if new_epoch { let _ = storage.prune_light_epoch_eligible(epoch.saturating_sub(2)); }
+            }
+        }
+    }
+
+    /// Boot rebuild of the per-epoch light-eligibility map from storage (genesis restart resilience):
+    /// without it a restart drops a shard's pre-restart attestations before the boundary bitmap TX.
+    pub fn rebuild_light_eligible_from_storage(&self, current_height: u64) {
+        let from_epoch = (current_height / 14400).saturating_sub(2);
+        if let Some(storage) = crate::node::try_get_storage() {
+            if let Ok(entries) = storage.load_light_epoch_eligible(from_epoch) {
+                if entries.is_empty() { return; }
+                let n = entries.len();
+                let mut map = self.epoch_light_eligible.write();
+                for (epoch, node_id) in entries { map.entry(epoch).or_default().insert(node_id); }
+                drop(map);
+                if crate::node::is_info() {
+                    println!("[INFO][LIGHT-BITMAP] epoch_eligible_rebuilt entries={} from_epoch={}", n, from_epoch);
+                }
+            }
         }
     }
 

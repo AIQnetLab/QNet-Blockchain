@@ -93,7 +93,7 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
 });
 
 const ITEMS_PER_PAGE = 50;
-const TX_TYPES = ['Transfer', 'Reward', 'Swap', 'Heartbeat', 'Registration', 'Activation', 'Contract', 'System'];
+const TX_TYPES = ['Transfer', 'Reward', 'Swap', 'Heartbeat', 'Light Eligibility', 'Registration', 'Activation', 'Contract', 'System'];
 
 export default function ExplorerClient({ initialData, initialHeight, initialTotal }: ExplorerClientProps) {
   // ========== STATE: initialized from SSR data — table renders INSTANTLY ==========

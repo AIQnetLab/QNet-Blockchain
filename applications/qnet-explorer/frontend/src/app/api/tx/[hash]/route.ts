@@ -36,6 +36,17 @@ function getNodeRpcUrl(): string {
 
 const NODE_RPC_URL = getNodeRpcUrl();
 
+// Normalize type-specific public data (JSONB object or JSON string) → object|null; null if empty.
+function parseTxTypeData(raw: unknown): Record<string, unknown> | null {
+  if (!raw) return null;
+  let obj: unknown = raw;
+  if (typeof raw === 'string') {
+    try { obj = JSON.parse(raw); } catch { return null; }
+  }
+  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return null;
+  return Object.keys(obj).length > 0 ? (obj as Record<string, unknown>) : null;
+}
+
 // Fetch TX from Node RPC (fallback if not in DB)
 async function fetchTransaction(hash: string): Promise<Record<string, unknown> | null> {
   try {
@@ -259,6 +270,7 @@ export async function GET(
           dilithium_signature: dbTx.dilithium_signature,
           dilithium_public_key: dbTx.dilithium_public_key,
           data: dbTx.data,
+          tx_type_data: parseTxTypeData(dbTx.tx_type_data),
         },
       }, {
         headers: {
@@ -370,6 +382,7 @@ export async function GET(
         dilithium_signature: tx.dilithium_signature as string | undefined,
         dilithium_public_key: tx.dilithium_public_key as string | undefined,
         data: tx.data as string | undefined,
+        tx_type_data: parseTxTypeData(tx.tx_type_data),
       },
     }, {
       headers: {

@@ -6014,6 +6014,43 @@ impl Storage {
         Ok(())
     }
 
+    /// Persist a light node's per-epoch attestation (genesis restart resilience): the boundary bitmap TX
+    /// is built from RAM only, so a mid-epoch restart would otherwise drop this shard's attestations.
+    /// Zero-padded epoch key ⇒ O(1) range-delete prune. Idempotent.
+    pub fn save_light_epoch_eligible(&self, epoch: u64, node_id: &str) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let key = format!("lelig_{:010}_{}", epoch, node_id);
+        self.persistent.db.put_cf(&cf, key.as_bytes(), &[1u8])?;
+        Ok(())
+    }
+
+    /// Reload persisted light attestations for epochs >= from_epoch (boot rebuild of the RAM map).
+    pub fn load_light_epoch_eligible(&self, from_epoch: u64) -> IntegrationResult<Vec<(u64, String)>> {
+        use rocksdb::{IteratorMode, Direction};
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let mut out = Vec::new();
+        let start = format!("lelig_{:010}_", from_epoch);
+        for item in self.persistent.db.iterator_cf(&cf, IteratorMode::From(start.as_bytes(), Direction::Forward)) {
+            let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(b"lelig_") { break; }
+            let s = match std::str::from_utf8(&k[6..]) { Ok(s) => s, Err(_) => continue };
+            if s.len() < 12 { continue; }
+            if let Ok(epoch) = s[..10].parse::<u64>() { out.push((epoch, s[11..].to_string())); }
+        }
+        Ok(out)
+    }
+
+    /// O(1) range-delete of persisted attestations for epochs < before_epoch (mirror the RAM 3-epoch prune).
+    pub fn prune_light_epoch_eligible(&self, before_epoch: u64) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let end = format!("lelig_{:010}_", before_epoch);
+        self.persistent.db.delete_range_cf(&cf, &b"lelig_0000000000_"[..], end.as_bytes())?;
+        Ok(())
+    }
+
     /// Load the ≤5 Light eligibility bitmaps for an epoch as (genesis_idx → bitmap), sorted.
     pub fn load_light_bitmaps(&self, epoch: u64) -> IntegrationResult<std::collections::BTreeMap<usize, Vec<u8>>> {
         let cf = self.persistent.db.cf_handle("pending_rewards")

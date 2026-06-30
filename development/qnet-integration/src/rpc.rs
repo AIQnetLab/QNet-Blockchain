@@ -8724,7 +8724,8 @@ async fn handle_server_node_status(
             
             if let Some((found_id, node_type, last_seen)) = node_info {
                 // v35: heartbeat count from the on-chain tally (Account.heartbeat_slots popcount).
-                let hb_epoch = blockchain.get_height().await / 14400;
+                let cur_height = blockchain.get_height().await;
+                let hb_epoch = cur_height / 14400;
                 let heartbeat_count = blockchain.get_account(found_id).await.ok().flatten()
                     .map(|a| crate::node::BlockchainNode::account_heartbeat_count(&a, hb_epoch))
                     .unwrap_or(0);
@@ -8738,9 +8739,15 @@ async fn handle_server_node_status(
                 
                 // Calculate if node is active (seen in last 15 minutes)
                 let is_online = now - last_seen < 15 * 60;
-                
-                // Calculate if eligible for rewards
-                let is_reward_eligible = heartbeat_count >= required_heartbeats;
+
+                // Pacing: heartbeat_count is the IN-PROGRESS epoch popcount (one bit per 1440-block
+                // subwindow), so a healthy node only reaches the full threshold near epoch end. Compare
+                // against elapsed subwindows so mid-epoch display doesn't false-alarm a node on pace.
+                let expected = ((cur_height % 14400) / 1440) as u32;
+                let on_pace = is_online && (heartbeat_count as u32) + 1 >= expected;
+
+                // Eligible if the full epoch threshold is met OR the node is online and on pace.
+                let is_reward_eligible = heartbeat_count >= required_heartbeats || on_pace;
                 
                 // v2.96: CRITICAL FIX - Get reputation from LAST MACROBLOCK SNAPSHOT (not local state)
                 // This ensures ALL nodes return SAME value (blockchain consensus)
@@ -8779,7 +8786,8 @@ async fn handle_server_node_status(
                     "reputation": reputation,
                     "current_block_height": block_height,
                     "current_window_start": current_window,
-                    "needs_attention": !is_online || heartbeat_count < required_heartbeats,
+                    // Attention only when offline or BEHIND pace (missed more than the current subwindow).
+                    "needs_attention": !is_online || (heartbeat_count as u32) + 1 < expected,
                     // Rewards info (QNC tokens in smallest units)
                     "pending_rewards": pending_rewards
                 })));
@@ -8794,19 +8802,22 @@ async fn handle_server_node_status(
                         Some(wallet) => wallet_claimable_qnc(&blockchain, &wallet).await,
                         None => 0,
                     };
+                    // No per-epoch light-eligible reader reachable here; approximate attestation by
+                    // online + recent ping (within one ping window) rather than bare registry presence.
+                    let is_online = node.is_active && now.saturating_sub(node.last_seen) < 15 * 60;
                     return Ok(warp::reply::json(&json!({
                         "success": true,
                         "node_id": target_id,
                         "node_type": "Light",
-                        "is_online": node.is_active,
+                        "is_online": is_online,
                         "last_seen": node.last_seen,
                         "last_seen_ago_seconds": now.saturating_sub(node.last_seen),
                         "heartbeat_count": 0,
                         "required_heartbeats": 1,
-                        "is_reward_eligible": node.is_active,
+                        "is_reward_eligible": is_online,
                         "reputation": null,
                         "current_block_height": block_height,
-                        "needs_attention": !node.is_active,
+                        "needs_attention": !is_online,
                         "pending_rewards": pending_rewards
                     })));
                 }
@@ -10097,20 +10108,29 @@ async fn handle_get_pending_rewards(
         let reward_manager_arc = blockchain.get_reward_manager();
         let reward_manager = reward_manager_arc.read().await;
         
+        // Emission is pure Pool-1: the authoritative total IS the pool1 base emission. Only trust the
+        // reward_manager per-pool split when it actually agrees with the on-chain total (else it's a
+        // stale/empty RAM view post-restart — report pool1=total honestly, no fabricated split, no noise).
         if let Some(reward) = reward_manager.get_pending_reward(&node_id) {
-            // Cross-check: if reward_manager disagrees with blockchain, log warning
-            if reward.total_reward != blockchain_total && blockchain_total > 0 {
-                eprintln!("[WARN][REWARDS] pending_mismatch node={} blockchain={} reward_mgr={}", 
-                         node_id, blockchain_total, reward.total_reward);
+            if reward.total_reward == blockchain_total {
+                (
+                    blockchain_total,
+                    reward.pool1_base_emission,
+                    reward.pool2_transaction_fees,
+                    reward.pool3_activation_bonus,
+                    format!("{:?}", reward.current_phase),
+                    blockchain_total >= 1_000_000_000, // Claimable if >= 1 QNC
+                )
+            } else {
+                (
+                    blockchain_total,
+                    blockchain_total, // Pure Pool-1 emission: total is the base-emission pool
+                    0,
+                    0,
+                    format!("{:?}", reward.current_phase),
+                    blockchain_total >= 1_000_000_000,
+                )
             }
-            (
-                blockchain_total, // Use blockchain total as authoritative value
-                reward.pool1_base_emission,
-                reward.pool2_transaction_fees,
-                reward.pool3_activation_bonus,
-                format!("{:?}", reward.current_phase),
-                blockchain_total >= 1_000_000_000, // Claimable if >= 1 QNC
-            )
         } else {
             // No breakdown in reward_manager — check if blockchain has a total anyway
             if blockchain_total > 0 {
