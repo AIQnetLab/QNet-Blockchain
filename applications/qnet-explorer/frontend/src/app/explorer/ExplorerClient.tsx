@@ -2,7 +2,7 @@
 
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Link from 'next/link';
-import { batchCache } from '@/lib/explorer-cache';
+import { batchCache, getListCache, setListCache, noteChainHeight } from '@/lib/explorer-cache';
 
 // ============================================================================
 // v4.0: SSR-powered Explorer Client
@@ -110,7 +110,7 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
   const [totalPages, setTotalPages] = useState(Math.ceil(initialTotal / ITEMS_PER_PAGE) || 1);
   const [totalCount, setTotalCount] = useState(initialTotal);
   const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
-  const [typeFilters, setTypeFilters] = useState<string[]>(['Transfer', 'Reward', 'Swap']);
+  const [typeFilters, setTypeFilters] = useState<string[]>([]);
   const [mounted, setMounted] = useState(false);
 
   const fetchDebounceRef = useRef<NodeJS.Timeout | null>(null);
@@ -118,9 +118,12 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
 
   useEffect(() => { setMounted(true); }, []);
 
-  // Pre-cache initial data for instant TX detail page loads
+  // Pre-cache SSR data: instant TX-detail loads + instant list re-display on filter/nav-back
   useEffect(() => {
     if (initialData.length > 0) {
+      const defaultKey = `${sortOrder}|${[...typeFilters].sort().join(',')}|1`;
+      setListCache(defaultKey, initialData, initialTotal, initialHeight);
+      noteChainHeight(initialHeight);
       batchCache('tx', initialData.map(tx => ({
         key: tx.hash,
         data: {
@@ -137,8 +140,23 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
 
   // ========== FETCH: client-side for filter/pagination/polling ==========
   const fetchActivity = useCallback(async (pageNum: number) => {
-    try {
+    const cacheKey = `${sortOrder}|${[...typeFilters].sort().join(',')}|${pageNum}`;
+
+    // Stale-while-revalidate: render cached rows INSTANTLY (no spinner), then refresh.
+    const cached = getListCache(cacheKey);
+    if (cached) {
+      const m = new Map<string, ActivityItem>();
+      for (const tx of cached.data as ActivityItem[]) if (tx.hash) m.set(tx.hash, tx);
+      setTransactionMap(m);
+      setTotalCount(cached.total);
+      setTotalPages(Math.ceil(cached.total / ITEMS_PER_PAGE) || 1);
+      if (cached.height) setCurrentHeight(cached.height);
+      setHasFetched(true);
+    } else {
       setLoading(true);
+    }
+
+    try {
       const typeParam = typeFilters.length > 0 && typeFilters.length < TX_TYPES.length
         ? `&types=${encodeURIComponent(typeFilters.join(','))}`
         : '';
@@ -149,6 +167,7 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
 
       if (data.success && data.data) {
         const networkHeight = data.pagination?.currentHeight || 0;
+        noteChainHeight(networkHeight); // wipe stale caches if the chain was reset to 0
         const total = data.pagination?.total || 0;
         const pages = Math.ceil(total / ITEMS_PER_PAGE) || 1;
 
@@ -162,7 +181,8 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
         setTotalCount(total);
         setTotalPages(pages);
 
-        // Pre-cache for instant detail page loads
+        // Cache this list page (instant filter/nav re-display) + seed TX-detail cache
+        setListCache(cacheKey, data.data, total, networkHeight);
         batchCache('tx', Array.from(newMap.values()).map(tx => ({
           key: tx.hash,
           data: {
@@ -217,6 +237,7 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
         const res = await fetch(`/api/network/stats?t=${Date.now()}`, { cache: 'no-store' });
         const data = await res.json();
         if (data.success && data.data?.height) {
+          noteChainHeight(data.data.height); // detect chain reset → wipe stale caches
           setCurrentHeight(data.data.height);
         }
       } catch {}

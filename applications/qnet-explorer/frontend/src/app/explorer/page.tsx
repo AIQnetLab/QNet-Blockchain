@@ -11,7 +11,6 @@ import { mapTxType, formatAmount } from '@/lib/tx-mapping';
 export const dynamic = 'force-dynamic';
 
 const PER_PAGE = 50;
-const DEFAULT_FILTERS = ['Transfer', 'Reward', 'Swap'];
 
 export default async function ExplorerPage() {
   // SSR: fetch data on the server — arrives in HTML, zero client wait
@@ -24,7 +23,7 @@ export default async function ExplorerPage() {
 
   try {
     const { transactions, total, currentHeight } = await getTransactions(
-      1, PER_PAGE, 'desc', undefined, DEFAULT_FILTERS
+      1, PER_PAGE, 'desc', undefined, undefined
     );
     initialHeight = currentHeight;
     initialTotal = total;

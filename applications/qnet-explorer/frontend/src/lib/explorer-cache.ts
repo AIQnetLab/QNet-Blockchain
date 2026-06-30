@@ -159,3 +159,37 @@ export function clearCache(): void {
   }
 }
 
+// ============================================================================
+// Activity-list cache (in-memory; survives client-side navigation, not reload).
+// Stale-while-revalidate: callers render cached rows INSTANTLY, then refresh.
+// Keyed by the query signature: `${sort}|${filters}|${page}`.
+// ============================================================================
+const listCache = new Map<string, { data: unknown; total: number; height: number; timestamp: number }>();
+let lastChainHeight = 0;
+
+export function getListCache(key: string): { data: unknown; total: number; height: number } | null {
+  const e = listCache.get(key);
+  if (!e || Date.now() - e.timestamp > CACHE_TTL) return null;
+  return { data: e.data, total: e.total, height: e.height };
+}
+
+export function setListCache(key: string, data: unknown, total: number, height: number): void {
+  listCache.set(key, { data, total, height, timestamp: Date.now() });
+}
+
+// Detect a chain reset (DB wiped to 0 / fresh genesis): if the live height drops
+// below what we've seen, every cached row/balance is stale — wipe ALL caches.
+// Returns true when a reset is detected so the caller can render fresh data.
+export function noteChainHeight(height: number): boolean {
+  if (height <= 0) return false;
+  // Reset = a big drop (to ~0). A bounded reorg/jitter is a few blocks — ignore those.
+  if (lastChainHeight > 100 && height < lastChainHeight - 100) {
+    listCache.clear();
+    clearCache();
+    lastChainHeight = height;
+    return true;
+  }
+  if (height > lastChainHeight) lastChainHeight = height;
+  return false;
+}
+

@@ -1,6 +1,11 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
+  // Client-side Router Cache: reuse a visited route's payload on back-navigation
+  // (instant tab-switch). Live data is refreshed by each page's own client polling.
+  experimental: {
+    staleTimes: { dynamic: 30, static: 180 },
+  },
   compiler: {
     // MUST keep all console methods - sync-service uses console.log for critical initialization
     removeConsole: false,
