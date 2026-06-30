@@ -14560,6 +14560,22 @@ impl BlockchainNode {
                     }
                 }
 
+                // Seal-frontier gate: cap microblocks ahead of the last SEALED macroblock (QC frontier),
+                // not just K-finality (which fallback keeps fresh under sub-quorum). Bounds the unsealed
+                // gap to <8-epoch fallback band so a straggler is never stranded beyond recovery.
+                {
+                    const MAX_UNSEALED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                    let last_sealed = qc_verified_frontier_cached();
+                    if last_sealed > 0 && next_block_height > last_sealed + MAX_UNSEALED_BLOCKS {
+                        if is_info() {
+                            println!("[WARN][PROD] seal_gate height={} sealed={} gap={} — awaiting macroblock seal",
+                                     next_block_height, last_sealed, next_block_height - last_sealed);
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
+
                 // v19/v23: BFT-certified microblock leader rotation. Leader is a pure
                 // function of on-chain state: select_microblock_producer_with_round(h,
                 // candidates=eligible(mb N-2), vrf=SHA3(mb N-2),
@@ -19901,8 +19917,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     tokio::spawn(async move {
                         let _ = p2p_sync.sync_macroblocks(mb_idx, mb_idx).await;
                     });
-                    println!("[ERR][CAND] DESYNC: mb={} NOT_FOUND h={} - node EXCLUDED from consensus!",
-                             required_macroblock, current_height);
+                    // Not excluded: the bounded walk-back below self-heals the set from the most-recent
+                    // finalized snapshot; true desync is logged only if no fallback is found.
                     
                     // Trigger async sync for missing MacroBlock
                     let current_tasks = ACTIVE_MACROBLOCK_CHECK_TASKS.load(std::sync::atomic::Ordering::Relaxed);

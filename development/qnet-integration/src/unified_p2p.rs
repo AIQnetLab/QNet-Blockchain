@@ -809,19 +809,6 @@ pub fn get_empty_slot_attestation_count(slot_height: u64, expected_producer: &st
         .unwrap_or(0)
 }
 
-/// Check whether 2f+1 empty-slot attestations have accumulated for a given
-/// (slot_height, expected_producer). Once true, the slot is deterministically
-/// considered empty and rotation should advance.
-pub fn has_sufficient_empty_slot_attestations(
-    slot_height: u64,
-    expected_producer: &str,
-    committee_size: usize,
-) -> bool {
-    let count = get_empty_slot_attestation_count(slot_height, expected_producer);
-    let threshold = (committee_size * 2 + 2) / 3; // Byzantine 2/3+
-    count >= threshold
-}
-
 /// All empty-slot attestations for a given slot height (any producer).
 pub fn get_empty_slot_attestations(slot_height: u64) -> Vec<EmptySlotAttestation> {
     EMPTY_SLOT_ATTESTATIONS
@@ -17787,13 +17774,11 @@ impl SimplifiedP2P {
             .collect()
     }
     
-    /// Corroborated network head: median last_block_height over CURRENTLY-connected peers in the round
-    /// committee union the 5 genesis, fresh (< TTL). The committee/genesis PRODUCE the tip so their median
-    /// IS the head; a random registered forger is NOT in the set so it is ignored, and >=3 in-set
-    /// corroborators are required so one compromised member cannot shift the median. 0 if none — the clamp
-    /// then trusts raw (bootstrap / fully-isolated; genesis-union + link-pin keep cmed>0 the norm at any
-    /// scale). Genesis era => members empty => the set IS the 5 genesis (byte-identical to the old median).
-    pub fn fresh_consensus_median_height(&self) -> u64 {
+    /// Byzantine-safe head ceiling: the (f+1)-th highest fresh last_block_height over CURRENTLY-connected
+    /// in-set peers (round committee ∪ genesis). >=f+1 members attesting a height ⇒ >=1 honest ⇒ a real
+    /// lower bound on the true tip, so stragglers in the set cannot demote a tip the honest majority
+    /// attests (a median would). 0 if <f+1 fresh corroborators ⇒ the clamp trusts raw (bootstrap/isolated).
+    pub fn corroborated_head_ceiling(&self) -> u64 {
         let cc = CURRENT_COMMITTEE.read().clone();
         let now = self.current_timestamp();
         let mut hs: Vec<u64> = self.connected_peers_lockfree.iter()
@@ -17806,18 +17791,26 @@ impl SimplifiedP2P {
             })
             .map(|e| e.value().last_block_height)
             .collect();
-        if hs.len() < 3 { return 0; } // need >=3 corroborators so a lone forged member can't shift the median
-        hs.sort_unstable();
-        hs[hs.len() / 2]
+        let f = hs.len().saturating_sub(1) / 3;
+        if hs.len() < f + 1 { return 0; }
+        hs.sort_unstable_by(|a, b| b.cmp(a)); // descending
+        hs[f] // (f+1)-th highest = Byzantine-safe lower bound on the true tip
     }
 
-    /// Anti-forgery clamp for the height oracle — single source for get_best/get_max_peer_height. A
-    /// verified head binds AUTHORSHIP not truth, so a registered peer could sign an absurd height; overrule
-    /// a raw more than one macroblock above the committee/genesis median (the corroborated tip). cmed==0
-    /// (bootstrap / no in-set corroborator) => trust raw; the genesis-union + link-pin keep cmed>0 the norm.
+    /// Anti-forgery CEILING for the height oracle (single source for get_best/get_max_peer_height): a
+    /// verified head binds AUTHORSHIP not truth, so overrule a raw more than one macroblock above the
+    /// (f+1)-corroborated tip — but NEVER below it (a stale-low median must not demote a tip the honest
+    /// majority attests). ceiling==0 (bootstrap / no corroborator) => trust raw.
     pub fn clamp_overclaim(&self, raw: u64) -> u64 {
-        let cmed = self.fresh_consensus_median_height();
-        if cmed > 0 && raw > cmed.saturating_add(HEAD_OVERCLAIM_MARGIN) { cmed } else { raw }
+        let ceiling = self.corroborated_head_ceiling();
+        if ceiling > 0 && raw > ceiling.saturating_add(HEAD_OVERCLAIM_MARGIN) {
+            // Fires only on a demotion — lets a live replay tell "honest majority truly at ceiling"
+            // from "a fresh-high tip was dropped".
+            if crate::node::is_info() {
+                println!("[WARN][ORACLE] overclaim_demote raw={} ceiling={} margin={}", raw, ceiling, HEAD_OVERCLAIM_MARGIN);
+            }
+            ceiling
+        } else { raw }
     }
 
     /// v9.5: Highest reported height among connected peers — the tip oracle for the behind-decision,
@@ -19528,11 +19521,14 @@ impl SimplifiedP2P {
             println!("[INFO][SYNC] Requesting repair for block #{}", height);
         }
         
-        let peers = self.get_validated_active_peers();
+        // Repair only from peers proven (authenticated height) to hold the block — co-stragglers serve
+        // empty and stall the deferred-drain cascade. Fall back to any active peer if none known ahead.
+        let mut peers = self.get_sync_peers_filtered_by_height(8, height);
+        if peers.is_empty() { peers = self.get_validated_active_peers(); }
         if peers.is_empty() {
             return Err("No peers available for repair".to_string());
         }
-        
+
         // Request from top 3 peers by reputation (redundancy for reliability)
         let mut sorted_peers = peers.clone();
         sorted_peers.sort_by(|a, b| 
