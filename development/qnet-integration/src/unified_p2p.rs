@@ -14895,7 +14895,9 @@ impl SimplifiedP2P {
                     });
                 }
                 
-                self.record_light_epoch_eligible(block_height, &light_node_id);
+                // v2.89: eligibility is recorded ONLY on origination (this genesis's own ping
+                // reply), so each genesis holds just its own 1/5 shard — not the broadcast set.
+                // Gossip below is for propagation/observability only.
 
                 // WHITEPAPER: Light nodes have FIXED reputation of 70
                 // NO reputation changes for Light nodes - they are always eligible if attested
@@ -17072,25 +17074,6 @@ impl SimplifiedP2P {
     // PRODUCTION: Sharded Light Node Ping System
     // ========================================================================
     
-    /// Calculate assigned node index for Light node (DYNAMIC distribution)
-    /// Returns which active Super node should ping this Light node (0 to N-1)
-    /// Uses consistent hashing to evenly distribute Light nodes across active pingers
-    pub fn calculate_assigned_node_index(light_node_id: &str, active_node_count: usize) -> usize {
-        if active_node_count == 0 { return 0; }
-        
-        use sha3::{Sha3_256, Digest};
-        let mut hasher = Sha3_256::new();
-        hasher.update(light_node_id.as_bytes());
-        let hash = hasher.finalize();
-        
-        // Use first 8 bytes as u64 for modulo
-        let hash_value = u64::from_le_bytes([
-            hash[0], hash[1], hash[2], hash[3],
-            hash[4], hash[5], hash[6], hash[7],
-        ]);
-        
-        (hash_value as usize) % active_node_count
-    }
     
     /// DEPRECATED: Old fixed 256-shard calculation (kept for backward compatibility)
     pub fn calculate_light_node_shard(light_node_id: &str) -> u8 {
@@ -17268,28 +17251,6 @@ impl SimplifiedP2P {
             })
     }
     
-    /// Get Light nodes assigned to THIS Super node (DYNAMIC distribution)
-    pub fn get_light_nodes_in_shard(&self) -> Vec<LightNodeRegistrationData> {
-        let our_node_id = &self.node_id;
-        
-        // DYNAMIC DISTRIBUTION: Get active Super nodes
-        let active_nodes = self.get_active_full_super_nodes();
-        let active_count = active_nodes.len().max(1);
-        
-        let our_node_idx = active_nodes.iter()
-            .position(|(node_id, _, _)| node_id == our_node_id)
-            .unwrap_or(0);
-        
-        let registry = self.light_node_registry.read();
-        
-        registry.values()
-            .filter(|node| {
-                Self::calculate_assigned_node_index(&node.node_id, active_count) == our_node_idx
-            })
-            .cloned()
-            .collect()
-    }
-    
     /// Get Light nodes to ping in current slot
     /// ARCHITECTURE v2.89: ONLY Genesis nodes ping Light nodes (reliability guarantee)
     ///   - 5 Genesis nodes → each pings 20% of ALL Light nodes (2M each for 10M total)
@@ -17431,34 +17392,6 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Periodically probe inactive nodes (once per window) to check if they're back online
-    /// Returns list of inactive nodes assigned to THIS node that should be probed
-    pub fn get_inactive_nodes_to_probe(&self) -> Vec<LightNodeRegistrationData> {
-        let our_node_id = &self.node_id;
-        let current_window = Self::get_current_window_number();
-        
-        // DYNAMIC DISTRIBUTION: Get active Super nodes
-        let active_nodes = self.get_active_full_super_nodes();
-        let active_count = active_nodes.len().max(1);
-        
-        let our_node_idx = active_nodes.iter()
-            .position(|(node_id, _, _)| node_id == our_node_id)
-            .unwrap_or(0);
-        
-        let registry = self.light_node_registry.read();
-        
-        registry.values()
-            .filter(|node| {
-                // DYNAMIC SHARD: Only nodes assigned to THIS node
-                Self::calculate_assigned_node_index(&node.node_id, active_count) == our_node_idx &&
-                // Only inactive nodes
-                (!node.is_active || node.consecutive_failures >= 5) &&
-                // Probe once per window: use hash to spread probes across slots
-                Self::calculate_randomized_slot(&node.node_id, current_window) == Self::get_current_slot()
-            })
-            .cloned()
-            .collect()
-    }
     
     /// Gossip Light Node attestation after successful ping
     pub fn gossip_light_node_attestation(&self, attestation: LightNodeAttestation) {
@@ -18042,36 +17975,6 @@ impl SimplifiedP2P {
             .collect()
     }
     
-    /// v2.78: Record Light node attestation (for pinging)
-    /// Used by Super nodes to record successful pings
-    pub fn record_light_node_attestation(
-        &self,
-        light_node_id: String,
-        pinger_id: String,
-        slot: u64,
-        timestamp: u64,
-        light_node_signature: String,
-        pinger_signature: String,
-        challenge: String,
-        block_height: u64,
-    ) {
-        let attestation_key = format!("{}:{}", light_node_id, slot);
-        
-        let mut attestations = self.light_node_attestations.write();
-        
-        attestations.insert(attestation_key, LightNodeAttestation {
-            light_node_id: light_node_id.clone(),
-            pinger_id,
-            slot,
-            timestamp,
-            light_node_signature,
-            pinger_signature,
-            challenge,
-            block_height,
-        });
-        drop(attestations);
-        self.record_light_epoch_eligible(block_height, &light_node_id);
-    }
 
     /// Record an attested light node into the per-epoch eligibility set (uncapped) + prune old epochs.
     fn record_light_epoch_eligible(&self, block_height: u64, light_node_id: &str) {

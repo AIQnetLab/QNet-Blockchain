@@ -2171,9 +2171,14 @@ impl BlockPipeline {
                     use futures::future::join_all;
                     let verify_futures: Vec<_> = decoded.microblock.transactions
                         .iter()
-                        .filter(|tx| match &tx.dilithium_signature {
-                            Some(s) => !s.is_empty(),
-                            None => false,
+                        .filter(|tx| {
+                            // Merkle reward-claims (system_rewards_pool) are authorized by the per-proof
+                            // re-verify in apply, not a client sig — exempt from PQ re-verify here.
+                            if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution)
+                                && tx.from == "system_rewards_pool" {
+                                return false;
+                            }
+                            matches!(&tx.dilithium_signature, Some(s) if !s.is_empty())
                         })
                         .map(|tx| crate::node::BlockchainNode::verify_dilithium_tx_signature_async(tx))
                         .collect();

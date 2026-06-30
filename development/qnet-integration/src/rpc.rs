@@ -871,19 +871,6 @@ fn default_per_page() -> usize { 20 }
 fn default_tx_type() -> String { "all".to_string() }
 fn default_direction() -> String { "all".to_string() }
 
-#[derive(Debug, Deserialize)]
-struct BatchRewardClaimRequest {
-    node_ids: Vec<String>,
-    owner_address: String,
-    // SECURITY v6.1: Hybrid signature (Ed25519 + Dilithium3) proves ownership of owner_address.
-    // Message: "batch_claim_rewards:{owner_address}:{node_ids_sorted_joined}:{timestamp}"
-    signature: String,               // Ed25519 sig (hex)
-    public_key: String,              // Ed25519 pubkey (hex)
-    dilithium_signature: String,     // Dilithium3 sig
-    dilithium_public_key: String,    // Dilithium3 pubkey
-    timestamp: u64,                  // Unix seconds — freshness window 5 min
-}
-
 /// Batch transfer request with MANDATORY signature verification
 /// NIST/CISCO COMPLIANT: Ed25519 (FIPS 186-5) required
 #[derive(Debug, Deserialize)]
@@ -1640,16 +1627,6 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         });
 
     // Batch operations endpoints
-    let batch_claim_rewards = api_v1
-        .and(warp::path("batch"))
-        .and(warp::path("claim-rewards"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
-        .and(warp::body::json())
-        .and(warp::addr::remote())
-        .and(blockchain_filter.clone())
-        .and_then(handle_batch_claim_rewards);
     
     let batch_transfer = api_v1
         .and(warp::path("batch"))
@@ -2355,7 +2332,6 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(account_balance_proof)  // v3.11: Balance with Merkle proof
         .or(validators_proof)       // v3.32: Validator set with Merkle proof
         .or(account_transactions)
-        .or(batch_claim_rewards)
         .or(batch_transfer);
         
     let transaction_routes = transaction_submit
@@ -5348,325 +5324,6 @@ async fn handle_bundle_cancel(
         });
         Ok(warp::reply::json(&error_response))
     }
-}
-
-async fn handle_batch_claim_rewards(
-    request: BatchRewardClaimRequest,
-    remote_addr: Option<std::net::SocketAddr>,
-    blockchain: Arc<BlockchainNode>,
-) -> Result<impl Reply, Rejection> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "claim_rewards") {
-        return Ok(rate_limit_response);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // HYBRID SIGNATURE VERIFICATION v6.1 (mirrors handle_claim_rewards exactly)
-    // Message: "batch_claim_rewards:{owner_address}:{node_ids_sorted}:{timestamp}"
-    // Part 1 — Ed25519:   proves classical ownership of owner_address
-    // Part 2 — Dilithium3: proves quantum-resistant ownership of owner_address
-    // ═══════════════════════════════════════════════════════════════════════════
-    {
-        let wallet = &request.owner_address;
-
-        // Validate EON address format
-        if let Err(e) = validate_eon_address_with_error(wallet) {
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Invalid owner_address format",
-                "details": e
-            })));
-        }
-
-        // Freshness check (max 5 min)
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        if now.abs_diff(request.timestamp) > 300 {
-            if crate::node::is_warn() {
-                println!("[WARN][CLAIM] batch_stale_ts ts={} now={} wallet={}...",
-                    request.timestamp, now, &wallet[..16.min(wallet.len())]);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Request timestamp is too old or too far in the future (max 5 min)",
-                "hint": "Regenerate the request with a fresh timestamp"
-            })));
-        }
-
-        // Deterministic canonical message — sorted node_ids to prevent ordering attacks
-        let mut sorted_ids = request.node_ids.clone();
-        sorted_ids.sort();
-        let claim_message = format!(
-            "batch_claim_rewards:{}:{}:{}",
-            wallet,
-            sorted_ids.join(","),
-            request.timestamp
-        );
-
-        // ── Part 1: Ed25519 ─────────────────────────────────────────────────
-        if request.signature.is_empty() || request.public_key.is_empty() {
-            if crate::node::is_warn() {
-                println!("[WARN][CLAIM] batch_ed25519_missing wallet={}...",
-                    &wallet[..16.min(wallet.len())]);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Ed25519 signature is required (hybrid v6.1, Part 1)",
-                "hint": "Sign the canonical message with your QNet Ed25519 wallet key"
-            })));
-        }
-
-        let ed25519_valid = verify_ed25519_client_signature(
-            wallet,
-            &claim_message,
-            &request.signature,
-            &request.public_key,
-        ).await;
-        if !ed25519_valid {
-            if crate::node::is_warn() {
-                println!("[WARN][CLAIM] batch_ed25519_invalid wallet={}...",
-                    &wallet[..16.min(wallet.len())]);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Invalid Ed25519 signature for batch reward claim (hybrid v6.1, Part 1)",
-                "message_format": "batch_claim_rewards:{owner_address}:{node_ids_sorted_comma}:{timestamp}"
-            })));
-        }
-        if crate::node::is_debug() {
-            println!("[DBG][CLAIM] batch_ed25519_ok wallet={}...", &wallet[..16.min(wallet.len())]);
-        }
-
-        // ── Part 2: Dilithium3 ───────────────────────────────────────────────
-        if request.dilithium_signature.is_empty() || request.dilithium_public_key.is_empty() {
-            if crate::node::is_warn() {
-                println!("[WARN][CLAIM] batch_dilithium_missing wallet={}...",
-                    &wallet[..16.min(wallet.len())]);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Dilithium3 signature is required (hybrid v6.1, Part 2)",
-                "hint": "Provide dilithium_signature + dilithium_public_key (ML-DSA-65)"
-            })));
-        }
-
-        if !verify_mobile_dilithium_signature(&claim_message, &request.dilithium_signature, &request.dilithium_public_key) {
-            if crate::node::is_warn() {
-                println!("[WARN][CLAIM] batch_dilithium_invalid wallet={}...",
-                    &wallet[..16.min(wallet.len())]);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Invalid Dilithium3 signature for batch reward claim (hybrid v6.1, Part 2)"
-            })));
-        }
-        if crate::node::is_info() {
-            println!("[INFO][CLAIM] batch_hybrid_verified wallet={}... nodes={}",
-                &wallet[..16.min(wallet.len())], request.node_ids.len());
-        }
-    }
-
-    // FIX R23-R1: CLAIM_IN_PROGRESS guard for batch claims — prevents concurrent
-    // batch claims for the same wallet from double-spending pending rewards.
-    // Uses same CLAIM_IN_PROGRESS DashSet as single claims for unified protection.
-    {
-        let batch_key = format!("batch_{}", request.owner_address);
-        if !CLAIM_IN_PROGRESS.insert(batch_key.clone()) {
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Batch claim already in progress for this wallet",
-                "hint": "Wait for the current batch claim to complete"
-            })));
-        }
-        // Also check individual node claims in progress
-        for node_id in &request.node_ids {
-            if CLAIM_IN_PROGRESS.contains(node_id) {
-                CLAIM_IN_PROGRESS.remove(&batch_key);
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": format!("Individual claim already in progress for node {}", node_id),
-                    "hint": "Wait for the current claim to complete"
-                })));
-            }
-        }
-    }
-    // RAII guard: remove batch claim lock on ANY exit path
-    let _batch_guard = {
-        struct BatchClaimGuard(String);
-        impl Drop for BatchClaimGuard {
-            fn drop(&mut self) { CLAIM_IN_PROGRESS.remove(&self.0); }
-        }
-        BatchClaimGuard(format!("batch_{}", request.owner_address))
-    };
-
-    // PRODUCTION: Process real batch reward claims
-    let mut total_rewards = 0u64;
-    let mut processed_nodes = Vec::new();
-    let mut failed_nodes: Vec<serde_json::Value> = Vec::new();
-
-    // Process each node's reward claim
-    for node_id in &request.node_ids {
-        // SECURITY v6.1: Verify owner_address matches on-chain registered wallet for this node.
-        // Prevents claiming rewards to a different wallet than the one registered on-chain.
-        let wallet_address_for_node = blockchain.get_node_wallet(node_id).await;
-        match &wallet_address_for_node {
-            Some(registered) if *registered != request.owner_address => {
-                if crate::node::is_warn() {
-                    println!("[WARN][CLAIM] batch_wallet_mismatch node={} registered={}... claimed={}...",
-                        node_id,
-                        &registered[..16.min(registered.len())],
-                        &request.owner_address[..16.min(request.owner_address.len())]);
-                }
-                failed_nodes.push(json!({
-                    "node_id": node_id,
-                    "error": "owner_address does not match on-chain registered wallet for this node",
-                    "status": "rejected"
-                }));
-                continue;
-            }
-            None => {
-                failed_nodes.push(json!({
-                    "node_id": node_id,
-                    "error": "Node not found in blockchain registry",
-                    "status": "rejected"
-                }));
-                continue;
-            }
-            _ => {}
-        }
-
-        // v3.34: SECURITY - Read pending amount from BLOCKCHAIN STATE (like single claim)
-        let blockchain_pending = {
-            let state = blockchain.get_state_manager();
-            let state_guard = state.read().await;
-            state_guard.get_pending_rewards(&request.owner_address)
-        };
-
-        if blockchain_pending == 0 {
-            failed_nodes.push(json!({
-                "node_id": node_id,
-                "error": "No pending rewards in blockchain state",
-                "status": "rejected"
-            }));
-            continue;
-        }
-        
-        // Claim from reward_manager (clears in-memory state)
-        let claim_result = {
-            let reward_manager_arc = blockchain.get_reward_manager();
-            let mut reward_manager = reward_manager_arc.write().await;
-            reward_manager.claim_rewards(node_id, &request.owner_address)
-        };
-        
-        if claim_result.success {
-            if let Some(reward) = claim_result.reward {
-                // v3.34: Use blockchain_pending as the authoritative amount
-                // reward_manager amount used for pool breakdown display only
-                let reward_amount = blockchain_pending;
-                
-                // Cross-check: warn if reward_manager disagrees with blockchain
-                if reward.total_reward != blockchain_pending {
-                    eprintln!("[WARN][CLAIM] batch_amount_mismatch node={} blockchain={} reward_mgr={}", 
-                             node_id, blockchain_pending, reward.total_reward);
-                }
-                // FIX R26-M1: checked arithmetic on batch reward accumulation
-                total_rewards = total_rewards.saturating_add(reward_amount);
-                // FIX R25-L1: don't leak exact reward amounts in response — return status only
-                processed_nodes.push(json!({
-                    "node_id": node_id,
-                    "status": "success",
-                    "phase": format!("{:?}", reward.current_phase)
-                }));
-                println!("[INFO][CLAIM] batch_claimed node={} amount={} QNC wallet={}...", 
-                         node_id, reward_amount / 1_000_000_000, &request.owner_address[..8.min(request.owner_address.len())]);
-                
-                // v3.33: Delete pending reward from RocksDB (same as single claim handler)
-                // Prevents double-claim after restart before block is processed
-                {
-                    let storage = blockchain.get_storage();
-                    if let Err(e) = storage.delete_pending_reward(node_id) {
-                        if crate::node::is_debug() { println!("[DBG][CLAIM] batch_delete_pending_fail node={} err={}", node_id, e); }
-                    } else {
-                        if crate::node::is_debug() { println!("[DBG][CLAIM] batch_pending_deleted node={}", node_id); }
-                    }
-                }
-                
-                // Create RewardDistribution transaction for actual payout
-                let current_time = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                
-                // Reward claim transaction - validation already done:
-                // 1. pending_reward existence checked
-                // 2. amount validated against pending
-                // 3. reward_manager.claim_rewards() validated eligibility
-                let mut reward_tx = qnet_state::Transaction {
-                    from: "system_rewards_pool".to_string(),
-                    to: Some(request.owner_address.clone()),
-                    amount: reward_amount,
-                    tx_type: qnet_state::TransactionType::RewardDistribution,
-                    timestamp: current_time,
-                    hash: String::new(),
-                    signature: None,
-                    public_key: None,
-                    gas_price: 0,
-                    gas_limit: 0,
-                    nonce: 0,
-                    data: Some(format!("reward_claim:{}:{}:batch", node_id, reward_amount)), // v3.33: Match sync handler format
-                    dilithium_signature: None,
-                    dilithium_public_key: None,
-                    chain_id: 0,
-                };
-
-                // Calculate hash using SHA3-256 (NIST compliant)
-                reward_tx.hash = reward_tx.calculate_hash();
-                
-                println!("[INFO][CLAIM] batch_tx_created node={} hash={}", node_id, &reward_tx.hash[..16.min(reward_tx.hash.len())]);
-                
-                // Submit transaction to blockchain
-                if let Err(e) = blockchain.submit_transaction(reward_tx).await {
-                    eprintln!("[ERR][CLAIM] batch_tx_submit_fail node={} err={}", node_id, e);
-                    failed_nodes.push(json!({
-                        "node_id": node_id,
-                        "error": format!("Failed to submit transaction: {}", e),
-                        "status": "failed"
-                    }));
-                }
-            } else {
-                failed_nodes.push(json!({
-                    "node_id": node_id,
-                    "error": "No reward data available",
-                    "status": "failed"
-                }));
-            }
-        } else {
-            failed_nodes.push(json!({
-                "node_id": node_id,
-                "error": claim_result.message,
-                "status": "failed"
-            }));
-            println!("[REWARDS] ❌ Failed to claim for node {}: {}", node_id, claim_result.message);
-        }
-    }
-    
-    let batch_id = format!("batch_{}", chrono::Utc::now().timestamp_millis());
-    let success = failed_nodes.is_empty();
-    
-    let response = json!({
-        "success": success,
-        "batch_id": batch_id,
-        "owner_address": request.owner_address,
-        "total_rewards": total_rewards,
-        "processed_count": processed_nodes.len(),
-        "failed_count": failed_nodes.len(),
-        "processed_nodes": processed_nodes,
-        "failed_nodes": failed_nodes,
-        "message": format!("Processed {} nodes, {} rewards claimed, {} failed", 
-                         request.node_ids.len(), processed_nodes.len(), failed_nodes.len()),
-        "processed_by": blockchain.get_node_id()
-    });
-    Ok(warp::reply::json(&response))
 }
 
 async fn handle_batch_transfer(
@@ -9927,6 +9584,10 @@ async fn handle_claim_rewards(
     // covering every unclaimed epoch (oldest-first → no forfeiture). Apply re-verifies every proof
     // against the consensus root, so this RPC cannot forge a credit.
     {
+        // Scale guard: bound concurrent merkle proof-gen across all claims (thousands of nodes may
+        // claim at an epoch boundary). Per-node CLAIM_IN_PROGRESS already serializes a single node.
+        static CLAIM_PROOFGEN_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+        let _proofgen_permit = CLAIM_PROOFGEN_SEM.acquire().await.ok();
         let storage = blockchain.get_storage();
         let last_claimed = {
             let state = blockchain.get_state_manager();

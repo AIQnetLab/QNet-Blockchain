@@ -5709,9 +5709,13 @@ impl BlockchainNode {
                 }
             }
             for (epoch, amount, proof) in &claims {
+                // Claims are ascending: STOP (not skip) at the first uncreditable epoch so the monotonic
+                // watermark never advances past it — the wallet re-claims it next time (no silent
+                // forfeiture). All nodes hold the same reconciled roots + proofs, so the stop point is
+                // deterministic. A missing root means this node hasn't reconciled that epoch yet.
                 let root_hex = match storage.load_epoch_reward_root(*epoch) {
                     Ok(Some((r, _, _, _))) => r,
-                    _ => continue,
+                    _ => break,
                 };
                 let mut hasher = Sha3_256::new();
                 hasher.update(to.as_bytes());
@@ -5719,8 +5723,10 @@ impl BlockchainNode {
                 hasher.update(&amount.to_le_bytes());
                 let leaf_hex = hex::encode(hasher.finalize());
                 if !qnet_core::crypto::merkle::verify_merkle_proof(&leaf_hex, &root_hex, proof) {
-                    eprintln!("[WARN][REWARDS] claim_proof_invalid wallet={}.. epoch={}", &to[..16.min(to.len())], epoch);
-                    continue;
+                    if is_warn() {
+                        eprintln!("[WARN][REWARDS] claim_proof_invalid wallet={}.. epoch={}", &to[..16.min(to.len())], epoch);
+                    }
+                    break;
                 }
                 if state_guard.claim_reward(to, *epoch, *amount) {
                     if is_info() {
@@ -5730,6 +5736,52 @@ impl BlockchainNode {
                 }
             }
         }
+    }
+
+    /// Admission/gossip pre-check for merkle reward-claims: reject if ANY claim whose epoch reward_root
+    /// is locally reconciled fails proof verification (junk/forged) — keeps no-op spam out of the
+    /// mempool/blocks. Claims for an un-reconciled epoch (sync lag) are accepted and re-verified at
+    /// apply (the final authority). Pure storage read; no state lock.
+    fn claim_proofs_admissible(storage: &crate::storage::Storage, tx: &qnet_state::Transaction) -> bool {
+        let to = match &tx.to { Some(w) => w, None => return false };
+        let data = match &tx.data { Some(d) => d, None => return false };
+        let entries = match serde_json::from_str::<serde_json::Value>(data).ok()
+            .and_then(|v| v.get("claims").and_then(|c| c.as_array().cloned())) {
+            Some(a) if !a.is_empty() => a,
+            _ => return false,
+        };
+        for e in &entries {
+            let (epoch, amount) = match (e.get("epoch").and_then(|v| v.as_u64()), e.get("amount").and_then(|v| v.as_u64())) {
+                (Some(ep), Some(am)) => (ep, am),
+                _ => return false,
+            };
+            let proof: Vec<(String, bool)> = match e.get("proof").and_then(|v| v.as_array()) {
+                Some(arr) => {
+                    let mut p = Vec::with_capacity(arr.len());
+                    for it in arr {
+                        match it.as_array().and_then(|a| Some((a.get(0)?.as_str()?.to_string(), a.get(1)?.as_bool()?))) {
+                            Some(t) => p.push(t),
+                            None => return false,
+                        }
+                    }
+                    p
+                }
+                None => return false,
+            };
+            let root_hex = match storage.load_epoch_reward_root(epoch) {
+                Ok(Some((r, _, _, _))) => r,
+                _ => continue, // root not reconciled yet — defer to apply
+            };
+            let mut hasher = Sha3_256::new();
+            hasher.update(to.as_bytes());
+            hasher.update(&epoch.to_le_bytes());
+            hasher.update(&amount.to_le_bytes());
+            let leaf_hex = hex::encode(hasher.finalize());
+            if !qnet_core::crypto::merkle::verify_merkle_proof(&leaf_hex, &root_hex, &proof) {
+                return false;
+            }
+        }
+        true
     }
 
     /// v35: build the reward-recipient HeartbeatSummary set for an epoch from on-chain Heartbeat
@@ -22628,9 +22680,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if tx.public_key.as_ref().map_or(true, |k| k.is_empty()) {
                     return Err(QNetError::ValidationError("Reward claim requires public_key".to_string()));
                 }
-                // data contains "reward_claim:{node_id}:{amount}" - used for audit trail
-                if tx.data.as_ref().map_or(true, |d| !d.starts_with("reward_claim:")) {
-                    return Err(QNetError::ValidationError("Reward claim must have valid data field".to_string()));
+                // Merkle reward-claim: verify each proof against the QC-certified reward_root so junk is
+                // rejected at the door (apply re-verifies as the final gate). Sig checked by the RPC endpoint.
+                if !Self::claim_proofs_admissible(&self.get_storage(), &tx) {
+                    return Err(QNetError::ValidationError("Reward claim has no valid merkle proofs".to_string()));
                 }
                 let has_quantum = tx.dilithium_signature.as_ref().map_or(false, |s| !s.is_empty());
                 if is_info() { 
@@ -23111,19 +23164,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 format!("contract_call:{}:{}:{}:{}", tx.from, contract, method, tx.nonce)
             }
             
-            // === REWARD CLAIM (signed by client with Ed25519) ===
-            // matches rpc.rs:7406 — client signs "claim_rewards:{node_id}:{wallet_address}"
-            // node_id is extracted from tx.data: "reward_claim:{node_id}:{amount}:..."
-            // CRITICAL FIX v3.42: Without this, gossip nodes reject claim TXs because
-            // the default pipe-format doesn't match the signed message, causing ~6min delays
-            qnet_state::TransactionType::RewardDistribution if tx.from == "system_rewards_pool" => {
-                let node_id = tx.data.as_ref()
-                    .and_then(|d| d.strip_prefix("reward_claim:"))
-                    .and_then(|rest| rest.split(':').next())
-                    .unwrap_or("");
-                format!("claim_rewards:{}:{}", node_id, to_str)
-            }
-            
+            // system_rewards_pool merkle claims are sig-exempt (authorized by per-proof re-verify
+            // in apply, not a client sig) — they never reach this builder, so no arm here.
+
             // === NODEREGISTRATION ===
             // Two signing paths:
             // 1. SERVER-SIGNED (legacy): hybrid Ed25519 (ephemeral) + Dilithium3 (producer key)
@@ -23681,29 +23724,29 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
 
             if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) && tx.from != "system_emission" {
-                // v3.35: FULL crypto verification for RewardDistribution (not just presence check!)
-                // Prevents forged claim TXs from being injected via gossip
-                let (sig, pubkey) = match (&tx.signature, &tx.public_key) {
-                    (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => (s, p),
-                    _ => return Err(QNetError::ValidationError(
-                        "Reward claim must have Ed25519 signature and public_key".to_string()
-                    )),
-                };
-                
-                // CRITICAL v3.35: Verify Ed25519 signature on claim message
-                // The message format is "claim_rewards:{node_id}:{wallet}" — same as RPC path
-                // This ensures gossip path has same security level as direct RPC
-                if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
-                    return Err(QNetError::ValidationError(
-                        "Invalid Ed25519 signature on reward claim TX (gossip)".to_string()
-                    ));
-                }
-                
-                // Validate data field format
-                if tx.data.as_ref().map_or(true, |d| !d.starts_with("reward_claim:")) {
-                    return Err(QNetError::ValidationError(
-                        "Reward claim must have valid data field (reward_claim:...)".to_string()
-                    ));
+                if tx.from == "system_rewards_pool" {
+                    // Merkle reward-claim: authorized by re-verifying each proof against the QC-certified
+                    // reward_root, NOT a client signature (the claimed node_id is not carried on-chain).
+                    // Verify proofs here too so junk/forged claims are rejected at the door, not merely
+                    // dropped as no-ops at apply — keeps spam out of the mempool and blocks.
+                    if !Self::claim_proofs_admissible(&self.get_storage(), &tx) {
+                        return Err(QNetError::ValidationError(
+                            "Reward claim has no valid merkle proofs".to_string()
+                        ));
+                    }
+                } else {
+                    // Other RewardDistribution: full Ed25519 verify on the canonical message.
+                    let (sig, pubkey) = match (&tx.signature, &tx.public_key) {
+                        (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => (s, p),
+                        _ => return Err(QNetError::ValidationError(
+                            "Reward TX must have Ed25519 signature and public_key".to_string()
+                        )),
+                    };
+                    if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
+                        return Err(QNetError::ValidationError(
+                            "Invalid Ed25519 signature on reward TX (gossip)".to_string()
+                        ));
+                    }
                 }
                 
                 if is_info() { 
