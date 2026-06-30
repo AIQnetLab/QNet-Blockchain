@@ -6031,8 +6031,11 @@ export class WalletManager {
         throw new Error(claimResult.error || 'Claim failed on server');
       }
       
-      // Extract amount from server response (server returns reward.total_qnc in QNC, not nanoQNC)
-      const claimedAmount = claimResult.reward?.total_qnc || claimResult.amount || 0;
+      // Server returns amount_qnc (QNC) + epochs_claimed. The claim is SUBMITTED here and credited on
+      // inclusion (the per-proof merkle claim finalizes within ~1 block); balance reconciles on the next
+      // status poll. Previously read reward.total_qnc/amount which the handler never returns → always 0.
+      const claimedAmount = claimResult.amount_qnc ?? claimResult.amount ?? 0;
+      const epochsClaimed = claimResult.epochs_claimed ?? 0;
       
       // Update local storage with claim time
       const storedRewardsStr = await AsyncStorage.getItem('qnet_node_rewards');
@@ -6052,6 +6055,8 @@ export class WalletManager {
       return {
         success: true,
         amount: claimedAmount,
+        epochsClaimed,
+        pending: true, // submitted; credited on inclusion — balance updates on the next status poll
         timestamp: Date.now(),
         nextClaim: claimResult.next_claim_time || (Date.now() + 24 * 60 * 60 * 1000),
         txHash: claimResult.tx_hash
