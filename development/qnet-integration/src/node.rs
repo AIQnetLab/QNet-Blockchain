@@ -10392,10 +10392,10 @@ impl BlockchainNode {
                     for ip in &genesis_ips {
                         if genesis_downloaded { break; }
 
-                        // Try multiple endpoints for genesis block download
+                        // Only the canonical raw-bincode genesis endpoint. The other two — a nonexistent
+                        // 404 route and a JSON block the bincode decode rejects — never delivered and spammed
+                        // a per-IP WARN storm on every joiner. Response is still decode-gated to height-0 below.
                         let urls = vec![
-                            format!("http://{}:8001/api/v1/blockchain/block/0", ip),
-                            format!("http://{}:8001/api/v1/block/0", ip),
                             format!("http://{}:8001/api/v1/genesis/block", ip),
                         ];
 
@@ -14540,36 +14540,26 @@ impl BlockchainNode {
                     }
                 }
 
-                // v9.8: Production gate — don't produce too far ahead of last finalized, else the
-                // producer diverges from BFT without confirmation. v2 2-chain finality trails the tip
-                // by ~2 checkpoints (the in-progress checkpoint + the 2-chain commit-lag); +1 checkpoint
-                // of headroom absorbs one skipped/slow round + gossip without throttling steady state.
-                // DERIVED from CHECKPOINT_INTERVAL so the gate auto-tracks the finality cadence: at the
-                // 90 default this is 270 (3 windows, unchanged); with intra-window finality (e.g. K=30)
-                // it tightens to 90 — matching the faster finality instead of a stale fixed 270-block gap.
+                // Production ceiling — throttle if we outrun EITHER bound, evaluated TOGETHER so neither
+                // short-circuits the other: (1) BFT finality (BFT-divergence guard, ~2-checkpoint trail +
+                // 1 headroom) and (2) the last SEALED macroblock/QC frontier (candidate-derivation guard).
+                // Both are committed-state-derived ⇒ deterministic same-on-all-nodes. The finality marker
+                // advances on the intra-K local commit path INDEPENDENT of the macroblock SEAL, so alone it
+                // never bound a seal-stalled producer (a runaway overran ~900 blocks past the last seal);
+                // OR-ing the seal bound caps that at +3 macroblocks. Both derive from the interval consts so
+                // the gate auto-tracks the cadence (90 finality / 270 seal at defaults).
                 {
                     const MAX_UNFINALIZED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
-                    let last_finalized = LAST_FINALIZED_CONSENSUS_ROUND.load(Ordering::SeqCst);
-                    if last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS {
-                        if is_info() {
-                            println!("[WARN][PROD] production_gate: height={} finalized={} gap={} — waiting for BFT",
-                                     next_block_height, last_finalized, next_block_height - last_finalized);
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                }
-
-                // Seal-frontier gate: cap microblocks ahead of the last SEALED macroblock (QC frontier),
-                // not just K-finality (which fallback keeps fresh under sub-quorum). Bounds the unsealed
-                // gap to <8-epoch fallback band so a straggler is never stranded beyond recovery.
-                {
                     const MAX_UNSEALED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                    let last_finalized = LAST_FINALIZED_CONSENSUS_ROUND.load(Ordering::SeqCst);
                     let last_sealed = qc_verified_frontier_cached();
-                    if last_sealed > 0 && next_block_height > last_sealed + MAX_UNSEALED_BLOCKS {
+                    let fin_over = last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS;
+                    let seal_over = last_sealed > 0 && next_block_height > last_sealed + MAX_UNSEALED_BLOCKS;
+                    if fin_over || seal_over {
                         if is_info() {
-                            println!("[WARN][PROD] seal_gate height={} sealed={} gap={} — awaiting macroblock seal",
-                                     next_block_height, last_sealed, next_block_height - last_sealed);
+                            println!("[WARN][PROD] production_throttle height={} finalized={} sealed={} awaiting={}",
+                                     next_block_height, last_finalized, last_sealed,
+                                     if seal_over { "macroblock_seal" } else { "bft_finality" });
                         }
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
@@ -23314,6 +23304,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             Ok(Err(e)) => Err(QNetError::ValidationError(e)),
             Err(e) => Err(QNetError::ValidationError(format!("Runtime error: {}", e))),
         }
+    }
+
+    /// N-2 committee needed to burn-gate `height` isn't locally present ⇒ node is BEHIND (post-genesis).
+    /// Genesis era (epochs 1-2) never lacks it. Lets the ingest gate DEFER (not reject) a burn-gated block
+    /// until N-2 applies, then re-verify — an honest registration isn't dropped while catching up.
+    pub fn n2_committee_absent(storage: &crate::storage::Storage, height: u64) -> bool {
+        let genesis_era = (height.saturating_sub(1) / 90 + 1).saturating_sub(2) == 0;
+        !genesis_era && Self::committee_for_height(storage, height).is_none()
     }
 
     /// Phase-1 proof-of-burn consensus gate. The external Solana 1DEV burn is non-deterministic

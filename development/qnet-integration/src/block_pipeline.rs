@@ -1504,6 +1504,10 @@ impl BlockPipeline {
         // Bounded to prevent OOM under load (thousands of Super nodes).
         const DEFERRED_MAX: usize = 2000;
         let mut deferred: HashMap<u64, DecodedBlock> = HashMap::new();
+        // Separate bucket for burn-gated blocks whose N-2 committee isn't applied yet (node behind). Their
+        // parent IS present (burn gate runs post parent-check), so the contiguity drain never revisits them
+        // — re-driven when their committee becomes available (see redrive below). Bounded by DEFERRED_MAX.
+        let mut committee_deferred: HashMap<u64, DecodedBlock> = HashMap::new();
 
         // Gossip horizon: drop blocks > GOSSIP_HORIZON ahead of the local
         // tip BEFORE the deferred buffer. Root cause = catch-up backpressure
@@ -1565,6 +1569,17 @@ impl BlockPipeline {
 
             // Process this block, then try to drain deferred chain
             let mut to_process = vec![decoded];
+
+            // Re-drive burn-gated blocks once their N-2 committee is applied (parent already present, so the
+            // contiguity drain never revisits them). Skipped when empty (the norm); O(committee_deferred).
+            if !committee_deferred.is_empty() {
+                let ready: Vec<u64> = committee_deferred.keys().copied()
+                    .filter(|h| !crate::node::BlockchainNode::n2_committee_absent(&storage, *h))
+                    .collect();
+                for h in ready {
+                    if let Some(def) = committee_deferred.remove(&h) { to_process.push(def); }
+                }
+            }
 
             while let Some(decoded) = to_process.pop() {
             let mb = &decoded.microblock;
@@ -2250,6 +2265,22 @@ impl BlockPipeline {
                 if !burn_futures.is_empty() {
                     let results = join_all(burn_futures).await;
                     if let Some(reason) = results.iter().find_map(|r| r.as_ref().err()) {
+                        // Committee-absent (post-genesis N-2 not yet applied) ⇒ we can't yet verify the burn
+                        // quorum: DEFER (re-verify once N-2 applies) so an honest registration isn't dropped
+                        // while behind. A genuine invalid burn (committee present) still HARD-REJECTs; synced
+                        // nodes hold the committee so never defer — the deterministic reject/fork-guard holds.
+                        let h = mb.height;
+                        if crate::node::BlockchainNode::n2_committee_absent(&storage, h) {
+                            if committee_deferred.len() < DEFERRED_MAX {
+                                if is_debug() {
+                                    println!("[DBG][PIPELINE] committee_deferred h={} reason=n2_absent buf={}", h, committee_deferred.len());
+                                }
+                                committee_deferred.insert(h, decoded);
+                            } else {
+                                metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            continue;
+                        }
                         if is_warn() {
                             println!(
                                 "[WARN][PIPELINE] burn_attestation_invalid h={} producer={} from={} reason={} action=reject_block",
@@ -2370,6 +2401,14 @@ impl BlockPipeline {
                                      evicted, cutoff, deferred.len());
                         }
                     }
+                }
+            }
+
+            // Bound committee-deferred the same way (its re-drive is committee-arrival, not tip contiguity).
+            if committee_deferred.len() > 100 {
+                let chain_h = storage.get_chain_height().unwrap_or(0);
+                if chain_h > 500 {
+                    committee_deferred.retain(|h, _| *h > chain_h - 500);
                 }
             }
         }

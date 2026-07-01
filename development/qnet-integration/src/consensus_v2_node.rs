@@ -330,6 +330,28 @@ fn try_propose(
 /// Re-handle buffered inbound now the round / in-flight committee may have advanced. One
 /// pass: messages still ahead of our round stay buffered (bounded), the rest verify+apply.
 /// No-op until we hold the in-flight window's committee.
+/// A Proposal's content must be INDEPENDENTLY reproducible from our own derived window (window_buf)
+/// before we vote — anti-forge of state_root / window_mb_hashes / beacon / epoch_commitment / reward_root
+/// / (gated) registry_root+total_supply, all folded into Checkpoint::hash. No local window for the claimed
+/// head ⇒ fail-stop (false). Non-Proposal messages carry no such content ⇒ true. Single source of truth
+/// for the live inbound path AND drain_pending (buffered replay must not bypass the content gate).
+fn content_ok(buf: &std::collections::HashMap<u64, WindowContent>, msg: &ConsensusMsg) -> bool {
+    match msg {
+        ConsensusMsg::Proposal(cp) => buf.get(&(cp.window_head_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL))
+            .map(|c| cp.state_root == c.state_root
+                && cp.window_mb_hashes == c.mb_hashes
+                && cp.beacon == c.beacon
+                && qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee, &c.banned) == cp.epoch_commitment
+                && cp.reward_root == c.reward_root
+                && (!qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height)
+                    || cp.registry_root == c.registry_root)
+                && (!qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height)
+                    || cp.total_supply == c.total_supply))
+            .unwrap_or(false),
+        _ => true,
+    }
+}
+
 fn drain_pending(
     driver: &mut ConsensusDriver, buf: &std::collections::HashMap<u64, WindowContent>,
     p2p: &SimplifiedP2P, committee: &[String], pending: &mut Vec<Vec<u8>>, max: usize,
@@ -340,7 +362,9 @@ fn drain_pending(
     let mut still = Vec::new();
     for data in std::mem::take(pending) {
         match bincode::deserialize::<ConsensusMsg>(&data) {
-            Ok(m) if msg_index(&m) <= cur => { if verify_msg(p2p, committee, &m) { effs.extend(driver.handle(&m)); } }
+            // Buffered replay applies the SAME sig + content gate as the live path — a Proposal whose window
+            // content we cannot independently reproduce is never handed to the driver (no forged head/state).
+            Ok(m) if msg_index(&m) <= cur => { if verify_msg(p2p, committee, &m) && content_ok(buf, &m) { effs.extend(driver.handle(&m)); } }
             Ok(_) if still.len() < max => still.push(data),
             _ => {}
         }
@@ -476,37 +500,10 @@ pub async fn run(
                                         v.index, &v.voter, v.checkpoint_hash, v.signature.clone()),
                                     _ => {}
                                 }
-                                let content_ok = match &msg {
-                                    ConsensusMsg::Proposal(cp) => window_buf.get(&(cp.window_head_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL))
-                                        .map(|c| cp.state_root == c.state_root
-                                            && cp.window_mb_hashes == c.mb_hashes
-                                            && cp.beacon == c.beacon
-                                            && qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee, &c.banned) == cp.epoch_commitment
-                                            // reward_root is QC-certified (folded into Checkpoint::hash), so it
-                                            // MUST be independently reproduced before we sign — exactly like the
-                                            // other four fields. A node only re-derives a non-[0;32] root at an
-                                            // emission boundary; off-boundary both sides are [0;32] and this is a
-                                            // trivial match. Without this, a single Byzantine leader could get an
-                                            // arbitrary reward_root 2f+1-certified (unbounded reward mint).
-                                            && cp.reward_root == c.reward_root
-                                            // registry_root is QC-certified (folded into Checkpoint::hash). Enforce
-                                            // the independent match under a feature gate so a determinism slip can
-                                            // never halt the network before the root is proven stable live (mirror
-                                            // of the burn-attestation gate); the field is in the hash regardless.
-                                            && (!qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height)
-                                                || cp.registry_root == c.registry_root)
-                                            // total_supply is QC-certified (folded into Checkpoint::hash). It is the
-                                            // apply-accumulated emission total — a deterministic accumulator both
-                                            // sides reproduce from the same window-head state — so it MUST match
-                                            // before we sign (epoch 0: both 0, trivial). Same gate as registry_root
-                                            // so a slip never halts before the field is proven stable live.
-                                            && (!qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height)
-                                                || cp.total_supply == c.total_supply))
-                                        // No locally-derived content for the proposer's claimed window ⇒
-                                        // we cannot verify it, so we never sign it (fail-stop).
-                                        .unwrap_or(false),
-                                    _ => true,
-                                };
+                                // Independent content re-derivation before we sign — single source of truth
+                                // (content_ok), shared with drain_pending so buffered replay applies the same
+                                // gate. Fail-stop on any mismatch/absent window; diagnostic below pinpoints the field.
+                                let content_ok = content_ok(&window_buf, &msg);
                                 if !content_ok {
                                     // fail-stop: a checkpoint whose content we don't independently reproduce
                                     // is never voted — a forged state_root cannot get our signature.

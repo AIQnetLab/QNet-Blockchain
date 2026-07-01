@@ -49,6 +49,9 @@ pub struct ConsensusDriver {
     seal_data: HashMap<u64, (Vec<u8>, Vec<NodeId>)>, // round → (eligible_producers, committee)
     sealed: std::collections::HashSet<u64>, // windows we already emitted Persist for (dedup)
     last_proposed_round: u64,               // one proposal per round we lead
+    high_window: u64,                       // monotonic high-water-mark of the QC'd window; next_window never
+                                            // regresses below it, so a head-less relayed QC/TC cannot collapse
+                                            // the proposal baseline to 1 (the desync seed).
     cp_interval: u64,                       // finality-checkpoint cadence (blocks); divides macro_interval
     macro_interval: u64,                    // macroblock/epoch cadence (blocks); Persist fires only at its boundary
 }
@@ -59,7 +62,7 @@ impl ConsensusDriver {
             eng: CheckpointConsensus::new(node_id.clone(), committee.clone()),
             committee, genesis_hash, node_id,
             proposals: HashMap::new(), heads: HashMap::new(), state_roots: HashMap::new(), seal_data: HashMap::new(),
-            sealed: std::collections::HashSet::new(), last_proposed_round: 0,
+            sealed: std::collections::HashSet::new(), last_proposed_round: 0, high_window: 0,
             cp_interval: CHECKPOINT_INTERVAL, macro_interval: MACROBLOCK_INTERVAL,
         }
     }
@@ -106,11 +109,23 @@ impl ConsensusDriver {
     /// window). Decoupled from the round: a round skip (timeout) does NOT advance it, so the
     /// next round re-proposes the same checkpoint (both extend the same high_qc) ⇒ contiguous heads.
     pub fn next_window(&self) -> u64 {
+        // Bounded by the monotonic high-water-mark: a head-less relayed QC/TC (heads has no entry for
+        // high_qc.index ⇒ .unwrap_or(0)) can no longer collapse this to 1 and desync the driver.
         let hq_idx = self.eng.high_qc.as_ref()
             .and_then(|q| self.heads.get(&q.index))
             .map(|h| h / self.cp_interval)
             .unwrap_or(0);
-        hq_idx + 1
+        hq_idx.max(self.high_window) + 1
+    }
+
+    /// Raise the monotonic window high-water-mark from the current high_qc once its head is known
+    /// (proposal/sync-carried). Called after every engine step; never lowers ⇒ safe.
+    fn refresh_high_window(&mut self) {
+        if let Some(idx) = self.eng.high_qc.as_ref().map(|q| q.index) {
+            if let Some(&head) = self.heads.get(&idx) {
+                self.high_window = self.high_window.max(head / self.cp_interval);
+            }
+        }
     }
 
     /// Propose `window` (the macroblock height) at the CURRENT round. The checkpoint
@@ -178,6 +193,17 @@ impl ConsensusDriver {
     pub fn handle(&mut self, msg: &ConsensusMsg) -> Vec<Effect> {
         let acts = match msg {
             ConsensusMsg::Proposal(cp) => {
+                // Contiguity invariant: a checkpoint's head MUST be the CONTIGUOUS next window (build_proposal
+                // enforces head = next_window()*cp_interval on the sign side). Reject any other head BEFORE it
+                // touches the index-keyed heads map — else a non-contiguous / inflated head (reachable via
+                // drain_pending, which routes to handle() past the node's content gate, and verify_msg checks
+                // only the proposer signature on a Proposal) lands in heads[idx] and refresh_high_window latches
+                // it into the MONOTONIC high_window forever (a poison-up liveness wedge). Honest lagging nodes
+                // never false-trip: the node loop routes a Proposal to handle() only once msg_index <=
+                // current_index (frontier caught up ⇒ next_window == this proposal's window); stale/forged is refused.
+                if cp.window_head_height != self.next_window().saturating_mul(self.cp_interval) {
+                    return Vec::new();
+                }
                 let ph = cp.parent_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash);
                 self.heads.insert(cp.index, cp.window_head_height);
                 self.state_roots.insert(cp.index, cp.state_root);
@@ -240,6 +266,7 @@ impl ConsensusDriver {
                 Action::FormedTc(tc) => out.push(Effect::Relay(ConsensusMsg::Tc(tc))),
             }
         }
+        self.refresh_high_window();
         out
     }
 }
@@ -456,5 +483,89 @@ mod tests {
         let d = ConsensusDriver::new("n0".into(), c.clone(), [7u8; 32]);
         assert_eq!(d.committed_index(), 0);
         assert_eq!(d.committed_head(), None, "no commit yet ⇒ no head to re-emit a finalize for");
+    }
+
+    // Desync-collapse regression: a HEAD-LESS relayed QC adopt (advances high_qc, but the driver holds
+    // no head for that index ⇒ heads.get == None ⇒ .unwrap_or(0)) must NOT collapse next_window to 1 —
+    // that seed let a node runaway-propose window 1 at a high round and wedge the whole net. The monotonic
+    // high_window floor holds next_window at the last KNOWN window; it may only advance (head arrives),
+    // never regress.
+    #[test]
+    fn headless_qc_adopt_does_not_collapse_next_window() {
+        let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
+        let genesis = [7u8; 32];
+        let mut d = ConsensusDriver::new("n9".into(), c.clone(), genesis);
+        d.set_intervals(90, 90);
+        // Sync to window 5 the honest way (heads populated) ⇒ high_window = 5, next_window = 6.
+        let mut parent_hash = genesis;
+        let mut prev_qc: Option<QuorumCertificate> = None;
+        for i in 1..=5u64 {
+            let cp = Checkpoint {
+                index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
+                window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
+            };
+            let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
+            let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
+            let qc = QuorumCertificate { checkpoint_hash: cp.hash(), index: i, sig_merkle_root: sig_merkle_root(&sigs), signers, sigs };
+            let _ = d.sync(&cp, &qc);
+            parent_hash = cp.hash();
+            prev_qc = Some(qc);
+        }
+        assert_eq!(d.next_window(), 6, "sanity: synced to window 5 ⇒ next_window 6");
+        // A HEAD-LESS QC for index 6 (no checkpoint/head held locally). Pre-fix: next_window collapsed to
+        // 1 (heads.get(6) == None ⇒ unwrap_or(0) + 1). Post-fix: the high_window floor keeps it at 6.
+        let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
+        let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let bare = QuorumCertificate { checkpoint_hash: [9u8; 32], index: 6, sig_merkle_root: sig_merkle_root(&sigs), signers, sigs };
+        let _ = d.handle(&ConsensusMsg::Qc(bare));
+        assert_eq!(d.next_window(), 6, "head-less QC adopt must not regress next_window below the known floor");
+    }
+
+    // Poison-up regression (adversarial audit): a Proposal carrying a NON-CONTIGUOUS / inflated head must be
+    // REJECTED by handle() (the contiguity guard) so it never lands in the index-keyed heads map, and a later
+    // QC for that index must NOT latch the monotonic high_window. Without the guard, the buffered-replay path
+    // (drain_pending, past the content gate; verify_msg on a Proposal is proposer-signature only) could let a
+    // single malicious head permanently wedge next_window too-high.
+    #[test]
+    fn poisoned_noncontiguous_head_rejected_and_high_window_unmoved() {
+        let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
+        let genesis = [7u8; 32];
+        let mut d = ConsensusDriver::new("n9".into(), c.clone(), genesis);
+        d.set_intervals(90, 90);
+        // Sync honestly to window 5 ⇒ high_window = 5, next_window = 6.
+        let mut parent_hash = genesis;
+        let mut prev_qc: Option<QuorumCertificate> = None;
+        for i in 1..=5u64 {
+            let cp = Checkpoint {
+                index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
+                window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
+            };
+            let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
+            let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
+            let qc = QuorumCertificate { checkpoint_hash: cp.hash(), index: i, sig_merkle_root: sig_merkle_root(&sigs), signers, sigs };
+            let _ = d.sync(&cp, &qc);
+            parent_hash = cp.hash();
+            prev_qc = Some(qc);
+        }
+        assert_eq!(d.next_window(), 6, "sanity: synced to window 5 ⇒ next_window 6");
+        // A validly-shaped Proposal at the next round (index 6) but with an INFLATED head (window 10_000).
+        let poison = Checkpoint {
+            index: 6, parent_qc: prev_qc.clone(), window_head_height: 10_000 * 90,
+            window_mb_hashes: vec![[6u8; 32]], state_root: [6u8; 32],
+            beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], total_supply: 0, timestamp: 0,
+            proposer: c[0].clone(), proposer_sig: Vec::new(),
+        };
+        let effs = d.handle(&ConsensusMsg::Proposal(poison.clone()));
+        assert!(effs.is_empty(), "non-contiguous head must yield no effects (no vote, no state written)");
+        // A QC certifying that poisoned checkpoint must NOT latch high_window (heads[6] was never written).
+        let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
+        let sigs: Vec<Vec<u8>> = signers.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let qc6 = QuorumCertificate { checkpoint_hash: poison.hash(), index: 6, sig_merkle_root: sig_merkle_root(&sigs), signers, sigs };
+        let _ = d.handle(&ConsensusMsg::Qc(qc6));
+        assert_eq!(d.next_window(), 6, "poisoned head must never latch high_window: next_window stays 6");
     }
 }
