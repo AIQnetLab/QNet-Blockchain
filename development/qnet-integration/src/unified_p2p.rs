@@ -2155,8 +2155,12 @@ pub struct SimplifiedP2P {
     /// PRODUCTION: Light Node registry synchronized via gossip
     /// All Super nodes maintain identical registry for deterministic ping assignment
     light_node_registry: Arc<RwLock<HashMap<String, LightNodeRegistrationData>>>,
-    
-    
+    /// Per-window ping-slot buckets for THIS genesis's shard: (window, registry_len, [slot 0..239]→node_ids).
+    /// Rebuilt only on window/size change ⇒ ping selection is O(bucket)/tick, not O(N log N) clone+sort of
+    /// the whole registry every tick — scales the 5-genesis pinger to millions of light nodes.
+    light_ping_slot_cache: Arc<RwLock<(u64, usize, Vec<Vec<String>>)>>,
+
+
     /// PRODUCTION: Storage reference for persistent heartbeat storage
     /// SCALABILITY: Each node stores ONLY its own heartbeats in RocksDB (10 records per 4h)
     /// Supports millions of nodes without RAM limitations
@@ -3071,7 +3075,8 @@ impl SimplifiedP2P {
             
             // PRODUCTION: Light Node registry for gossip sync
             light_node_registry: Arc::new(RwLock::new(HashMap::new())),
-            
+            light_ping_slot_cache: Arc::new(RwLock::new((u64::MAX, 0, Vec::new()))),
+
             // PRODUCTION: Heartbeat history for reward eligibility
             storage: storage, // v2.76: Storage for persistent heartbeat storage
             
@@ -16964,6 +16969,9 @@ impl SimplifiedP2P {
         
         for (node_id, wallet_address, _node_type, registered_at) in nodes {
             if !registry.contains_key(&node_id) {
+                // Restore the persisted liveness FSM instead of resurrecting to active — a dropped node
+                // stays dropped across a genesis restart until it re-attests (honors manual reactivation).
+                let inactive = self.storage.as_ref().map(|s| s.is_light_inactive(&node_id)).unwrap_or(false);
                 registry.insert(node_id.clone(), LightNodeRegistrationData {
                     node_id,
                     wallet_address,
@@ -16974,8 +16982,8 @@ impl SimplifiedP2P {
                     push_type: PushType::Polling,
                     unified_push_endpoint: None,
                     last_seen: registered_at,
-                    consecutive_failures: 0,
-                    is_active: true,
+                    consecutive_failures: if inactive { 5 } else { 0 },
+                    is_active: !inactive,
                     ed25519_signature: String::new(),
                     ed25519_public_key: String::new(),
                     ping_pubkey: String::new(),         // Populated on re-registration
@@ -17251,94 +17259,88 @@ impl SimplifiedP2P {
     /// SCALABILITY: 2M pings per Genesis per epoch = 139 pings/sec = easily handled
     pub fn get_light_nodes_to_ping(&self) -> Vec<(LightNodeRegistrationData, PingerRole)> {
         let current_slot = Self::get_current_slot();
+        let current_window = Self::get_current_window_number();
         let our_node_id = &self.node_id;
         let mut result = Vec::new();
-        
-        // v2.89: ONLY Genesis nodes can ping Light nodes
-        // This ensures 100% reliability - Genesis never goes offline
+
+        // v2.89: ONLY Genesis nodes ping Light nodes (5 fixed shard owners, always online).
         let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
             .unwrap_or(false);
-        
-        if !is_genesis_node {
-            // Non-Genesis nodes don't ping Light nodes anymore
-            // This prevents data loss when regular nodes go offline
-            return result;
-        }
-        
-        // Get our Genesis index (0-4) for shard assignment
+        if !is_genesis_node { return result; }
         let our_genesis_idx = std::env::var("QNET_BOOTSTRAP_ID")
-            .ok()
-            .and_then(|id| id.parse::<usize>().ok())
-            .map(|id| id.saturating_sub(1)) // Convert 001-005 to 0-4
-            .unwrap_or(0);
-        
+            .ok().and_then(|id| id.parse::<usize>().ok())
+            .map(|id| id.saturating_sub(1)).unwrap_or(0);
         const GENESIS_COUNT: usize = 5;
-        
+
         if crate::node::is_info() {
             println!("[INFO][GENESIS-PING] Genesis node {} (idx={}) checking Light nodes to ping slot={}",
                      our_node_id, our_genesis_idx, current_slot);
         }
-        
-        // Get all Light nodes from registry SORTED for consistent linear sharding
-        // v2.89 CRITICAL: Must use same ordering as bitmap creation!
+
         let registry = self.light_node_registry.read();
-        let mut all_nodes: Vec<_> = registry.values().cloned().collect();
-        all_nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id)); // Sort by node_id
-        let total_light_nodes = all_nodes.len();
-        
-        // v2.89: LINEAR SHARDING - each Genesis gets sequential range of indices
-        // This matches bitmap creation logic exactly!
-        let nodes_per_genesis = (total_light_nodes + GENESIS_COUNT - 1) / GENESIS_COUNT; // Ceiling division
-        let my_start = our_genesis_idx * nodes_per_genesis;
-        let my_end = std::cmp::min(my_start + nodes_per_genesis, total_light_nodes);
-        
-        for idx in my_start..my_end {
-            let node = &all_nodes[idx];
-            
-            // ACTIVITY FILTER: Skip inactive nodes (>5 consecutive failures)
-            if !node.is_active || node.consecutive_failures >= 5 {
-                continue;
+        let reg_len = registry.len();
+
+        // Rebuild this genesis's per-slot buckets only when the window rolls or the registry size changes.
+        // Linear sharding over the SORTED registry (must match bitmap creation). O(N log N) once per window,
+        // not every 60s tick — the O(N log N) clone+sort per tick did not scale to millions of light nodes.
+        let need_rebuild = { let c = self.light_ping_slot_cache.read(); c.0 != current_window || c.1 != reg_len };
+        if need_rebuild {
+            let mut ids: Vec<&String> = registry.keys().collect();
+            ids.sort();
+            let nodes_per_genesis = (reg_len + GENESIS_COUNT - 1) / GENESIS_COUNT;
+            let my_start = our_genesis_idx * nodes_per_genesis;
+            let my_end = std::cmp::min(my_start + nodes_per_genesis, reg_len);
+            let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 240];
+            for i in my_start..my_end {
+                let id = ids[i];
+                let slot = Self::calculate_randomized_slot(id, current_window) as usize;
+                buckets[slot].push(id.clone());
             }
-            
-            // Check if this is the node's ping slot (randomized per window)
-            if !Self::is_light_node_ping_slot(&node.node_id) {
-                continue;
-            }
-            
-            // Skip if already attested in ANY slot of the current 4h window.
-            // The 3-slot retry window is only for failures — if the node already proved
-            // liveness this window, no further FCM notifications are needed.
-            if self.has_attestation_in_window(&node.node_id) {
-                continue;
-            }
-            
-            // Genesis is always Primary pinger (no backup needed - Genesis is reliable)
-            result.push((node.clone(), PingerRole::Primary));
+            *self.light_ping_slot_cache.write() = (current_window, reg_len, buckets);
         }
-        
+
+        // Read the 3 grace slots {cur, cur-1, cur-2} (mod 240) — same window as is_light_node_ping_slot
+        // (slot_diff<=2). is_active/consecutive_failures/attested are mutable ⇒ filtered per tick.
+        let cache = self.light_ping_slot_cache.read();
+        for g in 0..=2u64 {
+            let s = ((current_slot + 240 - g) % 240) as usize;
+            for node_id in cache.2.get(s).into_iter().flatten() {
+                let node = match registry.get(node_id) { Some(n) => n, None => continue };
+                if !node.is_active || node.consecutive_failures >= 5 { continue; }
+                if self.has_attestation_in_window(node_id) { continue; }
+                result.push((node.clone(), PingerRole::Primary));
+            }
+        }
+
         if crate::node::is_debug() && !result.is_empty() {
-            println!("[DBG][GENESIS-PING] Genesis {} has {} Light nodes to ping this slot (total registry: {})",
-                     our_genesis_idx + 1, result.len(), total_light_nodes);
+            println!("[DBG][GENESIS-PING] Genesis {} has {} Light nodes to ping this slot (registry: {})",
+                     our_genesis_idx + 1, result.len(), reg_len);
         }
-        
         result
     }
     
     /// Mark Light node as failed (no response to ping)
     /// After 5 consecutive failures, node is marked inactive
     pub fn mark_light_node_ping_failed(&self, node_id: &str) {
-        let mut registry = self.light_node_registry.write();
-        if let Some(node) = registry.get_mut(node_id) {
-            node.consecutive_failures = node.consecutive_failures.saturating_add(1);
-            
-            if node.consecutive_failures >= 5 {
-                node.is_active = false;
-                if crate::node::is_info() {
-                    println!("[WARN][P2P] Node {} marked inactive after {} consecutive failures",
-                             node_id, node.consecutive_failures);
+        let mut flipped_inactive = false;
+        {
+            let mut registry = self.light_node_registry.write();
+            if let Some(node) = registry.get_mut(node_id) {
+                node.consecutive_failures = node.consecutive_failures.saturating_add(1);
+                if node.consecutive_failures >= 5 && node.is_active {
+                    node.is_active = false;
+                    flipped_inactive = true;
+                    if crate::node::is_info() {
+                        println!("[WARN][P2P] Node {} marked inactive after {} consecutive failures",
+                                 node_id, node.consecutive_failures);
+                    }
                 }
             }
+        }
+        // Persist the drop so a genesis restart does not silently resurrect it (honors manual reactivation).
+        if flipped_inactive {
+            if let Some(s) = &self.storage { s.mark_light_inactive(node_id); }
         }
     }
     
@@ -17372,6 +17374,7 @@ impl SimplifiedP2P {
             node.is_active = true;
             
             if was_inactive {
+                if let Some(s) = &self.storage { s.clear_light_inactive(node_id); }
                 if crate::node::is_info() {
                     println!("[INFO][P2P] Node {} reactivated after successful ping", node_id);
                 }

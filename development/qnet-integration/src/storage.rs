@@ -6645,6 +6645,25 @@ impl Storage {
         self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height), Some(burn_tx), vrf_pk)
     }
 
+    /// Light-node liveness FSM persistence (durable across genesis restart). A separate metadata-CF key,
+    /// NOT the registry_root-committed node_ row ⇒ zero consensus impact. Written only on the is_active
+    /// FLIP (drop-after-5-misses / reactivate), so a restart does not silently resurrect a dropped node.
+    pub fn mark_light_inactive(&self, node_id: &str) {
+        if let Some(cf) = self.persistent.db.cf_handle("metadata") {
+            let _ = self.persistent.db.put_cf(&cf, format!("lninact_{}", node_id).as_bytes(), b"1");
+        }
+    }
+    pub fn clear_light_inactive(&self, node_id: &str) {
+        if let Some(cf) = self.persistent.db.cf_handle("metadata") {
+            let _ = self.persistent.db.delete_cf(&cf, format!("lninact_{}", node_id).as_bytes());
+        }
+    }
+    pub fn is_light_inactive(&self, node_id: &str) -> bool {
+        self.persistent.db.cf_handle("metadata")
+            .and_then(|cf| self.persistent.db.get_cf(&cf, format!("lninact_{}", node_id).as_bytes()).ok().flatten())
+            .is_some()
+    }
+
     fn save_node_registration_inner(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: Option<u64>, burn_tx: Option<&str>, vrf_pk: Option<&[u8]>) -> IntegrationResult<()> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;

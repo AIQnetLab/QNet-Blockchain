@@ -912,15 +912,13 @@ pub fn window_content_from_accum(mb_idx: u64) -> Option<(Vec<[u8; 32]>, Vec<[u8;
 /// recency) and that was included in a block at-or-below scan_end. A pure function of the canonical chain
 /// ≤ scan_end ⇒ identical on every committee member, with NO live-tip dependence. Scans ≤2 subwindows
 /// (~2880 blocks), off the production path; bodies are retained 6 epochs, far beyond this window.
-/// (current, previous) global subwindow indices (anchor/1440 = epoch*10 + subwindow) for `scan_end`. The
-/// previous counts ONLY within the SAME epoch — at a subwindow-0/epoch boundary it returns current==prev
-/// (no previous), mirroring the prior `heartbeat_epoch==hb_epoch` + `if cur_sub>0` bitmask recency. Pure
-/// ⇒ unit-tested for the off-by-one + cross-epoch boundary.
+/// (current, previous) GLOBAL subwindow indices (anchor/1440) for `scan_end`; prev = cur-1 SPANS the
+/// epoch boundary — a Heartbeat from the prior epoch's last subwindow is still recent liveness. The old
+/// per-epoch reset (prev=cur at subwindow 0) ejected the whole non-genesis eligible set for the first
+/// subwindow of every epoch (the eligibility flicker at scale). Pure fn of scan_end ⇒ deterministic.
 fn recency_subwindow_indices(scan_end: u64) -> (u64, u64) {
     let cur_idx = scan_end / 1440;
-    let cur_sub = (scan_end % 14400) / 1440; // 0..9 within the epoch
-    let prev_idx = if cur_sub > 0 { cur_idx.saturating_sub(1) } else { cur_idx };
-    (cur_idx, prev_idx)
+    (cur_idx, cur_idx.saturating_sub(1))
 }
 
 fn recent_heartbeat_senders(storage: &crate::storage::Storage, scan_end: u64) -> std::collections::HashSet<String> {
@@ -27610,22 +27608,23 @@ mod tests {
         assert!(!checkpoint_participation_allowed(false, 0, mb_end));      // syncing, no window → defer
     }
 
-    // Phase-2A recency window (deterministic heartbeat eligibility): current subwindow + previous ONLY
-    // within the same epoch. The epoch boundary (subwindow 0) must NOT bridge to the prior epoch's
-    // subwindow 9 — that is the off-by-one that would change WHO is eligible vs the old bitmask gate.
+    // Phase-2A recency window: current subwindow + the immediately previous GLOBAL subwindow. prev = cur-1
+    // SPANS the epoch boundary (prior epoch's subwindow 9 is still recent liveness); the old per-epoch reset
+    // (prev=cur at subwindow 0) ejected the whole non-genesis eligible set each epoch start (the flicker).
     #[test]
     fn recency_subwindow_indices_boundary() {
-        // Mid-epoch: previous = current-1 (same epoch).
+        // Mid-epoch: previous = current-1.
         assert_eq!(recency_subwindow_indices(5 * 1440), (5, 4));
         assert_eq!(recency_subwindow_indices(5 * 1440 + 100), (5, 4));
-        // Epoch start (subwindow 0): no previous within the epoch ⇒ prev == cur (degenerates to {cur}).
+        // h0: no previous ⇒ saturating to (0, 0).
         assert_eq!(recency_subwindow_indices(0), (0, 0));
-        assert_eq!(recency_subwindow_indices(14400), (10, 10));        // epoch1 sub0 ⇒ (10,10), NOT (10,9)
-        assert_eq!(recency_subwindow_indices(14400 + 50), (10, 10));
-        // Epoch1 subwindow 1: previous is sub0 of the SAME epoch (10), never the prior epoch's sub9 (9).
+        // Epoch boundary (subwindow 0): prev = cur-1 BRIDGES to the prior epoch's subwindow 9 (no flicker).
+        assert_eq!(recency_subwindow_indices(14400), (10, 9));
+        assert_eq!(recency_subwindow_indices(14400 + 50), (10, 9));
+        // Epoch1 subwindow 1: previous is subwindow 0 of the same epoch.
         assert_eq!(recency_subwindow_indices(14400 + 1440), (11, 10));
-        // Epoch2 subwindow 0: again no bridge.
-        assert_eq!(recency_subwindow_indices(2 * 14400), (20, 20));
+        // Epoch2 boundary: bridges to epoch1 subwindow 9.
+        assert_eq!(recency_subwindow_indices(2 * 14400), (20, 19));
     }
 
     // committee_for_height determinism: genesis era ⇒ None (caller uses the genesis committee), and

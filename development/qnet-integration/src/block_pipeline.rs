@@ -1253,8 +1253,10 @@ impl BlockPipeline {
             const STUCK_THRESHOLD_MS: u64 = 30_000;
             let mut last_verified: u64 = 0;
             let mut last_applied: u64 = 0;
-            let mut last_verified_progress_ms: u64 = now_ms();
-            let mut last_applied_progress_ms: u64 = now_ms();
+            // 0 sentinel = "no verify/apply seen yet"; the dump guards require != 0, so the boot wait
+            // (nothing to apply) can't trip a spurious CRIT — stall is measured from first real progress.
+            let mut last_verified_progress_ms: u64 = 0;
+            let mut last_applied_progress_ms: u64 = 0;
             let mut last_verify_dump_ms: u64 = 0;
             let mut last_apply_dump_ms: u64 = 0;
             let mut interval = tokio::time::interval(WATCHDOG_TICK);
@@ -1287,6 +1289,7 @@ impl BlockPipeline {
 
                 // VERIFY STALL DUMP: counter unchanged for ≥30 s and op != idle.
                 if verify_stall_ms >= STUCK_THRESHOLD_MS
+                    && last_verified_progress_ms != 0
                     && verify_op != PIPELINE_OP_IDLE
                     && now.saturating_sub(last_verify_dump_ms) >= STUCK_THRESHOLD_MS
                 {
@@ -1309,6 +1312,7 @@ impl BlockPipeline {
 
                 // APPLY STALL DUMP: counter unchanged for ≥30 s and op != idle.
                 if apply_stall_ms >= STUCK_THRESHOLD_MS
+                    && last_applied_progress_ms != 0
                     && apply_op != PIPELINE_OP_IDLE
                     && now.saturating_sub(last_apply_dump_ms) >= STUCK_THRESHOLD_MS
                 {
