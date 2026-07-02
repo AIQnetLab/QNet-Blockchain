@@ -1043,6 +1043,40 @@ pub fn record_producer_heartbeat() {
 /// 0 = locked (no production), 1 = unlocked (production allowed)
 pub static PRODUCTION_UNLOCKED: AtomicU64 = AtomicU64::new(0);
 
+/// Wall-clock (secs) of this process's first pacemaker tick = the boot instant. Lazy-set once.
+/// The QUIC mesh takes tens-of-seconds to ~2 min to re-form after a (re)start, but the timeout-vote
+/// grace is only STALL_GRACE_SECS (5s). Without a boot window a freshly-restarted node — or a whole
+/// co-restarted cohort — escalates its certified round on a phantom "producer silent" before the real
+/// block can propagate; the inflated round then permanently rejects the network's valid lower-round
+/// blocks (the rolling-upgrade escalation-lock). Escalation is suppressed until the mesh has had time
+/// to form. Normal failover (uptime ≫ grace, at head, producer genuinely silent) is unaffected.
+pub static NODE_BOOT_WALL: AtomicU64 = AtomicU64::new(0);
+/// Min validated peers a node must see before it may drive view-change (real quorum reachable).
+pub const TIMEOUT_ESCALATION_MIN_PEERS: usize = 2;
+/// Short post-boot floor before any escalation — guards the first ticks against a mesh-not-yet race.
+pub const TIMEOUT_ESCALATION_BOOT_FLOOR_SECS: u64 = 15;
+
+/// Escalation eligibility (pure, testable, condition-based ⇒ scale-invariant). A node may emit a
+/// timeout-vote (drive its certified rotation round up) ONLY when meshed with a real peer quorum, past
+/// the boot floor, AND caught up to the network head. The head reference is the (f+1)-attested
+/// corroborated tip, NOT the raw monotonic-high peer height: a dead producer's un-appliable in-flight
+/// block, seen by <f+1 peers, must not read as "network ahead" and suppress the survivors' fast
+/// failover. Behind or under-connected ⇒ sync, don't escalate — that is what stops a restarted/
+/// co-restarted cohort from inflating the round and rejecting the network's valid lower-round blocks.
+/// GENESIS bootstrap (our_h==0 AND best_raw==0 ⇒ the whole visible net is still at h0) is failover-
+/// eligible: with no tip to lag there is no higher block to wrongly reject, yet failover IS needed to
+/// route around a first-block producer that never boots. A restarted node with intact storage has
+/// our_h>0 ⇒ excluded (stays gated); a lone fresh joiner to a live net sees best_raw>0 within the boot
+/// floor ⇒ excluded, and could not self-certify a genesis round alone anyway. Gates vote EMISSION only,
+/// never block acceptance ⇒ cannot fork.
+pub fn timeout_escalation_allowed(our_h: u64, corroborated_h: u64, best_raw_h: u64, peer_count: usize, wall_now: u64, boot_wall: u64) -> bool {
+    let meshed = peer_count >= TIMEOUT_ESCALATION_MIN_PEERS;
+    let genesis_bootstrap = our_h == 0 && best_raw_h == 0;
+    let at_head = genesis_bootstrap || (corroborated_h > 0 && our_h + 1 >= corroborated_h);
+    let boot_ok = wall_now.saturating_sub(boot_wall) >= TIMEOUT_ESCALATION_BOOT_FLOOR_SECS;
+    meshed && at_head && boot_ok
+}
+
 /// v4.6: Track last height at which VRF key was announced to peers
 static LAST_VRF_KEY_ANNOUNCE_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
@@ -13433,7 +13467,31 @@ impl BlockchainNode {
                         // 1 msg/s from leader only, identical 5→100k.
                         const HEARTBEAT_SILENT_MS: u64 = 3_000;
 
-                        if local_delay > STALL_GRACE_SECS && production_unlocked && !failover_capped {
+                        // RECOVERY GUARD (restart escalation-lock fix): only escalate timeout_round when
+                        // this node is genuinely AT the network head AND past the post-boot mesh-formation
+                        // window. A node that is BEHIND (can't yet fetch the tip) or freshly (re)started
+                        // (mesh not formed) must SYNC, not vote timeout — escalating there inflates the
+                        // local certified round and makes the node permanently reject the network's valid
+                        // lower-round blocks (the rolling-upgrade stall). "At head + producer genuinely
+                        // silent" is the ONLY legitimate escalation trigger; this changes vote EMISSION
+                        // only, never block acceptance, so it cannot fork. Normal failover (uptime ≫ grace,
+                        // at head) is unaffected; the honest at-head majority still drives view-change.
+                        let boot_wall = {
+                            let b = NODE_BOOT_WALL.load(Ordering::Relaxed);
+                            if b == 0 { NODE_BOOT_WALL.store(wall_now, Ordering::Relaxed); wall_now } else { b }
+                        };
+                        let our_h_esc = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+                        // (f+1)-corroborated tip, not raw monotonic-high: a dead producer's un-appliable
+                        // in-flight block (seen by <f+1 peers) must not read as "network ahead" and defer
+                        // the survivors' fast failover to the chronic-stall path.
+                        let corroborated_h_esc = unified_p2p.as_ref().map(|p| p.corroborated_head_ceiling()).unwrap_or(0);
+                        // Raw monotonic-high peer height — used ONLY as a genesis detector (best_raw==0 ⇒
+                        // no peer reports any block yet), never as the at-head reference.
+                        let best_raw_esc = unified_p2p.as_ref().map(|p| p.get_best_peer_height()).unwrap_or(0);
+                        let peers_esc = unified_p2p.as_ref().map(|p| p.get_validated_active_peers().len()).unwrap_or(0);
+                        let escalate_ok = timeout_escalation_allowed(our_h_esc, corroborated_h_esc, best_raw_esc, peers_esc, wall_now, boot_wall);
+
+                        if local_delay > STALL_GRACE_SECS && production_unlocked && !failover_capped && escalate_ok {
                             let mb_idx = next_height / 90;
                             let now_u64 = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -18104,7 +18162,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         let max_sync_attempts = backoff_schedule.len();
                                         
                                         for sync_attempt in 1..=max_sync_attempts {
-                                            match p2p_check.sync_blocks(expected_height_timeout, expected_height_timeout).await {
+                                            // Frontier fetch bypasses SYNC_INFLIGHT overlap-dedup (a plain
+                                            // sync_blocks single-height request was silently coalesced into a
+                                            // stuck bulk range) and has its own reserved budget.
+                                            match p2p_check.sync_blocks_frontier(expected_height_timeout, expected_height_timeout).await {
                                                 Ok(_) => {
                                                     // sync_blocks() is fire-and-forget — wait for block in storage
                                                     // Wait up to 3 seconds per attempt (30 * 100ms)
@@ -18163,6 +18224,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 std::sync::atomic::AtomicU32::new(0);
                                             static SYNC_FAIL_FIRST_TS: std::sync::atomic::AtomicU64 =
                                                 std::sync::atomic::AtomicU64::new(0);
+                                            // Per-process floor between bootstrap re-dials: at scale a mass
+                                            // restart strands many supers at once, all re-dialing the same
+                                            // few genesis anchors — cap each node to one reconnect per window
+                                            // so recovery can't self-inflict a thundering herd on genesis.
+                                            static LAST_BOOTSTRAP_RECONNECT: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            const BOOTSTRAP_RECONNECT_COOLDOWN_SECS: u64 = 30;
 
                                             let prev_fail_height = SYNC_FAIL_HEIGHT.load(Ordering::Relaxed);
                                             let fail_count = if prev_fail_height == expected_height_timeout {
@@ -18186,15 +18254,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             println!("[ERR][SYNC] failover_all_failed h={} network_has_block=true fail_count={} stuck={}s",
                                                      expected_height_timeout, fail_count, stuck_duration);
 
-                                            if fail_count >= 3 {
-                                                // 3+ consecutive failures for the same block:
-                                                // QUIC connections to sync peers are likely dead.
-                                                // Force QUIC reconnect to all bootstrap peers.
+                                            // First exhausted round already means the QUIC links to sync peers
+                                            // are likely dead (post-restart mesh churn) — re-dial NOW instead
+                                            // of after ~60s. Gated by a per-process cooldown so a stuck node
+                                            // re-dials at most once per window (fail_count is left to climb,
+                                            // NOT reset, so the trigger doesn't re-fire every round); this
+                                            // bounds the aggregate genesis reconnect rate under a mass restart.
+                                            let last_rc = LAST_BOOTSTRAP_RECONNECT.load(Ordering::Relaxed);
+                                            if fail_count >= 1 && now_ts.saturating_sub(last_rc) >= BOOTSTRAP_RECONNECT_COOLDOWN_SECS {
+                                                LAST_BOOTSTRAP_RECONNECT.store(now_ts, Ordering::Relaxed);
                                                 println!("[WARN][FAILOVER] h={} action=force_quic_reconnect (stuck {} rounds)",
                                                          expected_height_timeout, fail_count);
                                                 p2p_check.reconnect_all_bootstrap_peers().await;
-                                                // Reset counter so we give reconnected peers a chance
-                                                SYNC_FAIL_COUNT.store(0, Ordering::Relaxed);
                                             }
 
                                             if stuck_duration > 600 {
@@ -27683,6 +27754,54 @@ mod tests {
         assert_eq!(light_roster_cutoff(7), 7 * 14_400);          // 100800 (< gate)
         // Active (epoch 8+, epoch_start >= 115200): commit-window open.
         assert_eq!(light_roster_cutoff(8), 8 * 14_400 + 14_350); // 129550
+    }
+
+    // Restart escalation-lock fix: a node must NOT escalate timeout_round while behind the head or
+    // during the post-boot mesh-formation window. This is what stopped rolling upgrades from stalling.
+    #[test]
+    fn timeout_escalation_gate() {
+        let boot = 1_000u64;
+        let after = boot + super::TIMEOUT_ESCALATION_BOOT_FLOOR_SECS;   // boot floor elapsed
+        let during = after - 1;                                        // still in boot floor
+        let np = super::TIMEOUT_ESCALATION_MIN_PEERS;                   // meshed peer count
+        use super::timeout_escalation_allowed as ok;
+        // ok(our_h, corroborated_h, best_raw_h, peer_count, wall_now, boot_wall)
+
+        // BEHIND the head ⇒ never escalate (must sync), even meshed and long after boot.
+        assert!(!ok(97_650, 97_739, 97_739, np, after + 5_000, boot), "behind node must not escalate");
+
+        // Heard the live net but no f+1 corroboration (thin/stale) ⇒ never escalate — the scale gate.
+        assert!(!ok(50, 0, 97_739, np, after, boot), "no quorum-attested tip on a live net must not escalate");
+        assert!(!ok(97_739, 97_739, 97_739, np - 1, after, boot), "too few peers ⇒ no quorum, no escalate");
+
+        // Still in the boot floor ⇒ don't escalate yet.
+        assert!(!ok(97_739, 97_739, 97_739, np, during, boot), "boot floor blocks first ticks");
+
+        // Meshed + at head + past boot floor ⇒ legitimate failover escalation allowed.
+        assert!(ok(97_739, 97_739, 97_739, np, after, boot), "meshed + at head ⇒ escalate ok");
+        assert!(ok(97_739, 97_740, 97_740, np, after, boot), "1 behind (block in flight) counts as at-head");
+        assert!(ok(97_739, 97_739, 97_739, np + 50, after, boot), "more peers still ok");
+
+        // Dead-producer liveness (F1): survivors at the (f+1)-corroborated tip STILL escalate even though
+        // a lone peer's RAW height is higher — the at-head reference is corroborated_h, not best_raw, so
+        // the un-appliable in-flight block never reads as "network ahead".
+        assert!(ok(97_739, 97_739, 100_000, np, after + 200, boot), "phantom-high raw ⇒ fast failover preserved");
+
+        // >1 behind the corroborated tip is NOT at-head ⇒ genuine catch-up, must sync.
+        assert!(!ok(97_738, 97_740, 97_740, np, after, boot), ">1 behind must sync, not escalate");
+
+        // GENESIS bootstrap (our_h==0 AND best_raw==0 ⇒ whole visible net at h0): failover-eligible so a
+        // dead first-block producer can be routed around; still gated by peers + boot floor.
+        assert!(ok(0, 0, 0, np, after, boot), "genesis bootstrap ⇒ first-block failover allowed");
+        assert!(!ok(0, 0, 0, np - 1, after, boot), "genesis but too few peers ⇒ no escalate");
+        assert!(!ok(0, 0, 0, np, during, boot), "genesis but in boot floor ⇒ no escalate");
+
+        // RE-OPEN GUARDS — the genesis branch must NOT let a behind node escalate:
+        // (a) restarted node with intact storage, transient corroborated==0 AND best_raw==0 at boot, but
+        //     our_h>0 ⇒ NOT genesis ⇒ stays gated (this is exactly the restart escalation-lock bug).
+        assert!(!ok(97_740, 0, 0, np, after + 5_000, boot), "restarted high-our_h with raw=0 must stay gated");
+        // (b) fresh joiner to a live net: our_h==0 but best_raw>0 (heard the tip) ⇒ NOT genesis ⇒ sync.
+        assert!(!ok(0, 97_800, 97_800, np, after, boot), "fresh joiner to live net must sync, not escalate");
     }
 
     // lhb_ liveness index == body scan, byte-identical (Phase-2A eligibility feeds epoch_commitment;

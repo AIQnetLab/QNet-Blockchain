@@ -18119,9 +18119,38 @@ impl SimplifiedP2P {
             // v9.0: GENESIS BYPASS - Only by verified IP, not self-declared ID
             if is_genesis_peer {
                 false // Genesis nodes always allowed
-            // v10.1: Relaxed rate limit for nodes catching up (>5 blocks behind)
-            // Not unlimited — prevents DDoS via fake "catching up" requests
-            } else if blocks_behind > 5 {
+            // Priority (60/min) for any request the requester legitimately lacks: to_height ≤ our tip
+            // means we HAVE the block and it's a real catch-up/repair (near-tip repair included), not a
+            // future-height probe. The tip is unspoofable (server's own), extending priority past the 5
+            // genesis IPs to every honest super-node. id_prefix is caller-chosen (only the IP is
+            // QUIC-anchored), so a joint (IP,id) bucket alone could be multiplied by cycling ids — a
+            // per-IP aggregate ceiling bounds one IP's TOTAL priority serve first, then the joint bucket
+            // isolates co-located peers within it.
+            } else if to_height <= local_chain_height && local_chain_height > 0 {
+                // Per-IP aggregate ceiling — the hard bound against id-cycling amplification. Checked and
+                // released before the joint bucket (distinct keys, no overlapping DashMap guard).
+                let ip_over = {
+                    let ip_key = format!("priority_ip_{}", from_ip);
+                    let mut agg = self.rate_limiter.entry(ip_key).or_insert_with(|| RateLimit {
+                        requests: Vec::new(),
+                        max_requests: 180,  // ≈3 co-located full-rate repairs; caps a cycling-id attacker
+                        window_seconds: 60,
+                        blocked_until: 0,
+                    });
+                    if agg.blocked_until > current_time { true }
+                    else {
+                        let w = agg.window_seconds;
+                        agg.requests.retain(|&t| t > current_time - w);
+                        if agg.requests.len() >= agg.max_requests { agg.blocked_until = current_time + 30; true }
+                        else { agg.requests.push(current_time); false }
+                    }
+                };
+                if ip_over {
+                    if crate::node::is_warn() {
+                        println!("[WARN][SYNC] priority_ip_rate_exceeded ip={} id={}", from_ip, id_prefix);
+                    }
+                    true
+                } else {
                 // v24: joint (IP, node_id) key — see header above.
                 let rate_key = format!("priority_sync_{}_{}", from_ip, id_prefix);
                 let mut rate_limit = self.rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
@@ -18146,6 +18175,7 @@ impl SimplifiedP2P {
                         rate_limit.requests.push(current_time);
                         false
                     }
+                }
                 }
             } else {
                 // Normal rate limiting for synchronized nodes.
