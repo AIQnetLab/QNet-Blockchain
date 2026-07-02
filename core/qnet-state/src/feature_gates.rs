@@ -34,12 +34,25 @@ pub const BURN_ATTESTATION_GATE_HEIGHT: u64 = 0;
 /// follow-up (make vrf_pk_ co-resident with srtr_ first), not a reason to delay the burn-binding defence.
 pub const REGISTRY_ROOT_GATE_HEIGHT: u64 = 0;
 
+// The recent-Heartbeat recency rule (prev = cur-1 spans the epoch boundary, the flicker fix) is a
+// GENESIS rule — no gate — because it is ALREADY the deployed live-net behavior (a mixed-version net
+// stays in agreement without a coordinated flip).
+
+/// Coordinated activation for the light-reward roster cutoff (`light_reg_epoch_roster`), gated on
+/// epoch_start. At/after: roster freezes at the commit-window open (epoch_start + 14400 - 50), so a
+/// light node registered mid-epoch earns for that epoch. BELOW: legacy epoch_start — byte-exact to the
+/// DEPLOYED binary, so a ROLLING upgrade of the live chain agrees on the light bitmap/reward_root until
+/// the flip. Set to a FUTURE epoch boundary ahead of the current tip; deploy the new binary to ALL nodes
+/// before it, then every node flips together. 115200 = epoch 8 (tip was ~92k). For a FRESH genesis, 0.
+pub const LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT: u64 = 115_200;
+
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
 /// without on-chain governance. Genesis-active rules need no entry (the default is active);
 /// only rules that must stay dormant until a coordinated height are listed.
 const ACTIVATIONS: &[(&str, u64)] = &[
     ("burn_attestation_required", BURN_ATTESTATION_GATE_HEIGHT),
     ("registry_root_required", REGISTRY_ROOT_GATE_HEIGHT),
+    ("light_reg_epoch_roster", LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached
@@ -92,5 +105,17 @@ mod tests {
         // No upper bound — the rule stays active at every block height (this is a HEIGHT, not any
         // registration cap; the network has no limit on the number of registrations).
         assert!(super::is_active("burn_attestation_required", u64::MAX), "active at the highest possible height");
+    }
+
+    #[test]
+    fn light_reg_epoch_roster_gate_activation() {
+        // Gated on epoch_start; 115200 = epoch 8. Epochs 0-7 dormant (legacy epoch_start cutoff, byte-
+        // exact to the deployed binary for rolling safety), epoch 8+ active (commit-window cutoff).
+        assert_eq!(super::LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT, 115_200);
+        assert!(!super::is_active("light_reg_epoch_roster", 7 * 14_400), "epoch 7 dormant (100800 < 115200)");
+        assert!(super::is_active("light_reg_epoch_roster", 8 * 14_400), "epoch 8 active (115200)");
+        assert!(super::is_active("light_reg_epoch_roster", u64::MAX), "active above");
+        // recency_span_epoch is NOT gated (genesis rule = deployed behavior) ⇒ unlisted ⇒ always active.
+        assert!(super::is_active("recency_span_epoch", 0), "recency is genesis-active (matches deployed HEAD)");
     }
 }

@@ -5439,16 +5439,27 @@ export class WalletManager {
     if (burnAmount) payload.burn_amount = burnAmount;
     if (burnWallet) payload.burn_wallet = burnWallet;
 
-    // Optionally add Dilithium3 signature for post-quantum security
-    if (dilithiumKeys) {
-      try {
-        const { signWithDilithium } = require('../crypto/DilithiumCrypto');
-        const dilSig = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
-        if (dilSig) {
-          payload.dilithium_signature = dilSig;
-          payload.dilithium_public_key = dilithiumKeys.publicKey;
-        }
-      } catch (_) { /* Dilithium is optional on the TX submission path */ }
+    // MANDATORY: the Dilithium public key is this node's IMMUTABLE on-chain attestation root — the node
+    // verifies every liveness attestation (ping delegation cert) against it. Without it the node can
+    // never attest, so fail hard rather than silently registering an un-attestable node.
+    if (!dilithiumKeys) throw new Error('Dilithium keypair required (on-chain attestation root)');
+    {
+      const { signWithDilithium } = require('../crypto/DilithiumCrypto');
+      const dilSig = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
+      if (!dilSig) throw new Error('Dilithium proof-of-possession signature failed');
+      payload.dilithium_signature = dilSig;
+      payload.dilithium_public_key = dilithiumKeys.publicKey;
+    }
+
+    // Proof-of-ownership of the burning Solana wallet: sign with the Solana key, node verifies against
+    // burn_wallet. Binds THIS on-chain registration (which commits the immutable attestation root) to the
+    // wallet owner — stops an attacker front-running our first registration with our public burn_tx.
+    {
+      const solSecret = walletData.secretKey instanceof Uint8Array
+        ? walletData.secretKey : new Uint8Array(walletData.secretKey);
+      const ownerMsg = `qnet_onchain_reg:${nodeId}:${walletAddress}:${registrationProof}:${timestamp}`;
+      const ownerSig = nacl.sign.detached(Buffer.from(ownerMsg, 'utf8'), solSecret);
+      payload.owner_signature = Buffer.from(ownerSig).toString('hex');
     }
 
     // Get producer endpoint and submit
@@ -6148,7 +6159,7 @@ export class WalletManager {
       // v2.101: Use Math.round() to avoid floating point precision loss
       // Example: Math.floor(0.1 * 1e9) = 99999999, but Math.round() = 100000000
       const amountSmallest = Math.round(amount * 1_000_000_000); // Convert QNC to smallest unit (9 decimals)
-      const gasPrice = 1;
+      const gasPrice = 10; // nanoQNC/gas — matches node MIN_GAS_PRICE (fee = 10 * 10000 = 0.0001 QNC/transfer)
       const gasLimit = 10_000;
       
       // Get public key for verification (32 bytes hex)

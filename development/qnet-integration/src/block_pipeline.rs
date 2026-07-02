@@ -2677,6 +2677,11 @@ impl BlockPipeline {
                             let _ = ctx.storage.committed_burn_wallet_put(burn_tx, wallet_address);
                         }
                     }
+                    // Heartbeat liveness index (lhb_): Phase-2A recency reads this instead of a
+                    // 2-subwindow body scan. Mirrored by the producer's inline pre-save write.
+                    if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, .. } = &tx.tx_type {
+                        let _ = ctx.storage.index_heartbeat_inclusion(node_id, *anchor_height, height);
+                    }
                 }
 
                 // Materialise this block's node_registry entries (node_/srtr_/lrtr_ + the registry_root

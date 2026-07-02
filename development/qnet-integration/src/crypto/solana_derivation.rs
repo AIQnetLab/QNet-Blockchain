@@ -313,6 +313,41 @@ pub fn derive_qnet_address_from_mnemonic(mnemonic: &str) -> Result<String, Strin
 }
 
 // =========================================================================
+// QNet EON address derivation (must byte-match the mobile WalletManager.js)
+// =========================================================================
+
+/// Shared EON body+checksum format: 19 + "eon" + 15 + 8-hex SHA3-256 checksum (45 chars total).
+fn format_eon_from_sha512_hex(full_hash: &str) -> String {
+    use sha3::{Sha3_256, Digest as Sha3Digest};
+    let part1 = full_hash[..19].to_lowercase();
+    let part2 = full_hash[19..34].to_lowercase();
+    let body = format!("{}eon{}", part1, part2);
+    let mut h = Sha3_256::new();
+    h.update(body.as_bytes());
+    let checksum = hex::encode(&h.finalize()[..4]);
+    format!("{}eon{}{}", part1, part2, checksum)
+}
+
+/// Native QNet EON from the account's Ed25519 public key (hex): SHA512(pubkey_bytes) → EON.
+/// Mirrors mobile `generateQNetAddress`. Returns None on bad hex.
+pub fn eon_from_qnet_pubkey(pubkey_hex: &str) -> Option<String> {
+    use sha2::{Sha512, Digest as Sha2Digest};
+    let pk = hex::decode(pubkey_hex).ok()?;
+    let mut h = Sha512::new();
+    h.update(&pk);
+    Some(format_eon_from_sha512_hex(&hex::encode(h.finalize())))
+}
+
+/// Solana-imported QNet EON: SHA512(solana_address_str + "qnet-eon-bridge") → EON.
+/// Mirrors mobile `generateQNetAddressFromSolana`.
+pub fn eon_from_solana_address(solana_address: &str) -> String {
+    use sha2::{Sha512, Digest as Sha2Digest};
+    let mut h = Sha512::new();
+    h.update(format!("{}qnet-eon-bridge", solana_address).as_bytes());
+    format_eon_from_sha512_hex(&hex::encode(h.finalize()))
+}
+
+// =========================================================================
 // Tests
 // =========================================================================
 
@@ -341,6 +376,31 @@ mod tests {
     fn test_empty_mnemonic_fails() {
         assert!(derive_solana_address_from_mnemonic("").is_err());
         assert!(derive_solana_address_from_mnemonic("  ").is_err());
+    }
+
+    // EON derivations must byte-match the mobile app (WalletManager.js generateQNetAddress /
+    // generateQNetAddressFromSolana); a drift silently rejects EVERY legit light registration at
+    // submit check #3. Locks format, determinism, and the two derivations being distinct.
+    #[test]
+    fn test_eon_derivations() {
+        // Native: SHA512(pubkey_bytes) → EON. Mirrors the tested derive_qnet_address_from_mnemonic
+        // format code (part1[..19] + "eon" + part2[19..34] + sha3_256 checksum[..8] = 45 chars).
+        let pk = "aa".repeat(32); // 32-byte pubkey hex
+        let native = eon_from_qnet_pubkey(&pk).expect("valid hex");
+        assert_eq!(native.len(), 45, "EON is 45 chars");
+        assert_eq!(&native[19..22], "eon", "eon marker at position 19");
+        assert_eq!(eon_from_qnet_pubkey(&pk).as_deref(), Some(native.as_str()), "deterministic");
+        assert!(eon_from_qnet_pubkey("zz").is_none(), "bad hex → None");
+
+        // Solana: SHA512(addr + "qnet-eon-bridge") → EON.
+        let sol = eon_from_solana_address("So1anaAddr11111111111111111111111111111111");
+        assert_eq!(sol.len(), 45);
+        assert_eq!(&sol[19..22], "eon");
+        assert_eq!(eon_from_solana_address("So1anaAddr11111111111111111111111111111111"), sol, "deterministic");
+
+        // Distinct inputs / distinct domains ⇒ distinct EONs (no cross-domain collision).
+        assert_ne!(native, sol);
+        assert_ne!(sol, eon_from_solana_address("DifferentSolanaAddr2222222222222222222222222"));
     }
 
     #[test]

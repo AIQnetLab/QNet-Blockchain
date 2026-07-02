@@ -320,6 +320,14 @@ impl ApiRateLimiter {
             block_duration: 3600,
         });
 
+        // Attestation is once/epoch (dedup) but wakeups + retries can burst; per-IP bound so a spammer
+        // can't force unpriced storage reads + Dilithium verifies at 10M-node scale.
+        configs.insert("light_node_ping".to_string(), RateLimitConfig {
+            max_requests: 6,
+            window_seconds: 60,
+            block_duration: 300,
+        });
+
         configs.insert("light_node_token_refresh".to_string(), RateLimitConfig {
             max_requests: 2,
             window_seconds: 3600,
@@ -827,6 +835,13 @@ struct NodeRegistrationClientRequest {
     /// Solana address that performed the burn (committee verifies the on-chain burn against it).
     #[serde(default)]
     burn_wallet: Option<String>,
+    /// Proof-of-ownership: Solana-key signature over
+    /// "qnet_onchain_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}", verified against
+    /// `burn_wallet`. Binds the on-chain registration (which commits the node's IMMUTABLE Dilithium
+    /// attestation root) to the wallet that actually burned — so an attacker cannot front-run a
+    /// victim's first registration with the victim's public burn_tx and plant an attacker-owned key.
+    #[serde(default)]
+    owner_signature: Option<String>,
 }
 
 /// Query parameters for transaction history API
@@ -1714,6 +1729,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_ping_response);
 
@@ -1724,6 +1740,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and(warp::body::content_length_limit(16 * 1024)) // 16KB max
         .and(warp::body::json::<HashMap<String, String>>())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_ping_response);
 
@@ -2890,7 +2907,7 @@ async fn tx_submit(
         message: "Missing or invalid amount (must be unsigned integer)".to_string(),
     })?;
     
-    let gas_price = params["gas_price"].as_u64().unwrap_or(1);
+    let gas_price = params["gas_price"].as_u64().unwrap_or(qnet_state::transaction::MIN_GAS_PRICE); // floor default (was 1 ⇒ rejected)
     let gas_limit = params["gas_limit"].as_u64().unwrap_or(10_000); // QNet TRANSFER gas limit
     
     // PRODUCTION: Require signature for all transactions
@@ -3231,7 +3248,7 @@ async fn mempool_submit(
             to: Some(to.to_string()),
             amount,
             nonce,
-            gas_price: 1,
+            gas_price: qnet_state::transaction::MIN_GAS_PRICE, // at/above the fee floor (was 1 ⇒ rejected)
             gas_limit: 10_000, // QNet TRANSFER gas limit
             timestamp,
             signature: Some(signature.to_string()), // PRODUCTION: Required signature
@@ -5671,13 +5688,16 @@ async fn handle_gas_recommendations(
     let mempool_size = blockchain.get_mempool_size().await.unwrap_or(0);
     let current_height = blockchain.get_height().await;
     
-    // Calculate dynamic gas prices based on network congestion
+    // Per-gas-unit prices (nanoQNC/gas), rooted in the single-source floor so a mobile transfer
+    // (gas_limits::TRANSFER) at the eco tier costs exactly BASE_FEE_NANO_QNC = 0.0001 QNC. Congestion
+    // scales the multiple; the previous 50_000–250_000 values were the old total-fee-as-per-unit bug.
+    let floor = qnet_state::transaction::MIN_GAS_PRICE;
     let base_fee = match mempool_size {
-        0..=10 => 50_000,    // Very low traffic
-        11..=50 => 75_000,   // Low traffic
-        51..=100 => 100_000, // Normal traffic
-        101..=200 => 150_000, // High traffic
-        _ => 250_000,        // Very high traffic
+        0..=10 => floor,            // Very low traffic
+        11..=50 => floor * 3 / 2,   // Low traffic
+        51..=100 => floor * 2,      // Normal traffic
+        101..=200 => floor * 3,     // High traffic
+        _ => floor * 5,             // Very high traffic
     };
     
     let network_load = match mempool_size {
@@ -5711,22 +5731,22 @@ async fn handle_gas_recommendations(
             "eco": {
                 "gas_price": eco_price,
                 "estimated_time": eco_time,
-                "cost_qnc": (eco_price as f64 * 21_000.0) / 1_000_000_000.0 // Convert nanoQNC to QNC
+                "cost_qnc": (eco_price as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0 // nanoQNC → QNC
             },
             "standard": {
                 "gas_price": standard_price,
                 "estimated_time": standard_time,
-                "cost_qnc": (standard_price as f64 * 21_000.0) / 1_000_000_000.0
+                "cost_qnc": (standard_price as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0
             },
             "fast": {
                 "gas_price": fast_price,
                 "estimated_time": fast_time,
-                "cost_qnc": (fast_price as f64 * 21_000.0) / 1_000_000_000.0
+                "cost_qnc": (fast_price as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0
             },
             "priority": {
                 "gas_price": priority_price,
                 "estimated_time": priority_time,
-                "cost_qnc": (priority_price as f64 * 21_000.0) / 1_000_000_000.0
+                "cost_qnc": (priority_price as f64 * qnet_state::transaction::gas_limits::TRANSFER as f64) / 1_000_000_000.0
             }
         },
         "network_load": network_load,
@@ -6092,9 +6112,24 @@ async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: 
             return false;
         }
 
-        // Step 1: Verify delegation cert (wallet Dilithium3 authorized the ping key)
+        // Step 1: Verify delegation cert against the IMMUTABLE ON-CHAIN key, not the RAM registry's
+        // `quantum_pk` (which is set purely by gossip and is poisonable). load_vrf_public_key returns the
+        // Dilithium key committed by the node's own on-chain NodeRegistration (single-shot, ownership-
+        // gated at submit), so an attacker who poisons the RAM registry cannot forge this node's
+        // attestation. Fail-closed if the node has no on-chain key yet (not registered / TX not applied).
+        let onchain_pk_hex = match blockchain.get_storage().load_vrf_public_key(node_id) {
+            Ok(Some(bytes)) => hex::encode(bytes),
+            _ => {
+                if crate::node::is_warn() { println!("[WARN][LIGHT] no_onchain_key node={}", node_id); }
+                return false;
+            }
+        };
+        if !quantum_pk.is_empty() && quantum_pk != onchain_pk_hex {
+            if crate::node::is_warn() { println!("[WARN][LIGHT] ram_key_mismatch_onchain node={}", node_id); }
+            return false;
+        }
         let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, node_id);
-        let delegation_ok = verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &quantum_pk);
+        let delegation_ok = verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &onchain_pk_hex);
         if !delegation_ok {
             if crate::node::is_warn() {
                 println!("[WARN][LIGHT] ping_delegation_cert_invalid node={}", node_id);
@@ -6118,123 +6153,15 @@ async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: 
         };
     }
 
-    // LEGACY: Ed25519 ping key (v7.0 clients, will be removed after migration)
-    if signature.starts_with("ping_ed25519:") {
-        let sig_hex = &signature[13..];
-
-        let (ping_pk_hex, delegation_cert, quantum_pk) = if let Some(p2p) = blockchain.get_unified_p2p() {
-            let registry = p2p.get_light_node_registry();
-            if let Some(node) = registry.get(node_id) {
-                (node.ping_pubkey.clone(), node.ping_delegation_cert.clone(), node.quantum_pubkey.clone())
-            } else { return false; }
-        } else { return false; };
-
-        if ping_pk_hex.is_empty() || delegation_cert.is_empty() { return false; }
-
-        let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, node_id);
-        if !verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &quantum_pk) { return false; }
-
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
-            let pk_bytes: [u8; 32] = hex::decode(&ping_pk_hex)?.try_into().map_err(|_| "pk len")?;
-            let sig_bytes: [u8; 64] = hex::decode(sig_hex)?.try_into().map_err(|_| "sig len")?;
-            let vk = VerifyingKey::from_bytes(&pk_bytes)?;
-            let sig = Signature::from_bytes(&sig_bytes);
-            Ok(vk.verify(challenge.as_bytes(), &sig).is_ok())
-        })();
-
-        return result.unwrap_or(false);
+    // Legacy `ping_ed25519:` (RAM-rooted, poisonable) and `light_hybrid_pending:` (key derived FROM
+    // node_id ⇒ trivially forgeable) fallbacks were REMOVED: on a fresh chain every client signs
+    // `ping_dilithium:` (or `compact_bin:`), rooted in the immutable on-chain key above. Anything else
+    // is rejected — no un-rooted attestation path survives.
+    if crate::node::is_warn() {
+        println!("[WARN][LIGHT] unknown_sig_format prefix={} node={}",
+                 &signature[..20.min(signature.len())], node_id);
     }
-
-    // FALLBACK: Accept Ed25519-only during mobile migration period
-    // Format: "light_hybrid_pending:<hex>" - temporary until Dilithium library added
-    if signature.starts_with("light_hybrid_pending:") {
-        let sig_hex = &signature[21..]; // Skip "light_hybrid_pending:" prefix
-        
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        
-        // Decode signature (64 bytes)
-        let sig_bytes = match hex::decode(sig_hex) {
-            Ok(bytes) if bytes.len() == 64 => bytes,
-            Ok(bytes) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] ed25519_invalid_len len={} node={}", bytes.len(), node_id);
-                }
-                return false;
-            }
-            Err(e) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] ed25519_decode_failed err={} node={}", e, node_id);
-                }
-                return false;
-            }
-        };
-        
-        let signature_obj = match Signature::from_slice(&sig_bytes) {
-            Ok(sig) => sig,
-            Err(e) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] ed25519_parse_failed err={} node={}", e, node_id);
-                }
-                return false;
-            }
-        };
-        
-        // Get public key from node_id (Light nodes use their wallet address as node_id)
-        let wallet_address = if node_id.starts_with("light_") {
-            &node_id[6..]
-        } else {
-            node_id
-        };
-        
-        // Decode public key from wallet address (first 32 bytes)
-        let pubkey_bytes = match hex::decode(wallet_address) {
-            Ok(bytes) if bytes.len() >= 32 => bytes[..32].to_vec(),
-            Ok(bytes) if bytes.len() == 32 => bytes,
-            _ => {
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] pubkey_decode_failed node={}", node_id);
-                }
-                return false;
-            }
-        };
-        
-        let verifying_key = match VerifyingKey::from_bytes(&pubkey_bytes.try_into().unwrap_or([0u8; 32])) {
-            Ok(key) => key,
-            Err(e) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] pubkey_parse_failed err={} node={}", e, node_id);
-                }
-                return false;
-            }
-        };
-        
-        // Verify signature against challenge
-        match verifying_key.verify(challenge.as_bytes(), &signature_obj) {
-            Ok(_) => {
-                if crate::node::is_info() {
-                    println!("[INFO][LIGHT] ed25519_verified_fallback node={}", node_id);
-                }
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] fallback_mode action=upgrade_to_hybrid node={}", node_id);
-                }
-                true
-            }
-            Err(e) => {
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] ed25519_verify_failed err={} node={}", e, node_id);
-                }
-                false
-            }
-        }
-    } else {
-        // Unknown signature format
-        if crate::node::is_warn() {
-            println!("[WARN][LIGHT] unknown_sig_format prefix={} expected=compact_bin node={}", 
-                     &signature[..20.min(signature.len())], node_id);
-        }
-        false
-    }
+    false
 }
 
 // Generate quantum-resistant challenge
@@ -7697,18 +7624,57 @@ async fn handle_adaptive_bft_timeouts(remote_addr: Option<std::net::SocketAddr>,
 
 async fn handle_light_node_ping_response(
     params: HashMap<String, String>,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
     use crate::unified_p2p::{SimplifiedP2P, LightNodeAttestation};
-    
+
+    // Per-IP rate limit BEFORE any storage read / crypto verify (unpriced-work DoS bound at scale).
+    if let Err(rate_limited) = check_api_rate_limit(remote_addr, "light_node_ping") {
+        return Ok(rate_limited);
+    }
+
     let node_id = params.get("node_id").unwrap_or(&"unknown".to_string()).clone();
     let signature = params.get("signature").unwrap_or(&"".to_string()).clone();
     let challenge = params.get("challenge").unwrap_or(&"".to_string()).clone();
 
-    // SECURITY (G2): the challenge MUST be one THIS server stamped for THIS node and unexpired —
-    // closes self-attestation (a light node inventing its own challenge to fake liveness/rewards).
-    if !verify_challenge_stamp(&node_id, &challenge) {
+    // Cheap structural reject before the anchor storage read + Dilithium verify.
+    if !node_id.starts_with("light_") || signature.is_empty() || challenge.is_empty() {
+        return Ok(warp::reply::json(&json!({ "success": false, "error": "malformed ping-response" })));
+    }
+
+    // Two accepted challenge forms:
+    // 1. Server stamp (push path, G2): must be one THIS server stamped for THIS node, unexpired.
+    // 2. PULL self-attestation: "selfattest:{height}:{block_hash}" — a same-epoch canonical block
+    //    hash, unknowable before that block exists, so it proves the device is online THIS epoch
+    //    with the same strength as a stamped challenge but with no FCM delivery dependency.
+    //    (FCM stays as a best-effort wakeup; liveness no longer depends on it at scale.)
+    if let Some(rest) = challenge.strip_prefix("selfattest:") {
+        let parsed = (|| {
+            let (h_str, hash) = rest.split_once(':')?;
+            let h: u64 = h_str.parse().ok()?;
+            if hash.is_empty() || hash.contains(':') { return None; }
+            Some((h, hash))
+        })();
+        let tip = blockchain.get_height().await;
+        let valid = match parsed {
+            Some((h, hash)) if h <= tip && h / 14400 == tip / 14400 => {
+                blockchain.get_storage().get_microblock_hash_hex(h).ok().flatten()
+                    .map(|canon| canon == hash).unwrap_or(false)
+            }
+            _ => false,
+        };
+        if !valid {
+            if crate::node::is_warn() {
+                println!("[WARN][LIGHT] selfattest_anchor_invalid node={}", node_id);
+            }
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Invalid or stale self-attest anchor"
+            })));
+        }
+    } else if !verify_challenge_stamp(&node_id, &challenge) {
         if crate::node::is_warn() {
             println!("[WARN][LIGHT] challenge_unrecognized node={}", node_id);
         }
@@ -7718,25 +7684,17 @@ async fn handle_light_node_ping_response(
         })));
     }
 
-    // PRODUCTION v2.78: Verify Light node HYBRID signature (Ed25519+Dilithium)
-    let signature_valid = verify_light_node_signature(&node_id, &challenge, &signature, &blockchain).await;
-    
-    if !signature_valid {
-        println!("[LIGHT] ❌ Invalid signature from Light node {}", node_id);
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Invalid quantum signature"
-        })));
-    }
-    
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let current_slot = SimplifiedP2P::get_current_slot();
     let our_node_id = blockchain.get_node_id();
-    
-    // Check if attestation already exists for this slot (prevent duplicates)
+
+    // Dedup per EPOCH (the reward unit is one attestation per epoch, not per slot) — BEFORE the
+    // Dilithium verify so repeat submissions cost no crypto at scale.
     if let Some(p2p) = blockchain.get_unified_p2p() {
-        if p2p.has_attestation(&node_id, current_slot) {
-            println!("[LIGHT] ⚠️ Attestation already exists for {} in slot {}", node_id, current_slot);
+        if p2p.has_attestation_in_window(&node_id) {
+            if crate::node::is_debug() {
+                println!("[DBG][LIGHT] already_attested_epoch node={}", node_id);
+            }
             return Ok(warp::reply::json(&json!({
                 "success": true,
                 "node_id": node_id,
@@ -7744,6 +7702,17 @@ async fn handle_light_node_ping_response(
                 "timestamp": now
             })));
         }
+    }
+
+    // PRODUCTION v2.78: Verify Light node HYBRID signature (Ed25519+Dilithium)
+    let signature_valid = verify_light_node_signature(&node_id, &challenge, &signature, &blockchain).await;
+
+    if !signature_valid {
+        println!("[LIGHT] ❌ Invalid signature from Light node {}", node_id);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid quantum signature"
+        })));
     }
     
     // Create and gossip attestation
@@ -13239,6 +13208,72 @@ async fn handle_node_registration_client_submit(
         })));
     }
 
+    // SECURITY check #1: node_id MUST be the wallet-derived pseudonym. node_id keys the on-chain
+    // registry + the light-reward roster + the attestation-key commitment, so an unbound node_id would
+    // let anyone register an arbitrary id for a wallet. The region prefix is a cosmetic privacy label
+    // (per-node QNET_REGION), so we bind only the wallet-hash suffix — region-agnostic, deterministic.
+    {
+        let expected_suffix = blake3::hash(
+            format!("LIGHT_NODE_PRIVACY_{}", req.wallet_address).as_bytes()
+        ).to_hex();
+        let suffix_ok = req.node_id.starts_with("light_")
+            && req.node_id.rsplit('_').next() == Some(&expected_suffix[..8]);
+        if !suffix_ok {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "node_id is not the wallet-derived pseudonym"
+            })));
+        }
+    }
+
+    // SECURITY check #2: proof-of-ownership of the burning Solana wallet. Every light node backs its
+    // registration with a Solana 1DEV burn, so control of `burn_wallet` is the universal proof the
+    // submitter is the real owner (works for native AND Solana-imported QNet wallets). Without this an
+    // attacker could front-run a victim's first registration using the victim's PUBLIC burn_tx and
+    // commit an attacker-owned Dilithium key as the victim's immutable attestation root.
+    match (req.burn_wallet.as_deref().filter(|s| !s.is_empty()), req.owner_signature.as_deref()) {
+        (Some(solana_wallet), Some(owner_sig)) if !owner_sig.is_empty() => {
+            let owner_msg = format!("qnet_onchain_reg:{}:{}:{}:{}",
+                req.node_id, req.wallet_address, req.registration_proof, req.timestamp);
+            match crate::crypto::solana_derivation::verify_ed25519_signature(
+                owner_msg.as_bytes(), owner_sig, solana_wallet
+            ) {
+                Ok(true) => {}
+                _ => {
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "owner_signature invalid — not the burning wallet's owner"
+                    })));
+                }
+            }
+        }
+        _ => {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "burn_wallet + owner_signature required (proof of wallet ownership)"
+            })));
+        }
+    }
+
+    // SECURITY check #3: wallet_address (which DETERMINES node_id) must be DERIVED from a credential the
+    // submitter provably controls — either the Ed25519 public_key (native wallet; control proven by the
+    // client_node_reg signature verified below) or burn_wallet (Solana-imported; control proven by
+    // owner_signature above). Closes node_id squatting: without it an attacker could set wallet_address =
+    // a victim's PUBLIC EON, prove control of their OWN burn_wallet, and register the victim's node_id.
+    {
+        let from_pubkey = crate::crypto::solana_derivation::eon_from_qnet_pubkey(&req.public_key);
+        let from_solana = req.burn_wallet.as_deref()
+            .map(crate::crypto::solana_derivation::eon_from_solana_address);
+        let bound = from_pubkey.as_deref() == Some(req.wallet_address.as_str())
+            || from_solana.as_deref() == Some(req.wallet_address.as_str());
+        if !bound {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "wallet_address not derived from public_key or burn_wallet (ownership unproven)"
+            })));
+        }
+    }
+
     // Reject stale requests: timestamp must be within 5 minutes
     {
         let now = std::time::SystemTime::now()
@@ -14678,10 +14713,11 @@ async fn handle_contract_estimate_gas(
     
     let estimated_gas = base_gas + (code_size as u64 * per_byte_gas) + (args_size as u64 * 5);
     
-    // Get current gas prices
-    let min_gas_price = 100000u64; // 0.0001 QNC
-    let recommended_gas_price = 150000u64;
-    let fast_gas_price = 250000u64;
+    // Per-gas-unit prices (nanoQNC/gas), rooted in the single-source floor. slow == MIN_GAS_PRICE
+    // ⇒ a standard transfer (10k gas) costs 0.0001 QNC; standard/fast add priority headroom.
+    let min_gas_price = qnet_state::transaction::MIN_GAS_PRICE; // 10
+    let recommended_gas_price = min_gas_price + min_gas_price / 2; // 15 (1.5×)
+    let fast_gas_price = min_gas_price * 5 / 2; // 25 (2.5×)
     
     Ok(warp::reply::json(&json!({
         "success": true,

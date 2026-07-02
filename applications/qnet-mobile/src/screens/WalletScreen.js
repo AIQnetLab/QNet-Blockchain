@@ -892,8 +892,6 @@ const WalletScreen = () => {
   const [nodeInitializing, setNodeInitializing] = useState(true); // True until first load cycle completes
   const [reactivatingNode, setReactivatingNode] = useState(false); // Reactivation in progress
   const [nodeActivating, setNodeActivating] = useState(false); // Node activation in progress
-  const [restoringNode, setRestoringNode] = useState(false); // Restore existing node in progress
-  const [restoreNodeError, setRestoreNodeError] = useState(''); // Error message from restore attempt
   const [unlockError, setUnlockError] = useState(''); // Error message for unlock screen
   const [biometricEnabled, setBiometricEnabled] = useState(false);
   const [biometricSupported, setBiometricSupported] = useState(false);
@@ -1465,81 +1463,6 @@ const WalletScreen = () => {
     }
   };
 
-  // Restore an existing node after wallet re-import.
-  // Derives the light node pseudonym from the wallet address and queries the network.
-  const restoreExistingNode = async () => {
-    if (!wallet || restoringNode) return;
-    setRestoringNode(true);
-    setRestoreNodeError('');
-    try {
-      const walletAddress = wallet.qnetAddress || wallet.address;
-      if (!walletAddress) {
-        setRestoreNodeError('No wallet address found.');
-        return;
-      }
-
-      // Derive pseudonym using the same formula as the server
-      const CryptoJS = require('crypto-js');
-      const hash = CryptoJS.SHA256(`LIGHT_NODE_PRIVACY_${walletAddress}`).toString();
-      const pseudonym = `light_mobile_${hash.substring(0, 8)}`;
-
-      // Query any bootstrap node for node status
-      const { getRandomBootstrapNodeAsync } = require('../services/PushService');
-      const apiUrl = await getRandomBootstrapNodeAsync();
-
-      const resp = await fetch(
-        `${apiUrl}/api/v1/light-node/status?node_id=${encodeURIComponent(pseudonym)}`,
-        { method: 'GET' }
-      );
-      const data = await resp.json();
-
-      if (!data.success) {
-        // Not found in P2P registry — double-check on-chain via verify-activation
-        const onChainResp = await fetch(
-          `${apiUrl}/api/v1/verify-activation?wallet_address=${encodeURIComponent(walletAddress)}`,
-          { method: 'GET' }
-        );
-        const onChain = await onChainResp.json();
-        if (!onChain.verified) {
-          setRestoreNodeError('No registered node found for this wallet on the network.');
-          return;
-        }
-        // On-chain found but not in P2P — still restore with on-chain data
-      }
-
-      // Restore local state
-      const restoreCode = `RESTORED_${pseudonym}`;
-      setActivationCode(restoreCode);
-      setActivatedNodeType('light');
-      setNodePseudonym(pseudonym);
-
-      // Persist so next launch restores automatically
-      await AsyncStorage.setItem('qnet_light_node_info', JSON.stringify({
-        nodeId: pseudonym,
-        walletAddress,
-        pushType: data.push_type || 'FCM',
-        nextPingTime: data.next_ping_time || 0,
-        nextPingWindow: data.next_ping_window || 0,
-      }));
-      await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
-        nodeType: 'light',
-        code: restoreCode,
-        pseudonym,
-        timestamp: Date.now(),
-        walletAddress,
-        restored: true,
-      }));
-      await AsyncStorage.setItem(`node_pseudonym_${restoreCode}`, pseudonym);
-
-      console.log('[Restore] Light node restored:', pseudonym);
-    } catch (err) {
-      console.warn('[Restore] Failed:', err.message);
-      setRestoreNodeError('Network error. Check your connection and try again.');
-    } finally {
-      setRestoringNode(false);
-    }
-  };
-  
   // Handle Light node reactivation ("I'm Back" button)
   const handleReactivateNode = async () => {
     if (reactivatingNode) return;
@@ -1937,10 +1860,10 @@ const WalletScreen = () => {
     setSendAmount(amount);
   };
   
-  // QNet transaction fee constants (matching blockchain)
-  const QNET_GAS_PRICE = 1; // nanoQNC
+  // QNet transaction fee constants (matching blockchain MIN_GAS_PRICE = BASE_FEE / TRANSFER_gas)
+  const QNET_GAS_PRICE = 10; // nanoQNC/gas
   const QNET_GAS_LIMIT = 10000; // for transfers
-  const QNET_TX_FEE = (QNET_GAS_PRICE * QNET_GAS_LIMIT) / 1_000_000_000; // 0.00001 QNC
+  const QNET_TX_FEE = (QNET_GAS_PRICE * QNET_GAS_LIMIT) / 1_000_000_000; // 0.0001 QNC
   
   // v3.34: Poll TX status until confirmed
   // ARCHITECTURE: Polling only updates UI status (confirming → confirmed)
@@ -2458,14 +2381,18 @@ const WalletScreen = () => {
   // v3.31: Initialize node discovery + WebSocket + TX history when wallet ready
   useEffect(() => {
     if (wallet?.qnetAddress) {
+      // Wallet switch: drop the previous wallet's history (incl. its pending TXs) immediately.
+      setTxHistory([]);
+      pendingTxRef.current = null;
+
       // Load cached nodes and trigger discovery for load balancing
       walletManager.loadNodesFromCache().then(() => {
         walletManager.refreshNodeDiscovery();
       });
-      
+
       // Connect WebSocket for real-time notifications
       connectWebSocket();
-      
+
       // Load TX history
       loadTxHistory();
       
@@ -3354,14 +3281,15 @@ const WalletScreen = () => {
           fee: (tx.fee || tx.gas_used || 0) / 1e9
         }));
         
-        // v3.35: MERGE with pending TXs instead of replacing
-        // Keep pending TXs that are NOT yet in the blockchain response
-        // This prevents pending TX from disappearing when user switches to History tab
+        // MERGE with pending TXs instead of replacing, but ONLY pending sent from THIS wallet —
+        // a pending TX from a previously opened wallet must never survive a wallet switch.
         setTxHistory(prev => {
           const confirmedHashes = new Set(formattedTxs.map(t => t.hash));
-          // Keep pending TXs whose hash is NOT in the confirmed set (still in mempool)
-          const stillPending = prev.filter(t => t.status === 'pending' && !confirmedHashes.has(t.hash));
-          // Pending TXs on top, then confirmed from blockchain
+          const stillPending = prev.filter(t =>
+            t.status === 'pending' &&
+            (t.from || '').toLowerCase() === myAddress &&
+            !confirmedHashes.has(t.hash)
+          );
           return [...stillPending, ...formattedTxs];
         });
       }
@@ -5554,7 +5482,7 @@ const WalletScreen = () => {
                 }}
               >
                 <Text style={[styles.buttonText, styles.secondaryButtonText]}>
-                  Recover My Code
+                  Recover Activation Code
                 </Text>
               </TouchableOpacity>
             )}
@@ -5648,13 +5576,13 @@ const WalletScreen = () => {
                         </Text>
                       </View>
                     </View>
-                    <View style={{ alignItems: 'flex-end' }}>
+                    <View style={{ alignItems: 'flex-end', flexShrink: 1, marginLeft: 8 }}>
                       <Text style={{ 
                         color: tx.type === 'send' ? '#ff4444' : '#00ff88', 
                         fontSize: 16, 
                         fontWeight: '600' 
-                      }}>
-                        {tx.type === 'send' ? '-' : '+'}{tx.amount.toLocaleString('en-US', { minimumFractionDigits: 5, maximumFractionDigits: 9 })} QNC
+                      }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
+                        {tx.amount === 0 ? '0' : `${tx.type === 'send' ? '-' : '+'}${tx.amount.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: Math.abs(tx.amount) >= 1 ? 4 : 8 })}`} QNC
                       </Text>
                       {tx.fee > 0 && (
                         <Text style={{ color: '#666', fontSize: 11 }}>
@@ -5759,35 +5687,6 @@ const WalletScreen = () => {
                       {copiedAddress === (wallet?.qnetAddress || wallet?.address) ? 'Copied!' : `Copy: ${(wallet?.qnetAddress || wallet?.address)?.substring(0, 20)}...`}
                     </Text>
                   </TouchableOpacity>
-                </View>
-
-                {/* Restore existing node after wallet re-import */}
-                <View style={{marginTop: 16, borderTopWidth: 1, borderTopColor: '#1a1a2e', paddingTop: 14}}>
-                  <Text style={[styles.nodeMonitoringLabel, {fontSize: 12, color: '#888', marginBottom: 10}]}>
-                    Already activated a node with this wallet?
-                  </Text>
-                  <TouchableOpacity
-                    onPress={restoreExistingNode}
-                    disabled={restoringNode}
-                    style={{
-                      backgroundColor: restoringNode ? '#1a1a2e' : '#0a2a3a',
-                      borderWidth: 1,
-                      borderColor: '#00d4ff55',
-                      borderRadius: 8,
-                      paddingVertical: 10,
-                      paddingHorizontal: 14,
-                      alignItems: 'center',
-                    }}
-                  >
-                    <Text style={{color: restoringNode ? '#555' : '#00d4ff', fontSize: 13, fontWeight: '600'}}>
-                      {restoringNode ? 'Searching...' : 'I already have a node'}
-                    </Text>
-                  </TouchableOpacity>
-                  {restoreNodeError ? (
-                    <Text style={{color: '#ff6b6b', fontSize: 12, marginTop: 8, textAlign: 'center'}}>
-                      {restoreNodeError}
-                    </Text>
-                  ) : null}
                 </View>
               </View>
             )}

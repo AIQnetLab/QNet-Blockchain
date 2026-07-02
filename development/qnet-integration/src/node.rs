@@ -912,16 +912,46 @@ pub fn window_content_from_accum(mb_idx: u64) -> Option<(Vec<[u8; 32]>, Vec<[u8;
 /// recency) and that was included in a block at-or-below scan_end. A pure function of the canonical chain
 /// ≤ scan_end ⇒ identical on every committee member, with NO live-tip dependence. Scans ≤2 subwindows
 /// (~2880 blocks), off the production path; bodies are retained 6 epochs, far beyond this window.
-/// (current, previous) GLOBAL subwindow indices (anchor/1440) for `scan_end`; prev = cur-1 SPANS the
-/// epoch boundary — a Heartbeat from the prior epoch's last subwindow is still recent liveness. The old
-/// per-epoch reset (prev=cur at subwindow 0) ejected the whole non-genesis eligible set for the first
-/// subwindow of every epoch (the eligibility flicker at scale). Pure fn of scan_end ⇒ deterministic.
+/// (current, previous) GLOBAL subwindow indices (anchor/1440) for `scan_end`. prev = cur-1 SPANS the
+/// epoch boundary: a Heartbeat from the prior epoch's last subwindow is still recent liveness. This is
+/// the flicker fix — the earlier per-epoch reset (prev=cur at each epoch's first subwindow) ejected the
+/// whole non-genesis eligible set every epoch start. Pure fn of scan_end (the deterministic N-2 boundary,
+/// identical on every committee member — NOT the live tip), so it never diverges. The set feeds
+/// epoch_commitment→QC, so this MUST be a genesis rule, identical on every node. Pure ⇒ deterministic.
 fn recency_subwindow_indices(scan_end: u64) -> (u64, u64) {
     let cur_idx = scan_end / 1440;
     (cur_idx, cur_idx.saturating_sub(1))
 }
 
+/// Deterministic light-reward roster cutoff (`before_height`) for `epoch`. Gated by
+/// `light_reg_epoch_roster` (a coordinated live-net rollout, gated on epoch_start): at/after activation
+/// the roster freezes at the bitmap commit-window open (epoch_start + 14400 - 50), so a light node
+/// registered DURING the epoch (before its last 50 volatile blocks) is in the roster and earns for that
+/// epoch — including epoch 0, which an epoch_start=0 cutoff would leave permanently empty. BELOW
+/// activation: legacy epoch_start (byte-exact to the deployed binary, so a mixed-version net agrees on
+/// the light bitmap until the flip). The bitmap CREATOR and the reward READER use this identically;
+/// pure fn of the epoch ⇒ they never diverge. For a fresh genesis set the gate to 0. Pure ⇒ deterministic.
+fn light_roster_cutoff(epoch: u64) -> u64 {
+    let epoch_start = epoch.saturating_mul(14400);
+    if qnet_state::feature_gates::is_active("light_reg_epoch_roster", epoch_start) {
+        epoch_start + (14400 - 50)
+    } else {
+        epoch_start
+    }
+}
+
+/// Recent-Heartbeat liveness set for Phase-2A, read from the apply-time lhb_ index — O(recent supers),
+/// no block-body deserialization. Byte-identical to the body scan (`recent_heartbeat_senders_scan`,
+/// determinism-tested): the index is written on both apply paths and canonicalized at every height
+/// reset, so every node reads the same set for the same scan_end.
 fn recent_heartbeat_senders(storage: &crate::storage::Storage, scan_end: u64) -> std::collections::HashSet<String> {
+    let (cur_idx, prev_idx) = recency_subwindow_indices(scan_end);
+    storage.recent_heartbeat_senders_indexed(cur_idx, prev_idx, scan_end).unwrap_or_default()
+}
+
+/// Reference body scan (test oracle for the lhb_ index; not on any production path).
+#[cfg(test)]
+fn recent_heartbeat_senders_scan(storage: &crate::storage::Storage, scan_end: u64) -> std::collections::HashSet<String> {
     let (cur_idx, prev_idx) = recency_subwindow_indices(scan_end);
     let start = prev_idx.saturating_mul(1440);
     let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3361,24 +3391,27 @@ impl BlockchainNode {
 
         // LIGHT: recompute from on-chain eligibility bitmaps mapped through the deterministic
         // pre-epoch roster (sorted node_registry, NOT the RAM mirror) + the same linear 5-genesis
-        // sharding the producer used, so every node maps bits→nodes identically. O(1) macroblock.
-        if let Ok(roster) = storage.light_roster_sorted(ws) {
-            let total = roster.len();
+        // sharding the producer used, so every node maps bits→nodes identically. STREAMED: two
+        // lrtr_ walks (count, then positional bit-test) — memory O(eligible), never an O(roster)
+        // Vec on the emission path (at millions of light nodes that Vec was a multi-100MB spike).
+        {
+            let cutoff = light_roster_cutoff(epoch_num);
+            let mut total = 0usize;
+            let _ = storage.light_roster_for_each(cutoff, |_, _| { total += 1; });
             if total > 0 {
                 let per = (total + 4) / 5;
-                // Read the ≤5 genesis bitmaps from the apply-time index (epoch = window) — O(5)
-                // keys, not an O(14400)-block scan; identical content (last-in-window write wins).
                 let bitmaps = storage.load_light_bitmaps(epoch_num).unwrap_or_default();
-                for (gidx, bm) in bitmaps {
-                    let my_start = (gidx * per).min(total);
-                    let my_end = (my_start + per).min(total);
-                    for local_i in 0..(my_end - my_start) {
+                let mut pos = 0usize;
+                let _ = storage.light_roster_for_each(cutoff, |node_id, wallet| {
+                    let gidx = pos / per;
+                    let local_i = pos - gidx * per;
+                    if let Some(bm) = bitmaps.get(&gidx) {
                         if bm.get(local_i / 8).map(|b| b & (1 << (local_i % 8)) != 0).unwrap_or(false) {
-                            let (node_id, wallet) = &roster[my_start + local_i];
-                            if !wallet.is_empty() { eligible.push((node_id.clone(), wallet.clone())); }
+                            eligible.push((node_id.to_string(), wallet.to_string()));
                         }
                     }
-                }
+                    pos += 1;
+                });
             }
         }
 
@@ -7498,7 +7531,10 @@ impl BlockchainNode {
         
         let mempool_config = qnet_mempool::SimpleMempoolConfig {
             max_size: auto_mempool_size,
-            min_gas_price: 100_000, // SECURITY: 0.0001 QNC minimum — prevents near-free TX spam
+            // Per-gas-unit floor (single source of truth). MIN_GAS_PRICE * TRANSFER_gas = 0.0001 QNC min
+            // transfer fee. Was mistakenly set to 100_000 (a total-fee value used as a per-unit price ⇒
+            // 1 QNC min transfer, which silently dropped every user TX at admission).
+            min_gas_price: qnet_state::transaction::MIN_GAS_PRICE,
             max_per_sender: std::env::var("QNET_MAX_PER_SENDER")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -11156,7 +11192,6 @@ impl BlockchainNode {
                             
                             if let Some(ref p2p) = unified_p2p {
                                 // Get attestations for this epoch
-                                let epoch_start = current_epoch * EMISSION_BLOCK_INTERVAL;
                                 // Uncapped per-epoch attested set (union of received + gossiped pings);
                                 // not the 100k-capped attestation map, so the bitmap reflects all responders.
                                 let attested_light_ids = p2p.get_light_eligible_for_epoch(current_epoch);
@@ -11180,7 +11215,7 @@ impl BlockchainNode {
                                 // Deterministic pre-epoch roster (sorted node_registry, height-pinned),
                                 // NOT the RAM mirror, so the reward reader maps bits→nodes identically.
                                 let sorted_registry: Vec<String> = crate::node::try_get_storage()
-                                    .and_then(|s| s.light_roster_sorted(epoch_start).ok())
+                                    .and_then(|s| s.light_roster_sorted(light_roster_cutoff(current_epoch)).ok())
                                     .map(|r| r.into_iter().map(|(id, _)| id).collect())
                                     .unwrap_or_default();
                                 let total_light_nodes = sorted_registry.len() as u32;
@@ -16860,6 +16895,11 @@ impl BlockchainNode {
                     // the reward roster drop it, diverging from synced peers. Mirror of the peer-apply
                     // deferred consumer (block_pipeline.rs).
                     for tx in &txs {
+                        // Heartbeat liveness index (lhb_) — mirror of the peer-apply writer. Unconditional
+                        // per INCLUDED tx (the body scan it replaces reads the block body, not apply status).
+                        if let qnet_state::TransactionType::Heartbeat { node_id: hb_id, anchor_height: hb_anchor, .. } = &tx.tx_type {
+                            let _ = storage.index_heartbeat_inclusion(hb_id, *hb_anchor, next_block_height);
+                        }
                         // Only TXs whose state-apply SUCCEEDED (same gate the validator's deferred path uses).
                         if !applied_reg_hashes.contains(&tx.hash) { continue; }
                         match &tx.tx_type {
@@ -22812,8 +22852,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             );
         
         if !is_system_tx {
+            // Honest gas-floor rejection: return an ERROR the caller sees, instead of letting the
+            // mempool silently drop a below-floor TX while the RPC still reports success (which
+            // stranded user transfers as a permanent fake "Pending"). Mirrors the mempool floor so
+            // the two never disagree.
+            if tx.gas_price < qnet_state::transaction::MIN_GAS_PRICE {
+                return Err(QNetError::ValidationError(format!(
+                    "gas_price {} below minimum {} (0.0001 QNC/transfer floor)",
+                    tx.gas_price, qnet_state::transaction::MIN_GAS_PRICE
+                )));
+            }
+
             let state = self.state.read().await;
-            
+
             // Check nonce (only for user transactions)
             if let Some(account) = state.get_account(&tx.from) {
                 let expected_nonce = account.nonce + 1;
@@ -27608,23 +27659,118 @@ mod tests {
         assert!(!checkpoint_participation_allowed(false, 0, mb_end));      // syncing, no window → defer
     }
 
-    // Phase-2A recency window: current subwindow + the immediately previous GLOBAL subwindow. prev = cur-1
-    // SPANS the epoch boundary (prior epoch's subwindow 9 is still recent liveness); the old per-epoch reset
-    // (prev=cur at subwindow 0) ejected the whole non-genesis eligible set each epoch start (the flicker).
+    // Phase-2A recency window (genesis rule, no gate): prev = cur-1 SPANS the epoch boundary so the
+    // prior epoch's subwindow 9 is still recent liveness — the flicker fix. Feeds epoch_commitment→QC,
+    // so it MUST be identical on every node from block 0.
     #[test]
     fn recency_subwindow_indices_boundary() {
-        // Mid-epoch: previous = current-1.
-        assert_eq!(recency_subwindow_indices(5 * 1440), (5, 4));
+        assert_eq!(recency_subwindow_indices(5 * 1440), (5, 4));          // mid-epoch
         assert_eq!(recency_subwindow_indices(5 * 1440 + 100), (5, 4));
-        // h0: no previous ⇒ saturating to (0, 0).
-        assert_eq!(recency_subwindow_indices(0), (0, 0));
-        // Epoch boundary (subwindow 0): prev = cur-1 BRIDGES to the prior epoch's subwindow 9 (no flicker).
-        assert_eq!(recency_subwindow_indices(14400), (10, 9));
+        assert_eq!(recency_subwindow_indices(0), (0, 0));                 // h0 saturates
+        assert_eq!(recency_subwindow_indices(14400), (10, 9));           // epoch boundary bridges (no flicker)
         assert_eq!(recency_subwindow_indices(14400 + 50), (10, 9));
-        // Epoch1 subwindow 1: previous is subwindow 0 of the same epoch.
         assert_eq!(recency_subwindow_indices(14400 + 1440), (11, 10));
-        // Epoch2 boundary: bridges to epoch1 subwindow 9.
-        assert_eq!(recency_subwindow_indices(2 * 14400), (20, 19));
+        assert_eq!(recency_subwindow_indices(2 * 14400), (20, 19));      // epoch2 boundary bridges
+    }
+
+    // Light-reward roster cutoff, gated by light_reg_epoch_roster @ 115200 (epoch 8). Below the gate =
+    // legacy epoch_start (byte-exact to the deployed binary ⇒ mixed-version rolling agrees); at/after =
+    // commit-window open (epoch_start + 14350). Creator + reader use it identically.
+    #[test]
+    fn light_roster_cutoff_gate() {
+        // Dormant (epochs 0..7, epoch_start < 115200): legacy epoch_start.
+        assert_eq!(light_roster_cutoff(0), 0);
+        assert_eq!(light_roster_cutoff(7), 7 * 14_400);          // 100800 (< gate)
+        // Active (epoch 8+, epoch_start >= 115200): commit-window open.
+        assert_eq!(light_roster_cutoff(8), 8 * 14_400 + 14_350); // 129550
+    }
+
+    // lhb_ liveness index == body scan, byte-identical (Phase-2A eligibility feeds epoch_commitment;
+    // any index/scan divergence is a fork). Covers min-inclusion, reorg canonicalize, re-apply recovery.
+    #[test]
+    fn heartbeat_index_matches_body_scan() {
+        fn hb_tx(node_id: &str, anchor_height: u64) -> qnet_state::Transaction {
+            // Storage stores txs separately keyed by 64-hex hash — must be valid hex, unique per tx.
+            let uniq = node_id.bytes().fold(anchor_height, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
+            qnet_state::Transaction {
+                from: node_id.to_string(),
+                to: None,
+                amount: 0,
+                tx_type: qnet_state::TransactionType::Heartbeat {
+                    node_id: node_id.to_string(),
+                    anchor_height,
+                    anchor_hash: String::new(),
+                    signature: String::new(),
+                },
+                timestamp: 0,
+                hash: format!("{:064x}", uniq),
+                signature: None,
+                public_key: None,
+                gas_price: u64::MAX,
+                gas_limit: 0,
+                nonce: 1,
+                data: None,
+                dilithium_signature: None,
+                dilithium_public_key: Some(node_id.to_string()),
+                chain_id: 0,
+            }
+        }
+        fn put_block(storage: &crate::storage::Storage, height: u64, txs: Vec<qnet_state::Transaction>) {
+            let mb = qnet_state::MicroBlock {
+                height,
+                timestamp: 0,
+                transactions: txs,
+                producer: "genesis_node_001".to_string(),
+                signature: vec![0u8; 64],
+                merkle_root: [0u8; 32],
+                previous_hash: [0u8; 32],
+                poh_hash: vec![],
+                poh_count: 0,
+                vrf_output: None,
+                vrf_proof: None,
+                fees_collected: 0,
+                state_root: [0u8; 32],
+                timeout_round: 0,
+            };
+            let data = bincode::serialize(&mb).expect("serialize");
+            storage.save_microblock(height, &data).expect("save");
+        }
+        let _dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(_dir.path().to_str().unwrap()).expect("storage");
+
+        // (height, node, anchor): spans subwindows 0..2, incl. a REPEAT inclusion for (sw1, super_a).
+        let blocks: Vec<(u64, &str, u64)> = vec![
+            (100, "super_a", 50),      // sw0
+            (1500, "super_b", 1499),   // sw1
+            (1600, "super_a", 1450),   // sw1 first inclusion
+            (2000, "super_a", 1900),   // sw1 repeat — min must stay 1600
+            (2950, "super_c", 2890),   // sw2
+        ];
+        for (h, id, a) in &blocks {
+            put_block(&storage, *h, vec![hb_tx(id, *a)]);
+            storage.index_heartbeat_inclusion(id, *a, *h).expect("index"); // apply-path writer
+        }
+        for scan_end in [100u64, 1499, 1500, 1600, 1999, 2000, 2880, 2950, 3000] {
+            assert_eq!(recent_heartbeat_senders(&storage, scan_end),
+                       recent_heartbeat_senders_scan(&storage, scan_end),
+                       "index != scan at scan_end={}", scan_end);
+        }
+        // Min-inclusion survives the repeat: reader at 1999 must already see super_a via 1600.
+        assert!(recent_heartbeat_senders(&storage, 1999).contains("super_a"));
+
+        // Reorg to 1599: entries included above are dropped; index == scan at the new tip.
+        storage.canonicalize_heartbeat_index(1599).expect("canonicalize");
+        assert_eq!(recent_heartbeat_senders(&storage, 1599),
+                   recent_heartbeat_senders_scan(&storage, 1599), "post-reorg mismatch");
+        // Re-apply of the (same) fork tail restores full equality — writer is idempotent.
+        for (h, id, a) in blocks.iter().filter(|(h, _, _)| *h > 1599) {
+            storage.index_heartbeat_inclusion(id, *a, *h).expect("re-index");
+        }
+        for scan_end in [2000u64, 2950, 3000] {
+            assert_eq!(recent_heartbeat_senders(&storage, scan_end),
+                       recent_heartbeat_senders_scan(&storage, scan_end),
+                       "post-reapply index != scan at scan_end={}", scan_end);
+        }
     }
 
     // committee_for_height determinism: genesis era ⇒ None (caller uses the genesis committee), and

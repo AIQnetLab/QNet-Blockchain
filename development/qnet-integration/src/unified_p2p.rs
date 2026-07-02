@@ -27,9 +27,19 @@ use qnet_consensus::reputation::{NodeReputation, ReputationConfig, MaliciousBeha
 // PRODUCTION CONSTANTS: Capacity limits for scalability
 // ============================================================================
 
-/// Max Light nodes in RAM registry (LRU eviction when exceeded)
-/// 100K nodes × ~200 bytes = ~20MB RAM
+/// Max Light nodes in RAM registry (LRU eviction when exceeded). Role-dependent: genesis nodes
+/// ping + shard the FULL sorted registry so they must hold it all (10M × ~200B ≈ 2GB, genesis-class
+/// servers); non-genesis supers only relay registrations to genesis — a bounded cache suffices.
 const MAX_LIGHT_NODE_REGISTRY_SIZE: usize = 100_000;
+const MAX_LIGHT_NODE_REGISTRY_SIZE_GENESIS: usize = 10_000_000;
+
+/// Registry capacity for THIS node's role.
+fn light_registry_cap() -> usize {
+    let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
+        .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+        .unwrap_or(false);
+    if is_genesis { MAX_LIGHT_NODE_REGISTRY_SIZE_GENESIS } else { MAX_LIGHT_NODE_REGISTRY_SIZE }
+}
 
 /// Max attestations in RAM (24h window, auto-cleanup)
 /// 100K attestations × ~300 bytes = ~30MB RAM
@@ -14627,21 +14637,22 @@ impl SimplifiedP2P {
                 // Store in local registry with LRU eviction
                 {
                     let mut registry = self.light_node_registry.write();
-                    
-                    // LRU eviction: Remove oldest entries if at capacity
-                    if registry.len() >= MAX_LIGHT_NODE_REGISTRY_SIZE {
-                        // Find oldest 10% entries by registered_at timestamp
-                        let evict_count = MAX_LIGHT_NODE_REGISTRY_SIZE / 10;
+
+                    // Role-based cap; evict inactive-first (then oldest) so live nodes are never
+                    // dropped while dead entries remain.
+                    let cap = light_registry_cap();
+                    if registry.len() >= cap {
+                        let evict_count = cap / 10;
                         let mut entries: Vec<_> = registry.iter()
-                            .map(|(k, v)| (k.clone(), v.registered_at))
+                            .map(|(k, v)| (k.clone(), v.is_active, v.registered_at))
                             .collect();
-                        entries.sort_by_key(|(_, ts)| *ts);
-                        
-                        for (key, _) in entries.into_iter().take(evict_count) {
+                        entries.sort_by_key(|(_, active, ts)| (*active, *ts));
+
+                        for (key, _, _) in entries.into_iter().take(evict_count) {
                             registry.remove(&key);
                         }
                         if crate::node::is_info() {
-                            println!("[INFO][P2P] LRU evicted {} oldest Light nodes", evict_count);
+                            println!("[INFO][P2P] registry_evicted count={} cap={}", evict_count, cap);
                         }
                     }
                     
@@ -17080,23 +17091,20 @@ impl SimplifiedP2P {
     }
     
     /// Get current slot number (0-239 within 4h window, each slot = 1 minute)
+    /// Ping slot (0-239) of the CURRENT reward epoch, driven by BLOCK HEIGHT — NOT wall-clock — so the
+    /// ping schedule shares ONE clock with rewards/attestations (both height/14400). Wall-clock windows sit
+    /// on a different grid than block-epochs, so a node's slot could fall entirely outside an epoch's
+    /// block-span → that epoch got 0 pings (observed live: epoch 1 pinged twice, epoch 3 zero). Anchoring
+    /// to height puts exactly one ping inside every epoch. 240 slots × 60 blocks = one 14400-block epoch.
     pub fn get_current_slot() -> u64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let current_4h_window = now - (now % (4 * 60 * 60));
-        let seconds_in_window = now - current_4h_window;
-        seconds_in_window / 60  // 0-239
+        let h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        (h % 14400) / 60  // 0-239
     }
-    
-    /// Get current 4-hour window number (for randomizing ping slots)
+
+    /// Current ping window = the reward EPOCH (block height / 14400), so slot randomization
+    /// (calculate_randomized_slot) and the attestation epoch (record_light_epoch_eligible) share one clock.
     pub fn get_current_window_number() -> u64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now / (4 * 60 * 60)  // Window number since epoch
+        LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400
     }
     
     /// Calculate ping slot for Light node with per-window randomization
@@ -17115,30 +17123,25 @@ impl SimplifiedP2P {
     /// Get next ping time for a Light node (for polling fallback)
     /// Returns (timestamp, window_number) for the next scheduled ping
     pub fn get_next_ping_time(light_node_id: &str) -> (u64, u64) {
-        let _now = std::time::SystemTime::now()
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
-        let current_window = Self::get_current_window_number();
-        let current_slot = Self::get_current_slot();
+        let height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        let current_window = height / 14400;
         let node_slot = Self::calculate_randomized_slot(light_node_id, current_window);
-        
-        // Calculate window start timestamp
-        let window_start = current_window * 4 * 60 * 60;
-        
-        if node_slot > current_slot {
-            // Ping is later in current window
-            let ping_time = window_start + (node_slot * 60);
-            (ping_time, current_window)
+        // Target BLOCK of the node's slot this epoch; if already passed, the same slot next epoch.
+        let slot_block = current_window * 14400 + node_slot * 60;
+        let (target_block, window) = if slot_block > height {
+            (slot_block, current_window)
         } else {
-            // Ping already passed in current window, calculate for next window
             let next_window = current_window + 1;
             let next_slot = Self::calculate_randomized_slot(light_node_id, next_window);
-            let next_window_start = next_window * 4 * 60 * 60;
-            let ping_time = next_window_start + (next_slot * 60);
-            (ping_time, next_window)
-        }
+            (next_window * 14400 + next_slot * 60, next_window)
+        };
+        // Wall-clock estimate for polling clients (~1 block/s from the local tip).
+        let ping_time = now + target_block.saturating_sub(height);
+        (ping_time, window)
     }
     
     /// Determine if Light node should be pinged in current slot (randomized per window)
@@ -17224,26 +17227,13 @@ impl SimplifiedP2P {
         attestations.contains_key(&key)
     }
 
-    /// Check if attestation already exists for Light node anywhere in the current 4-hour window.
-    /// Used by ping scheduling: once a node attests in ANY slot of the window, skip it for the
-    /// rest of the window. The 3-slot retry window (slot_diff <= 2) is only for FAILURES — if
-    /// the node already proved liveness this window, no further FCM notifications are needed.
-    ///
-    /// O(1): checks only the 3 possible slots (primary + 2 retries) instead of scanning all entries.
+    /// True iff this light node already attested in the CURRENT reward epoch — checked against the
+    /// block-epoch eligibility set (record_light_epoch_eligible keys by block_height/14400), i.e. the
+    /// SAME clock as the reward. Skips re-pinging a node that already proved liveness this epoch. O(1).
     pub fn has_attestation_in_window(&self, light_node_id: &str) -> bool {
-        let current_window = Self::get_current_window_number();
-        let primary_slot = Self::calculate_randomized_slot(light_node_id, current_window);
-        let window_start = current_window * 4 * 60 * 60;
-        let attestations = self.light_node_attestations.read();
-
-        [primary_slot, (primary_slot + 1) % 240, (primary_slot + 2) % 240]
-            .iter()
-            .any(|&slot| {
-                let key = format!("{}:{}", light_node_id, slot);
-                attestations.get(&key)
-                    .map(|a| a.timestamp >= window_start)
-                    .unwrap_or(false)
-            })
+        let epoch = Self::get_current_window_number();
+        self.epoch_light_eligible.read().get(&epoch)
+            .map(|s| s.contains(light_node_id)).unwrap_or(false)
     }
     
     /// Get Light nodes to ping in current slot
@@ -17889,33 +17879,6 @@ impl SimplifiedP2P {
                 println!("[INFO][P2P] Removed {} old attestations (>24h)", removed);
             }
         }
-    }
-    
-    /// Check Light node reward eligibility (1/1 ping required per whitepaper)
-    pub fn check_light_node_eligibility(&self, light_node_id: &str) -> (u8, u8, bool) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        let _current_4h_window = now - (now % (4 * 60 * 60));
-        let window_start_slot = 0u64;
-        let window_end_slot = 239u64;
-        
-        // Count attestations in current 4h window
-        let mut count = 0u8;
-        {
-            let attestations = self.light_node_attestations.read();
-            for slot in window_start_slot..=window_end_slot {
-                let key = format!("{}:{}", light_node_id, slot);
-                if attestations.contains_key(&key) {
-                    count += 1;
-                    break;  // Light nodes only need 1 ping
-                }
-            }
-        }
-        
-        (count, 1, count >= 1)
     }
     
     // ========================================================================

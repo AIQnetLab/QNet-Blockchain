@@ -154,6 +154,15 @@ pub const PRIORITY_MULTIPLIER: u64 = 10; // 10x for priority transactions
 /// ACTIVATED: block 100_000 — change if current chain is above this height
 pub const GAS_METERING_ACTIVATION_HEIGHT: u64 = 100_000;
 
+/// Minimum gas PRICE (nanoQNC per gas unit) accepted from a user transaction — the single source of
+/// truth for the fee floor, used by the mempool admission filter, the /gas-price hint endpoint, and the
+/// RPC submit path. Derived so the floor is self-consistent: a standard transfer (`gas_limits::TRANSFER`
+/// gas) at this price costs exactly `BASE_FEE_NANO_QNC` = 0.0001 QNC. Fee = `effective_gas_price *
+/// gas_limit`; a Dilithium-signed (quantum) TX pays 1.5× via `effective_gas_price` (larger TX + verify
+/// cost). Anti-spam is layered (per-sender cap + per-IP rate limit + balance check), so the floor stays
+/// mobile-cheap rather than punitive. System TXs (activation/heartbeat/reward) bypass the floor.
+pub const MIN_GAS_PRICE: u64 = BASE_FEE_NANO_QNC / gas_limits::TRANSFER;
+
 /// v3.42: Maximum entries in a single contract's contract_storage HashMap.
 /// Prevents unbounded growth of Account → Merkle tree for popular QRC-20 tokens.
 /// At 1M entries (~80 bytes per KV pair) this is ~80 MB per contract — safe for testnet.

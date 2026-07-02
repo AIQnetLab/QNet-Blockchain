@@ -218,7 +218,10 @@ async function setupPollingService(nodeId, nextPingTime) {
     }, async (taskId) => {
       // This handler is called for BOTH periodic and scheduled tasks
       console.log('[Polling] Background task triggered:', taskId);
-      
+
+      // PULL: any background wake proves this-epoch liveness (deduped per epoch, so ~1 real call/4h).
+      await selfAttestIfNeeded();
+
       // Check if we're near our ping time (within 5 minutes)
       const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
       if (nodeInfoStr) {
@@ -226,7 +229,7 @@ async function setupPollingService(nodeId, nextPingTime) {
         const currentTime = Math.floor(Date.now() / 1000);
         const pingTime = nodeInfo.nextPingTime || 0;
         const timeToPing = pingTime - currentTime;
-        
+
         // Only check challenge if we're within 5 minutes of ping time
         // This prevents wasted API calls from periodic background fetches
         if (timeToPing <= 300 && timeToPing >= -180) {
@@ -236,7 +239,7 @@ async function setupPollingService(nodeId, nextPingTime) {
           console.log('[Polling] Not in ping window (', timeToPing, 'sec to ping), skipping');
         }
       }
-      
+
       BackgroundFetch.finish(taskId);
     }, (taskId) => {
       console.log('[Polling] Task timeout:', taskId);
@@ -401,6 +404,41 @@ export async function respondToChallenge(nodeId, challenge, responseUrl) {
 }
 
 /**
+ * PULL self-attestation: sign a fresh same-epoch block hash and submit through the standard
+ * ping-response endpoint (challenge = "selfattest:{height}:{hash}"). Proves this-epoch liveness
+ * on ANY wakeup (push, background fetch, app open) — no dependency on FCM delivery.
+ * Deduped per epoch locally; the node dedupes per epoch too.
+ */
+export async function selfAttestIfNeeded(nodeId) {
+  try {
+    const pingNodeId = nodeId || await AsyncStorage.getItem('qnet_ping_node_id');
+    if (!pingNodeId) return false;
+    const apiUrl = await getRandomBootstrapNodeAsync();
+    const hr = await fetch(`${apiUrl}/api/v1/height`);
+    const { height } = await hr.json();
+    if (!height || height < 3) return false;
+    const epoch = Math.floor(height / 14400);
+    const last = await AsyncStorage.getItem('qnet_last_self_attest_epoch');
+    if (last !== null && parseInt(last, 10) === epoch) return false;
+    // Canonical hash of block `anchor` = previous_hash of block anchor+1 (the chain link).
+    const anchor = height - 2;
+    const br = await fetch(`${apiUrl}/api/v1/microblock/${anchor + 1}`);
+    const block = await br.json();
+    if (!Array.isArray(block?.previous_hash)) return false;
+    const hash = block.previous_hash.map(b => b.toString(16).padStart(2, '0')).join('');
+    const ok = await respondToChallenge(pingNodeId, `selfattest:${anchor}:${hash}`, apiUrl);
+    if (ok) {
+      await AsyncStorage.setItem('qnet_last_self_attest_epoch', String(epoch));
+      console.log('[SelfAttest] ✅ Attested for epoch', epoch);
+    }
+    return ok;
+  } catch (error) {
+    console.warn('[SelfAttest] failed:', error.message || error);
+    return false;
+  }
+}
+
+/**
  * Handle incoming push message (FCM or UnifiedPush)
  */
 export async function handlePushMessage(data) {
@@ -408,7 +446,8 @@ export async function handlePushMessage(data) {
     console.log('[Push] 📥 Ping received:', data.node_id, 'from:', data.response_url || 'random');
     return await respondToChallenge(data.node_id, data.challenge, data.response_url);
   }
-  return false;
+  // Any other wakeup still proves liveness for this epoch.
+  return await selfAttestIfNeeded(data?.node_id);
 }
 
 /**
@@ -724,11 +763,14 @@ export async function initializePushService() {
   const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
   if (nodeInfoStr) {
     const nodeInfo = JSON.parse(nodeInfoStr);
-    
+
     // Setup polling if needed
     if (nodeInfo.pushType === PushType.POLLING) {
       await setupPollingService(nodeInfo.nodeId, nodeInfo.nextPingTime);
     }
+
+    // PULL: app open is a wakeup — attest for this epoch if not yet done (deduped inside).
+    selfAttestIfNeeded(nodeInfo.nodeId).catch(() => {});
   }
 
   return pushProvider;
@@ -936,6 +978,7 @@ export default {
   checkPendingChallenge,
   getNextPingTime,
   respondToChallenge,
+  selfAttestIfNeeded,
   handlePushMessage,
   setUnifiedPushEndpoint,
   initializePushService,

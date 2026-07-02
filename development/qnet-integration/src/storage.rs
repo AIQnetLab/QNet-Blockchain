@@ -6476,6 +6476,8 @@ impl Storage {
         key.extend_from_slice(&up_to_height.to_be_bytes());
         batch.put_cf(&meta_cf, &key, &root);
         self.persistent.db.write(batch)?;
+        // Same reset sites (boot/snapshot/reorg) must also canonicalize the heartbeat liveness index.
+        let _ = self.canonicalize_heartbeat_index(up_to_height);
         Ok(pruned)
     }
 
@@ -6830,6 +6832,115 @@ impl Storage {
             if !wallet.is_empty() { out.push((node_id.to_string(), wallet.to_string())); }
         }
         Ok(out)
+    }
+
+    /// Heartbeat liveness index write (apply path). Key `lhb_{anchor_subwindow:010}_{node_id}` →
+    /// first inclusion height (8B BE). First-write-wins keeps the MIN inclusion height, so a reader
+    /// bounded by scan_end reproduces the canonical body scan exactly (any inclusion of a cur/prev-
+    /// subwindow anchor is ≥ subwindow start, so `min ≤ scan_end` ⟺ `∃ inclusion ≤ scan_end`).
+    /// Lives in node_registry CF (rides the CF snapshot; NOT in registry_root — that scans only
+    /// srtr_/lrtr_/node_ rows). Prunes subwindows < sw-2 via one range-delete (bounded: ~3 subwindows
+    /// × supers). Apply is serialized per node ⇒ the get-then-put is race-free.
+    pub fn index_heartbeat_inclusion(&self, node_id: &str, anchor_height: u64, included_height: u64) -> IntegrationResult<()> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let sw = anchor_height / 1440;
+        let key = format!("lhb_{:010}_{}", sw, node_id);
+        if self.persistent.db.get_cf(&registry_cf, key.as_bytes())?.is_none() {
+            self.persistent.db.put_cf(&registry_cf, key.as_bytes(), &included_height.to_be_bytes())?;
+        }
+        // Prune once per subwindow advance (metadata watermark), not per heartbeat.
+        if sw >= 3 {
+            let meta_cf = self.persistent.db.cf_handle("metadata")
+                .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+            let want = sw - 2;
+            let have = self.persistent.db.get_cf(&meta_cf, b"lhb_pb")?
+                .and_then(|v| v[..8.min(v.len())].try_into().ok().map(u64::from_be_bytes)).unwrap_or(0);
+            if want > have {
+                let mut batch = rocksdb::WriteBatch::default();
+                batch.delete_range_cf(&registry_cf, b"lhb_0000000000_".as_ref(), format!("lhb_{:010}_", want).as_bytes());
+                batch.put_cf(&meta_cf, b"lhb_pb", &want.to_be_bytes());
+                self.persistent.db.write(batch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Indexed replacement for the recent-Heartbeat body scan: node_ids with a Heartbeat anchored in
+    /// subwindow cur/prev and included at ≤ scan_end. Two bounded prefix scans, O(recent supers) —
+    /// no block-body deserialization. Byte-identical to the body scan (determinism test).
+    pub fn recent_heartbeat_senders_indexed(&self, cur_idx: u64, prev_idx: u64, scan_end: u64) -> IntegrationResult<std::collections::HashSet<String>> {
+        use rocksdb::{IteratorMode, Direction};
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut idxs = [cur_idx, prev_idx];
+        idxs.sort_unstable();
+        let scan = |idx: u64, out: &mut std::collections::HashSet<String>| {
+            let prefix = format!("lhb_{:010}_", idx);
+            for item in self.persistent.db.iterator_cf(&registry_cf, IteratorMode::From(prefix.as_bytes(), Direction::Forward)) {
+                let (k, v) = match item { Ok(kv) => kv, Err(_) => break };
+                if !k.starts_with(prefix.as_bytes()) { break; }
+                if v.len() < 8 { continue; }
+                let inc = u64::from_be_bytes(v[..8].try_into().unwrap_or([0u8; 8]));
+                if inc <= scan_end {
+                    if let Ok(id) = std::str::from_utf8(&k[prefix.len()..]) { out.insert(id.to_string()); }
+                }
+            }
+        };
+        scan(idxs[0], &mut out);
+        if idxs[1] != idxs[0] { scan(idxs[1], &mut out); }
+        Ok(out)
+    }
+
+    /// Streaming lrtr_ walk (reg_height < before_height), node_id-ascending — same rows and order as
+    /// `light_roster_sorted` but O(1) memory: the reward reader at millions of light nodes must not
+    /// collect the roster into a Vec on the emission path.
+    pub fn light_roster_for_each<F: FnMut(&str, &str)>(&self, before_height: u64, mut f: F) -> IntegrationResult<()> {
+        use rocksdb::{IteratorMode, Direction};
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let prefix = b"lrtr_";
+        for item in self.persistent.db.iterator_cf(&registry_cf, IteratorMode::From(prefix, Direction::Forward)) {
+            let (k, v) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(prefix) { break; }
+            let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s, Err(_) => continue };
+            if v.len() < 8 { continue; }
+            let h = u64::from_be_bytes(v[..8].try_into().unwrap_or([0u8; 8]));
+            if h >= before_height { continue; }
+            let wallet = match std::str::from_utf8(&v[8..]) { Ok(s) => s, Err(_) => continue };
+            if !wallet.is_empty() { f(node_id, wallet); }
+        }
+        Ok(())
+    }
+
+    /// Canonicalize the lhb_ index at a height reset (boot / snapshot-apply / reorg): drop entries
+    /// included above the new tip, then re-index from the retained bodies of the last 3 subwindows
+    /// (first-write-wins ⇒ idempotent; missing bodies skip — the CF-snapshot-carried index covers them).
+    /// Keeps index == canonical chain on every path an old-binary or fork could have diverged.
+    pub fn canonicalize_heartbeat_index(&self, up_to_height: u64) -> IntegrationResult<()> {
+        use rocksdb::{IteratorMode, Direction};
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        for item in self.persistent.db.iterator_cf(&registry_cf, IteratorMode::From(b"lhb_", Direction::Forward)) {
+            let (k, v) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(b"lhb_") { break; }
+            let inc = if v.len() >= 8 { u64::from_be_bytes(v[..8].try_into().unwrap_or([0u8; 8])) } else { u64::MAX };
+            if inc > up_to_height { batch.delete_cf(&registry_cf, &k); }
+        }
+        self.persistent.db.write(batch)?;
+        let start_sw = (up_to_height / 1440).saturating_sub(2);
+        for h in start_sw.saturating_mul(1440)..=up_to_height {
+            if let Ok(Some(block)) = self.load_microblock_auto_format(h) {
+                for tx in &block.transactions {
+                    if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, .. } = &tx.tx_type {
+                        let _ = self.index_heartbeat_inclusion(node_id, *anchor_height, h);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Sorted (node_id, wallet) of all chain-registered Super/genesis nodes — the deterministic

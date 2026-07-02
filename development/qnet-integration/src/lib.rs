@@ -155,7 +155,7 @@ impl QNetBlockchain {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(200_000), // Production default: 200k (v4.1)
-            min_gas_price: 1,
+            min_gas_price: qnet_state::transaction::MIN_GAS_PRICE, // single source of truth (0.0001 QNC/transfer)
             max_per_sender: std::env::var("QNET_MAX_PER_SENDER")
                 .ok()
                 .and_then(|s| s.parse().ok())
