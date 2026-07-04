@@ -16,7 +16,10 @@ import {
   AppState,
   Modal,
   Animated,
-  Share
+  Share,
+  FlatList,
+  KeyboardAvoidingView,
+  BackHandler,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -779,6 +782,66 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
 // Prevents hammering the node API: no matter how many components re-render,
 // only one actual network request goes out per minute.
 const _blockHeightCache = { height: 0, fetchedAt: 0, inFlight: false };
+let _tokenIconCache = null; // built once on first getTokenIconUrl call (multi-KB base64 set)
+
+// Per-tab render isolation. Wraps a tab's JSX in a memo boundary keyed on the reactive values that
+// tab actually reads (`deps`). The `render` thunk is recreated every parent render, but the custom
+// comparator ignores it and re-renders ONLY when a dep changes — so an unrelated setState (balance /
+// block-height / WS tick) no longer reconciles the active tab's subtree. `deps` must list every
+// reactive value the tab reads (same contract as a useMemo dep array); a missing dep shows stale data
+// but never crashes (the thunk still closes over live refs). A `key` per tab guarantees clean remount
+// on tab switch, so no cross-tab output can leak.
+const TabBox = React.memo(
+  function TabBox({ render }) { return render(); },
+  (prev, next) =>
+    prev.deps.length === next.deps.length &&
+    prev.deps.every((v, i) => Object.is(v, next.deps[i]))
+);
+
+// Memoized transaction-history row — skips re-render on unrelated parent setState (balance/height ticks).
+const TxRow = React.memo(function TxRow({ tx, onCopy }) {
+  const isSend = tx.type === 'send';
+  const counter = isSend ? tx.to : tx.from;
+  const dateLabel = tx.status === 'pending'
+    ? '⏳ Pending...'
+    : (!tx.timestamp || tx.timestamp === 0 || tx.timestamp < 1000000)
+      ? 'Genesis'
+      : (() => {
+          const d = new Date(tx.timestamp);
+          const p = (n) => String(n).padStart(2, '0');
+          return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()}, ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+        })();
+  return (
+    <TouchableOpacity
+      style={{ backgroundColor: '#16213e', borderRadius: 12, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: tx.status === 'pending' ? '#ffaa00' : '#1a1a2e' }}
+      onPress={() => onCopy(tx.hash)}
+    >
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: isSend ? '#ff444420' : '#00ff8820', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
+            <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 18 }}>{isSend ? '↑' : '↓'}</Text>
+          </View>
+          <View>
+            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>{isSend ? 'Sent' : 'Received'}</Text>
+            <Text style={{ color: '#666', fontSize: 12 }}>{dateLabel}</Text>
+          </View>
+        </View>
+        <View style={{ alignItems: 'flex-end', flexShrink: 1, marginLeft: 8 }}>
+          <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 16, fontWeight: '600' }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
+            {tx.amount === 0 ? '0' : `${isSend ? '-' : '+'}${tx.amount.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: Math.abs(tx.amount) >= 1 ? 4 : 8 })}`} QNC
+          </Text>
+          {tx.fee > 0 && <Text style={{ color: '#666', fontSize: 11 }}>Fee: {tx.fee.toFixed(5)} QNC</Text>}
+        </View>
+      </View>
+      <View style={{ borderTopWidth: 1, borderTopColor: '#1a1a2e', paddingTop: 8 }}>
+        <Text style={{ color: '#888', fontSize: 11 }}>
+          {isSend ? 'To: ' : 'From: '}
+          <Text style={{ color: '#00d4ff', fontFamily: 'monospace' }}>{counter?.slice(0, 12)}...{counter?.slice(-8)}</Text>
+        </Text>
+      </View>
+    </TouchableOpacity>
+  );
+});
 
 async function fetchCachedBlockHeight() {
   const now = Date.now();
@@ -792,7 +855,9 @@ async function fetchCachedBlockHeight() {
   _blockHeightCache.inFlight = true;
   try {
     const apiUrl = getRandomGenesisNode();
-    const resp = await fetch(`${apiUrl}/api/v1/height`, { method: 'GET' });
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 3000);
+    const resp = await fetch(`${apiUrl}/api/v1/height`, { method: 'GET', signal: controller.signal }).finally(() => clearTimeout(t));
     if (resp.ok) {
       const data = await resp.json();
       const h = data.height || data.network_height || data.current_height || data.local_height || 0;
@@ -807,7 +872,7 @@ async function fetchCachedBlockHeight() {
 }
 
 const WalletScreen = () => {
-  const [walletManager] = useState(new WalletManager());
+  const [walletManager] = useState(() => new WalletManager()); // lazy: construct once, not every render
   const [hasWallet, setHasWallet] = useState(false);
   const [wallet, setWallet] = useState(null);
   const [balance, setBalance] = useState(0);
@@ -848,6 +913,10 @@ const WalletScreen = () => {
   // v3.30: TX History with WebSocket real-time updates
   const [txHistory, setTxHistory] = useState([]); // Array of { hash, from, to, amount, status, timestamp, type }
   const wsRef = useRef(null); // WebSocket connection
+  const wsShouldReconnectRef = useRef(true);  // false on unmount ⇒ no resurrecting reconnect
+  const wsReconnectTimerRef = useRef(null);   // cancellable reconnect timer
+  const wsBackoffRef = useRef(0);             // reconnect attempt count for exponential backoff
+  const txHistoryDebounceRef = useRef(null);  // coalesce bursty history refreshes
   // v3.27: Track Merkle proof verification status for trustless display
   const [balanceVerified, setBalanceVerified] = useState(false);
   const [language, setLanguage] = useState('en');
@@ -859,8 +928,6 @@ const WalletScreen = () => {
   const [showExportSeed, setShowExportSeed] = useState(false);
   const [showExportActivation, setShowExportActivation] = useState(false);
   const [exportPassword, setExportPassword] = useState('');
-  const [lastActivityTime, setLastActivityTime] = useState(Date.now());
-  const [autoLockTimer, setAutoLockTimer] = useState(null);
   const [showAutoLockPicker, setShowAutoLockPicker] = useState(false);
   const [showLanguagePicker, setShowLanguagePicker] = useState(false);
   const [importStep, setImportStep] = useState(1); // 1 = password, 2 = seed phrase
@@ -917,6 +984,14 @@ const WalletScreen = () => {
     setCustomAlert({ title, message, buttons, richContent });
   };
 
+  // Stable copy handler for TxRow — setCustomAlert is stable, so the FlatList rows never re-bind onPress.
+  const handleCopyTxHash = React.useCallback((hash) => {
+    if (!hash) return;
+    Clipboard.setString(hash);
+    setCustomAlert({ title: 'Copied', message: 'Transaction hash copied', buttons: [{ text: 'OK', onPress: () => {} }], richContent: null });
+  }, []);
+
+
   // Helper function to copy address with visual feedback (no alert)
   const copyToClipboard = (text, addressType = '') => {
     try {
@@ -931,9 +1006,9 @@ const WalletScreen = () => {
     }
   };
 
-  // Get token icon URL like in extension
+  // Get token icon URL. Built once (module cache) instead of a multi-KB base64 object per call/render.
   const getTokenIconUrl = (symbol) => {
-    const icons = {
+    if (!_tokenIconCache) _tokenIconCache = {
       // QNC - QNet app icon
       'QNC': 'data:image/png;base64,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',
       // SOL - official Solana token
@@ -942,7 +1017,7 @@ const WalletScreen = () => {
       // USDC
       'USDC': 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v/logo.png'
     };
-    return icons[symbol.toUpperCase()] || null;
+    return _tokenIconCache[symbol.toUpperCase()] || null;
   };
 
   useEffect(() => {
@@ -1128,7 +1203,7 @@ const WalletScreen = () => {
 
       return () => clearInterval(heightInterval);
     }
-  }, [activeTab, activatedNodeType, activationCode, nodePseudonym, wallet]); // Load when tab opens
+  }, [activeTab, activatedNodeType, activationCode, wallet]); // load on tab open; NOT nodePseudonym (set here → self-retrigger)
   
   // Load dynamic pricing when on activate tab
   useEffect(() => {
@@ -1148,7 +1223,7 @@ const WalletScreen = () => {
     }, 8000);
     try {
       const progress = await walletManager.getBurnProgress(isTestnet);
-      if (!done) { done = true; clearTimeout(fallbackTimer); setBurnProgress(progress); }
+      if (!done) { done = true; clearTimeout(fallbackTimer); if (progress != null) setBurnProgress(progress); }
     } catch (error) {
       if (!done) { done = true; clearTimeout(fallbackTimer); setBurnProgress('0.0'); }
     }
@@ -1204,26 +1279,52 @@ const WalletScreen = () => {
     if (!activationCode && !wallet) return;
 
     try {
-      // For all node types: pass nodePseudonym as nodeId for API lookup
-      // Light nodes use pseudonym (light_mobile_XXX), Genesis use genesis_node_XXX
-      const nodeId = nodePseudonym || null;
       // QNet address only: a node's reward wallet is an EON address; never fall back to a Solana addr
       // for node resolution (it would query a wallet that backs no node).
       const walletAddress = wallet?.qnetAddress || null;
+      // Resolve super/full nodes by WALLET (on-chain canonical) rather than a possibly-stale cached
+      // pseudonym: a single lagging node can hold an old pre-registration id (e.g. activation_*) and
+      // report the wrong name + "offline" while the rest of the network sees the node online under its
+      // real id. Genesis (activation_code path) and Light (pseudonym) keep their own resolution.
+      const preferWallet = !!walletAddress && activatedNodeType !== 'light';
+      const nodeId = preferWallet ? null : (nodePseudonym || null);
 
-      // Resolve by node_id if cached, else by WALLET (on-chain, resolves a server-activated super and
-      // offline/banned nodes), with activation_code only as the last resort.
-      const status = await checkServerNodeStatus(activationCode, nodeId, walletAddress);
+      // Quorum: ask several nodes in parallel and keep the AUTHORITATIVE view (online beats offline,
+      // then more heartbeats), so one node with a stale wallet→node_id record cannot pin the displayed
+      // identity or liveness. Wallet-scoped queries converge because each node maps the wallet to ITS
+      // own id and we keep the online one.
+      const quorumN = 3;
+      const responses = (await Promise.all(
+        Array.from({ length: quorumN }, () =>
+          checkServerNodeStatus(activationCode, nodeId, walletAddress, 1).catch(() => null))
+      )).filter(r => r && r.success);
+      let status;
+      if (responses.length > 0) {
+        responses.sort((a, b) => {
+          if (!!b.isOnline !== !!a.isOnline) return b.isOnline ? 1 : -1;
+          return (b.heartbeatCount || 0) - (a.heartbeatCount || 0);
+        });
+        status = responses[0];
+      } else {
+        // Nobody answered in the quorum — one plain attempt (its own retries) as a last resort.
+        status = await checkServerNodeStatus(activationCode, nodeId, walletAddress);
+      }
 
       // Claimable comes from the dedicated STATUS-INDEPENDENT endpoint (merkle reward-root) by the
       // resolved node_id, so earned rewards show + can be claimed even when the node is offline/banned.
       const resolvedId = status?.nodeId || nodeId;
       if (resolvedId) {
-        const pr = await getPendingRewards(resolvedId);
-        // On a transient fetch failure keep the last-known claimable rather than collapsing to the
-        // (legacy, ~0) /node/status value — never show a smaller number on a network hiccup.
-        if (pr.success) status.pendingRewards = pr.pendingRewards;
-        else if (serverNodeStatus?.pendingRewards != null) status.pendingRewards = serverNodeStatus.pendingRewards;
+        // Quorum the claimable (max of a few nodes): a claim proof is re-verified on-chain against the
+        // 2f+1 reward_root so no node can inflate it; an honest node only under-reports (local shard lag),
+        // so max = the certified amount — routes around a lagging node and removes the pending flicker.
+        const prs = (await Promise.all(
+          Array.from({ length: 3 }, () => getPendingRewards(resolvedId).catch(() => ({ success: false })))
+        )).filter(r => r && r.success && r.pendingRewards != null);
+        if (prs.length > 0) {
+          status.pendingRewards = prs.reduce((m, r) => Math.max(m, r.pendingRewards), 0);
+        } else if (serverNodeStatus?.pendingRewards != null) {
+          status.pendingRewards = serverNodeStatus.pendingRewards; // hiccup: keep last-known, don't shrink
+        }
       }
 
       setServerNodeStatus(status);
@@ -1233,10 +1334,11 @@ const WalletScreen = () => {
           ...status,
           cachedAt: Date.now()
         })).catch(() => {});
-        // Resolve the node name from chain when the local cache is empty: a
-        // server-activated super node is never activated in-app, so its pseudonym
-        // was never cached locally — take it from the on-chain status response.
-        if (status.nodeId && !nodePseudonym && activatedNodeType !== 'light') {
+        // Adopt the network-canonical id from an ONLINE (quorum-confirmed) response and OVERWRITE a
+        // stale cached pseudonym — e.g. an old activation_* id that one lagging node still returns and
+        // that the app previously latched onto — so the displayed name self-heals to the real one.
+        if (status.nodeId && activatedNodeType !== 'light' &&
+            status.nodeId !== nodePseudonym && (status.isOnline || !nodePseudonym)) {
           setNodePseudonym(status.nodeId);
           AsyncStorage.setItem(`node_pseudonym_${activationCode}`, status.nodeId).catch(() => {});
         }
@@ -1825,7 +1927,49 @@ const WalletScreen = () => {
     setSendAddress('');
     setSendAmount('');
   };
-  
+
+  // Android hardware-back: dismiss the topmost open overlay/modal instead of exiting the app.
+  // Returns true (handled) while anything is open; on the home tab returns false so the OS can exit.
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    const onBack = () => {
+      if (customAlert) { setCustomAlert(null); return true; }
+      if (showTermsModal) { setShowTermsModal(false); return true; }
+      if (showBiometricPasswordPrompt) { setShowBiometricPasswordPrompt(false); return true; }
+      if (showActivationInput) { setShowActivationInput(false); return true; }
+      if (showChangePassword) { setShowChangePassword(false); return true; }
+      if (showExportSeed) { setShowExportSeed(false); return true; }
+      if (showExportActivation) { setShowExportActivation(false); return true; }
+      if (showAutoLockPicker) { setShowAutoLockPicker(false); return true; }
+      if (showLanguagePicker) { setShowLanguagePicker(false); return true; }
+      if (showSeedConfirm) { setShowSeedConfirm(false); return true; }
+      if (showSendScreen) { closeSendScreen(); return true; }
+      if (showSettings) { setShowSettings(false); return true; }
+      // Pre-wallet onboarding full-screens: back steps in instead of exiting the app,
+      // mirroring the in-form Back buttons (import step 2 → step 1, else → landing).
+      if (showCreateOptions) {
+        if (showCreateOptions === 'import' && importStep === 2) {
+          setImportStep(1); setSeedPhrase(''); setPasswordError(''); setTermsAccepted(false);
+        } else {
+          setShowCreateOptions(false);
+          setPassword(''); setConfirmPassword(''); setSeedPhrase('');
+          setPasswordError(''); setTermsAccepted(false); setImportStep(1);
+        }
+        return true;
+      }
+      if (activeTab && activeTab !== 'assets') { setActiveTab('assets'); return true; }
+      return false; // nothing open on the home tab → let the OS exit the app
+    };
+    const sub = BackHandler.addEventListener('hardwareBackPress', onBack);
+    return () => sub.remove();
+  }, [
+    customAlert, showTermsModal, showBiometricPasswordPrompt, showActivationInput,
+    showChangePassword, showExportSeed, showExportActivation, showAutoLockPicker,
+    showLanguagePicker, showSeedConfirm, showSendScreen, showSettings,
+    showCreateOptions, importStep, activeTab,
+  ]);
+
+
   // v2.101: Validate amount input - international standard (dot separator, max 6 decimals)
   const validateAmountInput = (text) => {
     // Replace comma with dot (for locales that use comma)
@@ -1944,12 +2088,11 @@ const WalletScreen = () => {
         
         // TX not found yet - still pending
         if (attempts >= maxAttempts) {
-          // Timeout - TX might have failed, clear optimistic state
+          // Timeout - TX might have failed, clear optimistic + confirming state
           pendingTxRef.current = null;
           clearInterval(txPollingRef.current);
           txPollingRef.current = null;
-          
-          // Revert to server balance
+          setTxResult(prev => prev?.txHash === txHash ? { ...prev, confirming: false } : prev);
           if (wallet?.publicKey) {
             loadBalance(wallet.publicKey);
           }
@@ -1981,9 +2124,10 @@ const WalletScreen = () => {
       return;
     }
     
-    // Validate address format for QNet EON: 45 chars with 'eon' marker
+    // Validate address format for QNet EON: 45 chars, 'eon' marker at the fixed offset (matches the
+    // strict positional check in sendQNC; the 8-char SHA3 checksum is re-verified there pre-signing).
     if (sendingToken.network === 'qnet') {
-      const isValidEon = sendAddress.includes('eon') && sendAddress.length === 45;
+      const isValidEon = sendAddress.length === 45 && sendAddress.slice(19, 22) === 'eon';
       const isValidHex = /^[0-9a-fA-F]{64}$/.test(sendAddress);
 
       if (!isValidEon && !isValidHex) {
@@ -2185,10 +2329,9 @@ const WalletScreen = () => {
       // Use a ref to track last activity time to avoid re-creating the interval
       const lastActivityRef = { current: Date.now() };
       
-      // Reset timer on any activity
+      // Reset timer on any activity (local ref only — no setState, which would re-render the whole screen on every touch)
       const resetTimer = () => {
         lastActivityRef.current = Date.now();
-        setLastActivityTime(Date.now());
       };
 
       // Add global touch listener for activity tracking
@@ -2213,8 +2356,6 @@ const WalletScreen = () => {
           // Don't show alert - user will see unlock screen
         }
       }, 10000); // Check every 10 seconds
-
-      setAutoLockTimer(checkAutoLock);
 
       return () => {
         clearInterval(checkAutoLock);
@@ -2397,9 +2538,11 @@ const WalletScreen = () => {
       loadTxHistory();
       
       return () => {
-        // Cleanup WebSocket on unmount
+        wsShouldReconnectRef.current = false; // stop any resurrecting reconnect
+        if (wsReconnectTimerRef.current) { clearTimeout(wsReconnectTimerRef.current); wsReconnectTimerRef.current = null; }
         if (wsRef.current) {
-          wsRef.current.close();
+          wsRef.current.onclose = null; wsRef.current.onerror = null; // teardown must not trigger a reconnect
+          try { wsRef.current.close(); } catch (_) {}
           wsRef.current = null;
         }
       };
@@ -3028,64 +3171,42 @@ const WalletScreen = () => {
         walletManager.getQNCBalanceWithProof(currentWallet?.qnetAddress, true)
       ]);
       
-      // v3.27: Extract balance and verification status
-      const qncBalance = qncResult?.balance || 0;
+      const qncOk = !!qncResult?.ok;
       const isBalanceVerified = qncResult?.verified || false;
-      
-      // v3.27: Log verification status for debugging
-      if (!isBalanceVerified && qncBalance > 0) {
-        console.warn('[BALANCE] QNC balance not verified via Merkle proof - node may be untrusted');
-      }
-      
-      setBalance(bal);
-      
-      // v3.34: Optimistic balance protection
-      // Only loadBalance clears pendingTxRef — polling/WS only update UI status.
-      // This prevents bounce: 191K → 181K → 191K → 181K caused by
-      // polling confirming TX on Node 1 while loadBalance queries Node 3
-      // which hasn't propagated the block yet.
-      let finalQncBalance = qncBalance;
-      
-      if (pendingTxRef.current) {
-        const { expectedQnc, timestamp } = pendingTxRef.current;
-        const elapsed = Date.now() - timestamp;
-        
-        if (qncBalance <= expectedQnc) {
-          // ✅ Server balance matches or is below expected → TX confirmed on THIS node
-          // Safe to clear pending — the node we queried has the correct balance
-          pendingTxRef.current = null;
-          if (txPollingRef.current) {
-            clearInterval(txPollingRef.current);
-            txPollingRef.current = null;
+      setBalanceVerified && setBalanceVerified(qncOk && isBalanceVerified);
+
+      // Resolve the QNC value to apply OUTSIDE the state updater (it mutates refs). The optimistic-send
+      // guard holds the expected (lower) balance until the queried node has caught up to our TX.
+      let qncToApply = null; // null ⇒ QNC fetch failed: keep last-known, never flash 0
+      let optimistic = false;
+      if (qncOk) {
+        let q = qncResult.balance;
+        if (pendingTxRef.current) {
+          const { expectedQnc, timestamp } = pendingTxRef.current;
+          const elapsed = Date.now() - timestamp;
+          if (q <= expectedQnc || elapsed >= 120000) {
+            pendingTxRef.current = null;
+            if (txPollingRef.current) { clearInterval(txPollingRef.current); txPollingRef.current = null; }
+          } else {
+            q = expectedQnc; optimistic = true; // block not yet on this node — hold optimistic
           }
-          // Use server balance (it's correct)
-          finalQncBalance = qncBalance;
-        } else if (elapsed < 120000) {
-          // ⏳ Server still shows OLD (higher) balance AND within 2 min timeout
-          // Keep showing optimistic balance — block hasn't reached this node yet
-          finalQncBalance = expectedQnc;
-        } else {
-          // ⏰ Safety timeout (2 min) — TX might have been dropped, revert to server
-          pendingTxRef.current = null;
-          if (txPollingRef.current) {
-            clearInterval(txPollingRef.current);
-            txPollingRef.current = null;
-          }
-          finalQncBalance = qncBalance;
         }
+        qncToApply = q;
       }
-      
-      // Update all balances
-      setTokenBalances({
-        qnc: finalQncBalance,
-        sol: bal,
-        '1dev': oneDevBalance
+
+      // Merge: overwrite a token ONLY when its fetch succeeded (null/failed ⇒ keep last-known).
+      setTokenBalances(prev => {
+        const next = { ...prev };
+        if (bal != null) next.sol = bal;
+        if (oneDevBalance != null) next['1dev'] = oneDevBalance;
+        if (qncToApply != null) {
+          // Anti-zeroing: an UNVERIFIED node may not LOWER the displayed balance (keep last-known).
+          next.qnc = (!optimistic && !isBalanceVerified && qncToApply < (prev.qnc || 0)) ? prev.qnc : qncToApply;
+        }
+        return next;
       });
-      
-      // v3.27: Store verification status for UI indicators
-      setBalanceVerified && setBalanceVerified(isBalanceVerified);
-      
-      // Fetch real token prices (always mainnet prices as requested)
+      if (bal != null) setBalance(bal);
+
       await fetchTokenPrices();
     } catch (error) {
       // console.error('Error loading balance:', error);
@@ -3101,18 +3222,23 @@ const WalletScreen = () => {
     }
   };
 
-  // v3.35: WebSocket connection using discovered nodes
-  // FIX: Correct URL path (/ws/subscribe) and channels via query params (not JSON message)
-  // FIX: Handle NewBlock events (which only have metadata, not full TX data)
-  // FIX: Auto-refresh TX history when block with TXs arrives
+  // Cancellable, exponentially-backed-off WS reconnect. No-op after unmount (guard=false), and it
+  // dedups its own timer so onerror→close→onclose can't stack reconnects or storm the node set.
+  const scheduleWsReconnect = () => {
+    if (!wsShouldReconnectRef.current) return;
+    if (wsReconnectTimerRef.current) clearTimeout(wsReconnectTimerRef.current);
+    const delay = Math.min(30000, 1000 * Math.pow(2, wsBackoffRef.current++)) + Math.floor(Math.random() * 500);
+    wsReconnectTimerRef.current = setTimeout(connectWebSocket, delay);
+  };
+
   const connectWebSocket = () => {
+    wsShouldReconnectRef.current = true; // (re-)arm; cleanup disarms on unmount/wallet-switch
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
-    
+
     // Get nodes from discovery system (not hardcoded!)
     const httpNodes = walletManager.getAvailableNodes();
     if (!httpNodes || httpNodes.length === 0) {
-      // No nodes available yet — retry in 5s
-      setTimeout(connectWebSocket, 5000);
+      scheduleWsReconnect(); // no nodes yet
       return;
     }
     const myAddress = wallet?.qnetAddress || '';
@@ -3130,15 +3256,15 @@ const WalletScreen = () => {
     const wsUrl = wsNodes[Math.floor(Math.random() * wsNodes.length)];
     
     if (!wsUrl) {
-      setTimeout(connectWebSocket, 5000);
+      scheduleWsReconnect();
       return;
     }
-    
+
     try {
       wsRef.current = new WebSocket(wsUrl);
-      
+
       wsRef.current.onopen = () => {
-        // v3.35: No need to send subscribe message — channels are in URL params
+        wsBackoffRef.current = 0; // reset backoff on a good connection
         console.log('[WS] Connected to', wsUrl.replace(/channels=.*/, 'channels=...'));
       };
       
@@ -3150,52 +3276,32 @@ const WalletScreen = () => {
           // Rust sends: { type: "NewBlock", data: { height, hash, timestamp, tx_count, producer } }
           // NOTE: NewBlock does NOT include individual TX data!
           // When block has TXs → refresh history from API to get confirmed TXs
+          // NewBlock carries no per-TX data and isn't wallet-scoped; the account:${addr} BalanceUpdate
+          // channel already signals OUR changes with new_balance, so here we only coalesce a debounced
+          // history refresh (no balance re-poll — that was the random-node race that flashed 0).
           if (data.type === 'NewBlock' && data.data) {
-            const txCount = data.data.tx_count || 0;
-            
-            if (txCount > 0) {
-              // Block has transactions — refresh TX history to pick up confirmed TXs
-              // Small delay to allow block propagation to the node we'll query
-              setTimeout(() => {
-                loadTxHistory();
-                // Also refresh balance in case we received funds
-                if (wallet?.publicKey) {
-                  loadBalance(wallet.publicKey);
-                }
-              }, 1000);
+            if ((data.data.tx_count || 0) > 0) {
+              if (txHistoryDebounceRef.current) clearTimeout(txHistoryDebounceRef.current);
+              txHistoryDebounceRef.current = setTimeout(() => { txHistoryDebounceRef.current = null; loadTxHistory(); }, 1500);
             }
           }
-          
-          // v3.35: Handle BalanceUpdate events (account:ADDRESS channel)
-          // Rust sends: { type: "BalanceUpdate", data: { address, new_balance, change, tx_hash } }
+
+          // BalanceUpdate (account:${addr}) carries the authoritative post-block balance — apply it
+          // DIRECTLY (the emitting node has the block) instead of re-polling a random node that may lag.
           if (data.type === 'BalanceUpdate' && data.data) {
-            const updateAddr = (data.data.address || '').toLowerCase();
-            const myAddr = myAddress.toLowerCase();
-            
-            if (updateAddr === myAddr) {
-              // Our balance changed — update immediately
+            if ((data.data.address || '').toLowerCase() === myAddress.toLowerCase()) {
               const newBalanceQnc = (data.data.new_balance || 0) / 1e9;
-              
-              // Check if this is our pending TX being confirmed
               if (pendingTxRef.current?.txHash === data.data.tx_hash) {
-                // Stop polling (WS already confirmed)
-                if (txPollingRef.current) {
-                  clearInterval(txPollingRef.current);
-                  txPollingRef.current = null;
-                }
-                setTxResult(prev => prev?.txHash === data.data.tx_hash
-                  ? { ...prev, confirming: false, confirmed: true }
-                  : prev
-                );
-                // Update TX history status
+                pendingTxRef.current = null;
+                if (txPollingRef.current) { clearInterval(txPollingRef.current); txPollingRef.current = null; }
+                setTxResult(prev => prev?.txHash === data.data.tx_hash ? { ...prev, confirming: false, confirmed: true } : prev);
                 updateTxStatus(data.data.tx_hash, 'confirmed');
               }
-              
-              // Refresh balance and history
-              if (wallet?.publicKey) {
-                loadBalance(wallet.publicKey);
+              if (Number.isFinite(newBalanceQnc)) {
+                setTokenBalances(prev => ({ ...prev, qnc: newBalanceQnc }));
               }
-              loadTxHistory();
+              if (txHistoryDebounceRef.current) clearTimeout(txHistoryDebounceRef.current);
+              txHistoryDebounceRef.current = setTimeout(() => { txHistoryDebounceRef.current = null; loadTxHistory(); }, 1200);
             }
           }
           
@@ -3238,12 +3344,11 @@ const WalletScreen = () => {
       };
       
       wsRef.current.onclose = () => {
-        // Reconnect after 5 seconds
-        setTimeout(connectWebSocket, 5000);
+        scheduleWsReconnect(); // guarded + backed-off; no-op after unmount
       };
-      
+
       wsRef.current.onerror = () => {
-        wsRef.current?.close();
+        try { wsRef.current?.close(); } catch (_) {} // → onclose → scheduleWsReconnect (single schedule)
       };
     } catch (e) {
       // WS not available - polling will handle it
@@ -3259,10 +3364,12 @@ const WalletScreen = () => {
     
     try {
       const apiUrl = walletManager.getRandomBootstrapNode();
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 5000);
       const response = await fetch(
         `${apiUrl}/api/v1/account/${wallet.qnetAddress}/transactions?limit=50`,
-        { method: 'GET', headers: { 'Content-Type': 'application/json' } }
-      );
+        { method: 'GET', headers: { 'Content-Type': 'application/json' }, signal: controller.signal }
+      ).finally(() => clearTimeout(t));
       
       if (response.ok) {
         const data = await response.json();
@@ -3903,11 +4010,12 @@ const WalletScreen = () => {
           style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
           edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
         >
-          <ScrollView 
+          <ScrollView
             contentContainerStyle={styles.formContent}
             showsVerticalScrollIndicator={true}
             bounces={true}
             scrollEnabled={true}
+            keyboardShouldPersistTaps="handled"
           >
             <Text style={styles.title}>Create Wallet</Text>
             <Text style={styles.subtitle}>Enter a strong password (min 8 characters)</Text>
@@ -4083,11 +4191,12 @@ const WalletScreen = () => {
             style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
             edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
           >
-            <ScrollView 
+            <ScrollView
               contentContainerStyle={styles.formContent}
               showsVerticalScrollIndicator={true}
               bounces={true}
               scrollEnabled={true}
+              keyboardShouldPersistTaps="handled"
             >
               <Text style={styles.title}>Import Wallet</Text>
               <Text style={styles.subtitle}>Step 1: Create password</Text>
@@ -4185,11 +4294,12 @@ const WalletScreen = () => {
             style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
             edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
           >
-            <ScrollView 
+            <ScrollView
               contentContainerStyle={styles.formContent}
               showsVerticalScrollIndicator={true}
               bounces={true}
               scrollEnabled={true}
+              keyboardShouldPersistTaps="handled"
             >
               <Text style={styles.title}>Import Wallet</Text>
               <Text style={styles.subtitle}>Step 2: Enter your seed phrase</Text>
@@ -4343,20 +4453,13 @@ const WalletScreen = () => {
           // Transaction Result Screen
           if (txResult) {
             return (
-              <ScrollView 
+              <TabBox key="assets-result" deps={[txResult]} render={() => (
+              <ScrollView
                 style={styles.content}
                 contentContainerStyle={[styles.scrollContentContainer, styles.sendScreenContainer]}
               >
-                <View style={styles.sendScreenHeader}>
-                  <TouchableOpacity onPress={closeSendScreen} style={styles.backButton}>
-                    <Text style={styles.backButtonText}>← Back</Text>
-                  </TouchableOpacity>
-                  <Text style={styles.sendScreenTitle}>
-                    {txResult.success ? 'Success' : 'Failed'}
-                  </Text>
-                  <View style={{width: 60}} />
-                </View>
-                
+                {/* No header on the result screen: the ✓/✕ icon + title convey the outcome and the
+                    Done button dismisses — the redundant "← Back / Success" bar is removed. */}
                 <View style={styles.txResultContainer}>
                   {txResult.success ? (
                     <>
@@ -4370,10 +4473,19 @@ const WalletScreen = () => {
                       <Text style={styles.txResultTo}>
                         To: {txResult.to?.substring(0, 12)}...{txResult.to?.substring(txResult.to.length - 8)}
                       </Text>
-                      <View style={styles.txHashContainer}>
-                        <Text style={styles.txHashLabel}>Transaction Hash</Text>
+                      <TouchableOpacity
+                        style={styles.txHashContainer}
+                        activeOpacity={0.7}
+                        onPress={() => {
+                          if (txResult.txHash) {
+                            Clipboard.setString(txResult.txHash);
+                            showAlert('Copied', 'Transaction hash copied to clipboard');
+                          }
+                        }}
+                      >
+                        <Text style={styles.txHashLabel}>Transaction Hash (tap to copy)</Text>
                         <Text style={styles.txHashValue}>{txResult.txHash?.substring(0, 24)}...</Text>
-                      </View>
+                      </TouchableOpacity>
                     </>
                   ) : (
                     <>
@@ -4393,14 +4505,21 @@ const WalletScreen = () => {
                   </TouchableOpacity>
                 </View>
               </ScrollView>
+              )} />
             );
           }
-          
+
           // Send Form Screen
           return (
-            <ScrollView 
+            <TabBox key="assets-send" deps={[showSendScreen, sendingToken, sendAddress, sendAmount, sendingTransaction]} render={() => (
+            <KeyboardAvoidingView
+              style={{ flex: 1 }}
+              behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            >
+            <ScrollView
               style={styles.content}
               contentContainerStyle={[styles.scrollContentContainer, styles.sendScreenContainer]}
+              keyboardShouldPersistTaps="handled"
             >
               <View style={styles.sendScreenHeader}>
                 <TouchableOpacity onPress={closeSendScreen} style={styles.backButton}>
@@ -4501,12 +4620,15 @@ const WalletScreen = () => {
                 </Text>
               </TouchableOpacity>
             </ScrollView>
+            </KeyboardAvoidingView>
+            )} />
           );
         }
-        
+
         // Normal Assets View
         return (
-          <ScrollView 
+          <TabBox key="assets-normal" deps={[refreshing, wallet, selectedNetwork, tokenBalances, balance, tokenPrices, copiedAddress]} render={() => (
+          <ScrollView
             style={styles.content}
             contentContainerStyle={styles.scrollContentContainer}
             onScroll={handleUserActivity}
@@ -4674,14 +4796,16 @@ const WalletScreen = () => {
             )}
 
           </ScrollView>
+          )} />
         );
 
       case 'send':
         return (
-          <ScrollView 
-            style={styles.content} 
+          <TabBox key="send" deps={[sendAddress, sendAmount, selectedToken]} render={() => (
+          <ScrollView
+            style={styles.content}
             contentContainerStyle={styles.scrollContentContainer}
-            onScroll={handleUserActivity} 
+            onScroll={handleUserActivity}
             scrollEventThrottle={500}
             showsVerticalScrollIndicator={true}
             bounces={true}
@@ -4749,15 +4873,17 @@ const WalletScreen = () => {
               <Text style={styles.buttonText}>Send Transaction</Text>
             </TouchableOpacity>
           </ScrollView>
+          )} />
         );
 
       case 'receive':
         const currentReceiveAddress = selectedNetwork === 'qnet' 
           ? (wallet.qnetAddress || wallet.address)
           : (wallet.solanaAddress || wallet.address);
-        
+
         return (
-          <ScrollView 
+          <TabBox key="receive" deps={[selectedNetwork, wallet, copiedAddress]} render={() => (
+          <ScrollView
             style={styles.content} 
             contentContainerStyle={styles.scrollContentContainer}
             onScroll={handleUserActivity} 
@@ -4811,14 +4937,16 @@ const WalletScreen = () => {
               </View>
             </View>
           </ScrollView>
+          )} />
         );
 
       case 'activate':
         return (
-          <ScrollView 
-            style={styles.content} 
+          <TabBox key="activate" deps={[activationPricing, burnProgress, loading, nodeStatus, activatedNodeType, activatingNode, wallet, password, isTestnet]} render={() => (
+          <ScrollView
+            style={styles.content}
             contentContainerStyle={styles.scrollContentContainer}
-            onScroll={handleUserActivity} 
+            onScroll={handleUserActivity}
             scrollEventThrottle={500}
             showsVerticalScrollIndicator={true}
             bounces={true}
@@ -5091,7 +5219,10 @@ const WalletScreen = () => {
                           const [solBalance] = await Promise.all([
                             walletManager.getBalance(wallet.publicKey, isTestnet)
                           ]);
-                          
+                          // null = RPC unavailable (not a genuine 0) — fail closed with a clear message, never .toFixed(null).
+                          if (solBalance == null) {
+                            throw new Error('Could not verify SOL balance (network unavailable). Please retry.');
+                          }
                           const minSolRequired = 0.001;
                           if (solBalance < minSolRequired) {
                             throw new Error(`Insufficient SOL for transaction fees.\nNeed at least 0.001 SOL, have: ${solBalance.toFixed(4)}`);
@@ -5102,6 +5233,9 @@ const WalletScreen = () => {
                             : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump';
                           
                           const oneDevBalance = await walletManager.getTokenBalance(wallet.publicKey, oneDevMint, isTestnet);
+                          if (oneDevBalance == null) {
+                            throw new Error('Could not verify 1DEV balance (network unavailable). Please retry.');
+                          }
                           // v4.10: Dynamic pricing — fetch from server if not cached
                           let requiredAmount = activationPricing?.cost;
                           if (!requiredAmount) {
@@ -5487,22 +5621,35 @@ const WalletScreen = () => {
               </TouchableOpacity>
             )}
           </ScrollView>
+          )} />
         );
 
       case 'history':
         return (
-          <ScrollView 
+          <TabBox key="history" deps={[txHistory, refreshing]} render={() => (
+          <FlatList
             key="history-tab"
             style={styles.content}
             contentContainerStyle={[
               styles.scrollContentContainer,
               Platform.OS === 'ios' && { paddingBottom: 50 }
             ]}
+            data={txHistory}
+            keyExtractor={(tx, index) => tx.hash || String(index)}
+            renderItem={({ item }) => <TxRow tx={item} onCopy={handleCopyTxHash} />}
+            ListHeaderComponent={<Text style={[styles.sectionTitle, { marginBottom: 16 }]}>Transaction History</Text>}
+            ListEmptyComponent={
+              <View style={{ alignItems: 'center', paddingVertical: 40 }}>
+                <Text style={{ color: '#666', fontSize: 16 }}>No transactions yet</Text>
+              </View>
+            }
             showsVerticalScrollIndicator={true}
-            bounces={true}
-            scrollEnabled={true}
             onScroll={handleUserActivity}
             scrollEventThrottle={500}
+            initialNumToRender={12}
+            maxToRenderPerBatch={12}
+            windowSize={7}
+            removeClippedSubviews={true}
             refreshControl={
               <RefreshControl
                 refreshing={refreshing}
@@ -5515,99 +5662,14 @@ const WalletScreen = () => {
                 tintColor="#00d4ff"
               />
             }
-          >
-            <Text style={[styles.sectionTitle, { marginBottom: 16 }]}>Transaction History</Text>
-            
-            {txHistory.length === 0 ? (
-              <View style={{ alignItems: 'center', paddingVertical: 40 }}>
-                <Text style={{ color: '#666', fontSize: 16 }}>No transactions yet</Text>
-              </View>
-            ) : (
-              txHistory.map((tx, index) => (
-                <TouchableOpacity
-                  key={tx.hash || index}
-                  style={{
-                    backgroundColor: '#16213e',
-                    borderRadius: 12,
-                    padding: 16,
-                    marginBottom: 12,
-                    borderWidth: 1,
-                    borderColor: tx.status === 'pending' ? '#ffaa00' : '#1a1a2e'
-                  }}
-                  onPress={() => {
-                    Clipboard.setString(tx.hash);
-                    showAlert('Copied', 'Transaction hash copied');
-                  }}
-                >
-                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                      <View style={{
-                        width: 32,
-                        height: 32,
-                        borderRadius: 16,
-                        backgroundColor: tx.type === 'send' ? '#ff444420' : '#00ff8820',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        marginRight: 12
-                      }}>
-                        <Text style={{ color: tx.type === 'send' ? '#ff4444' : '#00ff88', fontSize: 18 }}>
-                          {tx.type === 'send' ? '↑' : '↓'}
-                        </Text>
-                      </View>
-                      <View>
-                        <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>
-                          {tx.type === 'send' ? 'Sent' : 'Received'}
-                        </Text>
-                        <Text style={{ color: '#666', fontSize: 12 }}>
-                          {tx.status === 'pending' 
-                            ? '⏳ Pending...' 
-                            : (!tx.timestamp || tx.timestamp === 0 || tx.timestamp < 1000000)
-                              ? 'Genesis'
-                              : (() => {
-                                  const d = new Date(tx.timestamp);
-                                  const dd = String(d.getDate()).padStart(2, '0');
-                                  const mm = String(d.getMonth() + 1).padStart(2, '0');
-                                  const yyyy = d.getFullYear();
-                                  const HH = String(d.getHours()).padStart(2, '0');
-                                  const MM = String(d.getMinutes()).padStart(2, '0');
-                                  const SS = String(d.getSeconds()).padStart(2, '0');
-                                  return `${dd}.${mm}.${yyyy}, ${HH}:${MM}:${SS}`;
-                                })()}
-                        </Text>
-                      </View>
-                    </View>
-                    <View style={{ alignItems: 'flex-end', flexShrink: 1, marginLeft: 8 }}>
-                      <Text style={{ 
-                        color: tx.type === 'send' ? '#ff4444' : '#00ff88', 
-                        fontSize: 16, 
-                        fontWeight: '600' 
-                      }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
-                        {tx.amount === 0 ? '0' : `${tx.type === 'send' ? '-' : '+'}${tx.amount.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: Math.abs(tx.amount) >= 1 ? 4 : 8 })}`} QNC
-                      </Text>
-                      {tx.fee > 0 && (
-                        <Text style={{ color: '#666', fontSize: 11 }}>
-                          Fee: {tx.fee.toFixed(5)} QNC
-                        </Text>
-                      )}
-                    </View>
-                  </View>
-                  <View style={{ borderTopWidth: 1, borderTopColor: '#1a1a2e', paddingTop: 8 }}>
-                    <Text style={{ color: '#888', fontSize: 11 }}>
-                      {tx.type === 'send' ? 'To: ' : 'From: '}
-                      <Text style={{ color: '#00d4ff', fontFamily: 'monospace' }}>
-                        {(tx.type === 'send' ? tx.to : tx.from)?.slice(0, 12)}...{(tx.type === 'send' ? tx.to : tx.from)?.slice(-8)}
-                      </Text>
-                    </Text>
-                  </View>
-                </TouchableOpacity>
-              ))
-            )}
-          </ScrollView>
+          />
+          )} />
         );
 
       case 'node':
         return (
-          <ScrollView 
+          <TabBox key="node" deps={[refreshing, activatedNodeType, loadingAllNodes, nodeInitializing, allUserNodes, wallet, copiedAddress, nodePseudonym, lightNodeStatus, serverNodeStatus, currentBlockHeight, reactivatingNode, processingValidation]} render={() => (
+          <ScrollView
             key="node-tab"
             style={styles.content}
             contentContainerStyle={[
@@ -5946,12 +6008,14 @@ const WalletScreen = () => {
             </View>
             )}
           </ScrollView>
+          )} />
         );
 
       case 'settings':
         return (
-          <ScrollView 
-            style={styles.content} 
+          <TabBox key="settings" deps={[autoLockTime, language, isTestnet, wallet, biometricSupported, biometricEnabled]} render={() => (
+          <ScrollView
+            style={styles.content}
             contentContainerStyle={styles.scrollContentContainer}
             showsVerticalScrollIndicator={true}
             bounces={true}
@@ -6120,6 +6184,7 @@ const WalletScreen = () => {
               </TouchableOpacity>
             </View>
           </ScrollView>
+          )} />
         );
 
       default:

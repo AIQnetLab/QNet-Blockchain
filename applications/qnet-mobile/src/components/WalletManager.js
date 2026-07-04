@@ -8,14 +8,13 @@ import nacl from 'tweetnacl'; // Ed25519 signing for node operations
 import * as Keychain from 'react-native-keychain';
 // v3.35: Centralized node configuration (no duplication!)
 // v4.10: Added getSolanaRpcUrl for centralized Solana RPC management
-import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl } from '../config/nodes';
+import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl, rotateSolanaRpc } from '../config/nodes';
 // Post-quantum BFT light-client: trustless committee-QC state-root verification
 // (replaces the MITM-bypassable 2/3 peer-poll). MITM-proof at any network size.
 import { verifyMacroblockStateRoot } from '../crypto/QcLightClient';
 
 export class WalletManager {
   constructor() {
-    this.connection = new Connection(getSolanaRpcUrl(true), 'confirmed');
     this.keyCache = null;       // Uint8Array (32-byte AES key), NOT the password
     this._keyCacheSalt = null;  // Hex salt that was used to derive keyCache
     this._keyCacheIter = 0;     // Iteration count used to derive keyCache
@@ -2896,16 +2895,9 @@ export class WalletManager {
       // Ignore cache errors
     }
     
-    // Fallback to Genesis bootstrap nodes if no discovered nodes
-    // These are the official Genesis nodes from genesis_constants.rs
-    const genesisNodes = [
-      { url: 'http://154.38.160.39:8001', region: 'North America' },
-      { url: 'http://62.171.157.44:8001', region: 'Europe' },
-      { url: 'http://161.97.86.81:8001', region: 'Europe' },
-      { url: 'http://5.189.130.160:8001', region: 'Europe' },
-      { url: 'http://162.244.25.114:8001', region: 'Europe' }
-    ];
-    
+    // Fallback to the canonical Genesis list (single source: config/nodes.js).
+    const genesisNodes = GENESIS_NODES.map(url => ({ url }));
+
     // Try to discover new nodes from Genesis nodes
     this.discoverNodes(genesisNodes);
     
@@ -2921,11 +2913,13 @@ export class WalletManager {
       // Query each seed node for their peer list
       for (const seed of seedNodes) {
         try {
+          const controller = new AbortController();
+          const t = setTimeout(() => controller.abort(), 5000);
           const response = await fetch(`${seed.url}/api/v1/peers`, {
             method: 'GET',
-            timeout: 5000
-          });
-          
+            signal: controller.signal, // `timeout:` is ignored by fetch — use AbortController
+          }).finally(() => clearTimeout(t));
+
           if (response.ok) {
             const data = await response.json();
             if (data.peers && Array.isArray(data.peers)) {
@@ -2977,6 +2971,8 @@ export class WalletManager {
   // v3.35: Cache contains ALL validators including Genesis (verified via Merkle)
   static discoveredNodesCache = null;
   static lastDiscoveryTime = 0;
+  static nodeHealth = {};   // baseUrl -> { ewmaMs, fails, lastFailAt } — client-side latency/failure
+  static nonceCache = {};   // address -> { next, at } — local nonce, re-anchored on staleness/error
   
   // v3.36: Synchronous node getter - uses cache with weighted random
   // Genesis nodes ARE in the cache - NO SEPARATE FALLBACK!
@@ -3016,71 +3012,128 @@ export class WalletManager {
     return getRandomGenesisNode();
   }
   
-  // v6.0: Get current block producer's HTTP endpoint for direct TX routing.
-  // Submitting TX directly to the producer cuts confirmation latency from
-  // up to 30 sec (random node + wait for its producer turn) down to ~1 sec.
-  // Falls back to random node if producer endpoint is unavailable.
-  async getProducerEndpoint() {
-    try {
-      const baseUrl = this.getRandomBootstrapNode();
-      const resp = await fetch(`${baseUrl}/api/v1/producer/status`, {
-        method: 'GET',
-        headers: { 'Content-Type': 'application/json' },
-      });
-      if (!resp.ok) return null;
-      const data = await resp.json();
-      // producer_endpoint is a full URL (e.g. "https://162.244.25.114:8001/api/v1/")
-      // We need just the base URL (without /api/v1/) for our fetch calls
-      const endpoint = data.producer_endpoint || '';
-      if (!endpoint) return null;
-      // Strip trailing /api/v1/ if present
-      const base = endpoint.replace(/\/api\/v1\/?$/, '');
-      return base || null;
-    } catch (_) {
-      return null;
-    }
+  // --- Scalable node client: health-ranked selection + hedged, timeout-bounded requests ---------
+  // Every remote call is capped by a timeout and hedged across two nodes, so one slow/unreachable
+  // node can never stall a send; load stays spread across the whole validator set.
+
+  _recordNode(base, ok, ms) {
+    const h = WalletManager.nodeHealth[base] || { ewmaMs: 300, fails: 0, lastFailAt: 0 };
+    if (ok) { h.ewmaMs = h.ewmaMs * 0.7 + ms * 0.3; h.fails = 0; }
+    else { h.fails = Math.min(h.fails + 1, 10); h.lastFailAt = Date.now(); }
+    WalletManager.nodeHealth[base] = h;
   }
 
-  // v6.0: Submit a signed transaction to the current producer first, with fallback.
-  // Ensures TX is in the right place at the right time — producer includes it in the
-  // very next microblock instead of waiting up to one full rotation (30 blocks).
-  async submitTransactionToProducer(txPayload) {
-    // Try current producer first
-    let producerUrl = null;
-    try {
-      producerUrl = await this.getProducerEndpoint();
-    } catch (_) { /* fallback below */ }
+  _recentlyFailed(base) {
+    const h = WalletManager.nodeHealth[base];
+    return !!h && h.fails >= 3 && (Date.now() - h.lastFailAt) < 30000;
+  }
 
-    const urls = [];
-    if (producerUrl) urls.push(producerUrl);
-    // Always add a random bootstrap node as fallback
-    urls.push(this.getRandomBootstrapNode());
-    // Deduplicate
-    const tried = new Set();
-
-    for (const baseUrl of urls) {
-      if (tried.has(baseUrl)) continue;
-      tried.add(baseUrl);
-      try {
-        const resp = await fetch(`${baseUrl}/api/v1/transaction`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(txPayload),
-        });
-        const result = await resp.json();
-        if (result.success || result.tx_hash) {
-          if (producerUrl && baseUrl === producerUrl) {
-            console.log('[Producer] TX submitted directly to producer:', baseUrl);
-          }
-          return result;
-        }
-        // Server returned an application-level error — propagate immediately
-        if (!result.success) return result;
-      } catch (netErr) {
-        console.warn('[Producer] Node unreachable, trying fallback:', baseUrl, netErr.message);
-      }
+  // Up to `count` distinct eligible nodes, weighted-random by reputation (spreads load), skipping
+  // recently-failing ones. Falls back to a genesis node only when the discovery cache is cold.
+  getRankedNodes(count = 2) {
+    const cache = WalletManager.discoveredNodesCache;
+    let pool = [];
+    if (cache && cache.length > 0) {
+      const now = Math.floor(Date.now() / 1000);
+      const eligible = (n) => (now - (n.lastSeen || 0)) < NODE_DISCOVERY.MAX_STALE_SECS
+        && n.reputation >= NODE_DISCOVERY.MIN_REPUTATION && n.isSynced !== false;
+      pool = cache.filter(n => eligible(n) && !this._recentlyFailed(n.url));
+      if (pool.length === 0) pool = cache.filter(eligible);   // relax if all transiently marked bad
     }
-    throw new Error('All nodes failed to accept transaction');
+    const urls = [];
+    const picks = pool.slice();
+    while (urls.length < count && picks.length > 0) {
+      const total = picks.reduce((s, n) => s + (n.reputation || 0.7), 0);
+      let r = Math.random() * total, idx = 0;
+      for (let i = 0; i < picks.length; i++) { r -= (picks[i].reputation || 0.7); if (r <= 0) { idx = i; break; } }
+      urls.push(picks[idx].url); picks.splice(idx, 1);
+    }
+    if (urls.length === 0) { this.refreshNodeDiscovery(); urls.push(getRandomGenesisNode()); }
+    return urls;
+  }
+
+  // Hedged request: fire the primary; if silent for hedgeMs, race a second node in parallel; first
+  // success wins and aborts the rest; a failing node hands off to the next at once. Each attempt is
+  // capped by timeoutMs. POST is safe to hedge — a signed TX is content-addressed, so the mempool
+  // dedups a double-submit.
+  async _hedged(path, { method = 'GET', body = null, timeoutMs = 4000, hedgeMs = 700, nodes = null, raw = false } = {}) {
+    const bases = nodes || this.getRankedNodes(2);
+    const ctrls = [];
+    let settled = false, launched = 0, pending = 0, lastErr = null;
+    const run = (base) => new Promise((resolve, reject) => {
+      const c = new AbortController(); ctrls.push(c);
+      const t0 = Date.now();
+      const guard = setTimeout(() => c.abort(), timeoutMs);
+      fetch(`${base}${path}`, {
+        method, headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined, signal: c.signal,
+      }).then(async (r) => {
+        clearTimeout(guard);
+        const data = raw ? (await r.text().catch(() => '')) : (await r.json().catch(() => ({})));
+        this._recordNode(base, true, Date.now() - t0);
+        resolve({ ok: r.ok, status: r.status, data, base });
+      }).catch((e) => {
+        clearTimeout(guard); this._recordNode(base, false, Date.now() - t0); reject(e);
+      });
+    });
+    return new Promise((resolve, reject) => {
+      const launch = (i) => {
+        if (settled || i >= bases.length) return;
+        launched++; pending++;
+        run(bases[i]).then((res) => {
+          if (settled) return;
+          settled = true; ctrls.forEach(c => { try { c.abort(); } catch (_) {} }); resolve(res);
+        }).catch((e) => {
+          pending--; lastErr = e;
+          if (settled) return;
+          if (launched < bases.length) launch(launched);            // failed → next immediately
+          else if (pending === 0) reject(lastErr || new Error('all nodes failed'));
+        });
+      };
+      launch(0);
+      if (bases.length > 1) setTimeout(() => { if (!settled && launched < 2) launch(1); }, hedgeMs);
+    });
+  }
+
+  // Submit a signed TX (hedged POST). Gossip routes it to the current producer within ~1 microblock,
+  // so no producer-lookup round-trip is needed.
+  async submitSignedTx(txPayload) {
+    const res = await this._hedged('/api/v1/transaction', { method: 'POST', body: txPayload, timeoutMs: 5000, hedgeMs: 900 });
+    return res.data || {};
+  }
+
+  // Nonce for the next TX from `address`, tracked locally so back-to-back sends skip the round-trip;
+  // re-anchored from chain when stale (TTL) or forced after a nonce-rejected submit.
+  async resolveNonce(address, forceFresh = false) {
+    const cached = WalletManager.nonceCache[address];
+    if (!forceFresh && cached && (Date.now() - cached.at) < 15000) return cached.next;
+    let accountNonce = 0;
+    try {
+      const res = await this._hedged(`/api/v1/account/${address}`, { timeoutMs: 4000, hedgeMs: 700 });
+      if (res.ok && res.data) accountNonce = res.data.nonce || 0;
+      else if (cached) return cached.next;
+    } catch (e) {
+      if (cached) return cached.next;
+      console.warn('[SEND] nonce fetch failed, assuming 0:', e.message);
+    }
+    const next = accountNonce + 1;
+    WalletManager.nonceCache[address] = { next, at: Date.now() };
+    return next;
+  }
+
+  _bumpNonce(address, usedNonce) {
+    WalletManager.nonceCache[address] = { next: usedNonce + 1, at: Date.now() };
+  }
+
+  // Stable per-wallet secret (Ed25519 private key hex, deterministic from the mnemonic) used to bind
+  // the node's Dilithium identity seed to a secret the owner holds — never public chain data.
+  async _walletSecretHex(password, walletData = null) {
+    const wd = walletData || await this.loadWallet(password);
+    const priv = wd?.qnetKeypair?.privateKey
+      ? new Uint8Array(wd.qnetKeypair.privateKey)
+      : (wd?.secretKey ? new Uint8Array(wd.secretKey.slice(0, 32)) : null);
+    if (!priv || priv.length < 32) throw new Error('wallet secret unavailable for key derivation');
+    return Buffer.from(priv).toString('hex');
   }
 
   // Async node getter with guaranteed fresh data
@@ -3348,81 +3401,53 @@ export class WalletManager {
 
   // Get wallet balance from Solana network
   async getBalance(publicKey, isTestnet = true) {
-    try {
-      // Use correct RPC based on network (don't use cached connection)
-      // FIXED: Previously inverted - now isTestnet=true means devnet
-      const rpcUrl = getSolanaRpcUrl(isTestnet);
-        
-      const response = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getBalance',
-          params: [publicKey]
-        })
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        // Convert lamports to SOL (1 SOL = 1e9 lamports)
-        return (data.result?.value || 0) / 1e9;
-      }
-      
-      return 0;
-    } catch (error) {
-      // console.error('Error getting balance:', error);
-      return 0;
+    // 2 attempts, rotating the Solana RPC endpoint on 429/failure; null (not 0) ⇒ keep last-known.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const rpcUrl = attempt === 0 ? getSolanaRpcUrl(isTestnet) : rotateSolanaRpc(isTestnet);
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 5000);
+        const response = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getBalance', params: [publicKey] }),
+          signal: controller.signal,
+        }).finally(() => clearTimeout(t));
+        if (response.ok) {
+          const data = await response.json();
+          return (data.result?.value || 0) / 1e9; // lamports → SOL
+        }
+      } catch (error) { /* rotate + retry */ }
     }
+    return null;
   }
   
   // Get SPL token balance (for 1DEV and other tokens)
   async getTokenBalance(walletAddress, mintAddress, isTestnet = true) {
-    try {
-      // v4.10: Centralized RPC URL
-      const rpcUrl = getSolanaRpcUrl(isTestnet);
-      
-      // Get token accounts for the wallet
-      const response = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTokenAccountsByOwner',
-          params: [
-            walletAddress,
-            {
-              mint: mintAddress
-            },
-            {
-              encoding: 'jsonParsed'
-            }
-          ]
-        })
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        const accounts = data.result?.value || [];
-        
-        if (accounts.length > 0) {
-          // Get the token amount from the first account
-          const tokenAmount = accounts[0].account.data.parsed.info.tokenAmount;
-          return parseFloat(tokenAmount.uiAmount) || 0;
+    // 2 attempts, rotating the Solana RPC on 429/failure; null (not 0) on failure ⇒ keep last-known.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const rpcUrl = attempt === 0 ? getSolanaRpcUrl(isTestnet) : rotateSolanaRpc(isTestnet);
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 5000);
+        const response = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getTokenAccountsByOwner',
+            params: [walletAddress, { mint: mintAddress }, { encoding: 'jsonParsed' }] }),
+          signal: controller.signal,
+        }).finally(() => clearTimeout(t));
+        if (response.ok) {
+          const data = await response.json();
+          const accounts = data.result?.value || [];
+          if (accounts.length > 0) {
+            return parseFloat(accounts[0].account.data.parsed.info.tokenAmount.uiAmount) || 0;
+          }
+          return 0; // no token account = genuine zero
         }
-      }
-      
-      return 0;
-    } catch (error) {
-      // console.error('Error getting token balance:', error);
-      return 0;
+      } catch (error) { /* rotate + retry */ }
     }
+    return null;
   }
 
   // v3.36: DEPRECATED - Use getQNCBalanceWithProof() for ALL balance queries!
@@ -3432,9 +3457,8 @@ export class WalletManager {
   // WHY: getQNCBalance() trusts the node response without Merkle verification
   // A malicious node could return fake balance. getQNCBalanceWithProof() prevents this.
   async getQNCBalance(address, maxRetries = 3) {
-    // v3.36: Redirect to trustless method - extract just the balance
     const result = await this.getQNCBalanceWithProof(address, true, maxRetries);
-    return result.balance || 0;
+    return result.ok ? result.balance : null;   // null on failure ⇒ caller keeps last-known
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -3449,91 +3473,46 @@ export class WalletManager {
    * @param {boolean} verify - Whether to verify the proof
    * @returns {Promise<{balance: number, verified: boolean, proof: object}>}
    */
-  async getQNCBalanceWithProof(address, verify = true, maxRetries = 3) {
+  // Returns { ok, balance, verified, ... }. ok=false ⇒ fetch failed / no data: the caller MUST keep
+  // the last-known balance, NEVER display a fabricated 0. Hedged + health-ranked (send-path bar).
+  async getQNCBalanceWithProof(address, verify = true, _maxRetries = 3) {
     if (!address || typeof address !== 'string') {
-      return { balance: 0, verified: false, proof: null, error: 'Invalid address' };
+      return { ok: false, balance: null, verified: false, error: 'Invalid address' };
     }
-    
-    let lastError = null;
-    const triedNodes = new Set();
-    
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      try {
-        // v3.35: Get random node, avoid retrying same node
-        let apiUrl = this.getRandomBootstrapNode();
-        let retryCount = 0;
-        while (triedNodes.has(apiUrl) && retryCount < 5) {
-          apiUrl = this.getRandomBootstrapNode();
-          retryCount++;
-        }
-        triedNodes.add(apiUrl);
-        
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout for proof
-        
-        // v3.11: Request balance WITH Merkle proof
-        const response = await fetch(`${apiUrl}/api/v1/account/${address}/balance/proof`, {
-          method: 'GET',
-          headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal
-        });
-        
-        clearTimeout(timeoutId);
-        
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        
-        const data = await response.json();
-        const balanceNano = data.balance || 0;
-        const balanceQNC = balanceNano / 1e9;
-        
-        // Verify proof if requested
-        let verified = false;
-        if (verify && data.merkle_proof && data.merkle_proof.length > 0) {
-          // Step 1: Verify Merkle proof locally
-          const proofValid = await this.verifyMerkleProof(
-            address,
-            balanceNano,
-            data.nonce || 0,
-            data.merkle_proof,
-            data.state_root
-          );
-          
-          // Step 2: Verify state_root is certified by a ≥quorum committee QC,
-          // verified inductively from the binary-pinned trust anchor (MITM-proof).
-          // Replaces the old verifyStateRootFromMultipleNodes 2/3 peer-poll, which a
-          // MITM could satisfy by returning matching fake roots from controlled nodes.
-          if (proofValid) {
-            verified = await verifyMacroblockStateRoot(
-              data.state_root,
-              data.block_height,
-              () => this.getRandomBootstrapNode()
-            );
-          }
-        }
-        
-        return {
-          balance: balanceQNC,
-          balanceNano: balanceNano,
-          nonce: data.nonce || 0,
-          verified: verified,
-          blockHeight: data.block_height,
-          stateRoot: data.state_root,
-          proof: data.merkle_proof
-        };
-      } catch (error) {
-        lastError = error;
-        // v3.35: Wait before retry (exponential backoff)
-        if (attempt < maxRetries - 1) {
-          await new Promise(r => setTimeout(r, (attempt + 1) * 500));
-        }
+    let res;
+    try {
+      // raw text: balance/nonce are uint64 — JSON.parse would lose precision past 2^53 nano (>9.007M QNC).
+      res = await this._hedged(`/api/v1/account/${address}/balance/proof`, { timeoutMs: 5000, hedgeMs: 800, raw: true });
+    } catch (e) {
+      console.warn('[BALANCE] proof fetch failed:', e.message);
+      return { ok: false, balance: null, verified: false, error: e.message };
+    }
+    if (!res.ok || !res.data) {
+      return { ok: false, balance: null, verified: false, error: `HTTP ${res.status}` };
+    }
+    let data;
+    try { data = JSON.parse(res.data); } catch (_) {
+      return { ok: false, balance: null, verified: false, error: 'bad json' };
+    }
+    // Exact base-units extracted as strings from the raw text (BigInt-safe for the proof); Number only
+    // for the display value, where precision loss above ~9M QNC is acceptable.
+    const balMatch = /"balance"\s*:\s*"?(\d+)"?/.exec(res.data);
+    const balanceNanoStr = balMatch ? balMatch[1] : String(data.balance || 0);
+    const nonceMatch = /"nonce"\s*:\s*"?(\d+)"?/.exec(res.data);
+    const nonceStr = nonceMatch ? nonceMatch[1] : String(data.nonce || 0);
+    const balanceQNC = Number(balanceNanoStr) / 1e9;
+    // QC-anchored proof verification (MITM-proof); advisory flag surfaced to the caller.
+    let verified = false;
+    if (verify && data.merkle_proof && data.merkle_proof.length > 0) {
+      const proofValid = await this.verifyMerkleProof(address, balanceNanoStr, nonceStr, data.merkle_proof, data.state_root);
+      if (proofValid) {
+        verified = await verifyMacroblockStateRoot(data.state_root, data.block_height, () => this.getRankedNodes(1)[0]);
       }
     }
-    
-    // All retries failed
-    console.warn(`[BALANCE_PROOF] Failed after ${maxRetries} retries:`, lastError?.message);
-    return { balance: 0, verified: false, proof: null, error: lastError?.message || 'Unknown error' };
+    return {
+      ok: true, balance: balanceQNC, balanceNano: balanceNanoStr, nonce: nonceStr,
+      verified, blockHeight: data.block_height, stateRoot: data.state_root, proof: data.merkle_proof,
+    };
   }
 
   /**
@@ -3945,15 +3924,9 @@ export class WalletManager {
       return this._networkSizeCache;
     }
     
-    // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
-    const bootstrapNodes = [
-      'http://154.38.160.39:8001',   // Genesis #1 - North America
-      'http://62.171.157.44:8001',   // Genesis #2 - Europe
-      'http://161.97.86.81:8001',    // Genesis #3 - Europe
-      'http://5.189.130.160:8001',   // Genesis #4 - Europe
-      'http://162.244.25.114:8001'   // Genesis #5 - Europe
-    ];
-    
+    // Canonical Genesis list (single source: config/nodes.js).
+    const bootstrapNodes = GENESIS_NODES;
+
     // Try multiple bootstrap nodes for reliability
     for (const apiUrl of bootstrapNodes) {
       try {
@@ -4052,12 +4025,9 @@ export class WalletManager {
         // console.error('[getBurnProgress] Failed to fetch:', response.status, response.statusText);
       }
       
-      // Fallback values
-      return '0.0';
+      return null; // failure ⇒ caller keeps last-known (don't fabricate 0.0%)
     } catch (error) {
-      // console.error('[getBurnProgress] Error:', error);
-      // Return zero if can't fetch real data
-      return '0.0';
+      return null;
     }
   }
 
@@ -5126,7 +5096,7 @@ export class WalletManager {
     const PHASE_1_BASE_PRICE = 1500; // Base cost in 1DEV at 0% burned
     const PRICE_REDUCTION_PER_10_PERCENT = 150; // 150 1DEV reduction per 10% burned
     try {
-      const burnPercent = parseFloat(await this.getBurnProgress(false));
+      const burnPercent = parseFloat((await this.getBurnProgress(false)) ?? '0'); // null ⇒ treat as 0% (same as old fallback)
       const MINIMUM_PRICE = 300; // Minimum price at 80-90% burned
       
       // Check if Phase 2 (90% burned or 5 years passed)
@@ -5383,15 +5353,15 @@ export class WalletManager {
   // Generate Light Node pseudonym (matching backend logic)
   generateLightNodePseudonym(walletAddress) {
     // MUST match server: rpc.rs generate_light_node_pseudonym() uses blake3
-    // blake3::hash("LIGHT_NODE_PRIVACY_{wallet}") → first 8 hex chars
+    // blake3::hash("LIGHT_NODE_PRIVACY_{wallet}") → first 16 hex chars (64-bit)
     const { blake3 } = require('@noble/hashes/blake3.js');
     const input = `LIGHT_NODE_PRIVACY_${walletAddress}`;
     const hashBytes = blake3(Buffer.from(input, 'utf8'));
-    // First 4 bytes → 8 hex chars (matches Rust: &pseudonym_hash.to_hex()[..8])
-    const hexHash = Array.from(hashBytes.slice(0, 4))
+    // First 8 bytes → 16 hex chars (matches Rust: &pseudonym_hash.to_hex()[..16])
+    const hexHash = Array.from(hashBytes.slice(0, 8))
       .map(b => b.toString(16).padStart(2, '0'))
       .join('');
-    // Server uses QNET_REGION env var defaulting to "mobile"
+    // Region-independent: server pins the "mobile" segment (no QNET_REGION in id derivation)
     return `light_mobile_${hexHash}`;
   }
   
@@ -5462,38 +5432,17 @@ export class WalletManager {
       payload.owner_signature = Buffer.from(ownerSig).toString('hex');
     }
 
-    // Get producer endpoint and submit
-    let producerUrl = null;
+    // Hedged submit — timeout-bounded across two nodes; gossip routes it to the producer.
+    let result;
     try {
-      producerUrl = await this.getProducerEndpoint();
-    } catch (_) { /* fallback below */ }
-
-    const nodes = [];
-    if (producerUrl) nodes.push(producerUrl);
-    nodes.push(this.getRandomBootstrapNode());
-    const tried = new Set();
-
-    for (const baseUrl of nodes) {
-      if (tried.has(baseUrl)) continue;
-      tried.add(baseUrl);
-      try {
-        const resp = await fetch(`${baseUrl}/api/v1/node-registration/submit`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        const result = await resp.json();
-        if (result.success) {
-          console.log('[NodeReg] TX submitted successfully, hash:', result.tx_hash, 'via', baseUrl);
-          return result;
-        }
-        console.warn('[NodeReg] TX rejected:', result.error);
-        return result;
-      } catch (netErr) {
-        console.warn('[NodeReg] Node unreachable, trying fallback:', baseUrl);
-      }
+      const res = await this._hedged('/api/v1/node-registration/submit', { method: 'POST', body: payload, timeoutMs: 8000, hedgeMs: 1200 });
+      result = res.data || {};
+    } catch (netErr) {
+      throw new Error('Failed to submit NodeRegistration TX: all nodes unreachable');
     }
-    throw new Error('Failed to submit NodeRegistration TX: all nodes unreachable');
+    if (result.success) console.log('[NodeReg] submitted hash:', result.tx_hash);
+    else console.warn('[NodeReg] rejected:', result.error);
+    return result;
   }
 
   // Register node with activation code
@@ -5519,7 +5468,7 @@ export class WalletManager {
 
         if (isDilithiumAvailable()) {
           // Generate or load Dilithium3 keypair
-          const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password);
+          const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password, await this._walletSecretHex(password));
 
           // Part 1 (Dilithium3): Sign wallet_address — quantum-resistant identity proof
           // Server verifies: verify_mobile_dilithium_signature(wallet_address, sig, pubkey)
@@ -5885,7 +5834,7 @@ export class WalletManager {
       }
 
       // Load Dilithium3 keys (mandatory — no Ed25519 fallback)
-      const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password);
+      const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password, await this._walletSecretHex(password));
 
       // Sign challenge with Dilithium3
       const dilithiumSig = await signWithDilithium(
@@ -5939,10 +5888,6 @@ export class WalletManager {
       if (serverPendingRewards !== null && serverPendingRewards < 1_000_000_000) {
         return { success: false, message: 'Minimum claim amount is 1 QNC' };
       }
-      
-      // Get backend URL - use official API endpoints
-      // Direct connection to bootstrap node - fully decentralized
-      const apiUrl = this.getRandomBootstrapNode();
       
       let nodeId;
       if (actualNodeId) {
@@ -6002,7 +5947,7 @@ export class WalletManager {
       try {
         const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
         if (isDilithiumAvailable()) {
-          const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password);
+          const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password, await this._walletSecretHex(password));
           dilithiumSignature = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
           dilithiumPublicKey = dilithiumKeys.publicKey;
         }
@@ -6012,32 +5957,22 @@ export class WalletManager {
         console.warn('[claimRewards] Dilithium signing failed (server will reject):', dilithiumErr.message);
       }
       
-      // Submit claim request to official API
-      const claimResponse = await fetch(`${apiUrl}/api/v1/rewards/claim`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
+      // Submit claim (hedged POST — timeout-bounded across two nodes).
+      const claimRes = await this._hedged('/api/v1/rewards/claim', {
+        method: 'POST', timeoutMs: 8000, hedgeMs: 1200,
+        body: {
           node_id: nodeId,
           wallet_address: walletAddress,
-          quantum_signature: quantumSignature,   // Ed25519 signature (hex)
-          public_key: publicKeyHex,              // Ed25519 public key (hex)
+          quantum_signature: quantumSignature,   // Ed25519 (hex)
+          public_key: publicKeyHex,              // Ed25519 pubkey (hex)
           ...(dilithiumSignature && { dilithium_signature: dilithiumSignature }),
           ...(dilithiumPublicKey && { dilithium_public_key: dilithiumPublicKey }),
-        })
+        },
       });
-      
-      if (!claimResponse.ok) {
-        const errorData = await claimResponse.json().catch(() => ({}));
-        throw new Error(errorData.error || errorData.message || 'Failed to claim rewards');
+      const claimResult = claimRes.data || {};
+      if (!claimRes.ok) {
+        throw new Error(claimResult.error || claimResult.message || 'Failed to claim rewards');
       }
-      
-      const claimResult = await claimResponse.json().catch(() => {
-        throw new Error('Invalid JSON response from server');
-      });
-      
-      // Check if claim was successful
       if (!claimResult.success) {
         throw new Error(claimResult.error || 'Claim failed on server');
       }
@@ -6106,16 +6041,22 @@ export class WalletManager {
         throw new Error('Recipient address is required');
       }
 
-      // Accept EON format (45 chars with 'eon') or hex format (64 chars)
-      const isEonFormat = toAddress.includes('eon') && toAddress.length === 45;
+      // EON (45 chars, "eon" marker at offset 19, 8-char SHA3 checksum) or hex (64 chars).
+      const isEonFormat = toAddress.length === 45 && toAddress.slice(19, 22) === 'eon';
       const isHexFormat = /^[0-9a-fA-F]{64}$/.test(toAddress);
-
       if (!isEonFormat && !isHexFormat) {
         throw new Error('Invalid address. EON (45 chars) or Hex (64 chars) required.');
       }
-      
-      if (!amount || amount <= 0) {
-        throw new Error('Amount must be greater than 0');
+      if (isEonFormat) {
+        // Reject a mistyped EON address BEFORE signing — checksum over the first 37 chars.
+        const { sha3_256 } = require('js-sha3');
+        const expectedCk = sha3_256(toAddress.slice(0, 37)).substring(0, 8).toLowerCase();
+        if (toAddress.slice(37).toLowerCase() !== expectedCk) {
+          throw new Error('Invalid recipient address (checksum mismatch)');
+        }
+      }
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new Error('Amount must be a valid positive number');
       }
       
       // Load wallet for signing
@@ -6158,72 +6099,54 @@ export class WalletManager {
       // Format: "transfer:from:to:amount:nonce:gas_price:gas_limit"
       // v2.101: Use Math.round() to avoid floating point precision loss
       // Example: Math.floor(0.1 * 1e9) = 99999999, but Math.round() = 100000000
-      const amountSmallest = Math.round(amount * 1_000_000_000); // Convert QNC to smallest unit (9 decimals)
+      const amountSmallest = Math.round(amount * 1_000_000_000); // QNC → nano (9 decimals)
+      if (!Number.isSafeInteger(amountSmallest)) {
+        throw new Error('Amount too large or imprecise'); // beyond 2^53 nano — would lose precision
+      }
       const gasPrice = 10; // nanoQNC/gas — matches node MIN_GAS_PRICE (fee = 10 * 10000 = 0.0001 QNC/transfer)
       const gasLimit = 10_000;
       
       // Get public key for verification (32 bytes hex)
       const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
       
-      // Use any bootstrap node to fetch nonce; then route TX to current producer
-      const anyNode = this.getRandomBootstrapNode();
-      
-      // CRITICAL v2.77: Get current nonce from blockchain state for replay protection
-      let currentNonce = 0;
-      try {
-        const accountResponse = await fetch(`${anyNode}/api/v1/account/${fromAddress}`);
-        if (accountResponse.ok) {
-          const accountData = await accountResponse.json();
-          currentNonce = accountData.nonce || 0;
-        }
-      } catch (nonceError) {
-        console.warn('[WalletManager] Failed to fetch nonce, using 0:', nonceError);
-      }
-      
-      // v2.77: Create signature message with nonce (Ethereum-style)
-      // CRITICAL: nonce in TX = account.nonce + 1 (like Ethereum)
-      const txNonce = currentNonce + 1;
-      const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${txNonce}:${gasPrice}:${gasLimit}`;
-      const messageBytes = Buffer.from(message, 'utf8');
-      
-      // Sign with Ed25519 (nacl needs 64-byte secret key = privateKey + publicKey)
-      const fullSecretKey = privateKeyBytes.length === 64 
-        ? privateKeyBytes 
+      // Ed25519 secret = 32-byte priv ++ 32-byte pub (nacl format).
+      const fullSecretKey = privateKeyBytes.length === 64
+        ? privateKeyBytes
         : new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
-      
-      const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
-      const signature = Buffer.from(ed25519Sig).toString('hex');
-      
-      // v6.0: Producer-aware routing — submit TX directly to the current block producer.
-      // This guarantees inclusion in the NEXT microblock (~1 sec) instead of waiting
-      // for a random node to become producer (up to 30 sec with 5 nodes × 30-block slots).
-      const result = await this.submitTransactionToProducer({
-        from: fromAddress,
-        to: toAddress,
-        amount: amountSmallest,
-        signature: signature,
-        public_key: publicKeyHex,
-        gas_price: gasPrice,
-        gas_limit: gasLimit,
-        nonce: txNonce,
-      });
-      
-      if (!result.success) {
-        // v2.101: Show BOTH error and details for debugging
-        const errorMsg = result.details 
+
+      // Sign + submit for a nonce. Message: "transfer:from:to:amount:nonce:gas_price:gas_limit".
+      const buildAndSubmit = async (txNonce) => {
+        const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${txNonce}:${gasPrice}:${gasLimit}`;
+        const sig = nacl.sign.detached(Buffer.from(message, 'utf8'), fullSecretKey);
+        return this.submitSignedTx({
+          from: fromAddress, to: toAddress, amount: amountSmallest,
+          signature: Buffer.from(sig).toString('hex'), public_key: publicKeyHex,
+          gas_price: gasPrice, gas_limit: gasLimit, nonce: txNonce,
+        });
+      };
+
+      // Local nonce → hedged submit; one retry with a chain-fresh nonce if the node rejects on drift.
+      let txNonce = await this.resolveNonce(fromAddress);
+      let result = await buildAndSubmit(txNonce);
+      if (result && result.success === false && !result.tx_hash &&
+          /nonce/i.test(`${result.error || ''} ${result.details || ''}`)) {
+        txNonce = await this.resolveNonce(fromAddress, true);
+        result = await buildAndSubmit(txNonce);
+      }
+      // Affirmative accept: require a real tx_hash (or explicit success). An ambiguous/empty 200 is
+      // NOT a successful send — never show "sent" + deduct balance for a TX the node may have dropped.
+      const accepted = !!(result && (result.tx_hash || result.success === true));
+      if (!accepted) {
+        const errorMsg = result && result.details
           ? `${result.error}: ${result.details}`
-          : (result.error || 'Failed to send transaction');
-        console.warn('[WalletManager] Transaction rejected:', result);
+          : (result && result.error) || 'Node did not acknowledge the transaction';
+        console.warn('[SEND] tx not accepted:', errorMsg);
         throw new Error(errorMsg);
       }
-      
+      this._bumpNonce(fromAddress, txNonce);
       return {
-        success: true,
-        txHash: result.tx_hash,
-        from: fromAddress,
-        to: toAddress,
-        amount: amount,
-        timestamp: Date.now()
+        success: true, txHash: result.tx_hash,
+        from: fromAddress, to: toAddress, amount, timestamp: Date.now(),
       };
     } catch (error) {
       console.warn('[WalletManager] Send QNC error:', error.message || error);

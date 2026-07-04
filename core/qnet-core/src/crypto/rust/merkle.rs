@@ -178,6 +178,159 @@ pub fn generate_merkle_proof(
     generate_merkle_proof_optimized(transaction_hashes, tx_index)
 }
 
+// ============================================================================
+// Sharded proof serving (scale: 10M+ reward leaves).
+// The reward tree is the SAME single binary tree compute_merkle_root builds — so
+// reward_root, the wire proof format, on-chain verify, and the app are ALL unchanged.
+// Sharding is purely a SERVING optimization: a claim rebuilds ONLY its shard's
+// subtree (≤ SHARD_SIZE leaves) + the small tree over shard-roots, i.e. O(SHARD_SIZE
+// + N/SHARD_SIZE) instead of the whole O(N) tree. SHARD_SIZE MUST be a power of two so
+// each shard is a height-log2(SHARD_SIZE) subtree of the bottom-up build; only the last
+// shard may be partial (the global build pads a partial/short shard up to that height by
+// the same odd→self duplication, so shard subtrees are built to FIXED height to match).
+// ============================================================================
+
+/// Levels a `shard_size`-leaf (power-of-two) shard occupies in the global tree.
+#[inline]
+pub fn shard_height(shard_size: usize) -> u32 { shard_size.trailing_zeros() }
+
+/// Decode leaf hex → the H(0x00||leaf) leaf-level nodes (same domain sep as the builders).
+fn leaf_nodes(leaf_hashes: &[String]) -> Result<Vec<[u8; HASH_SIZE]>, Box<dyn Error>> {
+    let mut out = Vec::with_capacity(leaf_hashes.len());
+    for hs in leaf_hashes {
+        let b = hex::decode(hs).map_err(|e| format!("Invalid hex: {}", e))?;
+        if b.len() != HASH_SIZE { return Err(format!("Invalid hash length: {}", b.len()).into()); }
+        let mut h = Sha3_256::new(); h.update(&[0x00u8]); h.update(&b);
+        let mut a = [0u8; HASH_SIZE]; a.copy_from_slice(&h.finalize()); out.push(a);
+    }
+    Ok(out)
+}
+
+#[inline]
+fn pair(l: &[u8; HASH_SIZE], r: &[u8; HASH_SIZE]) -> [u8; HASH_SIZE] {
+    let mut h = Sha3_256::new(); h.update(&[0x01u8]); h.update(l); h.update(r);
+    let mut a = [0u8; HASH_SIZE]; a.copy_from_slice(&h.finalize()); a
+}
+
+/// One shard's subtree root, built to EXACTLY `height` internal levels (H(0x01||l||r),
+/// odd→self, self-pad after the level collapses to 1) so it equals the global tree's
+/// node at (level=height, this shard). `leaf_hashes` = ONLY this shard's leaf hashes.
+pub fn shard_subtree_root(leaf_hashes: &[String], height: u32) -> Result<[u8; HASH_SIZE], Box<dyn Error>> {
+    let mut level = leaf_nodes(leaf_hashes)?;
+    if level.is_empty() { return Err("empty shard".into()); }
+    for _ in 0..height {
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        for i in (0..level.len()).step_by(2) {
+            let r = if i + 1 < level.len() { &level[i + 1] } else { &level[i] };
+            next.push(pair(&level[i], r));
+        }
+        level = next;
+    }
+    Ok(level[0])
+}
+
+/// All shard subtree-roots for a full leaf set split into `shard_size`-leaf blocks.
+/// When the whole set fits in ONE shard (len <= shard_size) it IS the tree ⇒ its root is the natural
+/// monolithic root (height ceil(log2(len)), NOT padded to log2(shard_size)); with >1 shards each is a
+/// fixed-height log2(shard_size) subtree (the global build pads a partial last shard to that height).
+pub fn reward_shard_roots(leaf_hashes: &[String], shard_size: usize) -> Result<Vec<[u8; HASH_SIZE]>, Box<dyn Error>> {
+    if !shard_size.is_power_of_two() || shard_size < 2 { return Err("shard_size must be power of two >= 2".into()); }
+    if leaf_hashes.is_empty() { return Ok(Vec::new()); }
+    if leaf_hashes.len() <= shard_size {
+        let b = hex::decode(compute_merkle_root(leaf_hashes)?)?;
+        let mut a = [0u8; HASH_SIZE]; a.copy_from_slice(&b);
+        return Ok(vec![a]);
+    }
+    let height = shard_height(shard_size);
+    let mut roots = Vec::with_capacity((leaf_hashes.len() + shard_size - 1) / shard_size);
+    let mut i = 0;
+    while i < leaf_hashes.len() {
+        let e = (i + shard_size).min(leaf_hashes.len());
+        roots.push(shard_subtree_root(&leaf_hashes[i..e], height)?);
+        i = e;
+    }
+    Ok(roots)
+}
+
+/// Root over already-hashed `nodes`, CONTINUING with internal pairing H(0x01||l||r)
+/// (NO re-leafing) — reproduces the global tree ABOVE the shard-root level. Fed the
+/// shard-roots this equals compute_merkle_root over the whole leaf set.
+pub fn merkle_continue_root(nodes: &[[u8; HASH_SIZE]]) -> [u8; HASH_SIZE] {
+    if nodes.is_empty() { return [0u8; HASH_SIZE]; }
+    let mut level = nodes.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        for i in (0..level.len()).step_by(2) {
+            let r = if i + 1 < level.len() { &level[i + 1] } else { &level[i] };
+            next.push(pair(&level[i], r));
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// Sibling path for `index` up the H(0x01)-continuation tree over `nodes` (the inter-shard part).
+pub fn merkle_continue_proof(nodes: &[[u8; HASH_SIZE]], index: usize) -> Vec<(String, bool)> {
+    let mut proof = Vec::new();
+    let mut level = nodes.to_vec();
+    let mut idx = index;
+    while level.len() > 1 {
+        let sib = idx ^ 1;
+        if sib < level.len() { proof.push((hex::encode(level[sib]), sib < idx)); }
+        else { proof.push((hex::encode(level[idx]), false)); }
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        for i in (0..level.len()).step_by(2) {
+            let r = if i + 1 < level.len() { &level[i + 1] } else { &level[i] };
+            next.push(pair(&level[i], r));
+        }
+        idx /= 2; level = next;
+    }
+    proof
+}
+
+/// Intra-shard sibling path for `index_in_shard`, built to EXACTLY `height` levels
+/// (self-pad after collapse) — the LOWER part of the global proof.
+pub fn shard_intra_proof(leaf_hashes: &[String], index_in_shard: usize, height: u32) -> Result<Vec<(String, bool)>, Box<dyn Error>> {
+    let mut level = leaf_nodes(leaf_hashes)?;
+    if index_in_shard >= level.len() { return Err("index out of shard".into()); }
+    let mut proof = Vec::with_capacity(height as usize);
+    let mut idx = index_in_shard;
+    for _ in 0..height {
+        let sib = idx ^ 1;
+        if sib < level.len() { proof.push((hex::encode(level[sib]), sib < idx)); }
+        else { proof.push((hex::encode(level[idx]), false)); }
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        for i in (0..level.len()).step_by(2) {
+            let r = if i + 1 < level.len() { &level[i + 1] } else { &level[i] };
+            next.push(pair(&level[i], r));
+        }
+        idx /= 2; level = next;
+    }
+    Ok(proof)
+}
+
+/// SINGLE-tree proof for a leaf via shard decomposition: intra-shard path ++ inter-shard
+/// path. BYTE-IDENTICAL to generate_merkle_proof over the whole leaf set (proven by the
+/// exhaustive test), so on-chain verify_merkle_proof and reward_root are unchanged — the
+/// serving node only needs this leaf's shard + the shard-roots, never the whole O(N) tree.
+pub fn generate_reward_proof_sharded(
+    shard_leaf_hashes: &[String],
+    index_in_shard: usize,
+    shard_roots: &[[u8; HASH_SIZE]],
+    shard_index: usize,
+    shard_size: usize,
+) -> Result<Vec<(String, bool)>, Box<dyn Error>> {
+    // One shard ⇒ the shard IS the whole tree: natural-height proof, no inter-shard part.
+    if shard_roots.len() <= 1 {
+        return generate_merkle_proof(shard_leaf_hashes, index_in_shard);
+    }
+    let height = shard_height(shard_size);
+    let mut proof = shard_intra_proof(shard_leaf_hashes, index_in_shard, height)?;
+    proof.extend(merkle_continue_proof(shard_roots, shard_index));
+    Ok(proof)
+}
+
+
 /// v3.10: Optimized proof generation using bytes
 fn generate_merkle_proof_optimized(
     hashes: &[String],

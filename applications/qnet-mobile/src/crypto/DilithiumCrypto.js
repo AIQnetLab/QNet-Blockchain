@@ -122,7 +122,12 @@ function hexToBytes(hex) {
  * @param {string} password       - Wallet password (never stored)
  * @returns {Promise<{publicKey: string, secretKey: string}>} hex-encoded keys
  */
-export async function getOrCreateDilithiumKeypair(activationCode, password) {
+export async function getOrCreateDilithiumKeypair(activationCode, password, walletSecretHex) {
+  // SECURITY: the seed MUST include a wallet-held secret. The activation code is derivable from public
+  // Solana burn data, so a code-only seed lets anyone reconstruct the node's quantum identity key.
+  if (!walletSecretHex || typeof walletSecretHex !== 'string' || walletSecretHex.length < 32) {
+    throw new Error('getOrCreateDilithiumKeypair: walletSecretHex (per-wallet secret) is required');
+  }
   if (!DilithiumModule) {
     throw new Error(
       `DilithiumModule native module not found on ${Platform.OS}. ` +
@@ -156,8 +161,9 @@ export async function getOrCreateDilithiumKeypair(activationCode, password) {
     }
   }
 
-  // Generate deterministic seed from activation code
-  const seed = `QNET_DILITHIUM3_KEYPAIR_${activationCode}`;
+  // Secret-bound seed (v2): depends on a wallet secret only the owner holds, so it is NOT
+  // reconstructible from public chain data. Deterministic from the mnemonic ⇒ survives reinstall.
+  const seed = `QNET_DILITHIUM3_KEYPAIR_v2_${walletSecretHex}_${activationCode}`;
   const result = await DilithiumModule.generateKeypairFromSeed(seed);
 
   // Generate fresh random salt for this keypair

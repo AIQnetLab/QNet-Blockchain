@@ -6351,6 +6351,16 @@ lazy_static::lazy_static! {
     static ref CLAIM_IN_PROGRESS: DashSet<String> =
         DashSet::new();
 
+    /// Epochs whose local leaf-set could NOT be reconstructed to the 2f+1-committed reward_root
+    /// (snapshot-synced / body-pruned node: it holds the root row but not the epoch's bitmaps/bodies).
+    /// Suppresses the O(N) leaf-set rebuild on the authenticated claim path so a permanently-
+    /// unreconstructible epoch costs the full walk at most once per process, not once per request —
+    /// closing the request-amplification vector. Bounded (cleared wholesale at the cap); a restart
+    /// re-attempts each at most once, and an epoch that later heals is served from its (now-present)
+    /// shards and never consults this set.
+    pub(crate) static ref REWARD_REBUILD_SKIP: DashSet<u64> =
+        DashSet::new();
+
     // REMOVED: REWARD_MANAGER was causing desync issues
     // Now using blockchain.get_reward_manager() everywhere for proper synchronization
 
@@ -9569,32 +9579,41 @@ async fn handle_claim_rewards(
         const MAX_BATCH: usize = 512; // bound the TX size; the wallet re-calls for any remainder
         for epoch in epochs.into_iter().filter(|e| *e > last_claimed) {
             if claim_entries.len() >= MAX_BATCH { break; }
-            // Leaf set: persisted blob if present, else recompute deterministically from on-chain
-            // data (same pure fn as emission) — avoids storing a per-epoch O(recipients) blob.
-            let wallets = match storage.load_epoch_reward_wallets(epoch) {
-                Ok(Some(w)) => w,
-                _ => match storage.load_epoch_reward_root(epoch) {
-                    Ok(Some((_, _, _, total))) =>
-                        crate::node::BlockchainNode::compute_epoch_reward_distribution(&storage, epoch, total).0,
-                    _ => continue,
-                },
+            // The 2f+1-committed reward_root is the SOLE authority for this epoch.
+            let (committed_root, ctotal) = match storage.load_epoch_reward_root(epoch) {
+                Ok(Some((r, _, _, t))) => (r, t),
+                _ => continue,
             };
-            {
-                if let Some(idx) = wallets.iter().position(|(w, _)| w == &wallet_address) {
-                    let amount = wallets[idx].1;
-                    let leaves: Vec<String> = wallets.iter().map(|(w, a)| {
-                        let mut hh = Sha3_256::new();
-                        hh.update(w.as_bytes());
-                        hh.update(&epoch.to_le_bytes());
-                        hh.update(&a.to_le_bytes());
-                        hex::encode(hh.finalize())
-                    }).collect();
-                    if let Ok(proof) = qnet_core::crypto::merkle::generate_merkle_proof(&leaves, idx) {
-                        let proof_json: Vec<serde_json::Value> = proof.iter().map(|(hh, l)| json!([hh, l])).collect();
-                        claim_entries.push(json!({ "epoch": epoch, "amount": amount, "proof": proof_json }));
-                        total_amount = total_amount.saturating_add(amount);
+            // Resolve the claim from the SHARDED structure — loads exactly ONE shard + the shard-meta,
+            // never the full O(N) leaf-set — and VERIFY the reconstructed shard-roots recombine to the
+            // committed root before proving. On Absent (a snapshot-synced/body-pruned node that has the
+            // root but not the leaf-set), rebuild the full set ONCE, verify, persist it sharded, then
+            // retry. A node that CANNOT reconstruct the epoch (bitmaps/bodies pruned) is memoised in
+            // REWARD_REBUILD_SKIP so it pays the O(N) walk at most once per process — never per request.
+            const REWARD_REBUILD_SKIP_CAP: usize = 16384;
+            let claim = match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, &wallet_address, true) {
+                crate::node::ShardClaim::Absent => {
+                    if REWARD_REBUILD_SKIP.contains(&epoch) { continue; }
+                    let w = crate::node::BlockchainNode::compute_epoch_reward_distribution(&storage, epoch, ctotal).0;
+                    if crate::node::BlockchainNode::epoch_reward_merkle_root(&w, epoch) != committed_root {
+                        if REWARD_REBUILD_SKIP.len() >= REWARD_REBUILD_SKIP_CAP { REWARD_REBUILD_SKIP.clear(); }
+                        REWARD_REBUILD_SKIP.insert(epoch);
+                        if crate::node::is_warn() {
+                            println!("[WARN][REWARDS] claim_set_divergent epoch={} action=skip (local index resync needed)", epoch);
+                        }
+                        continue;
                     }
+                    // Reconstructed OK ⇒ this epoch is serveable here; clear any prior skip mark.
+                    REWARD_REBUILD_SKIP.remove(&epoch);
+                    crate::node::BlockchainNode::save_epoch_reward_sharded(&storage, epoch, &w);
+                    crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, &wallet_address, true)
                 }
+                other => other,
+            };
+            if let crate::node::ShardClaim::Proof(amount, proof) = claim {
+                let proof_json: Vec<serde_json::Value> = proof.iter().map(|(hh, l)| json!([hh, l])).collect();
+                claim_entries.push(json!({ "epoch": epoch, "amount": amount, "proof": proof_json }));
+                total_amount = total_amount.saturating_add(amount);
             }
         }
         if !claim_entries.is_empty() {
@@ -9661,17 +9680,22 @@ async fn wallet_claimable_qnc(blockchain: &BlockchainNode, wallet: &str) -> u64 
     let mut counted = 0usize;
     for epoch in storage.load_reward_epochs().unwrap_or_default().into_iter().filter(|e| *e > last_claimed) {
         if counted >= MAX_BATCH { break; }
-        let wallets = match storage.load_epoch_reward_wallets(epoch) {
-            Ok(Some(w)) => w,
-            _ => match storage.load_epoch_reward_root(epoch) {
-                Ok(Some((_, _, _, t))) => crate::node::BlockchainNode::compute_epoch_reward_distribution(&storage, epoch, t).0,
-                _ => continue,
-            },
+        // 2f+1-committed root = authority for this epoch.
+        let committed_root = match storage.load_epoch_reward_root(epoch) {
+            Ok(Some((r, _, _, _))) => r,
+            _ => continue,
         };
-        if let Some((_, amt)) = wallets.iter().find(|(w, _)| w == wallet) {
-            total = total.saturating_add(*amt);
-            counted += 1;
-        }
+        // Amount-only resolution from the SHARDED structure (loads one shard, skips proof gen), verified
+        // against the committed root. This endpoint is UNAUTHENTICATED, so it must NEVER trigger the
+        // O(N) leaf-set rebuild (the Absent self-heal is the sig-gated claim path's job) — otherwise a
+        // cheap public request could amplify into a full-roster recompute. On Absent/Divergent skip the
+        // epoch; the figure self-corrects once the shards are present (via apply/finalization or a claim).
+        let amt = match crate::node::BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed_root, wallet, false) {
+            crate::node::ShardClaim::Proof(a, _) => a,
+            _ => continue,
+        };
+        total = total.saturating_add(amt);
+        counted += 1;
     }
     total
 }
@@ -12416,34 +12440,27 @@ fn extract_peer_ip_from_request() -> Option<String> {
 }
 
 
-/// PRIVACY: Generate quantum-secure pseudonym for Light node (mobile privacy protection)
+/// Wallet-derived Light pseudonym. Region-INDEPENDENT (fixed `mobile` segment): it is recomputed on
+/// every node to resolve wallet→node, so it must not depend on a per-node env var. MUST match the app's
+/// generateLightNodePseudonym: blake3("LIGHT_NODE_PRIVACY_"+wallet), first 16 hex (64-bit; P(collision)
+/// ~3e-6 at 10M light — money-safe: reward crediting keys on wallet, not node_id). Wallet not recoverable.
 pub fn generate_light_node_pseudonym(wallet_address: &str) -> String {
-    // EXISTING PATTERN: Use blake3 hash like other node identity functions
     let pseudonym_hash = blake3::hash(format!("LIGHT_NODE_PRIVACY_{}", wallet_address).as_bytes());
-
-    // PRIVACY: Generate mobile-friendly pseudonym without revealing IP or location
-    // Format: light_[region_hint]_[8_hex_chars] - no personal data exposed
-    let region_hint = std::env::var("QNET_REGION")
-        .unwrap_or_else(|_| "mobile".to_string())
-        .to_lowercase();
-
-    format!("light_{}_{}",
-            region_hint,
-            &pseudonym_hash.to_hex()[..8])
+    format!("light_mobile_{}", &pseudonym_hash.to_hex()[..16])
 }
 
-/// v15.11: privacy-preserving stable pseudonym for regular Super nodes
-/// (mirrors the Light scheme; separate domain so namespaces never collide).
-///   format: super_<region>_<blake3("SUPER_NODE_PRIVACY_<wallet>")[..8]>
-///   example: super_eu_d1fa101f
+/// Privacy-preserving stable pseudonym for regular Super nodes (mirrors the Light scheme; separate
+/// domain so namespaces never collide).
+///   format: super_node_<blake3("SUPER_NODE_PRIVACY_<wallet>")[..16]>
+///   example: super_node_d1fa101f8b2c4e60
 /// Replaces the old `node_<ip>` id which broke the heartbeat-validator
 /// prefix whitelist (super_/light_/genesis_node_), tied identity to the
 /// network address, and leaked the public IP.
 /// Wallet not recoverable from pseudonym; same wallet -> same id across
 /// restart/IP-migration/host-swap (reputation persists with the seed);
 /// anti-Sybil (one wallet -> one id; each fake costs a fresh 1500 1DEV
-/// burn); `super_` already validator-whitelisted. 32-bit space; collision
-/// <1% even at 100k registrations. O(1) (one Blake3 + hex truncate).
+/// burn); `super_` already validator-whitelisted. 64-bit space; P(collision)
+/// ~7e-11 at 50k supers, ~3e-8 at 1M. O(1) (one Blake3 + hex truncate).
 pub fn generate_super_node_pseudonym(wallet_address: &str) -> String {
     // PRODUCTION: domain-separated Blake3 hash — distinct from the Light
     // pseudonym domain above so a single wallet activating both tiers gets
@@ -12454,7 +12471,7 @@ pub fn generate_super_node_pseudonym(wallet_address: &str) -> String {
     // pre-activation sync gate compares this id), so it cannot depend on a per-node env
     // var — a region mismatch would make the same wallet resolve to two different ids and
     // the gate would never open. Fixed "node" segment preserves the historical format.
-    format!("super_node_{}", &pseudonym_hash.to_hex()[..8])
+    format!("super_node_{}", &pseudonym_hash.to_hex()[..16])
 }
 
 /// Extract peer IP from HTTP headers (PRODUCTION ready)
@@ -13217,7 +13234,7 @@ async fn handle_node_registration_client_submit(
             format!("LIGHT_NODE_PRIVACY_{}", req.wallet_address).as_bytes()
         ).to_hex();
         let suffix_ok = req.node_id.starts_with("light_")
-            && req.node_id.rsplit('_').next() == Some(&expected_suffix[..8]);
+            && req.node_id.rsplit('_').next() == Some(&expected_suffix[..16]);
         if !suffix_ok {
             return Ok(warp::reply::json(&json!({
                 "success": false,

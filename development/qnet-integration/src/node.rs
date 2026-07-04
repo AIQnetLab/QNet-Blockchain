@@ -3065,6 +3065,19 @@ pub struct BlockApplyResult {
     pub deferred_emission_root: Option<(u64, u64, String, u64, u32)>,
 }
 
+/// Outcome of resolving a wallet's per-epoch claim against the sharded reward structure.
+#[derive(Debug)]
+pub(crate) enum ShardClaim {
+    /// Recipient found; (amount, proof) — proof empty when the caller requested amount-only.
+    Proof(u64, Vec<(String, bool)>),
+    /// Structure present + consistent with the committed root, but the wallet is not a recipient.
+    NotRecipient,
+    /// Reconstructed shard-roots do not recombine to the committed root (drifted/catch-up node): skip.
+    Divergent,
+    /// Sharded structure not present on this node (e.g. snapshot-synced): caller rebuilds once.
+    Absent,
+}
+
 #[allow(dead_code)]
 impl BlockchainNode {
     /// Get reward manager for RPC integration
@@ -3371,19 +3384,119 @@ impl BlockchainNode {
             *wmap.entry(wallet.clone()).or_insert(0) += amt;
         }
         let wallet_vec: Vec<(String, u64)> = wmap.into_iter().collect();
-        let leaves: Vec<String> = wallet_vec.iter().map(|(w, a)| {
-            let mut h = Sha3_256::new();
-            h.update(w.as_bytes());
-            h.update(&epoch.to_le_bytes());
-            h.update(&a.to_le_bytes());
-            hex::encode(h.finalize())
-        }).collect();
-        let root = if leaves.is_empty() {
-            String::new()
-        } else {
-            qnet_core::crypto::merkle::compute_merkle_root(&leaves).unwrap_or_default()
-        };
+        let root = Self::epoch_reward_merkle_root(&wallet_vec, epoch);
         (wallet_vec, root)
+    }
+
+    /// Merkle root of a reward leaf-set for an epoch. Leaf = SHA3-256(wallet ‖ epoch_le ‖ amount_le),
+    /// byte-identical to the emission distribution and the claim-proof builder. The SINGLE hasher for the
+    /// verify-before-serve gate: any reconstructed leaf-set (frozen blob or live recompute) must hash to
+    /// the 2f+1-committed reward_root before a node serves it — else the node returns "resyncing", never a
+    /// wrong claimable amount (a per-node derived index can drift; the committed root is the only oracle).
+    pub(crate) fn epoch_reward_merkle_root(wallets: &[(String, u64)], epoch: u64) -> String {
+        if wallets.is_empty() { return String::new(); }
+        let leaves: Vec<String> = wallets.iter()
+            .map(|(w, a)| Self::reward_leaf_hash_hex(w, epoch, *a))
+            .collect();
+        qnet_core::crypto::merkle::compute_merkle_root(&leaves).unwrap_or_default()
+    }
+
+    /// Fixed reward-shard width (power of two). A claim loads exactly ONE shard ⇒ proof generation is
+    /// O(REWARD_SHARD_SIZE) memory/CPU regardless of recipient count — the 10M-light-node claim path.
+    pub(crate) const REWARD_SHARD_SIZE: usize = 4096;
+
+    /// Reward merkle leaf (hex) — SHA3-256(wallet ‖ epoch_le ‖ amount_le). The SINGLE leaf-hash source
+    /// shared by the monolithic root, the sharded structure, and the claim-proof builder, so every
+    /// derivation is byte-identical.
+    #[inline]
+    pub(crate) fn reward_leaf_hash_hex(wallet: &str, epoch: u64, amount: u64) -> String {
+        let mut h = Sha3_256::new();
+        h.update(wallet.as_bytes());
+        h.update(&epoch.to_le_bytes());
+        h.update(&amount.to_le_bytes());
+        hex::encode(h.finalize())
+    }
+
+    /// Persist the per-epoch reward set as a SHARDED structure (10M-scale claim serving): the SORTED
+    /// (wallet, amount) leaves split into REWARD_SHARD_SIZE-leaf shards + shard-meta (K subtree-roots +
+    /// each shard's first wallet, for O(log K) locate). The shard-roots recombine to the SAME reward_root
+    /// as the monolithic tree and per-shard proofs are byte-identical to it — reward_root, on-chain
+    /// verify, and the mobile app are all unchanged. A claim then loads exactly ONE shard, never O(N).
+    pub(crate) fn save_epoch_reward_sharded(storage: &crate::storage::Storage, epoch: u64, wallets: &[(String, u64)]) {
+        if wallets.is_empty() {
+            let _ = storage.delete_epoch_reward_shards(epoch);
+            return;
+        }
+        let leaf_hashes: Vec<String> = wallets.iter()
+            .map(|(w, a)| Self::reward_leaf_hash_hex(w, epoch, *a))
+            .collect();
+        let roots = match qnet_core::crypto::merkle::reward_shard_roots(&leaf_hashes, Self::REWARD_SHARD_SIZE) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let mut bounds: Vec<String> = Vec::with_capacity(roots.len());
+        let mut s = 0usize;
+        while s * Self::REWARD_SHARD_SIZE < wallets.len() {
+            let start = s * Self::REWARD_SHARD_SIZE;
+            let end = ((s + 1) * Self::REWARD_SHARD_SIZE).min(wallets.len());
+            let _ = storage.save_epoch_reward_shard(epoch, s, &wallets[start..end]);
+            bounds.push(wallets[start].0.clone());
+            s += 1;
+        }
+        let _ = storage.save_epoch_shard_meta(epoch, &roots, &bounds);
+    }
+
+    /// Resolve a wallet's claim for an epoch against the SHARDED reward structure, verified against the
+    /// 2f+1-committed reward_root. O(shard): loads the shard-meta (K roots+bounds) + exactly ONE shard,
+    /// never the full O(N) set. `want_proof=false` returns the amount only (pending display).
+    pub(crate) fn reward_proof_from_shard(
+        storage: &crate::storage::Storage,
+        epoch: u64,
+        committed_root: &str,
+        wallet: &str,
+        want_proof: bool,
+    ) -> ShardClaim {
+        let (roots, bounds) = match storage.load_epoch_shard_meta(epoch) {
+            Ok(Some(m)) => m,
+            _ => return ShardClaim::Absent,
+        };
+        if roots.is_empty() || bounds.len() != roots.len() {
+            return ShardClaim::Absent;
+        }
+        // Verify the shard-roots recombine to the committed reward_root (O(K)). A snapshot-synced or
+        // drifted node whose reconstructed structure disagrees must never serve a wrong claim.
+        if !committed_root.is_empty() {
+            let recombined = hex::encode(qnet_core::crypto::merkle::merkle_continue_root(&roots));
+            if recombined != committed_root {
+                return ShardClaim::Divergent;
+            }
+        }
+        // Locate the shard: bounds[s] = ascending first wallet of shard s over the globally-sorted set,
+        // so the target sits in the shard whose bound is the largest one not exceeding it.
+        let s = match bounds.binary_search_by(|b| b.as_str().cmp(wallet)) {
+            Ok(i) => i,
+            Err(0) => return ShardClaim::NotRecipient,
+            Err(i) => i - 1,
+        };
+        let shard = match storage.load_epoch_reward_shard(epoch, s) {
+            Ok(Some(sh)) => sh,
+            _ => return ShardClaim::Absent,
+        };
+        let idx = match shard.iter().position(|(w, _)| w == wallet) {
+            Some(i) => i,
+            None => return ShardClaim::NotRecipient,
+        };
+        let amount = shard[idx].1;
+        if !want_proof {
+            return ShardClaim::Proof(amount, Vec::new());
+        }
+        let shard_hashes: Vec<String> = shard.iter()
+            .map(|(w, a)| Self::reward_leaf_hash_hex(w, epoch, *a))
+            .collect();
+        match qnet_core::crypto::merkle::generate_reward_proof_sharded(&shard_hashes, idx, &roots, s, Self::REWARD_SHARD_SIZE) {
+            Ok(proof) => ShardClaim::Proof(amount, proof),
+            Err(_) => ShardClaim::Divergent,
+        }
     }
 
     /// Deterministic per-epoch reward distribution + merkle root, derived ENTIRELY from on-chain
@@ -3660,16 +3773,9 @@ impl BlockchainNode {
                         result.deferred_registrations.push((node_id.clone(), type_str.to_string(), wallet_address.clone(), burn_tx.clone(), reg_vrf));
                     }
                     qnet_state::TransactionType::NodeActivation { node_type, .. } => {
-                        let type_str = match node_type {
-                            qnet_state::account::NodeType::Super => "super",
-                            qnet_state::account::NodeType::Light => "light",
-                        };
-                        let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
-                        result.deferred_registrations.push((activation_id, type_str.to_string(), tx.from.clone(), String::new(), String::new()));
-                        // Super activation self-registers under its canonical region-independent
-                        // pseudonym (the id used to sign heartbeats/blocks) so reward crediting
-                        // resolves node_id→wallet even if the NodeRegistration TX is lost. Light
-                        // ids are region-dependent → never recomputed in apply (bind via their TX).
+                        // Super self-registers its canonical wallet-derived pseudonym (heartbeat/block signer)
+                        // so reward crediting resolves node_id→wallet even if NodeRegistration is lost; light
+                        // gets its row from NodeRegistration. No phantom tx-hash row ⇒ one wallet = one row.
                         if matches!(node_type, qnet_state::account::NodeType::Super) {
                             let pseudonym = crate::rpc::generate_super_node_pseudonym(&tx.from);
                             crate::unified_p2p::add_registered_super_node(pseudonym.clone());
@@ -5315,26 +5421,10 @@ impl BlockchainNode {
                         }
                     }
                 }
-                qnet_state::TransactionType::NodeActivation { node_type, phase, .. } => {
-                    // Index NodeActivation TX: wallet → activation record in RocksDB
-                    let wallet_address = &tx.from;
-                    let type_str = match node_type {
-                        qnet_state::account::NodeType::Super => "super",
-                        qnet_state::account::NodeType::Light => "light",
-                    };
-                    let phase_num = match phase {
-                        qnet_state::account::ActivationPhase::Phase1 => 1u8,
-                        qnet_state::account::ActivationPhase::Phase2 => 2u8,
-                    };
-                    // Use tx hash as node_id placeholder for activation-only records
-                    let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
-                    if let Err(e) = storage.save_node_registration(&activation_id, type_str, wallet_address, INITIAL_REPUTATION) {
-                        eprintln!("[WARN][ACT] cache_activation_fail wallet={} err={}", 
-                                 &wallet_address[..wallet_address.len().min(16)], e);
-                    } else if is_info() {
-                        println!("[INFO][ACT] indexed_activation wallet={}... type={} phase={}", 
-                                 &wallet_address[..wallet_address.len().min(16)], type_str, phase_num);
-                    }
+                qnet_state::TransactionType::NodeActivation { .. } => {
+                    // No cached identity row: a node's identity is the wallet-derived super_/light_ pseudonym
+                    // written by NodeRegistration apply. A tx-hash-keyed activation_ row is a phantom (never
+                    // resolved) and, at 10M light, dead storage — so skip it.
                 }
                 _ => {}
             }
@@ -5724,6 +5814,13 @@ impl BlockchainNode {
             let rcount = wallet_vec.len() as u32;
             let rper = if rcount > 0 { rtotal / rcount as u64 } else { 0 };
             let _ = storage.save_epoch_reward_root(epoch, &recomputed_root, rper, rcount, rtotal);
+            // Freeze the leaf-set so the claim/pending RPC reads a node-independent committed set instead
+            // of re-deriving it at query time (a node whose light_bm_ index drifted would otherwise map
+            // bits→wallets short and reject a valid claim). Persist ONLY when the local recompute agrees
+            // with the committed root — a divergent node must not freeze a wrong claimable set.
+            if committed_root.is_empty() || recomputed_root == committed_root {
+                Self::save_epoch_reward_sharded(storage, epoch, &wallet_vec);
+            }
             let _ = storage.append_reward_epoch(epoch);
             if is_info() {
                 println!("[INFO][REWARDS] reward_root_applied epoch={} root={}.. count={} total={} QNC",
@@ -5735,6 +5832,48 @@ impl BlockchainNode {
             let _ = storage.save_epoch_reward_root(epoch, committed_root, c_per, c_cnt, total);
             let _ = storage.append_reward_epoch(epoch);
         }
+        // Bound the sharded leaf-set CACHE: keep the newest SHARD_CACHE_RETAIN epochs, drop older shards
+        // (epoch_wshard_/epoch_shardmeta_ only — root/super_elig_/light_bm_ stay, so an old claim self-heals
+        // via the claim/backfill re-derive). Caps ~0.5GB/epoch at 10M light; nothing becomes unclaimable.
+        const SHARD_CACHE_RETAIN: usize = 256;
+        if let Ok(eps) = storage.load_reward_epochs() {
+            if eps.len() > SHARD_CACHE_RETAIN {
+                let _ = storage.prune_epoch_reward_shards(eps[eps.len() - SHARD_CACHE_RETAIN]);
+            }
+        }
+    }
+
+    /// Re-freeze any epoch that holds a 2f+1-certified reward_root but whose sharded leaf-set is Absent
+    /// locally (freeze-race, or a snapshot/catch-up that carried the root but not the shard). Re-derives
+    /// from the committed super_elig_/light_bm_ indices, verifies the set recombines to the certified root,
+    /// then freezes — so pending/claim serve the node-independent certified amount on EVERY node (incl.
+    /// snapshot-joined), not just those that froze at emission. Bounded to the recent claim window; an
+    /// unreconstructible epoch is memoised (shared with the claim path). Off consensus + off the public
+    /// endpoint (boot / post-snapshot); already-frozen epochs cost one point-read.
+    pub(crate) fn backfill_reward_shards(storage: &crate::storage::Storage) -> u32 {
+        const WINDOW: usize = 128;
+        let epochs = match storage.load_reward_epochs() { Ok(e) => e, Err(_) => return 0 };
+        let start = epochs.len().saturating_sub(WINDOW);
+        let mut healed = 0u32;
+        for &epoch in &epochs[start..] {
+            if storage.load_epoch_shard_meta(epoch).ok().flatten().is_some() { continue; }
+            if crate::rpc::REWARD_REBUILD_SKIP.contains(&epoch) { continue; }
+            let (committed_root, ctotal) = match storage.load_epoch_reward_root(epoch) {
+                Ok(Some((r, _, _, t))) if !r.is_empty() => (r, t),
+                _ => continue,
+            };
+            let w = Self::compute_epoch_reward_distribution(storage, epoch, ctotal).0;
+            if !w.is_empty() && Self::epoch_reward_merkle_root(&w, epoch) == committed_root {
+                Self::save_epoch_reward_sharded(storage, epoch, &w);
+                crate::rpc::REWARD_REBUILD_SKIP.remove(&epoch);
+                healed += 1;
+            } else {
+                if crate::rpc::REWARD_REBUILD_SKIP.len() >= 16384 { crate::rpc::REWARD_REBUILD_SKIP.clear(); }
+                crate::rpc::REWARD_REBUILD_SKIP.insert(epoch);
+            }
+        }
+        if healed > 0 && is_info() { println!("[INFO][REWARDS] reward_shard_backfill healed={}", healed); }
+        healed
     }
 
     /// v3 merkle-claim crediting (proof-verified). For each RewardDistribution-from-system_rewards_pool
@@ -8596,13 +8735,8 @@ impl BlockchainNode {
             }
         }
 
-        // v4.1: Backfill wallet reverse index (migration for pre-v4.1 data)
-        // Ensures O(1) verify-activation lookups work for nodes registered before reverse index existed
-        match blockchain.storage.backfill_wallet_reverse_index() {
-            Ok(count) if count > 0 => println!("[INFO][NODE] wallet_reverse_index_migrated entries={}", count),
-            Ok(_) => {} // No migration needed
-            Err(e) => println!("[WARN][NODE] wallet_index_backfill err={}", e),
-        }
+        // No wallet reverse-index migration: wallet→node is resolved by deriving the id (pure fn of the
+        // wallet) and point-reading node_<id> — there is no stored reverse index to backfill.
 
         // Reward-roster indices (srtr_/lrtr_) one-time migration for pre-index DBs. Marker-guarded so
         // the O(N) scan runs once, not on every restart (millions of light nodes). Fresh genesis sets
@@ -8617,6 +8751,10 @@ impl BlockchainNode {
                 Err(e) => println!("[WARN][NODE] roster_index_backfill err={}", e),
             }
         }
+
+        // Heal any reward epoch holding a certified root but an Absent local shard (freeze-race / snapshot
+        // join) so pending/claim serve the certified amount identically to a from-genesis node.
+        let _ = crate::node::BlockchainNode::backfill_reward_shards(&blockchain.storage);
 
         // Rebuild the committed burn→wallet index (cbw) from node_registry at boot: migrates a pre-cbw
         // DB and self-heals a stale cbw left by a crash mid-reorg. Unconditional but super-scoped
@@ -15796,6 +15934,9 @@ impl BlockchainNode {
                                     if let Err(e) = storage.save_epoch_reward_root(reward_epoch, &reward_root_hex, reward_per_node, reward_count, reward_total) {
                                         eprintln!("[WARN][EMISSION] reward_root_save_fail epoch={} err={}", reward_epoch, e);
                                     }
+                                    // Freeze the canonical leaf-set as the sharded structure (this producer's
+                                    // computed root IS the committed root) so claims load one shard, not O(N).
+                                    Self::save_epoch_reward_sharded(&storage, reward_epoch, &wallet_vec);
                                     if is_info() {
                                         println!("[INFO][EMISSION] reward_root epoch={} root={}.. count={} total={} QNC",
                                                  reward_epoch, &reward_root_hex[..16.min(reward_root_hex.len())],
@@ -16969,22 +17110,11 @@ impl BlockchainNode {
                                 Self::write_registration_row(&storage, rid, rtype, rwallet, rburn, tx.dilithium_public_key.as_ref(), next_block_height);
                             }
                             qnet_state::TransactionType::NodeActivation { node_type: ntype, phase, .. } => {
-                                // Mirror apply_block_to_state EXACTLY, including its FIRST-MATCH-WINS arm
-                                // order: there a Phase2 NodeActivation is consumed by the pool3 arm
-                                // (node.rs ~3333) and NEVER reaches the registry-stamping arm (~3360), so a
-                                // Phase2 activation stamps NO registry rows. The producer MUST skip Phase2
-                                // too — else it writes srtr_/lt_state rows the validator never writes →
-                                // registry_root + reward-roster diverge → content_ok never 2f+1 → halt.
-                                // Phase1/other → stamp activation_<hash16> (both types) + super_node_
-                                // pseudonym, byte-identical to the validator. burn empty ⇒ no cbw bind.
+                                // Mirror apply_block_to_state EXACTLY: Phase2 is consumed by the pool3 arm and
+                                // stamps NO registry rows — skip here too (else registry_root/reward-roster
+                                // diverge → content_ok never 2f+1 → halt). Phase1/other → super self-registers
+                                // its canonical pseudonym; no phantom tx-hash row (one wallet = one row).
                                 if matches!(phase, qnet_state::account::ActivationPhase::Phase2) { continue; }
-                                let ntype_str = match ntype {
-                                    qnet_state::account::NodeType::Super => "super",
-                                    qnet_state::account::NodeType::Light => "light",
-                                };
-                                let activation_id = format!("activation_{}", &tx.hash[..tx.hash.len().min(16)]);
-                                let _ = storage.save_node_registration_at_height_burn(
-                                    &activation_id, ntype_str, &tx.from, 1.0, next_block_height, "");
                                 if matches!(ntype, qnet_state::account::NodeType::Super) {
                                     let pseudonym = crate::rpc::generate_super_node_pseudonym(&tx.from);
                                     crate::unified_p2p::add_registered_super_node(pseudonym.clone());
@@ -24420,6 +24550,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         // Update our height to snapshot height
                         *self.height.write().await = snapshot_height;
                         if is_info() { println!("[INFO][SYNC] snapshot_loaded h={}", snapshot_height); }
+                        // Heal reward shards the snapshot carried a root but not a leaf-set for (certified-verified).
+                        let _ = Self::backfill_reward_shards(&self.storage);
                         
                         // Continue syncing from snapshot height
                         if let Some(ref p2p) = self.unified_p2p {
@@ -25132,18 +25264,32 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 let _ = self.storage.append_reward_epoch(epoch);
                                 if is_info() { println!("[INFO][REWARDS] reward_root_adopted epoch={} root={}..", epoch, &certified[..16.min(certified.len())]); }
                             }
+                            // Freeze the sharded leaf-set INDEPENDENTLY of the root-idempotency above: it
+                            // re-derived to the 2f+1 CERTIFIED root (strongest authority). If an earlier
+                            // finalization adopted the root ROOT-ONLY (incomplete data), the structure is
+                            // still missing — write it now so claims load one shard, not a per-call recompute.
+                            if self.storage.load_epoch_shard_meta(epoch).ok().flatten().is_none() {
+                                Self::save_epoch_reward_sharded(&self.storage, epoch, &wallets);
+                            }
                         }
                         // Leaf set not re-derivable here (incomplete/pruned/divergent): still adopt the
                         // certified ROOT under the canonical epoch so claims verify; wallets are served
                         // by synced peers. Epoch = boundary-height index − macroblocks/epoch (no scan).
                         other => {
-                            let epoch = match other {
-                                Some((_, _, _, e)) => e,
-                                None => (cp.window_head_height / mbi).saturating_sub(14400 / mbi),
+                            // Keep the CONSERVED total (available when a set was re-derived, even if it
+                            // mismatched the certified root) so a later recompute — once this node's data
+                            // heals — can rebuild the leaf-set; None ⇒ no emission info ⇒ 0.
+                            let (epoch, wtotal) = match other {
+                                Some((_, _, t, e)) => (e, t),
+                                None => ((cp.window_head_height / mbi).saturating_sub(14400 / mbi), 0),
                             };
                             let cur = self.storage.load_epoch_reward_root(epoch).ok().flatten().map(|(r, ..)| r);
                             if cur.as_deref() != Some(certified.as_str()) {
-                                let _ = self.storage.save_epoch_reward_root(epoch, &certified, 0, 0, 0);
+                                let _ = self.storage.save_epoch_reward_root(epoch, &certified, 0, 0, wtotal);
+                                // A structure frozen earlier no longer recombines to the adopted certified root
+                                // — drop it so the claim path rebuilds (verify-gated) instead of serving a stale
+                                // set; a healed node then serves correctly, meanwhile wallets come via peers.
+                                let _ = self.storage.delete_epoch_reward_shards(epoch);
                                 let _ = self.storage.append_reward_epoch(epoch);
                                 if is_warn() { println!("[WARN][REWARDS] reward_root_adopted_rootonly epoch={} (leaf set deferred; local recompute absent/divergent)", epoch); }
                             }
@@ -27744,16 +27890,134 @@ mod tests {
         assert_eq!(recency_subwindow_indices(2 * 14400), (20, 19));      // epoch2 boundary bridges
     }
 
-    // Light-reward roster cutoff, gated by light_reg_epoch_roster @ 115200 (epoch 8). Below the gate =
-    // legacy epoch_start (byte-exact to the deployed binary ⇒ mixed-version rolling agrees); at/after =
-    // commit-window open (epoch_start + 14350). Creator + reader use it identically.
+    // Light-reward roster cutoff. light_reg_epoch_roster is genesis-active (gate=0) for a fresh genesis,
+    // so EVERY epoch (incl. 0) freezes the roster at the commit-window open (epoch_start + 14350) — a light
+    // node registered mid-epoch earns for that epoch. Creator + reader call it identically (no divergence).
     #[test]
     fn light_roster_cutoff_gate() {
-        // Dormant (epochs 0..7, epoch_start < 115200): legacy epoch_start.
-        assert_eq!(light_roster_cutoff(0), 0);
-        assert_eq!(light_roster_cutoff(7), 7 * 14_400);          // 100800 (< gate)
-        // Active (epoch 8+, epoch_start >= 115200): commit-window open.
+        assert_eq!(light_roster_cutoff(0), 14_350);              // epoch 0: commit-window from genesis
+        assert_eq!(light_roster_cutoff(7), 7 * 14_400 + 14_350); // 115150
         assert_eq!(light_roster_cutoff(8), 8 * 14_400 + 14_350); // 129550
+    }
+
+    // Verify-before-serve invariant: the gate hasher (epoch_reward_merkle_root) MUST reproduce the exact
+    // root emission committed for the SAME leaf-set — else it would false-reject correct data on every node
+    // and break all claims. Locks the two hashers together; the epoch binding must also change the root.
+    #[test]
+    fn reward_verify_hasher_matches_committed_root() {
+        let eligible = vec![
+            ("genesis_node_001".to_string(), "EON1walletA".to_string()),
+            ("super_node_x".to_string(),      "EON1walletB".to_string()),
+            ("light_node_y".to_string(),      "EON1walletC".to_string()),
+        ];
+        let epoch = 7u64;
+        let (wallets, root) = super::BlockchainNode::distribute_equal_rewards(&eligible, 300, epoch);
+        assert!(!root.is_empty() && !wallets.is_empty());
+        assert_eq!(super::BlockchainNode::epoch_reward_merkle_root(&wallets, epoch), root,
+            "verify-gate hasher must reproduce the committed reward_root byte-for-byte");
+        assert_ne!(super::BlockchainNode::epoch_reward_merkle_root(&wallets, epoch + 1), root,
+            "leaf binds the epoch ⇒ a cross-epoch leaf-set is correctly rejected");
+        assert!(super::BlockchainNode::epoch_reward_merkle_root(&[], epoch).is_empty());
+    }
+
+    // Scale (10M+ light): a shard-decomposed reward proof MUST be byte-identical to the monolithic
+    // single-tree proof for EVERY leaf-count and index (incl. odd counts, partial/single-leaf last
+    // shards, N < shard_size) — else a serving node's O(shard) proof would fail on-chain and break all
+    // claims. Proven here so reward_root, the wire proof, on-chain verify, and the app stay UNCHANGED.
+    #[test]
+    fn reward_shard_proof_equals_monolithic() {
+        use qnet_core::crypto::merkle;
+        let leafset = |n: usize| -> Vec<String> {
+            (0..n).map(|i| {
+                let mut h = Sha3_256::new(); h.update(&(i as u64).to_le_bytes()); hex::encode(h.finalize())
+            }).collect::<Vec<_>>()
+        };
+        let counts: Vec<usize> = (1..=130).chain(vec![255, 256, 257, 300, 511, 512, 513]).collect();
+        for &n in &counts {
+            let leaves = leafset(n);
+            let mono_root = merkle::compute_merkle_root(&leaves).unwrap();
+            for &ssz in &[2usize, 4, 8, 16] {
+                let roots = merkle::reward_shard_roots(&leaves, ssz).unwrap();
+                assert_eq!(hex::encode(merkle::merkle_continue_root(&roots)), mono_root,
+                    "root mismatch n={} shard_size={}", n, ssz);
+                for i in 0..n {
+                    let s = i / ssz;
+                    let start = s * ssz;
+                    let end = (start + ssz).min(n);
+                    let mono = merkle::generate_merkle_proof(&leaves, i).unwrap();
+                    let sh = merkle::generate_reward_proof_sharded(&leaves[start..end], i - start, &roots, s, ssz).unwrap();
+                    // The proof MUST be byte-identical to the monolithic single-tree proof (all N).
+                    assert_eq!(sh, mono, "proof mismatch n={} shard_size={} i={}", n, ssz, i);
+                    // And verify against the (unchanged) monolithic root. n=1 is a pre-existing verify edge
+                    // (single-leaf, empty proof) that never occurs in a reward set (always >= 6 recipients).
+                    if n >= 2 {
+                        assert!(merkle::verify_merkle_proof(&leaves[i], &mono_root, &sh),
+                            "verify n={} shard_size={} i={}", n, ssz, i);
+                    }
+                }
+            }
+        }
+    }
+
+    // Storage round-trip for the sharded reward structure: partition → store → locate → serve. Proves
+    // reward_proof_from_shard returns the right amount + a proof that verifies against the committed root
+    // AND is byte-identical to the monolithic proof, across single- and multi-shard sizes, plus the
+    // NotRecipient / Divergent / Absent outcomes. Complements the pure-merkle equivalence test above.
+    #[test]
+    fn reward_shard_storage_roundtrip() {
+        use qnet_core::crypto::merkle;
+        let epoch = 7u64;
+        // Ascending-by-wallet (matches the BTreeMap order every writer produces); amount = 1000 + i.
+        let mk = |n: usize| -> Vec<(String, u64)> {
+            (0..n).map(|i| (format!("eon{:012}", i), 1000u64 + i as u64)).collect()
+        };
+        let ssz = BlockchainNode::REWARD_SHARD_SIZE;
+        for &n in &[1usize, 2, 5, 100, ssz - 1, ssz, ssz + 1, 2 * ssz + 37] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+            let wallets = mk(n);
+            let committed = BlockchainNode::epoch_reward_merkle_root(&wallets, epoch);
+            BlockchainNode::save_epoch_reward_sharded(&storage, epoch, &wallets);
+
+            let leaves: Vec<String> = wallets.iter()
+                .map(|(w, a)| BlockchainNode::reward_leaf_hash_hex(w, epoch, *a)).collect();
+
+            // Sample boundary + interior indices (verifying all is O(n·shard); sample for large n).
+            let mut idxs: Vec<usize> = vec![0, n - 1];
+            for b in [ssz.saturating_sub(1), ssz, ssz + 1, n / 2] { if b < n { idxs.push(b); } }
+            idxs.sort(); idxs.dedup();
+            for &i in &idxs {
+                let (w, amt) = wallets[i].clone();
+                match BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed, &w, true) {
+                    ShardClaim::Proof(a, proof) => {
+                        assert_eq!(a, amt, "amount n={} i={}", n, i);
+                        // n=1 is the pre-existing single-leaf verify edge (never a real reward set).
+                        assert!(n == 1 || merkle::verify_merkle_proof(&leaves[i], &committed, &proof),
+                            "verify n={} i={}", n, i);
+                        assert_eq!(proof, merkle::generate_merkle_proof(&leaves, i).unwrap(),
+                            "proof != monolithic n={} i={}", n, i);
+                    }
+                    other => panic!("expected Proof n={} i={} got {:?}", n, i, other),
+                }
+                // Amount-only path: same amount, no proof gen.
+                match BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed, &w, false) {
+                    ShardClaim::Proof(a, p) => { assert_eq!(a, amt); assert!(p.is_empty()); }
+                    other => panic!("amount-only expected Proof n={} i={} got {:?}", n, i, other),
+                }
+            }
+            // Not in the set ⇒ NotRecipient (structure present + consistent).
+            assert!(matches!(
+                BlockchainNode::reward_proof_from_shard(&storage, epoch, &committed, "zzz_absent_wallet", true),
+                ShardClaim::NotRecipient), "NotRecipient n={}", n);
+            // Wrong committed root ⇒ Divergent (never serves a mismatching claim).
+            assert!(matches!(
+                BlockchainNode::reward_proof_from_shard(&storage, epoch, &"00".repeat(32), &wallets[0].0, true),
+                ShardClaim::Divergent), "Divergent n={}", n);
+            // Never-written epoch ⇒ Absent (caller rebuilds once).
+            assert!(matches!(
+                BlockchainNode::reward_proof_from_shard(&storage, epoch + 999, &committed, &wallets[0].0, true),
+                ShardClaim::Absent), "Absent n={}", n);
+        }
     }
 
     // Restart escalation-lock fix: a node must NOT escalate timeout_round while behind the head or

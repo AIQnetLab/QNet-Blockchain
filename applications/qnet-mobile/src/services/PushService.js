@@ -21,6 +21,8 @@ export const PushType = {
  * v3.36: Uses node discovery cache first, falls back to genesis nodes
  * When 100+ server nodes exist, this will select from all synced nodes
  */
+let _eligibleUrlSnapshot = []; // in-memory eligible URLs, refreshed by the async picker for the sync one
+
 async function getRandomBootstrapNodeAsync() {
   try {
     const cachedNodesStr = await AsyncStorage.getItem('qnet_discovered_nodes');
@@ -32,7 +34,7 @@ async function getRandomBootstrapNodeAsync() {
         return age < 300 && n.reputation >= 0.7 && n.isSynced !== false;
       });
       if (eligible.length > 0) {
-        // Weighted random by reputation
+        _eligibleUrlSnapshot = eligible.map(n => n.url); // warm the sync snapshot
         const totalRep = eligible.reduce((sum, n) => sum + (n.reputation || 0.7), 0);
         let random = Math.random() * totalRep;
         for (const node of eligible) {
@@ -45,12 +47,17 @@ async function getRandomBootstrapNodeAsync() {
   } catch (e) {
     // Ignore cache errors
   }
-  // Fallback to genesis (first launch or stale cache)
-  return getRandomGenesisNode();
+  return getRandomGenesisNode(); // first launch / stale cache
 }
 
-// Synchronous version for backward compatibility (returns genesis as fallback)
+// Sync picker: spread recurring status/reward/ping load across the discovered validator set (not
+// pinned to the 5 genesis IPs). Uses the snapshot the async picker warms; genesis only until warm,
+// and it kicks a background refresh so the next call is spread.
 function getRandomBootstrapNode() {
+  if (_eligibleUrlSnapshot.length > 0) {
+    return _eligibleUrlSnapshot[Math.floor(Math.random() * _eligibleUrlSnapshot.length)];
+  }
+  getRandomBootstrapNodeAsync().catch(() => {}); // warm snapshot for subsequent calls
   return getRandomGenesisNode();
 }
 

@@ -40,11 +40,13 @@ pub const REGISTRY_ROOT_GATE_HEIGHT: u64 = 0;
 
 /// Coordinated activation for the light-reward roster cutoff (`light_reg_epoch_roster`), gated on
 /// epoch_start. At/after: roster freezes at the commit-window open (epoch_start + 14400 - 50), so a
-/// light node registered mid-epoch earns for that epoch. BELOW: legacy epoch_start — byte-exact to the
-/// DEPLOYED binary, so a ROLLING upgrade of the live chain agrees on the light bitmap/reward_root until
-/// the flip. Set to a FUTURE epoch boundary ahead of the current tip; deploy the new binary to ALL nodes
-/// before it, then every node flips together. 115200 = epoch 8 (tip was ~92k). For a FRESH genesis, 0.
-pub const LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT: u64 = 115_200;
+/// light node registered mid-epoch earns for that epoch — INCLUDING epoch 0 and its own registration
+/// epoch. BELOW: legacy epoch_start cutoff (empty epoch-0 roster ⇒ no epoch-0 light bitmap). 0 = ACTIVE
+/// FROM GENESIS, symmetric with the other two gates — correct for a fresh genesis so light rewards work
+/// from the first epoch. Raise to a future epoch boundary ONLY for a rolling upgrade of a LIVE chain:
+/// creator and reader both read this cutoff, so an uncoordinated flip mid-chain would diverge the light
+/// bitmap/reward_root. On a fresh genesis all nodes agree from h=0, so no staging window is needed.
+pub const LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT: u64 = 0;
 
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
 /// without on-chain governance. Genesis-active rules need no entry (the default is active);
@@ -109,12 +111,13 @@ mod tests {
 
     #[test]
     fn light_reg_epoch_roster_gate_activation() {
-        // Gated on epoch_start; 115200 = epoch 8. Epochs 0-7 dormant (legacy epoch_start cutoff, byte-
-        // exact to the deployed binary for rolling safety), epoch 8+ active (commit-window cutoff).
-        assert_eq!(super::LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT, 115_200);
-        assert!(!super::is_active("light_reg_epoch_roster", 7 * 14_400), "epoch 7 dormant (100800 < 115200)");
-        assert!(super::is_active("light_reg_epoch_roster", 8 * 14_400), "epoch 8 active (115200)");
-        assert!(super::is_active("light_reg_epoch_roster", u64::MAX), "active above");
+        // gate=0 ⇒ ACTIVE FROM GENESIS (fresh-genesis value, symmetric with burn_attestation/registry_root):
+        // the commit-window roster cutoff applies from epoch 0, so a light node earns for its registration
+        // epoch and epoch 0. (Re-gate to a future epoch boundary ONLY for a rolling upgrade of a live chain.)
+        assert_eq!(super::LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT, 0, "active-from-genesis on fresh genesis");
+        assert!(super::is_active("light_reg_epoch_roster", 0), "active from genesis (epoch 0)");
+        assert!(super::is_active("light_reg_epoch_roster", 8 * 14_400), "active later too");
+        assert!(super::is_active("light_reg_epoch_roster", u64::MAX), "active at the highest height");
         // recency_span_epoch is NOT gated (genesis rule = deployed behavior) ⇒ unlisted ⇒ always active.
         assert!(super::is_active("recency_span_epoch", 0), "recency is genesis-active (matches deployed HEAD)");
     }

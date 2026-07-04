@@ -5978,28 +5978,87 @@ impl Storage {
         }
     }
 
-    /// Persist the per-epoch reward leaf set (sorted (wallet, amount) pairs) for proof
-    /// generation. Survives heartbeat-body pruning so claims remain provable indefinitely.
-    pub fn save_epoch_reward_wallets(&self, epoch: u64, wallets: &[(String, u64)]) -> IntegrationResult<()> {
+    // --- Sharded reward leaf-set (10M-scale claim serving) ---------------------------------------
+    // The per-epoch reward set is partitioned into fixed-size shards of the SORTED (wallet, amount)
+    // leaves. A claim loads exactly ONE shard + the shard-meta (K roots + K first-wallet bounds),
+    // never the whole set, so proof generation is O(shard) memory/CPU regardless of recipient count.
+    // The wire proof it produces is byte-identical to the monolithic single-tree proof, so
+    // reward_root, the on-chain verify, and the mobile app are all unchanged. Keys are zero-padded
+    // for O(1) range-delete pruning.
+
+    /// Persist one reward shard's sorted (wallet, amount) leaf slice.
+    pub fn save_epoch_reward_shard(&self, epoch: u64, shard: usize, wallets: &[(String, u64)]) -> IntegrationResult<()> {
         let cf = self.persistent.db.cf_handle("pending_rewards")
             .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
-        let key = format!("epoch_wallets_{}", epoch);
+        let key = format!("epoch_wshard_{:010}_{:06}", epoch, shard);
         let data = bincode::serialize(wallets)
             .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
         self.persistent.db.put_cf(&cf, key.as_bytes(), &data)?;
         Ok(())
     }
 
-    /// Load the per-epoch reward leaf set (sorted (wallet, amount) pairs).
-    pub fn load_epoch_reward_wallets(&self, epoch: u64) -> IntegrationResult<Option<Vec<(String, u64)>>> {
+    /// Load one reward shard's sorted (wallet, amount) leaf slice.
+    pub fn load_epoch_reward_shard(&self, epoch: u64, shard: usize) -> IntegrationResult<Option<Vec<(String, u64)>>> {
         let cf = self.persistent.db.cf_handle("pending_rewards")
             .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
-        let key = format!("epoch_wallets_{}", epoch);
+        let key = format!("epoch_wshard_{:010}_{:06}", epoch, shard);
         match self.persistent.db.get_cf(&cf, key.as_bytes())? {
             Some(data) => Ok(Some(bincode::deserialize(&data)
                 .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?)),
             None => Ok(None),
         }
+    }
+
+    /// Persist per-epoch shard metadata: the K shard subtree-roots and the first wallet of each
+    /// shard (ascending). The bounds enable an O(log K) binary-search to locate a claimant's shard.
+    pub fn save_epoch_shard_meta(&self, epoch: u64, roots: &[[u8; 32]], bounds: &[String]) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let key = format!("epoch_shardmeta_{:010}", epoch);
+        let roots_vec: Vec<[u8; 32]> = roots.to_vec();
+        let bounds_vec: Vec<String> = bounds.to_vec();
+        let data = bincode::serialize(&(roots_vec, bounds_vec))
+            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+        self.persistent.db.put_cf(&cf, key.as_bytes(), &data)?;
+        Ok(())
+    }
+
+    /// Load per-epoch shard metadata (K roots, K first-wallet bounds).
+    pub fn load_epoch_shard_meta(&self, epoch: u64) -> IntegrationResult<Option<(Vec<[u8; 32]>, Vec<String>)>> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let key = format!("epoch_shardmeta_{:010}", epoch);
+        match self.persistent.db.get_cf(&cf, key.as_bytes())? {
+            Some(data) => Ok(Some(bincode::deserialize(&data)
+                .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop a single epoch's sharded reward set + meta (range-delete all its shards). Used by the
+    /// finalization path when a locally-frozen set no longer matches the 2f+1-certified root.
+    pub fn delete_epoch_reward_shards(&self, epoch: u64) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let start = format!("epoch_wshard_{:010}_{:06}", epoch, 0usize);
+        let end = format!("epoch_wshard_{:010}_{:06}", epoch + 1, 0usize);
+        self.persistent.db.delete_range_cf(&cf, start.as_bytes(), end.as_bytes())?;
+        let meta = format!("epoch_shardmeta_{:010}", epoch);
+        self.persistent.db.delete_cf(&cf, meta.as_bytes())?;
+        Ok(())
+    }
+
+    /// O(1) range-delete of the sharded leaf-set CACHE (epoch_wshard_/epoch_shardmeta_) for epochs <
+    /// before_epoch. Leaves epoch_root_/super_elig_/light_bm_ intact, so any pruned epoch's claim
+    /// self-heals by re-deriving + verifying against the committed root. Wired from persist_local_reward_root.
+    pub fn prune_epoch_reward_shards(&self, before_epoch: u64) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let wend = format!("epoch_wshard_{:010}_", before_epoch);
+        self.persistent.db.delete_range_cf(&cf, &b"epoch_wshard_0000000000_"[..], wend.as_bytes())?;
+        let mend = format!("epoch_shardmeta_{:010}", before_epoch);
+        self.persistent.db.delete_range_cf(&cf, &b"epoch_shardmeta_0000000000"[..], mend.as_bytes())?;
+        Ok(())
     }
 
     /// Persist a Light-node eligibility bitmap (decompressed) keyed by (epoch, genesis_idx),
@@ -6143,17 +6202,12 @@ impl Storage {
     /// True iff `wallet` has a chain-confirmed burn-attested NodeRegistration — a node_ entry with a
     /// non-empty backing burn. Gates NodeActivation (which carries no burn of its own) at verify: an
     /// activation is valid only for a wallet that already proved a burn at registration, so a raw
-    /// activation cannot mint a node identity (super pseudonym / reward-eligible row) for free. Two O(1)
-    /// point-reads (wallet_ reverse index → node_ forward entry). Genesis registrations carry an empty
-    /// burn (and never activate), so this correctly returns false for them.
+    /// activation cannot mint a node identity (super pseudonym / reward-eligible row) for free.
+    /// Derives the node_id (resolve_node_id) then one O(1) point-read of the node_ entry. Genesis
+    /// registrations carry an empty burn (and never activate), so this correctly returns false for them.
     pub fn wallet_is_burn_registered(&self, wallet: &str) -> bool {
         let cf = match self.persistent.db.cf_handle("node_registry") { Some(c) => c, None => return false };
-        let nid = match self.persistent.db.get_cf(&cf, format!("wallet_{}", wallet).as_bytes()) {
-            Ok(Some(v)) => serde_json::from_slice::<serde_json::Value>(&v).ok()
-                .and_then(|j| j["node_id"].as_str().map(|s| s.to_string())),
-            _ => None,
-        };
-        let nid = match nid { Some(n) => n, None => return false };
+        let nid = match self.resolve_node_id(wallet) { Some(n) => n, None => return false };
         match self.persistent.db.get_cf(&cf, format!("node_{}", nid).as_bytes()) {
             Ok(Some(v)) => serde_json::from_slice::<serde_json::Value>(&v).ok()
                 .and_then(|j| j["burn"].as_str().map(|b| !b.is_empty())).unwrap_or(false),
@@ -6161,19 +6215,13 @@ impl Storage {
         }
     }
 
-    /// True iff `wallet` belongs to a GENESIS bootstrap node — its registration maps (wallet_ reverse
-    /// index) to a node_id the genesis constants recognise. Genesis nodes are protocol-minted and
-    /// activate WITHOUT a 1DEV burn (they ARE the bootstrap), so the NodeActivation burn-gate must
-    /// exempt them — mirroring exactly the registration burn-attestation gate's genesis exemption
-    /// (is_legacy_genesis_node). Without this, a genesis self-activation (empty burn) is wrongly dropped.
+    /// True iff `wallet` belongs to a GENESIS bootstrap node — constant-table membership. Genesis nodes
+    /// are protocol-minted and activate WITHOUT a 1DEV burn (they ARE the bootstrap), so the
+    /// NodeActivation burn-gate must exempt them — mirroring exactly the registration burn-attestation
+    /// gate's genesis exemption. Without this, a genesis self-activation (empty burn) is wrongly dropped.
     pub fn wallet_is_genesis_node(&self, wallet: &str) -> bool {
-        let cf = match self.persistent.db.cf_handle("node_registry") { Some(c) => c, None => return false };
-        match self.persistent.db.get_cf(&cf, format!("wallet_{}", wallet).as_bytes()) {
-            Ok(Some(v)) => serde_json::from_slice::<serde_json::Value>(&v).ok()
-                .and_then(|j| j["node_id"].as_str().map(|s| crate::genesis_constants::is_legacy_genesis_node(s)))
-                .unwrap_or(false),
-            _ => false,
-        }
+        // Genesis membership is the constant table — no row lookup needed.
+        crate::genesis_constants::GENESIS_WALLETS.iter().any(|(_, w)| *w == wallet)
     }
 
     /// Rebuild the committed burn→wallet index (cbw_) DETERMINISTICALLY from the chain-confirmed
@@ -6452,12 +6500,11 @@ impl Storage {
                         .and_then(|s| hex::decode(s).ok()).unwrap_or_default();
                     lt.add(&crate::registry_lthash::row_lanes(&node_id, wallet, h, burn, &vrf));
                 } else {
-                    // orphan of a discarded block — prune both index keys + node_ + the wallet reverse
-                    // index (one wallet backs one node, so this wallet_ belongs to the orphan).
+                    // orphan of a discarded block — prune node_ + both roster indices. No wallet_ reverse
+                    // index exists (resolution derives the id), so nothing else to drop.
                     batch.delete_cf(&registry_cf, nk.as_bytes());
                     batch.delete_cf(&registry_cf, format!("srtr_{}", node_id).as_bytes());
                     batch.delete_cf(&registry_cf, format!("lrtr_{}", node_id).as_bytes());
-                    if !wallet.is_empty() { batch.delete_cf(&registry_cf, format!("wallet_{}", wallet).as_bytes()); }
                     pruned += 1;
                 }
             }
@@ -6739,13 +6786,8 @@ impl Storage {
         if !vrf_sha3_hex.is_empty() { data["vrf_pk_sha3"] = json!(vrf_sha3_hex); }
         batch.put_cf(&registry_cf, key.as_bytes(), data.to_string().as_bytes());
 
-        // Reverse index: wallet → node_id (O(1) lookup by wallet). Uses the FINAL (preserved) wallet.
-        let wallet_key = format!("wallet_{}", final_wallet);
-        let wallet_data = json!({
-            "node_id": node_id,
-            "node_type": node_type,
-        });
-        batch.put_cf(&registry_cf, wallet_key.as_bytes(), wallet_data.to_string().as_bytes());
+        // No wallet→node reverse index: wallet→node is resolved by DERIVING the id (resolve_node_id) and
+        // point-reading node_<id> — no mutable per-node slot exists to diverge across apply/gossip order.
 
         // Reward-roster indices (chain-confirmed only). Written in THIS batch so they are atomic
         // with the node_ entry and ride the node_registry snapshot (whole-CF copy). Keyed node_id-
@@ -7112,29 +7154,17 @@ impl Storage {
         }
     }
 
-    /// O(1) lookup: get node by wallet address using reverse index
-    /// Returns (node_id, node_type) if found
+    /// O(1) lookup: get node by wallet — derives the canonical id + point-reads node_<id> (no reverse index).
     pub fn get_node_by_wallet(&self, wallet_address: &str) -> IntegrationResult<Option<(String, String)>> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
-        
-        let wallet_key = format!("wallet_{}", wallet_address);
-        match self.persistent.db.get_cf(&registry_cf, wallet_key.as_bytes())? {
-            Some(value) => {
-                let json_str = std::str::from_utf8(&value)
-                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
-                let parsed: serde_json::Value = serde_json::from_str(json_str)
-                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
-                let node_id = parsed["node_id"].as_str().unwrap_or("").to_string();
-                let node_type = parsed["node_type"].as_str().unwrap_or("").to_string();
-                if node_id.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some((node_id, node_type)))
-                }
-            }
-            None => Ok(None),
-        }
+        let id = match self.resolve_node_id(wallet_address) { Some(i) => i, None => return Ok(None) };
+        let node_type = match self.persistent.db.get_cf(&registry_cf, format!("node_{}", id).as_bytes())? {
+            Some(v) => serde_json::from_slice::<serde_json::Value>(&v).ok()
+                .and_then(|j| j["node_type"].as_str().map(|s| s.to_string())).unwrap_or_default(),
+            None => return Ok(None),
+        };
+        Ok(Some((id, node_type)))
     }
     
     /// v4.9: Save device signature for node (used for migration detection)
@@ -7273,108 +7303,39 @@ impl Storage {
         }
     }
 
-    /// v4.3: Get all nodes registered with a specific wallet address — O(1) via reverse index
-    /// CRITICAL for mobile app: Returns nodes even when the node itself is offline!
-    /// Data is read from blockchain storage (RocksDB), not from the node's memory.
-    /// Uses wallet_{address} reverse index for constant-time lookup.
-    /// Architecture: 1 wallet = 1 node (strictly enforced), so result is always 0 or 1 entry.
-    /// Previous version (v3.1) used O(N) prefix scan over ALL nodes — not scalable for 100K+ nodes.
+    /// Get the node registered to a wallet (mobile app reads it even when the node is offline — data comes
+    /// from chain storage, not node memory). Deterministic wallet→node resolution: derive the wallet's
+    /// canonical id (pure fn of the wallet) and point-read node_<id>. No stored reverse index ⇒ every
+    /// honest node returns the identical answer, no per-node flip. O(1) (≤3 point-reads). One wallet backs
+    /// at most one node (each id costs a burn). Vec-typed for the existing callers; ≤1 element.
     pub fn get_nodes_by_wallet(&self, wallet_address: &str) -> IntegrationResult<Vec<(String, String, f64)>> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
-        
-        // O(1) lookup via reverse index: wallet_{address} → {node_id, node_type}
-        let wallet_key = format!("wallet_{}", wallet_address);
-        match self.persistent.db.get_cf(&registry_cf, wallet_key.as_bytes())? {
-            Some(value) => {
-                let json_str = std::str::from_utf8(&value)
-                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
-                let parsed: serde_json::Value = serde_json::from_str(json_str)
-                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
-                
-                let node_id = parsed["node_id"].as_str().unwrap_or("").to_string();
-                let node_type = parsed["node_type"].as_str().unwrap_or("").to_string();
-                
-                if node_id.is_empty() {
-                    return Ok(Vec::new());
-                }
-                
-                // Get reputation from forward index: node_{node_id} → full data
-                let node_key = format!("node_{}", node_id);
-                let reputation = match self.persistent.db.get_cf(&registry_cf, node_key.as_bytes())? {
-                    Some(node_data) => {
-                        let node_json = std::str::from_utf8(&node_data).unwrap_or("{}");
-                        let node_parsed: serde_json::Value = serde_json::from_str(node_json).unwrap_or_default();
-                        node_parsed["reputation"].as_f64()
-                            .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION)
-                    }
-                    None => qnet_consensus::deterministic_reputation::INITIAL_REPUTATION,
-                };
-                
-                Ok(vec![(node_id, node_type, reputation)])
+        let id = match self.resolve_node_id(wallet_address) { Some(i) => i, None => return Ok(Vec::new()) };
+        let (node_type, reputation) = match self.persistent.db.get_cf(&registry_cf, format!("node_{}", id).as_bytes())? {
+            Some(v) => {
+                let np: serde_json::Value = serde_json::from_slice(&v).unwrap_or_default();
+                (np["node_type"].as_str().unwrap_or("").to_string(),
+                 np["reputation"].as_f64().unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION))
             }
-            None => Ok(Vec::new()),
-        }
+            None => return Ok(Vec::new()),
+        };
+        Ok(vec![(id, node_type, reputation)])
     }
-    
-    /// v4.1: Backfill reverse index (wallet → node_id) from existing forward entries.
-    /// Called once on startup to migrate data created before reverse index was added.
-    /// Idempotent — safe to call multiple times. Skips entries that already have reverse index.
-    pub fn backfill_wallet_reverse_index(&self) -> IntegrationResult<u32> {
-        let registry_cf = self.persistent.db.cf_handle("node_registry")
-            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
-        
-        let prefix = b"node_";
-        let iter = self.persistent.db.prefix_iterator_cf(&registry_cf, prefix);
-        let mut backfilled = 0u32;
-        let mut batch = rocksdb::WriteBatch::default();
-        
-        for item in iter {
-            if let Ok((key, value)) = item {
-                let key_str = match std::str::from_utf8(&key) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                
-                if !key_str.starts_with("node_") { continue; }
-                let node_id = &key_str[5..];
-                
-                let json_str = match std::str::from_utf8(&value) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let parsed: serde_json::Value = match serde_json::from_str(json_str) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                
-                let wallet = match parsed["wallet"].as_str() {
-                    Some(w) if !w.is_empty() => w,
-                    _ => continue,
-                };
-                let node_type = parsed["node_type"].as_str().unwrap_or("unknown");
-                
-                // Check if reverse index already exists
-                let wallet_key = format!("wallet_{}", wallet);
-                if self.persistent.db.get_cf(&registry_cf, wallet_key.as_bytes())?.is_some() {
-                    continue; // Already has reverse index
-                }
-                
-                let wallet_data = json!({
-                    "node_id": node_id,
-                    "node_type": node_type,
-                });
-                batch.put_cf(&registry_cf, wallet_key.as_bytes(), wallet_data.to_string().as_bytes());
-                backfilled += 1;
-            }
+
+    /// Derive the wallet's candidate node ids (pure functions of the wallet: genesis constant map, else
+    /// super_node_<h> / light_mobile_<h>) and return the first whose node_<id> row exists. Recomputed
+    /// identically on every node — resolution never reads a mutable, race-able reverse slot.
+    fn resolve_node_id(&self, wallet: &str) -> Option<String> {
+        let cf = self.persistent.db.cf_handle("node_registry")?;
+        let mut cands: Vec<String> = Vec::with_capacity(3);
+        for (id, w) in crate::genesis_constants::GENESIS_WALLETS {
+            if *w == wallet { cands.push(format!("genesis_node_{}", id)); break; }
         }
-        
-        if backfilled > 0 {
-            self.persistent.db.write(batch)?;
-            println!("[INFO][STORAGE] backfill_wallet_index entries={}", backfilled);
-        }
-        
-        Ok(backfilled)
+        cands.push(crate::rpc::generate_super_node_pseudonym(wallet));
+        cands.push(crate::rpc::generate_light_node_pseudonym(wallet));
+        cands.into_iter().find(|id|
+            matches!(self.persistent.db.get_cf(&cf, format!("node_{}", id).as_bytes()), Ok(Some(_))))
     }
     
     /// v4.3: Load ALL node registrations from RocksDB for P2P registry restore on startup.
@@ -11286,6 +11247,42 @@ mod v32_9_pattern_c_tests {
     }
 
     #[test]
+    fn wallet_node_resolution_is_derived_and_phantom_free() {
+        // Variant A: wallet→node resolves by DERIVING the id (pure fn of the wallet) + point-read node_<id>.
+        // A non-derivable id (an activation_ phantom) can never be resolved, and resolution is independent
+        // of insertion/gossip order (no reverse slot to race).
+        let (storage, _dir) = open_test_storage();
+
+        // Super: register under its canonical derived id; a phantom row for the SAME wallet, written before
+        // AND re-cached after (None path), must not change the resolved id.
+        let ws = "walletS";
+        let super_id = crate::rpc::generate_super_node_pseudonym(ws);
+        storage.save_node_registration_at_height("activation_deadbeef01", "super", ws, 70.0, 100).unwrap();
+        storage.save_node_registration_at_height(&super_id, "super", ws, 70.0, 101).unwrap();
+        storage.save_node_registration("activation_deadbeef01", "super", ws, 70.0).unwrap();
+        let got = storage.get_nodes_by_wallet(ws).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, super_id, "resolves to the derived super id, never the phantom");
+
+        // Light: derived light id resolves.
+        let wl = "walletL";
+        let light_id = crate::rpc::generate_light_node_pseudonym(wl);
+        storage.save_node_registration_at_height(&light_id, "light", wl, 70.0, 200).unwrap();
+        assert_eq!(storage.get_nodes_by_wallet(wl).unwrap()[0].0, light_id);
+
+        // Genesis: constant-map wallet resolves to its genesis_node_<id>.
+        let (gid, gw) = crate::genesis_constants::GENESIS_WALLETS[0];
+        let genesis_id = format!("genesis_node_{}", gid);
+        storage.save_node_registration_at_height(&genesis_id, "super", gw, 70.0, 0).unwrap();
+        assert_eq!(storage.get_nodes_by_wallet(gw).unwrap()[0].0, genesis_id);
+
+        // A wallet with ONLY a phantom row resolves to nothing.
+        let wp = "walletPhantomOnly";
+        storage.save_node_registration_at_height("activation_ffff", "super", wp, 70.0, 300).unwrap();
+        assert!(storage.get_nodes_by_wallet(wp).unwrap().is_empty(), "a non-derivable id is never resolvable");
+    }
+
+    #[test]
     fn canonical_root_independent_of_insert_order() {
         let (storage_a, _da) = open_test_storage();
         put_account(&storage_a, b"acct_zzz", b"vZ");
@@ -11488,18 +11485,20 @@ mod v32_9_pattern_c_tests {
 
     #[test]
     fn wallet_burn_registration_gate() {
-        // C: NodeActivation is gated on the wallet holding a burn-attested registration.
+        // C: NodeActivation is gated on the wallet holding a burn-attested registration. Nodes register
+        // under their wallet-derived id, which the gate re-derives to resolve.
         let (storage, _dir) = open_test_storage();
-        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
+        let sa = crate::rpc::generate_super_node_pseudonym("walletA");
+        storage.save_node_registration_at_height_burn(&sa, "super", "walletA", 1.0, 50, "burnA").unwrap();
         assert!(storage.wallet_is_burn_registered("walletA"), "burn-attested registration ⇒ activation allowed");
         // Genesis-style empty-burn registration is NOT a burn proof (genesis never activates).
-        storage.save_node_registration_at_height_burn("genesis_node_001", "super", "walletG", 1.0, 0, "").unwrap();
-        assert!(!storage.wallet_is_burn_registered("walletG"), "empty-burn registration ⇒ not a burn proof");
+        let (gid, gw) = crate::genesis_constants::GENESIS_WALLETS[0];
+        storage.save_node_registration_at_height_burn(&format!("genesis_node_{}", gid), "super", gw, 1.0, 0, "").unwrap();
+        assert!(!storage.wallet_is_burn_registered(gw), "empty-burn registration ⇒ not a burn proof");
         // A raw activation from an unregistered wallet is rejected.
         assert!(!storage.wallet_is_burn_registered("walletX"), "no registration ⇒ activation rejected");
-        // Genesis exemption: genesis self-activates without a 1DEV burn, so the gate must let it through
-        // via wallet_is_genesis_node (mirrors the registration burn-gate's is_legacy_genesis_node).
-        assert!(storage.wallet_is_genesis_node("walletG"), "genesis wallet ⇒ activation exempt");
+        // Genesis exemption: constant-table membership (mirrors the registration burn-gate's genesis exemption).
+        assert!(storage.wallet_is_genesis_node(gw), "genesis wallet ⇒ activation exempt");
         assert!(!storage.wallet_is_genesis_node("walletA"), "non-genesis super ⇒ NOT genesis-exempt");
         assert!(!storage.wallet_is_genesis_node("walletX"), "unregistered ⇒ NOT genesis-exempt");
     }
@@ -11507,29 +11506,108 @@ mod v32_9_pattern_c_tests {
     #[test]
     fn prune_orphan_registrations_drops_above_target() {
         // B: on reorg, orphan roster index KEYS (reg_height > target) are pruned so the reward-roster
-        // readers (super/light, which scan srtr_/lrtr_ directly) match a from-genesis node.
+        // readers (super/light, which scan srtr_/lrtr_ directly) match a from-genesis node. Nodes are
+        // keyed by their wallet-derived pseudonym (same as production) so wallet→node resolution works.
         let (storage, _dir) = open_test_storage();
-        storage.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
-        storage.save_node_registration_at_height_burn("super_orphan", "super", "walletO", 1.0, 200, "burnO").unwrap();
-        storage.save_node_registration_at_height_burn("light_a", "light", "walletL", 1.0, 60, "burnL").unwrap();
-        storage.save_node_registration_at_height_burn("light_orphan", "light", "walletLO", 1.0, 250, "burnLO").unwrap();
+        let sa = crate::rpc::generate_super_node_pseudonym("walletA");
+        let so = crate::rpc::generate_super_node_pseudonym("walletO");
+        let la = crate::rpc::generate_light_node_pseudonym("walletL");
+        let lo = crate::rpc::generate_light_node_pseudonym("walletLO");
+        storage.save_node_registration_at_height_burn(&sa, "super", "walletA", 1.0, 50, "burnA").unwrap();
+        storage.save_node_registration_at_height_burn(&so, "super", "walletO", 1.0, 200, "burnO").unwrap();
+        storage.save_node_registration_at_height_burn(&la, "light", "walletL", 1.0, 60, "burnL").unwrap();
+        storage.save_node_registration_at_height_burn(&lo, "light", "walletLO", 1.0, 250, "burnLO").unwrap();
         assert_eq!(storage.super_registrations_sorted().unwrap().len(), 2, "both supers in the unbounded roster pre-prune");
         // rebuild_registry_lthash folds the orphan prune into its single scan; it returns the orphan count.
         let pruned = storage.rebuild_registry_lthash(100).unwrap();
         assert_eq!(pruned, 2, "both orphans (reg_height 200, 250) pruned");
         assert_eq!(storage.super_registrations_sorted().unwrap(),
-                   vec![("super_a".to_string(), "walletA".to_string())], "orphan super gone from the roster");
+                   vec![(sa.clone(), "walletA".to_string())], "orphan super gone from the roster");
         assert_eq!(storage.light_roster_sorted(1000).unwrap(),
-                   vec![("light_a".to_string(), "walletL".to_string())], "orphan light gone from the roster");
+                   vec![(la.clone(), "walletL".to_string())], "orphan light gone from the roster");
         assert!(storage.wallet_is_burn_registered("walletA"), "canonical entry survives");
         assert!(!storage.wallet_is_burn_registered("walletO"), "orphan node_ entry also pruned");
         // The reg_height-bounded views (cbw / lt_state) already excluded the orphans by bound.
         assert_eq!(storage.compute_lt_state(u64::MAX).root(), {
             let (s2, _d) = open_test_storage();
-            s2.save_node_registration_at_height_burn("super_a", "super", "walletA", 1.0, 50, "burnA").unwrap();
-            s2.save_node_registration_at_height_burn("light_a", "light", "walletL", 1.0, 60, "burnL").unwrap();
+            s2.save_node_registration_at_height_burn(&sa, "super", "walletA", 1.0, 50, "burnA").unwrap();
+            s2.save_node_registration_at_height_burn(&la, "light", "walletL", 1.0, 60, "burnL").unwrap();
             s2.compute_lt_state(u64::MAX).root()
         }, "post-prune roster == a from-genesis node with only the canonical registrations");
+    }
+
+    #[test]
+    fn reward_shard_backfill_heals_absent_certified_epoch() {
+        // A node holding the 2f+1 reward_root but an Absent local shard (freeze-race / snapshot join)
+        // re-derives from super_elig_ + registrations, verifies == certified, freezes → serves the
+        // certified amount; an unreconstructible epoch is memoised instead of re-walked.
+        crate::rpc::REWARD_REBUILD_SKIP.clear();
+        let (storage, _dir) = open_test_storage();
+        let wa = "wa".to_string();
+        let wb = "wb".to_string();
+        let sa = crate::rpc::generate_super_node_pseudonym(&wa);
+        let sb = crate::rpc::generate_super_node_pseudonym(&wb);
+        storage.save_node_registration_at_height_burn(&sa, "super", &wa, 1.0, 50, "burnA").unwrap();
+        storage.save_node_registration_at_height_burn(&sb, "super", &wb, 1.0, 50, "burnB").unwrap();
+        storage.save_super_eligible_batch(1, &vec![sa.clone(), sb.clone()]).unwrap(); // eligible for epoch_num=1
+        let mbi = 320u64; // macroblock_index → epoch_num = 320/160-1 = 1
+        const TOTAL: u64 = 251_432_000_000_000;
+        let (w, root) = crate::node::BlockchainNode::compute_epoch_reward_distribution(&storage, mbi, TOTAL);
+        assert!(!w.is_empty() && !root.is_empty(), "canonical set non-empty");
+        // Certified root committed, but NO shard (freeze-race / snapshot-carried-root-only state).
+        storage.save_epoch_reward_root(mbi, &root, TOTAL / w.len() as u64, w.len() as u32, TOTAL).unwrap();
+        storage.append_reward_epoch(mbi).unwrap();
+        assert!(storage.load_epoch_shard_meta(mbi).unwrap().is_none(), "no shard pre-heal");
+        assert!(matches!(crate::node::BlockchainNode::reward_proof_from_shard(&storage, mbi, &root, &wa, false),
+                         crate::node::ShardClaim::Absent), "pending serves Absent pre-heal");
+        // Unreconstructible epoch: certified root but no super_elig for its epoch_num ⇒ memoised, not healed.
+        let bad = 480u64;
+        storage.save_epoch_reward_root(bad, &"d".repeat(64), 0, 0, TOTAL).unwrap();
+        storage.append_reward_epoch(bad).unwrap();
+
+        let healed = crate::node::BlockchainNode::backfill_reward_shards(&storage);
+        assert_eq!(healed, 1, "exactly the reconstructible epoch heals");
+        assert!(storage.load_epoch_shard_meta(mbi).unwrap().is_some(), "shard frozen post-heal");
+        match crate::node::BlockchainNode::reward_proof_from_shard(&storage, mbi, &root, &wa, false) {
+            crate::node::ShardClaim::Proof(amount, _) => assert_eq!(amount, TOTAL / 2, "wallet A gets its half"),
+            _ => panic!("expected Proof post-heal"),
+        }
+        assert!(crate::rpc::REWARD_REBUILD_SKIP.contains(&bad), "unreconstructible epoch memoised");
+        assert!(!crate::rpc::REWARD_REBUILD_SKIP.contains(&mbi), "healed epoch not memoised");
+        crate::rpc::REWARD_REBUILD_SKIP.clear();
+    }
+
+    #[test]
+    fn prune_reward_shards_keeps_epoch_claimable_via_reheal() {
+        // Pruning the shard CACHE (epoch_wshard_/epoch_shardmeta_) leaves root/super_elig_ intact, so a
+        // pruned epoch re-freezes from those indices (verified vs certified root) — nothing unclaimable.
+        crate::rpc::REWARD_REBUILD_SKIP.clear();
+        let (storage, _dir) = open_test_storage();
+        let wa = "wa".to_string();
+        let wb = "wb".to_string();
+        let sa = crate::rpc::generate_super_node_pseudonym(&wa);
+        let sb = crate::rpc::generate_super_node_pseudonym(&wb);
+        storage.save_node_registration_at_height_burn(&sa, "super", &wa, 1.0, 50, "burnA").unwrap();
+        storage.save_node_registration_at_height_burn(&sb, "super", &wb, 1.0, 50, "burnB").unwrap();
+        storage.save_super_eligible_batch(1, &vec![sa.clone(), sb.clone()]).unwrap();
+        let mbi = 320u64;
+        const TOTAL: u64 = 251_432_000_000_000;
+        let (w, root) = crate::node::BlockchainNode::compute_epoch_reward_distribution(&storage, mbi, TOTAL);
+        storage.save_epoch_reward_root(mbi, &root, TOTAL / w.len() as u64, w.len() as u32, TOTAL).unwrap();
+        storage.append_reward_epoch(mbi).unwrap();
+        crate::node::BlockchainNode::save_epoch_reward_sharded(&storage, mbi, &w);
+        assert!(storage.load_epoch_shard_meta(mbi).unwrap().is_some(), "frozen pre-prune");
+        // Prune the shard cache for this epoch (keep everything >= mbi+1).
+        storage.prune_epoch_reward_shards(mbi + 1).unwrap();
+        assert!(storage.load_epoch_shard_meta(mbi).unwrap().is_none(), "shard cache pruned");
+        assert!(storage.load_epoch_reward_root(mbi).unwrap().is_some(), "certified root retained");
+        // Re-heal from the retained root + super_elig_ ⇒ epoch stays claimable.
+        assert_eq!(crate::node::BlockchainNode::backfill_reward_shards(&storage), 1, "pruned epoch re-freezes");
+        match crate::node::BlockchainNode::reward_proof_from_shard(&storage, mbi, &root, &wa, false) {
+            crate::node::ShardClaim::Proof(amount, _) => assert_eq!(amount, TOTAL / 2, "wallet A recovers its half"),
+            _ => panic!("expected Proof after re-heal"),
+        }
+        crate::rpc::REWARD_REBUILD_SKIP.clear();
     }
 
     // Positional 5-genesis sharding (mirrors node.rs reward + producer): roster sorted by node_id,
