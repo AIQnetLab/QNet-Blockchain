@@ -1,0 +1,3 @@
+# Keep patch files LF-only so patch-package can parse them.
+# (Windows core.autocrlf must NOT rewrite these to CRLF — that breaks `npm install`.)
+*.patch text eol=lf

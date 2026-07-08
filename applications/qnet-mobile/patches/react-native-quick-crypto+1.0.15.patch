@@ -1,7 +1,7 @@
 diff --git a/android/CMakeLists.txt b/android/CMakeLists.txt
 --- a/android/CMakeLists.txt
 +++ b/android/CMakeLists.txt
-@@ -119,6 +119,12 @@ target_link_libraries(
+@@ -119,3 +119,9 @@
  )
  
 +# Suppress third-party library warnings (OpenSSL 3.x deprecations, virtual function hiding)
@@ -11,5 +11,3 @@ diff --git a/android/CMakeLists.txt b/android/CMakeLists.txt
 +)
 +
  if(SODIUM_ENABLED)
-   add_definitions(-DBLSALLOC_SODIUM)
-   find_package(sodium REQUIRED CONFIG)

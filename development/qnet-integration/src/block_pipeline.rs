@@ -3230,6 +3230,38 @@ impl BlockPipeline {
                 }
             }
 
+            // STORAGE HYGIENE (epoch boundary) on EVERY node's apply path — the body-prune's twin
+            // to the producer path in node.rs:17800. apply_stage is the single universal per-block
+            // apply path for received blocks (gossip broadcast AND batch sync both funnel through
+            // block_tx → pipeline), so this prunes on EVERY Super node that APPLIES a 14400-boundary
+            // block. It intentionally does NOT use should_materialize_snapshot's ~1-in-5 holder gate,
+            // so its per-node coverage is strictly BROADER than the co-located snapshot materialization
+            // (each node must bound its OWN storage regardless of snapshot-holder duty). The prior
+            // producer-only trigger left every non-boundary-producer growing unbounded (observed live:
+            // one genesis at full ~2.8GB history vs a pruned one at ~1.1GB). prune_old_microblock_bodies
+            // self-gates to Super and is watermark-based/idempotent (catch-up: drops everything below
+            // height − 6 epochs), so any single applied boundary reclaims the whole window. Body-only
+            // prune keeps hashes + macroblocks + snapshots + state → non-consensus, cannot affect
+            // state_root or cold-join. (14400 is a multiple of the 3600 snapshot interval, so every
+            // prune boundary is also a snapshot boundary — compatible cadences.)
+            //
+            // NOTE: recompress_old_blocks() is deliberately NOT run here. It is O(chain) — it re-scans
+            // and re-decompresses the WHOLE history plus an unconditional full-CF compaction every
+            // call, with near-zero steady-state benefit (blocks already at their age-bucket level are
+            // not rewritten). Multiplying that across every node every epoch would burn CPU and contend
+            // the apply write path at the boundary, so recompression stays producer-only (node.rs).
+            if height % 14_400 == 0 && height > 0 {
+                let storage_for_body_prune = ctx.storage.clone();
+                let prune_h = height;
+                tokio::spawn(async move {
+                    match storage_for_body_prune.prune_old_microblock_bodies(prune_h, crate::node::MICROBLOCK_BODY_RETENTION_BLOCKS) {
+                        Ok(0) => {}
+                        Ok(n) => println!("[INFO][PIPELINE] microblock_bodies_pruned count={} window=6epochs h={}", n, prune_h),
+                        Err(e) => { if is_warn() { println!("[WARN][PIPELINE] body_prune_failed err={:?}", e); } }
+                    }
+                });
+            }
+
             // ────────────────────────────────────────────────────────────────
             // v14.10: GENESIS GLOBAL STATE (was missing in pipeline apply path!)
             //

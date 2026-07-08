@@ -8100,8 +8100,9 @@ impl Storage {
         // 4. Failover events (>24h)
         let failover_removed = self.cleanup_old_failover_events(cutoff_timestamp).unwrap_or(0);
         
-        // 5. Old snapshots — keep latest 3
-        let snapshots_removed = self.cleanup_old_snapshots(3).unwrap_or(0);
+        // 5. Old snapshots — keep latest SNAPSHOT_KEEP_COUNT (bound by the sync-safety const-assert
+        //    in node.rs: keep_count × snapshot interval must stay inside the body-retention window).
+        let snapshots_removed = self.cleanup_old_snapshots(crate::node::SNAPSHOT_KEEP_COUNT).unwrap_or(0);
 
         // 6. v9.0: Prune old tx_index + tx_by_address (runs on ALL node types including Super).
         // Retention: 100,000 blocks (~28h at 1 block/sec). Explorer API queries use tx_by_address;

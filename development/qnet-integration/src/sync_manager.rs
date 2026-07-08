@@ -485,7 +485,7 @@ impl SyncManager {
         // sub-interval fresh genesis) fall through to the block-by-block path below.
         // On success local_h is advanced so the genesis-h=0 fetch is skipped and the
         // loop only fills the tail. Same proven call the legacy node.rs path used.
-        const SNAPSHOT_FAST_PATH_GAP: u64 = 1_500;
+        const SNAPSHOT_FAST_PATH_GAP: u64 = crate::node::SNAPSHOT_SYNC_SWITCH_GAP;
         // GALC cold/dormant-join: whenever the snapshot fast-path will run (fresh cold join OR a returning
         // node behind by > the gap), request the latest genesis-signed checkpoint capsule so the lineage
         // walk roots near the tip (bounded) at ANY chain age — NOT only at local_h==0 (a long-offline warm

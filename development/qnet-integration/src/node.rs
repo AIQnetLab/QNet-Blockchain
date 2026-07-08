@@ -41,6 +41,27 @@ const BACKGROUND_SYNC_TIMEOUT_SECS: u64 = 30; // Background sync timeout
 const SNAPSHOT_FULL_INTERVAL: u64 = 43200; // Full snapshot every 12 hours (43,200 microblocks = 480 macroblocks)
 pub const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3600; // Incremental snapshot every 1 hour (3,600 microblocks = 40 macroblocks)
 pub const SNAPSHOT_EARLY_ANCHOR_HEIGHT: u64 = 90; // First consensus-bindable boundary (mb_idx=1): a young chain has a servable snapshot well before the 3600 interval
+/// Newest snapshots retained per type by cleanup_old_snapshots (single source of truth).
+pub const SNAPSHOT_KEEP_COUNT: usize = 3;
+/// A node behind the tip by more than this block-gap snapshot-jumps instead of block-replaying
+/// (single source; both SyncManager and the legacy node.rs catch-up read it).
+pub const SNAPSHOT_SYNC_SWITCH_GAP: u64 = 1_500;
+/// Microblock BODIES older than this are pruned (kept: hashes + macroblocks + snapshots + state).
+/// = 6 epochs (~24h). Single source; both prune sites (node.rs producer path + block_pipeline apply
+/// path) read it. See prune_old_microblock_bodies (storage.rs).
+pub const MICROBLOCK_BODY_RETENTION_BLOCKS: u64 = 6 * 14_400;
+/// SYNC-SAFETY INVARIANT (compile-time): a cold/lagging node never needs a pruned microblock body.
+/// When it is more than SNAPSHOT_SYNC_SWITCH_GAP behind it snapshot-jumps, then block-replays only
+/// the tail from the OLDEST retained snapshot to tip (≤ SNAPSHOT_KEEP_COUNT × SNAPSHOT_INCREMENTAL_
+/// INTERVAL blocks). That tail — and the sub-switch-gap block-sync range — must stay INSIDE the
+/// body-retention window. This const-assert turns any future change to these constants into a COMPILE
+/// ERROR instead of a silent cold-join / catch-up break (e.g. lowering keep_count, raising the switch
+/// gap, or shrinking retention).
+const _: () = assert!(
+    MICROBLOCK_BODY_RETENTION_BLOCKS > SNAPSHOT_SYNC_SWITCH_GAP
+        && MICROBLOCK_BODY_RETENTION_BLOCKS > (SNAPSHOT_KEEP_COUNT as u64) * SNAPSHOT_INCREMENTAL_INTERVAL,
+    "microblock-body retention must exceed both the snapshot-switch gap and the retained-snapshot span, else cold/lagging sync could need a pruned body",
+);
 
 /// Active-node count mirrored from the production loop, read O(1) off the hot apply path by the
 /// snapshot-holder predicate. 0 = unknown ⇒ all-hold (a count-read gap can never make NOBODY hold).
@@ -14112,7 +14133,7 @@ impl BlockchainNode {
                                     // retries up to ~5 min waiting for the first network anchor
                                     // (v32.6 makes that h=90 ≈ 90 s); warm gap > threshold tries
                                     // once. Either way falls through to block-by-block on failure.
-                                    const RUNTIME_SNAPSHOT_GAP_THRESHOLD: u64 = 1_500;
+                                    const RUNTIME_SNAPSHOT_GAP_THRESHOLD: u64 = SNAPSHOT_SYNC_SWITCH_GAP;
                                     if sync_from_height == 0 || height_difference > RUNTIME_SNAPSHOT_GAP_THRESHOLD {
                                         let cold_start = sync_from_height == 0;
                                         let max_retries: u32 = if cold_start { 30 } else { 1 };
@@ -17795,9 +17816,8 @@ impl BlockchainNode {
                                     // state. Bounds storage to a ~6-epoch window instead of growing forever.
                                     let storage_for_body_prune = Arc::clone(&storage);
                                     tokio::spawn(async move {
-                                        const HB_BODY_RETENTION: u64 = 6 * 14_400; // 6 epochs (~24h)
                                         match storage_for_body_prune
-                                            .prune_old_microblock_bodies(microblock_height, HB_BODY_RETENTION)
+                                            .prune_old_microblock_bodies(microblock_height, MICROBLOCK_BODY_RETENTION_BLOCKS)
                                         {
                                             Ok(0) => {}
                                             Ok(n) => println!("[INFO][NODE] microblock_bodies_pruned count={} window=6epochs", n),
