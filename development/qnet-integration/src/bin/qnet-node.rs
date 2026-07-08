@@ -655,7 +655,7 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
     println!("🔮 QNET QUANTUM BLOCKCHAIN NODE INITIALIZED");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("🚀 Node Type: {:?} | 🔐 Post-Quantum Security: ACTIVE", node_type);
-    println!("🛡️  Quantum Algorithms: CRYSTALS-Dilithium3 + ML-KEM-768 + Ed25519 Hybrid");
+    println!("🛡️  Quantum Algorithms: CRYSTALS-Dilithium3 (ML-DSA-65) signatures + X25519Kyber768 (ML-KEM-768) hybrid TLS KEX");
     println!("⚡ Performance Target: 100,000+ TPS | ⏱️  Block Time: 1s microblocks");
     println!("🌐 Network: Production Ready | 💎 Consensus: Byzantine-BFT");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -3036,18 +3036,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // v5.0: Handle both SIGINT (Ctrl+C) and SIGTERM (docker stop)
     // Docker sends SIGTERM on `docker stop`. Without this, the process ignores
     // SIGTERM and gets SIGKILL after 10s, losing unflushed macroblock data.
+    // SIGTERM is an optional convenience (docker stop). If registration fails,
+    // never panic node boot — fall back to SIGINT-only graceful shutdown.
     #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(
+    let mut sigterm = match tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate()
-    ).expect("failed to register SIGTERM handler");
+    ) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            println!("[WARN][SHUTDOWN] sigterm_register_failed err={} fallback=sigint_only", e);
+            None
+        }
+    };
 
     let shutdown_handler = async {
         let signal_name;
         #[cfg(unix)]
         {
+            // Pending future when SIGTERM is unavailable so select falls through to SIGINT only.
+            let sigterm_recv = async {
+                match sigterm.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => { signal_name = "SIGINT"; }
-                _ = sigterm.recv() => { signal_name = "SIGTERM"; }
+                _ = sigterm_recv => { signal_name = "SIGTERM"; }
             }
         }
         #[cfg(not(unix))]
@@ -4572,8 +4587,12 @@ async fn perform_dht_peer_discovery() -> Result<Vec<String>, String> {
     discovered_peers.append(&mut second_hop_peers);
     discovered_peers.sort();
     discovered_peers.dedup();
-    
-    println!("[DHT] 📊 DHT discovery complete: {} initial peers, {} total after propagation", 
+
+    // Total cap: even across many honest+malicious responses the accepted set
+    // is bounded by a constant, independent of network size.
+    discovered_peers.truncate(MAX_DISCOVERED_PEERS);
+
+    println!("[DHT] 📊 DHT discovery complete: {} initial peers, {} total after propagation",
              initial_count, discovered_peers.len());
     
     // DIAGNOSTIC: Show final peer summary
@@ -4706,6 +4725,12 @@ async fn query_node_for_peers(node_addr: &str) -> Result<Vec<String>, String> {
     Err(format!("All endpoints failed for {}", node_addr))
 }
 
+// Constant cap on peers accepted from ONE response — a peer cannot flood the
+// discovery set with phantom addresses. Fixed bound (not proportional to N).
+const MAX_PEERS_PER_RESPONSE: usize = 64;
+// Total cap on the peer set produced by one DHT discovery pass.
+const MAX_DISCOVERED_PEERS: usize = 256;
+
 // HTTP query for peer list with timeout
 async fn query_peers_http(endpoint: &str) -> Result<Vec<String>, String> {
     use std::time::Duration;
@@ -4742,7 +4767,7 @@ async fn query_peers_http(endpoint: &str) -> Result<Vec<String>, String> {
                                 }
                                 None
                             }).collect();
-                            return Ok(peers);
+                            return Ok(cap_peer_list(peers));
                         }
                     }
                     // Fallback: simple comma-separated format
@@ -4751,7 +4776,7 @@ async fn query_peers_http(endpoint: &str) -> Result<Vec<String>, String> {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty() && s.contains(':') && !s.contains('"'))
                         .collect();
-                    Ok(peers)
+                    Ok(cap_peer_list(peers))
                 }
                 Err(e) => Err(format!("Failed to read response: {}", e)),
             }
@@ -4759,6 +4784,16 @@ async fn query_peers_http(endpoint: &str) -> Result<Vec<String>, String> {
         Ok(response) => Err(format!("HTTP error: {}", response.status())),
         Err(e) => Err(format!("Request failed: {}", e)),
     }
+}
+
+// Dedup then truncate to a constant per-response bound so no single peer can
+// flood the discovery set. Order-stable (dedup keeps first sight) — no map iteration.
+fn cap_peer_list(peers: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    peers.into_iter()
+        .filter(|p| seen.insert(p.clone()))
+        .take(MAX_PEERS_PER_RESPONSE)
+        .collect()
 }
 
 // Get peer list from an active node

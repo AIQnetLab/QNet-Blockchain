@@ -161,7 +161,7 @@ pub struct RoundData {
 }
 
 /// Reveal structure
-/// PRODUCTION v2.40.3: Added hybrid signature for authentication
+/// PRODUCTION v2.40.3: Added post-quantum Dilithium signature for authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reveal {
     pub node_id: String,
@@ -581,7 +581,7 @@ impl CommitRevealConsensus {
         // CRITICAL: Use consensus_crypto module for REAL Dilithium verification
         // This module handles:
         // - Real CRYSTALS-Dilithium with pqcrypto (if feature enabled)
-        // - Hybrid signatures (Dilithium + Ed25519)
+        // - Pure post-quantum Dilithium3 (ML-DSA-65) signatures
         // - Proper signature format parsing
         use crate::consensus_crypto;
         
@@ -647,7 +647,7 @@ impl CommitRevealConsensus {
             let _ = self.get_or_create_round(block_height, vec![reveal.node_id.clone()]);
         }
         
-        // Verify hybrid signature cryptographically
+        // Verify post-quantum Dilithium signature cryptographically
         {
             // CRITICAL FIX v2.52: Message format MUST match generation in node.rs
             // Format: node_id:reveal_data_hex:nonce_hex:timestamp (4 fields)
@@ -675,7 +675,7 @@ impl CommitRevealConsensus {
             if !signature_valid {
                 println!("[REJECT][COMMIT-REVEAL] invalid_signature node={}", reveal.node_id);
                 return Err(ConsensusError::InvalidSignature(
-                    format!("Invalid hybrid reveal signature for node {}", reveal.node_id)
+                    format!("Invalid PQ reveal signature for node {}", reveal.node_id)
                 ));
             }
         }

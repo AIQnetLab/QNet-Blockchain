@@ -54,6 +54,42 @@ pub fn derive_mldsa65_from_xi(xi: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
     (pk_bytes, sk_bytes)
 }
 
+// ── User-wallet ML-DSA-65 identity (pure-Dilithium migration, F0.2) ───────────
+// Distinct from the consensus key: one mnemonic yields INDEPENDENT keys because the
+// KeyGen seed is derived on a different path. Cross-client byte-exactness: the 32-byte
+// seed is SHAKE-256 of a canonical seed string — byte-identical to the mobile native
+// `derive_seed_from_string` (`shake256(out, 32, str, len)`), so node / mobile / ext
+// derive the SAME keypair (hence the SAME EON address) from the SAME mnemonic. The
+// cross-client KAT vector below pins it. Genesis-locked constant.
+const WALLET_SEED_PREFIX: &str = "QNET_WALLET_MLDSA65_v1:";
+
+/// Canonical wallet seed string: `PREFIX + hex(BIP-39 64-byte seed)`. Node and the
+/// client wallets SHAKE-256 this exact string to obtain the 32-byte KeyGen seed.
+pub fn wallet_seed_string(mnemonic: &str) -> String {
+    let seed64 = crate::crypto::solana_derivation::bip39_seed64(mnemonic);
+    format!("{}{}", WALLET_SEED_PREFIX, hex::encode(seed64))
+}
+
+/// SHAKE-256(seed_string) -> 32-byte ML-DSA-65 KeyGen seed. Byte-for-byte identical
+/// to the mobile native `shake256(out, 32, str, len)` used by generateKeypairFromSeed.
+pub fn wallet_xi_from_seed_string(seed_string: &str) -> [u8; 32] {
+    use sha3::Shake256;
+    use sha3::digest::{Update, ExtendableOutput, XofReader};
+    let mut h = Shake256::default();
+    Update::update(&mut h, seed_string.as_bytes());
+    let mut xof = h.finalize_xof();
+    let mut xi = [0u8; 32];
+    xof.read(&mut xi);
+    xi
+}
+
+/// Deterministic USER-WALLET ML-DSA-65 keypair from a BIP-39 mnemonic. Standard
+/// FIPS-204 encoding (pk 1952, sk 4032), byte-identical to the mobile/ext wallet key.
+pub fn derive_wallet_mldsa65_from_mnemonic(mnemonic: &str) -> (Vec<u8>, Vec<u8>) {
+    let xi = wallet_xi_from_seed_string(&wallet_seed_string(mnemonic));
+    derive_mldsa65_from_xi(&xi)
+}
+
 /// Fail-closed startup self-test: determinism + sizes + fips204→pqcrypto
 /// cross-sign/verify. Any failure → caller MUST abort (boot refusal, not split).
 pub fn backend_self_test() -> Result<(), String> {
@@ -140,6 +176,88 @@ mod kat {
         let (pk, sk) = derive_mldsa65_from_xi(&derive_xi(b"sizes"));
         assert_eq!(pk.len(), MLDSA65_PK_LEN, "ML-DSA-65 pk = 1952 bytes");
         assert_eq!(sk.len(), MLDSA65_SK_LEN, "ML-DSA-65 sk = 4032 bytes");
+    }
+
+    // ── Wallet identity (F0.2) ────────────────────────────────────────────────
+    const TEST_MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn wallet_keygen_deterministic_sized_and_independent() {
+        let (pk1, sk1) = derive_wallet_mldsa65_from_mnemonic(TEST_MNEMONIC);
+        let (pk2, sk2) = derive_wallet_mldsa65_from_mnemonic(TEST_MNEMONIC);
+        assert_eq!(pk1, pk2, "wallet pk must be deterministic");
+        assert_eq!(sk1, sk2, "wallet sk must be deterministic");
+        assert_eq!(pk1.len(), MLDSA65_PK_LEN);
+        assert_eq!(sk1.len(), MLDSA65_SK_LEN);
+        // Same mnemonic must NOT reuse the consensus key (distinct derivation paths).
+        let (cons_pk, _) = derive_mldsa65_from_mnemonic(TEST_MNEMONIC);
+        assert_ne!(pk1, cons_pk, "wallet key must be independent of the consensus key");
+    }
+
+    /// Cross-client KAT anchor: the canonical seed string, the SHAKE-256 xi, and the
+    /// resulting EON address are fixed constants that the mobile (native shake256 +
+    /// pqclean) and the extension (@noble ml-dsa) wallet MUST reproduce byte-for-byte.
+    /// Run with `--nocapture` to print the reference vector for pinning in the clients.
+    #[test]
+    fn wallet_cross_client_kat_vector() {
+        let s = wallet_seed_string(TEST_MNEMONIC);
+        let xi = wallet_xi_from_seed_string(&s);
+        let (pk, _sk) = derive_wallet_mldsa65_from_mnemonic(TEST_MNEMONIC);
+        let pk_hex = hex::encode(&pk);
+        let eon = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(&pk_hex)
+            .expect("valid pk hex");
+
+        // xi must be exactly SHAKE-256(seed_string) truncated to 32 bytes.
+        assert_eq!(xi.len(), 32);
+        // EON layout: 45 chars, positional "eon" tag at [19..22].
+        assert_eq!(eon.len(), 45, "EON must be 45 chars");
+        assert_eq!(&eon[19..22], "eon", "positional eon tag");
+
+        // GOLDEN cross-client vector (genesis-locked). Mobile (native shake256 +
+        // pqclean) and the extension (@noble ml-dsa) MUST reproduce these exactly.
+        // Any change here is an intentional, breaking derivation change.
+        assert_eq!(
+            hex::encode(xi),
+            "5c5c79cac60d06d566b9c23047ad28b5da96dab4367593563ef34539067b57f6",
+            "SHAKE-256 xi golden vector"
+        );
+        let pk_sha3 = {
+            use sha3::{Digest, Sha3_256};
+            let mut h = Sha3_256::new();
+            h.update(&pk);
+            hex::encode(h.finalize())
+        };
+        assert_eq!(
+            pk_sha3,
+            "cc8dbbec8ddd7b01f7926748b3738028ab92570e04e694bf0f4ddc346085de6f",
+            "ML-DSA-65 pk golden digest"
+        );
+        assert_eq!(
+            eon, "d9fa370374e24333242eon847d1d354dcd87fe873823e",
+            "wallet EON golden vector"
+        );
+        // Determinism of the address end-to-end.
+        let (pk_b, _) = derive_wallet_mldsa65_from_mnemonic(TEST_MNEMONIC);
+        assert_eq!(
+            eon,
+            crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(&hex::encode(&pk_b)).unwrap(),
+            "address must be deterministic from the mnemonic"
+        );
+
+        println!("---8<--- WALLET KAT (pin in mobile + extension) ---8<---");
+        println!("mnemonic       = {}", TEST_MNEMONIC);
+        println!("seed_string    = {}", s);
+        println!("xi_shake256    = {}", hex::encode(xi));
+        println!("pk_len         = {}", pk.len());
+        println!("pk_sha3_256    = {}", {
+            use sha3::{Digest, Sha3_256};
+            let mut h = Sha3_256::new();
+            h.update(&pk);
+            hex::encode(h.finalize())
+        });
+        println!("eon_address    = {}", eon);
+        println!("---8<--- END WALLET KAT ---8<---");
     }
 
     /// Decisive: fips204-derived keypair must sign/verify under prod

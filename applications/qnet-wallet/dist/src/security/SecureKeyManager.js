@@ -35,22 +35,57 @@ class SecureKeyManager {
         this.autoLockTimer = null;
     }
     
+    // Access the canonical pure-Dilithium (ML-DSA-65) bundle. Loaded in setup.html + popup.html via
+    // <script src="lib/noble-pq-ml-dsa.js"> BEFORE this file. In a page it lives on window; fall back
+    // to self/globalThis for safety. This is the ONLY valid source of a QNet EON address.
+    getQNetDilithium() {
+        const g = (typeof window !== 'undefined') ? window
+                : (typeof self !== 'undefined') ? self
+                : (typeof globalThis !== 'undefined') ? globalThis : null;
+        const lib = g && g.QNetDilithiumLib;
+        const Q = lib && lib.QNetDilithium;
+        if (!Q || typeof Q.deriveWallet !== 'function') {
+            throw new Error('QNetDilithium bundle not loaded — lib/noble-pq-ml-dsa.js must load before SecureKeyManager.js');
+        }
+        return Q;
+    }
+
     // Initialize wallet with OPTIONAL encrypted seed storage
     async initializeWallet(password, seedPhrase, storeSeedPhrase = true) {
         try {
             // 1. Derive keys from seed
             const seed = await this.mnemonicToSeed(seedPhrase);
-            
+
             // 2. Generate private keys
+            //    QNet/EON is pure-Dilithium (ML-DSA-65) — its key material comes from the canonical
+            //    bundle (deriveWallet), NOT from a BIP44 m/44'/195' HMAC seed. Deriving a raw eon "key"
+            //    here and hashing it produced a divergent 34-char address the node/mobile reject. Solana
+            //    stays on its Ed25519 SLIP-0010 path.
+            const Q = this.getQNetDilithium();
+            const qnetWallet = Q.deriveWallet(seedPhrase.trim()); // { address(45), publicKey(hex), secretKey(hex), xi }
+
             const keys = {
-                eon: await this.deriveKey(seed, "m/44'/195'/0'/0/0"),
+                // Store the ML-DSA-65 secret key bytes for the eon slot (used by pure-Dilithium signing),
+                // not a BIP44-derived stub. Hex → Uint8Array.
+                eon: Uint8Array.from(qnetWallet.secretKey.match(/../g).map(b => parseInt(b, 16))),
                 solana: await this.deriveKey(seed, "m/44'/501'/0'/0'")
             };
-            
+
             // 3. Generate addresses
+            //    EON address MUST be the canonical ML-DSA-65 address from the bundle (byte-identical to
+            //    Rust node + mobile: golden KAT "abandon…about" → d9fa37…823e). Solana unchanged.
             const addresses = {
-                eon: await this.getAddress(keys.eon, 'eon'),
+                eon: qnetWallet.address,
                 solana: await this.getAddress(keys.solana, 'solana')
+            };
+
+            // Public ML-DSA-65 key material kept alongside the vault so signers (Q.signQNet) can read the
+            // pk/sk hex without re-deriving. Never transmitted; encrypted at rest with the private keys.
+            const qnetKeypair = {
+                address: qnetWallet.address,
+                publicKeyHex: qnetWallet.publicKey,
+                privateKeyHex: qnetWallet.secretKey,
+                algorithm: 'ML-DSA-65'
             };
             
             // 4. Create encryption key from password
@@ -77,6 +112,14 @@ class SecureKeyManager {
             const vault = {
                 version: '4.1.0',
                 addresses: addresses,
+                // Canonical ML-DSA-65 public key material (hex). Non-secret pk + the address let signers
+                // and unlock resurface the correct QNet identity without re-deriving. (privateKeyHex is
+                // ALSO carried inside encryptedKeys.eon; this copy is convenience for pk/address.)
+                qnetKeypair: {
+                    address: qnetKeypair.address,
+                    publicKeyHex: qnetKeypair.publicKeyHex,
+                    algorithm: qnetKeypair.algorithm
+                },
                 encryptedKeys: encryptedKeys,
                 encryptedSeedPhrase: encryptedSeedPhrase,
                 salt: safeBase64Encode(String.fromCharCode(...salt)),
@@ -641,24 +684,14 @@ class SecureKeyManager {
             
             // Encode public key as base58 address
             return this.simpleBase58(publicKey);
-        } else if (network === 'eon') {
-            // CRITICAL v2.66: Generate proper Ed25519 public key (NOT SHA-256!)
-            // Use nacl if available, otherwise delegate to ProductionCrypto
-            let publicKey;
-            if (typeof nacl !== 'undefined' && nacl.sign && nacl.sign.keyPair) {
-                const keypair = nacl.sign.keyPair.fromSeed(privateKey.slice(0, 32));
-                publicKey = keypair.publicKey;
-            } else {
-                // Fallback to SHA-512 for address generation only (not for signing)
-                const hash = await crypto.subtle.digest('SHA-512', privateKey);
-                publicKey = new Uint8Array(hash).slice(0, 32);
-            }
-            // Generate EON address from public key
-            const addrHash = await crypto.subtle.digest('SHA-512', publicKey);
-            const fullHex = Array.from(new Uint8Array(addrHash)).map(b => b.toString(16).padStart(2, '0')).join('');
-            const part1 = fullHex.substring(0, 19).toLowerCase();
-            const part2 = fullHex.substring(19, 34).toLowerCase();
-            return part1 + 'eon' + part2; // Without checksum for simplicity
+        } else if (network === 'eon' || network === 'qnet') {
+            // DIVERGENT PATH REMOVED. The old code hashed a BIP44-derived key with SHA-512 into a
+            // checksum-less 34-char "eon" address that the Rust node + mobile app reject. A QNet EON
+            // address is ONLY valid when derived from the ML-DSA-65 public key via the canonical bundle.
+            // getAddress() only has a private key here, not the mnemonic, so it cannot derive the
+            // canonical address — callers must use QNetDilithium.deriveWallet(mnemonic).address instead
+            // (initializeWallet already does). Fail loudly rather than mint a wrong address.
+            throw new Error('SecureKeyManager.getAddress: EON/QNet addresses must come from QNetDilithium.deriveWallet(mnemonic).address (bundle), not from a derived key.');
         }
         return 'ADDRESS_PLACEHOLDER';
     }

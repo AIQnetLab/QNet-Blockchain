@@ -596,16 +596,16 @@ testing/integration/*/IDENTITY
 testing/integration/*/LOCK
 testing/integration/*/LOG*
 testing/integration/*/MANIFEST-*
-testing/integration/*/OPTIONS-*b a c k u p s / 
- 
- 
+testing/integration/*/OPTIONS-*backups/
+
+
 # Private scripts (not for public distribution)
 scripts/install-genesis.sh
-a s s e t s / 
- 
- a p p l i c a t i o n s / q n e t - m o b i l e / a n d r o i d / g r a d l e / w r a p p e r / g r a d l e - * - b i n / 
- 
- 
+assets/
+
+applications/qnet-mobile/android/gradle/wrapper/gradle-*-bin/
+
+
 # QNet Explorer - Local data
 applications/qnet-explorer/frontend/node_data_local/
 applications/qnet-explorer/frontend/data/
@@ -674,5 +674,16 @@ infrastructure/nginx/ssl/*.pem
 infrastructure/nginx/ssl/*.key
 infrastructure/nginx/ssl/*.crt
 
+# Secret keypair (contains private_key_b58) — must NEVER be tracked
+infrastructure/config/issuer_keypair.json
+**/issuer_keypair.json
+
 # overnight audit scaffolding + findings (local, do not track)
 audit-overnight/
+
+# local scratch (workflow scripts, temp captures) — never track
+dev-scratch/
+
+# Build artifacts (never track)
+*.rlib
+*.tsbuildinfo

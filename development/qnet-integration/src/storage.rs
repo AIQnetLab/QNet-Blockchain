@@ -870,6 +870,13 @@ impl PersistentStorage {
                 // pruning task once an epoch has rolled).
                 ColumnFamilyDescriptor::new("cross_shard_pending", create_hot_cf_opts()),
                 ColumnFamilyDescriptor::new("cross_shard_receipts", create_hot_cf_opts()),
+                // Phase C (default-OFF): persistent Merkle store. Moving the committed
+                // node/leaf set off-heap into RocksDB is what cuts the ~2.5GB resident
+                // tree at 10M accounts. Leaf key = raw 32-byte addr_hash; node key =
+                // 4-byte big-endian depth ++ 32-byte node key. Created at open so a
+                // fresh genesis DB carries them even when the feature stays disabled.
+                ColumnFamilyDescriptor::new("merkle_leaves", create_cf_opts()),
+                ColumnFamilyDescriptor::new("merkle_nodes", create_cf_opts()),
             ]
         }
 
@@ -884,6 +891,7 @@ impl PersistentStorage {
             "snapshots", "tx_index", "tx_by_address", "attestations", "heartbeats", "poh_state",
             "contract_storage", "fcm_tokens", "mempool", "cross_shard_pending", "cross_shard_receipts",
             "accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage",
+            "merkle_leaves", "merkle_nodes",
         ];
         let open_descriptors = || -> Vec<ColumnFamilyDescriptor> {
             let mut cfs = build_column_families();
@@ -2240,33 +2248,23 @@ impl PersistentStorage {
         Ok(identity_hash[..16].to_string())
     }
     
-    /// Get server IP address
+    /// Get server IP (informational tracking field only, not node identity).
+    /// Trust only the operator-supplied endpoint; never ingest an unvalidated
+    /// external string (removed the curl-to-third-party shell-out: no timeout,
+    /// no format check, hangs boot, lets a network attacker inject any string).
     fn get_server_ip() -> String {
-        use std::process::Command;
-        
-        // Try to get public IP
-        if let Ok(output) = Command::new("curl")
-            .arg("-s")
-            .arg("--max-time")
-            .arg("2")
-            .arg("https://api.ipify.org")
-            .output() {
-            if let Ok(ip) = String::from_utf8(output.stdout) {
-                if !ip.trim().is_empty() {
-                    return ip.trim().to_string();
+        for var in ["QNET_EXTERNAL_IP", "QNET_PUBLIC_IP"] {
+            if let Ok(raw) = std::env::var(var) {
+                let candidate = raw.trim();
+                // Strict IP-format validation before accepting into the record.
+                if candidate.parse::<std::net::IpAddr>().is_ok() {
+                    return candidate.to_string();
+                }
+                if !candidate.is_empty() {
+                    println!("[WARN][STORAGE] server_ip_invalid var={} value_len={}", var, candidate.len());
                 }
             }
         }
-        
-        // Fallback to local IP
-        if let Ok(output) = Command::new("hostname").arg("-I").output() {
-            if let Ok(ip) = String::from_utf8(output.stdout) {
-                if let Some(first_ip) = ip.split_whitespace().next() {
-                    return first_ip.to_string();
-                }
-            }
-        }
-        
         "unknown".to_string()
     }
     
@@ -2640,6 +2638,11 @@ impl PersistentStorage {
             let hash = macroblock.hash();
             batch.put_cf(&metadata_cf, b"latest_macroblock_hash", &hash);
 
+            // The contiguous seal watermark (last_sealed_mb) is derived on read by
+            // last_sealed_mb_index(), never written here: two writers (BFT seal +
+            // P2P sync ingest) save macroblocks concurrently and un-serialized, so
+            // a writer-side read-modify-write would lose updates and freeze the
+            // frontier. Body writes stay independent per-index; the reader folds them.
             db.write(batch)?;
             println!("[INFO][STORAGE] macroblock_saved h={}", height);
             Ok(())
@@ -2657,11 +2660,41 @@ impl PersistentStorage {
         // where index is the macroblock number (1 for blocks 1-90, 2 for blocks 91-180, etc)
         // NOT the block height! This matches save_macroblock which uses round_number
         let key = format!("macroblock_{}", macroblock_index);
-        
+
         match self.db.get_cf(&microblocks_cf, key.as_bytes())? {
             Some(data) => Ok(Some(data)),
             None => Ok(None),
         }
+    }
+
+    /// Contiguous last-sealed-macroblock index (0 if none) — the TRUE seal frontier the production
+    /// backpressure reads (never chain_height/90, the microblock tip, which can't bound a seal-stalled
+    /// producer). Defined as the largest F with macroblock_1..F all present, derived here by scanning
+    /// forward from the persisted hint (always <= F) and read-repairing the hint when it advances.
+    /// Race-immune: a pure function of committed macroblocks with a single writer (this reader), so
+    /// concurrent save_macroblock ordering cannot freeze it. Amortised O(1); one O(F) scan on cold cache.
+    pub fn last_sealed_mb_index(&self) -> u64 {
+        let metadata_cf = match self.db.cf_handle("metadata") { Some(cf) => cf, None => return 0 };
+        let micro_cf = match self.db.cf_handle("microblocks") { Some(cf) => cf, None => return 0 };
+        let hint = self.db.get_cf(&metadata_cf, b"last_sealed_mb").ok().flatten()
+            .filter(|v| v.len() == 8)
+            .map(|v| { let mut b = [0u8; 8]; b.copy_from_slice(&v[..8]); u64::from_le_bytes(b) })
+            .unwrap_or(0);
+        // Floor at the cold-join snapshot anchor: a snapshot-joined node holds NO sub-anchor macroblock
+        // bodies (the anchor's 2f+1 QC finalized them in bulk), so contiguity is measured FROM the anchor,
+        // not from 1 — otherwise the forward-scan finds macroblock_1 absent, reports 0, and disables seal
+        // backpressure on every joined node. (metadata key snapshot_anchor = anchor_mb LE ++ hash.)
+        let anchor = self.db.get_cf(&metadata_cf, b"snapshot_anchor").ok().flatten()
+            .filter(|v| v.len() >= 8)
+            .map(|v| { let mut b = [0u8; 8]; b.copy_from_slice(&v[..8]); u64::from_le_bytes(b) })
+            .unwrap_or(0);
+        let mut wm = hint.max(anchor);
+        while self.db.get_cf(&micro_cf, format!("macroblock_{}", wm + 1).as_bytes())
+            .ok().flatten().map_or(false, |v| !v.is_empty()) { wm += 1; }
+        if wm > hint {
+            let _ = self.db.put_cf(&metadata_cf, b"last_sealed_mb", &wm.to_le_bytes());
+        }
+        wm
     }
     
     /// PRODUCTION v2.45: Delete macroblock by index (for fork recovery)
@@ -2933,47 +2966,8 @@ impl PersistentStorage {
                 }
             },
             None => {
-                // Fallback: Check microblocks for legacy data (will be removed in future)
-                // v9.1: Bounded to 100K iterations to prevent OOM on large chains
-        let microblocks_cf = self.db.cf_handle("microblocks")
-            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
-
-        let iter = self.db.iterator_cf(&microblocks_cf, rocksdb::IteratorMode::Start);
-        let mut scan_count = 0usize;
-        const MAX_LEGACY_SCAN: usize = 100_000;
-        for item in iter {
-            scan_count += 1;
-            if scan_count > MAX_LEGACY_SCAN {
-                break;
-            }
-            let (key, data) = item.map_err(|e| IntegrationError::StorageError(e.to_string()))?;
-            let key_str = std::str::from_utf8(&key).unwrap_or("");
-            
-            if key_str.starts_with("microblock_") {
-                // Try both legacy and efficient formats
-                if let Ok(legacy_block) = bincode::deserialize::<qnet_state::MicroBlock>(&data) {
-                    for tx in &legacy_block.transactions {
-                        if tx.hash == tx_hash {
-                            return Ok(legacy_block.height);
-                        }
-                    }
-                } else if let Ok(efficient_block) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&data) {
-                    // For efficient blocks, we need to check transaction pool
-                    if let Ok(hash_bytes) = hex::decode(tx_hash) {
-                        if hash_bytes.len() == 32 {
-                            let mut hash_array = [0u8; 32];
-                            hash_array.copy_from_slice(&hash_bytes);
-                            
-                            if efficient_block.transaction_hashes.contains(&hash_array) {
-                                return Ok(efficient_block.height);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-                // Transaction not found
+                // tx_index is the O(1) authority; a miss is an authoritative not-found.
+                // No full-chain microblock scan (unbounded DoS amplifier on unknown hashes).
                 Err(IntegrationError::StorageError(format!("Transaction {} not found in blockchain", tx_hash)))
             }
         }
@@ -3223,6 +3217,136 @@ pub struct PatternRecognizer {
     pattern_stats: HashMap<TransactionPattern, u64>,
 }
 
+/// Phase C (default-OFF): RocksDB-backed persistent Merkle store.
+///
+/// Moves the committed leaf/node set off-heap into two dedicated column
+/// families so the ~2.5GB resident tree at 10M accounts lives on disk with
+/// only a bounded cache in RAM. Point reads are single `get_cf` lookups; a
+/// finalize's delta is one atomic `WriteBatch`. Cloning the `Arc<DB>` is
+/// zero-copy and the CF names are resolved per-call via `cf_handle`, so the
+/// store carries no borrowed CF lifetime.
+struct RocksMerkleNodeStore {
+    db: Arc<DB>,
+    leaf_cf: &'static str,
+    node_cf: &'static str,
+}
+
+impl RocksMerkleNodeStore {
+    /// 36-byte node key = 4-byte big-endian depth ++ 32-byte node key. Big-endian
+    /// keeps depth-major ordering in the CF; the fixed 36-byte width keeps every
+    /// node key strictly below the 37-byte all-0xFF upper bound used by the wipe.
+    #[inline]
+    fn node_db_key(depth: u32, key: &[u8; 32]) -> [u8; 36] {
+        let mut k = [0u8; 36];
+        k[..4].copy_from_slice(&depth.to_be_bytes());
+        k[4..].copy_from_slice(key);
+        k
+    }
+}
+
+impl qnet_state::MerkleNodeStore for RocksMerkleNodeStore {
+    fn get_leaf(&self, key: &[u8; 32]) -> Option<[u8; 32]> {
+        let cf = self.db.cf_handle(self.leaf_cf)?;
+        let v = self.db.get_cf(&cf, &key[..]).ok().flatten()?;
+        if v.len() == 32 {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&v);
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    fn get_node(&self, depth: u32, key: &[u8; 32]) -> Option<[u8; 32]> {
+        let cf = self.db.cf_handle(self.node_cf)?;
+        let dbk = Self::node_db_key(depth, key);
+        let v = self.db.get_cf(&cf, &dbk[..]).ok().flatten()?;
+        if v.len() == 32 {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&v);
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])> {
+        let cf = match self.db.cf_handle(self.leaf_cf) {
+            Some(cf) => cf,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(_) => continue, // skip malformed rows defensively
+            };
+            if k.len() != 32 || v.len() != 32 {
+                continue;
+            }
+            let mut key = [0u8; 32];
+            let mut val = [0u8; 32];
+            key.copy_from_slice(&k);
+            val.copy_from_slice(&v);
+            out.push((key, val));
+        }
+        out
+    }
+
+    fn put_batch(
+        &self,
+        leaf_puts: &[([u8; 32], [u8; 32])],
+        leaf_dels: &[[u8; 32]],
+        node_puts: &[((u32, [u8; 32]), [u8; 32])],
+        node_dels: &[(u32, [u8; 32])],
+        wipe_all_nodes: bool,
+    ) -> Result<(), String> {
+        let leaf_cf = self.db.cf_handle(self.leaf_cf)
+            .ok_or_else(|| format!("merkle leaf CF '{}' not found", self.leaf_cf))?;
+        let node_cf = self.db.cf_handle(self.node_cf)
+            .ok_or_else(|| format!("merkle node CF '{}' not found", self.node_cf))?;
+
+        // Full rebuild: wipe the ENTIRE node set as its OWN committed write BEFORE
+        // the puts batch. A single 36-byte-wide range [0x00 .. 0xFF×37) covers every
+        // node key (all are 36 bytes < the 37-byte upper bound), so no stale node can
+        // survive to silently fork the chain. Committing separately avoids same-batch
+        // DeleteRange+Put ordering ambiguity — the subsequent puts carry the complete
+        // non-default node set. LEAVES are never wiped.
+        if wipe_all_nodes {
+            let lo = [0u8; 1];
+            let hi = [0xFFu8; 37];
+            self.db.delete_range_cf(&node_cf, &lo[..], &hi[..])
+                .map_err(|e| e.to_string())?;
+        }
+
+        let mut batch = WriteBatch::default();
+
+        // Leaves: leaf_puts/leaf_dels are disjoint by contract ⇒ order-independent.
+        for key in leaf_dels {
+            batch.delete_cf(&leaf_cf, &key[..]);
+        }
+        for (key, val) in leaf_puts {
+            batch.put_cf(&leaf_cf, &key[..], &val[..]);
+        }
+
+        // Nodes: on the merge path (no wipe) apply node_dels BEFORE node_puts so a
+        // re-put of the same key wins. After a wipe there is nothing left to delete,
+        // so node_dels are a no-op — node_puts alone repopulate the full set.
+        if !wipe_all_nodes {
+            for (depth, key) in node_dels {
+                let dbk = Self::node_db_key(*depth, key);
+                batch.delete_cf(&node_cf, &dbk[..]);
+            }
+        }
+        for ((depth, key), val) in node_puts {
+            let dbk = Self::node_db_key(*depth, key);
+            batch.put_cf(&node_cf, &dbk[..], &val[..]);
+        }
+
+        self.db.write(batch).map_err(|e| e.to_string())
+    }
+}
+
 pub struct Storage {
     persistent: PersistentStorage,
     /// Transaction pool for efficient storage without duplication
@@ -3293,6 +3417,24 @@ impl Storage {
         self.persistent.verify_and_repair_chain_height()
     }
 
+    /// Phase C: RocksDB-backed persistent Merkle store over the two dedicated
+    /// column families ("merkle_leaves", "merkle_nodes"). Both CFs are created at
+    /// open (build_column_families), so on a fresh genesis DB they always exist.
+    /// Handed to `StateManager::set_merkle_node_store` when the persistent-tree
+    /// feature is enabled, moving the committed tree off-heap. The `Arc<DB>` clone
+    /// is zero-copy; CF handles are resolved lazily on each store operation.
+    pub fn merkle_node_store(&self) -> std::sync::Arc<dyn qnet_state::MerkleNodeStore> {
+        std::sync::Arc::new(RocksMerkleNodeStore {
+            db: self.persistent.db.clone(),
+            leaf_cf: "merkle_leaves",
+            node_cf: "merkle_nodes",
+        })
+    }
+
+    // Smart-contract VM (P2): WASM code blobs are stored via the existing
+    // `save_contract_code` / `get_contract_code` (content-addressed by code_hash,
+    // `contract:code:{hash}` in the raw store). No new CF needed.
+
     // ========================================================================
     // v15.9: WRITE-THROUGH ACCOUNT PERSISTENCE (Stage 1) — public surface
     // ========================================================================
@@ -3339,6 +3481,22 @@ impl Storage {
             println!("[INFO][STATE] load_all_accounts count={}", out.len());
         }
         Ok(out)
+    }
+
+    /// Stream-sum all account balances from the accounts CF (O(1) RAM, no Vec). Used only by the
+    /// legacy pre-emission cold-join fallback where the anchor lacks a checkpoint_qc; post-emission
+    /// anchors bind total_supply via the QC checkpoint instead of a balance sum.
+    pub fn sum_all_account_balances(&self) -> IntegrationResult<u64> {
+        let cf = self.persistent.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let mut sum: u64 = 0;
+        for item in self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (_k, v) = item.map_err(|e| IntegrationError::StorageError(format!("accounts_iter_err: {}", e)))?;
+            let account: qnet_state::Account = bincode::deserialize(&v)
+                .map_err(|e| IntegrationError::SerializationError(format!("accounts_decode_err: {}", e)))?;
+            sum = sum.saturating_add(account.balance);
+        }
+        Ok(sum)
     }
 
     // ========================================================================
@@ -4802,6 +4960,11 @@ impl Storage {
             let complete_macroblocks = chain_height / 90;
             Ok(complete_macroblocks)
         }
+    }
+
+    /// Contiguous last-sealed-macroblock index — the seal frontier for production backpressure.
+    pub fn last_sealed_mb_index(&self) -> u64 {
+        self.persistent.last_sealed_mb_index()
     }
     
     /// Load microblock with automatic format detection.
@@ -7975,37 +8138,29 @@ impl Storage {
     /// Save a failover event (optimized with bincode serialization and LZ4 compression)
     /// NOTE: Light nodes should NOT call this method - they don't store failover history
     pub fn save_failover_event(&self, event: &FailoverEvent) -> IntegrationResult<()> {
-        // OPTIMIZATION: Light nodes don't store failover events
-        if std::env::var("QNET_NODE_TYPE").unwrap_or_default() == "light" {
-            return Ok(()); // Skip storage for light nodes
+        // Gate on the authoritative configured role, not an env string a
+        // caller could flip: a safety record must not be env-bypassable.
+        // Light nodes are pure API clients with no chain storage.
+        if self.storage_mode != StorageMode::Super {
+            return Ok(());
         }
-        
+
         let failover_cf = self.persistent.db.cf_handle("failover_events")
             .ok_or_else(|| IntegrationError::StorageError("failover_events column family not found".to_string()))?;
-        
+
         // Use height as key for efficient range queries
         // Format: failover_<height>_<timestamp> for uniqueness
         let key = format!("failover_{:012}_{}", event.height, event.timestamp);
-        
+
         // Serialize with bincode (more efficient than JSON)
         let value = bincode::serialize(event)
             .map_err(|e| IntegrationError::StorageError(format!("Failed to serialize failover event: {}", e)))?;
-        
+
         self.persistent.db.put_cf(&failover_cf, key.as_bytes(), &value)?;
-        
-        // Auto-cleanup old events based on time relevance, not node type
-        // Keep ~30 days of history (assuming ~100 failovers per day worst case)
-        let max_events = match std::env::var("QNET_NODE_TYPE").unwrap_or_default().as_str() {
-            "super" => 10_000,   // Super nodes: ~30 days (400KB) - enough for analysis
-            // v3.18: Full nodes removed - use "super" for all server nodes
-            _ => 0,              // Light nodes: don't store (mobile devices)
-        };
-        
-        // Only cleanup if we're not a light node
-        if max_events > 0 {
-            self.cleanup_old_failovers(max_events)?;
-        }
-        
+
+        // Bounded retention: ~30 days (≈100 failovers/day worst case).
+        self.cleanup_old_failovers(10_000)?;
+
         Ok(())
     }
     
@@ -8138,6 +8293,19 @@ impl Storage {
         self.persistent.prepare_snapshot_view(hot_accounts)
     }
 
+    /// O(1) RocksDB estimate of total persisted accounts — the TOTAL on-disk
+    /// account count (every hot ∪ cold row in the "accounts" CF), NOT the bounded
+    /// LRU cache size. Best-effort: unwraps to 0 on missing CF / None / Err so it
+    /// never panics. node.rs uses it for the merkle-store auto-heuristic.
+    pub fn estimate_account_count(&self) -> u64 {
+        self.persistent.db.cf_handle("accounts")
+            .and_then(|cf| self.persistent.db
+                .property_int_value_cf(&cf, "rocksdb.estimate-num-keys")
+                .ok()
+                .flatten())
+            .unwrap_or(0)
+    }
+
     pub fn put_galc_held(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_galc_held(bytes) }
     pub fn get_galc_held(&self) -> IntegrationResult<Option<Vec<u8>>> { self.persistent.get_galc_held() }
     pub fn put_snapshot_anchor(&self, bytes: &[u8]) -> IntegrationResult<()> { self.persistent.put_snapshot_anchor(bytes) }
@@ -8199,15 +8367,39 @@ impl Storage {
         // reproduces exactly state_root@H even while H+1.. mutate the live DB.
         let (account_count, rewards_count, contract_entries, registry_count, compressed_kb, uncompressed_kb) =
             tokio::task::spawn_blocking(move || -> IntegrationResult<(u64, u64, u64, u64, usize, usize)> {
+                use std::io::Write;
                 let db = &view.db;
                 let snap = &view.snap;
                 let snapshots_cf = db.cf_handle("snapshots")
                     .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
 
-                let mut snapshot_data = Vec::new();
-                snapshot_data.extend_from_slice(&crate::node::PROTOCOL_VERSION.to_le_bytes());
-                snapshot_data.extend_from_slice(&height.to_le_bytes());
-                snapshot_data.extend_from_slice(&timestamp.to_le_bytes());
+                // Stream the logical payload straight into a zstd encoder so the full
+                // uncompressed blob (multi-GB at 10M accounts) is NEVER materialized.
+                // `uncompressed_len` tracks the running byte count fed to the encoder,
+                // reproducing the exact wire header without holding the blob. Content and
+                // order are byte-identical to the prior in-RAM [0x02 | body] layout, so
+                // every node still streams the same bytes ⇒ the frame stays deterministic.
+                let mut encoder = zstd::Encoder::new(Vec::new(), 3)
+                    .map_err(|e| IntegrationError::Other(format!("Full snapshot encoder init error: {}", e)))?;
+                let mut uncompressed_len: u64 = 0;
+                // Feed a chunk into the encoder while accumulating its length into
+                // `uncompressed_len` (checked-add: a >u64 payload is unrepresentable,
+                // never a silent wrap on the consensus-critical header).
+                macro_rules! feed {
+                    ($enc:expr, $len:expr, $chunk:expr) => {{
+                        let c = $chunk;
+                        $enc.write_all(c)
+                            .map_err(|e| IntegrationError::Other(format!("Full snapshot write error: {}", e)))?;
+                        $len = $len.checked_add(c.len() as u64)
+                            .ok_or_else(|| IntegrationError::Other("snapshot length overflow".to_string()))?;
+                    }};
+                }
+
+                // Type discriminator first (0x02 = SNAP_TYPE_FULL), then the header fields.
+                feed!(encoder, uncompressed_len, &[0x02u8]); // SNAP_TYPE_FULL
+                feed!(encoder, uncompressed_len, &crate::node::PROTOCOL_VERSION.to_le_bytes());
+                feed!(encoder, uncompressed_len, &height.to_le_bytes());
+                feed!(encoder, uncompressed_len, &timestamp.to_le_bytes());
 
                 // 4. Account state — the COMPLETE committed tree leaf set. The pinned view's accounts
                 //    CF holds every hot account (flushed at prepare) ∪ every cold account (persist-
@@ -8218,10 +8410,10 @@ impl Storage {
                 let mut account_count = 0u64;
                 for item in snap.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start) {
                     let (key, value) = item?;
-                    snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                    snapshot_data.extend_from_slice(&key);
-                    snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
-                    snapshot_data.extend_from_slice(&value);
+                    feed!(encoder, uncompressed_len, &(key.len() as u32).to_le_bytes());
+                    feed!(encoder, uncompressed_len, &key);
+                    feed!(encoder, uncompressed_len, &(value.len() as u32).to_le_bytes());
+                    feed!(encoder, uncompressed_len, &value);
                     account_count += 1;
                 }
 
@@ -8229,62 +8421,57 @@ impl Storage {
                 let mut rewards_count = 0u64;
                 if let Some(rewards_cf) = db.cf_handle("pending_rewards") {
                     // Write marker for rewards section
-                    snapshot_data.extend_from_slice(b"REWARDS_V1");
+                    feed!(encoder, uncompressed_len, b"REWARDS_V1");
 
                     let rewards_iter = snap.iterator_cf(&rewards_cf, rocksdb::IteratorMode::Start);
                     for item in rewards_iter {
                         let (key, value) = item?;
-                        snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                        snapshot_data.extend_from_slice(&key);
-                        snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
-                        snapshot_data.extend_from_slice(&value);
+                        feed!(encoder, uncompressed_len, &(key.len() as u32).to_le_bytes());
+                        feed!(encoder, uncompressed_len, &key);
+                        feed!(encoder, uncompressed_len, &(value.len() as u32).to_le_bytes());
+                        feed!(encoder, uncompressed_len, &value);
                         rewards_count += 1;
                     }
 
                     // Write end marker
-                    snapshot_data.extend_from_slice(b"REWARDS_END");
+                    feed!(encoder, uncompressed_len, b"REWARDS_END");
                 }
 
                 // 6. v5.0: Include contract_storage for full state recovery
                 let mut contract_entries = 0u64;
                 if let Some(cs_cf) = db.cf_handle("contract_storage") {
-                    snapshot_data.extend_from_slice(b"CONTRACT_STORAGE_V1");
+                    feed!(encoder, uncompressed_len, b"CONTRACT_STORAGE_V1");
                     let cs_iter = snap.iterator_cf(&cs_cf, rocksdb::IteratorMode::Start);
                     for item in cs_iter {
                         let (key, value) = item?;
-                        snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                        snapshot_data.extend_from_slice(&key);
-                        snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
-                        snapshot_data.extend_from_slice(&value);
+                        feed!(encoder, uncompressed_len, &(key.len() as u32).to_le_bytes());
+                        feed!(encoder, uncompressed_len, &key);
+                        feed!(encoder, uncompressed_len, &(value.len() as u32).to_le_bytes());
+                        feed!(encoder, uncompressed_len, &value);
                         contract_entries += 1;
                     }
-                    snapshot_data.extend_from_slice(b"CONTRACT_STORAGE_END");
+                    feed!(encoder, uncompressed_len, b"CONTRACT_STORAGE_END");
                 }
 
                 // 7. v5.0: Include node_registry for producer wallet lookups after snapshot restore
                 let mut registry_count = 0u64;
                 if let Some(nr_cf) = db.cf_handle("node_registry") {
-                    snapshot_data.extend_from_slice(b"NODE_REGISTRY_V1");
+                    feed!(encoder, uncompressed_len, b"NODE_REGISTRY_V1");
                     let nr_iter = snap.iterator_cf(&nr_cf, rocksdb::IteratorMode::Start);
                     for item in nr_iter {
                         let (key, value) = item?;
-                        snapshot_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                        snapshot_data.extend_from_slice(&key);
-                        snapshot_data.extend_from_slice(&(value.len() as u32).to_le_bytes());
-                        snapshot_data.extend_from_slice(&value);
+                        feed!(encoder, uncompressed_len, &(key.len() as u32).to_le_bytes());
+                        feed!(encoder, uncompressed_len, &key);
+                        feed!(encoder, uncompressed_len, &(value.len() as u32).to_le_bytes());
+                        feed!(encoder, uncompressed_len, &value);
                         registry_count += 1;
                     }
-                    snapshot_data.extend_from_slice(b"NODE_REGISTRY_END");
+                    feed!(encoder, uncompressed_len, b"NODE_REGISTRY_END");
                 }
 
-                // Prepend type discriminator: 0x02 = SNAP_TYPE_FULL
-                let mut typed_data = Vec::with_capacity(1 + snapshot_data.len());
-                typed_data.push(0x02); // SNAP_TYPE_FULL
-                typed_data.extend_from_slice(&snapshot_data);
-
-                // Compress with Zstd-3 (fast for large snapshots, good ratio)
-                let uncompressed_len = typed_data.len() as u64;
-                let compressed = zstd::encode_all(&typed_data[..], 3)
+                // finish() flushes the final zstd frame and returns the wrapped Vec — a
+                // complete single stream, decoded identically by the untouched loader.
+                let compressed = encoder.finish()
                     .map_err(|e| IntegrationError::Other(format!("Full snapshot compression error: {}", e)))?;
 
                 // Integrity hash over compressed data
@@ -8725,6 +8912,18 @@ impl Storage {
         let rewards_cf_name = if stage { "pending_rewards_stage" } else { "pending_rewards" };
         let contract_cf_name = if stage { "contract_storage_stage" } else { "contract_storage" };
         let registry_cf_name = if stage { "node_registry_stage" } else { "node_registry" };
+
+        // Clear the staging CFs BEFORE a fresh staged load. A crash in a prior attempt's narrow
+        // promote window (marker deleted but stage-clear not yet finished) can leave stale rows;
+        // loading a new snapshot on top would then let those poison this snapshot's Pattern-C
+        // merkle recompute → a fail-closed reject of an otherwise-honest snapshot (a liveness
+        // hole, forcing a needless full replay). The *_stage CFs are throwaway verify-space, so
+        // truncating them here is always safe and makes each staged load self-contained.
+        if stage {
+            for cf in &[accounts_cf_name, rewards_cf_name, contract_cf_name, registry_cf_name] {
+                let _ = self.clear_cf(cf);
+            }
+        }
 
         let snapshots_cf = self.persistent.db.cf_handle("snapshots")
             .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
@@ -9228,34 +9427,11 @@ impl Storage {
         }
     }
     
-    /// Share snapshot via P2P network (announce IPFS CID to peers)
-    pub async fn announce_snapshot_to_peers(&self, height: u64, cid: &str, p2p: &crate::unified_p2p::SimplifiedP2P) {
-        println!("[INFO][STORAGE] snapshot_announcing height={} cid={}", height, cid);
-        
-        // Create announcement message
-        let _announcement = json!({
-            "type": "snapshot_available",
-            "height": height,
-            "ipfs_cid": cid,
-            "timestamp": chrono::Utc::now().timestamp(),
-            "node_id": p2p.node_id.clone()
-        });
-        
-        // Broadcast to all connected peers
-        let peers = p2p.get_validated_active_peers();
-        for peer in &peers {
-            let message = crate::unified_p2p::NetworkMessage::StateSnapshot {
-                height,
-                ipfs_cid: cid.to_string(),
-                sender_id: p2p.node_id.clone(),
-            };
-            
-            p2p.send_network_message(&peer.addr, message);
-        }
-        
-        println!("[INFO][STORAGE] snapshot_announced peers={}", peers.len());
-    }
-    
+    // NOTE: a former `announce_snapshot_to_peers` broadcast a StateSnapshot IPFS-CID hint to
+    // every peer, but the receiver only logged it (never fetched) — dead traffic. State sync
+    // is fully handled by GALC + the QC-anchored snapshot/full-sync path, so the announcement
+    // was removed.
+
     /// EIP-4444-style body expiry for the archival (Super) tier. Microblock BODIES
     /// (the bulk: heartbeats + TXs) older than `retention_blocks` are dropped, while
     /// the hash index (metadata), macroblocks, snapshots and account state are kept —
@@ -9266,6 +9442,18 @@ impl Storage {
     /// every body reader uses `if let Ok(Some(..))`, so a pruned body is skipped, and
     /// cold-start replays from a <=1h snapshot, never across the retention window.
     /// Returns the number of bodies pruned this run.
+    /// Height below which per-block bodies AND blocklogs have been pruned on this node (0 if never
+    /// pruned) — the `body_prune_watermark` written by prune_old_microblock_bodies. getLogs reads
+    /// this to report `pruned_below`, so an empty result for an aged-out height is distinguishable
+    /// from a block that genuinely emitted no events (both otherwise return count:0).
+    pub fn log_prune_floor(&self) -> u64 {
+        self.persistent.db.cf_handle("metadata")
+            .and_then(|cf| self.persistent.db.get_cf(&cf, b"body_prune_watermark").ok().flatten())
+            .filter(|v| v.len() == 8)
+            .map(|v| { let mut b = [0u8; 8]; b.copy_from_slice(&v[..8]); u64::from_le_bytes(b) })
+            .unwrap_or(0)
+    }
+
     pub fn prune_old_microblock_bodies(&self, current_height: u64, retention_blocks: u64) -> IntegrationResult<u64> {
         // Super (incl. genesis) is the only tier that stores block data: Light nodes
         // are stateless mobile clients and Full nodes are removed. Off-tier or before
@@ -9305,6 +9493,10 @@ impl Storage {
         for h in from..prune_before {
             // Body only — KEEP metadata/microblock_hash_{h} (continuity) + macroblocks.
             batch.delete_cf(&microblocks_cf, format!("microblock_{}", h).as_bytes());
+            // Co-prune the OFF-consensus WASM log receipts on the same window: getLogs serves only a
+            // bounded recent range (<< retention_blocks), so aged-out blocklogs are unreachable and
+            // safe to drop. Default CF (save_raw); zero-padded key ⇒ lexicographically contiguous.
+            batch.delete(format!("blocklogs_{:010}", h).as_bytes());
         }
         batch.put_cf(&metadata_cf, WATERMARK_KEY, &prune_before.to_le_bytes());
         self.persistent.db.write(batch)?;
@@ -9314,6 +9506,11 @@ impl Storage {
             &microblocks_cf,
             Some(format!("microblock_{}", from).as_bytes()),
             Some(format!("microblock_{}", prune_before).as_bytes()),
+        );
+        // Same reclaim for the co-pruned blocklogs range (default CF).
+        self.persistent.db.compact_range(
+            Some(format!("blocklogs_{:010}", from).as_bytes()),
+            Some(format!("blocklogs_{:010}", prune_before).as_bytes()),
         );
         if crate::node::is_info() {
             println!("[INFO][STORAGE] body_prune_compacted from={} to={}", from, prune_before);
@@ -9688,20 +9885,20 @@ impl Storage {
     }
 
     /// Account merkle over an explicit CF: "accounts" (live) or "accounts_stage" (cold-join verify).
+    /// Streams the CF row-by-row into a throwaway tree (no full Vec) — the finalized root is identical
+    /// (the tree is leaf-set-keyed, so insertion streaming vs batch yields the same root).
     pub fn recompute_account_merkle_root_cf(&self, cf_name: &str) -> IntegrationResult<[u8; 32]> {
         let accounts_cf = self.persistent.db.cf_handle(cf_name)
             .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
-        let mut updates: Vec<(String, qnet_state::Account)> = Vec::new();
+        let mut tree = qnet_state::StateMerkleTree::new();
         for item in self.persistent.db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start) {
             let (k, v) = item.map_err(|e| IntegrationError::StorageError(format!("merkle_iter_err: {}", e)))?;
             let addr = String::from_utf8(k.to_vec())
                 .map_err(|e| IntegrationError::StorageError(format!("merkle_addr_utf8_err: {}", e)))?;
             let account: qnet_state::Account = bincode::deserialize(&v)
                 .map_err(|e| IntegrationError::SerializationError(format!("merkle_account_decode_err: {}", e)))?;
-            updates.push((addr, account));
+            tree.insert_lazy(&addr, &account);
         }
-        let mut tree = qnet_state::StateMerkleTree::new();
-        tree.insert_batch(&updates);
         Ok(tree.finalize())
     }
 
@@ -10838,9 +11035,8 @@ impl Storage {
         state: &std::sync::Arc<tokio::sync::RwLock<crate::StateManager>>,
         anchor_height: u64,
     ) -> IntegrationResult<()> {
-        // load_all_accounts materializes a Vec — acceptable for a one-time cold-join; a streaming
-        // variant is the scale follow-up (millions of accounts), not a blocker here.
-        let accounts = self.load_all_accounts()?;
+        // Accounts are streamed row-by-row from the promoted CF into the merkle+DashMap below (no full
+        // Vec materialization) — see the streaming restore after the anchor root/total_supply are read.
         // Emission watermark: highest emission macroblock already minted at/below the anchor. Derived
         // with the SAME formula the apply path uses (node.rs apply_block_to_state) so the rehydrated
         // node never re-mints an epoch the bound state already includes (>=2 epochs ⇒ double-mint).
@@ -10879,8 +11075,8 @@ impl Storage {
                         cp.total_supply
                     }
                     // No checkpoint_qc ⇒ only legacy/genesis pre-emission anchors (epoch<2), where the
-                    // balance sum is exact (minted==sum-of-balances). Post-emission anchors always carry it.
-                    None => accounts.iter().map(|(_, a)| a.balance).fold(0u64, |acc, b| acc.saturating_add(b)),
+                    // balance sum is exact (minted==sum-of-balances). Streamed (O(1) RAM), not a Vec fold.
+                    None => self.sum_all_account_balances()?,
                 };
                 (mb.state_root, ts)
             }
@@ -10892,11 +11088,24 @@ impl Storage {
         };
 
         let sg = state.write().await;
-        sg.restore_accounts(accounts)
-            .map_err(|e| IntegrationError::StorageError(format!("rehydrate_restore_fail {}", e)))?;
+        // STREAMING restore: feed the accounts CF row-by-row into the merkle + DashMap (no full Vec,
+        // no double-hold — peak RAM drops from ~2x accounts to ~1x). A row that fails to decode is
+        // skipped+logged; the resulting incompleteness trips the fail-closed merkle assert below
+        // (clear + block-replay), so a corrupt row can never admit partial state.
+        let cf = self.persistent.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let acct_iter = self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start).filter_map(|item| {
+            let (k, v) = item.ok()?;
+            let addr = String::from_utf8(k.to_vec()).ok()?;
+            match bincode::deserialize::<qnet_state::Account>(&v) {
+                Ok(a) => Some((addr, a)),
+                Err(e) => { println!("[WARN][STATE] rehydrate_skip_corrupt_account err={}", e); None }
+            }
+        });
         // FAIL-CLOSED merkle assert BEFORE seeding chain_state — a mismatch then leaves no partial
         // chain_state to roll back (clear() resets accounts+merkle; chain_state was never mutated).
-        let computed = sg.finalize_merkle();
+        let computed = sg.restore_accounts_streamed(acct_iter)
+            .map_err(|e| IntegrationError::StorageError(format!("rehydrate_restore_fail {}", e)))?;
         if computed != anchor_state_root {
             println!("[ERR][STATE] rehydrate_merkle_mismatch expected={} computed={} action=clear_block_replay",
                      hex::encode(&anchor_state_root[..8]), hex::encode(&computed[..8]));
@@ -11029,19 +11238,33 @@ impl Storage {
         let key = format!("contract:state:{}:{}", contract_address, state_key);
         self.persistent.save_raw(&key, value.as_bytes())
     }
-    
-    /// Save contract WASM code
-    pub fn save_contract_code(&self, code_hash: &str, wasm_code: &[u8]) -> IntegrationResult<()> {
-        let key = format!("contract:code:{}", code_hash);
-        self.persistent.save_raw(&key, wasm_code)
+
+    /// OFF-CONSENSUS receipt store: persist a block's captured WASM event logs for RPC `getLogs`.
+    /// Keyed by height; value = bincode of `Vec<(tx_hash, contract_hex, data)>` in emit order.
+    /// NEVER hashed / never part of state_root — a pure side-index. No-op on an empty list.
+    pub fn save_block_logs(&self, height: u64, logs: &[(String, String, Vec<u8>)]) -> IntegrationResult<()> {
+        if logs.is_empty() { return Ok(()); }
+        let key = format!("blocklogs_{:010}", height);
+        let bytes = bincode::serialize(logs)
+            .map_err(|e| IntegrationError::StorageError(format!("blocklogs serialize: {}", e)))?;
+        self.persistent.save_raw(&key, &bytes)
     }
-    
-    /// Get contract WASM code by hash
-    pub fn get_contract_code(&self, code_hash: &str) -> IntegrationResult<Option<Vec<u8>>> {
-        let key = format!("contract:code:{}", code_hash);
-        self.persistent.load_raw(&key)
+
+    /// Read one block's captured WASM logs (emit order), or empty if none/undecodable.
+    pub fn get_block_logs(&self, height: u64) -> Vec<(String, String, Vec<u8>)> {
+        let key = format!("blocklogs_{:010}", height);
+        match self.persistent.load_raw(&key) {
+            Ok(Some(bytes)) => bincode::deserialize(&bytes).unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
-    
+
+    // NOTE: contract WASM code + storage are NOT kept in a separate RocksDB namespace.
+    // They live inside `Account.contract_storage` (the "code" key + hex data entries), so
+    // they are part of the state-root-hashed account leaf and survive snapshot/restore for
+    // free. The former `save_contract_code`/`get_contract_code` raw-KV helpers were dead
+    // (never the real path) and have been removed.
+
     // =========================================================================
     // JAIL PERSISTENCE (for network-wide consistency)
     // =========================================================================
@@ -11102,11 +11325,9 @@ impl Storage {
     // Certificates are NOT stored separately!
     // They are ALREADY embedded in each block's vrf_proof field.
     // 
-    // vrf_proof contains HybridSignature which includes:
-    // - certificate: HybridCertificate (~2.6KB)
-    // - ephemeral_public_key
-    // - message_signature
-    // - dilithium_key_signature
+    // vrf_proof contains PqSignature which includes:
+    // - certificate: PqCertificate (~2.6KB)
+    // - dilithium_key_signature (pure ML-DSA-65 after P8)
     //
     // For historical block validation:
     // 1. Load block from storage (already have vrf_proof)
@@ -11212,6 +11433,62 @@ mod v32_9_pattern_c_tests {
     }
 
     #[test]
+    fn rocks_merkle_store_honors_contract() {
+        // Phase C fork-guard: the RocksDB MerkleNodeStore must honor put_batch
+        // semantics on a REAL DB — leaf_dels remove exactly one leaf, and a
+        // wipe_all_nodes rebuild drops the ENTIRE old node set (no orphan survives).
+        use qnet_state::MerkleNodeStore;
+        let (storage, _dir) = open_test_storage();
+        let store = storage.merkle_node_store();
+
+        let k1 = [1u8; 32];
+        let k2 = [2u8; 32];
+        let k3 = [3u8; 32];
+        let v = |b: u8| [b; 32];
+
+        // Seed three leaves.
+        store.put_batch(
+            &[(k1, v(11)), (k2, v(22)), (k3, v(33))],
+            &[], &[], &[], false,
+        ).expect("seed leaves");
+        assert_eq!(store.get_leaf(&k2), Some(v(22)));
+        assert_eq!(store.all_leaves().len(), 3);
+
+        // Delete one leaf via leaf_dels.
+        store.put_batch(&[], &[k2], &[], &[], false).expect("del leaf");
+        assert_eq!(store.get_leaf(&k2), None, "deleted leaf must be absent");
+        assert!(!store.all_leaves().iter().any(|(k, _)| *k == k2),
+            "all_leaves must not contain the deleted leaf");
+        assert_eq!(store.all_leaves().len(), 2);
+
+        // Seed an OLD node set at two depths.
+        let na = [0xAAu8; 32];
+        let nb = [0xBBu8; 32];
+        store.put_batch(
+            &[], &[],
+            &[((0, na), v(1)), ((5, nb), v(2))],
+            &[], false,
+        ).expect("seed nodes");
+        assert_eq!(store.get_node(0, &na), Some(v(1)));
+        assert_eq!(store.get_node(5, &nb), Some(v(2)));
+
+        // Full rebuild carrying a DIFFERENT node set — old nodes must vanish.
+        let nc = [0xCCu8; 32];
+        store.put_batch(
+            &[], &[],
+            &[((7, nc), v(9))],
+            &[], true, // wipe_all_nodes
+        ).expect("rebuild nodes");
+        assert_eq!(store.get_node(0, &na), None, "old node must be wiped on rebuild");
+        assert_eq!(store.get_node(5, &nb), None, "old node must be wiped on rebuild");
+        assert_eq!(store.get_node(7, &nc), Some(v(9)), "only the new node set survives");
+
+        // Leaves are never wiped by a node rebuild.
+        assert_eq!(store.get_leaf(&k1), Some(v(11)));
+        assert_eq!(store.get_leaf(&k3), Some(v(33)));
+    }
+
+    #[test]
     fn super_eligible_index_roundtrips_sorted_and_epoch_isolated() {
         // R6: the apply-time super-eligibility index must return EXACTLY the saved node set, sorted
         // by node_id, deduped, epoch-isolated — so every node recomputes the same reward_root
@@ -11244,6 +11521,45 @@ mod v32_9_pattern_c_tests {
         assert!(!bm.contains_key(&1), "only written genesis indices present");
         assert!(storage.load_light_bitmaps(1600).unwrap().contains_key(&0));
         assert!(storage.load_light_bitmaps(161).unwrap().is_empty());
+    }
+
+    #[test]
+    fn seal_watermark_is_reader_derived_and_race_immune() {
+        // The contiguous seal watermark drives production backpressure; it must equal the largest F
+        // with macroblock_1..F all present, be derived by the READER (not a racy writer RMW), skip
+        // holes, heal when a hole fills, and recover from a frozen hint — the exact lost-update state
+        // two concurrent save_macroblock writers (BFT seal + P2P sync ingest) could otherwise leave.
+        let (storage, _dir) = open_test_storage();
+        let db = storage.persistent.db.clone();
+        let micro = db.cf_handle("microblocks").expect("microblocks CF");
+        let meta = db.cf_handle("metadata").expect("metadata CF");
+        let put_body = |n: u64| db.put_cf(&micro, format!("macroblock_{}", n).as_bytes(), b"b").unwrap();
+        let hint = || db.get_cf(&meta, b"last_sealed_mb").unwrap()
+            .map(|v| { let mut b = [0u8; 8]; b.copy_from_slice(&v[..8]); u64::from_le_bytes(b) });
+
+        assert_eq!(storage.last_sealed_mb_index(), 0, "no macroblocks → 0");
+
+        // Contiguous 1..3 → frontier 3, hint read-repaired.
+        for n in 1..=3 { put_body(n); }
+        assert_eq!(storage.last_sealed_mb_index(), 3);
+        assert_eq!(hint(), Some(3), "reader read-repairs the persisted hint");
+
+        // Hole at 4 (body 5 present) → conservative stop at 3, hint unchanged.
+        put_body(5);
+        assert_eq!(storage.last_sealed_mb_index(), 3, "a hole below the tip never advances the watermark");
+        assert_eq!(hint(), Some(3));
+
+        // Fill the hole → heal forward over 4 AND the already-present 5.
+        put_body(4);
+        assert_eq!(storage.last_sealed_mb_index(), 5, "filling the gap heals forward over stored successors");
+        assert_eq!(hint(), Some(5));
+
+        // Race reproduction: freeze the hint below a fully-contiguous body set (what a lost writer
+        // update leaves) and require the reader to recover the true frontier + read-repair it.
+        for n in 6..=8 { put_body(n); }
+        db.put_cf(&meta, b"last_sealed_mb", &3u64.to_le_bytes()).unwrap();
+        assert_eq!(storage.last_sealed_mb_index(), 8, "reader recovers from a frozen watermark hint");
+        assert_eq!(hint(), Some(8), "and read-repairs it forward");
     }
 
     #[test]
@@ -11689,5 +12005,85 @@ mod v32_9_pattern_c_tests {
                    storage.super_registrations_sorted_scan().unwrap(), "post-backfill super mismatch");
         assert_eq!(storage.light_roster_sorted(before).unwrap(),
                    storage.light_roster_sorted_scan(before).unwrap(), "post-backfill light mismatch");
+    }
+
+    // Read every (key, value) row of a CF into a sorted map for set-equality checks.
+    fn dump_cf(storage: &Storage, cf_name: &str) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+        let cf = storage.persistent.db.cf_handle(cf_name).expect("cf handle");
+        let mut out = std::collections::BTreeMap::new();
+        for item in storage.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = item.expect("iter row");
+            out.insert(k.to_vec(), v.to_vec());
+        }
+        out
+    }
+
+    #[test]
+    fn streamed_snapshot_dump_roundtrips_through_untouched_loader() {
+        // A2/A3: the streaming DUMP (no full uncompressed blob materialized) must produce a frame the
+        // UNTOUCHED loader decodes to a byte-identical account set — proving the streamed content is
+        // ordering- and byte-equivalent to the prior in-RAM assembly through the same wire format.
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (src, _sd) = open_test_storage();
+
+        // Seed a handful of accounts (arbitrary bytes — the loader restores raw CF rows) plus one
+        // reward / contract-storage / registry row to exercise every snapshot section.
+        put_account(&src, b"acct_aaa", b"balance-1");
+        put_account(&src, b"acct_bbb", b"balance-2");
+        put_account(&src, b"acct_ccc", b"balance-3");
+        {
+            let cf = src.persistent.db.cf_handle("pending_rewards").expect("rewards cf");
+            src.persistent.db.put_cf(&cf, b"rew_key", b"rew_val").expect("put reward");
+        }
+        {
+            let cf = src.persistent.db.cf_handle("contract_storage").expect("cs cf");
+            src.persistent.db.put_cf(&cf, b"contract\x00slot", b"cs_val").expect("put contract");
+        }
+        {
+            let cf = src.persistent.db.cf_handle("node_registry").expect("nr cf");
+            src.persistent.db.put_cf(&cf, b"node_super_x", b"nr_val").expect("put registry");
+        }
+
+        // Stream the dump: prepare a pinned view (accounts already flushed to the CF, so pass none)
+        // and materialize the compressed frame under full_snap_<h>.
+        let height = 90u64;
+        let view = src.prepare_snapshot_view(&[]).expect("view");
+        rt.block_on(src.create_state_snapshot(height, view)).expect("create snapshot");
+
+        // The frame must be a valid single zstd stream with the unchanged [hash(32)|len(8)|zstd] header.
+        let src_snaps = src.persistent.db.cf_handle("snapshots").expect("snapshots cf");
+        let frame = src.persistent.db
+            .get_cf(&src_snaps, format!("full_snap_{}", height).as_bytes())
+            .expect("get frame").expect("frame present");
+        assert!(frame.len() > 40, "frame carries the 40-byte header + compressed body");
+        let stored_hash = &frame[..32];
+        let claimed_len = u64::from_le_bytes(frame[32..40].try_into().unwrap());
+        let compressed = &frame[40..];
+        use sha3::{Sha3_256, Digest};
+        let mut h = Sha3_256::new();
+        h.update(compressed);
+        assert_eq!(stored_hash, h.finalize().as_slice(), "hash is over the compressed buffer");
+        let decoded = zstd::decode_all(compressed).expect("single valid zstd frame");
+        assert_eq!(decoded.len() as u64, claimed_len, "uncompressed_len header matches streamed byte count");
+        assert_eq!(decoded.first().copied(), Some(0x02u8), "SNAP_TYPE_FULL discriminator preserved");
+
+        // Load the frame into a FRESH storage via the untouched loader and compare the account set.
+        let (dst, _dd) = open_test_storage();
+        let dst_snaps = dst.persistent.db.cf_handle("snapshots").expect("snapshots cf");
+        dst.persistent.db
+            .put_cf(&dst_snaps, format!("full_snap_{}", height).as_bytes(), &frame)
+            .expect("stage frame");
+        rt.block_on(dst.load_state_snapshot(height, false)).expect("load snapshot");
+
+        assert_eq!(dump_cf(&src, "accounts"), dump_cf(&dst, "accounts"),
+                   "streamed dump round-trips to a byte-identical account set");
+        // The recomputed account-state root must match — the consensus-critical invariant.
+        assert_eq!(src.compute_canonical_state_root(height).expect("src root"),
+                   dst.compute_canonical_state_root(height).expect("dst root"),
+                   "recomputed account-state root identical after round-trip");
+        // Other streamed sections also survive the round-trip.
+        assert_eq!(dump_cf(&src, "pending_rewards"), dump_cf(&dst, "pending_rewards"));
+        assert_eq!(dump_cf(&src, "contract_storage"), dump_cf(&dst, "contract_storage"));
+        assert_eq!(dump_cf(&src, "node_registry"), dump_cf(&dst, "node_registry"));
     }
 }

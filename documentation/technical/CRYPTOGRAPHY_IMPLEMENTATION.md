@@ -7,11 +7,25 @@
 
 ---
 
+> **Status (2026-07): signatures are now PURE ML-DSA-65 (Dilithium3).** The
+> Ed25519 removal is complete — transactions, consensus messages, node
+> identity and P2P gossip are all signed with a single Dilithium3 signature.
+> Sections below that describe an "Ed25519 + Dilithium hybrid signature",
+> "ephemeral Ed25519 keys per message", "dual signatures", or Ed25519-signed
+> client transactions reflect the **superseded** design and are kept for
+> historical context. The `CompactHybridSignature` / `HybridSignature` structs
+> no longer carry `ephemeral_public_key` or `message_signature` fields.
+> **"Hybrid" is still correct in exactly one place**: the
+> **X25519Kyber768 (ML-KEM-768) key exchange** in QUIC TLS 1.3 — that is key
+> exchange, not a signature.
+
+---
+
 ## 🎯 Executive Summary
 
 QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
-- ✅ **Real CRYSTALS-Dilithium3** (~2500-byte RAW signatures) for quantum resistance
-- ✅ **Hybrid Ed25519 + Dilithium** (single Dilithium signature per message)
+- ✅ **Pure ML-DSA-65 (CRYSTALS-Dilithium3)** (~2500-byte RAW signatures) for all transaction, consensus, node-identity and P2P-gossip signatures
+- ✅ **Single Dilithium signature per message** (Ed25519 fully removed from signing; the only classical primitive left is the X25519Kyber768 hybrid **key exchange** in QUIC TLS 1.3)
 - ✅ **Compact signatures v2.23** (~2.6KB RAW bytes, 88% reduction from 22KB)
 - ✅ **Certificate caching** (100K LRU cache for scalability)
 - ✅ **Defense-in-depth** (two-layer verification: P2P + Consensus with real Dilithium)
@@ -25,10 +39,10 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Gulf Stream protocol** (direct TX forwarding to producer, ~10ms latency)
 - ✅ **Anti-Storm protection** (DashSet deduplication prevents gossip amplification)
 - ✅ **100K TX/block** (up from 50K, bincode enables faster processing)
-- ✅ **Optional Dilithium TX signatures** (post-quantum for enterprise, +50% gas)
+- ✅ **Pure Dilithium3 TX signatures** (post-quantum ML-DSA-65 for every transaction; no Ed25519, no optional tier)
 
 ### v2.25.2 Additions (High TPS Optimization)
-- ✅ **Batch Ed25519 verification** (3x faster using ed25519-dalek batch verify)
+- ✅ **Batch Dilithium3 verification** (parallel ML-DSA-65 verify across the TX accumulator)
 - ✅ **Batch mempool operations** (1 lock per 1000 TX instead of per TX)
 - ✅ **10K TX batch size** (benchmark optimized for 100K TX/block)
 - ✅ **Skip self-broadcast** (producer doesn't broadcast TX to self)
@@ -75,7 +89,7 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Round update ONLY at save** (not at spawn/sync/rate-limit - prevents desync)
 - ✅ **Reveal Loss Prevention** (participant nodes don't call trigger mid-consensus)
 - ✅ **Dynamic Height Threshold** (5/10/20 blocks based on network size for scalability)
-- ✅ **Signed Reveal Messages** (SHA3-256 + Dilithium+Ed25519 hybrid signatures)
+- ✅ **Signed Consensus Votes** (SHA3-256 + pure Dilithium3 signatures over Checkpoint-BFT v2 votes; no commit/reveal)
 
 ### v2.74.0 Additions (Embedded RocksDB Indexing)
 - ✅ **Built-in TX Index** (`tx_index` column family in RocksDB for O(1) lookups)
@@ -107,15 +121,14 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Intercontinental Support** (USA↔Europe 7500km reliable sync)
 
 ### v2.57.0 Additions (Stage Pipeline Runtime Isolation)
-- ✅ **SIGVERIFY_RUNTIME** (dedicated Ed25519/Dilithium verification)
+- ✅ **SIGVERIFY_RUNTIME** (dedicated pure Dilithium3 signature verification)
 - ✅ **BANKING_RUNTIME** (transaction intake, mempool operations)
 - ✅ **REPLAY_RUNTIME** (state machine execution, balance updates)
 - ✅ **BROADCAST_RUNTIME** (Shred protocol, block propagation)
 - ✅ **Adaptive Threading** (2 cores→4t, 4 cores→5t, 8 cores→10t, 16 cores→20t)
 - ✅ **Configurable thread counts** (QNET_SIGVERIFY_THREADS, QNET_BANKING_THREADS, etc.)
 - ✅ **Zero starvation guarantee** (crypto ops never block broadcast)
-- ✅ **Consistent latency** (Ed25519 <50μs, Dilithium <500μs guaranteed)
-- ✅ **verify_ed25519_tx_signature_async()** (runs on SIGVERIFY_RUNTIME)
+- ✅ **Consistent latency** (Dilithium3 verify <500μs guaranteed)
 - ✅ **verify_dilithium_tx_signature_async()** (runs on SIGVERIFY_RUNTIME)
 - ✅ **spawn_sigverify()** (public API for external crypto tasks)
 - ✅ **RuntimeStats** (monitoring: get_runtime_stats())
@@ -180,8 +193,8 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 │                                                          │
 │  ┌──────────────────────────────────────────────────┐  │
 │  │  CONSENSUS LAYER (hybrid_crypto.rs)              │  │
-│  │  ├─ Real CRYSTALS-Dilithium3                     │  │
-│  │  ├─ Ephemeral Ed25519 (per message)              │  │
+│  │  ├─ Pure ML-DSA-65 (Dilithium3), 1 sig/message   │  │
+│  │  ├─ Per-message certificate (no Ed25519)         │  │
 │  │  ├─ NIST/Cisco Encapsulated Keys                 │  │
 │  │  └─ Certificate Caching (Byzantine-safe)         │  │
 │  └──────────────────────────────────────────────────┘  │
@@ -217,8 +230,8 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 
 | Component | Library | Version | Purpose |
 |-----------|---------|---------|---------|
-| Consensus | `pqcrypto-dilithium` | 0.5 | Real CRYSTALS-Dilithium3 (2420-byte sigs) |
-| Hybrid | `ed25519-dalek` | 2.0 | Ed25519 classical signatures |
+| Signatures (all) | `pqcrypto-dilithium` | 0.5 | Pure ML-DSA-65 / CRYSTALS-Dilithium3 (2420-byte sigs) |
+| Transport KEX | `rustls` + `aws-lc-rs` | — | X25519Kyber768 (ML-KEM-768) hybrid key exchange in QUIC TLS 1.3 |
 | Hashing (Security) | `sha3` | 0.10 | SHA3-256/512 (NIST FIPS 202) |
 | Hashing (Speed) | `blake3` | Latest | Fast ping hashing |
 | Encryption | `aes-gcm` | 0.10 | AES-256-GCM key storage |
@@ -230,7 +243,13 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 
 ### Overview
 
-QNet implements **Ed25519 signatures** for client transactions with **optional Dilithium3** for quantum-resistant transactions. This provides optimal performance for regular users while offering enterprise-grade post-quantum security for high-value transfers.
+> **Superseded:** the description below of Ed25519-signed client transactions
+> reflects the pre-migration design. Client transactions are now signed with
+> **pure ML-DSA-65 (Dilithium3)** — the same post-quantum scheme used across
+> the rest of QNet. Wallet keys derive from a standard BIP39 seed via the QNet
+> derivation path, and a QNet address is a hash of the Dilithium public key.
+
+QNet signs **all client transactions with pure ML-DSA-65 (CRYSTALS-Dilithium3)**. There is no Ed25519 path and no optional/premium quantum tier — every transfer, reward claim, and node registration carries a single post-quantum Dilithium3 signature. Wallet keys derive deterministically from a standard BIP39 seed via the QNet derivation path, and a QNet address is a hash of the Dilithium public key.
 
 ### Architecture v2.25
 
@@ -238,25 +257,20 @@ QNet implements **Ed25519 signatures** for client transactions with **optional D
 ┌─────────────────────────────────────────────────────────┐
 │  CLIENT LAYER (Mobile + Browser)                        │
 ├─────────────────────────────────────────────────────────┤
-│  DEFAULT: Ed25519 ONLY                                  │
-│  ✅ 20μs sign/verify operations                         │
-│  ✅ 64-byte signatures                                  │
-│  ✅ 32-byte public keys                                 │
-│  ✅ Low energy consumption                              │
-│  ✅ BIP39 mnemonic + HD derivation                      │
-├─────────────────────────────────────────────────────────┤
-│  OPTIONAL: Ed25519 + Dilithium3 (QUANTUM)               │
-│  🔐 Post-quantum resistant                              │
-│  🔐 +50% gas fee (compensates verification cost)        │
-│  🔐 ~3293-byte signature + ~1952-byte pubkey            │
-│  🔐 For enterprise/high-value transfers                 │
+│  PURE ML-DSA-65 (CRYSTALS-Dilithium3) — single path     │
+│  ✅ Post-quantum resistant (NIST FIPS 204)              │
+│  ✅ ~3309-byte signature                                │
+│  ✅ ~1952-byte public key                               │
+│  ✅ Address = hash of Dilithium public key              │
+│  ✅ Keys derived from BIP39 seed (QNet path)            │
+│  ✅ No Ed25519, no optional/premium quantum tier        │
 └─────────────────────────────────────────────────────────┘
                          ↓
 ┌─────────────────────────────────────────────────────────┐
 │  NODE LAYER (Consensus)                                 │
 ├─────────────────────────────────────────────────────────┤
-│  ✅ Hybrid (Ed25519 + Dilithium)                        │
-│  ✅ Encapsulated keys (NIST/CISCO)                      │
+│  ✅ Pure ML-DSA-65 (Dilithium3), 1 sig/message          │
+│  ✅ Per-message certificate (NIST/CISCO encapsulation)  │
 │  ✅ Certificate caching (O(1))                          │
 │  ✅ Post-quantum secure                                 │
 └─────────────────────────────────────────────────────────┘
@@ -264,10 +278,11 @@ QNet implements **Ed25519 signatures** for client transactions with **optional D
 
 ### Transaction Signature Options
 
-| Mode | Ed25519 | Dilithium3 | Gas Cost | Use Case |
-|------|---------|------------|----------|----------|
-| **Standard** | ✅ Required | ❌ None | 100% | Regular transfers |
-| **Quantum** | ✅ Required | ✅ Optional | **150%** | Enterprise, high-value |
+Every transaction uses the same single signing path — there are no tiers.
+
+| Mode | Signature | Gas Cost | Use Case |
+|------|-----------|----------|----------|
+| **Standard (only mode)** | Pure ML-DSA-65 (Dilithium3) | 100% | All transfers, claims, registrations |
 
 ### Transaction Structure v2.25
 
@@ -275,48 +290,39 @@ QNet implements **Ed25519 signatures** for client transactions with **optional D
 pub struct Transaction {
     // ... existing fields ...
     
-    /// Ed25519 signature (64 bytes, hex encoded) - REQUIRED
+    /// Dilithium3 (ML-DSA-65) signature (~3309 bytes, hex encoded) - REQUIRED
     pub signature: Option<String>,
     
-    /// Ed25519 public key (32 bytes, hex encoded) - REQUIRED
+    /// Dilithium3 (ML-DSA-65) public key (~1952 bytes, hex encoded) - REQUIRED
+    /// The QNet sender address is a hash of this public key.
     pub public_key: Option<String>,
-    
-    /// QUANTUM v2.25: Dilithium3 signature (~3293 bytes) - OPTIONAL
-    /// When present: TX is quantum-resistant + 50% higher gas
-    pub dilithium_signature: Option<String>,
-    
-    /// QUANTUM v2.25: Dilithium3 public key (~1952 bytes) - OPTIONAL
-    pub dilithium_public_key: Option<String>,
 }
 
-// Effective gas calculation
+// Gas is uniform: there is no quantum surcharge because every TX is already
+// post-quantum signed with pure ML-DSA-65 (Dilithium3).
 impl Transaction {
     pub fn effective_gas_price(&self) -> u64 {
-        if self.is_quantum_signed() {
-            self.gas_price + (self.gas_price / 2)  // +50%
-        } else {
-            self.gas_price
-        }
+        self.gas_price
     }
 }
 ```
 
-### Why Ed25519 as Default?
+### Why Pure ML-DSA-65 (Dilithium3) for Clients?
 
-| Aspect | Ed25519 | Dilithium3 | Decision |
-|--------|---------|------------|----------|
-| **Speed** | 20μs | 100ms | ✅ Ed25519 (5000x faster) |
-| **Size** | 64 bytes | 3293 bytes | ✅ Ed25519 (51x smaller) |
-| **Energy** | Low | High | ✅ Ed25519 (mobile-friendly) |
-| **Security** | 128-bit | Post-quantum | ✅ Ed25519 (sufficient for clients) |
-| **Maturity** | RFC 8032 | NIST Draft | ✅ Ed25519 (battle-tested) |
+| Aspect | Dilithium3 (ML-DSA-65) | Notes |
+|--------|------------------------|-------|
+| **Security** | Post-quantum, NIST Level 3 | Resistant to Shor's algorithm |
+| **Standard** | NIST FIPS 204 | Ratified ML-DSA standard |
+| **Signature Size** | ~3309 bytes | Single signature per TX |
+| **Public Key Size** | ~1952 bytes | Address = hash of this key |
+| **Verify Time** | <500μs | Fast enough for 1-second blocks |
 
 **Rationale:**
-- Client transactions are short-lived (seconds to minutes)
-- Quantum computers are not an immediate threat to individual transactions
-- User experience requires fast, responsive operations
-- Mobile devices have limited battery and processing power
-- Ed25519 provides 128-bit security (sufficient for decades)
+- A single, uniform signing path keeps wallets and validators simple (no tier logic, no downgrade path)
+- Post-quantum security applies to every transaction, not just high-value ones
+- Keys derive deterministically from a BIP39 seed, so recovery works with any BIP39-compatible backup
+- The QNet address being a hash of the Dilithium public key binds identity to the post-quantum key
+- Ed25519 has been removed from QNet signing entirely; it survives only on Solana (external chain) for the 1DEV burn
 
 ### Transaction Types
 
@@ -326,7 +332,8 @@ impl Transaction {
 ```javascript
 // Format: "transfer:from:to:amount:gas_price:gas_limit"
 const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:1:10000`;
-const signature = nacl.sign.detached(messageBytes, secretKey);
+// Pure ML-DSA-65 (Dilithium3) signature — key derived from BIP39 seed
+const signature = dilithium.sign(messageBytes, dilithiumSecretKey);
 ```
 
 **Server Verification:**
@@ -334,14 +341,15 @@ const signature = nacl.sign.detached(messageBytes, secretKey);
 // Validator creates same message format
 let message = format!("transfer:{}:{}:{}:{}:{}", 
     from, to, amount, tx.gas_price, tx.gas_limit);
-verifying_key.verify(&message, &signature)?;
+// Verify pure Dilithium3 (ML-DSA-65) signature against the sender's Dilithium public key
+verify_dilithium_tx_signature(&dilithium_public_key, message.as_bytes(), &signature)?;
 ```
 
 **Security:**
 - ✅ Deterministic message format
 - ✅ No nonce/timestamp (set by server)
-- ✅ Public key in transaction
-- ✅ Strict cryptographic verification
+- ✅ Dilithium public key in transaction (address = hash of it)
+- ✅ Strict post-quantum cryptographic verification
 
 #### 2. Reward Claims (claimRewards)
 
@@ -349,13 +357,14 @@ verifying_key.verify(&message, &signature)?;
 ```javascript
 // Format: "claim_rewards:node_id:wallet_address"
 const message = `claim_rewards:${nodeId}:${walletAddress}`;
-const signature = nacl.sign.detached(messageBytes, secretKey);
+// Pure ML-DSA-65 (Dilithium3) signature
+const signature = dilithium.sign(messageBytes, dilithiumSecretKey);
 ```
 
 **Server Processing:**
 ```rust
-// 1. Verify Ed25519 signature
-verify_ed25519_client_signature(...).await;
+// 1. Verify pure Dilithium3 (ML-DSA-65) signature
+verify_dilithium_client_signature(...).await;
 
 // 2. Create RewardDistribution transaction
 let tx = Transaction {
@@ -382,30 +391,29 @@ blockchain.submit_transaction(tx).await;
 
 | Platform | Library | Purpose |
 |----------|---------|---------|
-| **Mobile (React Native)** | `tweetnacl` | Ed25519 signing |
-| **Mobile (React Native)** | `ed25519-hd-key` | HD key derivation |
-| **Browser Extension** | `tweetnacl` | Ed25519 signing |
-| **Browser Extension** | `bip39` | Mnemonic generation |
+| **Mobile (React Native)** | Dilithium3 (ML-DSA-65) WASM/native | Post-quantum TX signing |
+| **Mobile (React Native)** | `bip39` | BIP39 seed → Dilithium key derivation |
+| **Browser Extension** | Dilithium3 (ML-DSA-65) WASM | Post-quantum TX signing |
+| **Browser Extension** | `bip39` | Mnemonic generation / seed derivation |
 
 ### Performance Characteristics
 
 | Operation | Time | Scalability |
 |-----------|------|-------------|
-| **Key Generation** | ~1ms | O(1) |
-| **Sign** | ~20μs | O(1) |
-| **Verify** | ~20μs | O(1) |
-| **Total (sign + verify)** | ~40μs | Linear |
+| **Key Generation** | ~3ms | O(1) |
+| **Sign** | ~0.2ms | O(1) |
+| **Verify** | <0.5ms | O(1) |
+| **Total (sign + verify)** | <0.7ms | Linear |
 
 **For 1M clients:**
-- Signing: 20 seconds (parallel)
-- Verification: 20 seconds (parallel)
+- Verification parallelizes across the SIGVERIFY runtime (batched Dilithium3 verify)
 - No bottlenecks or shared state
 
 ### Security Guarantees
 
 1. **Cryptographic:**
-   - ✅ 128-bit security level
-   - ✅ Collision-resistant
+   - ✅ NIST Level 3 post-quantum security (ML-DSA-65 / Dilithium3)
+   - ✅ Resistant to Shor's algorithm (lattice-based)
    - ✅ Signature forgery impossible without private key
 
 2. **Implementation:**
@@ -418,11 +426,18 @@ blockchain.submit_transaction(tx).await;
    - ✅ All nodes verify signatures
    - ✅ Immutable audit trail
 
-### Migration Path (Future)
+### Migration Path (COMPLETED)
+
+> **Superseded:** this migration is done. QNet no longer waits for quantum
+> computers to "become a threat" — the network already signs everything with
+> **pure ML-DSA-65 (Dilithium3)**. Mobile wallets sign with Dilithium3, the
+> Ed25519 signing path has been removed entirely, and there was no break to
+> existing transactions. The steps below are retained only as a record of the
+> original plan.
 
 When quantum computers become a threat:
 1. Add Dilithium support to mobile wallets (WASM)
-2. Implement hybrid signatures (Ed25519 + Dilithium)
+2. Implement pure ML-DSA-65 (Dilithium3) signatures — DONE
 3. Gradual rollout with backward compatibility
 4. No breaking changes to existing transactions
 
@@ -674,7 +689,7 @@ QNet implements a **Hybrid Merkle + Sampling** architecture for on-chain ping co
 
 ### Light Node Attestations
 
-**ARCHITECTURE v2.78:** Light nodes use HYBRID signatures for quantum resistance.
+Light nodes sign attestations with **pure ML-DSA-65 (Dilithium3)** for quantum resistance.
 
 ```rust
 struct LightNodeAttestation {
@@ -682,19 +697,18 @@ struct LightNodeAttestation {
     pinger_node_id: String,
     slot: u64,
     timestamp: u64,
-    light_node_signature: String,       // HYBRID compact_bin (Ed25519 + Dilithium3, ~2.6KB)
-    pinger_signature: String,           // HYBRID compact_bin (Ed25519 + Dilithium3, ~2.6KB)
+    light_node_signature: String,       // pure Dilithium3 compact_bin (~2.6KB)
+    pinger_signature: String,           // pure Dilithium3 compact_bin (~2.6KB)
 }
 ```
 
-**Dual Signature Requirement (Both HYBRID)**:
-- ✅ Light node signs challenge with HYBRID `compact_bin` format (quantum-resistant)
-- ✅ Pinger signs attestation with HYBRID `compact_bin` format (quantum-resistant)
+**Signature Requirement (Both pure ML-DSA-65)**:
+- ✅ Light node signs challenge with the Dilithium3 `compact_bin` format (quantum-resistant)
+- ✅ Pinger signs attestation with the Dilithium3 `compact_bin` format (quantum-resistant)
 
 **Implementation Status**:
-- ✅ **Server:** Full HYBRID verification ready (`compact_bin` format supported)
-- ⚠️ **Mobile:** Ed25519 fallback (`light_hybrid_pending`) until Dilithium3 library added
-- 🎯 **Target:** Mobile app with Dilithium3 WASM for full HYBRID signatures
+- ✅ **Server:** Full Dilithium3 verification (`compact_bin` format)
+- ✅ **Mobile:** Dilithium3 signing (the Ed25519 fallback / `light_hybrid_pending` path has been removed)
 
 ### Super/Genesis Node Heartbeats (v34 — Unforgeable On-Chain)
 
@@ -841,7 +855,7 @@ QNet implements **post-quantum MEV protection** using Dilithium3 signatures for 
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
 │  1. User creates transactions                               │
-│     └─► TX_1, TX_2 (signed with Ed25519)                    │
+│     └─► TX_1, TX_2 (signed with pure Dilithium3)            │
 │                                                              │
 │  2. Node bundles transactions                               │
 │     └─► Bundle = {TX_1, TX_2, timestamps, constraints}      │
@@ -965,19 +979,19 @@ if !valid {
 
 ### Integration with Client Transactions
 
-**Important**: User transactions inside bundles use **Ed25519 signatures** (fast, mobile-friendly), while the **bundle wrapper** uses **Dilithium3** (quantum-resistant, node-level).
+**Important**: Both the user transactions inside a bundle and the **bundle wrapper** are signed with **pure ML-DSA-65 (Dilithium3)**. Users sign each TX with their BIP39-derived Dilithium key; the node signs the bundle wrapper with its persistent Dilithium key (80%+ reputation required).
 
 ```
 Bundle (Dilithium3 by node)
-├─► TX_1 (Ed25519 by user)
-├─► TX_2 (Ed25519 by user)
-└─► TX_3 (Ed25519 by user)
+├─► TX_1 (Dilithium3 by user)
+├─► TX_2 (Dilithium3 by user)
+└─► TX_3 (Dilithium3 by user)
 ```
 
-This hybrid approach provides:
-- ✅ **User convenience**: Fast Ed25519 for individual TXs
+This end-to-end post-quantum approach provides:
+- ✅ **User TX security**: Pure Dilithium3 for every individual TX
 - ✅ **Bundle security**: Post-quantum Dilithium3 for bundle wrapper
-- ✅ **Backward compatibility**: Works with existing wallets
+- ✅ **Uniform verification**: One signature scheme across the whole stack
 
 ---
 
@@ -1030,13 +1044,12 @@ pub struct CompactHybridSignature {
     pub node_id: String,                   // Producer node ID
     pub cert_serial: String,               // Certificate reference
     #[serde(with = "serde_bytes")]
-    pub ephemeral_public_key: [u8; 32],    // NEW Ed25519 key for THIS message
-    #[serde(with = "serde_bytes")]
-    pub message_signature: [u8; 64],       // Ed25519 RAW bytes
-    #[serde(with = "serde_bytes")]
-    pub dilithium_key_signature: Vec<u8>,  // Dilithium3 RAW bytes (~2500 bytes)
+    pub dilithium_key_signature: Vec<u8>,  // Pure Dilithium3 RAW bytes (~2500 bytes)
+                                           // signs message_hash || timestamp
     pub signed_at: u64,                    // Unix timestamp
 }
+// NOTE: ephemeral_public_key / message_signature (Ed25519) fields were removed —
+// a single Dilithium3 signature over (message_hash || timestamp) is the only signature.
 ```
 
 #### Size Breakdown (v2.23)
@@ -1044,9 +1057,7 @@ pub struct CompactHybridSignature {
 |-----------|------|-------------|
 | `node_id` | ~20 bytes | String (e.g., "genesis_node_001") |
 | `cert_serial` | ~30 bytes | String (e.g., "cert_2024_11_16_12345") |
-| `ephemeral_public_key` | 32 bytes | RAW bytes (NEW Ed25519 key) |
-| `message_signature` | 64 bytes | Ed25519 RAW bytes |
-| `dilithium_key_signature` | **~2500 bytes** | Dilithium3 RAW bytes |
+| `dilithium_key_signature` | **~2500 bytes** | Pure Dilithium3 RAW bytes (signs message_hash + timestamp) |
 | `signed_at` | 8 bytes | u64 timestamp |
 | **Total** | **~2.6KB** | **88% reduction from 22KB!** |
 
@@ -1055,8 +1066,6 @@ pub struct CompactHybridSignature {
 "compact:{
   \"node_id\": \"genesis_node_001\",
   \"cert_serial\": \"cert_2024_11_16_12345\",
-  \"ephemeral_public_key\": [32, 64, 128, ...],  // 32 bytes
-  \"message_signature\": [64, 32, 128, ...],     // 64 bytes
   \"dilithium_key_signature\": [12, 45, 78, ...], // ~2500 bytes RAW
   \"signed_at\": 1700140800
 }"
@@ -1069,20 +1078,19 @@ P2P Layer (node.rs::verify_microblock_signature):
 2. Lookup certificate using cert_serial
    ├─► Cache HIT (100K LRU cache): Use cached certificate ✅
    └─► Cache MISS: Request via P2P broadcast
-3. Verify Ed25519 with ephemeral key (64 bytes RAW)
-4. Recreate encapsulated_data = ephemeral_pk || message_hash || timestamp
-5. Verify Dilithium via dilithium3::open() ✅ REAL CRYPTO
-6. All must be valid → Accept block
+3. Recreate signed_data = message_hash || timestamp
+4. Verify pure Dilithium3 via dilithium3::open() ✅ REAL CRYPTO
+5. Must be valid → Accept block
 
 Consensus Layer (consensus_crypto.rs::verify_compact_hybrid_signature):
 1. Parse RAW bytes from JSON
-2. Reconstruct encapsulated_data
+2. Reconstruct signed_data (message_hash || timestamp)
 3. Real Dilithium3 verification via dilithium3::open()
 4. Byzantine consensus (2/3+ honest nodes)
 5. Only verified blocks participate
 ```
 
-### 2.2 Full Hybrid Signatures (Macroblocks) - v2.23
+### 2.2 Macroblock Signatures — pure ML-DSA-65 (Dilithium3) - v2.23
 
 **Purpose**: Immediate verification for low-frequency macroblocks (1/90 seconds)
 
@@ -1094,23 +1102,19 @@ Consensus Layer (consensus_crypto.rs::verify_compact_hybrid_signature):
 pub struct HybridSignature {
     pub certificate: HybridCertificate,        // Full certificate embedded
     #[serde(with = "serde_bytes")]
-    pub ephemeral_public_key: [u8; 32],        // NEW Ed25519 key RAW
-    #[serde(with = "serde_bytes")]
-    pub message_signature: [u8; 64],           // Ed25519 RAW bytes
-    #[serde(with = "serde_bytes")]
-    pub dilithium_key_signature: Vec<u8>,      // Dilithium3 RAW bytes
+    pub dilithium_key_signature: Vec<u8>,      // Pure Dilithium3 RAW bytes
+                                               // signs message_hash || timestamp
     pub signed_at: u64,
 }
+// NOTE: ephemeral_public_key / message_signature (Ed25519) removed — one Dilithium3 sig only.
 
 pub struct HybridCertificate {
     pub node_id: String,
     pub serial: String,
     #[serde(with = "serde_bytes")]
-    pub ed25519_public_key: [u8; 32],          // RAW bytes
-    #[serde(with = "serde_bytes")]
     pub dilithium_public_key: Vec<u8>,         // ~1952 bytes RAW
     #[serde(with = "serde_bytes")]
-    pub dilithium_signature_of_ed25519: Vec<u8>, // RAW bytes
+    pub dilithium_self_signature: Vec<u8>,     // Dilithium3 self-binding of node_id + key
     pub valid_from: u64,
     pub valid_until: u64,
 }
@@ -1119,15 +1123,12 @@ pub struct HybridCertificate {
 #### Size Breakdown (v2.23)
 | Component | Size | Description |
 |-----------|------|-------------|
-| `ephemeral_public_key` | 32 bytes | NEW Ed25519 key RAW |
-| `message_signature` (Ed25519) | 64 bytes | RAW bytes |
 | `dilithium_key_signature` | ~2500 bytes | RAW bytes (no base64!) |
 | **Certificate**: | | |
-| - `ed25519_public_key` | 32 bytes | RAW bytes |
 | - `dilithium_public_key` | 1952 bytes | RAW bytes |
-| - `dilithium_signature_of_ed25519` | ~2500 bytes | RAW bytes |
+| - `dilithium_self_signature` | ~2500 bytes | RAW bytes |
 | - Serial + timestamps | ~50 bytes | Metadata |
-| **Total** | **~5KB** | **58% reduction from 12KB!** |
+| **Total** | **~5KB** | RAW bytes optimization |
 
 ### 2.3 Bandwidth Comparison (v2.23)
 
@@ -1151,24 +1152,27 @@ pub struct HybridCertificate {
 
 ### 2.0 Where Each Crypto System is Used
 
-QNet uses **TWO DIFFERENT** cryptographic systems for different purposes:
+All QNet signatures use **pure ML-DSA-65 (Dilithium3)**. The systems below differ in
+key lifecycle (persistent vs. per-message certificate) and in what they sign, not in
+the signature algorithm:
 
 | Component | Crypto System | Use Case | Key Type |
 |-----------|---------------|----------|----------|
-| **Macroblock Consensus** | Hybrid Crypto (ephemeral) | Commit/Reveal messages | Ephemeral Ed25519 + Dilithium |
-| **Microblock Signatures** | Key Manager (persistent) | Block signing & verification | Dilithium-seeded SHA3-512 |
-| **Macroblock Signatures** | Key Manager (persistent) | Macroblock finalization | Dilithium-seeded SHA3-512 |
+| **Macroblock Consensus** | Checkpoint-BFT v2 messages | Committee checkpoint votes / QC | Dilithium3 (per-message certificate) |
+| **Microblock Signatures** | Key Manager (persistent) | Block signing & verification | Persistent Dilithium3 key |
+| **Macroblock Signatures** | Key Manager (persistent) | Macroblock finalization | Persistent Dilithium3 key |
 | **MEV Bundle Signatures** | Real Dilithium3 | Private bundle authentication | Node's persistent Dilithium key |
-| **Client Transactions** | Ed25519-only | User transactions (wallet) | User's Ed25519 key |
+| **Client Transactions** | Pure Dilithium3 | User transactions (wallet) | User's Dilithium3 key (BIP39-derived) |
 | **Producer Selection** | Deterministic SHA3-512 | Quantum-resistant leader election | Hash of finality block + round |
 | **Emergency Producer** | Deterministic SHA3-512 | Failover leader election | Hash of entropy + height |
 
 **Critical distinction:**
-- **Ephemeral keys (hybrid_crypto.rs)**: For Byzantine consensus messages (commit/reveal)
+- **Per-message certificate keys (hybrid_crypto.rs)**: For Byzantine consensus messages (Checkpoint-BFT v2 votes); the Dilithium3 signing key is fresh per certificate window
 - **Persistent keys (key_manager.rs)**: For all block signatures (micro + macro)
 - **MEV bundles (mev_protection.rs)**: Signed with node's persistent Dilithium key (80%+ reputation required)
-- **Client transactions**: Ed25519-only for fast mobile/browser operations
+- **Client transactions**: Pure Dilithium3, derived from a BIP39 seed via the QNet derivation path
 - **Deterministic Selection**: Producer selection uses SHA3-512 for identical results on all nodes (no forks)
+- **Note**: The only classical primitive remaining anywhere in the stack is the **X25519Kyber768 (ML-KEM-768) hybrid key exchange** in QUIC TLS 1.3 — that is transport key exchange, not a signature.
 
 ---
 
@@ -1176,9 +1180,15 @@ QNet uses **TWO DIFFERENT** cryptographic systems for different purposes:
 
 ### 3.1 NIST/Cisco Encapsulated Keys Implementation
 
-**File:** `development/qnet-integration/src/hybrid_crypto.rs`
+**File:** `development/qnet-integration/src/crypto/hybrid_crypto.rs`
 
-**Purpose:** Sign Byzantine consensus commit/reveal messages with ephemeral keys
+**Purpose:** Sign Byzantine consensus messages (Checkpoint-BFT v2 committee votes)
+
+> **Superseded structure:** the current `HybridSignature` / `CompactHybridSignature`
+> types no longer carry `ephemeral_public_key` or `message_signature` (Ed25519)
+> fields — a single Dilithium3 signature covers `message_hash || timestamp`. The
+> struct listing and signing/verification steps below still show the old
+> Ed25519-bearing layout and are kept for historical context only.
 
 #### Signature Structure
 
@@ -1186,17 +1196,15 @@ QNet uses **TWO DIFFERENT** cryptographic systems for different purposes:
 pub struct HybridSignature {
     certificate: HybridCertificate {
         node_id: String,
-        ed25519_public_key: [u8; 32],           // RAW bytes
         dilithium_public_key: Vec<u8>,          // RAW bytes (~1952 bytes)
-        dilithium_signature_of_ed25519: Vec<u8>,// RAW bytes (certificate binding)
+        dilithium_self_signature: Vec<u8>,      // RAW bytes (certificate self-binding)
         issued_at: u64,
         expires_at: u64,                         // 270-second lifetime (4.5 minutes)
         serial_number: String,
     },
-    ephemeral_public_key: [u8; 32],             // NEW Ed25519 key RAW
-    message_signature: [u8; 64],                // Ed25519 RAW bytes
-    dilithium_key_signature: Vec<u8>,           // Dilithium RAW (~2500 bytes)
-    // NOTE: dilithium_message_signature REMOVED in v2.23 (redundant)
+    dilithium_key_signature: Vec<u8>,           // Pure Dilithium3 RAW (~2500 bytes)
+                                                // signs message_hash || timestamp
+    // NOTE: ephemeral_public_key / message_signature (Ed25519) REMOVED — one Dilithium3 sig only.
     signed_at: u64,
 }
 ```
@@ -1204,37 +1212,29 @@ pub struct HybridSignature {
 ### 3.2 Signing Process (v2.23)
 
 ```rust
-// Step 1: Generate NEW ephemeral Ed25519 key for THIS message
-let ephemeral_signing_key = SigningKey::from_bytes(&rand::thread_rng().gen::<[u8; 32]>());
-let ephemeral_verifying_key = ephemeral_signing_key.verifying_key();
+// Step 1: Build signed data = message_hash || timestamp (single Dilithium sig covers both)
+let mut signed_data = Vec::new();
+signed_data.extend_from_slice(&sha3::Sha3_256::digest(message));    // 32 bytes
+signed_data.extend_from_slice(&timestamp.to_le_bytes());            // 8 bytes
 
-// Step 2: Sign message with ephemeral Ed25519
-let ed25519_signature = ephemeral_signing_key.sign(message);  // 64 bytes RAW
-
-// Step 3: Create encapsulated data (includes message_hash!)
-let mut encapsulated_data = Vec::new();
-encapsulated_data.extend_from_slice(ephemeral_verifying_key.as_bytes());  // 32 bytes
-encapsulated_data.extend_from_slice(&sha3::Sha3_256::digest(message));    // 32 bytes
-encapsulated_data.extend_from_slice(&timestamp.to_le_bytes());            // 8 bytes
-
-// Step 4: Sign encapsulated data with Dilithium (SINGLE signature!)
-// v2.23: Message hash is ALREADY in encapsulated_data, so one sig is enough
+// Step 2: Sign with the node's Dilithium3 key (SINGLE post-quantum signature!)
+// The message hash is inside signed_data, so one Dilithium3 signature is enough.
 let dilithium_key_sig = quantum_crypto
-    .create_consensus_signature(&node_id, &hex::encode(&encapsulated_data))
+    .create_consensus_signature(&node_id, &hex::encode(&signed_data))
     .await?;
 // Extract RAW bytes (no base64!)
 let dilithium_raw = extract_dilithium_raw_bytes(&dilithium_key_sig);  // ~2500 bytes
 
-// Step 5: Create certificate (4.5-minute lifetime with 80% rotation threshold)
+// Step 3: Create certificate (4.5-minute lifetime with 80% rotation threshold)
 // SECURITY: Optimized for quantum resistance with minimal network overhead
 // - Lifetime: 270 seconds (3 macroblocks)
 // - Rotation: 216 seconds (80% threshold)
 // - Grace period: 54 seconds (sufficient for global WAN propagation)
 // - Quantum attack time: 10^15 years (NIST Security Level 3)
-let ephemeral_certificate = HybridCertificate {
+let certificate = HybridCertificate {
     node_id,
-    ed25519_public_key: *ephemeral_verifying_key.as_bytes(),
-    dilithium_signature_of_ed25519: dilithium_key_sig.signature,  // RAW bytes
+    dilithium_public_key: node_dilithium_pk,             // RAW bytes (~1952)
+    dilithium_self_signature: dilithium_key_sig.signature, // RAW bytes (self-binding)
     issued_at: now,
     expires_at: now + 270,  // 4.5 minutes = 270 seconds (CERTIFICATE_LIFETIME_SECS)
     serial_number: format!("{:x}", now),
@@ -1255,20 +1255,19 @@ pub async fn verify_signature(
         return Ok(false);
     }
     
-    // Step 2: Recreate encapsulated data
-    let mut encapsulated_data = Vec::new();
-    encapsulated_data.extend_from_slice(&signature.certificate.ed25519_public_key);
-    encapsulated_data.extend_from_slice(&sha3::Sha3_256::digest(message));
+    // Step 2: Recreate signed data = message_hash || timestamp
+    let mut signed_data = Vec::new();
+    signed_data.extend_from_slice(&sha3::Sha3_256::digest(message));
+    signed_data.extend_from_slice(&signature.signed_at.to_le_bytes());
     
-    // Step 3: Verify Dilithium signature on encapsulated data (v2.23)
-    // NOTE: encapsulated_data includes message_hash, so this covers both key binding AND message!
-    // dilithium_message_signature was REMOVED as redundant in v2.23
+    // Step 3: Verify the single Dilithium3 signature over signed_data
+    // NOTE: signed_data includes message_hash, so this one signature covers the message.
     
     // Use real dilithium3::open() for cryptographic verification
     let dilithium_valid = pqcrypto_dilithium::dilithium3::open(
-        &signature.dilithium_key_signature,  // RAW bytes
-        &encapsulated_data,                   // Includes message_hash
-        &dilithium_public_key
+        &signature.dilithium_key_signature,   // RAW bytes
+        &signed_data,                          // Includes message_hash
+        &signature.certificate.dilithium_public_key
     ).is_ok();
     
     if !dilithium_valid {
@@ -1276,14 +1275,7 @@ pub async fn verify_signature(
         return Ok(false);
     }
     
-    // Step 4: Verify Ed25519 message signature (fast path)
-    let ed25519_valid = verify_ed25519_signature(
-        message,
-        &signature.message_signature,  // [u8; 64] RAW
-        &signature.ephemeral_public_key  // [u8; 32] RAW
-    )?;
-    
-    Ok(ed25519_valid && dilithium_valid)
+    Ok(dilithium_valid)
 }
 ```
 
@@ -1291,9 +1283,9 @@ pub async fn verify_signature(
 
 | Property | Implementation | Benefit |
 |----------|----------------|---------|
-| **Ephemeral Keys** | NEW Ed25519 per message | Forward secrecy |
-| **Dual Signatures** | Dilithium signs BOTH key AND message | Full quantum protection |
-| **Encapsulation** | Dilithium signs (key + hash) | NIST/Cisco compliant |
+| **Certificate Rotation** | Per-message certificate window (270s) | Forward secrecy |
+| **Single PQ Signature** | One Dilithium3 sig over (message_hash + timestamp) | Full quantum protection |
+| **Encapsulation** | Dilithium signs (message_hash + timestamp) | NIST/Cisco compliant |
 | **Certificate Caching** | LRU cache (100K entries) | Performance + Byzantine-safe |
 | **Expiration** | 4.5-minute lifetime (80% rotation) | Optimal quantum protection (10^15 years attack time) |
 | **Memory Safety** | zeroize() clears sensitive data | Prevents memory dumps |
@@ -1304,11 +1296,11 @@ pub async fn verify_signature(
 **Critical security enhancement to prevent memory-based attacks:**
 
 ```rust
-// Ephemeral key cleanup (hybrid_crypto.rs:256-257)
-let mut ephemeral_key_bytes = rand::thread_rng().gen::<[u8; 32]>();
-let ephemeral_signing_key = SigningKey::from_bytes(&ephemeral_key_bytes);
-// ... use key ...
-ephemeral_key_bytes.zeroize();  // Clear from memory
+// Dilithium secret-key material cleanup (hybrid_crypto.rs / key_manager.rs)
+// After signing, any transient copies of Dilithium secret-key material are zeroized.
+let mut sk_material = load_transient_secret_material();
+// ... use for signing ...
+sk_material.zeroize();  // Clear from memory
 
 // Seed cleanup (key_manager.rs:191, 295-296)
 let mut seed = self.generate_seed();
@@ -1567,13 +1559,13 @@ fn get_encryption_key(&self) -> Result<[u8; 32]> {
 |--------|-----------|------------|
 | **Shor's Algorithm** | Factor RSA/ECC | Dilithium (lattice-based) ✅ |
 | **Grover's Algorithm** | Hash search | SHA3-512 (512→256 bit) ✅ |
-| **Quantum Replay** | Reuse signatures | Ephemeral keys (4.5min rotation) ✅ |
+| **Quantum Replay** | Reuse signatures | Per-message certificate rotation (4.5min) ✅ |
 
 #### Classical Threats
 
 | Attack | Protection | Implementation |
 |--------|------------|----------------|
-| **Signature Forgery** | Dilithium + Ed25519 | Dual signatures |
+| **Signature Forgery** | Pure ML-DSA-65 (Dilithium3) | Single post-quantum signature per message |
 | **Key Extraction** | AES-256-GCM | Encrypted storage |
 | **Byzantine Attacks** | Message verification | Every signature checked |
 | **Replay Attacks** | Timestamps + expiry | 270-second window (certificate lifetime) |
@@ -1748,17 +1740,19 @@ Conclusion: O(1) scaling regardless of network size
 
 | Requirement | Status | Implementation |
 |-------------|--------|----------------|
-| **Encapsulated Keys** | ✅ Complete | Dilithium signs ephemeral Ed25519 |
-| **Every Message Signed** | ✅ Complete | Both Ed25519 AND Dilithium per message |
+| **Post-Quantum Signatures** | ✅ Complete | Pure ML-DSA-65 (Dilithium3) — Ed25519 removed |
+| **Every Message Signed** | ✅ Complete | Single Dilithium3 signature per message |
 | **Forward Secrecy** | ✅ Complete | 4.5-minute certificate lifetime with 80% rotation (216s) |
 | **Quantum-Resistant** | ✅ Complete | CRYSTALS-Dilithium3 (2420 bytes) |
 | **Byzantine-Safe** | ✅ Complete | 2/3+ consensus with 6-layer certificate protection |
+| **Post-Quantum Key Exchange** | ✅ Complete | X25519Kyber768 (ML-KEM-768) hybrid KEX in QUIC TLS 1.3 |
 
 #### NIST Post-Quantum Standards
 
 | Standard | Algorithm | Status |
 |----------|-----------|--------|
-| **FIPS 203** | CRYSTALS-Dilithium | ✅ Implemented |
+| **FIPS 204** | ML-DSA (CRYSTALS-Dilithium) | ✅ Implemented |
+| **FIPS 203** | ML-KEM (CRYSTALS-Kyber) key exchange | ✅ Implemented |
 | **FIPS 202** | SHA3-256/512 | ✅ Implemented |
 | **FIPS 197** | AES-256-GCM | ✅ Implemented |
 
@@ -1786,19 +1780,19 @@ Conclusion: O(1) scaling regardless of network size
 ### 6.1 File Structure
 
 ```
-development/qnet-integration/src/
-├── hybrid_crypto.rs          # Consensus commit/reveal signatures (NIST/Cisco ephemeral)
-├── key_manager.rs            # Persistent block signatures (SHA3-512 + Dilithium)
+development/qnet-integration/src/crypto/
+├── hybrid_crypto.rs          # Checkpoint-BFT v2 consensus message signatures (pure Dilithium3, per-message certificate)
+├── key_manager.rs            # Persistent block signatures (pure Dilithium3)
 ├── quantum_crypto.rs         # Core crypto operations & Dilithium management
-├── vrf_hybrid.rs             # Hybrid VRF (used for QRB randomness beacon, NOT producer selection)
-└── vrf.rs                    # Legacy VRF (deprecated)
+└── vrf.rs                    # VRF (committee sampling / randomness beacon)
 
 core/qnet-consensus/src/
 └── consensus_crypto.rs       # Signature verification for consensus messages
 
 Note: Producer SELECTION uses DETERMINISTIC SHA3-512 (identical on all nodes, no forks).
       This provides verifiable selection: SHA3(finality_block + round + sorted_candidates).
-      Block SIGNATURES use Hybrid crypto (Dilithium signs ephemeral Ed25519 per NIST/Cisco).
+      Block SIGNATURES use pure ML-DSA-65 (Dilithium3) — a single Dilithium signature
+      per message. (The "hybrid_crypto.rs" filename is historical; Ed25519 has been removed.)
 ```
 
 ### 6.2 Dependencies
@@ -1810,8 +1804,7 @@ pqcrypto = "0.18"
 pqcrypto-dilithium = "0.5"
 pqcrypto-traits = "0.3"
 
-# Classical cryptography
-ed25519-dalek = "2.0"
+# Symmetric crypto, hashing & RNG (no Ed25519 — signing is pure Dilithium3)
 aes-gcm = "0.10"
 sha3 = "0.10"
 rand = "0.8"
@@ -1842,7 +1835,8 @@ hex = "0.4.3"
 
 #### NIST Post-Quantum Cryptography
 
-- ✅ **CRYSTALS-Dilithium** (FIPS 203): Digital signatures
+- ✅ **CRYSTALS-Dilithium / ML-DSA** (FIPS 204): Digital signatures
+- ✅ **CRYSTALS-Kyber / ML-KEM-768** (FIPS 203): X25519Kyber768 key exchange (QUIC TLS 1.3)
 - ✅ **SHA-3** (FIPS 202): Quantum-resistant hashing
 - ✅ **AES-256-GCM** (FIPS 197): Key encryption
 
@@ -1850,8 +1844,8 @@ hex = "0.4.3"
 
 - ✅ **NIST/Cisco Encapsulated Keys**: Implemented
 - ✅ **Certificate Caching**: O(1) certificate lookup after first verification
-- ✅ **Message Verification**: Ed25519 + Dilithium checked EVERY time
-- ✅ **Forward Secrecy**: Ephemeral key rotation (270s lifetime)
+- ✅ **Message Verification**: Single pure Dilithium3 signature checked EVERY time
+- ✅ **Forward Secrecy**: Per-message certificate rotation (270s lifetime)
 - ✅ **Byzantine Safety**: Full message verification prevents attacks
 
 ### 7.2 Audit Trail
@@ -1921,7 +1915,7 @@ let is_valid = dilithium3::open(signed_msg, &pk).is_ok();
 ```
 
 **Specifications**:
-- **Signature Size**: 2420 bytes (NIST FIPS 203 standard)
+- **Signature Size**: 2420 bytes (NIST FIPS 204 / ML-DSA-65 standard)
 - **Public Key**: 1952 bytes
 - **Secret Key**: 4000 bytes
 - **Security Level**: NIST Level 3 (equivalent to AES-192)
@@ -1929,39 +1923,33 @@ let is_valid = dilithium3::open(signed_msg, &pk).is_ok();
 
 ---
 
-#### Dual-Algorithm Consensus Verification
+#### Pure Post-Quantum Consensus Verification
 
-Every consensus block is verified using BOTH classical and post-quantum algorithms:
+Every consensus block is verified with a single pure ML-DSA-65 (Dilithium3) signature:
 
 **Microblock Verification** (`node.rs:8126-8254`):
 ```rust
-// Step 1: Dilithium signature verification (quantum-resistant)
+// Single step: pure Dilithium3 signature verification (quantum-resistant)
+// The signature covers message_hash || timestamp, so one check is sufficient.
 let dilithium_valid = quantum_crypto
-    .verify_dilithium_signature(&message_hash, dilithium_sig, &producer)
+    .verify_dilithium_signature(&message_hash, &compact_sig.dilithium_key_signature, &producer)
     .await?;
 
-// Step 2: Ed25519 format validation (performance)
-let ed25519_valid = HybridCrypto::verify_ed25519_signature(
-    &certificate.ed25519_public_key,
-    &microblock_hash,
-    &compact_sig.message_signature
-)?;
-
-// Both must pass for acceptance
-return dilithium_valid && ed25519_valid;
+// Must pass for acceptance
+return dilithium_valid;
 ```
 
 **Macroblock Verification**:
-- Full hybrid signatures with embedded certificates
-- Both Ed25519 and Dilithium verified independently
+- Full signatures with embedded certificates (pure Dilithium3)
+- One Dilithium3 signature verified via `dilithium3::open()`
 - Byzantine consensus requires 2/3+ node agreement
 - Invalid blocks rejected by majority
 
 **Security Properties**:
-- ✅ Quantum attacker must break BOTH algorithms
-- ✅ Classical attacker must break BOTH algorithms
+- ✅ Quantum attacker must break Dilithium3 (module-lattice, Shor-resistant)
+- ✅ Classical attacker must break Dilithium3
 - ✅ Byzantine-safe (2/3+ honest nodes)
-- ✅ No single point of failure
+- ✅ No Ed25519 dependency — post-quantum from end to end
 
 ---
 
@@ -1971,51 +1959,49 @@ QNet implements encapsulated keys per NIST/Cisco recommendations:
 
 **Certificate Structure** (`hybrid_crypto.rs:256-300`):
 ```rust
-// CRITICAL: ENCAPSULATED KEY per NIST/Cisco standard
-// Dilithium MUST sign the RAW Ed25519 public key bytes
-let mut encapsulated_data = Vec::new();
-encapsulated_data.extend_from_slice(verifying_key.as_bytes()); // 32 bytes Ed25519 key
-encapsulated_data.extend_from_slice(self.node_id.as_bytes());
-encapsulated_data.extend_from_slice(&now.to_le_bytes());
+// CRITICAL: node identity bound by a pure Dilithium3 self-signature
+// Dilithium signs the node_id + its own public key + timestamp
+let mut cert_data = Vec::new();
+cert_data.extend_from_slice(&node_dilithium_pk);   // ~1952 bytes Dilithium key
+cert_data.extend_from_slice(self.node_id.as_bytes());
+cert_data.extend_from_slice(&now.to_le_bytes());
 
-let encapsulated_hex = hex::encode(&encapsulated_data);
+let cert_hex = hex::encode(&cert_data);
 
 let dilithium_sig = quantum_crypto
-    .create_consensus_signature(&node_id, &encapsulated_hex)
+    .create_consensus_signature(&node_id, &cert_hex)
     .await?;
 
 // Certificate contains:
-// - Ed25519 public key (32 bytes) - ENCAPSULATED
-// - Dilithium signature of ENCAPSULATED key (2420 bytes)
+// - Dilithium public key (~1952 bytes)
+// - Dilithium self-signature binding node_id + key (~2420 bytes)
 // - Metadata (timestamps, serial)
 ```
 
 **Message Signing** (`hybrid_crypto.rs:352-396`):
 ```rust
-// Every message signed by BOTH algorithms
-let ed25519_signature = signing_key.sign(message);
+// Every message signed by a SINGLE pure Dilithium3 signature
+// signed_data = message_hash || timestamp
 let dilithium_sig = quantum_crypto
-    .create_consensus_signature(&node_id, &hex::encode(&encapsulated_data))
+    .create_consensus_signature(&node_id, &hex::encode(&signed_data))
     .await?;
 
 // v2.23: Extract RAW bytes (no base64!)
 let dilithium_raw = extract_dilithium_raw_bytes(&dilithium_sig);
 
 HybridSignature {
-    certificate: certificate.clone(),              // Dilithium → Ed25519
-    ephemeral_public_key: *ephemeral_verifying_key.as_bytes(),  // [u8; 32] RAW
-    message_signature: ed25519_signature.to_bytes(),             // [u8; 64] RAW
-    dilithium_key_signature: dilithium_raw,                      // Vec<u8> RAW (~2500 bytes)
+    certificate: certificate.clone(),              // pure Dilithium3 certificate
+    dilithium_key_signature: dilithium_raw,        // Vec<u8> RAW (~2500 bytes)
     signed_at: timestamp,
 }
 ```
 
 **Compliance Checklist (v2.23)**:
-- ✅ **Encapsulated Keys**: Dilithium signs ephemeral Ed25519 key + message_hash
-- ✅ **Single Dilithium Signature**: Message hash included in encapsulated_data
+- ✅ **Encapsulated Data**: Dilithium signs message_hash + timestamp
+- ✅ **Single Dilithium Signature**: One pure ML-DSA-65 signature per message
 - ✅ **RAW Bytes Format**: No base64 overhead (88% size reduction)
 - ✅ **Forward Secrecy**: 4.5-minute certificate lifetime with 80% rotation threshold (216s)
-- ✅ **Quantum Resistance**: CRYSTALS-Dilithium3 (NIST FIPS 203)
+- ✅ **Quantum Resistance**: CRYSTALS-Dilithium3 / ML-DSA-65 (NIST FIPS 204)
 - ✅ **Defense-in-Depth**: Real verification at P2P + Consensus layers
 - ✅ **Byzantine Safety**: Certificate caching secured by 2/3+ honest node threshold
 
@@ -2023,7 +2009,7 @@ HybridSignature {
 
 #### Production Status (December 6, 2025)
 
-✅ **NIST/Cisco Compliant**: Encapsulated keys, Dilithium binds ephemeral key + message_hash  
+✅ **NIST/Cisco Compliant**: Single pure Dilithium3 signature binds message_hash + timestamp  
 ✅ **Real Dilithium3**: Official `pqcrypto_dilithium::dilithium3` library  
 ✅ **RAW Bytes v2.23**: 88% size reduction via `serde_bytes`  
 ✅ **Defense-in-Depth**: Both P2P and Consensus layers verify via `dilithium3::open()`  
@@ -2036,11 +2022,12 @@ HybridSignature {
 
 ## 📚 References
 
-1. **NIST FIPS 203**: CRYSTALS-Dilithium Standard
-2. **NIST FIPS 202**: SHA-3 Standard
-3. **Cisco Post-Quantum Guidelines**: Encapsulated Key Recommendations
-4. **pqcrypto-dilithium Documentation**: Implementation Guide
-5. **QNet Whitepaper**: Section 4 - Post-Quantum Cryptography
+1. **NIST FIPS 204**: ML-DSA (CRYSTALS-Dilithium) Signature Standard
+2. **NIST FIPS 203**: ML-KEM (CRYSTALS-Kyber) Key-Encapsulation Standard
+3. **NIST FIPS 202**: SHA-3 Standard
+4. **Cisco Post-Quantum Guidelines**: Encapsulated Key Recommendations
+5. **pqcrypto-dilithium Documentation**: Implementation Guide
+6. **QNet Whitepaper**: Section 4 - Post-Quantum Cryptography
 
 ---
 
@@ -2075,7 +2062,7 @@ cargo bench --bench crypto_benchmark
 QNet's cryptographic implementation achieves:
 
 1. **99.6% Security Score** (exceeds production requirements)
-2. **Full NIST/Cisco Compliance** (encapsulated keys, dual signatures)
+2. **Full NIST/Cisco Compliance** (encapsulated data, single pure Dilithium3 signature)
 3. **NIST Level 3 Security** (Dilithium3 equivalent to AES-192)
 4. **Byzantine-Safe** (message signatures verified every time)
 5. **Production Ready** (tested and audited)
@@ -2148,11 +2135,16 @@ assert_eq!(loaded_hash, stored_hash, "Snapshot corrupted!");
 
 ### 8.5 Dynamic Sharding (v2.19.10)
 
+> **Status (2026-07): sharding is DEFERRED by design.** QNet runs **single-shard**
+> today (a single shard already sustains the ~50k TPS target), and the automatic
+> shard auto-arm is **gated OFF**. The scaling table and `get_optimal_shard_count()`
+> below describe the future multi-shard option, not the current live configuration.
+
 **Sharding = Parallel TX Processing, NOT Storage Partitioning**
 
 All nodes receive ALL blocks via P2P broadcast. Shards determine which transactions can be processed in parallel, not what data each node stores.
 
-**Automatic shard scaling based on network size:**
+**Automatic shard scaling based on network size (future option, off today):**
 
 | Network Size | Shards | Processing Capacity |
 |--------------|--------|---------------------|
@@ -2181,7 +2173,7 @@ pub fn get_optimal_shard_count(network_size: usize) -> u32 {
 }
 ```
 
-**Testing with 256 shards:**
+**Testing with 256 shards** (execution sharding is deferred — single-shard today, auto-arm gated OFF):
 ```bash
 QNET_SHARD_COUNT=256 ./qnet-node  # Force 256 shards for testing
 # System will auto-adjust to optimal count based on actual network size
@@ -2253,7 +2245,7 @@ Gulf Stream is a transaction forwarding protocol that reduces TX latency by send
 
 ### Cryptographic Integrity
 
-1. **TX Signature**: Ed25519 signature verified before broadcast
+1. **TX Signature**: Pure Dilithium3 (ML-DSA-65) signature verified before broadcast
 2. **TX Hash**: SHA3-256 hash computed from bincode bytes
 3. **Deduplication**: Hash-based seen_tx_hashes prevents replay
 4. **Producer Verification**: Producer identity from consensus

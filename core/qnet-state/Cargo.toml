@@ -11,6 +11,8 @@ name = "qnet_state"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# Smart-contract VM (P3 apply dispatch; GATED default-OFF via WASM_VM_ENABLED)
+qnet-vm = { path = "../qnet-vm" }
 # Storage
 rocksdb = "0.21"
 
@@ -57,6 +59,7 @@ pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
 [dev-dependencies]
 tempfile = "3.8.1"
 criterion = "0.5"
+wat = "1"  # compile readable WAT test contracts for the WASM apply tests
 
 [features]
 default = []

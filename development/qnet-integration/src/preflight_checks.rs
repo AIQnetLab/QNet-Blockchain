@@ -370,10 +370,19 @@ async fn check_udp_external_connectivity(external_ip: &str, port: u16) -> CheckR
     // External check requires external service or peer
     match UdpSocket::bind("0.0.0.0:0") {
         Ok(socket) => {
-            let addr: SocketAddr = format!("{}:{}", external_ip, port)
-                .parse()
-                .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-            
+            // Never substitute a bogus fallback address that masks a bad external_ip.
+            let addr: SocketAddr = match format!("{}:{}", external_ip, port).parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    println!("[WARN][PREFLIGHT] invalid external address, skipping UDP check ip={} port={} err={}", external_ip, port, e);
+                    return CheckResult {
+                        name,
+                        passed: false,
+                        message: format!("Invalid external address {}:{} ({})", external_ip, port, e),
+                    };
+                }
+            };
+
             // Try to send a probe packet
             match socket.send_to(b"QNET_PREFLIGHT_CHECK", addr) {
                 Ok(_) => {

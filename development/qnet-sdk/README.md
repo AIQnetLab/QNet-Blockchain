@@ -65,7 +65,7 @@ await client.sendTransaction({ ...tx, signature: mySignature.toString('hex') });
 | `getPendingRewards(address)` | Unclaimed rewards |
 | `claimRewards(address, signature)` | Claim pending rewards |
 | `requestFaucetTokens(walletAddress)` | Get 1500 1DEV + 0.001 SOL (testnet) |
-| `deployContract(params)` | Deploy a PQ-EVM contract |
+| `deployContract(params)` | Deploy a WASM smart contract |
 | `callContract(params)` | Read-only contract call |
 | `sendContractCall(params)` | State-mutating contract call |
 | `getContractLogs(addr, from, to)` | Contract event logs |
@@ -201,6 +201,6 @@ npm run build
 | Signature | ECDSA secp256k1 | Dilithium3 / ML-DSA-65 (NIST FIPS 204 L3) |
 | Address | `0x` 20-byte hex | EON format (25 bytes + checksum) |
 | Block time | ~12 s | ~1 s (microblock) |
-| Finality | ~2 min | MacroBlock ~90 s |
+| Finality | ~2 min | MacroBlock ~60 s (Checkpoint-BFT v2) |
 | Custom opcodes | — | `PQ_SIGN`, `PQ_VERIFY`, `PQ_ENCRYPT` |
 | Polling | WebSocket + HTTP | HTTP polling (WebSocket: v2 roadmap) |

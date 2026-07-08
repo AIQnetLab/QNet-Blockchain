@@ -13,11 +13,16 @@ Sharding is dividing the blockchain into multiple parallel chains (shards), wher
 
 ### How Sharding Works in QNet
 
+> **Status:** QNet runs **single-shard by design** today. A single chain is enough
+> for QNet's target throughput (~50K TPS), so the sharding auto-arm is gated OFF.
+> Sharding is a **future option**, not active — the diagrams below illustrate the
+> deferred multi-shard design, not current behavior.
+
 ```
-Without Sharding (current):
+Without Sharding (current, single-shard):
 ┌─────────────────────┐
 │  All Transactions   │
-│     (100K TPS)      │
+│     (~50K TPS)      │
 └──────────┬──────────┘
            │
            ▼
@@ -26,7 +31,7 @@ Without Sharding (current):
 │  Processes All      │
 └─────────────────────┘
 
-With Sharding (planned):
+With Sharding (future option, off today):
 ┌─────────────────────┐
 │  All Transactions   │
 │    (1M+ TPS)        │

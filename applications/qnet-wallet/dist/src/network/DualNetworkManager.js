@@ -105,51 +105,37 @@ export class DualNetworkManager {
     }
 
     /**
-     * Generate EON address format: 7a9bk4f2eon8x3m5z1c7
+     * Access the canonical pure-Dilithium (ML-DSA-65) bundle. index.html loads
+     * lib/noble-pq-ml-dsa.js (classic script) BEFORE src/main.js, so window.QNetDilithiumLib is
+     * present at runtime. This is the ONLY valid source of a QNet EON address.
+     */
+    getQNetDilithium() {
+        const g = (typeof window !== 'undefined') ? window
+                : (typeof globalThis !== 'undefined') ? globalThis : null;
+        const lib = g && g.QNetDilithiumLib;
+        const Q = lib && lib.QNetDilithium;
+        if (!Q || typeof Q.deriveWallet !== 'function') {
+            throw new Error('QNetDilithium bundle not loaded — lib/noble-pq-ml-dsa.js must load before DualNetworkManager');
+        }
+        return Q;
+    }
+
+    /**
+     * Generate the CANONICAL pure-Dilithium (ML-DSA-65) EON address from a BIP39 mnemonic.
+     * Byte-identical to the Rust node + mobile app (golden KAT "abandon…about" →
+     * d9fa370374e24333242eon847d1d354dcd87fe873823e). The old base36-of-seed builder produced a
+     * ~23-char address unrelated to the ML-DSA key — a divergent bug. Route through the bundle.
      */
     async generateEonAddress(seedPhrase) {
         try {
-            // Derive seed from mnemonic
-            const seed = await secureBIP39.importFromExternalWallet(seedPhrase, '');
-            
-            // Generate address components
-            const part1 = this.generateAddressPart(seed.seed.slice(0, 8));
-            const part2 = this.generateAddressPart(seed.seed.slice(8, 16));
-            const checksum = this.calculateAddressChecksum(part1 + part2);
-            
-            return `${part1}eon${part2}${checksum}`;
+            if (!seedPhrase || typeof seedPhrase !== 'string') {
+                throw new Error('generateEonAddress requires a BIP39 mnemonic');
+            }
+            const Q = this.getQNetDilithium();
+            return Q.deriveWallet(seedPhrase.trim()).address;
         } catch (error) {
             throw new Error(`Failed to generate EON address: ${error.message}`);
         }
-    }
-
-    /**
-     * Generate address part from seed bytes
-     */
-    generateAddressPart(seedBytes) {
-        const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
-        let result = '';
-        
-        for (let i = 0; i < 8; i++) {
-            const byte = seedBytes[i] || 0;
-            result += chars[byte % chars.length];
-        }
-        
-        return result;
-    }
-
-    /**
-     * Calculate checksum for EON address
-     */
-    calculateAddressChecksum(addressPart) {
-        // Simple checksum algorithm
-        let hash = 0;
-        for (let i = 0; i < addressPart.length; i++) {
-            hash = ((hash << 5) - hash + addressPart.charCodeAt(i)) & 0xffffffff;
-        }
-        
-        const chars = '0123456789abcdef';
-        return Math.abs(hash % 65536).toString(16).padStart(4, '0');
     }
 
     /**
@@ -157,23 +143,25 @@ export class DualNetworkManager {
      */
     async getOrCreateEonAddress() {
         try {
-            // Check if EON address already exists in storage
+            // Only trust a cached address if it is a well-formed 45-char canonical EON address
+            // (19 + "eon" + 15 + 8-char checksum). A previously-cached divergent/base36 address (any
+            // other length/shape) must be discarded and re-derived from the mnemonic via the bundle.
             const stored = await this.loadFromStorage('qnet_eon_address');
-            if (stored) {
+            if (stored && typeof stored === 'string' && stored.length === 45 && stored.substring(19, 22) === 'eon') {
                 return stored;
             }
 
-            // Generate new EON address from wallet seed
+            // Generate canonical EON address from wallet mnemonic (pure-Dilithium via the bundle).
             const walletData = await this.loadFromStorage('qnet_wallet_data');
             if (!walletData?.mnemonic) {
                 throw new Error('No wallet found for EON address generation');
             }
 
             const eonAddress = await this.generateEonAddress(walletData.mnemonic);
-            
-            // Store EON address
+
+            // Store canonical EON address
             await this.saveToStorage('qnet_eon_address', eonAddress);
-            
+
             return eonAddress;
         } catch (error) {
             throw new Error(`Failed to get EON address: ${error.message}`);

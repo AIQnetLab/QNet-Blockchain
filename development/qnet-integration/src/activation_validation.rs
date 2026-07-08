@@ -529,21 +529,25 @@ impl BlockchainActivationRegistry {
         for (i, &enc_byte) in encrypted_bytes.iter().enumerate() {
             decrypted.push(enc_byte ^ key_bytes[i % key_bytes.len()]);
         }
-        let decrypted_prefix = String::from_utf8_lossy(&decrypted).to_string();
-        
-        // Compare decrypted prefix with wallet address prefix
-        let wallet_prefix = &wallet_address[..decrypted_prefix.len().min(wallet_address.len())];
-        let matches = decrypted_prefix == wallet_prefix;
-        
-        if matches {
-            println!("[INFO][VERIFY] ownership_confirmed method=stateless_xor wallet={}... prefix_match={}",
-                &wallet_address[..16.min(wallet_address.len())], decrypted_prefix.len());
-        } else {
-            println!("[WARN][VERIFY] ownership_rejected method=stateless_xor expected={}... got={}...",
-                &wallet_prefix[..8.min(wallet_prefix.len())],
-                &decrypted_prefix[..8.min(decrypted_prefix.len())]);
+
+        // FIXED-width byte binding: the code carries exactly the first N bytes of the
+        // wallet. Compare those N bytes byte-exact — never a variable window derived
+        // from decrypted content (a short/empty decrypt must not truncate-match).
+        let bind_len = decrypted.len();
+        if wallet_address.len() < bind_len {
+            return Err(IntegrationError::ValidationError(
+                "[REJECT][ACTIVATION] wallet_shorter_than_binding".to_string()));
         }
-        
+        let matches = decrypted.as_slice() == &wallet_address.as_bytes()[..bind_len];
+
+        if matches {
+            println!("[INFO][VERIFY] ownership_confirmed method=stateless_xor wallet={}... bind_bytes={}",
+                &wallet_address[..16.min(wallet_address.len())], bind_len);
+        } else {
+            println!("[WARN][VERIFY] ownership_rejected method=stateless_xor wallet={}... bind_bytes={}",
+                &wallet_address[..16.min(wallet_address.len())], bind_len);
+        }
+
         Ok(matches)
     }
     
@@ -717,50 +721,12 @@ impl BlockchainActivationRegistry {
     
     /// Direct blockchain query using load balancer
     async fn query_blockchain_directly_by_hash(&self, code_hash: &str) -> Result<bool, IntegrationError> {
-        // PRODUCTION: Direct blockchain state query through consensus engine using secure hash
-        
-        match self.query_activation_state(code_hash).await {
-            Ok(exists) => {
-                println!("✅ Blockchain hash query: hash {} exists: {}", 
-                    code_hash, exists);
-                Ok(exists) // Return true if hash exists in blockchain
-            }
-            Err(query_error) => {
-                if self.is_genesis_bootstrap_mode() {
-                    println!("🚀 Genesis mode: Allowing hash validation without blockchain history");
-                    Ok(false) // In genesis mode, assume hash doesn't exist
-                } else {
-                    Err(IntegrationError::BlockchainError(
-                        format!("Blockchain hash query failed: {}", query_error)
-                    ))
-                }
-            }
-        }
-    }
-    
-    /// Check code uniqueness through blockchain consensus
-    #[allow(dead_code)]
-    async fn consensus_check_code_uniqueness(&self, code: &str) -> Result<bool, String> {
-        // Query blockchain state for activation code usage
-        // Use SHA3-256 for consistency with hash_activation_code_for_blockchain
-        let code_hash_hex = self.hash_activation_code_for_blockchain(code)
-            .map_err(|e| format!("Failed to hash activation code: {}", e))?;
-        
-        // Check if activation code exists in blockchain state
-        match self.query_activation_state(&code_hash_hex).await {
-            Ok(exists) => Ok(!exists), // Return true if unique (doesn't exist)
-            Err(e) => Err(format!("Consensus query failed: {}", e))
-        }
-    }
-    
-    /// Query activation state from blockchain
-    async fn query_activation_state(&self, code_hash: &str) -> Result<bool, String> {
-        // TODO: [INTEGRATION] Connect to actual blockchain state query
-        // Conservative default: assume code does not exist yet
-        println!("[WARN][ACTIVATION] stub_blockchain_query fn=query_activation_state code_hash={} cross_node_dedup=disabled", code_hash);
+        // Registration-dedup authority is the on-chain registry_root in the QC Checkpoint,
+        // not a per-node RAM tier; this local L4 has no independent history and reports absent.
+        println!("[WARN][ACTIVATION] local_dedup_absent code_hash={} authority=registry_root", code_hash);
         Ok(false)
     }
-    
+
     /// Get comprehensive performance statistics
     pub async fn get_performance_stats(&self) -> PerformanceStats {
         let cache_stats = self.cache_stats.read().await;
@@ -1760,13 +1726,17 @@ impl BlockchainActivationRegistry {
                                             }
                                         };
                                         
-                                        // Extract activation_amount from JSON (CRITICAL for XOR key derivation)
-                                        // Phase 1: 1DEV amount (e.g., 1500, 1350), Phase 2: QNC amount
-                                        let activation_amount = activation_json["activation_amount"].as_u64()
-                                            .unwrap_or_else(|| {
-                                                // Fallback: Phase 1 default is 1500 1DEV
-                                                1500
-                                            });
+                                        // activation_amount gates the burn-cost floor and the XOR key —
+                                        // a missing field on a burn-gated entry must reject, never
+                                        // silently default. Genesis entries are burn-exempt (amount 0).
+                                        let activation_amount = match activation_json["activation_amount"].as_u64() {
+                                            Some(a) if a > 0 || is_genesis_activation => a,
+                                            _ => {
+                                                println!("[REJECT][ACTIVATION] missing_activation_amount code={} tx={}",
+                                                         code_hash, burn_tx_hash);
+                                                continue; // Skip invalid activation
+                                            }
+                                        };
                                         
                                         let phase_val = activation_json["phase"].as_u64().unwrap_or(1);
                                         if phase_val > 2 {
@@ -1999,13 +1969,12 @@ impl BlockchainActivationRegistry {
             chain_id: 0,
         };
 
-        // SECURITY v6.1: Sign NodeActivation TX with ephemeral Ed25519 so it can be
-        // verified by receiving nodes via validate_and_add_network_transaction.
-        // Without this, the TX is rejected by all P2P peers (no public_key → rejected).
-        // Canonical message matches build_canonical_verify_message's `_` → pipe format.
+        // Pure ML-DSA-65: NodeActivation is authenticated solely by this node's consensus
+        // Dilithium3 key (registered on-chain at NodeRegistration). Admission requires + verifies
+        // it via verify_dilithium_tx_signature_async (signer_id = dilithium_public_key) over the
+        // canonical message (build_canonical_verify_message's NodeActivation arm). Ed25519 was an
+        // illusory leg that proved no identity and is quantum-breakable — removed.
         {
-            use ed25519_dalek::{SigningKey, Signer};
-            use rand::rngs::OsRng;
             let canonical_msg = format!(
                 "{}|{}|{}|{}|{}|{}|{}",
                 transaction.from,
@@ -2016,19 +1985,6 @@ impl BlockchainActivationRegistry {
                 transaction.gas_limit,
                 transaction.timestamp,
             );
-            let signing_key = SigningKey::generate(&mut OsRng);
-            let verifying_key = signing_key.verifying_key();
-            let sig = signing_key.sign(canonical_msg.as_bytes());
-            transaction.signature  = Some(hex::encode(sig.to_bytes()));
-            transaction.public_key = Some(hex::encode(verifying_key.as_bytes()));
-
-            // Post-quantum: ALSO sign with this node's consensus Dilithium3 key (registered
-            // on-chain at NodeRegistration). The ephemeral Ed25519 above only satisfies the
-            // P2P "must carry a signature" gate — it proves no identity and is quantum-breakable.
-            // This Dilithium sig binds the activation to the node's PQ identity. Same crypto
-            // pair as the heartbeat (proven on-chain); verified on admission by
-            // verify_dilithium_tx_signature_async (signer_id = dilithium_public_key) over the
-            // SAME canonical message (build_canonical_verify_message's NodeActivation arm).
             let local_node_id = crate::unified_p2p::GLOBAL_NODE_ID.read().clone();
             if !local_node_id.is_empty() {
                 if let Some(crypto) = crate::node::try_get_quantum_crypto() {

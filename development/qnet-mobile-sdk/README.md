@@ -471,7 +471,7 @@ class _MyAppState extends State<MyApp> {
   mining" or "passive sync" battery profile applies.)
 
 ### Data Usage (Light node)
-- Per ping cycle: a few KB (challenge + Hybrid Ed25519+Dilithium3
+- Per ping cycle: a few KB (challenge + pure ML-DSA-65 (Dilithium3)
   attestation, ~2.6 KB compact_bin)
 - Per balance / TX-history query: REST API roundtrip (~1–5 KB)
 - No initial chain sync, no continuous block download. Typical

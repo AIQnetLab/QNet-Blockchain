@@ -18,10 +18,9 @@ export async function GET() {
     const dbPool = getDbPool();
     await dbPool.query('SELECT 1');
     status.database = 'ok';
-  } catch (dbErr: any) {
-    /* log disabled */
+  } catch {
+    // Do not leak internal error details to clients; log server-side only.
     status.database = 'error';
-    status.databaseError = dbErr?.message || 'Unknown error';
     status.application = 'degraded';
   }
 
@@ -35,13 +34,9 @@ export async function GET() {
     if (syncStatus.lastError) {
       status.application = 'degraded';
     }
-  } catch (syncErr: any) {
-    /* log disabled */
-    status.syncService = { 
-      isRunning: false,
-      error: syncErr?.message || 'Unknown error',
-      stack: syncErr?.stack 
-    };
+  } catch {
+    // Do not leak internal error details/stack to clients; log server-side only.
+    status.syncService = { isRunning: false, error: 'unavailable' };
     status.application = 'degraded';
   }
 
@@ -49,18 +44,16 @@ export async function GET() {
   try {
     const health = getMonitoringHealth();
     status.monitoring = health;
-  } catch (monErr: any) {
-    /* log disabled */
-    status.monitoring = { error: monErr?.message || 'Unknown error' };
+  } catch {
+    status.monitoring = { error: 'unavailable' };
   }
 
   // Get rate limit stats
   try {
     const rateLimitStats = await getRateLimitStats();
     status.rateLimit = rateLimitStats;
-  } catch (rateErr: any) {
-    /* log disabled */
-    status.rateLimit = { error: rateErr?.message || 'Unknown error' };
+  } catch {
+    status.rateLimit = { error: 'unavailable' };
   }
 
   // Always return 200, even if degraded, so we can see the status

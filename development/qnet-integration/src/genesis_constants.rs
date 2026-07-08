@@ -224,8 +224,11 @@ lazy_static::lazy_static! {
         parking_lot::RwLock::new(HashMap::new());
 }
 
-/// FIX L-G1: Maximum VRF registry size to prevent unbounded growth
-const MAX_VRF_REGISTRY_SIZE: usize = 50_000;
+/// Memory-budget knob, NOT a correctness bound: the durable vrf-pk CF is the
+/// source of truth (a miss re-resolves via save_vrf_public_key /
+/// register_vrf_public_key on block apply). Sized for the active-super ceiling
+/// so a busy cluster does not thrash evict/reload.
+const MAX_VRF_REGISTRY_SIZE: usize = 1_000_000;
 
 /// Register a node's VRF public key.
 ///
@@ -292,9 +295,12 @@ pub fn get_all_vrf_keys() -> HashMap<String, Vec<u8>> {
 
 use dashmap::DashMap;
 
-/// Capacity ceiling matches CONSENSUS_PK_REGISTRY (100K). Beyond this, eviction
-/// uses the LAST_ACTIVITY tracker that already governs PK registry eviction.
-const MAX_NODE_ENDPOINT_REGISTRY_SIZE: usize = 100_000;
+/// Memory-budget knob, NOT a correctness bound: the durable node_registry CF is
+/// the source of truth (a miss re-resolves via cache_node_registrations_from_
+/// transactions_with_dashmap on block apply). Sized for the active-super ceiling
+/// so a busy cluster does not thrash evict/reload. At capacity a new registration
+/// evicts one existing entry (see register_node_endpoint) so it is never refused.
+const MAX_NODE_ENDPOINT_REGISTRY_SIZE: usize = 1_000_000;
 
 lazy_static::lazy_static! {
     pub static ref NODE_ENDPOINT_REGISTRY: DashMap<String, String> = DashMap::new();
@@ -324,11 +330,15 @@ pub fn register_node_endpoint(node_id: &str, api_endpoint: &str) {
     if NODE_ENDPOINT_REGISTRY.len() >= MAX_NODE_ENDPOINT_REGISTRY_SIZE
         && !NODE_ENDPOINT_REGISTRY.contains_key(node_id)
     {
-        // At capacity — let LAST_ACTIVITY-driven eviction reclaim later.
-        if std::env::var("QNET_DETAILED_LOGGING").ok().as_deref() == Some("1") {
-            println!("[WARN][REG] endpoint_registry_full size={}", NODE_ENDPOINT_REGISTRY.len());
+        // At capacity: evict one entry so a new registration is never refused. This is an advisory
+        // IP-identity cache re-resolved from chain, so which entry goes is non-consensus and safe.
+        let victim = NODE_ENDPOINT_REGISTRY.iter().next().map(|e| e.key().clone());
+        if let Some(v) = victim {
+            NODE_ENDPOINT_REGISTRY.remove(&v);
         }
-        return;
+        if std::env::var("QNET_DETAILED_LOGGING").ok().as_deref() == Some("1") {
+            println!("[WARN][REG] endpoint_registry_full evicted_one size={}", NODE_ENDPOINT_REGISTRY.len());
+        }
     }
     NODE_ENDPOINT_REGISTRY.insert(node_id.to_string(), ip);
 }

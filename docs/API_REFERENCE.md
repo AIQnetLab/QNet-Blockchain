@@ -20,7 +20,7 @@ Note: Light nodes use REST API (HTTP). Super nodes use QUIC for P2P.
 
 Most endpoints are public. Protected endpoints require:
 - `Authorization: Bearer {token}` header
-- Ed25519 signature verification
+- ML-DSA-65 (Dilithium3) signature verification
 
 > **📚 Cryptography Details**: See [CRYPTOGRAPHY_IMPLEMENTATION.md](../documentation/technical/CRYPTOGRAPHY_IMPLEMENTATION.md) for full cryptographic specifications.
 
@@ -28,9 +28,9 @@ Most endpoints are public. Protected endpoints require:
 
 | Context | Algorithm | Notes |
 |---------|-----------|-------|
-| **User Transactions** | Ed25519 | Standard wallet signatures |
-| **Node-to-Node (P2P)** | Hybrid (Ed25519 + Dilithium) | NIST/Cisco compliant, ephemeral keys per message |
-| **Block Signatures** | Hybrid (Ed25519 + Dilithium) | Quantum-resistant, FIPS 204 |
+| **User Transactions** | ML-DSA-65 (Dilithium3) | Pure post-quantum wallet signatures (NIST FIPS 204) |
+| **Node-to-Node (P2P)** | ML-DSA-65 (Dilithium3) | Pure post-quantum; transport uses X25519Kyber768 hybrid TLS key exchange |
+| **Block Signatures** | ML-DSA-65 (Dilithium3) | Quantum-resistant, FIPS 204 |
 
 ---
 
@@ -181,16 +181,13 @@ POST /api/v1/transaction
 Content-Type: application/json
 ```
 
-**⚠️ MANDATORY Signature Verification (NIST FIPS 186-5):**
-- Ed25519 signature - **REQUIRED** for all transactions
-- Without signature, transaction will be **REJECTED**
+**⚠️ MANDATORY Signature Verification (NIST FIPS 204):**
+- ML-DSA-65 (Dilithium3) signature - **REQUIRED** for all transactions
+- The `dilithium_public_key` must derive to `from` (address = hash of the Dilithium public key)
+- Without a valid Dilithium signature, transaction will be **REJECTED**
+- Ed25519 is **not accepted** on any QNet path (it is Solana-only, used for the 1DEV burn on Solana)
 
-**🔐 OPTIONAL Quantum-Resistant Signatures (v2.25):**
-- Dilithium3 signature - **OPTIONAL** for post-quantum security
-- When present: **+50% gas fee** (enterprise quantum protection)
-- Both Ed25519 AND Dilithium3 are verified if Dilithium present
-
-**Request Body (Standard TX - Ed25519 only):**
+**Request Body (Standard TX - pure ML-DSA-65):**
 ```json
 {
   "from": "a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2",
@@ -199,28 +196,10 @@ Content-Type: application/json
   "nonce": 42,
   "gas_price": 100000,
   "gas_limit": 10000,
-  "signature": "ed25519_signature_hex",
-  "public_key": "ed25519_pubkey_hex"
+  "dilithium_signature": "dilithium3_signature_hex",
+  "dilithium_public_key": "dilithium3_pubkey_hex"
 }
 ```
-
-**Request Body (Quantum TX - Ed25519 + Dilithium3):**
-```json
-{
-  "from": "a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2",
-  "to": "b2c3d4e5f6g7h8i9j0keonl1m2n3o4p5q6r7s8t9u0v1w2",
-  "amount": 1000000000,
-  "nonce": 42,
-  "gas_price": 100000,
-  "gas_limit": 10000,
-  "signature": "ed25519_signature_hex",
-  "public_key": "ed25519_pubkey_hex",
-  "dilithium_signature": "dilithium3_signature_hex_6586chars",
-  "dilithium_public_key": "dilithium3_pubkey_hex_3904chars"
-}
-```
-
-> **Note**: Quantum TX gas = `gas_price * 1.5 * gas_limit` (50% premium for post-quantum security)
 
 **Signature Message Format:**
 ```
@@ -498,7 +477,7 @@ Content-Type: application/json
 {
   "node_id": "light_node_abc123",
   "wallet_address": "a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2",
-  "signature": "ed25519_signature_hex"
+  "signature": "dilithium3_signature_hex"
 }
 ```
 
@@ -670,8 +649,8 @@ Content-Type: application/json
 {
   "node_id": "node_abc123",
   "wallet_address": "a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2",
-  "quantum_signature": "ed25519_signature_hex",
-  "public_key": "ed25519_pubkey_hex"
+  "quantum_signature": "dilithium3_signature_hex",
+  "public_key": "dilithium3_pubkey_hex"
 }
 ```
 
@@ -698,7 +677,7 @@ Content-Type: application/json
 {
   "node_ids": ["node_1", "node_2", "node_3"],
   "owner_address": "a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2",
-  "signature": "ed25519_signature_hex"
+  "signature": "dilithium3_signature_hex"
 }
 ```
 
@@ -710,8 +689,8 @@ POST /api/v1/batch/transfer
 Content-Type: application/json
 ```
 
-**⚠️ MANDATORY Signature Verification (NIST FIPS 186-5):**
-- Ed25519 signature - **REQUIRED**
+**⚠️ MANDATORY Signature Verification (NIST FIPS 204):**
+- ML-DSA-65 (Dilithium3) signature - **REQUIRED**
 - All transfers in batch must be from the **SAME sender**
 
 **Request Body:**
@@ -732,8 +711,8 @@ Content-Type: application/json
     }
   ],
   "batch_id": "batch_unique_id_123",
-  "signature": "ed25519_signature_hex",
-  "public_key": "ed25519_pubkey_hex"
+  "signature": "dilithium3_signature_hex",
+  "public_key": "dilithium3_pubkey_hex"
 }
 ```
 
@@ -1429,12 +1408,11 @@ POST /api/v1/contract/deploy
 Content-Type: application/json
 ```
 
-**⚠️ MANDATORY Hybrid Signatures (like consensus):**
-- Ed25519 signature (NIST FIPS 186-5) - **REQUIRED**
-- Dilithium signature (NIST FIPS 204) - **REQUIRED** (post-quantum security)
+**⚠️ MANDATORY Signature (pure post-quantum):**
+- ML-DSA-65 (Dilithium3) signature (NIST FIPS 204) - **REQUIRED**
 - SHA3-256 hash (NIST FIPS 202) - For code hash
 
-> Smart contracts are critical operations. Like node consensus, they require BOTH classical and post-quantum signatures.
+> Smart contracts are critical operations and are authorised with a pure ML-DSA-65 (Dilithium3) signature, like all other QNet transactions. Ed25519 is not used on any QNet path.
 
 **Request Body:**
 ```json
@@ -1449,10 +1427,8 @@ Content-Type: application/json
   "gas_limit": 500000,
   "gas_price": 150000,
   "nonce": 1,
-  "signature": "ed25519_signature_hex",
-  "public_key": "ed25519_pubkey_hex",
-  "dilithium_signature": "dilithium_signature_hex",
-  "dilithium_public_key": "dilithium_pubkey_hex"
+  "dilithium_signature": "dilithium3_signature_hex",
+  "dilithium_public_key": "dilithium3_pubkey_hex"
 }
 ```
 
@@ -1472,13 +1448,11 @@ contract_deploy:{from}:{code_hash}:{nonce}
   "deployer": "a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2",
   "message": "Contract deployment submitted to mempool",
   "security": {
-    "ed25519_verified": true,
     "dilithium_verified": true,
     "quantum_secure": true,
     "nist_standards": {
-      "signature": "FIPS 186-5 (Ed25519)",
-      "hash": "FIPS 202 (SHA3-256)",
-      "post_quantum": "FIPS 204 (Dilithium)"
+      "signature": "FIPS 204 (ML-DSA-65 / Dilithium3)",
+      "hash": "FIPS 202 (SHA3-256)"
     }
   }
 }
@@ -1500,12 +1474,11 @@ POST /api/v1/contract/call
 Content-Type: application/json
 ```
 
-**⚠️ MANDATORY Hybrid Signatures for State-Changing Calls:**
-- Ed25519 signature (NIST FIPS 186-5) - **REQUIRED**
-- Dilithium signature (NIST FIPS 204) - **REQUIRED**
+**⚠️ MANDATORY Signature for State-Changing Calls (pure post-quantum):**
+- ML-DSA-65 (Dilithium3) signature (NIST FIPS 204) - **REQUIRED**
 - View calls (read-only) require NO signatures
 
-**Request Body (State-Changing Call - BOTH signatures required):**
+**Request Body (State-Changing Call - Dilithium signature required):**
 ```json
 {
   "from": "a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2",
@@ -1518,10 +1491,8 @@ Content-Type: application/json
   "gas_limit": 100000,
   "gas_price": 150000,
   "nonce": 2,
-  "signature": "ed25519_signature_hex",
-  "public_key": "ed25519_pubkey_hex",
-  "dilithium_signature": "dilithium_signature_hex",
-  "dilithium_public_key": "dilithium_pubkey_hex",
+  "dilithium_signature": "dilithium3_signature_hex",
+  "dilithium_public_key": "dilithium3_pubkey_hex",
   "is_view": false
 }
 ```
@@ -1557,7 +1528,6 @@ contract_call:{from}:{contract_address}:{method}:{nonce}
   "gas_limit": 100000,
   "message": "Contract call submitted to mempool",
   "security": {
-    "ed25519_verified": true,
     "dilithium_verified": true,
     "quantum_secure": true
   }
@@ -1952,8 +1922,8 @@ POST /api/v1/token/deploy
   "symbol": "MTK",
   "decimals": 9,
   "initial_supply": 1000000000000000000,
-  "signature": "base64_ed25519_signature",
-  "public_key": "base64_ed25519_pubkey"
+  "signature": "base64_dilithium3_signature",
+  "public_key": "base64_dilithium3_pubkey"
 }
 ```
 
@@ -2071,6 +2041,8 @@ GET /api/v1/snapshot/{height}
 
 ## 📝 Changelog
 
+> **Note (2026-07): superseded on signatures.** Any earlier entry describing a HYBRID (Ed25519 + Dilithium) signature for transactions, heartbeats, or block/consensus signing is legacy. QNet now signs all transactions, consensus, node identity, and P2P gossip with pure ML-DSA-65 (Dilithium3); Ed25519 is Solana-only (1DEV burn). "Hybrid" applies only to the QUIC/TLS 1.3 X25519Kyber768 key exchange.
+
 ### v2.43.1 (December 2025)
 
 **🎁 REWARDS API OVERHAUL**
@@ -2105,7 +2077,7 @@ GET /api/v1/snapshot/{height}
 - **SYNC**: Background re-request every 30s with exponential backoff
 
 ### v2.23 (December 2025)
-- **SECURITY**: Heartbeat with HYBRID signature (Ed25519 + Dilithium, quantum-resistant)
+- **SECURITY**: Heartbeat signed with pure ML-DSA-65 (Dilithium3)
 - **OPTIMIZATION**: RAW bytes signatures (88% size reduction)
 - **OPTIMIZATION**: Shred Protocol block propagation for ALL network sizes
 - **OPTIMIZATION**: Kademlia K-neighbors for heartbeat routing (K=3)

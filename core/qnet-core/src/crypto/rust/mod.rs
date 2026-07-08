@@ -22,7 +22,7 @@ pub use merkle::{
 
 // Re-export main types for backward compatibility
 pub use production_crypto::{
-    ProductionCrypto, DilithiumParams, SphincsParams, CryptoErrorWithKind as CryptoError, 
+    ProductionCrypto, DilithiumParams, DilithiumLevel, SphincsParams, CryptoErrorWithKind as CryptoError,
     CryptoErrorKind, default_dilithium_params, default_sphincs_params
 };
 

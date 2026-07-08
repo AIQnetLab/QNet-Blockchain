@@ -1,8 +1,8 @@
 # QNet v2.62 - Quick Reference Guide
 
-> ⚠️ **v2.62 CONSENSUS UPDATED**  
-> Per-round storage: each consensus round is independent, no data loss on transition.  
-> 100% first-attempt success rate (was 87%).
+> ⚠️ **CONSENSUS: Checkpoint-BFT v2 (live, always on)**  
+> Macroblock finality is Checkpoint-BFT v2 — one checkpoint per 90-block window, finalized by a
+> single 2f+1 quorum certificate (no commit/reveal phases). Finality ~60s (two-chain).
 
 > ⚠️ **v2.61 SYNC UPDATED**  
 > Size-based batching + ShredProtocol unicast for intercontinental sync.  
@@ -15,16 +15,16 @@
 
 ### Block Structure
 - **Microblocks**: Every 1 second (transactions)
-- **Macroblocks**: Every 90 seconds (consensus finalization)
+- **Macroblocks**: One macroblock every 90 microblocks (~1s each); ~60s to full finality (Checkpoint-BFT v2, two-chain)
 - **Producer Rotation**: Every 30 blocks
 - **Finality Window**: 10 blocks (~10 seconds)
 - **Entropy Consensus**: At rotation boundaries (adaptive 200ms-2s)
 
-### Signature Types (v2.23 - RAW bytes)
+### Signature Types (v2.23 - RAW bytes, pure ML-DSA-65)
 | Type | Size | Use Case | Certificate |
 |------|------|----------|-------------|
-| **Compact v2.23** | ~2.6KB | Microblocks (high frequency) | Cached separately |
-| **Full v2.23** | ~5KB | Macroblocks (low frequency) | Embedded |
+| **Compact ML-DSA-65 v2.23** | ~2.6KB | Microblocks (high frequency) | Cached separately |
+| **Full ML-DSA-65 v2.23** | ~5KB | Macroblocks (low frequency) | Embedded |
 
 > **v2.23 Update**: RAW bytes format via `serde_bytes` (88% reduction from 22KB)
 
@@ -71,31 +71,30 @@ Block 270+: PFP Level 4 (critical)
 
 ## 🔐 Security
 
-### Cryptography Stack (NIST/Cisco Compliant v2.19.22)
-- **Post-Quantum**: CRYSTALS-Dilithium3 (NIST FIPS 204)
-- **Classical**: Ed25519 (EPHEMERAL per message!)
+### Cryptography Stack (NIST Post-Quantum, v2.19.22)
+- **Signatures**: pure ML-DSA-65 / CRYSTALS-Dilithium3 (NIST FIPS 204) — TXs, consensus, identity, gossip
+- **Transport KEX**: X25519Kyber768Draft00 hybrid (ML-KEM-768, FIPS 203) in QUIC TLS 1.3
 - **Hashing**: SHA3-256 (quantum-resistant)
 - **Consensus**: Byzantine (2/3+ honest nodes)
+- **Ed25519**: Solana-side only (1DEV burn credential) — NOT on QNet's signing path
 
-### Hybrid Signature (Per Message)
+### ML-DSA-65 Signature (Per Message)
 ```
-1. Generate NEW ephemeral Ed25519 keypair
-2. Sign message with ephemeral Ed25519
-3. Dilithium signs: ephemeral_pk || hash || timestamp
-4. Dilithium signs: message_hash
+1. Build canonical message (payload || hash || timestamp)
+2. Sign with the persistent ML-DSA-65 (Dilithium3) key
+3. Verify against the signer's on-chain registry public key
 ```
-**Why?** Forward secrecy + quantum protection
+**Why?** End-to-end post-quantum security (no classical Ed25519 dependency)
 
 ### Verification Flow
 ```
 Microblock arrives
     ↓
 P2P Layer (node.rs)
-    ├─► Structure check (ephemeral_public_key present?)
+    ├─► Structure check (signature + signer cert present?)
     ├─► Certificate lookup
-    ├─► Ed25519 verify with EPHEMERAL key ✅
-    ├─► Dilithium verify key binding ✅
-    └─► Dilithium verify message ✅
+    ├─► ML-DSA-65 (Dilithium3) verify vs signer's registry key ✅
+    └─► Signer ↔ registry-key binding check ✅
     ↓
 Consensus Layer (consensus_crypto.rs)
     ├─► Re-validate structure
@@ -155,7 +154,11 @@ Handles out-of-order block arrival in gossip P2P network while preventing memory
 
 ## 🎯 Reputation System
 
-### Split Reputation Model
+> **Status (2026-07): superseded.** Live consensus reputation is **binary {70 or 0}** —
+> eligible (70) or excluded (0). The split-score model, passive recovery, progressive jail,
+> and decay below are **removed**; kept only as historical context. Consensus gate = `reputation == 70`.
+
+### Split Reputation Model (historical)
 
 | Score | Purpose | Threshold | Events |
 |-------|---------|-----------|--------|
@@ -324,17 +327,18 @@ Total: 100% block utilization
 
 ### Throughput
 ```
-Base:           100,000 TPS (1 microblock/sec × 100K tx)
-With Sharding:  1,000,000 TPS (10 shards × 100K)
-Max Theoretical: 25,600,000 TPS (256 shards × 100K) v2.64
+Base (single-shard, TODAY): ~50-100K TPS (1 microblock/sec × up to 100K tx)
+With Sharding (FUTURE, off): 1,000,000 TPS (10 shards × 100K) — deferred, auto-arm gated OFF
+Max Theoretical (FUTURE):    25,600,000 TPS (256 shards × 100K) v2.64 — future option
 ```
+> QNet runs SINGLE-shard today; multi-shard figures above are a future option, not live.
 
 ### Latency
 ```
 Transaction → Microblock: ~1 second
 Quick Confirmation:       5 seconds (5 blocks)
 Near Final:               10 seconds (Finality Window)
-Full Finalization:        90 seconds (Macroblock)
+Full Finalization:        ~60 seconds (Checkpoint-BFT v2, two-chain)
 ```
 
 ### Bandwidth
@@ -466,7 +470,7 @@ const REPAIR_BATCH_DELAY_MS: u64 = 5;                // Pacing between batches
 2. **Defense in Depth**: Two-layer verification (P2P + Consensus)
 3. **Byzantine Safety**: All PFP levels maintain 2/3+ requirement (except Level 4 emergency)
 4. **Scalability**: Max 1000 validators regardless of total nodes
-5. **NIST Compliant**: Post-quantum cryptography (CRYSTALS-Dilithium)
+5. **NIST Compliant**: pure ML-DSA-65 (Dilithium3) signatures + ML-KEM-768 TLS key exchange
 6. **Memory Protected**: Bounded block buffering (~10 MB max)
 7. **Tracked Delivery**: Byzantine 2/3+ threshold for critical certificates
 

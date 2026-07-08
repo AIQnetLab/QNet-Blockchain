@@ -25,8 +25,21 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
         const val SECRET_KEY_SIZE  = 4032
         const val SIGNATURE_SIZE   = 3309   // pqclean / pqcrypto-dilithium 0.5
 
+        /** True once libdilithium_native.so has loaded. Load is fail-soft: on a device whose ABI we
+         *  somehow lack, the app must NOT crash at launch (the old arm64-only build did) — the
+         *  @ReactMethod calls below reject cleanly instead, so the UI still opens. */
+        @Volatile @JvmStatic
+        var nativeAvailable: Boolean = false
+            private set
+
         init {
-            System.loadLibrary("dilithium_native")
+            nativeAvailable = try {
+                System.loadLibrary("dilithium_native")
+                true
+            } catch (t: Throwable) {
+                Log.e("DILITHIUM", "native lib load failed (unsupported ABI?): ${t.message}")
+                false
+            }
         }
     }
 
@@ -46,18 +59,22 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
 
     override fun getName(): String = NAME
 
-    // Run the native compat test on init — verifies the pqclean C code is working
+    // Run the native compat test on init — verifies the pqclean C code is working. Skipped when the
+    // native lib is unavailable; catches Throwable so a JNI link error on this background thread can
+    // never take the whole app down.
     init {
-        Thread {
-            try {
-                val result = nativeCompatTest()
-                Log.e("DILITHIUM_COMPAT", "=== PQCLEAN NATIVE COMPAT TEST ===")
-                Log.e("DILITHIUM_COMPAT", "Result: $result")
-                Log.e("DILITHIUM_COMPAT", "SIG_SIZE=$SIGNATURE_SIZE (pqcrypto-dilithium 0.5 compatible)")
-            } catch (e: Exception) {
-                Log.e("DILITHIUM_COMPAT", "ERROR: ${e.message}")
-            }
-        }.start()
+        if (nativeAvailable) {
+            Thread {
+                try {
+                    val result = nativeCompatTest()
+                    Log.e("DILITHIUM_COMPAT", "=== PQCLEAN NATIVE COMPAT TEST ===")
+                    Log.e("DILITHIUM_COMPAT", "Result: $result")
+                    Log.e("DILITHIUM_COMPAT", "SIG_SIZE=$SIGNATURE_SIZE (pqcrypto-dilithium 0.5 compatible)")
+                } catch (t: Throwable) {
+                    Log.e("DILITHIUM_COMPAT", "ERROR: ${t.message}")
+                }
+            }.start()
+        }
     }
 
     /**
@@ -67,6 +84,10 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
      */
     @ReactMethod
     fun generateKeypairFromSeed(seed: String, promise: Promise) {
+        if (!nativeAvailable) {
+            promise.reject("DILITHIUM_NATIVE_UNAVAILABLE", "Post-quantum crypto is unavailable on this device build.")
+            return
+        }
         try {
             val combined = nativeGenerateKeypair(seed)
                 ?: throw RuntimeException("nativeGenerateKeypair returned null")
@@ -86,7 +107,7 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
             result.putInt("publicKeySize", pk.size)
             result.putInt("secretKeySize", sk.size)
             promise.resolve(result)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             promise.reject("DILITHIUM_KEYGEN_ERROR", "Failed to generate Dilithium3 keypair: ${e.message}", e)
         }
     }
@@ -108,6 +129,10 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
         nodeId: String,
         promise: Promise
     ) {
+        if (!nativeAvailable) {
+            promise.reject("DILITHIUM_NATIVE_UNAVAILABLE", "Post-quantum crypto is unavailable on this device build.")
+            return
+        }
         try {
             val messageBytes = message.toByteArray(Charsets.UTF_8)
 
@@ -139,7 +164,7 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
             result.putInt("signatureSize", sigBytes.size)
             result.putInt("totalBinarySize", binaryData.size)
             promise.resolve(result)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             promise.reject("DILITHIUM_SIGN_ERROR", "Failed to sign with Dilithium3: ${e.message}", e)
         }
     }
@@ -160,7 +185,7 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
             val msgBytes = message.toByteArray(Charsets.UTF_8)
             val valid = nativeVerify(pkBytes, sigBytes, msgBytes)
             promise.resolve(valid)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             promise.reject("DILITHIUM_VERIFY_ERROR", "Failed to verify: ${e.message}", e)
         }
     }
@@ -180,7 +205,7 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
             map.putString("sigSize", SIGNATURE_SIZE.toString())
             map.putBoolean("isPqclean", true)
             promise.resolve(map)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             promise.reject("COMPAT_TEST_ERROR", e.message, e)
         }
     }

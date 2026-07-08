@@ -23,13 +23,12 @@ See [LICENSE](LICENSE) for full terms.
 
 ### Transaction Signing
 
-QNet Mobile Wallet uses **Ed25519 signatures** for all transactions:
+QNet Mobile Wallet signs all transactions with pure **ML-DSA-65 (Dilithium3)**:
 
-- ✅ **Fast**: 20μs sign/verify operations
-- ✅ **Secure**: 128-bit security level (RFC 8032)
-- ✅ **Small**: 64-byte signatures
-- ✅ **Mobile-friendly**: Low energy consumption
-- ✅ **Battle-tested**: Used by Signal, Tor, SSH
+- ✅ **Post-quantum**: NIST-standardized lattice signatures (FIPS 204)
+- ✅ **Quantum-resistant**: Level 3 security, safe against quantum attacks
+- ✅ **Uniform**: Same signature scheme used across wallet and node consensus
+- ✅ **Deterministic**: Reproducible signing for consensus safety
 
 ### Key Management
 
@@ -43,28 +42,28 @@ QNet Mobile Wallet uses **Ed25519 signatures** for all transactions:
 #### 1. Transfer (sendQNC)
 ```javascript
 // Client signs: "transfer:from:to:amount:1:10000"
-// Server verifies Ed25519 signature
+// Server verifies ML-DSA-65 (Dilithium3) signature
 // Transaction recorded on blockchain
 ```
 
 #### 2. Reward Claims
 ```javascript
 // Client signs: "claim_rewards:node_id:wallet_address"
-// Server verifies Ed25519 signature
+// Server verifies ML-DSA-65 (Dilithium3) signature
 // Creates RewardDistribution transaction
 // All nodes verify and record on blockchain
 ```
 
-### Why Ed25519 (not Dilithium)?
+### Why pure ML-DSA-65 (Dilithium3)?
 
-| Aspect | Ed25519 | Dilithium |
-|--------|---------|-----------|
-| Speed | 20μs | 100ms (5000x slower) |
-| Size | 64 bytes | 2420 bytes (38x larger) |
-| Energy | Low | High |
-| Mobile | ✅ Perfect | ❌ Too heavy |
+| Aspect | ML-DSA-65 (Dilithium3) |
+|--------|------------------------|
+| Security | Post-quantum, NIST Level 3 (FIPS 204) |
+| Signature size | ~3.3 KB |
+| Standardization | NIST-standardized lattice signatures |
+| Quantum resistance | ✅ Safe against quantum attacks |
 
-**Note**: Dilithium is used for node consensus (long-term security), while Ed25519 is optimal for client transactions (user experience).
+**Note**: QNet uses pure ML-DSA-65 (Dilithium3) everywhere — both client transactions and node consensus — so the entire system is quantum-resistant with no classical-crypto weak link. (Ed25519 is not used by QNet; it appears only as the Solana-side signature required to burn 1DEV during node activation.)
 
 ---
 

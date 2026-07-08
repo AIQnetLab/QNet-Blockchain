@@ -26,14 +26,15 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import Clipboard from '@react-native-clipboard/clipboard';
 import WalletManager from '../components/WalletManager';
 import QRCode from 'react-native-qrcode-svg';
-import { 
-  checkNodeStatus, 
-  reactivateNode, 
+import {
+  checkNodeStatus,
+  reactivateNode,
   checkServerNodeStatus,
   getAllNodesByWallet,
   getPendingRewards,
   refreshFcmTokenOnServer,
   isTokenRefreshNeeded,
+  teardownLightNode,
 } from '../services/PushService';
 import { getRandomGenesisNode } from '../config/nodes';
 
@@ -906,6 +907,16 @@ const WalletScreen = () => {
     sol: 0,
     '1dev': 0
   });
+  // QRC-20 tokens: on-chain holdings (from /account/{addr}/tokens) merged with user-persisted
+  // custom tokens (AsyncStorage 'qnet_custom_tokens'). Each entry:
+  // { contract, name, symbol, decimals, balance (human string) }. Keyed/deduped by contract.
+  const [qrcTokens, setQrcTokens] = useState([]); // held + custom, merged for the Assets list
+  const [customTokens, setCustomTokens] = useState([]); // user-added (persisted), balances filled in on load
+  // Add-Custom-Token modal
+  const [showAddTokenModal, setShowAddTokenModal] = useState(false);
+  const [addTokenAddress, setAddTokenAddress] = useState('');
+  const [addTokenError, setAddTokenError] = useState('');
+  const [addingToken, setAddingToken] = useState(false);
   // v3.29: Track pending TX with proper confirmation polling
   // { txHash, expectedQnc, previousQnc, timestamp, status: 'pending'|'confirmed'|'failed' }
   const pendingTxRef = useRef(null);
@@ -1255,6 +1266,16 @@ const WalletScreen = () => {
     
     try {
       const status = await checkNodeStatus();
+      // A restored/reinstalled device has no local ping identity, so checkNodeStatus returns
+      // {registered:false} WITH NO error. If this wallet nonetheless has an activated light code,
+      // surface it as needs-reactivation so the UI shows OFFLINE + the reactivate button instead of a
+      // stale "ONLINE". Guard on !status.error: checkNodeStatus ALSO returns {registered:false,error}
+      // on a transient poll failure (unreachable/hiccuping bootstrap node) for a perfectly healthy
+      // online node — that must NOT flip a live node to a false OFFLINE. The genuine-offline signal
+      // for a registered node arrives separately via success:true + needs_reactivation:true.
+      if (status && status.registered === false && !status.error && activationCode) {
+        status.needsReactivation = true;
+      }
       setLightNodeStatus(status);
       // Update cached block height if checkNodeStatus returned a fresh value
       if (status?.currentBlockHeight > 0) {
@@ -1568,9 +1589,27 @@ const WalletScreen = () => {
   // Handle Light node reactivation ("I'm Back" button)
   const handleReactivateNode = async () => {
     if (reactivatingNode) return;
-    
+
     setReactivatingNode(true);
     try {
+      // If the local ping identity is gone (e.g. after a seed restore), a plain reactivate has no ping
+      // key to sign with. Re-establish it first via registerNodeWithCode (restore-safe: re-finds the
+      // burn on Solana, regenerates the ping delegation key signed by the restored wallet key, NO
+      // re-burn), then refresh status.
+      const localInfo = await AsyncStorage.getItem('qnet_light_node_info');
+      if (!localInfo && activationCode && wallet) {
+        // registerNodeWithCode returns {success:false,error} on failure (it does NOT throw), so we
+        // MUST inspect the result — else a failed re-establish would falsely report Success and loop.
+        // wallet_address MUST be the QNet EON (qnetAddress), never the Solana publicKey (server rejects).
+        const res = await walletManager.registerNodeWithCode(activationCode, wallet.qnetAddress || wallet.address, password);
+        if (res && res.success) {
+          showAlert('Success', 'Node re-established on this device. Attestation will resume shortly.');
+          await loadLightNodeStatus();
+        } else {
+          showAlert('Error', (res && res.error) || 'Could not re-establish node. Please try again.');
+        }
+        return;
+      }
       const result = await reactivateNode();
 
       if (result.success) {
@@ -1578,20 +1617,16 @@ const WalletScreen = () => {
           'Your node has been reactivated! Next ping scheduled.' :
           'Your node is already active.');
 
-        // Refresh FCM token after reactivation (it may have changed while offline)
-        if (wallet && wallet.secretKey) {
-          try {
-            const nacl = require('tweetnacl');
-            const skBytes = wallet.secretKey instanceof Uint8Array
-              ? wallet.secretKey : new Uint8Array(wallet.secretKey);
-            const kp = nacl.sign.keyPair.fromSeed(skBytes.slice(0, 32));
-            const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
-            if (nodeInfoStr) {
-              const ni = JSON.parse(nodeInfoStr);
-              if (ni.nodeId) await refreshFcmTokenOnServer(ni.nodeId, kp.secretKey);
-            }
-          } catch (_) { /* non-critical */ }
-        }
+        // Refresh FCM token after reactivation (it may have changed while offline).
+        // refreshFcmTokenOnServer signs with the Dilithium ping-delegation key — no
+        // wallet-seed keypair derivation needed here.
+        try {
+          const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
+          if (nodeInfoStr) {
+            const ni = JSON.parse(nodeInfoStr);
+            if (ni.nodeId) await refreshFcmTokenOnServer(ni.nodeId);
+          }
+        } catch (_) { /* non-critical */ }
 
         // Reload status
         await loadLightNodeStatus();
@@ -1907,11 +1942,16 @@ const WalletScreen = () => {
   };
   
   // Open Send Screen from Assets (click on token) - inline, not modal
-  const openSendModal = (tokenSymbol, tokenBalance, network) => {
+  // Open the Send screen. For QRC-20 tokens, pass the extra `token` descriptor
+  // { contract, decimals } so handleSendTransaction can route through qrc20Transfer and
+  // scale the amount by the token's OWN decimals. Native QNC/SOL omit it (contract stays null).
+  const openSendModal = (tokenSymbol, tokenBalance, network, token = null) => {
     setSendingToken({
       symbol: tokenSymbol,
       balance: tokenBalance,
-      network: network
+      network: network,
+      contract: token ? token.contract : null,
+      decimals: token ? token.decimals : null,
     });
     setSendAddress('');
     setSendAmount('');
@@ -1919,6 +1959,80 @@ const WalletScreen = () => {
     setShowSendScreen(true);
   };
   
+  // Open / close the Add-Custom-Token modal.
+  const openAddTokenModal = () => {
+    setAddTokenAddress('');
+    setAddTokenError('');
+    setAddingToken(false);
+    setShowAddTokenModal(true);
+  };
+  const closeAddTokenModal = () => {
+    setShowAddTokenModal(false);
+    setAddTokenAddress('');
+    setAddTokenError('');
+    setAddingToken(false);
+  };
+
+  // Validate a pasted contract address, resolve its token metadata via getTokenInfo, persist it to
+  // AsyncStorage 'qnet_custom_tokens' (deduped by contract_address), merge it into the Assets list,
+  // and fetch its balance for the current wallet.
+  const handleAddCustomToken = async () => {
+    if (addingToken) return;
+    const contract = (addTokenAddress || '').trim();
+    if (!contract) { setAddTokenError('Enter a contract address'); return; }
+    // QNet contract addresses are 64-char hex (derive_contract_address → SHA3-256 hex).
+    if (!/^[0-9a-fA-F]{64}$/.test(contract)) {
+      setAddTokenError('Invalid contract address (must be 64 hex characters)');
+      return;
+    }
+    setAddingToken(true);
+    setAddTokenError('');
+    try {
+      const info = await walletManager.getTokenInfo(contract);
+      if (!info) {
+        setAddTokenError('No token found at this address');
+        setAddingToken(false);
+        return;
+      }
+      const entry = {
+        contract_address: contract,
+        contract,
+        name: info.name,
+        symbol: info.symbol,
+        decimals: info.decimals,
+      };
+      // Persist (dedupe by contract_address).
+      let persisted = [];
+      try {
+        const raw = await AsyncStorage.getItem('qnet_custom_tokens');
+        persisted = raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(persisted)) persisted = [];
+      } catch (_) { persisted = []; }
+      if (!persisted.some((t) => (t.contract_address || t.contract) === contract)) {
+        persisted.push(entry);
+        await AsyncStorage.setItem('qnet_custom_tokens', JSON.stringify(persisted));
+      }
+      setCustomTokens(persisted);
+
+      // Fetch this token's balance for the current wallet and merge into the Assets list.
+      const qnetAddr = wallet?.qnetAddress || (await walletManager.getCurrentWallet())?.qnetAddress;
+      let balanceStr = '0';
+      if (qnetAddr) {
+        const bal = await walletManager.getTokenBalanceOf(contract, qnetAddr, info.decimals);
+        if (bal.balance != null) balanceStr = bal.balance;
+      }
+      setQrcTokens((prev) => {
+        const next = prev.filter((t) => t.contract !== contract);
+        next.push({ contract, name: info.name, symbol: info.symbol, decimals: info.decimals, balance: balanceStr });
+        return next;
+      });
+      closeAddTokenModal();
+    } catch (e) {
+      setAddTokenError(e.message || 'Failed to add token');
+      setAddingToken(false);
+    }
+  };
+
   // Close Send Screen and go back to assets
   const closeSendScreen = () => {
     setShowSendScreen(false);
@@ -1943,6 +2057,7 @@ const WalletScreen = () => {
       if (showAutoLockPicker) { setShowAutoLockPicker(false); return true; }
       if (showLanguagePicker) { setShowLanguagePicker(false); return true; }
       if (showSeedConfirm) { setShowSeedConfirm(false); return true; }
+      if (showAddTokenModal) { closeAddTokenModal(); return true; }
       if (showSendScreen) { closeSendScreen(); return true; }
       if (showSettings) { setShowSettings(false); return true; }
       // Pre-wallet onboarding full-screens: back steps in instead of exiting the app,
@@ -1966,7 +2081,7 @@ const WalletScreen = () => {
     customAlert, showTermsModal, showBiometricPasswordPrompt, showActivationInput,
     showChangePassword, showExportSeed, showExportActivation, showAutoLockPicker,
     showLanguagePicker, showSeedConfirm, showSendScreen, showSettings,
-    showCreateOptions, importStep, activeTab,
+    showCreateOptions, importStep, activeTab, showAddTokenModal,
   ]);
 
 
@@ -2017,40 +2132,58 @@ const WalletScreen = () => {
   // loadBalance clears pendingTxRef ONLY when the queried node's balance
   // actually reflects the TX (qncBalance <= expectedQnc).
   const startTxConfirmationPolling = (txHash, expectedBalance, previousBalance) => {
-    // Clear any existing polling
+    // Clear any existing polling (clearTimeout also cancels a setInterval handle)
     if (txPollingRef.current) {
-      clearInterval(txPollingRef.current);
+      clearTimeout(txPollingRef.current);
+      txPollingRef.current = null;
     }
-    
+
     // v3.31: Use discovered nodes (not hardcoded Genesis!)
     const allNodes = walletManager.getAvailableNodes();
-    
+
     let attempts = 0;
-    const maxAttempts = 30; // 30 * 2sec = 60 sec max
-    
-    txPollingRef.current = setInterval(async () => {
+    // Self-scheduling backoff: start at 2s, grow ×1.5 up to a 15s cap, and stop
+    // at a wall-clock deadline. This avoids an endless fixed-cadence spinner and
+    // spaces out requests as confirmation takes longer, instead of a hard 60s cliff.
+    const baseDelayMs = 2000;
+    const maxDelayMs = 15000;
+    const deadline = Date.now() + 180000; // ~3 min total, then declare "still pending"
+
+    const finishStillPending = () => {
+      // Deadline reached without confirmation: don't hang the UI on an infinite
+      // spinner. Drop the optimistic hold and surface an explicit pending state.
+      pendingTxRef.current = null;
+      txPollingRef.current = null;
+      setTxResult(prev => prev?.txHash === txHash ? { ...prev, confirming: false, stillPending: true } : prev);
+      updateTxStatus(txHash, 'pending');
+      if (wallet?.publicKey) {
+        loadBalance(wallet.publicKey);
+      }
+    };
+
+    const poll = async () => {
       attempts++;
-      
+
       // Rotate through nodes on each attempt for better reliability
       const nodeIndex = (attempts - 1) % allNodes.length;
       const apiUrl = allNodes[nodeIndex];
-      
+
       try {
         // Check TX status via API
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 3000);
-        
+
         const response = await fetch(`${apiUrl}/api/v1/transaction/${txHash}`, {
           method: 'GET',
           headers: { 'Content-Type': 'application/json' },
           signal: controller.signal
         });
-        
+
         clearTimeout(timeoutId);
-        
+
         if (response.ok) {
           const txData = await response.json();
-          
+
           // v3.34: FIX — Check transaction object AND status, not tx_hash!
           // BEFORE: txData.tx_hash was ALWAYS present (even when not_found) → false positive
           // NOW: Check that transaction object exists AND status is not "not_found"
@@ -2060,47 +2193,44 @@ const WalletScreen = () => {
             // loadBalance will clear it when the queried node's balance catches up.
             // This prevents the bounce: polling confirms on Node 1, but loadBalance
             // queries Node 3 which still has old balance → stale data without protection.
-            
+
             // Stop polling (TX is confirmed, no need to keep checking)
-            clearInterval(txPollingRef.current);
             txPollingRef.current = null;
-            
+
             // Update txResult to show confirmed
-            setTxResult(prev => prev?.txHash === txHash 
+            setTxResult(prev => prev?.txHash === txHash
               ? { ...prev, confirming: false, confirmed: true }
               : prev
             );
-            
+
             // v3.30: Update TX history status
             updateTxStatus(txHash, 'confirmed');
-            
+
             // Trigger balance refresh (loadBalance will handle pendingTxRef clearing)
             if (wallet?.publicKey) {
               loadBalance(wallet.publicKey);
             }
-            
+
             // v3.35: Refresh full TX history from blockchain
             // This ensures the confirmed TX appears with correct block data
             loadTxHistory();
             return;
           }
         }
-        
-        // TX not found yet - still pending
-        if (attempts >= maxAttempts) {
-          // Timeout - TX might have failed, clear optimistic + confirming state
-          pendingTxRef.current = null;
-          clearInterval(txPollingRef.current);
-          txPollingRef.current = null;
-          setTxResult(prev => prev?.txHash === txHash ? { ...prev, confirming: false } : prev);
-          if (wallet?.publicKey) {
-            loadBalance(wallet.publicKey);
-          }
-        }
       } catch (error) {
-        // Network error - will try next node on next attempt
+        // Network error - will try next node on next reschedule
       }
-    }, 2000); // Poll every 2 seconds
+
+      // TX not found yet — reschedule with backoff until the deadline.
+      if (Date.now() >= deadline) {
+        finishStillPending();
+        return;
+      }
+      const nextDelay = Math.min(baseDelayMs * Math.pow(1.5, attempts - 1), maxDelayMs);
+      txPollingRef.current = setTimeout(poll, nextDelay);
+    };
+
+    txPollingRef.current = setTimeout(poll, baseDelayMs);
   };
   
   // Send QNC transaction (real blockchain transaction)
@@ -2112,16 +2242,28 @@ const WalletScreen = () => {
       setTxResult({ success: false, error: 'Please enter a valid amount' });
       return;
     }
-    
-    // Calculate total cost (amount + fee)
-    const totalCost = amount + QNET_TX_FEE;
-    
-    if (totalCost > sendingToken.balance) {
-      setTxResult({ 
-        success: false, 
-        error: `Insufficient balance. Need ${totalCost.toFixed(6)} ${sendingToken.symbol} (including fee).\nYour balance: ${sendingToken.balance.toFixed(6)} ${sendingToken.symbol}`
-      });
-      return;
+
+    // QRC-20 gas is paid in QNC (separate balance), NOT in the token itself — so a token send only
+    // needs `amount` of the token, while native QNC needs amount + fee. Guard each accordingly.
+    const isTokenSend = sendingToken.network === 'qnet' && !!sendingToken.contract;
+    if (isTokenSend) {
+      if (amount > sendingToken.balance) {
+        setTxResult({
+          success: false,
+          error: `Insufficient balance. Need ${amount} ${sendingToken.symbol}.\nYour balance: ${sendingToken.balance} ${sendingToken.symbol}`,
+        });
+        return;
+      }
+    } else {
+      // Calculate total cost (amount + fee) for the native asset
+      const totalCost = amount + QNET_TX_FEE;
+      if (totalCost > sendingToken.balance) {
+        setTxResult({
+          success: false,
+          error: `Insufficient balance. Need ${totalCost.toFixed(6)} ${sendingToken.symbol} (including fee).\nYour balance: ${sendingToken.balance.toFixed(6)} ${sendingToken.symbol}`,
+        });
+        return;
+      }
     }
     
     // Validate address format for QNet EON: 45 chars, 'eon' marker at the fixed offset (matches the
@@ -2141,11 +2283,49 @@ const WalletScreen = () => {
     
     setSendingTransaction(true);
     try {
+      if (isTokenSend) {
+        // QRC-20 transfer: scale the human amount by the TOKEN's decimals to u64 base units
+        // (BigInt/string math, no float), then call the byte-correct qrc20Transfer SDK. Gas is
+        // paid in QNC by the node; the token balance only drops by `amount`.
+        const decimals = sendingToken.decimals || 0;
+        const amountBaseUnits = walletManager.toBaseUnits(sendAmount, decimals); // string
+        const result = await walletManager.qrc20Transfer(
+          sendingToken.contract,
+          sendAddress,
+          amountBaseUnits,
+          password
+        );
+        // buildContractCall returns the node's { tx_hash, success, ... } (or throws on non-accept).
+        const txHash = result.tx_hash || result.txHash;
+        setTxResult({
+          success: true,
+          txHash,
+          amount,
+          to: sendAddress,
+          symbol: sendingToken.symbol,
+          confirming: true,
+        });
+        // Optimistic balance update using the TOKEN's decimals (string math): subtract the sent
+        // base units from the current base units, then merge back into the Assets list row.
+        setQrcTokens((prev) => prev.map((t) => {
+          if (t.contract !== sendingToken.contract) return t;
+          try {
+            const curBase = BigInt(walletManager.toBaseUnits(String(t.balance || '0'), decimals));
+            const sentBase = BigInt(amountBaseUnits);
+            const nextBase = curBase > sentBase ? (curBase - sentBase) : 0n;
+            return { ...t, balance: walletManager._formatBaseUnits(nextBase.toString(), decimals) };
+          } catch (_) {
+            return t;
+          }
+        }));
+        return;
+      }
+
       // Get wallet address
-      const fromAddress = sendingToken.network === 'qnet' 
+      const fromAddress = sendingToken.network === 'qnet'
         ? (wallet.qnetAddress || wallet.address)
         : (wallet.solanaAddress || wallet.address);
-      
+
       // Call WalletManager to send transaction
       const result = await walletManager.sendTransaction(
         fromAddress,
@@ -2154,13 +2334,13 @@ const WalletScreen = () => {
         sendingToken.symbol,
         password
       );
-      
+
       if (result.success) {
         const previousBalance = sendingToken.balance;
-        const expectedBalance = sendingToken.symbol === 'QNC' 
+        const expectedBalance = sendingToken.symbol === 'QNC'
           ? Math.max(0, previousBalance - amount - QNET_TX_FEE)
           : previousBalance;
-        
+
         // Show success with "confirming" status
         setTxResult({
           success: true,
@@ -2170,7 +2350,7 @@ const WalletScreen = () => {
           symbol: sendingToken.symbol,
           confirming: true // Shows "Confirming..." in UI
         });
-        
+
         // v3.29: Set pending TX state
         if (sendingToken.symbol === 'QNC') {
           pendingTxRef.current = {
@@ -2180,16 +2360,16 @@ const WalletScreen = () => {
             timestamp: Date.now(),
             status: 'pending'
           };
-          
+
           // Immediately show expected balance (optimistic update)
           setTokenBalances(prev => ({
             ...prev,
             qnc: expectedBalance
           }));
-          
+
           // v3.30: Add to TX history with pending status
           addPendingTxToHistory(result.txHash, sendAddress, amount, QNET_TX_FEE);
-          
+
           // Start polling for TX confirmation
           startTxConfirmationPolling(result.txHash, expectedBalance, previousBalance);
         }
@@ -2503,15 +2683,9 @@ const WalletScreen = () => {
         const nodeInfo = JSON.parse(nodeInfoStr);
         if (!nodeInfo.nodeId) return;
 
-        // Derive Ed25519 gossip keypair from wallet seed
-        const nacl = require('tweetnacl');
-        const secretKeyBytes = wallet.secretKey instanceof Uint8Array
-          ? wallet.secretKey
-          : new Uint8Array(wallet.secretKey);
-        const privateKeyBytes = secretKeyBytes.slice(0, 32);
-        const kp = nacl.sign.keyPair.fromSeed(privateKeyBytes);
-
-        await refreshFcmTokenOnServer(nodeInfo.nodeId, kp.secretKey);
+        // Auth is rooted in the Dilithium ping-delegation key inside
+        // refreshFcmTokenOnServer — no wallet-seed gossip keypair derivation needed.
+        await refreshFcmTokenOnServer(nodeInfo.nodeId);
       } catch (_) { /* silent — next foreground will retry */ }
     };
 
@@ -2777,6 +2951,22 @@ const WalletScreen = () => {
                 timestamp: Date.now(),
                 walletAddress: imported.qnetAddress || imported.address
               }));
+
+              // Restore-recovery: a light node's local ping identity (qnet_light_node_info + ping
+              // delegation key) lives only on the old device, so after a seed restore the phone stops
+              // attesting and the status shows a stale "ONLINE" with no way back. Re-establish it now.
+              // registerNodeWithCode is restore-safe: it re-finds the burn on Solana, regenerates the
+              // ping delegation key signed by the restored wallet key, and does NOT re-burn (unlike
+              // activateLightNode). wallet_address MUST be the QNet EON (qnetAddress) — it derives the
+              // pseudonym/node_id and is EON-format-validated server-side; the Solana publicKey is
+              // rejected. A silent failure is fine here: the badge falls to OFFLINE and the user retries.
+              if (nodeType === 'light') {
+                try {
+                  await walletManager.registerNodeWithCode(codeStr, imported.qnetAddress || imported.address, password);
+                } catch (regErr) {
+                  console.log('Light re-register on restore failed (will need manual reactivate):', regErr.message);
+                }
+              }
               } // end if (!isHashOnly && !isPending)
             }
           }
@@ -3151,10 +3341,59 @@ const WalletScreen = () => {
     });
   };
 
+  // Load QRC-20 tokens for the Assets list: the account's on-chain holdings merged with the
+  // user's persisted custom tokens (AsyncStorage 'qnet_custom_tokens'). Custom tokens not present
+  // in holdings get their balance fetched individually. Deduped by contract address (held wins for
+  // balance freshness). Runs in the SAME effect as balance loading (called from loadBalance).
+  const loadQrcTokens = async (qnetAddress) => {
+    if (!qnetAddress) return;
+    try {
+      // 1) On-chain holdings (already human-scaled by each token's decimals).
+      const holdings = await walletManager.getTokenHoldings(qnetAddress);
+      const byContract = new Map();
+      for (const h of holdings) {
+        if (h.contract) byContract.set(h.contract, { ...h });
+      }
+
+      // 2) Persisted custom tokens — merge in any not already present as a holding, and refresh
+      //    their balances (a custom token the wallet has zero of won't appear in holdings).
+      let persisted = [];
+      try {
+        const raw = await AsyncStorage.getItem('qnet_custom_tokens');
+        persisted = raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(persisted)) persisted = [];
+      } catch (_) { persisted = []; }
+      setCustomTokens(persisted);
+
+      await Promise.all(persisted.map(async (c) => {
+        const contract = c.contract_address || c.contract;
+        if (!contract) return;
+        if (byContract.has(contract)) return; // already a live holding — keep the holding row
+        const dec = Number(c.decimals) || 0;
+        const bal = await walletManager.getTokenBalanceOf(contract, qnetAddress, dec);
+        byContract.set(contract, {
+          contract,
+          name: c.name || c.symbol || 'Token',
+          symbol: c.symbol || '',
+          decimals: dec,
+          balance: bal.balance != null ? bal.balance : '0',
+        });
+      }));
+
+      setQrcTokens(Array.from(byContract.values()));
+    } catch (e) {
+      // Non-fatal: keep the last-known token list rather than flashing empty.
+      // console.warn('[QRC20] token list load failed:', e.message);
+    }
+  };
+
   const loadBalance = async (publicKey) => {
     try {
       // Get current wallet reference (might be set after initial call)
       const currentWallet = wallet || await walletManager.getCurrentWallet();
+      // Load QRC-20 token holdings in the SAME effect as balances (non-blocking).
+      const qnetAddr = currentWallet?.qnetAddress;
+      if (qnetAddr) loadQrcTokens(qnetAddr);
       
       // Load balances in parallel for better performance
       // v3.27: Use getQNCBalanceWithProof for trustless verification (TOP L1 pattern)
@@ -3765,6 +4004,10 @@ const WalletScreen = () => {
           style: 'destructive',
           onPress: async () => {
             try {
+              // Stop light-node attestation FIRST: cancels the background ping task, wipes the ping
+              // signing key, and removes qnet_light_node_info / qnet_ping_node_id / last-attest epoch.
+              // Otherwise the "deleted" device keeps attesting (and earning eligibility) for 1-2 epochs.
+              await teardownLightNode();
               await AsyncStorage.removeItem('qnet_wallet');
               await AsyncStorage.removeItem('qnet_wallet_address');
               await walletManager.disableBiometricUnlock();
@@ -4627,7 +4870,7 @@ const WalletScreen = () => {
 
         // Normal Assets View
         return (
-          <TabBox key="assets-normal" deps={[refreshing, wallet, selectedNetwork, tokenBalances, balance, tokenPrices, copiedAddress]} render={() => (
+          <TabBox key="assets-normal" deps={[refreshing, wallet, selectedNetwork, tokenBalances, balance, tokenPrices, copiedAddress, qrcTokens]} render={() => (
           <ScrollView
             style={styles.content}
             contentContainerStyle={styles.scrollContentContainer}
@@ -4741,6 +4984,48 @@ const WalletScreen = () => {
                     <Text style={styles.tokenAmount}>{tokenBalances.qnc.toFixed(5)}</Text>
                   </View>
                 </TouchableOpacity>
+
+                {/* QRC-20 tokens: on-chain holdings + persisted custom tokens (deduped by contract).
+                    Each row opens the Send screen carrying its contract address + decimals. */}
+                {qrcTokens.map((tk) => (
+                  <TouchableOpacity
+                    key={tk.contract}
+                    style={styles.tokenItemClickable}
+                    onPress={() => openSendModal(
+                      tk.symbol || tk.name || 'Token',
+                      parseFloat(tk.balance) || 0,
+                      'qnet',
+                      { contract: tk.contract, decimals: tk.decimals }
+                    )}
+                    activeOpacity={0.6}
+                  >
+                    <View style={styles.tokenInfo}>
+                      <View style={styles.tokenIcon}>
+                        <Text style={styles.tokenIconText}>
+                          {(tk.symbol || tk.name || 'T').slice(0, 1).toUpperCase()}
+                        </Text>
+                      </View>
+                      <View style={styles.tokenDetails}>
+                        <Text style={styles.tokenName}>{tk.symbol || tk.name || 'Token'}</Text>
+                        {!!tk.name && tk.name !== tk.symbol && (
+                          <Text style={styles.tokenPrice}>{tk.name}</Text>
+                        )}
+                      </View>
+                    </View>
+                    <View style={styles.tokenBalance}>
+                      <Text style={styles.tokenAmount}>{tk.balance}</Text>
+                    </View>
+                  </TouchableOpacity>
+                ))}
+
+                {/* Add-Custom-Token button */}
+                <TouchableOpacity
+                  style={styles.addTokenButton}
+                  onPress={openAddTokenModal}
+                  activeOpacity={0.6}
+                >
+                  <Text style={styles.addTokenButtonText}>+ Add token</Text>
+                </TouchableOpacity>
               </View>
             ) : (
               <View style={styles.tokenList}>
@@ -4799,82 +5084,8 @@ const WalletScreen = () => {
           )} />
         );
 
-      case 'send':
-        return (
-          <TabBox key="send" deps={[sendAddress, sendAmount, selectedToken]} render={() => (
-          <ScrollView
-            style={styles.content}
-            contentContainerStyle={styles.scrollContentContainer}
-            onScroll={handleUserActivity}
-            scrollEventThrottle={500}
-            showsVerticalScrollIndicator={true}
-            bounces={true}
-            scrollEnabled={true}
-          >
-            <Text style={styles.tabTitle}>Send Tokens</Text>
-            
-            <View style={styles.formGroup}>
-              <Text style={styles.label}>To Address</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="Enter recipient address"
-                placeholderTextColor="#888"
-                value={sendAddress}
-                onChangeText={setSendAddress}
-              />
-            </View>
-
-            <View style={styles.formGroup}>
-              <Text style={styles.label}>Amount</Text>
-              <View style={styles.amountInputGroup}>
-                <TextInput
-                  style={[styles.input, styles.amountInput]}
-                  placeholder="0.00"
-                  placeholderTextColor="#888"
-                  keyboardType="decimal-pad"
-                  value={sendAmount}
-                  onChangeText={validateAmountInput}
-                  maxLength={20}
-                />
-                <View style={styles.tokenSelector}>
-                  <TouchableOpacity 
-                    style={[styles.tokenButton, selectedToken === 'qnc' && styles.tokenButtonActive]}
-                    onPress={() => setSelectedToken('qnc')}
-                  >
-                    <Text style={[styles.tokenButtonText, selectedToken === 'qnc' && styles.tokenButtonTextActive]}>QNC</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity 
-                    style={[styles.tokenButton, selectedToken === 'sol' && styles.tokenButtonActive]}
-                    onPress={() => setSelectedToken('sol')}
-                  >
-                    <Text style={[styles.tokenButtonText, selectedToken === 'sol' && styles.tokenButtonTextActive]}>SOL</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            </View>
-
-            <View style={styles.formGroup}>
-              <Text style={styles.label}>Network Fee</Text>
-              <Text style={styles.feeText}>
-                {selectedToken === 'qnc' ? 'Free' : '~0.00025 SOL'}
-              </Text>
-            </View>
-
-            <TouchableOpacity 
-              style={styles.button}
-              onPress={() => {
-                if (!sendAddress || !sendAmount) {
-                  showAlert('Error', 'Please enter address and amount');
-                  return;
-                }
-                showAlert('Send', 'Transaction functionality coming soon');
-              }}
-            >
-              <Text style={styles.buttonText}>Send Transaction</Text>
-            </TouchableOpacity>
-          </ScrollView>
-          )} />
-        );
+      // NOTE: the legacy standalone 'send' tab was removed — sending is handled by the inline
+      // Send screen (openSendModal → handleSendTransaction), which supports native QNC and QRC-20.
 
       case 'receive':
         const currentReceiveAddress = selectedNetwork === 'qnet' 
@@ -5282,7 +5493,8 @@ const WalletScreen = () => {
                               burnTxHash: burnResult.signature,
                               burnAmount: requiredAmount,
                               phase: 1,
-                              walletAddress: walletAddress
+                              // Use the in-scope qnet wallet address; the bare identifier was undeclared here (ReferenceError on super activation).
+                              walletAddress: wallet.qnetAddress || wallet.address
                             });
                           
                             // Create result with REAL transaction signature
@@ -6146,7 +6358,7 @@ const WalletScreen = () => {
               <View style={styles.settingItem}>
                 <View style={styles.settingInfo}>
                   <Text style={styles.settingTitle}>{t('current_network')}</Text>
-                  <Text style={styles.settingSubtitle}>Solana {isTestnet ? 'Testnet' : 'Mainnet'}</Text>
+                  <Text style={styles.settingSubtitle}>QNet {isTestnet ? 'Testnet' : 'Mainnet'}</Text>
                 </View>
               </View>
             </View>
@@ -6350,6 +6562,46 @@ const WalletScreen = () => {
                 disabled={loading}
               >
                 <Text style={styles.modalButtonText}>{loading ? t('changing') : t('change')}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      )}
+
+      {/* Add Custom QRC-20 Token Modal */}
+      {showAddTokenModal && (
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalBox}>
+            <Text style={styles.modalTitle}>Add token</Text>
+            <Text style={styles.modalContent}>
+              Enter the QRC-20 contract address (64 hex characters).
+            </Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Contract address"
+              placeholderTextColor="#888"
+              value={addTokenAddress}
+              onChangeText={(txt) => { setAddTokenAddress(txt.trim()); setAddTokenError(''); }}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            {!!addTokenError && (
+              <Text style={[styles.modalContent, { color: '#ff5555' }]}>{addTokenError}</Text>
+            )}
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={[styles.modalButton, styles.modalButtonSecondary, { flex: 1 }]}
+                onPress={closeAddTokenModal}
+                disabled={addingToken}
+              >
+                <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalButton, styles.modalButtonPrimary, { flex: 1 }]}
+                onPress={handleAddCustomToken}
+                disabled={addingToken}
+              >
+                <Text style={styles.modalButtonText}>{addingToken ? 'Adding...' : 'Add'}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -7467,6 +7719,23 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: '300',
     marginLeft: 8,
+  },
+  addTokenButton: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'transparent',
+    borderRadius: 12,
+    padding: 14,
+    marginTop: 4,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.4)',
+    borderStyle: 'dashed',
+  },
+  addTokenButtonText: {
+    color: '#00d4ff',
+    fontSize: 15,
+    fontWeight: '600',
   },
   // Send Modal Styles
   sendBalanceInfo: {

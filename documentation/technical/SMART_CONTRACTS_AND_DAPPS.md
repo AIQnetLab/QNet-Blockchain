@@ -378,10 +378,10 @@ Developers can publish and monetize their contracts:
 
 ## 🚀 Why QNet for dApps?
 
-1. **Speed**: 100,000+ TPS thanks to WASM and Rust
-2. **Scalability**: Sharding and Layer 2 solutions
+1. **Speed**: ~50,000 TPS on a single shard thanks to WASM and Rust
+2. **Scalability**: Single-shard today (sharding is deferred by design and off; a future option)
 3. **Mobility**: Works on any device
-4. **Security**: Post-quantum cryptography
+4. **Security**: Post-quantum cryptography (pure ML-DSA-65 signatures)
 5. **Simplicity**: Familiar languages and tools
 6. **Community**: Active developer support
 

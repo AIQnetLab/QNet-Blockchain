@@ -1,14 +1,20 @@
 # QNet Sharding Implementation Plan
 
+> Status (2026-07): future option, OFF today. QNet runs SINGLE-shard by design —
+> a single shard already reaches ~50k TPS, and the auto-arm is gated OFF. This
+> document is a forward-looking design plan; sharding is not active on the live
+> network. Treat the config/`enabled` snippets below as illustrative future
+> settings, not current defaults.
+
 ## Overview
 
-Sharding is a critical scalability solution that will enable QNet to achieve 1M+ TPS by dividing the network state and transaction processing across multiple shards.
+Sharding is a future scalability option that would let QNet raise throughput further by dividing the network state and transaction processing across multiple shards. It is deferred by design and disabled today.
 
 ## Current Status
 
-- **Base Performance**: 100K TPS (without sharding)
-- **Target with Sharding**: 1M+ TPS
-- **Sharding Status**: ❌ Not yet implemented (planned)
+- **Base Performance**: single-shard, ~50k TPS (no sharding)
+- **Target with Sharding (future)**: higher TPS via added shards
+- **Sharding Status**: ❌ Deferred by design — single-shard today, auto-arm gated OFF
 
 ## Sharding Architecture
 
@@ -93,8 +99,9 @@ pub enum CrossShardStatus {
 
 ### Shard Configuration
 ```toml
+# Illustrative future config — sharding is deferred and OFF today (enabled = false).
 [sharding]
-enabled = true
+enabled = false
 shard_count = 16
 min_validators_per_shard = 100
 cross_shard_timeout_ms = 5000
@@ -142,8 +149,8 @@ impl StateDB {
 
 ### qnet-consensus
 ```rust
-// Shard-aware consensus
-impl CommitRevealConsensus {
+// Shard-aware consensus (Checkpoint-BFT v2)
+impl CheckpointConsensus {
     pub fn for_shard(shard_id: u32, config: ConsensusConfig) -> Self {
         // Create shard-specific consensus
     }
@@ -169,4 +176,4 @@ impl Mempool {
 
 ## Conclusion
 
-Sharding is essential for QNet to achieve web-scale performance. While not yet implemented, the architecture is designed to support sharding from the ground up. The modular Rust implementation makes adding sharding straightforward without major refactoring. 
+Sharding is a future scaling lever for QNet, not a current requirement: a single shard already serves ~50k TPS and the auto-arm is gated OFF by design. The architecture is nonetheless designed to support sharding from the ground up, and the modular Rust implementation makes adding it straightforward without major refactoring should throughput demand ever exceed the single-shard ceiling. 

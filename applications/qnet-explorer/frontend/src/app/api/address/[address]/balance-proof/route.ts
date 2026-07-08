@@ -23,6 +23,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
+import { getRateLimitKey } from '../../../../../../lib/rate-limit';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BOOTSTRAP NODES — for initial validator discovery only
@@ -246,21 +247,38 @@ function setCachedVerification(address: string, result: Record<string, unknown>)
 
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 const RATE_LIMIT_WINDOW = 60_000; // 1 minute
-const RATE_LIMIT_MAX = 10; // 10 verifications per minute per IP
+// This is a READ-ONLY balance check hit by potentially millions of light
+// wallets, and many legitimate users share a public IP behind NAT/CGNAT. Once
+// the client IP is derived correctly (per-IP, not one shared bucket), a strict
+// 10/min cap would brick an entire NAT'd network. 120/min per IP (2 req/s
+// sustained) is generous for real wallets while still capping a single abusive
+// source. The result cache (30s/address) already absorbs duplicate lookups.
+const RATE_LIMIT_MAX = 120; // 120 balance checks per minute per IP
+const MAX_RATE_LIMIT_ENTRIES = 10_000; // Cap map size — bound memory under many distinct IPs
+
+// Client-IP derivation is provided by the shared helper in lib/rate-limit.ts:
+// it parses the first hop of x-forwarded-for / x-real-ip only behind a trusted
+// proxy, and fails closed on mainnet when no IP source is configured (rather
+// than pooling every caller under one 'unknown' key). See getRateLimitKey.
 
 function checkRateLimit(ip: string): boolean {
   const now = Date.now();
   const entry = rateLimitMap.get(ip);
-  
+
   if (!entry || now > entry.resetAt) {
+    // Evict the oldest entry when full so the map cannot grow without bound.
+    if (!rateLimitMap.has(ip) && rateLimitMap.size >= MAX_RATE_LIMIT_ENTRIES) {
+      const oldest = rateLimitMap.keys().next().value;
+      if (oldest !== undefined) rateLimitMap.delete(oldest);
+    }
     rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW });
     return true;
   }
-  
+
   if (entry.count >= RATE_LIMIT_MAX) {
     return false; // Rate limited
   }
-  
+
   entry.count++;
   return true;
 }
@@ -290,15 +308,22 @@ export async function GET(
       }, { status: 400 });
     }
     
-    // Rate limiting
-    const clientIp = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() 
-      || request.headers.get('x-real-ip')
-      || 'unknown';
-    
-    if (!checkRateLimit(clientIp)) {
+    // Rate limiting. Derive the per-IP key from trusted proxy headers; on
+    // mainnet with no trusted proxy configured this fails closed (503) instead
+    // of collapsing every caller into one shared 'unknown' bucket (which would
+    // self-DoS the whole network once RATE_LIMIT_MAX requests land).
+    const ipKey = getRateLimitKey(request);
+    if (!ipKey.ok) {
       return NextResponse.json({
         success: false,
-        error: 'Rate limited. Max 10 verifications per minute.',
+        error: `Service misconfigured: ${ipKey.reason}`,
+      }, { status: 503 });
+    }
+
+    if (!checkRateLimit(ipKey.ip)) {
+      return NextResponse.json({
+        success: false,
+        error: `Rate limited. Max ${RATE_LIMIT_MAX} verifications per minute.`,
       }, { status: 429 });
     }
     

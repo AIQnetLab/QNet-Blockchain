@@ -1,17 +1,35 @@
 /// MEV Protection Integration Tests
 /// PRODUCTION: Real tests for bundle validation, reputation, gas premium, rate limiting
 use qnet_mempool::{MevProtectedMempool, TxBundle, BundleAllocationConfig, SimpleMempool, SimpleMempoolConfig};
+use qnet_state::{Transaction, TransactionType};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
-/// Helper: Create test mempool
-fn create_test_mempool() -> Arc<RwLock<SimpleMempool>> {
+/// Build a valid, serialized Transfer transaction (current schema) + its canonical hash.
+fn make_transfer_json(from: &str, gas_price: u64) -> (String, String) {
+    let mut tx = Transaction::new(
+        from.to_string(),
+        Some("dest_addr".to_string()),
+        1000,
+        0,
+        gas_price,
+        21000,
+        1_700_000_000,
+        None,
+        TransactionType::Transfer { from: from.to_string(), to: "dest_addr".to_string(), amount: 1000 },
+        None,
+    );
+    tx.hash = tx.calculate_hash();
+    (serde_json::to_string(&tx).expect("serialize tx"), tx.hash.clone())
+}
+
+/// Helper: Create test mempool. SimpleMempool is internally thread-safe, so no outer lock.
+fn create_test_mempool() -> Arc<SimpleMempool> {
     let config = SimpleMempoolConfig {
         max_size: 1000,
         min_gas_price: 100_000, // 0.0001 QNC
         max_per_sender: 10_000,
     };
-    Arc::new(RwLock::new(SimpleMempool::new(config)))
+    Arc::new(SimpleMempool::new(config))
 }
 
 /// Helper: Create test bundle
@@ -23,6 +41,7 @@ fn create_test_bundle(tx_count: usize) -> TxBundle {
     TxBundle {
         bundle_id: "test_bundle_123".to_string(),
         transactions,
+        tx_bytes: vec![],
         min_timestamp: 1700000000,
         max_timestamp: 1700000060,
         reverting_tx_hashes: vec![],
@@ -114,18 +133,11 @@ async fn test_gas_premium_validation() {
     
     let public_pool = create_test_mempool();
     
-    // Add test transactions to public mempool with gas prices
-    {
-        let pool = public_pool.write().await;
-        
-        // TX with insufficient gas (100k base, needs 120k)
-        let low_gas_tx = r#"{"gas_price": 100000}"#;
-        pool.add_raw_transaction(low_gas_tx.to_string(), "tx_low_gas".to_string(), 100_000);
-        
-        // TX with sufficient gas (120k, meets premium)
-        let high_gas_tx = r#"{"gas_price": 120000}"#;
-        pool.add_raw_transaction(high_gas_tx.to_string(), "tx_high_gas".to_string(), 120_000);
-    }
+    // Add test transactions to public mempool with gas prices (SimpleMempool is thread-safe)
+    let low_gas_tx = r#"{"gas_price": 100000}"#;
+    public_pool.add_raw_transaction(low_gas_tx.to_string(), "tx_low_gas".to_string(), 100_000);
+    let high_gas_tx = r#"{"gas_price": 120000}"#;
+    public_pool.add_raw_transaction(high_gas_tx.to_string(), "tx_high_gas".to_string(), 120_000);
     
     let config = BundleAllocationConfig::default();
     let mev_pool = MevProtectedMempool::new(public_pool, config);
@@ -268,20 +280,14 @@ async fn test_mempool_priority_integration() {
     };
     let mempool = SimpleMempool::new(config);
     
-    // Add transactions with different gas prices (using correct SHA3-256 hashes)
-    let tx_low = r#"{"from":"user1","gas_price":100000}"#;
-    let tx_medium = r#"{"from":"user2","gas_price":200000}"#;
-    let tx_high = r#"{"from":"user3","gas_price":500000}"#;
-    
-    // Calculate real SHA3-256 hashes for test data
-    use sha3::{Sha3_256, Digest};
-    let hash_low = format!("{:x}", Sha3_256::digest(tx_low.as_bytes()));
-    let hash_medium = format!("{:x}", Sha3_256::digest(tx_medium.as_bytes()));
-    let hash_high = format!("{:x}", Sha3_256::digest(tx_high.as_bytes()));
-    
-    mempool.add_raw_transaction(tx_low.to_string(), hash_low.clone(), 100_000);
-    mempool.add_raw_transaction(tx_medium.to_string(), hash_medium.clone(), 200_000);
-    mempool.add_raw_transaction(tx_high.to_string(), hash_high.clone(), 500_000);
+    // Build valid Transfer transactions (current schema) with distinct gas prices
+    let (tx_low, hash_low) = make_transfer_json("user1", 100_000);
+    let (tx_medium, hash_medium) = make_transfer_json("user2", 200_000);
+    let (tx_high, hash_high) = make_transfer_json("user3", 500_000);
+
+    mempool.add_raw_transaction(tx_low, hash_low, 100_000);
+    mempool.add_raw_transaction(tx_medium, hash_medium, 200_000);
+    mempool.add_raw_transaction(tx_high, hash_high, 500_000);
     
     // Get pending transactions (should be ordered by gas price descending)
     let pending = mempool.get_pending_transactions(10);

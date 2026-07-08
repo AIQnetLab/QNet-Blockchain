@@ -231,13 +231,7 @@ export default function TokenFaucet() {
     }
   };
 
-  // Load last claim time from localStorage on component mount
-  useState(() => {
-    const stored = localStorage.getItem('qnet_faucet_last_claim');
-    if (stored) {
-      setLastClaim(stored);
-    }
-  });
+  // Last-claim load happens in the mount effect above; no duplicate initializer needed.
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">

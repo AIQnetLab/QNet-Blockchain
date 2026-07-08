@@ -16,6 +16,7 @@ pub mod state_manager;
 pub mod errors;
 pub mod state;
 pub mod feature_gates;
+pub mod wasm_exec;         // Smart-contract WASM execution for apply (P3, GATED default-OFF)
 
 #[cfg(feature = "python")]
 mod python_bindings;
@@ -35,6 +36,8 @@ pub use state::BlockSnapshot;
 pub use state::{activate_pending_rewards_in_merkle, is_pending_rewards_in_merkle, reset_pending_rewards_in_merkle};
 // v15.10 STAGE-2: read-through fallback trait for disk-backed accounts
 pub use state::AccountStore;
+// Read-through disk-backed node store for the merkle tree (default-off seam).
+pub use state::MerkleNodeStore;
 
 #[cfg(feature = "python")]
 pub use python_bindings::*;

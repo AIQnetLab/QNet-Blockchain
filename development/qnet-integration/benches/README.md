@@ -56,7 +56,7 @@ Complete system performance testing.
 
 **Cryptography:**
 - SHA3-512 vs SHA3-256 comparison
-- Ed25519 signing performance
+- Dilithium3 (ML-DSA-65) signing performance
 - Signature verification
 
 ## 🚀 Running Benchmarks

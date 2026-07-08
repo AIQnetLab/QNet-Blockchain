@@ -54,6 +54,14 @@ pub const CHECKPOINT_INTERVAL: u64 = 30;
 /// boundary would not coincide with a checkpoint and the seal cadence would be undefined.
 const _: () = assert!(MACROBLOCK_INTERVAL % CHECKPOINT_INTERVAL == 0, "CHECKPOINT_INTERVAL must divide MACROBLOCK_INTERVAL");
 
+/// How many checkpoint indices BELOW the committed frontier the driver + engine retain before
+/// evicting per-index consensus state (proposals/votes/timeouts/qcs/heads/seal_data). Bounds the
+/// always-on consensus task's memory to O(RETAIN·committee) instead of O(chain length): everything
+/// below `committed_index` is final, the 2-chain commit rule looks back ≤2 indices, and anything
+/// pruned that a lagging node still needs is reconstructed from §4.5 macroblock sync — never a wedge.
+/// 128 ≈ ~1 h of checkpoints at the 30-block cadence, ample slack for reordering/partitions.
+pub const CONSENSUS_STATE_RETAIN: u64 = 128;
+
 /// Checkpoint-BFT view (round) timeout in ms: how long a replica waits for the leader's proposal
 /// before broadcasting a TimeoutVote toward a view change. CONSENSUS PACING — must be network-uniform;
 /// per-node values desync view-change timing and churn liveness (it is NOT a per-operator knob).
@@ -233,6 +241,17 @@ pub struct Checkpoint {
     /// node_registry — the source of cbw and attestor VRF keys — against this committed root,
     /// closing the forgeable-snapshot Sybil/fork vector.
     pub registry_root: Hash,
+    /// RESERVED QC-signed merkle root over the WASM event logs in this checkpoint's window.
+    /// Deterministically [0;32] on every node TODAY: although the contract VM is ENABLED and
+    /// contracts do emit logs (qnet_vm::emit_log), those logs are consumed off-consensus at
+    /// apply and are NOT yet threaded into the window seal — so this stays uncommitted. It is
+    /// reserved in the QC-signed hash from genesis so activation is a value change, never a
+    /// consensus wire-format migration. Activation (producer feeds `logs_merkle_root(window_logs)`,
+    /// 2f+1 certify it exactly like reward_root, giving trustless light-client event proofs)
+    /// requires the window logs to be recomputed BYTE-IDENTICALLY on the verifier side
+    /// (content_ok's WindowContent) so a producer/verifier mismatch can never reach 2f+1, plus
+    /// a live multi-node equivalence run — the same bar state_root/reward_root cleared.
+    pub logs_root: Hash,
     /// QC-signed total minted supply as of window_head_height. The apply-accumulated
     /// emission total (genesis=0, monotonic +emit_rewards). QC-signed ⇒ 2f+1 certify it ⇒
     /// a cold-joiner reads this QC-bound value instead of summing restored balances (which
@@ -265,11 +284,35 @@ impl Checkpoint {
         h.update(self.epoch_commitment);
         h.update(self.reward_root);
         h.update(self.registry_root);
+        h.update(self.logs_root);
         h.update(self.total_supply.to_le_bytes());
         h.update(self.timestamp.to_le_bytes());
         h.update(self.proposer.as_bytes());
         h.finalize().into()
     }
+}
+
+/// Merkle root over an ordered WASM-log list, domain-separated from `sig_merkle_root`.
+/// `[0;32]` for an empty window — the invariant while the contract VM is gated OFF, so
+/// every node produces the same root deterministically. The QC binds it into
+/// `Checkpoint.logs_root`; a light client verifies one log against the root + a sample.
+pub fn logs_merkle_root(logs: &[Vec<u8>]) -> Hash {
+    if logs.is_empty() { return [0u8; 32]; }
+    let mut layer: Vec<Hash> = logs.iter().map(|l| {
+        let mut h = Sha3_256::new(); h.update(b"log-leaf"); h.update(l); h.finalize().into()
+    }).collect();
+    while layer.len() > 1 {
+        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+        for pair in layer.chunks(2) {
+            let mut h = Sha3_256::new();
+            h.update(b"log-node");
+            h.update(pair[0]);
+            h.update(if pair.len() == 2 { pair[1] } else { pair[0] });
+            next.push(h.finalize().into());
+        }
+        layer = next;
+    }
+    layer[0]
 }
 
 /// Merkle root over an ordered signature list (light clients verify root + sample).
@@ -435,7 +478,7 @@ mod tests {
         let mut c = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 90,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3),
-            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let x = c.hash();
         c.proposer_sig = vec![9, 9, 9];   // sig change must NOT change hash
@@ -450,6 +493,27 @@ mod tests {
         let mut b = a.clone();
         b.reward_root = h(5);
         assert_ne!(a.hash(), b.hash());
+        // logs_root MUST be bound too: at VM activation the QC certifies the window's WASM-log
+        // root, so a checkpoint differing only in logs_root must hash differently (else a
+        // proposer-chosen log root would ride uncertified). [0;32] while gated OFF.
+        let mut la = c.clone();
+        la.logs_root = h(0);
+        let mut lb = la.clone();
+        lb.logs_root = h(7);
+        assert_ne!(la.hash(), lb.hash());
+    }
+
+    #[test]
+    fn logs_merkle_root_empty_is_zero_and_deterministic() {
+        // Gated-OFF invariant: an empty window ⇒ [0;32] on every node.
+        assert_eq!(logs_merkle_root(&[]), [0u8; 32]);
+        // Non-empty is order-sensitive + deterministic + domain-separated from sig_merkle_root.
+        let logs = vec![b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()];
+        assert_eq!(logs_merkle_root(&logs), logs_merkle_root(&logs));
+        assert_ne!(logs_merkle_root(&logs), [0u8; 32]);
+        assert_ne!(logs_merkle_root(&logs), sig_merkle_root(&logs));
+        let reordered = vec![b"bb".to_vec(), b"a".to_vec(), b"ccc".to_vec()];
+        assert_ne!(logs_merkle_root(&logs), logs_merkle_root(&reordered));
     }
 
     #[test]
@@ -460,7 +524,7 @@ mod tests {
         let c = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 90,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3),
-            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), total_supply: 1_000_000, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),total_supply: 1_000_000, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let base = c.hash();
         assert_eq!(c.hash(), base, "hash must be deterministic for fixed fields");
@@ -634,7 +698,7 @@ mod tests {
         let child = Checkpoint {
             index: 5, parent_qc: Some(parent_qc), window_head_height: 450,
             window_mb_hashes: vec![h(1)], state_root: h(2), beacon: h(3),
-            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), total_supply: 0, timestamp: 0, proposer: "n0".into(), proposer_sig: vec![],
+            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),total_supply: 0, timestamp: 0, proposer: "n0".into(), proposer_sig: vec![],
         };
         let child_qc = mk_qc(&committee, child.hash(), 5, 3);
         assert_eq!(commits_parent(&child, &child_qc), Some(4)); // C4 final
@@ -650,7 +714,7 @@ mod tests {
         let c = Checkpoint {
             index: 7, parent_qc: Some(qc.clone()), window_head_height: 630,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3), beacon: h(4),
-            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let bytes = bincode::serialize(&c).unwrap();
         let back: Checkpoint = bincode::deserialize(&bytes).unwrap();

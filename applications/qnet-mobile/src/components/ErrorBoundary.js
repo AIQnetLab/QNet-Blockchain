@@ -161,7 +161,9 @@ class ErrorBoundary extends React.Component {
               The app encountered an unexpected error. You can try to continue or clear the cache if the problem persists.
             </Text>
 
-            {this.state.error && (
+            {/* Raw error text / stack can embed file paths, inlined values and
+                secrets — only render it in dev builds, never in production UI. */}
+            {__DEV__ && this.state.error && (
               <View style={styles.errorDetails}>
                 <Text style={styles.errorTitle}>Error Details:</Text>
                 <Text style={styles.errorText}>

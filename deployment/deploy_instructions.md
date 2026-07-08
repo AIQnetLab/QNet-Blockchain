@@ -31,6 +31,11 @@ No interactive menu — all configuration via `-e` flags (identical to Genesis n
 
 Get activation data from QNet Mobile App: **Settings > Export Activation Codes**
 
+> **⚠️ Handling `QNET_WALLET_SEED` (and burn data) securely**
+> - The seed is your 12-word mnemonic — anyone who reads it controls the wallet. **Never** echo it, paste it into chat/tickets, or commit it to a file. Prefer an `--env-file` with `600` permissions, or inject it from a secrets manager, over an inline `-e` flag (inline values are visible in shell history and `docker inspect`).
+> - `QNET_WALLET_SEED`, `QNET_BURN_TX_HASH`, and `QNET_BURN_AMOUNT` are **not** trusted blindly by the node: on startup it derives the address from the seed, XOR-verifies the activation code binds to that seed, and validates the burn transaction on-chain (amount + fee-payer) via the network quorum. A forged or mismatched value fails activation — it cannot be used to impersonate another wallet.
+> - Rotate/clear these vars from the environment after the container is running; they are only needed at first activation.
+
 ---
 
 ## System Requirements

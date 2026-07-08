@@ -37,6 +37,10 @@ const HeaderComponent = () => {
   const mainNavLinks = [
     { href: '/', label: 'Home' },
     { href: getExplorerUrl(), label: 'Explorer', external: !isLocalDev },
+    // Token directory lives under the explorer. On production the explorer is a
+    // separate origin (full external URL), so only expose the relative /explorer
+    // /tokens entry in local dev where the explorer is served from this app.
+    ...(isLocalDev ? [{ href: '/explorer/tokens', label: 'Tokens' }] : []),
     { href: '/dao', label: 'DAO' },
     { href: '/testnet', label: 'Testnet' },
     { href: '/wallet', label: 'Wallet' },
@@ -48,6 +52,7 @@ const HeaderComponent = () => {
   const explorerNavLinks = [
     { href: isLocalDev ? '/' : 'https://aiqnet.io', label: 'Home', external: !isLocalDev },
     { href: '/explorer', label: 'Explorer' },
+    { href: '/explorer/tokens', label: 'Tokens' },
   ];
 
   const navLinks = isExplorerDomain ? explorerNavLinks : mainNavLinks;

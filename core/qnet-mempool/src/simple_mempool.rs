@@ -1,6 +1,6 @@
 //! Optimized mempool with binary storage support
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use std::collections::{VecDeque, BTreeMap};
@@ -48,7 +48,9 @@ pub struct SimpleMempool {
     // PROTOCOL-LEVEL: TX hashes confirmed in recent blocks (prevents re-inclusion after gossip)
     // Analogous to processed transaction signatures - standard L1 mechanism
     // Prevents race condition: TX removed from mempool by block → re-arrives via P2P → re-added
-    included_tx_hashes: Arc<DashSet<String>>,
+    // hash -> inclusion Instant. Timestamp lets us window-prune by age so a
+    // confirmed tx is only forgotten once it is provably unreachable by gossip.
+    included_tx_hashes: Arc<DashMap<String, std::time::Instant>>,
     /// Timestamp when each TX was added (for TTL eviction)
     tx_timestamps: DashMap<String, std::time::Instant>,
     /// Per-sender TX count for spam protection
@@ -105,7 +107,7 @@ impl SimpleMempool {
             transactions: Arc::new(DashMap::new()),
             by_gas_price: Arc::new(RwLock::new(BTreeMap::new())),
             use_binary,
-            included_tx_hashes: Arc::new(DashSet::new()),
+            included_tx_hashes: Arc::new(DashMap::new()),
             tx_timestamps: DashMap::new(),
             tx_count_by_sender: DashMap::new(),
             tx_sender_map: DashMap::new(),
@@ -352,7 +354,7 @@ impl SimpleMempool {
         }
 
         // PROTOCOL: Reject TX already confirmed in recent blocks (prevents post-gossip re-inclusion)
-        if self.included_tx_hashes.contains(&hash) {
+        if self.included_tx_hashes.contains_key(&hash) {
             return false;
         }
 
@@ -546,7 +548,7 @@ impl SimpleMempool {
         }
 
         // PROTOCOL: Reject TX already confirmed in recent blocks (prevents post-gossip re-inclusion)
-        if self.included_tx_hashes.contains(&hash) {
+        if self.included_tx_hashes.contains_key(&hash) {
             return false;
         }
 
@@ -968,14 +970,17 @@ impl SimpleMempool {
         // PROTOCOL: Record ALL hashes as included BEFORE removing from mempool
         // This prevents race condition: remove → gossip arrives → re-add
         for hash in hashes {
-            self.included_tx_hashes.insert(hash.clone());
+            self.included_tx_hashes.insert(hash.clone(), std::time::Instant::now());
         }
-        
+
         // Step 1: Remove from transactions map (fast O(1) per hash)
         let mut removed_count = 0;
         for hash in hashes {
             if self.transactions.remove(hash).is_some() {
                 self.tx_timestamps.remove(hash.as_str());
+                // Decrement ONLY the removed sender's counter; a wholesale reset
+                // would let a spammer refill their whole quota every block.
+                self.decrement_sender_for_hash(hash);
                 // v15.5: clear commitment dedup tables for every hash that
                 // actually existed in storage. Idempotent and O(1) per hash.
                 self.cleanup_commitment_indices_for_hash(hash);
@@ -995,8 +1000,6 @@ impl SimpleMempool {
         }
         
         if removed_count > 0 {
-            // FIX L-M16: Reset sender counts after bulk removal
-            self.reset_sender_counts();
             println!("[INFO][MEMPOOL] block_cleanup removed={} included_set={}", removed_count, self.included_tx_hashes.len());
         }
     }
@@ -1005,25 +1008,50 @@ impl SimpleMempool {
     /// Prevents re-inclusion of confirmed TXs arriving via delayed P2P gossip
     pub fn record_included_txs(&self, hashes: &[String]) {
         for hash in hashes {
-            self.included_tx_hashes.insert(hash.clone());
+            self.included_tx_hashes.insert(hash.clone(), std::time::Instant::now());
         }
     }
-    
-    /// Periodic cleanup of included_tx_hashes to prevent unbounded growth
-    /// Safe to call periodically - evicts ~50% when set exceeds threshold
-    /// ARCHITECTURE: 100K entries ≈ 100K blocks worth of TXs (at ~1 TX/block avg)
-    /// At 1 block/sec that's ~28 hours of history - more than enough for gossip delay
-    /// FIX L-M17: More aggressive cleanup -- retain ~25% to favor recent entries
-    /// Uses 2-bit mask for probabilistic retention (deterministic per hash)
+
+    /// Periodic cleanup of included_tx_hashes: finality-windowed age prune.
+    /// Forget a confirmed tx only once it is provably unreachable by gossip
+    /// (older than the finality window); entries inside the window are ALWAYS
+    /// retained regardless of count, so we never drop a still-re-addable tx.
     pub fn cleanup_included_tx_hashes(&self) {
-        const MAX_INCLUDED_SIZE: usize = 100_000;
-        let current_size = self.included_tx_hashes.len();
-        if current_size > MAX_INCLUDED_SIZE {
-            // Retain ~25% by hash prefix (2-bit mask)
-            self.included_tx_hashes.retain(|hash| {
-                hash.as_bytes().first().map(|b| b & 3 == 0).unwrap_or(false)
-            });
-            println!("[INFO][MEMPOOL] included_set_cleanup before={} after={}", current_size, self.included_tx_hashes.len());
+        // Retention window = the driver's unfinalized bound (3 checkpoint
+        // intervals) in seconds at the ~1 block/sec cadence, times a slack
+        // factor for gossip/clock skew. Beyond this a re-arriving copy cannot
+        // reach an un-applied height, so the guard is no longer needed.
+        const GOSSIP_SLACK: u64 = 4;
+        let window_secs =
+            3 * qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL * GOSSIP_SLACK;
+        let before = self.included_tx_hashes.len();
+        self.included_tx_hashes
+            .retain(|_hash, included_at| included_at.elapsed().as_secs() <= window_secs);
+        let after = self.included_tx_hashes.len();
+        if after != before {
+            println!("[INFO][MEMPOOL] included_set_cleanup before={} after={} window_secs={}", before, after, window_secs);
+        }
+
+        // Hard RAM backstop on top of the age window. The age window is the PRIMARY pruner, but under
+        // sustained adversarial block-fill the map can accrue entries faster than they age out (its
+        // size grows with TPS × window). Cap the entry COUNT so worst-case memory is bounded
+        // independent of throughput, evicting the OLDEST-by-inclusion beyond the cap. A dropped
+        // still-in-window entry only risks a re-inclusion ATTEMPT of an already-confirmed tx, which is
+        // then rejected deterministically by the nonce/idempotency check at apply — never a safety
+        // issue. Sized to cover several full microblocks at the design ceiling while bounding RAM.
+        const MAX_INCLUDED_TX_HASHES: usize = 2_000_000;
+        if after > MAX_INCLUDED_TX_HASHES {
+            let mut by_age: Vec<(String, std::time::Instant)> = self
+                .included_tx_hashes
+                .iter()
+                .map(|e| (e.key().clone(), *e.value()))
+                .collect();
+            by_age.sort_by_key(|(_, t)| *t); // oldest first
+            let evict = after - MAX_INCLUDED_TX_HASHES;
+            for (hash, _) in by_age.into_iter().take(evict) {
+                self.included_tx_hashes.remove(&hash);
+            }
+            println!("[INFO][MEMPOOL] included_set_cap_evict evicted={} cap={}", evict, MAX_INCLUDED_TX_HASHES);
         }
     }
     
@@ -1091,6 +1119,9 @@ impl SimpleMempool {
             // incorrectly block re-submission of expired (never-confirmed) TXs.
             for hash in &expired_hashes {
                 self.transactions.remove(hash);
+                // Release this sender's quota slot for the one expired tx only;
+                // a wholesale reset would hand a spammer a free per-block refill.
+                self.decrement_sender_for_hash(hash);
                 // v15.5: TTL eviction must release the dedup-index slot too,
                 // otherwise an expired commitment would block a fresh
                 // submission for the same `(identity, epoch_or_index)` until
@@ -1105,10 +1136,6 @@ impl SimpleMempool {
             }
             priority_queue.retain(|_, hashes| !hashes.is_empty());
             drop(priority_queue);
-
-            // FIX L-M16: Reset sender counts after bulk removal to stay accurate
-            // Without per-TX sender tracking, a full reset is the safest approach
-            self.reset_sender_counts();
 
             // v15.9: persistent mempool — mirror TTL evictions to RocksDB
             // AFTER the priority-queue lock is released. Without this the
@@ -1135,10 +1162,15 @@ impl SimpleMempool {
         self.add_binary_transaction(tx_bytes, hash, gas_price)
     }
 
-    /// Reset per-sender counts (call periodically, e.g., every block)
-    pub fn reset_sender_counts(&self) {
-        self.tx_count_by_sender.clear();
-        self.tx_sender_map.clear();
+    /// Release one anti-spam quota slot for a removed tx: drop its hash→sender
+    /// entry and decrement that sender's live count. O(1); bounded per removal,
+    /// so per-sender quota can never be reset wholesale by a spammer.
+    fn decrement_sender_for_hash(&self, hash: &str) {
+        if let Some((_, sender)) = self.tx_sender_map.remove(hash) {
+            if let Some(mut count) = self.tx_count_by_sender.get_mut(&sender) {
+                *count = count.saturating_sub(1);
+            }
+        }
     }
 
     /// v2.67: Debug method to check mempool consistency

@@ -70,13 +70,21 @@ stop_existing() {
 # Deploy container
 deploy_container() {
     log_info "Deploying production container..."
-    
+
+    # JWT_SECRET must be provisioned out-of-band (secrets manager / CI secret) and
+    # kept stable across deploys. Minting a fresh one per restart silently invalidates
+    # every issued token and leaves no rotation/audit trail, so fail closed instead.
+    if [ -z "$JWT_SECRET" ]; then
+        log_error "JWT_SECRET is not set. Provision it from your secrets manager and export it before deploying."
+        exit 1
+    fi
+
     docker run -d \
         --name $CONTAINER_NAME \
         --restart unless-stopped \
         -p $PORT:8080 \
         -e ENVIRONMENT=production \
-        -e JWT_SECRET=${JWT_SECRET:-$(openssl rand -hex 32)} \
+        -e JWT_SECRET="$JWT_SECRET" \
         -e CORS_ORIGINS="https://wallet.qnet.io,https://aiqnet.io" \
         --memory="1g" \
         --cpus="2" \
@@ -176,9 +184,16 @@ setup_ssl() {
         apt-get install -y certbot python3-certbot-nginx
     fi
     
+    # Fail loudly if DNS does not yet resolve to this host: certbot --non-interactive
+    # would otherwise fail the challenge and leave the self-signed cert silently in place.
+    if ! host "$DOMAIN" > /dev/null 2>&1 && ! nslookup "$DOMAIN" > /dev/null 2>&1; then
+        log_error "DNS for $DOMAIN does not resolve yet. Point it at this server and re-run before issuing SSL."
+        exit 1
+    fi
+
     # Generate certificate
     certbot --nginx -d $DOMAIN --non-interactive --agree-tos --email admin@qnet.io
-    
+
     log_info "✅ SSL certificate configured"
 }
 

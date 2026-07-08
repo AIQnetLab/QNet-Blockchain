@@ -1,12 +1,35 @@
 'use client';
 
 import type React from 'react';
-import { useState } from 'react';
+import { useState, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import { Search, Loader2 } from 'lucide-react';
 import { Input } from '../ui/input';
 import { Button } from '../ui/button';
 import { qnetAPI } from '@/lib/api';
 import type { SearchResult } from '@/lib/types';
+
+// Map a search result to the explorer URL it should open. Blocks/txs/addresses
+// key off `hash`/`id`; token & contract results open the token detail page.
+function resultHref(result: SearchResult): string {
+  const key = result.id || result.hash;
+  switch (result.type) {
+    case 'block':
+      return `/explorer/block/${key}`;
+    case 'transaction':
+      return `/explorer/tx/${key}`;
+    case 'address':
+      return `/explorer/address/${key}`;
+    case 'token':
+    case 'contract':
+      return `/explorer/token/${key}`;
+    case 'node':
+      // Nodes are identified by their operator address on this explorer.
+      return `/explorer/address/${key}`;
+    default:
+      return `/explorer/address/${key}`;
+  }
+}
 
 interface SearchBarProps {
   onSearchResults?: (results: SearchResult[]) => void;
@@ -19,9 +42,12 @@ export default function SearchBar({
   placeholder = "Search blocks, transactions, or addresses...",
   className = "" 
 }: SearchBarProps) {
+  const router = useRouter();
   const [query, setQuery] = useState('');
   const [isSearching, setIsSearching] = useState(false);
   const [results, setResults] = useState<SearchResult[]>([]);
+  // Per-instance debounce timer so multiple SearchBars don't clobber each other.
+  const searchTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleSearch = async (searchQuery: string) => {
     if (!searchQuery.trim()) {
@@ -53,22 +79,22 @@ export default function SearchBar({
     setQuery(value);
     
     // Debounced search for better UX
-    clearTimeout((window as any).searchTimeout);
-    (window as any).searchTimeout = setTimeout(() => {
+    if (searchTimeout.current) clearTimeout(searchTimeout.current);
+    searchTimeout.current = setTimeout(() => {
       handleSearch(value);
     }, 500);
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') {
-      clearTimeout((window as any).searchTimeout);
+      if (searchTimeout.current) clearTimeout(searchTimeout.current);
       handleSearch(query);
     }
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    clearTimeout((window as any).searchTimeout);
+    if (searchTimeout.current) clearTimeout(searchTimeout.current);
     handleSearch(query);
   };
 
@@ -107,11 +133,13 @@ export default function SearchBar({
         <div className="absolute top-full left-0 right-0 mt-2 quantum-card border border-purple-500/30 rounded-lg overflow-hidden z-50">
           <div className="max-h-96 overflow-y-auto">
             {results.map((result, index) => (
-              <SearchResultItem 
-                key={index} 
+              <SearchResultItem
+                key={index}
                 result={result}
                 onClick={() => {
-                  // Handle result click navigation
+                  // Navigate to the correct explorer page for this result type,
+                  // then clear the dropdown.
+                  router.push(resultHref(result));
                   setResults([]);
                   setQuery('');
                 }}
@@ -146,6 +174,11 @@ function SearchResultItem({ result, onClick }: SearchResultItemProps) {
         return '💸';
       case 'address':
         return '👤';
+      case 'node':
+        return '🖥️';
+      case 'token':
+      case 'contract':
+        return '🪙';
       default:
         return '🔍';
     }
@@ -154,11 +187,17 @@ function SearchResultItem({ result, onClick }: SearchResultItemProps) {
   const getResultTitle = () => {
     switch (result.type) {
       case 'block':
-        return `Block #${(result.data as any).index}`;
+        return `Block #${(result.data as any)?.index ?? ''}`.trim();
       case 'transaction':
         return `Transaction`;
       case 'address':
         return `Address`;
+      case 'node':
+        return `Node`;
+      case 'token':
+        return result.display || 'Token';
+      case 'contract':
+        return result.display || 'Contract';
       default:
         return 'Result';
     }

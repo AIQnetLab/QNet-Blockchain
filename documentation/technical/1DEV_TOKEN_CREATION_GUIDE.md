@@ -19,7 +19,7 @@ This guide explains how to create the 1DEV meme token on Solana and test the QNe
 - **Microblock interval**: 1 second (optimized for high-frequency consensus)
 - **Decreasing price**: 10% reduction per 10% burned supply
 - **Transition**: After 90% burned OR 5 years → QNC activation model (DYNAMIC PRICING: 2.5k-30k QNC)
-- **Security**: Hybrid Dilithium2 + Ed25519 signatures with rate limiting
+- **Security**: pure ML-DSA-65 (Dilithium3) signatures on QNet with rate limiting (the 1DEV burn itself is a Solana-native Ed25519 SPL transfer)
 - **Purpose**: Sybil resistance and network bootstrapping
 
 ## 🛠️ Token Creation Steps

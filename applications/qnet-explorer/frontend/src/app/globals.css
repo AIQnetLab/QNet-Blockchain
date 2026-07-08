@@ -2446,9 +2446,23 @@ a[href*="play.google.com"] img {
   color: #80c0ff;
 }
 
-.type-badge.type-contract {
+.type-badge.type-contract,
+.type-badge.type-contract-call {
   background: rgba(240,130,130,0.15);
   color: #f09090;
+}
+
+/* ContractCall(transfer/transferFrom) is surfaced as "Token Transfer" — share
+   the cyan transfer accent so it reads as a value move, not a raw contract call. */
+.type-badge.type-token-transfer {
+  background: rgba(0,220,240,0.15);
+  color: #00e5f0;
+}
+
+/* ContractDeploy is surfaced as "Deploy" — a distinct amber accent. */
+.type-badge.type-deploy {
+  background: rgba(240,170,60,0.15);
+  color: #f0b040;
 }
 
 .type-badge.type-system {
@@ -2673,6 +2687,43 @@ a[href*="play.google.com"] img {
   color: #8b9caa;
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.85rem;
+}
+
+/* Token detail / directory */
+.token-row-expanded .token-name {
+  color: #6b7c8a;
+  font-size: 0.8rem;
+  margin-left: 0.5rem;
+  font-weight: 400;
+}
+
+.token-lookup-input {
+  flex: 1;
+  min-width: 0;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(0, 200, 220, 0.2);
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  color: #cfe0ea;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  margin-right: 0.75rem;
+}
+
+.token-lookup-input:focus {
+  outline: none;
+  border-color: rgba(0, 200, 220, 0.5);
+}
+
+.token-directory-note {
+  margin-top: 1rem;
+  color: #6b7c8a;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.text-error {
+  color: #ff6b6b;
 }
 
 /* Transaction direction */

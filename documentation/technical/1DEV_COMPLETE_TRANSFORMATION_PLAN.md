@@ -1,5 +1,12 @@
 # $1DEV Complete Project Transformation Plan
 
+> Status (2026-07): historical roadmap — superseded. Many items below were later delivered
+> and their details have since changed. For current reality note that: QNet signatures are
+> pure ML-DSA-65 (Dilithium3) with X25519Kyber768 hybrid TLS key exchange; node participation
+> is proof-of-burn (burn 1DEV on Solana), never staking; QRC-20/QRC-721 tokens and the wasmi
+> WASM smart-contract VM are built and enabled; DAO/governance is not yet wired. See the
+> current technical docs for authoritative specifications.
+
 ## 🎯 NEW TOKEN MECHANICS OVERVIEW
 
 ### **Three-Layer Token System:**

@@ -24,8 +24,8 @@
 QNet is an experimental post-quantum blockchain created to prove: **one person-operator without technical knowledge, multi-million investments, and funds is capable of building an advanced blockchain**.
 
 Experimental achievements:
-- ✅ **Post-quantum cryptography**: CRYSTALS-Dilithium3 (NIST FIPS 204) + Ed25519 hybrid  
-- ✅ **NIST/Cisco Compliant**: Ephemeral Ed25519 keys per message + Dilithium key binding
+- ✅ **Post-quantum cryptography**: pure ML-DSA-65 / CRYSTALS-Dilithium3 (NIST FIPS 204) for all signatures  
+- ✅ **NIST/Cisco Compliant**: ML-DSA-65 signs message hash + timestamp (Ed25519 removed)
 - ✅ **Compact Signatures v2.23**: ~2.6KB RAW bytes (88% reduction) with certificate caching
 - ✅ **Progressive Finalization Protocol**: Self-healing consensus recovery (80% → 1% degradation)
 - ✅ **424,411 TPS**: Proven performance in tests
@@ -41,7 +41,7 @@ Experimental achievements:
 - ✅ **Consensus Deduplication v2.49.1**: ACTIVE_CONSENSUS_MB prevents 60→1 duplicate tasks
 - ✅ **Idempotent Rounds v2.49.1**: Preserves commits/reveals if round already active
 - ✅ **700x Faster Consensus v2.49.1**: 7107s→3-10s per MacroBlock
-- ✅ **Batch Ed25519 Verification (v2.25.2)**: 3x faster signature verification using batch API
+- ✅ **Batch Signature Verification (v2.25.2)**: 3x faster ML-DSA-65 signature verification using batch API
 - ✅ **Batch Mempool (v2.25.2)**: 1 lock per 1000 TX (1000x reduction in lock contention)
 - ✅ **TX Accumulator (v2.25.2)**: Batch 1000 TX for verification with 100ms timeout
 - ✅ **Skip Self-Broadcast (v2.25.2)**: Producer doesn't re-broadcast own TX
@@ -63,7 +63,7 @@ Experimental achievements:
 - ✅ **Reveal Loss Prevention (v2.48.0)**: Participant nodes don't reset consensus engine mid-round
 - ✅ **Dynamic Height Threshold (v2.48.0)**: 5/10/20 blocks based on network size (scalable resync)
 - ✅ **Stage Pipeline (v2.57.0)**: Isolated runtime for each processing stage
-- ✅ **SIGVERIFY_RUNTIME (v2.57.0)**: Dedicated threads for Ed25519/Dilithium verification
+- ✅ **SIGVERIFY_RUNTIME (v2.57.0)**: Dedicated threads for ML-DSA-65 (Dilithium3) verification
 - ✅ **BANKING_RUNTIME (v2.57.0)**: Dedicated threads for transaction intake and mempool
 - ✅ **REPLAY_RUNTIME (v2.57.0)**: Dedicated threads for state machine execution
 - ✅ **BROADCAST_RUNTIME (v2.57.0)**: Dedicated threads for Shred protocol propagation
@@ -110,9 +110,9 @@ The experimental QNet blockchain has achieved the following metrics:
 
 - **Maximum performance**: 424,411 TPS (confirmed by tests)
 - **Microblock time**: 1 second (instant transactions)
-- **Macroblock time**: 90 seconds (Byzantine consensus)
+- **Macroblock cadence**: every 90 microblocks (epoch / emission boundary)
 - **Transaction confirmation**: 1-2 seconds (user sees confirmation)
-- **Full finality**: 90 seconds (macroblock consensus)
+- **Full finality**: ~60 seconds (Checkpoint-BFT v2, two-chain commit)
 - **Fast Finality Indicators**: 5-level confirmation system for exchanges and bridges
 - **Mobile performance**: 8,859 TPS (on-device)
 - **Mobile optimization**: <0.01% battery consumption
@@ -123,8 +123,8 @@ These characteristics make QNet suitable for mass mobile usage with exchange-gra
 
 QNet presents an experimental blockchain platform with unique characteristics:
 
-1. **Post-quantum cryptography**: CRYSTALS-Dilithium3 (NIST FIPS 204) + Ephemeral Ed25519 (per message)
-2. **NIST/Cisco Compliant**: Dilithium signs ephemeral key binding + message hash (forward secrecy)
+1. **Post-quantum cryptography**: pure ML-DSA-65 / CRYSTALS-Dilithium3 (NIST FIPS 204) for all signatures
+2. **NIST/Cisco Compliant**: ML-DSA-65 signs message hash + timestamp (Ed25519 removed)
 3. **Compact signatures v2.23**: 88% bandwidth reduction (~2.6KB RAW bytes) via certificate caching
 3. **Progressive Finalization Protocol**: Self-healing consensus with zero-downtime
 4. **High performance**: 424,411+ TPS achieved in experiments
@@ -155,7 +155,8 @@ QNet presents an experimental blockchain platform with unique characteristics:
 │       Microblocks (1s) + Macroblocks                │
 ├─────────────────────────────────────────────────────┤
 │           Cryptography Layer                        │
-│  CRYSTALS-Dilithium3 + Ephemeral Ed25519 (NIST)     │
+│  ML-DSA-65 / CRYSTALS-Dilithium3 signatures (NIST)  │
+│  TLS key exchange: X25519Kyber768 (ML-KEM-768)      │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -456,63 +457,59 @@ MicroBlock {
    - 128-bit post-quantum security
    - NIST FIPS 202 standard
 
-### 4.2 Hybrid Implementation (NIST/Cisco Encapsulated Keys)
+### 4.2 Pure ML-DSA-65 Signature Implementation
 
-**QNet implements NIST/Cisco recommended encapsulated key approach:**
+**QNet signs every message with pure ML-DSA-65 (CRYSTALS-Dilithium3) — the Ed25519 layer has been removed:**
 
 ```rust
-// CRITICAL: NEW ephemeral Ed25519 key for EVERY message (v2.23 RAW bytes)
+// Every message carries a single ML-DSA-65 (Dilithium3) signature (v2.24 RAW bytes)
 struct HybridSignature {
     certificate: HybridCertificate {
         node_id: String,
-        ed25519_public_key: [u8; 32],           // RAW bytes
         dilithium_public_key: Vec<u8>,          // RAW bytes (~1952 bytes)
-        dilithium_signature_of_ed25519: Vec<u8>,// RAW bytes (certificate binding)
         issued_at: u64,
         expires_at: u64,                         // 4.5 minute lifetime (270s)
         serial_number: String,
     },
-    ephemeral_public_key: [u8; 32],             // NEW Ed25519 key RAW
-    message_signature: [u8; 64],                // Ed25519 signs message RAW
     dilithium_key_signature: Vec<u8>,           // RAW bytes (~2500 bytes)
     signed_at: u64,
 }
 
-// Signing Process (v2.23):
-// 1. Generate NEW ephemeral Ed25519 key
-// 2. Sign message with ephemeral key → message_signature
-// 3. Create encapsulated_data = ephemeral_pk || message_hash || timestamp
-// 4. Sign encapsulated_data with Dilithium → dilithium_key_signature (SINGLE sig!)
-// 5. Certificate expires in 270 seconds (4.5 minutes)
+// Signing Process (pure ML-DSA-65):
+// 1. Build preimage = message_hash || timestamp
+// 2. Sign preimage with Dilithium → dilithium_key_signature (SINGLE sig!)
+// 3. Certificate (Dilithium public key) expires in 270 seconds (4.5 minutes)
 
 // Verification Process (Defense-in-Depth):
 // P2P Layer (node.rs):
 // 1. Check certificate expiration
-// 2. Verify Ed25519 signature with ephemeral key
-// 3. Recreate encapsulated_data
-// 4. Verify Dilithium via dilithium3::open() ✅ REAL CRYPTO
+// 2. Reconstruct preimage = message_hash || timestamp
+// 3. Verify Dilithium via dilithium3::open() ✅ REAL CRYPTO
 //
 // Consensus Layer (consensus_crypto.rs):
-// 1. Parse RAW bytes from JSON
-// 2. Reconstruct encapsulated_data
+// 1. Parse RAW bytes
+// 2. Reconstruct preimage
 // 3. Real Dilithium3 verification via dilithium3::open() ✅
 // 4. Byzantine consensus (2/3+ honest nodes)
 ```
 
 **Key Features:**
-1. **Ephemeral Keys**: NEW Ed25519 key for each certificate (4.5-minute rotation = 270s)
-2. **Encapsulation**: Dilithium signs (ephemeral_key + message_hash), not message
+1. **Single Signature**: One ML-DSA-65 signature per message (no dual/Ed25519 signature)
+2. **Preimage Binding**: Dilithium signs (message_hash + timestamp)
 3. **Certificate Caching**: LRU cache (100K) for certificate verification only
 4. **Quantum Security**: 10^15 years attack time (NIST Security Level 3)
-5. **Forward Secrecy**: Keys expire in 270 seconds (4.5 minutes, 80% rotation)
-6. **NIST Compliant**: Follows Cisco/NIST post-quantum recommendations
+5. **Certificate Rotation**: Certificates expire in 270 seconds (4.5 minutes, 80% rotation)
+6. **NIST Compliant**: FIPS 204 (ML-DSA-65) post-quantum signatures
 
 **Security Advantages:**
-- ✅ Full quantum protection (Dilithium protects every message's key)
-- ✅ Fast Ed25519 for actual message signing
-- ✅ No single-point-of-failure (ephemeral keys)
+- ✅ Full quantum protection (Dilithium protects every message — no classical fallback)
+- ✅ No single-point-of-failure
 - ✅ Byzantine-safe (no caching vulnerabilities)
-- ✅ Forward secrecy (old keys can't decrypt new messages)
+- ✅ Uniform post-quantum guarantee across transactions, consensus, identity and P2P gossip
+
+> **Note on the "hybrid" transport:** QNet is still hybrid at the TLS layer — QUIC/TLS 1.3
+> uses the X25519Kyber768 (ML-KEM-768, FIPS 203) hybrid **key exchange**. That hybrid applies
+> to transport key exchange only, NOT to signatures.
 
 ### 4.3 Key Management (v2.19.11 Security Update)
 
@@ -551,37 +548,35 @@ let signature = dilithium3::sign(data, &sk);  // 2420 bytes
 
 | Component | Algorithm | Size | Security Level | Implementation |
 |-----------|-----------|------|----------------|----------------|
-| **Consensus Signatures** | CRYSTALS-Dilithium3 | 2420 bytes | NIST Level 3 | Real pqcrypto-dilithium |
-| **Hybrid Certificates** | Dilithium + Ed25519 | 2484 bytes | Quantum-resistant | Encapsulated keys (NIST) |
+| **Consensus Signatures** | ML-DSA-65 / CRYSTALS-Dilithium3 | 2420 bytes | NIST Level 3 | Real pqcrypto-dilithium |
+| **Certificates** | ML-DSA-65 public key | 1952 bytes | Quantum-resistant | Dilithium-only (NIST) |
 | **Key Storage** | Dilithium3 keypair | ~6KB encrypted | AES-256-GCM | Random encryption key |
 | **Encryption Key** | Random 32 bytes | 40 bytes file | SHA3-256 integrity | NOT derived from node_id |
-| **Message Signing** | Ed25519 (ephemeral) | 64 bytes | Fast verification | 4.5-minute lifetime |
-| **Heartbeat Signatures** | HYBRID (v2.23+) | ~2.6KB RAW | Quantum-resistant | Ed25519 + Dilithium |
+| **Message Signing** | ML-DSA-65 / Dilithium3 | 2420 bytes | Post-quantum | Certificate 4.5-min lifetime |
+| **Heartbeat Signatures** | ML-DSA-65 (v2.24+) | ~2.6KB RAW | Quantum-resistant | Pure Dilithium |
+| **TLS Key Exchange** | X25519Kyber768 (ML-KEM-768) | — | Hybrid PQ KEX | rustls + aws-lc-rs |
 | **Hashing** | SHA3-256 | 32 bytes | Grover-resistant | All operations |
 
 **Cryptographic Architecture:**
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  CONSENSUS MESSAGE SIGNING (Per NIST/Cisco)             │
+│  CONSENSUS MESSAGE SIGNING (pure ML-DSA-65)             │
 ├─────────────────────────────────────────────────────────┤
-│  1. Generate ephemeral Ed25519 key                      │
-│  2. Sign message with ephemeral Ed25519                 │
-│  3. Create encapsulated data:                           │
-│     - Ephemeral public key (32 bytes)                   │
-│     - Node ID (variable length)                         │
+│  1. Build preimage:                                     │
+│     - Message hash (32 bytes)                           │
 │     - Timestamp (8 bytes)                               │
-│  4. Sign encapsulated data with Dilithium               │
-│  5. Create certificate (expires in 270 seconds)         │
+│  2. Sign preimage with ML-DSA-65 (Dilithium3)           │
+│  3. Attach certificate (Dilithium public key,           │
+│     expires in 270 seconds)                             │
 ├─────────────────────────────────────────────────────────┤
 │  VERIFICATION (Certificate Caching OK)                  │
 ├─────────────────────────────────────────────────────────┤
 │  1. Check certificate NOT expired                       │
-│  2. Verify Dilithium signature on encapsulated data     │
-│     (cached after first verification - O(1) lookup)     │
-│  3. Verify Ed25519 signature on message (EVERY time)    │
-│  4. Verify Dilithium message signature (EVERY time)     │
-│  5. ALL signatures must pass for quantum resistance     │
+│  2. Reconstruct preimage (message hash + timestamp)     │
+│  3. Verify Dilithium signature (EVERY time)             │
+│     (certificate cached after first verification)       │
+│  4. Signature must pass for quantum resistance          │
 └─────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────┐
@@ -605,11 +600,11 @@ let signature = dilithium3::sign(data, &sk);  // 2420 bytes
 - ✅ **Real Dilithium3**: Uses `pqcrypto_dilithium::dilithium3` (NIST FIPS 204)
 - ✅ **Random Encryption**: Key NOT derived from public identifiers
 - ✅ **Tamper Detection**: SHA3-256 integrity hash on encryption secret
-- ✅ **Forward secrecy**: Ephemeral keys expire in 4.5 minutes
+- ✅ **Certificate Rotation**: Dilithium certificates expire in 4.5 minutes
 - ✅ **Byzantine-safe**: No O(1) caching vulnerabilities
-- ✅ **NIST compliant**: FIPS 204 (Dilithium) + FIPS 197 (AES-GCM)
+- ✅ **NIST compliant**: FIPS 204 (ML-DSA-65) + FIPS 197 (AES-GCM) + FIPS 203 (ML-KEM-768 TLS KEX)
 
-**Unique feature**: QNet is the **first blockchain** to implement NIST/Cisco encapsulated keys for quantum-resistant hybrid signatures with per-message ephemeral key rotation
+**Unique feature**: QNet is post-quantum end to end — pure ML-DSA-65 signatures for transactions, consensus, node identity and P2P gossip, plus ML-KEM-768 (X25519Kyber768) hybrid key exchange for transport.
 
 ---
 
@@ -628,12 +623,11 @@ let signature = dilithium3::sign(data, &sk);  // 2420 bytes
    - **Selection method**: SHA3-256 hash with entropy from previous round
    - **Rewards**: +1 reputation per block produced
 
-2. **Macroblocks** (every 90 seconds):
+2. **Macroblocks** (every 90 microblocks):
    - Aggregate 90 microblocks  
-   - Byzantine consensus with up to 1000 validators
-   - Active listener on all Full/Super nodes (1-second polling)
-   - Consensus window: blocks 61-90 (30-block early start)
-   - State finalization
+   - Checkpoint-BFT v2: VRF-sampled committee (≤100 of up to 1000 eligible)
+   - One 2f+1 quorum certificate (QC) per window seals the macroblock
+   - State finalization (epoch transition + emission); ~60s to irreversibility (two-chain commit)
    - Size: ~50-100 KB
    - **Consensus leader**: +10 reputation
    - **Participants**: +5 reputation each
@@ -868,11 +862,15 @@ MAX_MESSAGE_SIZE: 10 MB       // Supports full macroblocks (~3MB)
 
 ### 6.5 Reputation System
 
-**Deterministic Blockchain-Based Reputation (v2.24):**
+**Deterministic Blockchain-Based Reputation:**
 
-> **ARCHITECTURE v2.24:** Reputation computed from blockchain data + FULL snapshots in macroblocks.
-> All nodes have IDENTICAL reputation state after every macroblock - 100% synchronized.
-> See [docs/REPUTATION_SYSTEM.md](docs/REPUTATION_SYSTEM.md) for full documentation.
+> **Status (2026-07): binary consensus reputation.** Live consensus reputation is now
+> BINARY — a node is either eligible (70) or not (0). The graduated scores, progressive
+> jail ladder, passive decay/recovery, and tiered reward/penalty tables described below are
+> LEGACY and no longer active; they are retained here only for historical context. The
+> current rule: reputation ≥ 70 ⇒ consensus-eligible and reward-eligible; reputation 0 ⇒
+> excluded. Reputation is still computed deterministically from on-chain data so all nodes
+> agree.
 
 ```rust
 /// FULL reputation snapshot stored in every macroblock (v2.24)
@@ -901,7 +899,7 @@ pub struct FullReputationSnapshot {
 ```
 REWARDS (from blockchain data):
   ├── Full Rotation: +2.0 (ONLY if 30/30 blocks! Partial = NO reward!)
-  ├── Consensus Participation: +1.0 (macroblock commit+reveal)
+  ├── Consensus Participation: +1.0 (macroblock checkpoint QC signature)
   └── Passive Recovery: +1.0/4h (online nodes with rep 10-69%)
 
 PENALTIES (SlashingEvent - cryptographic proof REQUIRED):
@@ -931,7 +929,7 @@ PROGRESSIVE JAIL (6 chances, stored in snapshot):
 After 2 macroblocks with 2/3+ validator signatures = FINAL
 ├── Prevents long-range attacks
 ├── Cannot rewrite finalized history
-└── ~3 minutes to finality (2 × 90 seconds)
+└── ~60 seconds to finality (Checkpoint-BFT v2, two-chain; a macroblock every 90 microblocks)
 ```
 
 **Ping/Heartbeat-based participation (every 4 hours) - v2.19.4:**
@@ -945,7 +943,7 @@ Response requirements:
 Architecture (v3.18+):
 ├── Light: 5 Genesis nodes ping mobile Light nodes (FCM V1 / UnifiedPush / Polling)
 │           → Light signs challenge with Dilithium3 ping-delegation key
-│           → pinger creates HYBRID Ed25519+Dilithium3 attestation
+│           → pinger creates Dilithium3 (ML-DSA-65) attestation
 ├── Super/Genesis: liveness proven by UNFORGEABLE on-chain Heartbeat TXs
 │           (~10 tiny Dilithium-signed TXs per 4h epoch, one per ~1440-block subwindow)
 ├── Linear sharding: each of 5 Genesis pings 20% of Light registry (sorted by node_id)
@@ -1037,7 +1035,7 @@ OPTIMIZATIONS (v2.19.20):
 ├── Adaptive Buffer: Full/Super 500 blocks (~50MB) - Light nodes: thin client (no buffer)
 ├── Kademlia K-neighbors: Heartbeats use DHT distance for efficient routing
 ├── Shred Protocol ALWAYS: Block propagation uses Shred Protocol for ALL network sizes
-├── Heartbeat with HYBRID (v2.23): Full quantum protection (Ed25519 + Dilithium per message)
+├── Heartbeat with pure ML-DSA-65 (v2.24): Full quantum protection (Dilithium per message)
 └── Priority channels: Blocks/Consensus use separate channels (implicit priority)
 
 BYZANTINE SAFETY:
@@ -1531,7 +1529,7 @@ Restoration Features:
 NOT MINING - Simple Network Health Check:
 ├── Frequency: 1+ per 4-hour window (network pings Light nodes)
 ├── Response Window: 3 minutes (grace period)
-├── Computation: Ed25519 signature (~20μs)
+├── Computation: Dilithium3 (ML-DSA-65) signature (~2ms)
 ├── Battery Impact: <0.5% daily
 ├── Data Usage: <1MB daily
 └── CPU Usage: Negligible (like push notifications)
@@ -1549,7 +1547,7 @@ NOT MINING - Simple Network Health Check:
 Light Node Attestation Structure:
 ├── light_node_id: String
 ├── pinger_node_id: String  
-├── light_node_signature: Ed25519 (64 bytes) - Light node signs challenge
+├── light_node_signature: Dilithium3 (~2420 bytes) - Light node signs challenge (ping-delegation key)
 ├── pinger_dilithium_signature: Dilithium (2420 bytes) - Pinger attests
 └── timestamp: u64
 ```
@@ -1633,37 +1631,33 @@ Priority Multipliers:
 ├── Fast: 2.0x (priority processing)
 └── Priority: 3.0x (immediate processing)
 
-Quantum Transaction Premium (v2.25):
-├── Standard TX: Ed25519 only (1.0x gas)
-└── Quantum TX: Ed25519 + Dilithium3 (1.5x gas)
-    ├── Optional post-quantum protection
-    ├── Both signatures verified
-    └── Enterprise-grade security
+Post-Quantum Signatures (all transactions):
+└── Every TX: pure ML-DSA-65 / Dilithium3 (1.0x gas)
+    ├── Post-quantum protection by default
+    ├── Single signature verified
+    └── Uniform security for every user
 ```
 
-**Transaction Signature Architecture (v2.25):**
+**Transaction Signature Architecture:**
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    TRANSACTION SIGNATURES                           │
 ├─────────────────────────────────────────────────────────────────────┤
-│  STANDARD TX (default)        │  QUANTUM TX (optional)              │
-│  ─────────────────────────    │  ──────────────────────────────────│
-│  Ed25519 signature: REQUIRED  │  Ed25519 signature: REQUIRED       │
-│  Ed25519 pubkey: REQUIRED     │  Ed25519 pubkey: REQUIRED          │
-│  Dilithium3 sig: null         │  Dilithium3 sig: REQUIRED          │
-│  Dilithium3 pubkey: null      │  Dilithium3 pubkey: REQUIRED       │
-│                               │                                     │
-│  Gas: gas_price * gas_limit   │  Gas: gas_price * 1.5 * gas_limit  │
-│  Use case: Regular users      │  Use case: Enterprise, high-value  │
+│  ALL TRANSACTIONS (pure ML-DSA-65 / Dilithium3)                     │
+│  ─────────────────────────────────────────────────────────────────  │
+│  Dilithium3 signature: REQUIRED                                     │
+│  Dilithium3 pubkey:    REQUIRED (QNet address = hash of this key)   │
+│                                                                     │
+│  Gas: gas_price * gas_limit                                         │
+│  Use case: all users — post-quantum by default                     │
 └─────────────────────────────────────────────────────────────────────┘
 
 Signature Flow:
-1. Client creates Ed25519 signature (always)
-2. Client optionally creates Dilithium3 signature
-3. Node verifies Ed25519 (mandatory)
-4. Node verifies Dilithium3 if present (optional)
-5. Gas fee calculated with quantum premium if applicable
+1. Client signs the transaction with its Dilithium3 (ML-DSA-65) key
+2. Node verifies the Dilithium3 signature (mandatory)
+3. Node checks signature key hashes to the sender address
+4. Gas fee calculated (no separate quantum premium — PQ is the default)
 ```
 
 Smart Contract Fees:
@@ -2409,6 +2403,12 @@ vote = {
 
 **Innovative Consensus Without Staking:**
 
+> **Status (2026-07): binary consensus reputation.** Consensus reputation is now BINARY
+> (70 = eligible, 0 = excluded). The graduated scoring matrix, passive recovery/decay curves,
+> and tiered penalty ladders below are LEGACY and no longer active — kept for historical
+> context. The single live rule is: reputation ≥ 70 ⇒ eligible; otherwise excluded. There is
+> no staking anywhere in QNet.
+
 ```
 Core Innovation:
 ├── No token locking required (full liquidity)
@@ -2674,8 +2674,7 @@ ws://node:8001/ws/transactions // Subscribe to transactions
 
 **Q4 2025:**
 - 🔄 Full security audit
-- 🔄 Sharding implementation
-- 🔄 Sharding implementation
+- 🔄 Sharding (deferred by design — QNet runs single-shard today, auto-arm gated OFF)
 - 🔄 Testnet launching
 - 🔄 Mainnet launching
 
@@ -2705,7 +2704,7 @@ ws://node:8001/ws/transactions // Subscribe to transactions
 | **Microblock time** | 1 second | ✅ Implemented |
 | **Macroblock time** | 90 seconds | ✅ Byzantine consensus |
 | **Mobile TPS** | 8,859 | ✅ Crypto operations on device |
-| **Quantum protection** | Dilithium2 + Ed25519 | ✅ Both signatures on every message |
+| **Quantum protection** | pure ML-DSA-65 (Dilithium3) | ✅ Single PQ signature on every message |
 | **Reputation system** | 70/10 thresholds (ALL: ≥70 for NEW rewards) | ✅ Without staking |
 
 ### 14.2 Experimental Architecture
@@ -2988,8 +2987,9 @@ accounts: {
 - Website: https://aiqnet.io
 
 **Contracts:**
-- 1DEV Token: `62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ`
-- Burn Contract: `1nc1nerator11111111111111111111111111111111`
+- 1DEV Token (Mainnet): `4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump` (Solana, pump.fun mint)
+- 1DEV Token (Testnet): `62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ` (Solana devnet)
+- Burn Address: `1nc1nerator11111111111111111111111111111111`
 
 ---
 

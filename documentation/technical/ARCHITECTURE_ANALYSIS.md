@@ -6,7 +6,7 @@
 - **Python**: Core blockchain logic, node implementation, APIs
 - **Rust**: Performance-critical modules (crypto, validation)
 - **Go**: P2P networking layer
-- **Solidity/Rust**: Smart contracts (Solana)
+- **Rust/WASM**: Native QNet smart contracts — QRC-20 (fungible) and QRC-721 (NFT) are fully on-chain, and a deterministic wasmi WASM VM (fuel = gas) is built and enabled; the 1DEV burn lives on Solana
 
 ### Strengths ✅
 
@@ -92,12 +92,17 @@ async fn main() -> std::io::Result<()> {
 ```
 **Why**: Better performance, type safety, and async handling
 
-### Priority 4: Unified VM in Rust 🟢
+### Priority 4: Unified VM in Rust ✅ (DONE)
+> **Status: implemented.** A deterministic WASM VM is built and ENABLED — a `wasmi`
+> interpreter with fuel = gas, deploy-time determinism validation (no floats/threads),
+> plus deploy + call + cross-contract calls (EIP-2930-style access list). The old
+> `pq_evm` was deleted. QRC-20 and QRC-721 are also fully on-chain.
+
 ```rust
-// Single VM for all smart contract languages
+// Single WASM VM for QNet smart contracts (built + enabled)
 pub struct QNetVM {
-    wasm_engine: wasmtime::Engine,
-    gas_meter: GasMeter,
+    wasm_engine: wasmi::Engine,   // deterministic interpreter
+    gas_meter: GasMeter,          // fuel = gas
     state_access: StateInterface,
 }
 ```

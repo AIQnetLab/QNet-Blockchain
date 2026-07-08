@@ -223,10 +223,15 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     }
     FORK_RECOVERY_TRIGGER_TIMES.insert(h, now);
 
-    // Signal the lowest disputed height; the consumer rolls back to it - 1.
+    // Signal the LAST-GOOD height (disputed-1, clamped >= finalized). The v33 consumer
+    // rolls back TO this height and deletes strictly above it, so it must be h-1 for the
+    // losing block at h to be dropped — matching anchor_recovery (disputed-2) and
+    // apply_breaker (height-1). Deepest pending target wins (min) so a concurrent, deeper
+    // signal is never masked. (h > finalized is guaranteed above; .max is a floor clamp.)
+    let target = h.saturating_sub(1).max(finalized);
     let prev = FORK_RECOVERY_HEIGHT.load(Ordering::SeqCst);
-    if prev == 0 || h < prev {
-        FORK_RECOVERY_HEIGHT.store(h, Ordering::SeqCst);
+    if prev == 0 || target < prev {
+        FORK_RECOVERY_HEIGHT.store(target, Ordering::SeqCst);
     }
     if is_warn() {
         println!("[WARN][FORK] round_supersede h={} our_round={} new_round={} action=reorg_to_certified",
@@ -2197,6 +2202,22 @@ impl BlockPipeline {
                                 && tx.from == "system_rewards_pool" {
                                 return false;
                             }
+                            // API-1 receive-path close: value TXs (Transfer/ContractDeploy/ContractCall/Swap)
+                            // are exempt from the Ed25519 batch (is_unsigned_system_tx), so a SIGNATURELESS
+                            // forged value TX would otherwise skip this presence-filter and never reach the
+                            // eon(dpk)==from bind — a Byzantine producer draining any account on the sole
+                            // receive-side gate. ALWAYS verify them: verify_dilithium_tx_signature_async
+                            // delegates value TXs to verify_user_tx_dilithium (sig over canonical msg +
+                            // eon(dpk)==from), which returns false when the sig is absent → block hard-
+                            // rejected below. Pure/deterministic (TX bytes only). Genesis (h==0) is skipped
+                            // by the branch above, so reserved-sender bootstrap TXs are unaffected.
+                            if matches!(tx.tx_type,
+                                qnet_state::TransactionType::Transfer { .. }
+                                | qnet_state::TransactionType::ContractDeploy
+                                | qnet_state::TransactionType::ContractCall
+                                | qnet_state::TransactionType::Swap { .. }) {
+                                return true;
+                            }
                             matches!(&tx.dilithium_signature, Some(s) if !s.is_empty())
                         })
                         .map(|tx| crate::node::BlockchainNode::verify_dilithium_tx_signature_async(tx))
@@ -2231,6 +2252,29 @@ impl BlockPipeline {
                             mb.height, total_txs, txsig_elapsed.as_millis()
                         );
                     }
+                }
+            }
+
+            // Shared system-TX identity binds — the SAME gate the gossip path enforces
+            // (BlockchainNode::verify_system_tx_binds), applied here so a Byzantine producer's block
+            // cannot smuggle an unsigned or mis-attributed system TX past the receive-side validator:
+            // an unsigned bitmap/ping would otherwise forge a whole shard's light eligibility (no burn
+            // gate on those), a cross-shard bitmap would hijack another genesis' shard, and an unbound
+            // first-registration would skip the native dpk→wallet bind. Presence + signer↔declared-
+            // identity binds; the Dilithium VALIDITY is the verify stage above. Pure/deterministic
+            // (TX bytes + committed-state VRF registry), so the verdict is byte-identical per node.
+            if mb.height > 0 {
+                if let Some(reason) = decoded.microblock.transactions.iter()
+                    .find_map(|tx| crate::node::BlockchainNode::verify_system_tx_binds(tx).err())
+                {
+                    if is_warn() {
+                        println!(
+                            "[WARN][PIPELINE] system_tx_bind_failed h={} producer={} from={} reason={} action=reject_block",
+                            mb.height, mb.producer, decoded.from_peer, reason
+                        );
+                    }
+                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    continue; // HARD REJECT — system TX fails presence / identity binds
                 }
             }
 
@@ -2518,13 +2562,15 @@ impl BlockPipeline {
             {
                 use std::collections::HashSet;
                 let mut warm_set: HashSet<String> = HashSet::new();
+                // Warm the FULL affected set per tx (from + recipients +
+                // contract/escrow), the same set apply_transaction_lazy loads.
+                // The bounded LRU can evict, so a narrow warm (from + Transfer.to)
+                // would let apply read a cold recipient/escrow and miss silently;
+                // a superset only touches cache residency, never state.
                 for tx in &block.microblock.transactions {
-                    if !tx.from.is_empty() {
-                        warm_set.insert(tx.from.clone());
-                    }
-                    if let qnet_state::TransactionType::Transfer { to, .. } = &tx.tx_type {
-                        if !to.is_empty() {
-                            warm_set.insert(to.clone());
+                    for addr in tx.get_all_affected_addresses() {
+                        if !addr.is_empty() {
+                            warm_set.insert(addr);
                         }
                     }
                 }

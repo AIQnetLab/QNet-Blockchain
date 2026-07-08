@@ -12,7 +12,7 @@
 - ✅ **HD Wallets**: BIP32/39/44 standard implementation
 - ✅ **Biometric Auth**: Fingerprint/Face ID integration  
 - ✅ **Secure Storage**: Hardware Security Module (HSM) support
-- ✅ **Post-Quantum Crypto**: Hybrid Dilithium2 + Ed25519 signatures
+- ✅ **Post-Quantum Crypto**: pure ML-DSA-65 (Dilithium3) signatures
 - ✅ **CSP Headers**: Apple domains included for web content
 - ✅ **Code Signing**: Apple Developer certificate validation
 
@@ -41,8 +41,8 @@
 
 ### **Post-Quantum Readiness** ✅ VERIFIED
 ```
-Algorithm: Dilithium2 (NIST-approved) + Ed25519 (performance)
-Implementation: Hybrid signature system
+Algorithm: ML-DSA-65 / Dilithium3 (NIST-approved)
+Implementation: pure ML-DSA-65 (Dilithium3) signatures
 Future-Proof: Ready for quantum computer threats
 Compliance: NIST post-quantum cryptography standards
 Performance: Zero impact on 424,411 TPS capability
@@ -322,7 +322,7 @@ Security Audit Results (June 11, 2025):
 
 ### **Cryptographic Validation**
 - ✅ **Kyber-1024 KEM** - NIST Level 5 security
-- ✅ **Hybrid Signatures** - Dilithium2 + Ed25519 dual-signature system
+- ✅ **Post-Quantum Signatures** - pure ML-DSA-65 (Dilithium3) signatures
 - ✅ **HD Wallet Security** - BIP-32 deterministic key derivation
 - ✅ **Hash Functions** - SHA-256/SHA-3/BLAKE3
 - ✅ **Wallet Encryption** - AES-equivalent security

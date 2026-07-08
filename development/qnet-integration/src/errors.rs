@@ -118,12 +118,6 @@ impl From<qnet_mempool::MempoolError> for IntegrationError {
     }
 }
 
-impl From<crate::validator::ValidationError> for IntegrationError {
-    fn from(err: crate::validator::ValidationError) -> Self {
-        IntegrationError::ValidationError(err.to_string())
-    }
-}
-
 impl From<rocksdb::Error> for IntegrationError {
     fn from(err: rocksdb::Error) -> Self {
         IntegrationError::StorageError(err.to_string())

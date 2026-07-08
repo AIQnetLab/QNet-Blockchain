@@ -267,7 +267,7 @@
 - ✅ **Cross-platform** iOS/Android support
 - ✅ **Firebase SDK** integrated (iOS + Android)
 - ✅ **FCM push notifications** for ping challenges
-- ✅ **Ed25519 signature** for ping responses
+- ✅ **Dilithium3 (ML-DSA-65) signature** for ping responses
 - 🔄 **App store** preparation underway
 
 ### **Web Application**
@@ -287,7 +287,7 @@
 - ✅ **No inline handlers** for CSP compliance
 
 ### **Network Security**
-- ✅ **Ed25519** cryptographic signatures
+- ✅ **Dilithium3 (ML-DSA-65)** cryptographic signatures
 - ✅ **TLS encryption** for all communications
 - ✅ **Anti-spam** mechanisms implemented
 - ✅ **Rate limiting** across all endpoints

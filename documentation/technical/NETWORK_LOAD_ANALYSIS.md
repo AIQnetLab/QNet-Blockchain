@@ -146,21 +146,23 @@ All-nodes signing (pre-Checkpoint-BFT):
 - With 1M nodes: 2M messages per block!
 ```
 
-#### Solution: Sampling-Based Consensus
+#### Solution: VRF Committee Sampling (Checkpoint-BFT v2)
 ```rust
 struct ConsensusRound {
     // Only select subset for each round
-    validator_count: u32,  // e.g., 1,000
+    validator_count: u32,  // <=1000 eligible producers, VRF committee <=100
     
-    // Selection based on reputation + randomness
+    // Uniform-VRF selection among eligible nodes (reputation is a binary
+    // admission gate {70 | 0}, never a ranking weight)
     selected_validators: Vec<NodeId>,
 }
 
 fn select_validators(eligible_nodes: &[Node]) -> Vec<NodeId> {
-    // QNet PRODUCTION: Simple reputation-based selection (NO WEIGHTS)
+    // QNet PRODUCTION: uniform-VRF selection (NO reputation weighting)
     let mut selected = Vec::new();
     
-    // Filter qualified candidates: Only Full and Super nodes with reputation ≥ 70%
+    // Admission gate: Only Full and Super nodes that are NOT equivocation-banned
+    // (binary consensus reputation == 70, i.e. reputation >= MIN_REPUTATION 70)
     let qualified_nodes: Vec<&Node> = eligible_nodes.iter()
         .filter(|node| {
             matches!(node.node_type, NodeType::Full | NodeType::Super) &&
@@ -168,7 +170,7 @@ fn select_validators(eligible_nodes: &[Node]) -> Vec<NodeId> {
         })
         .collect();
     
-    // Simple random selection from qualified candidates
+    // Uniform-VRF sample from qualified candidates (entropy = N-2 macroblock hash)
     selected.extend(simple_random_sample(qualified_nodes, 1000));
     
     selected

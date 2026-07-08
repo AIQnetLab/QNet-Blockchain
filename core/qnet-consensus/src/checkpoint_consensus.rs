@@ -182,6 +182,20 @@ impl CheckpointConsensus {
         self.proposals.insert((cp.index, cp.hash()), cp.clone());
         self.adopt_qc(qc)
     }
+
+    /// Evict per-index state (proposals/votes/timeouts/qcs) strictly below `floor`. These maps are
+    /// otherwise insert-only, so without this the always-on engine grows one committee-sized entry
+    /// (votes/qcs carry a quorum of ML-DSA sigs) per checkpoint forever → OOM. Safe: everything below
+    /// the committed frontier is final; the driver calls this with committed_index−CONSENSUS_STATE_RETAIN,
+    /// keeping a generous reorg/late-message window, and lock/high_qc/committed_index are scalar fields
+    /// untouched by pruning (never regress). No-op when `floor == 0`.
+    pub fn prune_below(&mut self, floor: u64) {
+        if floor == 0 { return; }
+        self.proposals.retain(|(idx, _), _| *idx >= floor);
+        self.votes.retain(|(idx, _), _| *idx >= floor);
+        self.timeouts.retain(|idx, _| *idx >= floor);
+        self.qcs.retain(|idx, _| *idx >= floor);
+    }
 }
 
 #[cfg(test)]
@@ -229,7 +243,7 @@ mod tests {
         Checkpoint {
             index, parent_qc, window_head_height: index * 10,
             window_mb_hashes: vec![hh(index as u8)], state_root: hh(index as u8),
-            beacon: hh(0), epoch_commitment: hh(0), reward_root: hh(0), registry_root: hh(0), total_supply: 0, timestamp: 0, proposer: c[li].clone(), proposer_sig: Vec::new(),
+            beacon: hh(0), epoch_commitment: hh(0), reward_root: hh(0), registry_root: hh(0), logs_root: hh(0), total_supply: 0, timestamp: 0, proposer: c[li].clone(), proposer_sig: Vec::new(),
         }
     }
 
@@ -373,5 +387,32 @@ mod tests {
         for k in 1..n {
             assert_eq!(eng[k].committed_index, ci, "node {} diverged on committed chain", k);
         }
+    }
+
+    // Pruning bounds the otherwise-insert-only per-index maps: state strictly below the floor is
+    // evicted; the retention window is kept; scalar progress (committed_index) never regresses.
+    #[test]
+    fn prune_below_evicts_buried_index_state() {
+        let c = committee(4);
+        let mut eng = CheckpointConsensus::new("n0".into(), c.clone());
+        for i in 1..=10u64 {
+            let cp = propose(&c, i, None, hh(0));
+            eng.proposals.insert((i, cp.hash()), cp.clone());
+            eng.votes.entry((i, cp.hash())).or_default()
+                .insert("n0".into(), Vote { checkpoint_hash: cp.hash(), index: i, voter: "n0".into(), signature: vec![1] });
+            eng.timeouts.entry(i).or_default()
+                .insert("n0".into(), TimeoutMsg { index: i, voter: "n0".into(), high_qc_index: 0, signature: vec![1] });
+            eng.qcs.insert(i, QuorumCertificate { checkpoint_hash: cp.hash(), index: i, sig_merkle_root: hh(0), signers: vec![], sigs: vec![] });
+        }
+        eng.committed_index = 10;
+        eng.prune_below(6);
+        assert!(eng.proposals.keys().all(|(idx, _)| *idx >= 6), "proposals below floor evicted");
+        assert!(eng.votes.keys().all(|(idx, _)| *idx >= 6), "votes below floor evicted");
+        assert!(eng.timeouts.keys().all(|idx| *idx >= 6), "timeouts below floor evicted");
+        assert!(eng.qcs.keys().all(|idx| *idx >= 6), "qcs below floor evicted");
+        assert_eq!(eng.qcs.len(), 5, "indices 6..=10 retained");
+        assert_eq!(eng.committed_index, 10, "prune never regresses committed_index");
+        eng.prune_below(0); // floor 0 is a no-op
+        assert_eq!(eng.qcs.len(), 5);
     }
 }

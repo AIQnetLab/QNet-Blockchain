@@ -557,35 +557,40 @@ fn is_internal_ip(ip_str: &str) -> bool {
     if ip_str.is_empty() {
         return false;
     }
-    // Localhost
-    if ip_str == "127.0.0.1" || ip_str == "::1" || ip_str == "localhost" {
+    if ip_str == "localhost" {
         return true;
     }
-    // FIX R25-M3: IPv6 link-local (fe80::/10) and unique-local (fc00::/7)
-    if ip_str.starts_with("fe80:") || ip_str.starts_with("fc") || ip_str.starts_with("fd") {
+    // Parse once; string-prefix range checks are over-broad (e.g. "fc.127.0.1" or "10.evil").
+    let ip = match ip_str.parse::<IpAddr>() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    if WHITELIST_IPS.contains(&ip) {
         return true;
     }
-    // Parse and check against whitelist
-    if let Ok(ip) = ip_str.parse::<IpAddr>() {
-        if WHITELIST_IPS.contains(&ip) {
-            return true;
+    is_private_ip(&ip)
+}
+
+/// True for loopback, link-local, and RFC1918/unique-local (fc00::/7) ranges.
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local()
         }
-    }
-    // Private networks: 10.x.x.x, 172.16-31.x.x, 192.168.x.x
-    if ip_str.starts_with("10.") || ip_str.starts_with("192.168.") {
-        return true;
-    }
-    if ip_str.starts_with("172.") {
-        if let Some(second_octet_str) = ip_str.split('.').nth(1) {
-            if let Ok(second_octet) = second_octet_str.parse::<u8>() {
-                if (16..=31).contains(&second_octet) {
-                    return true;
-                }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return true;
             }
+            // Unique-local fc00::/7: first byte 0xfc or 0xfd.
+            let first = v6.octets()[0];
+            if first == 0xfc || first == 0xfd {
+                return true;
+            }
+            // Link-local fe80::/10.
+            let seg0 = v6.segments()[0];
+            (seg0 & 0xffc0) == 0xfe80
         }
     }
-    // Docker bridge networks (common: 172.17.x.x covered above)
-    false
 }
 
 /// Helper function to check rate limit and return error response if exceeded
@@ -757,10 +762,6 @@ struct TransactionRequest {
     gas_limit: u64,
     /// Nonce for replay protection
     nonce: u64,
-    /// Ed25519 signature (REQUIRED - NIST FIPS 186-5)
-    signature: String,
-    /// Ed25519 public key for verification (REQUIRED)
-    public_key: String,
     /// QUANTUM v2.25: Optional Dilithium3 signature for post-quantum security
     /// When present: TX is quantum-resistant, gas cost +50%
     /// Format: hex-encoded (~6618 chars for 3309 bytes)
@@ -785,12 +786,6 @@ struct NodeReactivationRequest {
     last_macroblock_hash: String,
     /// Index of the latest macroblock
     last_macroblock_index: u64,
-    /// v10.0: Ed25519 signature over "reactivate:{node_id}:{current_height}" (required for remote requests)
-    #[serde(default)]
-    signature: Option<String>,
-    /// v10.0: Ed25519 public key of the node (required when signature is provided)
-    #[serde(default)]
-    public_key: Option<String>,
 }
 
 /// v6.0: Client-created NodeRegistration TX submit request
@@ -810,10 +805,6 @@ struct NodeRegistrationClientRequest {
     registration_proof: String,
     /// Unix timestamp used when signing (client must include exact value)
     timestamp: u64,
-    /// Ed25519 signature over "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
-    signature: String,
-    /// Ed25519 public key (hex)
-    public_key: String,
     /// Optional Dilithium3 signature for post-quantum security
     #[serde(default)]
     dilithium_signature: Option<String>,
@@ -894,10 +885,6 @@ struct BatchTransferRequest {
     transfers: Vec<TransferData>,
     /// Unique batch identifier
     batch_id: String,
-    /// Ed25519 signature for entire batch (REQUIRED - NIST FIPS 186-5)
-    signature: String,
-    /// Ed25519 public key for verification (REQUIRED)
-    public_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -928,8 +915,8 @@ struct TransferData {
 // ============================================================================
 
 /// Request to deploy a new smart contract
-/// NIST/CISCO COMPLIANT: MANDATORY hybrid signatures (Ed25519 + CRYSTALS-Dilithium)
-/// Smart contracts are critical operations - require BOTH signatures like consensus
+/// NIST/CISCO COMPLIANT: MANDATORY post-quantum signature (CRYSTALS-Dilithium3 / ML-DSA-65)
+/// Smart contracts are critical operations - require a valid Dilithium signature like consensus
 #[derive(Debug, Deserialize)]
 struct ContractDeployRequest {
     /// Deployer's EON address
@@ -944,10 +931,6 @@ struct ContractDeployRequest {
     gas_price: u64,
     /// Nonce for replay protection
     nonce: u64,
-    /// Ed25519 signature (REQUIRED - NIST FIPS 186-5)
-    signature: String,
-    /// Ed25519 public key for verification (REQUIRED)
-    public_key: String,
     /// Dilithium signature (REQUIRED - NIST FIPS 204 post-quantum)
     /// MANDATORY for contract deployment - critical operation
     dilithium_signature: String,
@@ -956,7 +939,7 @@ struct ContractDeployRequest {
 }
 
 /// Request to call a smart contract method
-/// NIST/CISCO COMPLIANT: MANDATORY hybrid signatures for state-changing calls
+/// NIST/CISCO COMPLIANT: MANDATORY post-quantum Dilithium3 signature for state-changing calls
 #[derive(Debug, Deserialize)]
 struct ContractCallRequest {
     /// Caller's EON address
@@ -973,12 +956,6 @@ struct ContractCallRequest {
     gas_price: u64,
     /// Nonce for replay protection
     nonce: u64,
-    /// Ed25519 signature (REQUIRED for state-changing calls - NIST FIPS 186-5)
-    #[serde(default)]
-    signature: Option<String>,
-    /// Ed25519 public key for verification
-    #[serde(default)]
-    public_key: Option<String>,
     /// Dilithium signature (REQUIRED for state-changing calls - NIST FIPS 204)
     #[serde(default)]
     dilithium_signature: Option<String>,
@@ -997,6 +974,17 @@ struct ContractStateQuery {
     key: Option<String>,
     /// Multiple keys to query
     keys: Option<Vec<String>>,
+}
+
+/// Query for GET /api/v1/logs — off-consensus contract event logs (the getLogs analogue).
+#[derive(serde::Deserialize)]
+struct ContractLogsQuery {
+    /// Optional contract-address filter; omit for all contracts in the range.
+    contract: Option<String>,
+    /// Inclusive from-height (default 0).
+    from: Option<u64>,
+    /// Inclusive to-height (default = chain tip; the scan window is capped to from+500).
+    to: Option<u64>,
 }
 
 // ContractInfo is now defined in storage.rs as StoredContractInfo
@@ -1079,7 +1067,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             // SECURITY: Rate limit ALL JSON-RPC methods (bypass with valid API key)
             let method = &request.method;
             let limit_category = match method.as_str() {
-                "tx_submit" | "tx_sendTransaction" | "mempool_submit" | "device_migration" | "account_setPQRequirement" => "write",
+                "tx_submit" | "tx_sendTransaction" | "mempool_submit" | "device_migration" => "write",
                 _ => "read_only",
             };
             if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, limit_category) {
@@ -1099,7 +1087,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             // SECURITY: Rate limit ALL JSON-RPC methods (bypass with valid API key)
             let method = &request.method;
             let limit_category = match method.as_str() {
-                "tx_submit" | "tx_sendTransaction" | "mempool_submit" | "device_migration" | "account_setPQRequirement" => "write",
+                "tx_submit" | "tx_sendTransaction" | "mempool_submit" | "device_migration" => "write",
                 _ => "read_only",
             };
             if let Err(rate_limit_response) = check_api_rate_limit_with_key(remote_addr, api_key, limit_category) {
@@ -2192,6 +2180,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_contract_state);
 
+    // OFF-CONSENSUS contract event logs (getLogs). Top-level path (not under contract/{param})
+    // to avoid the /contract/{addr} route-ordering collision. GET /api/v1/logs?contract=&from=&to=
+    let contract_logs = api_v1
+        .and(warp::path("logs"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<ContractLogsQuery>())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_contract_logs);
+
     // Estimate gas for contract operation (write category)
     let contract_estimate_gas = api_v1
         .and(warp::path("contract"))
@@ -2215,7 +2214,32 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_token_deploy);
-    
+
+    // Deploy QRC-721 (NFT) collection
+    let nft_deploy = api_v1
+        .and(warp::path("nft"))
+        .and(warp::path("deploy"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::content_length_limit(128 * 1024)) // 128KB max
+        .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_nft_deploy);
+
+    // Deploy a generic WASM smart contract (P3; the tx is rejected at apply while
+    // the VM gate WASM_VM_ENABLED is off — this endpoint is ready for activation).
+    let wasm_deploy = api_v1
+        .and(warp::path("wasm"))
+        .and(warp::path("deploy"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::content_length_limit(1024 * 1024)) // 1MB max (code blobs)
+        .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_wasm_deploy);
+
     // Get token info
     let token_info = api_v1
         .and(warp::path("token"))
@@ -2461,8 +2485,11 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(contract_call)
         .or(contract_info)
         .or(contract_state)
+        .or(contract_logs)
         .or(contract_estimate_gas)
         .or(token_deploy)
+        .or(nft_deploy)
+        .or(wasm_deploy)
         .or(token_info)
         .or(token_balance)
         .or(tokens_for_address);
@@ -2623,9 +2650,7 @@ async fn handle_rpc(
         "tx_submit" => tx_submit(blockchain, request.params).await,
         "tx_sendTransaction" => tx_submit(blockchain, request.params).await, // Alias for compatibility
         "tx_get" => tx_get(blockchain, request.params).await,
-        // Post-quantum enforcement: per-wallet opt-in lock
-        "account_setPQRequirement" => account_set_pq_requirement(blockchain, request.params).await,
-        
+
         // Mempool methods
         "mempool_getTransactions" => mempool_get_transactions(blockchain).await,
         "mempool_submit" => mempool_submit(blockchain, request.params).await,
@@ -2910,27 +2935,24 @@ async fn tx_submit(
     let gas_price = params["gas_price"].as_u64().unwrap_or(qnet_state::transaction::MIN_GAS_PRICE); // floor default (was 1 ⇒ rejected)
     let gas_limit = params["gas_limit"].as_u64().unwrap_or(10_000); // QNet TRANSFER gas limit
     
-    // PRODUCTION: Require signature for all transactions
-    let signature = params["signature"].as_str().ok_or_else(|| RpcError {
-        code: -32602,
-        message: "Missing signature - all transactions must be signed".to_string(),
-    })?;
-    
-    // PRODUCTION: Require public key for Ed25519 verification
-    let public_key = params["public_key"].as_str().ok_or_else(|| RpcError {
-        code: -32602,
-        message: "Missing public_key - required for signature verification".to_string(),
-    })?;
-    
-    // QUANTUM v2.25: Optional Dilithium signature for post-quantum security
-    let dilithium_signature = params["dilithium_signature"].as_str().map(|s| s.to_string());
-    let dilithium_public_key = params["dilithium_public_key"].as_str().map(|s| s.to_string());
-    
-    // Validate: if dilithium_signature present, dilithium_public_key must also be present
-    if dilithium_signature.is_some() && dilithium_public_key.is_none() {
+    // PURE DILITHIUM (F0.2): QNet TX are authorised by ML-DSA-65 only (Ed25519 is Solana-only). Require
+    // the Dilithium sig+pk and bind the key to `from` (address = SHA512(dilithium_pk)); the authoritative
+    // check is verify_user_tx_dilithium at submit_transaction downstream.
+    let dilithium_signature = params["dilithium_signature"].as_str().map(|s| s.to_string()).filter(|s| !s.is_empty());
+    let dilithium_public_key = params["dilithium_public_key"].as_str().map(|s| s.to_string()).filter(|s| !s.is_empty());
+    let dil_pk = match &dilithium_public_key {
+        Some(p) if dilithium_signature.is_some() => p.clone(),
+        _ => return Err(RpcError {
+            code: -32602,
+            message: "dilithium_signature + dilithium_public_key required (pure-PQ; Ed25519 not accepted on QNet)".to_string(),
+        }),
+    };
+    let binds_from = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(&dil_pk)
+        .map(|e| e == from).unwrap_or(false);
+    if !binds_from {
         return Err(RpcError {
             code: -32602,
-            message: "dilithium_public_key required when dilithium_signature is present".to_string(),
+            message: "dilithium_public_key does not derive to `from` (ownership unproven)".to_string(),
         });
     }
     
@@ -2944,8 +2966,8 @@ async fn tx_submit(
         gas_price,
         gas_limit,
         timestamp: chrono::Utc::now().timestamp() as u64,
-        signature: Some(signature.to_string()), // PRODUCTION: Required signature
-        public_key: Some(public_key.to_string()), // PRODUCTION: Required for verification
+        signature: None,  // pure-Dilithium; Ed25519 not on a QNet path
+        public_key: None,
         tx_type: qnet_state::TransactionType::Transfer {
             from: from.to_string(),
             to: to.to_string(),
@@ -2974,148 +2996,8 @@ async fn tx_submit(
     }
 }
 
-/// Post-quantum enforcement upgrade — submit a `SetPQRequirement` transaction.
-///
-/// Submitting this method permanently locks the sender account into mandatory
-/// Dilithium3 signing. Once accepted on-chain, every future TX from this account
-/// MUST carry a Dilithium3 signature whose public key matches the registered
-/// key on this transaction. One-way upgrade — cannot be reversed.
-///
-/// REQUEST PARAMS (all required):
-///   * `from`                  — sender EON wallet address
-///   * `nonce`                 — current account nonce + 1
-///   * `signature`             — Ed25519 signature (hex)
-///   * `public_key`            — Ed25519 public key (hex, 32 bytes / 64 chars)
-///   * `dilithium_signature`   — Dilithium3 signature (hex, 3309 bytes / 6618 chars)
-///   * `dilithium_public_key`  — Dilithium3 public key (hex, 1952 bytes / 3904 chars)
-///   * `gas_price` (optional, default 0) — system TX, no gas fee
-///   * `gas_limit` (optional, default 0)
-///
-/// CANONICAL SIGNED MESSAGE:
-///   The sender must sign `"set_pq_requirement:{from}:{nonce}"` with BOTH the
-///   Ed25519 wallet key AND the Dilithium3 key. The dual signature proves
-///   ownership of both keypairs at the moment of upgrade.
-///
-/// RESPONSE:
-///   * On success: `{ "hash": "<tx_hash>" }`
-///   * On failure: JSON-RPC error with descriptive message
-///
-/// SECURITY NOTES:
-///   * Dilithium3 public key on this TX becomes the REGISTERED key for the
-///     account. All future hybrid TXs must use the same Dilithium3 key.
-///   * Re-submission on a locked account with the SAME registered key is a
-///     no-op (idempotent, only nonce advances).
-///   * Re-submission with a DIFFERENT Dilithium3 key is rejected — use the
-///     `KeyRotation` TX path for legitimate key rotation.
-async fn account_set_pq_requirement(
-    blockchain: Arc<BlockchainNode>,
-    params: Option<Value>,
-) -> Result<Value, RpcError> {
-    let params = params.ok_or_else(|| RpcError {
-        code: -32602,
-        message: "Invalid params".to_string(),
-    })?;
-
-    let from = params["from"].as_str().ok_or_else(|| RpcError {
-        code: -32602,
-        message: "Missing from".to_string(),
-    })?;
-
-    if let Err(e) = validate_eon_address_with_error(from) {
-        return Err(RpcError {
-            code: -32602,
-            message: format!("Invalid 'from' address: {}", e),
-        });
-    }
-
-    let nonce = params["nonce"].as_u64().ok_or_else(|| RpcError {
-        code: -32602,
-        message: "Missing or invalid nonce (must be unsigned integer)".to_string(),
-    })?;
-
-    // Both signatures REQUIRED — dual-sig is the authorisation proof for
-    // permanent quantum-lock. We reject the upgrade if either is missing.
-    let signature = params["signature"].as_str().ok_or_else(|| RpcError {
-        code: -32602,
-        message: "Missing signature (Ed25519) — required for PQ upgrade".to_string(),
-    })?;
-    let public_key = params["public_key"].as_str().ok_or_else(|| RpcError {
-        code: -32602,
-        message: "Missing public_key (Ed25519) — required for PQ upgrade".to_string(),
-    })?;
-    let dilithium_signature = params["dilithium_signature"].as_str().ok_or_else(|| RpcError {
-        code: -32602,
-        message: "Missing dilithium_signature — required for PQ upgrade (the whole point)".to_string(),
-    })?;
-    let dilithium_public_key = params["dilithium_public_key"].as_str().ok_or_else(|| RpcError {
-        code: -32602,
-        message: "Missing dilithium_public_key — required for PQ upgrade".to_string(),
-    })?;
-
-    // Validate Dilithium3 public key format up-front: 1952 bytes = 3904 hex chars.
-    if dilithium_public_key.len() != 3904 {
-        return Err(RpcError {
-            code: -32602,
-            message: format!(
-                "Invalid dilithium_public_key length: expected 3904 hex chars (1952 bytes), got {}",
-                dilithium_public_key.len()
-            ),
-        });
-    }
-    if hex::decode(dilithium_public_key).is_err() {
-        return Err(RpcError {
-            code: -32602,
-            message: "Invalid dilithium_public_key: not valid hex".to_string(),
-        });
-    }
-
-    let gas_price = params["gas_price"].as_u64().unwrap_or(0); // system TX
-    let gas_limit = params["gas_limit"].as_u64().unwrap_or(0);
-
-    // Construct SetPQRequirement TX. The transaction-level signatures (Ed25519
-    // + Dilithium3) carry the dual-sig authorisation proof. The applied state
-    // change (account.require_pq_signature = true; account.dilithium_public_key
-    // = registered key) commits atomically.
-    let mut tx = qnet_state::Transaction {
-        hash: String::new(),
-        from: from.to_string(),
-        to: None, // SetPQRequirement is account-scoped — no recipient
-        amount: 0,
-        nonce,
-        gas_price,
-        gas_limit,
-        timestamp: chrono::Utc::now().timestamp() as u64,
-        signature: Some(signature.to_string()),
-        public_key: Some(public_key.to_string()),
-        tx_type: qnet_state::TransactionType::SetPQRequirement {},
-        data: None,
-        dilithium_signature: Some(dilithium_signature.to_string()),
-        dilithium_public_key: Some(dilithium_public_key.to_string()),
-        chain_id: 0,
-    };
-
-    tx.hash = tx.calculate_hash();
-
-    match blockchain.submit_transaction(tx).await {
-        Ok(hash) => {
-            if crate::node::is_info() {
-                println!("[INFO][RPC] pq_upgrade_submitted account={}... hash={}",
-                    &from[..from.len().min(20)], &hash[..hash.len().min(16)]);
-            }
-            Ok(json!({
-                "hash": hash,
-                "info": "Post-quantum lock submitted. Once accepted on-chain, every future transaction from this account must carry a valid Dilithium3 signature under the registered public key."
-            }))
-        }
-        Err(e) => {
-            println!("[WARN][RPC] rpc_error method=account_setPQRequirement err={}", e);
-            Err(RpcError {
-                code: -32000,
-                message: format!("PQ upgrade rejected: {}", e),
-            })
-        }
-    }
-}
+// PURE DILITHIUM (F0.1): account_set_pq_requirement RPC removed — PQ signing is
+// mandatory network-wide, so a per-wallet opt-in upgrade endpoint is obsolete.
 
 async fn tx_get(
     blockchain: Arc<BlockchainNode>,
@@ -3229,17 +3111,22 @@ async fn mempool_submit(
         let nonce = tx_data["nonce"].as_u64().unwrap_or(0);
         let timestamp = tx_data["timestamp"].as_u64().unwrap_or_else(|| chrono::Utc::now().timestamp() as u64);
         
-        // PRODUCTION: Require signature
-        let signature = tx_data["signature"].as_str().ok_or_else(|| RpcError {
+        // PURE DILITHIUM (F0.2): require the ML-DSA-65 sig+pk per TX and bind the key to `from`
+        // (address = SHA512(dilithium_pk)); Ed25519 is Solana-only and not accepted on a QNet path.
+        let dil_sig = tx_data["dilithium_signature"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| RpcError {
             code: -32602,
-            message: "Missing signature field - all transactions must be signed".to_string(),
+            message: "Missing dilithium_signature - QNet TX require an ML-DSA-65 signature".to_string(),
         })?;
-        
-        // PRODUCTION: Require public key
-        let public_key = tx_data["public_key"].as_str().ok_or_else(|| RpcError {
+        let dil_pk = tx_data["dilithium_public_key"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| RpcError {
             code: -32602,
-            message: "Missing public_key field - required for signature verification".to_string(),
+            message: "Missing dilithium_public_key".to_string(),
         })?;
+        if crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(dil_pk).as_deref() != Some(from) {
+            return Err(RpcError {
+                code: -32602,
+                message: "dilithium_public_key does not derive to `from` (ownership unproven)".to_string(),
+            });
+        }
         
         // Create transaction
         let mut tx = qnet_state::Transaction {
@@ -3251,16 +3138,16 @@ async fn mempool_submit(
             gas_price: qnet_state::transaction::MIN_GAS_PRICE, // at/above the fee floor (was 1 ⇒ rejected)
             gas_limit: 10_000, // QNet TRANSFER gas limit
             timestamp,
-            signature: Some(signature.to_string()), // PRODUCTION: Required signature
-            public_key: Some(public_key.to_string()), // PRODUCTION: Required for verification
+            signature: None,  // pure-Dilithium; Ed25519 not on a QNet path
+            public_key: None,
             tx_type: qnet_state::TransactionType::Transfer {
                 from: from.to_string(),
                 to: to.to_string(),
                 amount,
             },
             data: None, // no data for simple transfer
-            dilithium_signature: None,   // Batch TX - no quantum sig by default
-            dilithium_public_key: None,
+            dilithium_signature: Some(dil_sig.to_string()),
+            dilithium_public_key: Some(dil_pk.to_string()),
             chain_id: 0,
         };
 
@@ -4320,7 +4207,8 @@ async fn handle_block_by_hash(
                     serde_json::to_string(&block).unwrap_or_default().as_bytes()
                 ));
                 
-                if block_hash.starts_with(&hash) || hash.starts_with(&block_hash[..8]) {
+                // Exact match only: prefix matching lets short queries collide with real hashes.
+                if block_hash == hash {
                     found_block = Some(block);
                     break;
                 }
@@ -4489,6 +4377,7 @@ async fn handle_macroblock_proof(
         "epoch_commitment": hex::encode(cp.epoch_commitment),
         "reward_root": hex::encode(cp.reward_root),
         "registry_root": hex::encode(cp.registry_root),
+        "logs_root": hex::encode(cp.logs_root),
         "total_supply": cp.total_supply,
         "timestamp": cp.timestamp,
         "proposer": cp.proposer,
@@ -4768,82 +4657,32 @@ async fn handle_transaction_submit(
     // Without this, ANYONE could send transactions from ANY address!
     // =========================================================================
     
-    // Build message to verify (canonical format)
-    // v2.77: Include nonce in signature for replay protection (Ethereum-style)
-    // Format: "transfer:from:to:amount:nonce:gas_price:gas_limit"
-    let message_to_sign = format!("transfer:{}:{}:{}:{}:{}:{}", 
-        tx_request.from, 
-        tx_request.to,
-        tx_request.amount,
-        tx_request.nonce,
-        tx_request.gas_price,
-        tx_request.gas_limit
-    );
-    
-    // Verify Ed25519 signature
-    let signature_valid = verify_ed25519_client_signature(
-        &tx_request.from,
-        &message_to_sign,
-        &tx_request.signature,
-        &tx_request.public_key
-    ).await;
-    
-    if !signature_valid {
-        println!("[WARN][TX] ed25519_verify_failed from={}", 
-                 &tx_request.from[..16.min(tx_request.from.len())]);
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Signature verification failed (NIST FIPS 186-5)",
-            "details": "Ed25519 signature does not match the transaction data",
-            "message_format": "transfer:{from}:{to}:{amount}:{gas_price}:{gas_limit}"
-        })));
-    }
-    
-    println!("[INFO][TX] ed25519_verified from={} to={}", 
-             &tx_request.from[..8.min(tx_request.from.len())],
-             &tx_request.to[..8.min(tx_request.to.len())]);
-    
-    // v2.95.3: Verify Dilithium signature if present (quantum-resistant)
-    // CRITICAL: Must verify Dilithium BEFORE creating transaction!
-    let dilithium_verified = if let (Some(ref dil_sig), Some(ref dil_pk)) = 
-        (&tx_request.dilithium_signature, &tx_request.dilithium_public_key) 
-    {
-        if !dil_sig.is_empty() && !dil_pk.is_empty() {
-            // Verify Dilithium signature on same message
-            match verify_dilithium_client_signature(&message_to_sign, dil_sig, dil_pk).await {
-                Ok(valid) => {
-                    if !valid {
-                        println!("[WARN][TX] dilithium_verify_failed from={}", 
-                                 &tx_request.from[..16.min(tx_request.from.len())]);
-                        return Ok(warp::reply::json(&json!({
-                            "success": false,
-                            "error": "Dilithium signature verification failed",
-                            "details": "Post-quantum signature does not match transaction data"
-                        })));
-                    }
-                    println!("[INFO][TX] dilithium_verified from={}", 
-                             &tx_request.from[..16.min(tx_request.from.len())]);
-                    true
-                }
-                Err(e) => {
-                    println!("[WARN][TX] dilithium_verify_error from={} err={}", 
-                             &tx_request.from[..16.min(tx_request.from.len())], e);
-                    return Ok(warp::reply::json(&json!({
-                        "success": false,
-                        "error": "Dilithium signature verification error",
-                        "details": e
-                    })));
-                }
-            }
-        } else {
-            false // Empty Dilithium signature - not quantum TX
-        }
-    } else {
-        false // No Dilithium signature provided
+    // PURE DILITHIUM (F0.1): QNet value TX are authorised by ML-DSA-65 ONLY. Ed25519 is a Solana-only
+    // credential and is NOT checked here. Require the Dilithium sig+pubkey, bind `from` to the key via
+    // the address (closes API-1 forge-from-any), then verify the signature the SAME way the ingest/
+    // gossip path does (over the canonical "transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas_limit}").
+    let dil_sig = match tx_request.dilithium_signature.as_ref().filter(|s| !s.is_empty()) {
+        Some(s) => s.clone(),
+        None => return Ok(warp::reply::json(&json!({
+            "success": false, "error": "value TX requires dilithium_signature (pure-PQ)"
+        }))),
     };
-    
-    // Create transaction from request WITH verified signature
-    // QUANTUM v2.25.2: Full support for both Ed25519 and Ed25519+Dilithium TX
+    let dil_pk = match tx_request.dilithium_public_key.as_ref().filter(|p| !p.is_empty()) {
+        Some(p) => p.clone(),
+        None => return Ok(warp::reply::json(&json!({
+            "success": false, "error": "value TX requires dilithium_public_key (pure-PQ)"
+        }))),
+    };
+    // Address binding: `from` MUST be the address derived from the signing ML-DSA-65 key.
+    match crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(&dil_pk) {
+        Some(d) if d == tx_request.from => {}
+        _ => return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "from not derived from dilithium_public_key (ownership unproven)"
+        }))),
+    }
+
+    // Create the transaction (pure Dilithium — no Ed25519 signature/public_key).
     let tx = qnet_state::Transaction::new(
         tx_request.from.clone(),
         Some(tx_request.to.clone()),
@@ -4852,20 +4691,27 @@ async fn handle_transaction_submit(
         tx_request.gas_price,
         tx_request.gas_limit,
         chrono::Utc::now().timestamp() as u64,
-        Some(tx_request.signature.clone()), // CRITICAL: Include verified Ed25519 signature
+        None, // no Ed25519 signature on QNet
         qnet_state::TransactionType::Transfer {
             from: tx_request.from.clone(),
             to: tx_request.to.clone(),
             amount: tx_request.amount,
         },
-        Some(serde_json::to_string(&json!({
-            "dilithium_verified": dilithium_verified,
-            "public_key": tx_request.public_key,
-            "standard": if dilithium_verified { "NIST FIPS 186-5 + CRYSTALS-Dilithium3" } else { "NIST FIPS 186-5 (Ed25519)" }
-        })).unwrap_or_default()),
+        None,
     )
-    .with_public_key(Some(tx_request.public_key.clone()))
-    .with_quantum_signature(tx_request.dilithium_signature.clone(), tx_request.dilithium_public_key.clone());
+    .with_quantum_signature(Some(dil_sig), Some(dil_pk));
+
+    // Verify the ML-DSA-65 signature exactly as the ingest/gossip path will.
+    if !crate::node::BlockchainNode::verify_user_tx_dilithium(&tx) {
+        println!("[WARN][TX] dilithium_verify_failed from={}", &tx_request.from[..16.min(tx_request.from.len())]);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Dilithium signature verification failed",
+            "details": "ML-DSA-65 signature does not match the transaction data or the bound key"
+        })));
+    }
+    println!("[INFO][TX] dilithium_verified from={} to={}",
+             &tx_request.from[..8.min(tx_request.from.len())], &tx_request.to[..8.min(tx_request.to.len())]);
 
     // Log quantum TX if present
     if tx.is_quantum_signed() {
@@ -4958,7 +4804,7 @@ async fn handle_transaction_get(
                 "status": tx.status,
                 "tx_type": tx.tx_type,  // Include transaction type for explorer
                 "is_quantum_signed": is_quantum,
-                "signature_type": if is_quantum { "Ed25519 + Dilithium3" } else { "Ed25519" }
+                "signature_type": if is_quantum { "Dilithium3 (ML-DSA-65)" } else { "none" }
             });
             
             // Add quantum signature details if present
@@ -5176,6 +5022,7 @@ async fn handle_bundle_submit(
     let bundle = TxBundle {
         bundle_id: String::new(), // Will be generated in add_bundle
         transactions,
+        tx_bytes: Vec::new(), // Captured authoritatively inside add_bundle
         min_timestamp,
         max_timestamp,
         reverting_tx_hashes,
@@ -5405,35 +5252,9 @@ async fn handle_batch_transfer(
         }
     };
     
-    // Build message to verify (canonical format for batch)
-    let message_to_sign = format!("batch_transfer:{}:{}:{}:{}", 
-        from_address, 
-        total_amount,
-        request.transfers.len(),
-        request.batch_id
-    );
-    
-    // Verify Ed25519 signature
-    let signature_valid = verify_ed25519_client_signature(
-        &from_address,
-        &message_to_sign,
-        &request.signature,
-        &request.public_key
-    ).await;
-    
-    if !signature_valid {
-        println!("[BATCH] ❌ SECURITY: Invalid signature for batch transfer from {}", 
-                 &from_address[..16.min(from_address.len())]);
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Signature verification failed (NIST FIPS 186-5)",
-            "details": "Ed25519 signature does not match the batch data",
-            "message_format": "batch_transfer:{from}:{total_amount}:{transfer_count}:{batch_id}"
-        })));
-    }
-    
-    println!("[BATCH] ✅ Ed25519 signature verified for batch {} from {}", 
-             request.batch_id, &from_address[..8.min(from_address.len())]);
+    // PURE DILITHIUM (F0.2): Ed25519 is Solana-only, never verified on a QNet path. NOTE: the
+    // BatchTransfers TX type is admission-rejected at node.rs ingest (RPC + gossip), so this handler
+    // builds a TX that never applies; no signature is stamped.
     
     let batch_tx = qnet_state::Transaction::new(
         from_address.clone(),                      // from
@@ -5443,7 +5264,7 @@ async fn handle_batch_transfer(
         100_000,                                   // gas_price: base gas price
         request.transfers.len() as u64 * 10_000,   // gas_limit: per transfer (optimized)
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),  // timestamp
-        Some(request.signature.clone()),           // signature
+        None,                                      // signature (pure-Dilithium; Ed25519 not on a QNet path)
         qnet_state::TransactionType::BatchTransfers {  // tx_type
             transfers: request.transfers.iter().map(|t| BatchTransferData {
                 to_address: t.to_address.clone(),
@@ -5452,10 +5273,7 @@ async fn handle_batch_transfer(
             }).collect(),
             batch_id: request.batch_id.clone()
         },
-        Some(serde_json::to_string(&json!({        // data
-            "public_key": request.public_key,
-            "standard": "NIST FIPS 186-5 (Ed25519)"
-        })).unwrap_or_default()),
+        None,                                      // data
     );
     
     // Submit batch transaction to blockchain
@@ -5823,164 +5641,10 @@ async fn handle_network_ping(
     })))
 }
 
-// PRODUCTION: Quantum-secure signature verification using CRYSTALS-Dilithium
-/// PRODUCTION: Verify Ed25519 signature from client (mobile/browser)
-/// Generic function - message is passed directly, NOT constructed internally
-/// This allows different message formats for different operations:
-/// - Transfers: "transfer:{from}:{to}:{amount}:{nonce}"
-/// - Reward claims: "claim_rewards:{node_id}:{wallet}"
-/// - Batch transfers: "batch_transfer:{from}:{total}:{count}:{batch_id}"
-async fn verify_ed25519_client_signature(
-    context: &str,         // For logging only (e.g., "from", "node_id")
-    message: &str,         // ACTUAL message that was signed by client
-    signature_hex: &str,
-    public_key_hex: &str
-) -> bool {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    
-    // v2.66: Concise crypto logging (message content redacted for security)
-    println!("[DBG][CRYPTO] ed25519_verify context={} msg_len={} sig_len={} pk_len={}",
-             context, message.len(), signature_hex.len(), public_key_hex.len());
-    
-    // Basic validation
-    if signature_hex.len() != 128 {  // 64 bytes = 128 hex chars
-        println!("[CRYPTO] ❌ Invalid Ed25519 signature length: {} (expected 128)", signature_hex.len());
-        return false;
-    }
-    
-    if public_key_hex.len() != 64 {  // 32 bytes = 64 hex chars
-        println!("[CRYPTO] ❌ Invalid Ed25519 public key length: {} (expected 64)", public_key_hex.len());
-        return false;
-    }
-    
-    // Decode public key
-    let pubkey_bytes = match hex::decode(public_key_hex) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            println!("[CRYPTO] ❌ Failed to decode public key: {}", e);
-            return false;
-        }
-    };
-    
-    let pubkey_array: [u8; 32] = match pubkey_bytes.as_slice().try_into() {
-        Ok(arr) => arr,
-        Err(_) => {
-            println!("[CRYPTO] ❌ Invalid public key length: expected 32 bytes, got {}", pubkey_bytes.len());
-            return false;
-        }
-    };
-    let verifying_key = match VerifyingKey::from_bytes(&pubkey_array) {
-        Ok(key) => key,
-        Err(e) => {
-            println!("[CRYPTO] ❌ Invalid Ed25519 public key: {}", e);
-            return false;
-        }
-    };
-    
-    // Decode signature
-    let sig_bytes = match hex::decode(signature_hex) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            println!("[CRYPTO] ❌ Failed to decode signature: {}", e);
-            return false;
-        }
-    };
-    
-    let sig_array: [u8; 64] = match sig_bytes.as_slice().try_into() {
-        Ok(arr) => arr,
-        Err(_) => {
-            println!("[CRYPTO] ❌ Invalid signature length: expected 64 bytes, got {}", sig_bytes.len());
-            return false;
-        }
-    };
-    let signature = Signature::from_bytes(&sig_array);
-    
-    // CRITICAL FIX: Use the PASSED message directly, don't construct internally!
-    // The caller knows what message format was signed by the client
-    let message_bytes = message.as_bytes();
-    
-    // Verify signature
-    match verifying_key.verify(message_bytes, &signature) {
-        Ok(_) => {
-            println!("[DBG][CRYPTO] ed25519_verified context={} msg_len={}", context, message.len());
-            true
-        }
-        Err(e) => {
-            println!("[WARN][CRYPTO] ed25519_verify_failed context={} err={} msg_len={}", context, e, message.len());
-            false
-        }
-    }
-}
+// F0.2 REMOVED: verify_ed25519_client_signature — dead. Ed25519 is Solana-only; the last QNet caller
+// (the reward claim) is now pure-Dilithium, so no QNet path verifies a client Ed25519 signature.
 
-/// v2.95.3: Verify Dilithium client signature (for quantum-safe transactions)
-/// Uses raw public key from client (not node_id lookup)
-async fn verify_dilithium_client_signature(
-    message: &str,
-    signature_hex: &str,
-    public_key_hex: &str
-) -> Result<bool, String> {
-    use pqcrypto_mldsa::mldsa65 as dilithium3;
-    use pqcrypto_traits::sign::*;
-    
-    // Basic validation
-    if signature_hex.is_empty() || public_key_hex.is_empty() {
-        return Err("Empty signature or public key".to_string());
-    }
-    
-    // Dilithium3 public key is 1952 bytes = 3904 hex chars
-    if public_key_hex.len() != 3904 {
-        println!("[DBG][DILITHIUM] unexpected_pubkey_len len={} expected=3904", public_key_hex.len());
-        // Don't fail - some implementations may use different encoding
-    }
-    
-    // Decode public key
-    let pk_bytes = match hex::decode(public_key_hex) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return Err(format!("Invalid public key hex: {}", e));
-        }
-    };
-    
-    let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
-        Ok(pk) => pk,
-        Err(e) => {
-            return Err(format!("Invalid Dilithium3 public key: {:?}", e));
-        }
-    };
-    
-    // Decode signature (ML-DSA-65 signature is 3309 bytes, CTILDEBYTES=48)
-    let sig_bytes = match hex::decode(signature_hex) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return Err(format!("Invalid signature hex: {}", e));
-        }
-    };
-    
-    // Create signed message (signature + message for verification)
-    let mut signed_msg = sig_bytes.clone();
-    signed_msg.extend_from_slice(message.as_bytes());
-    
-    let signed_message = match dilithium3::SignedMessage::from_bytes(&signed_msg) {
-        Ok(sm) => sm,
-        Err(e) => {
-            return Err(format!("Invalid signed message format: {:?}", e));
-        }
-    };
-    
-    // Verify signature
-    match dilithium3::open(&signed_message, &public_key) {
-        Ok(_) => {
-            if crate::node::is_info() {
-                println!("[INFO][DILITHIUM] client_sig_verified");
-            }
-            Ok(true)
-        }
-        Err(_) => {
-            println!("[WARN][DILITHIUM] client_sig_invalid");
-            Ok(false)
-        }
-    }
-}
+// F0.2 REMOVED: verify_dilithium_client_signature — dead (no callers after the pure-Dilithium cutover).
 
 /// PRODUCTION v2.78: Verify Dilithium signature (for registration/reactivation)
 /// ARCHITECTURE: Pure Dilithium verification using quantum crypto system
@@ -6036,8 +5700,8 @@ async fn verify_dilithium_signature(node_id: &str, message: &str, signature: &st
     }
 }
 
-/// PRODUCTION v2.78: Verify Light node signature (HYBRID - Ed25519+Dilithium)
-/// ARCHITECTURE: Light nodes use compact_bin HYBRID signature format
+/// PRODUCTION v2.78: Verify Light node signature (pure post-quantum Dilithium3 / ML-DSA-65)
+/// ARCHITECTURE: Light nodes use compact_bin Dilithium3 signature format
 /// Same format as Super nodes for consistency and quantum resistance
 async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: &str, blockchain: &Arc<BlockchainNode>) -> bool {
     // Basic validation
@@ -6048,7 +5712,7 @@ async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: 
         return false;
     }
     
-    // PRODUCTION v2.78: Full HYBRID signature verification (compact_bin format)
+    // PRODUCTION v2.78: Full Dilithium3 signature verification (compact_bin format)
     // Format: "compact_bin:<base64_bincode_zstd>" - same as pinger attestations
     // This provides quantum resistance for Light node attestations
     if signature.starts_with("compact_bin:") {
@@ -6059,11 +5723,11 @@ async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: 
             
             if is_valid {
                 if crate::node::is_info() {
-                    println!("[INFO][LIGHT] hybrid_verified format=compact_bin node={}", node_id);
+                    println!("[INFO][LIGHT] pq_verified format=compact_bin node={}", node_id);
                 }
             } else {
                 if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] hybrid_verify_failed format=compact_bin node={}", node_id);
+                    println!("[WARN][LIGHT] pq_verify_failed format=compact_bin node={}", node_id);
                 }
             }
             
@@ -6229,14 +5893,14 @@ fn verify_challenge_stamp(node_id: &str, challenge: &str) -> bool {
     bytes[24..40] == expected[..]
 }
 
-// PRODUCTION: Sign with HYBRID cryptography (Ed25519 + CRYSTALS-Dilithium) per NIST/Cisco
-// CRITICAL: Generates NEW ephemeral Ed25519 key for each challenge - NO FALLBACK!
+// PRODUCTION: Sign with post-quantum cryptography (pure CRYSTALS-Dilithium3 / ML-DSA-65) per NIST/Cisco
+// CRITICAL: Uses the node's Dilithium3 key for each challenge - NO FALLBACK!
 async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
-    use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+    use crate::pq_crypto::{PqCrypto, GLOBAL_PQ_INSTANCES};
     use std::sync::Arc;
-    
-    // Get or create hybrid crypto instance (thread-safe global cache)
-    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+
+    // Get or create post-quantum crypto instance (thread-safe global cache)
+    let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
     }).await;
     
@@ -6247,42 +5911,42 @@ async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
     
     // Create instance if not exists
     if !instances_guard.contains_key(&normalized_node_id) {
-        let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
-        if let Err(e) = hybrid.initialize().await {
-            println!("[CRYPTO] ❌ CRITICAL: Hybrid crypto init failed for {}: {}", node_id, e);
+        let mut pq = PqCrypto::new(normalized_node_id.clone());
+        if let Err(e) = pq.initialize().await {
+            println!("[CRYPTO] ❌ CRITICAL: PQ crypto init failed for {}: {}", node_id, e);
             // NO FALLBACK - return error signature that will be rejected
             return format!("ERROR_NO_HYBRID_CRYPTO_{}", node_id);
         }
-        instances_guard.insert(normalized_node_id.clone(), hybrid);
+        instances_guard.insert(normalized_node_id.clone(), pq);
     }
-    
-    let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
-    
+
+    let pq = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
+
     // Check certificate rotation
-    if hybrid.needs_rotation() {
-        if let Err(e) = hybrid.rotate_certificate().await {
+    if pq.needs_rotation() {
+        if let Err(e) = pq.rotate_certificate().await {
             println!("[CRYPTO] ⚠️ Certificate rotation failed: {}", e);
         }
     }
-    
-    // CRITICAL: Sign RAW challenge with hybrid (hashes before signing)
+
+    // CRITICAL: Sign RAW challenge with Dilithium3 (hashes before signing)
     // OPTIMIZED v2.24: bincode+zstd - use standard compact_bin format for verification compatibility
-    match hybrid.sign_raw_message_compact(challenge.as_bytes()).await {
+    match pq.sign_raw_message_compact(challenge.as_bytes()).await {
         Ok(compact_sig) => {
             match compact_sig.to_binary_compressed() {
                 Ok(binary_data) => {
                     let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
-                    println!("[CRYPTO] ✅ HYBRID RPC signature created for node {} (bincode v2.24)", node_id);
+                    println!("[CRYPTO] ✅ PQ RPC signature created for node {} (bincode v2.24)", node_id);
                     format!("compact_bin:{}", base64_data)  // Standard format for verification
                 }
                 Err(e) => {
-                    println!("[CRYPTO] ❌ Failed to serialize hybrid signature: {}", e);
+                    println!("[CRYPTO] ❌ Failed to serialize PQ signature: {}", e);
                     format!("ERROR_SERIALIZE_FAILED_{}", node_id)
                 }
             }
         }
         Err(e) => {
-            println!("[CRYPTO] ❌ Hybrid signing failed for node {}: {}", node_id, e);
+            println!("[CRYPTO] ❌ PQ signing failed for node {}: {}", node_id, e);
             // NO FALLBACK - unsigned/weak signatures are security vulnerabilities!
             format!("ERROR_HYBRID_SIGN_FAILED_{}", node_id)
         }
@@ -6521,7 +6185,7 @@ async fn handle_internal_fcm_token_sync(
 
 /// Public endpoint: POST /api/v1/light-node/token-refresh
 /// Lightweight FCM token update — no activation code / burn_tx needed.
-/// Ed25519-signed for authentication.
+/// Dilithium ping-delegation-signed for authentication.
 #[derive(Debug, serde::Deserialize)]
 struct TokenRefreshRequest {
     node_id:      String,
@@ -6530,7 +6194,7 @@ struct TokenRefreshRequest {
     push_type:    String,
     #[serde(default)]
     endpoint:     Option<String>,
-    signature:    String,   // Ed25519 sign of "token_refresh:{node_id}:{timestamp}"
+    signature:    String,   // "ping_dilithium:" + Dilithium sign of "token_refresh:{node_id}:{timestamp}"
     timestamp:    u64,
 }
 fn default_fcm_str() -> String { "fcm".to_string() }
@@ -6562,41 +6226,89 @@ async fn handle_light_node_token_refresh(
         })));
     }
 
-    // Verify node exists and get stored Ed25519 pubkey
-    let stored_pubkey = if let Some(p2p) = blockchain.get_unified_p2p() {
+    // PING DELEGATION v7.1: token-refresh auth is rooted in the node's Dilithium ping-delegation
+    // chain (same proven pattern as the `ping_dilithium:` arm in verify_light_node_ping), NOT the
+    // RAM-poisonable Ed25519 gossip pubkey. The delegation cert is verified against the IMMUTABLE
+    // on-chain key (load_vrf_public_key), so an attacker who poisons the RAM registry cannot forge
+    // this node's token-refresh. Fail-closed at every missing/mismatch step.
+    // Request signature format: "ping_dilithium:<dilithium_sig>".
+    if !req.signature.starts_with("ping_dilithium:") {
+        if crate::node::is_warn() {
+            println!("[WARN][LIGHT] token_refresh_bad_sig_prefix node={}", req.node_id);
+        }
+        return Ok(warp::reply::json(&serde_json::json!({
+            "success": false, "error": "Invalid signature"
+        })));
+    }
+    let inner_sig = &req.signature[15..]; // Skip "ping_dilithium:" prefix
+
+    // Load ping_pubkey + ping_delegation_cert + quantum_pubkey from the light-node registry.
+    let (ping_pk_hex, delegation_cert, quantum_pk) = if let Some(p2p) = blockchain.get_unified_p2p() {
         let registry = p2p.get_light_node_registry();
-        registry.get(&req.node_id).map(|n| n.ed25519_public_key.clone())
+        if let Some(node) = registry.get(&req.node_id) {
+            (
+                node.ping_pubkey.clone(),
+                node.ping_delegation_cert.clone(),
+                node.quantum_pubkey.clone(),
+            )
+        } else {
+            return Ok(warp::reply::json(&serde_json::json!({
+                "success": false, "error": "Node not found"
+            })));
+        }
     } else {
-        None
+        return Ok(warp::reply::json(&serde_json::json!({
+            "success": false, "error": "internal error"
+        })));
     };
 
-    let pubkey_hex = match stored_pubkey {
-        Some(pk) if !pk.is_empty() => pk,
+    if ping_pk_hex.is_empty() || delegation_cert.is_empty() {
+        if crate::node::is_warn() {
+            println!("[WARN][LIGHT] token_refresh_ping_delegation_missing node={}", req.node_id);
+        }
+        return Ok(warp::reply::json(&serde_json::json!({
+            "success": false, "error": "Node not found or missing ping delegation"
+        })));
+    }
+
+    // Load the IMMUTABLE on-chain Dilithium key; fail-closed on None/err.
+    let onchain_pk_hex = match blockchain.get_storage().load_vrf_public_key(&req.node_id) {
+        Ok(Some(bytes)) => hex::encode(bytes),
         _ => {
+            if crate::node::is_warn() {
+                println!("[WARN][LIGHT] token_refresh_no_onchain_key node={}", req.node_id);
+            }
             return Ok(warp::reply::json(&serde_json::json!({
-                "success": false, "error": "Node not found or missing Ed25519 key"
+                "success": false, "error": "Invalid signature"
             })));
         }
     };
 
-    // Verify Ed25519 signature
-    let message = format!("token_refresh:{}:{}", req.node_id, req.timestamp);
-    let sig_valid = {
-        use ed25519_dalek::{Verifier, VerifyingKey, Signature};
-        let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
-            let pk_bytes = hex::decode(&pubkey_hex)?;
-            let sig_bytes = hex::decode(&req.signature)?;
-            if pk_bytes.len() != 32 || sig_bytes.len() != 64 {
-                return Ok(false);
-            }
-            let vk = VerifyingKey::from_bytes(&pk_bytes.try_into().map_err(|_| "pk len")?)?;
-            let sig = Signature::from_bytes(&sig_bytes.try_into().map_err(|_| "sig len")?);
-            Ok(vk.verify(message.as_bytes(), &sig).is_ok())
-        })();
-        result.unwrap_or(false)
-    };
+    // RAM-poison guard: RAM quantum_pubkey (gossip-set) must match the on-chain key.
+    if !quantum_pk.is_empty() && quantum_pk != onchain_pk_hex {
+        if crate::node::is_warn() {
+            println!("[WARN][LIGHT] token_refresh_ram_key_mismatch_onchain node={}", req.node_id);
+        }
+        return Ok(warp::reply::json(&serde_json::json!({
+            "success": false, "error": "Invalid signature"
+        })));
+    }
 
-    if !sig_valid {
+    // Step 1: Verify the delegation cert authorizing ping_pubkey, against the on-chain key.
+    let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, req.node_id);
+    if !verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &onchain_pk_hex) {
+        if crate::node::is_warn() {
+            println!("[WARN][LIGHT] token_refresh_delegation_cert_invalid node={}", req.node_id);
+        }
+        return Ok(warp::reply::json(&serde_json::json!({
+            "success": false, "error": "Invalid signature"
+        })));
+    }
+
+    // Step 2: Verify the token-refresh signature against the authorized ping_pubkey.
+    // Message string MUST stay byte-identical to what the mobile signs.
+    let message = format!("token_refresh:{}:{}", req.node_id, req.timestamp);
+    if !verify_mobile_dilithium_signature(&message, inner_sig, &ping_pk_hex) {
         if crate::node::is_warn() {
             println!("[WARN][LIGHT] token_refresh_bad_sig node={}", req.node_id);
         }
@@ -6691,13 +6403,6 @@ struct LightNodeRegisterRequest {
                                         // Signed with Solana private key (same key that burned tokens)
     #[serde(default)]
     signature_timestamp: Option<u64>,   // v4.7: Timestamp used in signature message (prevents replay)
-    // HYBRID v2.90: Gossip Ed25519 signature for P2P authentication (not burn proof)
-    // Message: "light_node_gossip:{node_pseudonym}:{wallet_address}"
-    // Signed with QNet wallet Ed25519 key (same key used to sign NodeRegistration TX)
-    #[serde(default)]
-    ed25519_gossip_signature: Option<String>,  // 128 hex chars (Ed25519 sig)
-    #[serde(default)]
-    ed25519_gossip_pubkey: Option<String>,     // 64 hex chars (QNet wallet Ed25519 pubkey)
     // PING DELEGATION v7.1: Dedicated Dilithium3 ping key for background pings.
     // ping_pubkey is a separate Dilithium3 pubkey (3904 hex) or legacy Ed25519 (64 hex),
     // stored in device Keychain (AFTER_FIRST_UNLOCK). ping_delegation_cert is Dilithium3
@@ -7008,16 +6713,12 @@ async fn handle_light_node_register(
     let light_node_pseudonym = generate_light_node_pseudonym(&register_request.wallet_address);
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // HYBRID GOSSIP SIGNATURE VERIFICATION v6.1 (mirrors unified_p2p.rs exactly)
-    // Both parts MUST pass — if either fails here, ALL peer nodes would also reject
-    // the gossip message, making the registration invisible network-wide.
+    // GOSSIP SIGNATURE VERIFICATION (pure ML-DSA-65, mirrors unified_p2p.rs exactly)
+    // Must pass here — if it fails, ALL peer nodes would also reject the gossip
+    // message, making the registration invisible network-wide.
     //
-    // Part 1 — Dilithium3 (ML-DSA-65): quantum-resistant identity proof
+    // Dilithium3 (ML-DSA-65): quantum-resistant identity proof
     //   Signs: wallet_address  |  Key: quantum_pubkey (activation-derived keypair)
-    //
-    // Part 2 — Ed25519: classical wallet ownership proof for gossip authentication
-    //   Signs: "light_node_gossip:{node_pseudonym}:{wallet_address}"
-    //   Key:   ed25519_gossip_pubkey (QNet wallet Ed25519 key)
     // ═══════════════════════════════════════════════════════════════════════════
     {
         let wallet = &register_request.wallet_address;
@@ -7028,12 +6729,12 @@ async fn handle_light_node_register(
             || register_request.quantum_signature.len() < 32
         {
             if crate::node::is_warn() {
-                println!("[WARN][LIGHT] hybrid_dilithium_missing wallet={}...",
+                println!("[WARN][LIGHT] pq_dilithium_missing wallet={}...",
                     &wallet[..16.min(wallet.len())]);
             }
             return Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": "Dilithium3 quantum signature is required (hybrid v6.1, Part 1)",
+                "error": "Dilithium3 quantum signature is required (pq v6.1, Part 1)",
                 "hint": "Provide quantum_pubkey and quantum_signature (ML-DSA-65). Client signs wallet_address with activation-derived Dilithium3 keypair."
             })));
         }
@@ -7045,71 +6746,23 @@ async fn handle_light_node_register(
         );
         if !dilithium_ok {
             if crate::node::is_warn() {
-                println!("[WARN][LIGHT] hybrid_dilithium_invalid wallet={}...",
+                println!("[WARN][LIGHT] pq_dilithium_invalid wallet={}...",
                     &wallet[..16.min(wallet.len())]);
             }
             return Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": "Invalid Dilithium3 signature (hybrid v6.1, Part 1)",
+                "error": "Invalid Dilithium3 signature (pq v6.1, Part 1)",
                 "hint": "Client must sign wallet_address with Dilithium3 (ML-DSA-65) using activation-derived keypair"
             })));
         }
         if crate::node::is_debug() {
-            println!("[DBG][LIGHT] hybrid_dilithium_ok pseudonym={}", light_node_pseudonym);
+            println!("[DBG][LIGHT] pq_dilithium_ok pseudonym={}", light_node_pseudonym);
         }
 
-        // ── Part 2: Ed25519 gossip ──────────────────────────────────────────
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let gossip_sig_hex = register_request.ed25519_gossip_signature.as_deref().unwrap_or("");
-        let gossip_pk_hex  = register_request.ed25519_gossip_pubkey.as_deref().unwrap_or("");
-
-        if gossip_sig_hex.is_empty() || gossip_pk_hex.is_empty() {
-            if crate::node::is_warn() {
-                println!("[WARN][LIGHT] hybrid_ed25519_missing wallet={}...",
-                    &wallet[..16.min(wallet.len())]);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Ed25519 gossip signature is required (hybrid v6.1, Part 2)",
-                "hint": "Sign 'light_node_gossip:{node_pseudonym}:{wallet_address}' with QNet Ed25519 wallet key; include ed25519_gossip_signature + ed25519_gossip_pubkey"
-            })));
-        }
-
-        if gossip_sig_hex.len() != 128 || gossip_pk_hex.len() != 64 {
-            if crate::node::is_warn() {
-                println!("[WARN][LIGHT] hybrid_ed25519_bad_len sig_len={} pk_len={} wallet={}...",
-                    gossip_sig_hex.len(), gossip_pk_hex.len(), &wallet[..16.min(wallet.len())]);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Ed25519 gossip signature has invalid length (hybrid v6.1, Part 2)",
-                "hint": "ed25519_gossip_signature = 128 hex chars (64 bytes), ed25519_gossip_pubkey = 64 hex chars (32 bytes)"
-            })));
-        }
-
-        let gossip_msg = format!("light_node_gossip:{}:{}", light_node_pseudonym, wallet);
-        let ed25519_ok = (|| -> Option<bool> {
-            let pk_bytes: [u8; 32] = hex::decode(gossip_pk_hex).ok()?.try_into().ok()?;
-            let vk = VerifyingKey::from_bytes(&pk_bytes).ok()?;
-            let sig_bytes: [u8; 64] = hex::decode(gossip_sig_hex).ok()?.try_into().ok()?;
-            let sig = Signature::from_bytes(&sig_bytes);
-            Some(vk.verify(gossip_msg.as_bytes(), &sig).is_ok())
-        })().unwrap_or(false);
-
-        if !ed25519_ok {
-            if crate::node::is_warn() {
-                println!("[WARN][LIGHT] hybrid_ed25519_invalid pseudonym={} wallet={}...",
-                    light_node_pseudonym, &wallet[..16.min(wallet.len())]);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Ed25519 gossip signature verification failed (hybrid v6.1, Part 2)",
-                "hint": "Sign 'light_node_gossip:{node_pseudonym}:{wallet_address}' with QNet Ed25519 wallet key"
-            })));
-        }
-
+        // Pure ML-DSA-65: the Dilithium3 proof above is the SOLE gossip authenticator. The former
+        // Ed25519 (light_node_gossip:...) wallet-key proof and its request fields are removed in P8.
         if crate::node::is_info() {
-            println!("[INFO][LIGHT] hybrid_gossip_verified pseudonym={} dilithium=ok ed25519=ok",
+            println!("[INFO][LIGHT] pq_gossip_verified pseudonym={} dilithium=ok",
                 light_node_pseudonym);
         }
 
@@ -7282,7 +6935,7 @@ async fn handle_light_node_register(
         };
         
         // Register in P2P gossip-synced registry and broadcast to network
-        // HYBRID v2.90: include Ed25519 gossip signature for HYBRID P2P verification
+        // Pure ML-DSA-65: the mobile Dilithium3 signature is the sole gossip authenticator
         let registration = LightNodeRegistrationData {
             node_id: light_node_pseudonym.clone(),
             wallet_address: register_request.wallet_address.clone(),
@@ -7295,8 +6948,6 @@ async fn handle_light_node_register(
             last_seen: now,
             consecutive_failures: 0,
             is_active: true,
-            ed25519_signature: register_request.ed25519_gossip_signature.clone().unwrap_or_default(),
-            ed25519_public_key: register_request.ed25519_gossip_pubkey.clone().unwrap_or_default(),
             ping_pubkey: register_request.ping_pubkey.clone().unwrap_or_default(),
             ping_delegation_cert: register_request.ping_delegation_cert.clone().unwrap_or_default(),
         };
@@ -7714,7 +7365,7 @@ async fn handle_light_node_ping_response(
         }
     }
 
-    // PRODUCTION v2.78: Verify Light node HYBRID signature (Ed25519+Dilithium)
+    // PRODUCTION v2.78: Verify Light node post-quantum Dilithium3 signature
     let signature_valid = verify_light_node_signature(&node_id, &challenge, &signature, &blockchain).await;
 
     if !signature_valid {
@@ -7731,53 +7382,53 @@ async fn handle_light_node_ping_response(
         let attestation_data = format!("attestation:{}:{}:{}:{}", 
             node_id, current_slot, now, challenge);
         
-        // CRITICAL: Sign with HYBRID cryptography per NIST/Cisco
+        // CRITICAL: Sign with post-quantum Dilithium3 cryptography per NIST/Cisco
         let pinger_signature = {
-            use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+            use crate::pq_crypto::{PqCrypto, GLOBAL_PQ_INSTANCES};
             use std::sync::Arc;
-            
-            // Get or create hybrid crypto instance
-            let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+
+            // Get or create post-quantum crypto instance
+            let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
                 Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
             }).await;
-            
+
             let mut instances_guard = instances.lock().await;
-            
+
             // v2.24: Use node_id directly
             let normalized_node_id = our_node_id.clone();
-            
+
             // Create instance if not exists
             if !instances_guard.contains_key(&normalized_node_id) {
-                let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
-                if let Err(e) = hybrid.initialize().await {
-                    println!("[LIGHT] ❌ Failed to init hybrid crypto: {}", e);
+                let mut pq = PqCrypto::new(normalized_node_id.clone());
+                if let Err(e) = pq.initialize().await {
+                    println!("[LIGHT] ❌ Failed to init PQ crypto: {}", e);
                     return Ok(warp::reply::json(&json!({
                         "success": false,
-                        "error": "Hybrid crypto initialization failed"
+                        "error": "PQ crypto initialization failed"
                     })));
                 }
-                instances_guard.insert(normalized_node_id.clone(), hybrid);
+                instances_guard.insert(normalized_node_id.clone(), pq);
             }
-            
-            let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
-            
+
+            let pq = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
+
             // Check rotation
-            if hybrid.needs_rotation() {
-                let _ = hybrid.rotate_certificate().await;
+            if pq.needs_rotation() {
+                let _ = pq.rotate_certificate().await;
             }
-            
-            // CRITICAL: Sign RAW attestation with hybrid (hashes before signing)
+
+            // CRITICAL: Sign RAW attestation with Dilithium3 (hashes before signing)
             // OPTIMIZED v2.24: bincode+zstd instead of JSON
-            match hybrid.sign_raw_message_compact(attestation_data.as_bytes()).await {
+            match pq.sign_raw_message_compact(attestation_data.as_bytes()).await {
                 Ok(compact_sig) => {
                     match compact_sig.to_binary_compressed() {
                         Ok(binary_data) => {
                             let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
-                            println!("[LIGHT] ✅ HYBRID attestation signature (bincode v2.24)");
+                            println!("[LIGHT] ✅ PQ attestation signature (bincode v2.24)");
                             format!("compact_bin:{}", base64_data)  // Standard format for verification
                         }
                         Err(e) => {
-                            println!("[LIGHT] ❌ Failed to serialize hybrid signature: {}", e);
+                            println!("[LIGHT] ❌ Failed to serialize PQ signature: {}", e);
                             return Ok(warp::reply::json(&json!({
                                 "success": false,
                                 "error": "Failed to serialize attestation signature"
@@ -7789,7 +7440,7 @@ async fn handle_light_node_ping_response(
                     println!("[LIGHT] ❌ Failed to sign attestation: {:?}", e);
                     return Ok(warp::reply::json(&json!({
                         "success": false,
-                        "error": "Failed to sign attestation with hybrid crypto"
+                        "error": "Failed to sign attestation with PQ crypto"
                     })));
                 }
             }
@@ -8941,7 +8592,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
         
         let mut last_reannounce = std::time::Instant::now();
         let mut last_flush = std::time::Instant::now(); // v3.41: WAL flush tracker
-        
+
         loop {
             check_interval.tick().await;
             
@@ -9237,7 +8888,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                 // After grace period (3 minutes), check if nodes responded
                 // This runs at slot N+3 to check slot N
                 let check_slot = if current_slot >= 3 { current_slot - 3 } else { 240 - 3 + current_slot };
-                
+
                 // Use the same GENESIS LINEAR SHARDING as get_light_nodes_to_ping().
                 // The old SHA3-based calculate_light_node_shard() used 0-255 shards
                 // which almost never matched the 0-4 genesis shard_id → failures
@@ -9279,7 +8930,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                         }
                     }
                 };
-                
+
                 for node_id in nodes_in_check_slot {
                     // Check if attestation exists for the checked slot
                     if !p2p.has_attestation(&node_id, check_slot) {
@@ -9287,7 +8938,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                         p2p.mark_light_node_ping_failed(&node_id);
                     }
                 }
-                
+
                 // INACTIVE PROBING DISABLED: Reactivation is manual-only
                 // via /api/v1/light-node/reactivate (user presses "I'm back").
                 // Rationale: automatic probing adds O(inactive_nodes) load per
@@ -9411,8 +9062,14 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
 struct ClaimRewardsRequest {
     node_id: String,
     wallet_address: String,
-    quantum_signature: String,     // Ed25519 signature (REQUIRED — ownership proof)
-    public_key: String,            // Ed25519 public key (REQUIRED)
+    // LEGACY Ed25519 fields — pure-Dilithium clients no longer send them (Ed25519 is Solana-only, never
+    // verified on a QNet path). Optional for wire back-compat during cutover.
+    #[serde(default)]
+    #[allow(dead_code)]
+    quantum_signature: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    public_key: Option<String>,
     // v5.0: Dilithium3 signature (REQUIRED for ALL nodes — NIST FIPS 204, no exceptions)
     // Both Android (NDK/JNI) and iOS (ObjC bridge) apps v5.0+ provide these fields.
     #[serde(default)]
@@ -9441,40 +9098,11 @@ async fn handle_claim_rewards(
         })));
     }
     
-    // PRODUCTION: Verify Ed25519 signature from client (NOT Dilithium - that's for node consensus only)
-    // Client signs: "claim_rewards:{node_id}:{wallet_address}"
+    // PURE DILITHIUM (F0.2): the reward claim is authorised by the MANDATORY ML-DSA-65 signature below
+    // over "claim_rewards:{node_id}:{wallet_address}", the on-chain registered-wallet match, and the
+    // per-proof merkle re-verify against the QC-certified reward_root at apply. Ed25519 is Solana-only
+    // and is NOT verified on this QNet path.
     let claim_message = format!("claim_rewards:{}:{}", claim_request.node_id, claim_request.wallet_address);
-    
-    // v2.66: Diagnostic logging for signature verification
-    println!("[INFO][CLAIM] verify_ed25519 node={} wallet={}... sig_len={} pubkey_len={}",
-             claim_request.node_id,
-             &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())],
-             claim_request.quantum_signature.len(),
-             claim_request.public_key.len());
-    
-    let signature_valid = verify_ed25519_client_signature(
-        &claim_request.node_id,  // context for logging
-        &claim_message,          // actual signed message
-        &claim_request.quantum_signature,
-        &claim_request.public_key
-    ).await;
-    
-    if !signature_valid {
-        println!("[WARN][CLAIM] ed25519_invalid node={}", claim_request.node_id);
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Invalid Ed25519 signature for reward claim",
-            "message_format": "claim_rewards:{node_id}:{wallet_address}",
-            "debug": {
-                "node_id": claim_request.node_id,
-                "wallet_preview": &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())],
-                "sig_len": claim_request.quantum_signature.len(),
-                "pubkey_len": claim_request.public_key.len()
-            }
-        })));
-    }
-    
-    println!("[INFO][CLAIM] ed25519_verified node={}", claim_request.node_id);
     
     // v5.0: MANDATORY Dilithium3 (ML-DSA-65) signature for ALL reward claims — no exceptions.
     // Android (NDK/JNI) and iOS (ObjC bridge) both support Dilithium since v5.0.
@@ -9628,8 +9256,8 @@ async fn handle_claim_rewards(
                 gas_price: 0,
                 gas_limit: 0,
                 timestamp: chrono::Utc::now().timestamp() as u64,
-                signature: Some(claim_request.quantum_signature.clone()),
-                public_key: Some(claim_request.public_key.clone()),
+                signature: None,   // pure-Dilithium; Ed25519 not on a QNet path
+                public_key: None,
                 tx_type: qnet_state::TransactionType::RewardDistribution,
                 data: Some(data),
                 dilithium_signature: claim_request.dilithium_signature.clone(),
@@ -10571,24 +10199,21 @@ async fn handle_get_reward_summary(
 }
 
 // POST /api/v1/nodes - Register a new node
-/// Sign a NodeRegistration TX with hybrid crypto: ephemeral Ed25519 + producer Dilithium3.
+/// Sign a NodeRegistration TX with pure Dilithium3 (ML-DSA-65) — no Ed25519 leg.
 ///
-/// Layer 1 — ephemeral Ed25519 (forward secrecy, REQUIRED):
-///   Satisfies validate_transaction() Ed25519 check on every peer so the TX propagates.
-///   Without this the TX has an empty signature and is rejected by all peers (bug v4.x).
-///
-/// Layer 2 — producer node Dilithium3 (provenance proof, best-effort):
+/// The node's Dilithium3 signature is the sole authenticator (provenance proof):
 ///   Proves that this specific node (genesis or super) created the registration TX.
-///   Works identically to HeartbeatCommitment: create_consensus_signature(node_id, msg).
-///   The signer is identified by tx.dilithium_public_key = node_id, which is what
-///   verify_dilithium_tx_signature_async uses for key lookup (NOT tx.from = user wallet).
-///   If quantum crypto is not yet initialised the TX remains valid via Ed25519 alone.
+///   Works identically to HeartbeatCommitment / NodeReactivation:
+///   create_consensus_signature(node_id, msg). The signer is identified by
+///   tx.dilithium_public_key = node_id, which verify_dilithium_tx_signature_async
+///   uses for key lookup (NOT tx.from = user wallet). NodeRegistration is exempt from
+///   the Ed25519 batch (verify_ed25519_batch) and admitted on the Dilithium leg alone —
+///   exactly like NodeReactivation — so no Ed25519 signature is needed for propagation.
+///   If quantum crypto is not yet initialised the TX is left unsigned and is rejected
+///   by the mandatory-Dilithium gossip gate (fail-closed).
 ///
 /// Canonical message: from|to|amount|nonce|gas_price|gas_limit|timestamp (pipe format).
 async fn sign_node_registration_tx(tx: &mut qnet_state::Transaction, producer_node_id: &str) {
-    use ed25519_dalek::{SigningKey, Signer};
-    use rand::rngs::OsRng;
-
     let canonical_msg = format!(
         "{}|{}|{}|{}|{}|{}|{}",
         tx.from,
@@ -10600,35 +10225,26 @@ async fn sign_node_registration_tx(tx: &mut qnet_state::Transaction, producer_no
         tx.timestamp,
     );
 
-    // --- Layer 1: ephemeral Ed25519 (required for P2P validation) ---
-    let signing_key   = SigningKey::generate(&mut OsRng);
-    let verifying_key = signing_key.verifying_key();
-    let ed25519_sig   = signing_key.sign(canonical_msg.as_bytes());
-
-    tx.signature  = Some(hex::encode(ed25519_sig.to_bytes()));
-    tx.public_key = Some(hex::encode(verifying_key.as_bytes()));
-
-    // --- Layer 2: producer node Dilithium3 (provenance proof) ---
+    // Pure ML-DSA-65: the node's Dilithium3 signature is the sole authenticator.
     use crate::node::try_get_quantum_crypto;
     if let Some(crypto) = try_get_quantum_crypto() {
         match crypto.create_consensus_signature(producer_node_id, &canonical_msg).await {
             Ok(dilithium_sig) => {
                 tx.dilithium_signature  = Some(dilithium_sig.signature);
                 tx.dilithium_public_key = Some(producer_node_id.to_string());
-                println!("[INFO][REG] node_registration_tx hybrid_signed \
-                          ed25519=ephemeral dilithium={}", producer_node_id);
+                println!("[INFO][REG] node_registration_tx signed dilithium3={}", producer_node_id);
             }
             Err(e) => {
-                println!("[WARN][REG] node_registration_tx dilithium_skip \
-                          node={} err={}", producer_node_id, e);
+                println!("[WARN][REG] node_registration_tx dilithium_sign_failed \
+                          node={} err={} (tx will be rejected)", producer_node_id, e);
             }
         }
     } else {
         println!("[WARN][REG] node_registration_tx quantum_crypto_not_init \
-                  node={} (Ed25519 only)", producer_node_id);
+                  node={} (unsigned — will be rejected)", producer_node_id);
     }
 
-    // Hash MUST be recalculated after all signature fields are set.
+    // Hash MUST be recalculated after the signature field is set.
     tx.hash = tx.calculate_hash();
 }
 
@@ -10655,7 +10271,7 @@ async fn handle_register_node(
     // v3.18: Full nodes removed - only Light and Super allowed
     // v6.1: Light node registration REMOVED from this endpoint.
     //       Light nodes MUST use /api/v1/light-node/register which issues a proper
-    //       hybrid gossip signature (Ed25519 + Dilithium3).
+    //       post-quantum gossip signature (pure Dilithium3 / ML-DSA-65).
     //       This endpoint gossips with empty signatures → other nodes reject the gossip
     //       → light node exists only on the receiving node (broken state, L1 violation).
     //       L1 precedent: Ethereum EIP-2718 hard-blocked legacy TX format for typed TXs.
@@ -10664,7 +10280,7 @@ async fn handle_register_node(
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "Light node registration via /api/v1/register is disabled (v6.1).",
-                "hint": "Use POST /api/v1/light-node/register — supports hybrid Ed25519+Dilithium3 gossip signatures.",
+                "hint": "Use POST /api/v1/light-node/register — supports pure Dilithium3 (ML-DSA-65) gossip signatures.",
                 "migration_endpoint": "/api/v1/light-node/register"
             })));
         },
@@ -11192,8 +10808,6 @@ async fn handle_register_node(
                 last_seen: now,
                 consecutive_failures: 0,
                 is_active: true,
-                ed25519_signature: String::new(),
-                ed25519_public_key: String::new(),
                 ping_pubkey: String::new(),
                 ping_delegation_cert: String::new(),
             };
@@ -11273,7 +10887,7 @@ async fn handle_register_node(
             let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
             let tx_hash = registration_tx.hash.clone();
             if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
-                println!("[INFO][REG] super_onchain_tx node={} wallet={}... hash={}... signed=hybrid",
+                println!("[INFO][REG] super_onchain_tx node={} wallet={}... hash={}... signed=dilithium3",
                          node_id,
                          &wallet_address[..16.min(wallet_address.len())],
                          &tx_hash[..16.min(tx_hash.len())]);
@@ -13273,22 +12887,20 @@ async fn handle_node_registration_client_submit(
     }
 
     // SECURITY check #3: wallet_address (which DETERMINES node_id) must be DERIVED from a credential the
-    // submitter provably controls — either the Ed25519 public_key (native wallet; control proven by the
-    // client_node_reg signature verified below) or burn_wallet (Solana-imported; control proven by
-    // owner_signature above). Closes node_id squatting: without it an attacker could set wallet_address =
-    // a victim's PUBLIC EON, prove control of their OWN burn_wallet, and register the victim's node_id.
-    {
-        let from_pubkey = crate::crypto::solana_derivation::eon_from_qnet_pubkey(&req.public_key);
-        let from_solana = req.burn_wallet.as_deref()
-            .map(crate::crypto::solana_derivation::eon_from_solana_address);
-        let bound = from_pubkey.as_deref() == Some(req.wallet_address.as_str())
-            || from_solana.as_deref() == Some(req.wallet_address.as_str());
-        if !bound {
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "wallet_address not derived from public_key or burn_wallet (ownership unproven)"
-            })));
-        }
+    // submitter provably controls. PURE DILITHIUM (F0.1): a native wallet derives from the ML-DSA-65 key
+    // (control proven by the client_node_reg Dilithium signature verified below); a Solana-imported wallet
+    // derives from burn_wallet (control proven by owner_signature above). Closes node_id squatting.
+    let native_bound = req.dilithium_public_key.as_deref()
+        .and_then(crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey)
+        .as_deref() == Some(req.wallet_address.as_str());
+    let solana_bound = req.burn_wallet.as_deref()
+        .map(crate::crypto::solana_derivation::eon_from_solana_address)
+        .as_deref() == Some(req.wallet_address.as_str());
+    if !native_bound && !solana_bound {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "wallet_address not derived from dilithium_public_key or burn_wallet (ownership unproven)"
+        })));
     }
 
     // Reject stale requests: timestamp must be within 5 minutes
@@ -13305,39 +12917,39 @@ async fn handle_node_registration_client_submit(
         }
     }
 
-    // Verify Ed25519 signature
     // Message: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
     let message = format!("client_node_reg:{}:{}:{}:{}",
         req.node_id, req.wallet_address, req.registration_proof, req.timestamp);
-    
-    let sig_valid = verify_ed25519_client_signature(
-        &req.from,
-        &message,
-        &req.signature,
-        &req.public_key,
-    ).await;
 
-    if !sig_valid {
-        println!("[WARN][NODE-REG-CLIENT] ed25519_verify_failed from={}",
-                 &req.from[..16.min(req.from.len())]);
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Signature verification failed",
-            "details": "Ed25519 signature does not match client_node_reg message"
-        })));
-    }
-
-    // Optionally verify Dilithium3 if present
-    // Uses verify_mobile_dilithium_signature which handles Android "dilithium_sig_{nodeId}_{base64}" format
-    if let (Some(ref dil_sig), Some(ref dil_pk)) = (&req.dilithium_signature, &req.dilithium_public_key) {
-        if !dil_sig.is_empty() && !dil_pk.is_empty() {
-            if !verify_mobile_dilithium_signature(&message, dil_sig, dil_pk) {
-                println!("[WARN][NODE-REG-CLIENT] dilithium_sig_invalid node={}", req.node_id);
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "Dilithium3 signature verification failed"
-                })));
-            }
+    // PURE DILITHIUM: QNet identity is Dilithium-ONLY. Ed25519 is a Solana-only credential (used for
+    // the Solana address + owner_signature bridge) and is NEVER verified on a QNet path.
+    // For a native (dilithium-derived) wallet the client_node_reg Dilithium
+    // signature is the authoritative wallet-control proof and is MANDATORY — it must verify under the
+    // SAME dilithium_public_key the binding derived wallet_address from (an attacker cannot bind a
+    // victim's key without also forging its ML-DSA signature). Solana-imported wallets use owner_signature.
+    if native_bound {
+        let (dil_sig, dil_pk) = match (&req.dilithium_signature, &req.dilithium_public_key) {
+            (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => (s, p),
+            _ => return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "native registration requires dilithium_signature + dilithium_public_key (pure-PQ)"
+            }))),
+        };
+        if !verify_mobile_dilithium_signature(&message, dil_sig, dil_pk) {
+            println!("[WARN][NODE-REG-CLIENT] dilithium_sig_invalid node={}", req.node_id);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Dilithium3 signature verification failed"
+            })));
+        }
+    } else if let (Some(ref dil_sig), Some(ref dil_pk)) = (&req.dilithium_signature, &req.dilithium_public_key) {
+        // Solana-imported path: Dilithium optional, but if present it must be valid.
+        if !dil_sig.is_empty() && !dil_pk.is_empty()
+            && !verify_mobile_dilithium_signature(&message, dil_sig, dil_pk) {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Dilithium3 signature verification failed"
+            })));
         }
     }
 
@@ -13371,9 +12983,9 @@ async fn handle_node_registration_client_submit(
     reg_tx.data = Some(format!("client_node_reg:{}:{}:{}:",
         req.node_id, req.wallet_address, req.registration_proof));
 
-    // Store client's Ed25519 signature (not a server ephemeral key)
-    reg_tx.signature = Some(req.signature.clone());
-    reg_tx.public_key = Some(req.public_key.clone());
+    // PURE DILITHIUM: the NodeRegistration TX carries ONLY the Dilithium sig as its authoritative proof
+    // (set below); the legacy Ed25519 signature/public_key are not verified on any QNet path, so they are
+    // not stamped onto the on-chain TX.
     if let Some(dil_sig) = req.dilithium_signature {
         reg_tx.dilithium_signature = Some(dil_sig);
     }
@@ -13497,26 +13109,16 @@ async fn handle_node_reactivation_submit(
         req.node_id == self_node_id
     };
     if !is_local && !is_self_node {
-        // External request for a different node — require signature proof
-        let signature = req.signature.as_deref().unwrap_or("");
-        if signature.is_empty() {
-            println!("[WARN][RPC] reactivation_rejected node={} ip={} reason=signature_required",
-                     req.node_id, remote_ip_str);
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Signature required for remote reactivation. Sign node_id + current_height with node's registered key."
-            })));
-        }
-        // Verify signature: message = "reactivate:{node_id}:{current_height}"
-        let reactivation_msg = format!("reactivate:{}:{}", req.node_id, req.current_height);
-        let pubkey = req.public_key.as_deref().unwrap_or("");
-        if pubkey.is_empty() || !verify_ed25519_client_signature("reactivation", &reactivation_msg, signature, pubkey).await {
-            println!("[WARN][RPC] reactivation_sig_failed node={} ip={}", req.node_id, remote_ip_str);
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Invalid signature for reactivation"
-            })));
-        }
+        // PURE DILITHIUM (F0.2): the old Ed25519 remote-reactivation proof bound no identity (any keypair
+        // passed), so it was illusory. Remote reactivation for a DIFFERENT node is now rejected — a node
+        // reactivates itself (is_self_node) or from an internal IP (is_local). Reactivation authenticity is
+        // re-established at block-validation by the Layer-2 Dilithium check against the on-chain VRF key.
+        println!("[WARN][RPC] reactivation_rejected node={} ip={} reason=remote_not_self",
+                 req.node_id, remote_ip_str);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Remote reactivation for another node is not supported (reactivate from the node itself)"
+        })));
     }
 
     if req.last_macroblock_hash.is_empty() || req.last_macroblock_hash.len() < 16 {
@@ -13541,7 +13143,7 @@ async fn handle_node_reactivation_submit(
         req.last_macroblock_index,
     );
 
-    // Sign with hybrid Ed25519 + Dilithium3 (same as NodeRegistration for Super/Genesis nodes)
+    // Sign with pure Dilithium3 (ML-DSA-65) — the node's registered post-quantum identity key
     let wallet_identity = blockchain.get_wallet_identity();
     crate::node::BlockchainNode::sign_reactivation_tx(
         &mut react_tx,
@@ -13689,7 +13291,7 @@ async fn handle_network_diagnostics(
         "transport": {
             "protocol": "QUIC v1 + TLS 1.3",
             "serialization": "bincode (binary)",
-            "pki": "HybridCertificate (Ed25519 + Dilithium)",
+            "pki": "PqCertificate (Ed25519 + Dilithium)",
             "quic": quic_metrics
         }
     });
@@ -13919,7 +13521,7 @@ async fn generate_quantum_activation_code(
 // ============================================================================
 
 /// Handle smart contract deployment
-/// NIST/CISCO COMPLIANT: Hybrid signature verification (Ed25519 + CRYSTALS-Dilithium)
+/// NIST/CISCO COMPLIANT: Post-quantum signature verification (pure CRYSTALS-Dilithium3 / ML-DSA-65)
 async fn handle_contract_deploy(
     request: ContractDeployRequest,
     remote_addr: Option<std::net::SocketAddr>,
@@ -13944,56 +13546,20 @@ async fn handle_contract_deploy(
     // Standard: NIST FIPS 186-5 (Ed25519) + NIST FIPS 204 (CRYSTALS-Dilithium)
     // =========================================================================
     
-    // Build message to verify (deployer + code_hash + nonce)
-    let message_to_sign = format!("contract_deploy:{}:{}:{}", 
-        request.from, 
-        {
-            let mut hasher = Sha3_256::new();
-            if let Ok(code) = base64::engine::general_purpose::STANDARD.decode(&request.code) {
-                hasher.update(&code);
-            }
-            hex::encode(hasher.finalize())
-        },
-        request.nonce
-    );
-    
-    // Step 1: Verify Ed25519 signature (NIST FIPS 186-5 - classical security)
-    let ed25519_valid = verify_ed25519_client_signature(
-        &request.from,
-        &message_to_sign,
-        &request.signature,
-        &request.public_key
-    ).await;
-    
-    if !ed25519_valid {
+    // PURE DILITHIUM (F0.2): structural presence check only. The AUTHORITATIVE verify is the value-TX
+    // gate in submit_transaction (verify_user_tx_dilithium): it opens the ML-DSA-65 signature over the
+    // SAME canonical message build_canonical_verify_message() rebuilds — "contract_deploy:{from}:
+    // {code_hash}:{nonce}" (code_hash = hex(sha3(wasm)), read from tx.data) — AND binds
+    // eon_from_qnet_dilithium_pubkey(dpk)==from. The client MUST sign that exact message in the
+    // "dilithium_sig_{pk}_{b64([sig_len][SignedMessage][pk_len][pk])}" wire format with a wallet
+    // ML-DSA-65 key whose eon address == from.
+    if request.dilithium_signature.is_empty() || request.dilithium_public_key.is_empty() {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Ed25519 signature verification failed (NIST FIPS 186-5)",
-            "security_level": "classical"
+            "error": "dilithium_signature + dilithium_public_key required (pure-PQ; ML-DSA-65)"
         })));
     }
-    
-    println!("[CONTRACT] ✅ Ed25519 signature verified (NIST FIPS 186-5)");
-    
-    // Step 2: Verify Dilithium signature (NIST FIPS 204 - post-quantum) - MANDATORY
-    // Smart contracts are critical operations - require BOTH signatures like consensus
-    let dilithium_valid = verify_dilithium_signature_for_contract(
-        &message_to_sign,
-        &request.dilithium_signature,
-        &request.dilithium_public_key
-    ).await;
-    
-    if !dilithium_valid {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Dilithium signature verification failed (NIST FIPS 204)",
-            "security_level": "post-quantum",
-            "requirement": "MANDATORY - Smart contracts require hybrid signatures"
-        })));
-    }
-    
-    println!("[CONTRACT] ✅ Dilithium signature verified (NIST FIPS 204 - Post-Quantum)");
-    let is_quantum_secure = true; // Always true for contracts - Dilithium is mandatory
+    let is_quantum_secure = true;
     
     // Validate gas limits
     if request.gas_limit < 50000 {
@@ -14033,21 +13599,8 @@ async fn handle_contract_deploy(
         })));
     }
     
-    // Calculate contract address (deterministic from deployer + nonce)
-    let contract_address = {
-        let mut hasher = Sha3_256::new();
-        hasher.update(request.from.as_bytes());
-        hasher.update(&request.nonce.to_le_bytes());
-        let hash = hex::encode(hasher.finalize());
-        // Format as EON address
-        let part1 = &hash[0..19];
-        let part2 = &hash[19..34];
-        // Generate SHA3-256 checksum (4 bytes = 32-bit collision resistance)
-        let checksum_input = format!("{}eon{}", part1, part2);
-        use sha3::{Sha3_256, Digest};
-        let checksum = hex::encode(&Sha3_256::digest(checksum_input.as_bytes())[..4]);
-        format!("{}eon{}{}", part1, part2, checksum)
-    };
+    // Single-source on-chain derivation; apply ignores caller-supplied `to` (no address squatting)
+    let contract_address = qnet_state::transaction::derive_contract_address(&request.from, request.nonce);
 
     // Calculate code hash (SHA3-256 - NIST FIPS 202)
     let code_hash = {
@@ -14057,7 +13610,7 @@ async fn handle_contract_deploy(
     };
     
     // Create ContractDeploy transaction with security metadata
-    let tx = qnet_state::Transaction::new(
+    let mut tx = qnet_state::Transaction::new(
         request.from.clone(),                      // from
         Some(contract_address.clone()),            // to: contract address
         0,                                         // amount: 0 for deployment
@@ -14065,29 +13618,33 @@ async fn handle_contract_deploy(
         request.gas_price,                         // gas_price
         request.gas_limit,                         // gas_limit
         chrono::Utc::now().timestamp() as u64,     // timestamp
-        Some(request.signature.clone()),           // signature
+        None,                                      // signature (pure-Dilithium; Ed25519 not on a QNet path)
         qnet_state::TransactionType::ContractDeploy,  // tx_type
         Some(serde_json::to_string(&json!({        // data
             "code_hash": code_hash,
             "code_size": wasm_code.len(),
             "constructor_args": request.constructor_args,
             "security": {
-                "ed25519_verified": true,
                 "dilithium_verified": is_quantum_secure,
                 "nist_compliant": true,
-                "standards": ["FIPS 186-5", "FIPS 202", if is_quantum_secure { "FIPS 204" } else { "N/A" }]
+                "standards": ["FIPS 202", "FIPS 204"]
             }
         })).unwrap_or_default()),
     );
-    
+    // Carry the caller's ML-DSA-65 signature so the value-TX gate verifies it (over the canonical
+    // "contract_deploy:{from}:{code_hash}:{nonce}" message) and binds the key to `from`.
+    tx.dilithium_signature = Some(request.dilithium_signature.clone());
+    tx.dilithium_public_key = Some(request.dilithium_public_key.clone());
+    tx.hash = tx.calculate_hash();
+
     // Submit to mempool
-    let tx_hash = tx.hash.clone();  // Transaction::new() already calculated SHA3-256 hash
+    let tx_hash = tx.hash.clone();
     match blockchain.add_transaction_to_mempool(tx).await {
         Ok(_) => {
-            println!("[CONTRACT] ✅ deployment_submitted contract={} hash={}", 
+            println!("[CONTRACT] ✅ deployment_submitted contract={} hash={}",
                      &contract_address[..16.min(contract_address.len())], 
                      &tx_hash[..16.min(tx_hash.len())]);
-            println!("[CONTRACT] 🔒 security ed25519=✅ dilithium={}", if is_quantum_secure { "✅" } else { "N/A" });
+            println!("[CONTRACT] security dilithium=✅ (pure-PQ, FIPS 204)");
             Ok(warp::reply::json(&json!({
                 "success": true,
                 "contract_address": contract_address,
@@ -14097,13 +13654,11 @@ async fn handle_contract_deploy(
                 "deployer": request.from,
                 "message": "Contract deployment submitted to mempool",
                 "security": {
-                    "ed25519_verified": true,
                     "dilithium_verified": is_quantum_secure,
                     "quantum_secure": is_quantum_secure,
                     "nist_standards": {
-                        "signature": "FIPS 186-5 (Ed25519)",
-                        "hash": "FIPS 202 (SHA3-256)",
-                        "post_quantum": if is_quantum_secure { "FIPS 204 (Dilithium)" } else { "Not provided" }
+                        "signature": "FIPS 204 (ML-DSA-65)",
+                        "hash": "FIPS 202 (SHA3-256)"
                     }
                 }
             })))
@@ -14252,69 +13807,11 @@ fn verify_mobile_dilithium_signature(
     }
 }
 
-/// NIST FIPS 204: Verify Dilithium3 signature for smart contracts
-/// FIXED v2.26.6: Use Dilithium3 consistently across entire codebase (was Dilithium5)
-async fn verify_dilithium_signature_for_contract(
-    message: &str,
-    signature_hex: &str,
-    public_key_hex: &str,
-) -> bool {
-    use pqcrypto_mldsa::mldsa65 as dilithium3;
-    use pqcrypto_traits::sign::*;
-    
-    // Decode public key
-    let pk_bytes = match hex::decode(public_key_hex) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            println!("[WARN][DILITHIUM] Invalid public key hex: {}", e);
-            return false;
-        }
-    };
-    
-    let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
-        Ok(pk) => pk,
-        Err(e) => {
-            println!("[WARN][DILITHIUM] Invalid Dilithium3 public key: {:?}", e);
-            return false;
-        }
-    };
-    
-    // Decode signature
-    let sig_bytes = match hex::decode(signature_hex) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            println!("[WARN][DILITHIUM] Invalid signature hex: {}", e);
-            return false;
-        }
-    };
-    
-    // Create signed message (signature + message for verification)
-    let mut signed_msg = sig_bytes.clone();
-    signed_msg.extend_from_slice(message.as_bytes());
-    
-    let signed_message = match dilithium3::SignedMessage::from_bytes(&signed_msg) {
-        Ok(sm) => sm,
-        Err(e) => {
-            println!("[WARN][DILITHIUM] Invalid signed message format: {:?}", e);
-            return false;
-        }
-    };
-    
-    // Verify signature
-    match dilithium3::open(&signed_message, &public_key) {
-        Ok(_) => {
-            println!("[INFO][DILITHIUM] Signature verified (NIST FIPS 204, Level 3)");
-            true
-        }
-        Err(_) => {
-            println!("[WARN][DILITHIUM] Signature verification failed");
-            false
-        }
-    }
-}
+// F0.2 REMOVED: verify_dilithium_signature_for_contract — dead after contract/token deploy moved to the
+// single authoritative value-TX gate (verify_user_tx_dilithium in submit_transaction).
 
 /// Handle smart contract method call
-/// NIST/CISCO COMPLIANT: Hybrid signature verification (Ed25519 + CRYSTALS-Dilithium)
+/// NIST/CISCO COMPLIANT: Post-quantum signature verification (pure CRYSTALS-Dilithium3 / ML-DSA-65)
 async fn handle_contract_call(
     request: ContractCallRequest,
     remote_addr: Option<std::net::SocketAddr>,
@@ -14349,52 +13846,81 @@ async fn handle_contract_call(
         match blockchain.get_account(&request.contract_address).await {
             Ok(Some(account)) if account.is_contract => {
                 let cs = &account.contract_storage;
-                let is_qrc20 = cs.get("type").map(|t| t == "qrc20").unwrap_or(false);
-                
-                let return_value: serde_json::Value = if is_qrc20 {
-                    match request.method.as_str() {
-                        "balanceOf" | "balance_of" => {
-                            let holder = request.args.as_array()
-                                .and_then(|a| a.get(0))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(&request.from);
-                            let key = format!("balance:{}", holder);
-                            let bal: u64 = cs.get(&key).and_then(|s| s.parse().ok()).unwrap_or(0);
-                            json!(bal)
+                let ctype = cs.get("type").map(|s| s.as_str()).unwrap_or("");
+                // token_id and addresses are ALWAYS string args (apply-side rejects non-string) —
+                // so view reads pull args[i] as a string and format keys byte-identically to apply.
+                let arg_str = |i: usize| -> Option<String> {
+                    request.args.as_array().and_then(|a| a.get(i)).and_then(|v| v.as_str().map(|s| s.to_string()))
+                };
+
+                let return_value: serde_json::Value = match ctype {
+                    "qrc20" => {
+                        match request.method.as_str() {
+                            "balanceOf" | "balance_of" => {
+                                let holder = arg_str(0).unwrap_or_else(|| request.from.clone());
+                                let bal: u64 = cs.get(&format!("balance:{}", holder)).and_then(|s| s.parse().ok()).unwrap_or(0);
+                                json!(bal)
+                            }
+                            "totalSupply" | "total_supply" => {
+                                let supply: u64 = cs.get("total_supply").and_then(|s| s.parse().ok()).unwrap_or(0);
+                                json!(supply)
+                            }
+                            "name" => json!(cs.get("name").cloned().unwrap_or_default()),
+                            "symbol" => json!(cs.get("symbol").cloned().unwrap_or_default()),
+                            "decimals" => {
+                                let d: u8 = cs.get("decimals").and_then(|s| s.parse().ok()).unwrap_or(9);
+                                json!(d)
+                            }
+                            "allowance" => {
+                                let owner = arg_str(0).unwrap_or_default();
+                                let spender = arg_str(1).unwrap_or_default();
+                                let val: u64 = cs.get(&format!("allowance:{}:{}", owner, spender)).and_then(|s| s.parse().ok()).unwrap_or(0);
+                                json!(val)
+                            }
+                            _ => json!(null)
                         }
-                        "totalSupply" | "total_supply" => {
-                            let supply: u64 = cs.get("total_supply").and_then(|s| s.parse().ok()).unwrap_or(0);
-                            json!(supply)
-                        }
-                        "name" => json!(cs.get("name").cloned().unwrap_or_default()),
-                        "symbol" => json!(cs.get("symbol").cloned().unwrap_or_default()),
-                        "decimals" => {
-                            let d: u8 = cs.get("decimals").and_then(|s| s.parse().ok()).unwrap_or(9);
-                            json!(d)
-                        }
-                        "allowance" => {
-                            let owner = request.args.as_array().and_then(|a| a.get(0)).and_then(|v| v.as_str()).unwrap_or("");
-                            let spender = request.args.as_array().and_then(|a| a.get(1)).and_then(|v| v.as_str()).unwrap_or("");
-                            let key = format!("allowance:{}:{}", owner, spender);
-                            let val: u64 = cs.get(&key).and_then(|s| s.parse().ok()).unwrap_or(0);
-                            json!(val)
-                        }
-                        _ => json!(null)
                     }
-                } else {
-                    // Generic contract — fall back to contract_vm for execution
-                    let storage = blockchain.get_storage();
-                    let vm = crate::contract_vm::ContractVM::new(storage);
-                    let args: Vec<serde_json::Value> = request.args.as_array().cloned().unwrap_or_default();
-                    match vm.execute_contract(&request.contract_address, &request.method, &args, &request.from) {
-                        Ok(result) => {
-                            if result.return_data.len() >= 8 {
-                                json!(u64::from_le_bytes(result.return_data[..8].try_into().unwrap_or([0u8; 8])))
-                            } else {
-                                json!(hex::encode(&result.return_data))
+                    "qrc721" => {
+                        // Reads mirror the apply-path keys EXACTLY: owner:{token_id}, bal:{addr},
+                        // approved:{token_id} (transaction.rs QRC-721 dispatch).
+                        match request.method.as_str() {
+                            "ownerOf" | "owner_of" =>
+                                json!(arg_str(0).and_then(|tid| cs.get(&format!("owner:{}", tid)).cloned())),
+                            "balanceOf" | "balance_of" | "balanceOf_nft" => {
+                                let holder = arg_str(0).unwrap_or_else(|| request.from.clone());
+                                let bal: u64 = cs.get(&format!("bal:{}", holder)).and_then(|s| s.parse().ok()).unwrap_or(0);
+                                json!(bal)
+                            }
+                            "getApproved" | "get_approved" =>
+                                json!(arg_str(0).and_then(|tid| cs.get(&format!("approved:{}", tid)).cloned())),
+                            "name" => json!(cs.get("name").cloned().unwrap_or_default()),
+                            "symbol" => json!(cs.get("symbol").cloned().unwrap_or_default()),
+                            _ => json!(null)
+                        }
+                    }
+                    _ => {
+                        // Generic WASM contract. Two read shapes (both off-consensus, read-only):
+                        //   storageGet(key) -> raw stored value bytes (the getStorageAt analogue)
+                        //   <method>()      -> execute the view read-only via the deterministic VM
+                        //                      against CURRENT on-chain storage, return its i64.
+                        match request.method.as_str() {
+                            "storageGet" | "storage_get" | "get" => match arg_str(0) {
+                                Some(k) => match qnet_state::wasm_exec::view_storage_get(&account, k.as_bytes()) {
+                                    Some(v) => json!(String::from_utf8_lossy(&v).to_string()),
+                                    None => json!(null),
+                                },
+                                None => json!(null),
+                            },
+                            _ => {
+                                let view_height = blockchain.get_height().await;
+                                match qnet_state::wasm_exec::view_call(
+                                    &request.contract_address, &account, &request.method, &request.from, view_height,
+                                ) {
+                                    Ok(v) => json!(v),
+                                    Err(e) => json!({ "error": e }),
+                                }
                             }
                         }
-                        Err(e) => json!(format!("error: {:?}", e))
                     }
                 };
                 
@@ -14425,77 +13951,34 @@ async fn handle_contract_call(
         }
     }
     
-    // State-changing call requires BOTH signatures (hybrid - like consensus)
-    if request.signature.is_none() || request.public_key.is_none() {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Ed25519 signature and public_key required for state-changing contract calls"
-        })));
-    }
-    
+    // State-changing call requires the ML-DSA-65 signature (pure-Dilithium; Ed25519 is Solana-only).
     if request.dilithium_signature.is_none() || request.dilithium_public_key.is_none() {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Dilithium signature and public_key required for state-changing contract calls",
-            "requirement": "MANDATORY - Smart contracts require hybrid signatures (Ed25519 + Dilithium)"
+            "error": "Dilithium signature and public_key required for state-changing contract calls"
         })));
     }
     
     // =========================================================================
-    // NIST/CISCO COMPLIANT HYBRID SIGNATURE VERIFICATION (MANDATORY)
+    // NIST/CISCO COMPLIANT POST-QUANTUM DILITHIUM3 SIGNATURE VERIFICATION (MANDATORY)
     // =========================================================================
     
-    let signature = request.signature.as_ref()
-        .ok_or_else(|| warp::reject::reject())?;
-    let public_key = request.public_key.as_ref()
-        .ok_or_else(|| warp::reject::reject())?;
-    let dilithium_sig = request.dilithium_signature.as_ref()
-        .ok_or_else(|| warp::reject::reject())?;
-    let dilithium_pk = request.dilithium_public_key.as_ref()
-        .ok_or_else(|| warp::reject::reject())?;
-    
-    // Build message to verify
-    let message_to_sign = format!("contract_call:{}:{}:{}:{}", 
-        request.from, 
-        request.contract_address,
-        request.method,
-        request.nonce
-    );
-    
-    // Step 1: Verify Ed25519 signature (NIST FIPS 186-5) - MANDATORY
-    let ed25519_valid = verify_ed25519_client_signature(
-        &request.from,
-        &message_to_sign,
-        signature,
-        public_key
-    ).await;
-    
-    if !ed25519_valid {
+    // PURE DILITHIUM (F0.2): structural presence check only — the AUTHORITATIVE verify is the value-TX
+    // gate in submit_transaction (verify_user_tx_dilithium), which opens the ML-DSA-65 sig over the SAME
+    // canonical message build_canonical_verify_message() rebuilds — "contract_call:{from}:{sha3(tx.data
+    // calldata)}:{nonce}" (AC-1: the exact calldata bytes are bound, so method/recipient/amount can't be
+    // tampered and no cross-impl re-serialization can diverge) — AND binds
+    // eon_from_qnet_dilithium_pubkey(dpk)==from. The client MUST sign that exact message in the
+    // "dilithium_sig_{pk}_{b64}" wire format with a wallet key whose eon == from.
+    let dilithium_sig = request.dilithium_signature.clone().unwrap_or_default();
+    let dilithium_pk = request.dilithium_public_key.clone().unwrap_or_default();
+    if dilithium_sig.is_empty() || dilithium_pk.is_empty() {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Ed25519 signature verification failed (NIST FIPS 186-5)"
+            "error": "dilithium_signature + dilithium_public_key required (pure-PQ; ML-DSA-65)"
         })));
     }
-    
-    println!("[CONTRACT] ✅ Ed25519 signature verified (NIST FIPS 186-5)");
-    
-    // Step 2: Verify Dilithium signature (NIST FIPS 204) - MANDATORY
-    let dilithium_valid = verify_dilithium_signature_for_contract(
-        &message_to_sign,
-        dilithium_sig,
-        dilithium_pk
-    ).await;
-    
-    if !dilithium_valid {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Dilithium signature verification failed (NIST FIPS 204)"
-        })));
-    }
-    
-    println!("[CONTRACT] ✅ Dilithium signature verified (NIST FIPS 204 - Post-Quantum)");
-    let is_quantum_secure = true; // Always true - both signatures mandatory
-    
+
     // Validate gas limits
     if request.gas_limit < 10000 {
         return Ok(warp::reply::json(&json!({
@@ -14504,9 +13987,9 @@ async fn handle_contract_call(
             "min_gas_limit": 10000
         })));
     }
-    
-    // Create ContractCall transaction with security metadata
-    let tx = qnet_state::Transaction::new(
+
+    // Create ContractCall transaction; tx.data is the exact calldata bound by the AC-1 signature
+    let mut tx = qnet_state::Transaction::new(
         request.from.clone(),                      // from
         Some(request.contract_address.clone()),    // to: contract address
         0,                                         // amount: 0 for call (unless payable)
@@ -14514,20 +13997,20 @@ async fn handle_contract_call(
         request.gas_price,                         // gas_price
         request.gas_limit,                         // gas_limit
         chrono::Utc::now().timestamp() as u64,     // timestamp
-        request.signature.clone(),                 // signature
+        None,                                      // signature (pure-Dilithium; Ed25519 not on a QNet path)
         qnet_state::TransactionType::ContractCall, // tx_type
-        Some(serde_json::to_string(&json!({        // data
+        Some(serde_json::to_string(&json!({        // data = exact calldata bound by the AC-1 signature
             "contract": request.contract_address,
             "method": request.method,
-            "args": request.args,
-            "security": {
-                "ed25519_verified": true,
-                "dilithium_verified": is_quantum_secure
-            }
+            "args": request.args
         })).unwrap_or_default()),
     );
-    
-    // Transaction::new() already calculated SHA3-256 hash via canonical_bytes()
+    // Carry the caller's ML-DSA-65 signature so the value-TX gate verifies it (over the canonical
+    // "contract_call:{from}:{sha3(tx.data calldata)}:{nonce}" message) and binds the key to `from`.
+    tx.dilithium_signature = Some(dilithium_sig.clone());
+    tx.dilithium_public_key = Some(dilithium_pk.clone());
+    tx.hash = tx.calculate_hash();
+
     let tx_hash = tx.hash.clone();
     
     // Submit to mempool
@@ -14614,6 +14097,57 @@ async fn handle_contract_info(
 }
 
 /// Handle contract state query
+/// OFF-CONSENSUS contract event logs (the getLogs analogue). Scans the persisted per-block WASM
+/// log receipts over a BOUNDED height range, optionally filtered by contract address. Read-only:
+/// the log store is a side index (never consensus state / never hashed), so this cannot affect
+/// state_root and needs no signature.
+async fn handle_contract_logs(
+    query: ContractLogsQuery,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    let storage = blockchain.get_storage();
+    let tip = blockchain.get_height().await;
+    let from = query.from.unwrap_or(0);
+    // Bound the scan (off-consensus point-reads): at most 500 blocks per call.
+    const MAX_LOG_RANGE: u64 = 500;
+    let to = query.to.unwrap_or(tip).min(tip).min(from.saturating_add(MAX_LOG_RANGE));
+    let filter = query.contract.as_ref().map(|c| c.to_lowercase());
+    let mut logs_out: Vec<serde_json::Value> = Vec::new();
+    let mut h = from;
+    while h <= to {
+        for (tx_hash, contract, data) in storage.get_block_logs(h) {
+            if filter.as_ref().map_or(true, |f| &contract.to_lowercase() == f) {
+                logs_out.push(json!({
+                    "height": h,
+                    "tx_hash": tx_hash,
+                    "contract": contract,
+                    "data": hex::encode(&data),
+                }));
+            }
+        }
+        h = h.saturating_add(1);
+    }
+    // Retention honesty: blocklogs below the prune floor are physically gone on this node, so an
+    // empty result there is NOT "no events". Report `oldest_available` always, and set
+    // `pruned_below` when the request dips below it — the client then knows results under that
+    // height are incomplete and must be fetched from an archive node (never silent data loss).
+    let floor = storage.log_prune_floor();
+    let pruned_below = if from < floor { Some(floor) } else { None };
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "from": from,
+        "to": to,
+        "oldest_available": floor,
+        "pruned_below": pruned_below,
+        "count": logs_out.len(),
+        "logs": logs_out,
+    })))
+}
+
 async fn handle_contract_state(
     contract_address: String,
     query: ContractStateQuery,
@@ -15126,6 +14660,240 @@ async fn handle_ws_connection_with_cleanup(
 // QRC-20 TOKEN HANDLERS (v2.19.12)
 // ============================================================================
 
+/// Request to deploy a generic WASM smart contract (P3).
+#[derive(Debug, Deserialize)]
+struct WasmDeployRequest {
+    /// Creator's EON address
+    from: String,
+    /// WASM module bytes, hex-encoded
+    code: String,
+    /// Replay-protection nonce (signed into "contract_deploy:{from}:{code_hash}:{nonce}").
+    nonce: u64,
+    /// Dilithium3 signature + public key (MANDATORY; pure ML-DSA-65)
+    dilithium_signature: String,
+    dilithium_public_key: String,
+}
+
+/// Handle a generic WASM contract deploy. Builds a ContractDeploy value-TX with
+/// data {"wasm":true,"code":<hex>,"code_hash":<sha3(code)>}; the value-TX gate
+/// verifies the ML-DSA-65 sig over canonical "contract_deploy:{from}:{code_hash}:
+/// {nonce}" (code_hash = hex(sha3(code_bytes))). NOTE: while the VM gate
+/// WASM_VM_ENABLED is OFF the tx is rejected at apply — this endpoint is wired for
+/// activation. Validates the module up-front for fast, honest feedback.
+async fn handle_wasm_deploy(
+    request: WasmDeployRequest,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "activation") {
+        return Ok(rate_limit_response);
+    }
+    if let Err(e) = validate_eon_address_with_error(&request.from) {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "Invalid creator address", "details": e
+        })));
+    }
+    // Defensive pre-check: the VM must be active for the deploy to land at apply. The VM is ENABLED
+    // from genesis (WASM_VM_ENABLED=true), so this branch is normally unreachable — it only fires on a
+    // build that gates the VM off, and the message describes exactly that state (no false "pending").
+    if !qnet_state::wasm_exec::wasm_vm_enabled() {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "WASM VM is disabled on this node (WASM_VM_ENABLED=false)"
+        })));
+    }
+    let code = match hex::decode(request.code.trim()) {
+        Ok(c) => c,
+        Err(_) => return Ok(warp::reply::json(&json!({
+            "success": false, "error": "code must be hex-encoded WASM bytes"
+        }))),
+    };
+    // Same deterministic gate the apply path enforces (fail fast + honestly).
+    if let Err(e) = qnet_vm::validate_wasm_module(&code, &qnet_vm::VmLimits::default()) {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "invalid WASM module", "details": format!("{}", e)
+        })));
+    }
+    if request.dilithium_signature.is_empty() || request.dilithium_public_key.is_empty() {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "dilithium_signature + dilithium_public_key required (pure-PQ; ML-DSA-65)"
+        })));
+    }
+
+    let nonce = request.nonce;
+    let contract_address = qnet_state::transaction::derive_contract_address(&request.from, nonce);
+    // Signature-binding digest = sha3(code bytes); build_canonical_verify_message
+    // reads this "code_hash" tx.data field.
+    let code_hash = {
+        let mut hasher = Sha3_256::new();
+        hasher.update(&code);
+        hex::encode(hasher.finalize())
+    };
+    let gas_price = 1000u64;
+    let gas_limit = 200_000u64;
+
+    let mut tx = qnet_state::Transaction {
+        hash: String::new(),
+        from: request.from.clone(),
+        to: Some(contract_address.clone()),
+        amount: 0,
+        nonce,
+        gas_price,
+        gas_limit,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+        signature: None,
+        public_key: None,
+        tx_type: qnet_state::TransactionType::ContractDeploy,
+        data: Some(serde_json::to_string(&json!({
+            "wasm": true,
+            "code": request.code.trim(),
+            "code_hash": code_hash
+        })).unwrap_or_default()),
+        dilithium_signature: Some(request.dilithium_signature.clone()),
+        dilithium_public_key: Some(request.dilithium_public_key.clone()),
+        chain_id: 0,
+    };
+    tx.hash = tx.calculate_hash();
+    let tx_hash = tx.hash.clone();
+
+    match blockchain.submit_transaction(tx).await {
+        Ok(_) => {
+            println!("[INFO][VM] wasm_deploy_submitted contract={} code_bytes={} hash={}",
+                     &contract_address[..16.min(contract_address.len())], code.len(),
+                     &tx_hash[..16.min(tx_hash.len())]);
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "tx_hash": tx_hash,
+                "contract": { "contract_address": contract_address, "creator": request.from },
+                "message": "WASM contract deployment submitted to blockchain (pending confirmation)"
+            })))
+        }
+        Err(e) => Ok(warp::reply::json(&json!({
+            "success": false, "error": "Failed to submit WASM deploy transaction",
+            "details": format!("{}", e)
+        }))),
+    }
+}
+
+/// Request to deploy a new QRC-721 (NFT) collection
+#[derive(Debug, Deserialize)]
+struct NftDeployRequest {
+    /// Creator's EON address
+    from: String,
+    /// Collection name
+    name: String,
+    /// Collection symbol
+    symbol: String,
+    /// Replay-protection nonce (client signs it into the canonical
+    /// "contract_deploy:{from}:{code_hash}:{nonce}" message the value-TX gate verifies).
+    nonce: u64,
+    /// Dilithium3 signature (MANDATORY; pure ML-DSA-65)
+    dilithium_signature: String,
+    /// Dilithium3 public key (MANDATORY; pure ML-DSA-65)
+    dilithium_public_key: String,
+}
+
+/// Handle QRC-721 (NFT) collection deployment. Mirrors handle_token_deploy: builds a
+/// ContractDeploy value-TX with data {"qrc721":true,...} that apply_to_state materializes
+/// on every node; authorisation is the value-TX gate (verify_user_tx_dilithium) over the
+/// canonical "contract_deploy:{from}:{code_hash}:{nonce}" where code_hash = hex(sha3(
+/// "QRC721:"+name+":"+symbol)) — the client MUST sign THAT message with a wallet ML-DSA-65
+/// key whose eon address == from. Individual NFTs are minted afterwards via ContractCall.
+async fn handle_nft_deploy(
+    request: NftDeployRequest,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "activation") {
+        return Ok(rate_limit_response);
+    }
+    if let Err(e) = validate_eon_address_with_error(&request.from) {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "Invalid creator address", "details": e
+        })));
+    }
+    if request.name.is_empty() || request.name.len() > 64 {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "Collection name must be 1-64 characters"
+        })));
+    }
+    if request.symbol.is_empty() || request.symbol.len() > 10 {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "Collection symbol must be 1-10 characters"
+        })));
+    }
+    if request.dilithium_signature.is_empty() || request.dilithium_public_key.is_empty() {
+        return Ok(warp::reply::json(&json!({
+            "success": false, "error": "dilithium_signature + dilithium_public_key required (pure-PQ; ML-DSA-65)"
+        })));
+    }
+
+    let nonce = request.nonce;
+    let contract_address = qnet_state::transaction::derive_contract_address(&request.from, nonce);
+    // Signature-binding digest (NOT the on-chain contract_code_hash, which apply recomputes
+    // as sha3(data_str)); build_canonical_verify_message reads this "code_hash" tx.data field.
+    let code_hash = {
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"QRC721:");
+        hasher.update(request.name.as_bytes());
+        hasher.update(b":");
+        hasher.update(request.symbol.as_bytes());
+        hex::encode(hasher.finalize())
+    };
+    let gas_price = 1000u64;
+    let gas_limit = 50_000u64;
+
+    let mut tx = qnet_state::Transaction {
+        hash: String::new(),
+        from: request.from.clone(),
+        to: Some(contract_address.clone()),
+        amount: 0,
+        nonce,
+        gas_price,
+        gas_limit,
+        timestamp: chrono::Utc::now().timestamp() as u64,
+        signature: None,
+        public_key: None,
+        tx_type: qnet_state::TransactionType::ContractDeploy,
+        data: Some(serde_json::to_string(&json!({
+            "qrc721": true,
+            "name": request.name,
+            "symbol": request.symbol,
+            "code_hash": code_hash
+        })).unwrap_or_default()),
+        dilithium_signature: Some(request.dilithium_signature.clone()),
+        dilithium_public_key: Some(request.dilithium_public_key.clone()),
+        chain_id: 0,
+    };
+    tx.hash = tx.calculate_hash();
+    let tx_hash = tx.hash.clone();
+
+    match blockchain.submit_transaction(tx).await {
+        Ok(_) => {
+            println!("[INFO][NFT] qrc721_deploy_submitted name={} symbol={} contract={} hash={}",
+                     request.name, request.symbol,
+                     &contract_address[..16.min(contract_address.len())],
+                     &tx_hash[..16.min(tx_hash.len())]);
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "tx_hash": tx_hash,
+                "collection": {
+                    "contract_address": contract_address,
+                    "name": request.name,
+                    "symbol": request.symbol,
+                    "creator": request.from
+                },
+                "message": "QRC-721 collection deployment submitted to blockchain (pending confirmation)"
+            })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({
+                "success": false, "error": "Failed to submit NFT deploy transaction",
+                "details": format!("{}", e)
+            })))
+        }
+    }
+}
+
 /// Request to deploy a new QRC-20 token
 #[derive(Debug, Deserialize)]
 struct TokenDeployRequest {
@@ -15140,10 +14908,9 @@ struct TokenDeployRequest {
     decimals: u8,
     /// Initial supply
     initial_supply: u64,
-    /// Ed25519 signature
-    signature: String,
-    /// Ed25519 public key
-    public_key: String,
+    /// Replay-protection nonce (client-provided; the caller signs it into the canonical
+    /// "contract_deploy:{from}:{code_hash}:{nonce}" message the value-TX gate verifies).
+    nonce: u64,
     /// Dilithium3 signature (MANDATORY v6.1)
     dilithium_signature: String,
     /// Dilithium3 public key (MANDATORY v6.1)
@@ -15200,79 +14967,27 @@ async fn handle_token_deploy(
         })));
     }
     
-    // Verify Ed25519 signature
-    let message_to_sign = format!("token_deploy:{}:{}:{}:{}", 
-        request.from, request.name, request.symbol, request.initial_supply);
-    
-    let ed25519_valid = verify_ed25519_client_signature(
-        &request.from,
-        &message_to_sign,
-        &request.signature,
-        &request.public_key
-    ).await;
-    
-    if !ed25519_valid {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Ed25519 signature verification failed for token deploy"
-        })));
-    }
-
-    // SECURITY v6.1: Dilithium3 is MANDATORY for token deploy (same as contract_deploy)
+    // PURE DILITHIUM (F0.2): structural presence check only. A QRC-20 token deploy IS a ContractDeploy
+    // value-TX, so the AUTHORITATIVE verify is the value-TX gate in submit_transaction
+    // (verify_user_tx_dilithium): it opens the ML-DSA-65 sig over the canonical message
+    // build_canonical_verify_message() rebuilds — "contract_deploy:{from}:{code_hash}:{nonce}" where
+    // code_hash = hex(sha3("QRC20:"+name+":"+symbol)) — AND binds eon_from_qnet_dilithium_pubkey(dpk)==from.
+    // The client MUST sign THAT message (NOT "token_deploy:..") in the "dilithium_sig_{pk}_{b64}" wire
+    // format with a wallet ML-DSA-65 key whose eon address == from, and provide the matching `nonce`.
     if request.dilithium_signature.is_empty() || request.dilithium_public_key.is_empty() {
-        if crate::node::is_warn() {
-            println!("[WARN][TOKEN] dilithium_missing wallet={}...",
-                &request.from[..16.min(request.from.len())]);
-        }
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Dilithium3 signature is required for token deploy (hybrid v6.1)",
-            "hint": "Provide dilithium_signature + dilithium_public_key (ML-DSA-65)"
+            "error": "dilithium_signature + dilithium_public_key required (pure-PQ; ML-DSA-65)"
         })));
     }
-    {
-        if !verify_mobile_dilithium_signature(&message_to_sign, &request.dilithium_signature, &request.dilithium_public_key) {
-            if crate::node::is_warn() {
-                println!("[WARN][TOKEN] dilithium_invalid wallet={}...", &request.from[..16.min(request.from.len())]);
-            }
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Invalid Dilithium3 signature for token deploy"
-            })));
-        }
-        if crate::node::is_debug() {
-            println!("[DBG][TOKEN] dilithium_ok wallet={}...", &request.from[..16.min(request.from.len())]);
-        }
-    }
-    if crate::node::is_info() {
-        println!("[INFO][TOKEN] hybrid_verified wallet={}... token={}", 
-            &request.from[..16.min(request.from.len())], request.symbol);
-    }
 
-    // v3.40: Get nonce from state for replay protection
-    let nonce = {
-        let state_manager = blockchain.get_state_manager();
-        let state = state_manager.read().await;
-        match state.get_account(&request.from) {
-            Some(acc) => acc.nonce + 1,
-            None => 1, // First TX for this account
-        }
-    };
+    // Client-provided nonce (replay protection is enforced at apply). It MUST match the nonce the caller
+    // signed into the canonical "contract_deploy:{from}:{code_hash}:{nonce}" message, else the value-TX
+    // gate rejects the derived ContractDeploy at ingest.
+    let nonce = request.nonce;
     
-    // v3.40: Deterministic contract address from deployer + nonce (same on ALL nodes)
-    let contract_address = {
-        let mut hasher = Sha3_256::new();
-        hasher.update(b"qrc20:");
-        hasher.update(request.from.as_bytes());
-        hasher.update(b":");
-        hasher.update(nonce.to_le_bytes());
-        let hash = hex::encode(hasher.finalize());
-        let part1 = &hash[0..19];
-        let part2 = &hash[19..34];
-        use sha3::{Sha3_256, Digest};
-        let checksum = hex::encode(&Sha3_256::digest(format!("{}eon{}", part1, part2).as_bytes())[..4]);
-        format!("{}eon{}{}", part1, part2, checksum)
-    };
+    // Single-source on-chain derivation; apply ignores caller-supplied `to` (no address squatting)
+    let contract_address = qnet_state::transaction::derive_contract_address(&request.from, nonce);
 
     // v3.40: Code hash for QRC-20 standard (deterministic from token params)
     let code_hash = {
@@ -15298,8 +15013,8 @@ async fn handle_token_deploy(
         gas_price,
         gas_limit,
         timestamp: chrono::Utc::now().timestamp() as u64,
-        signature: Some(request.signature.clone()),
-        public_key: Some(request.public_key.clone()),
+        signature: None,
+        public_key: None,
         tx_type: qnet_state::TransactionType::ContractDeploy,
         data: Some(serde_json::to_string(&json!({
             "qrc20": true,
@@ -15371,7 +15086,10 @@ async fn handle_token_info(
                         "name": storage.get("name").cloned().unwrap_or_default(),
                         "symbol": storage.get("symbol").cloned().unwrap_or_default(),
                         "decimals": storage.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9),
-                        "total_supply": storage.get("total_supply").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                        // u64 base units as a STRING: a JSON number is an f64 and loses precision above
+                        // 2^53, so a large-supply token would round in any JS client. Parse validates it
+                        // as u64, .to_string() re-emits it exactly. Clients scale by `decimals`.
+                        "total_supply": storage.get("total_supply").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0).to_string(),
                         "deployer": storage.get("deployer").cloned().unwrap_or_default(),
                         "deployed_at": storage.get("deployed_at").cloned().unwrap_or_default()
                     },
@@ -15423,7 +15141,8 @@ async fn handle_token_balance(
                 "success": true,
                 "contract_address": contract_address,
                 "holder_address": holder_address,
-                "balance": balance,
+                // u64 base units as a STRING (exact past 2^53 — a JSON number would round). Client scales by decimals.
+                "balance": balance.to_string(),
                 "token_name": storage.get("name").cloned().unwrap_or_default(),
                 "token_symbol": storage.get("symbol").cloned().unwrap_or_default(),
                 "decimals": storage.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9),
@@ -15470,7 +15189,8 @@ async fn handle_tokens_for_address(
                 if balance > 0 {
                     tokens.push(json!({
                         "contract_address": addr,
-                        "balance": balance,
+                        // u64 base units as a STRING (exact past 2^53). Client scales by decimals.
+                        "balance": balance.to_string(),
                         "name": cs.get("name").cloned().unwrap_or_default(),
                         "symbol": cs.get("symbol").cloned().unwrap_or_default(),
                         "decimals": cs.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9)
@@ -15513,11 +15233,11 @@ struct BenchmarkStartRequest {
     /// Number of test accounts
     #[serde(default)]
     num_accounts: Option<usize>,
-    /// Enable hybrid signing: Ed25519 + Dilithium3 (ML-DSA-65).
-    /// Each TX is double-signed — real post-quantum throughput measurement.
+    /// Enable post-quantum signing: pure Dilithium3 (ML-DSA-65).
+    /// Each TX is Dilithium3-signed — real post-quantum throughput measurement.
     /// Note: Dilithium3 is ~50x slower than Ed25519; expect ~1-2K TPS per core.
     #[serde(default)]
-    use_hybrid: Option<bool>,
+    use_pq: Option<bool>,
     /// v10.0: Authentication secret (must match QNET_BENCHMARK_SECRET env var)
     #[serde(default)]
     secret: Option<String>,
@@ -15561,14 +15281,14 @@ async fn handle_benchmark_start(
     }
     
     // Build config from preset or custom values
-    let use_hybrid = request.use_hybrid.unwrap_or(false);
+    let use_pq = request.use_pq.unwrap_or(false);
     let config = if let Some(preset) = request.preset {
         let mut cfg = BenchmarkConfig::from_preset(preset);
         if let Some(shards) = request.shards { cfg.shards = shards.min(256).max(1); }
         if let Some(total) = request.total { cfg.total_transactions = total; }
         if let Some(tps) = request.target_tps { cfg.target_tps = tps; }
         if let Some(accounts) = request.num_accounts { cfg.num_accounts = accounts; }
-        cfg.use_hybrid_sig = use_hybrid;
+        cfg.use_pq_sig = use_pq;
         cfg
     } else if request.shards.is_some() || request.total.is_some() || request.target_tps.is_some() {
         let shards = request.shards.unwrap_or(256).min(256).max(1);
@@ -15580,11 +15300,11 @@ async fn handle_benchmark_start(
             target_tps: request.target_tps.unwrap_or(shards as u64 * tps_per_shard),
             num_accounts: request.num_accounts.unwrap_or(shards * 40),
             initial_balance: 1_000_000 * crate::benchmark::ONE_QNC,
-            use_hybrid_sig: use_hybrid,
+            use_pq_sig: use_pq,
         }
     } else {
         let mut cfg = BenchmarkConfig::default();
-        cfg.use_hybrid_sig = use_hybrid;
+        cfg.use_pq_sig = use_pq;
         cfg
     };
     
@@ -15599,12 +15319,12 @@ async fn handle_benchmark_start(
             let target_tps = config.target_tps;
             
             let is_progressive = config.is_progressive();
-            let is_hybrid = config.use_hybrid_sig;
+            let is_pq = config.use_pq_sig;
             tokio::spawn(async move {
                 if is_progressive {
                     run_progressive_benchmark(blockchain_clone, total).await;
-                } else if is_hybrid {
-                    run_hybrid_benchmark_generator(blockchain_clone, total, target_tps).await;
+                } else if is_pq {
+                    run_pq_benchmark_generator(blockchain_clone, total, target_tps).await;
                 } else {
                     run_benchmark_generator(blockchain_clone, total, target_tps).await;
                 }
@@ -15617,8 +15337,8 @@ async fn handle_benchmark_start(
                     "total_transactions": config.total_transactions,
                     "target_tps": config.target_tps,
                     "num_accounts": config.num_accounts,
-                    "use_hybrid_sig": config.use_hybrid_sig,
-                    "sig_type": if config.use_hybrid_sig { "Ed25519 + Dilithium3 (ML-DSA-65)" } else { "Ed25519" }
+                    "use_pq_sig": config.use_pq_sig,
+                    "sig_type": if config.use_pq_sig { "Dilithium3 (ML-DSA-65)" } else { "none (unsigned throughput)" }
                 }
             })))
         }
@@ -15932,23 +15652,23 @@ async fn run_benchmark_generator(
     println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 
-/// HYBRID BENCHMARK GENERATOR — Ed25519 + Dilithium3 (ML-DSA-65) dual signing.
+/// PQ BENCHMARK GENERATOR — pure Dilithium3 (ML-DSA-65) signing.
 ///
-/// Every TX is double-signed on the generator side and dual-verified on the node side.
+/// Every TX is Dilithium3-signed on the generator side and verified on the node side.
 /// This measures REAL post-quantum throughput — no shortcuts.
 ///
 /// Design mirrors run_benchmark_generator but:
-///   - Uses HybridBenchmarkAccount (Ed25519 + Dilithium3 keypairs)
-///   - Calls generate_hybrid_transaction_from_snapshot() for each TX
-///   - Submits via submit_benchmark_batch_hybrid() (dual-verify gate)
+///   - Uses PqBenchmarkAccount (Dilithium3 keypairs)
+///   - Calls generate_pq_transaction_from_snapshot() for each TX
+///   - Submits via submit_benchmark_batch_pq() (Dilithium3 verify gate)
 ///
 /// Scale horizontally across cores with multiple worker tasks.
-async fn run_hybrid_benchmark_generator(
+async fn run_pq_benchmark_generator(
     blockchain: Arc<BlockchainNode>,
     total_transactions: u64,
     target_tps: u64,
 ) {
-    use crate::benchmark::{BENCHMARK_MANAGER, generate_hybrid_transaction_from_snapshot};
+    use crate::benchmark::{BENCHMARK_MANAGER, generate_pq_transaction_from_snapshot};
     use std::time::Instant;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc as StdArc;
@@ -15962,19 +15682,19 @@ async fn run_hybrid_benchmark_generator(
     let batch_size = 100usize; // Small batches — Dilithium3 verify is expensive
     let batch_delay = std::time::Duration::from_millis(10);
 
-    println!("[BENCHMARK-HYBRID] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("[BENCHMARK-HYBRID] 🔐 Ed25519 + Dilithium3 (ML-DSA-65) dual-sign mode");
-    println!("[BENCHMARK-HYBRID] ⚙️  Workers: {}, Batch: {}, Target TPS: {}", num_workers, batch_size, target_tps);
-    println!("[BENCHMARK-HYBRID] ⚠️  ~50× slower than Ed25519-only — real PQ overhead");
-    println!("[BENCHMARK-HYBRID] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK-PQ] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK-PQ] 🔐 Pure Dilithium3 (ML-DSA-65) sign mode");
+    println!("[BENCHMARK-PQ] ⚙️  Workers: {}, Batch: {}, Target TPS: {}", num_workers, batch_size, target_tps);
+    println!("[BENCHMARK-PQ] ⚠️  ~50× slower than Ed25519-only — real PQ overhead");
+    println!("[BENCHMARK-PQ] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let accounts_snapshot = BENCHMARK_MANAGER.get_hybrid_accounts_snapshot().await;
+    let accounts_snapshot = BENCHMARK_MANAGER.get_pq_accounts_snapshot().await;
     if accounts_snapshot.len() < 2 {
-        println!("[BENCHMARK-HYBRID] ❌ Not enough hybrid accounts! Aborting.");
+        println!("[BENCHMARK-PQ] ❌ Not enough PQ accounts! Aborting.");
         BENCHMARK_MANAGER.stop().await;
         return;
     }
-    println!("[BENCHMARK-HYBRID] 📋 {} hybrid accounts cloned for workers", accounts_snapshot.len());
+    println!("[BENCHMARK-PQ] 📋 {} PQ accounts cloned for workers", accounts_snapshot.len());
 
     let start = Instant::now();
     let global_sent      = StdArc::new(AtomicU64::new(0));
@@ -16010,8 +15730,8 @@ async fn run_hybrid_benchmark_generator(
                     if local_sent >= tx_per_worker || !BENCHMARK_MANAGER.is_running() {
                         break;
                     }
-                    // Dilithium3 sign happens inside generate_hybrid_transaction_from_snapshot
-                    if let Some(tx) = generate_hybrid_transaction_from_snapshot(&worker_accounts) {
+                    // Dilithium3 sign happens inside generate_pq_transaction_from_snapshot
+                    if let Some(tx) = generate_pq_transaction_from_snapshot(&worker_accounts) {
                         batch.push(tx);
                         local_sent += 1;
                     }
@@ -16025,8 +15745,8 @@ async fn run_hybrid_benchmark_generator(
                 }
 
                 let batch_len = batch.len();
-                // Dual-verify gate: Ed25519 + Dilithium3
-                match blockchain_clone.submit_benchmark_batch_hybrid(batch).await {
+                // Verify gate: pure Dilithium3
+                match blockchain_clone.submit_benchmark_batch_pq(batch).await {
                     Ok(confirmed) => {
                         sent_counter.fetch_add(batch_len as u64, Ordering::SeqCst);
                         confirmed_counter.fetch_add(confirmed as u64, Ordering::SeqCst);
@@ -16055,7 +15775,7 @@ async fn run_hybrid_benchmark_generator(
     let final_errors    = global_errors.load(Ordering::SeqCst);
     let final_tps       = final_sent as f64 / elapsed.max(0.001);
 
-    // Final sync with BENCHMARK_MANAGER (same pattern as Ed25519 generator)
+    // Final sync with BENCHMARK_MANAGER (same pattern as the non-PQ generator)
     let current_stats = BENCHMARK_MANAGER.get_status().await;
     let remaining_sent = final_sent.saturating_sub(current_stats.transactions_sent);
     let remaining_confirmed = final_confirmed.saturating_sub(current_stats.transactions_confirmed);
@@ -16069,14 +15789,14 @@ async fn run_hybrid_benchmark_generator(
         if final_tps > *peak { *peak = final_tps; }
     }
 
-    println!("[BENCHMARK-HYBRID] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("[BENCHMARK-HYBRID] 🏁 HYBRID BENCHMARK COMPLETED");
-    println!("[BENCHMARK-HYBRID] 📦 Sent:      {}", final_sent);
-    println!("[BENCHMARK-HYBRID] ✅ Confirmed: {} (dual Ed25519+Dilithium3 verified)", final_confirmed);
-    println!("[BENCHMARK-HYBRID] ❌ Errors:    {}", final_errors);
-    println!("[BENCHMARK-HYBRID] ⏱️  Duration:  {:.2}s", elapsed);
-    println!("[BENCHMARK-HYBRID] ⚡ Actual TPS: {:.0} (PQ-honest)", final_tps);
-    println!("[BENCHMARK-HYBRID] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK-PQ] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK-PQ] 🏁 PQ BENCHMARK COMPLETED");
+    println!("[BENCHMARK-PQ] 📦 Sent:      {}", final_sent);
+    println!("[BENCHMARK-PQ] ✅ Confirmed: {} (Dilithium3 verified)", final_confirmed);
+    println!("[BENCHMARK-PQ] ❌ Errors:    {}", final_errors);
+    println!("[BENCHMARK-PQ] ⏱️  Duration:  {:.2}s", elapsed);
+    println!("[BENCHMARK-PQ] ⚡ Actual TPS: {:.0} (PQ-honest)", final_tps);
+    println!("[BENCHMARK-PQ] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     BENCHMARK_MANAGER.stop().await;
 }

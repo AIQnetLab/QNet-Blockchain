@@ -24,14 +24,20 @@ echo -e "Server IP: ${GREEN}$SERVER_IP${NC}"
 echo -e "Domain: ${GREEN}$DOMAIN_NAME${NC}"
 echo ""
 
+# accept-new pins the host key on first contact and rejects it if it ever
+# changes (MITM), unlike "no" which blindly trusts every key. For stronger
+# assurance, pre-provision the host key: ssh-keyscan $SERVER_IP >> ~/.ssh/known_hosts
+# and switch this to StrictHostKeyChecking=yes.
+SSH_OPTS="-o StrictHostKeyChecking=accept-new"
+
 # Function to run commands on remote server
 run_remote() {
-    ssh -o StrictHostKeyChecking=no $SSH_USER@$SERVER_IP "$1"
+    ssh $SSH_OPTS $SSH_USER@$SERVER_IP "$1"
 }
 
 # Function to copy files to remote server
 copy_to_remote() {
-    scp -o StrictHostKeyChecking=no "$1" $SSH_USER@$SERVER_IP:"$2"
+    scp $SSH_OPTS "$1" $SSH_USER@$SERVER_IP:"$2"
 }
 
 echo -e "${YELLOW}📋 Step 1: Initial Server Setup${NC}"
@@ -184,6 +190,14 @@ EOF
 echo -e "${YELLOW}📋 Step 4: Setup SSL Certificate${NC}"
 echo -e "${BLUE}⚠️ Make sure your domain $DOMAIN_NAME points to $SERVER_IP before continuing${NC}"
 read -p "Press Enter when DNS is configured..."
+
+# Confirm DNS actually resolves to this server; otherwise certbot --non-interactive
+# fails the challenge and silently leaves the temporary self-signed cert in place.
+RESOLVED_IP=$(getent hosts "$DOMAIN_NAME" | awk '{print $1}' | head -n1)
+if [ "$RESOLVED_IP" != "$SERVER_IP" ]; then
+    echo -e "${RED}❌ $DOMAIN_NAME resolves to '${RESOLVED_IP:-nothing}', expected $SERVER_IP. Fix DNS and re-run.${NC}"
+    exit 1
+fi
 
 run_remote "
     echo '🔐 Installing SSL certificate...'

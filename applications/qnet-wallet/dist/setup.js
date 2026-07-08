@@ -1868,67 +1868,19 @@ async function generateEONAddress(seedPhrase) {
         // Error:('No seed phrase provided for EON address generation');
         return 'error_no_seed_eon_address';
     }
-    
-    try {
-        // Convert mnemonic to seed using BIP39 standard
-        const seed = await mnemonicToSeed(seedPhrase);
-        
-        // BIP44 path for QNet: m/44'/9999'/0'/0'/0'
-        const path = "m/44'/9999'/0'/0'/0'";
-        
-        // Derive seed for QNet using the path
-        const derivedSeed = await deriveEd25519Seed(seed, path);
-        
-        // Generate keypair from derived seed
-        const privateKey = derivedSeed.slice(0, 32);
-        
-        // CRITICAL v2.66: Generate Ed25519 public key (NOT SHA-256!)
-        // SHA256(privateKey) was cryptographically WRONG - signatures didn't work
-        // Must use Ed25519 curve: publicKey = privateKey * G
-        let publicKey;
-        if (typeof nacl !== 'undefined' && nacl.sign && nacl.sign.keyPair) {
-            const keypair = nacl.sign.keyPair.fromSeed(privateKey);
-            publicKey = keypair.publicKey;
-        } else {
-            // Fallback to background.js ProductionCrypto if nacl not available
-            throw new Error('tweetnacl not available for Ed25519 keypair generation');
-        }
-        
-        // Generate address from public key
-        const addressData = await crypto.subtle.digest('SHA-512', publicKey);
-        const addressHash = Array.from(new Uint8Array(addressData));
-        const fullHex = addressHash.map(b => b.toString(16).padStart(2, '0')).join('');
-        
-        // Create address format: 19 chars + "eon" + 15 chars + 4 char checksum
-        const part1 = fullHex.substring(0, 19).toLowerCase();
-        const part2 = fullHex.substring(19, 34).toLowerCase();
-        
-        // Generate SHA-256 checksum
-        const addressWithoutChecksum = part1 + 'eon' + part2;
-        const encoder = new TextEncoder();
-        const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
-        const checksumHash = Array.from(new Uint8Array(checksumBuffer));
-        const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
-        const checksum = checksumHex.substring(0, 4).toLowerCase();
-        
-        return `${part1}eon${part2}${checksum}`;
-    } catch (error) {
-        // Error:('Failed to generate QNet address:', error);
-        // Fallback to old method for compatibility
-        const encoder = new TextEncoder();
-        const seedData = encoder.encode(seedPhrase + 'qnet_eon_0');
-        const hashBuffer = await crypto.subtle.digest('SHA-512', seedData);
-        const hash = Array.from(new Uint8Array(hashBuffer));
-        const fullHex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
-        const part1 = fullHex.substring(0, 19).toLowerCase();
-        const part2 = fullHex.substring(19, 34).toLowerCase();
-        const addressWithoutChecksum = part1 + 'eon' + part2;
-        const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
-        const checksumHash = Array.from(new Uint8Array(checksumBuffer));
-        const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
-        const checksum = checksumHex.substring(0, 4).toLowerCase();
-        return `${part1}eon${part2}${checksum}`;
+
+    // CANONICAL pure-Dilithium (ML-DSA-65) EON address via the bundle. This is the SAME derivation
+    // the background service worker uses to actually create the wallet, so the address shown here in
+    // setup MATCHES the stored wallet and is byte-identical to the Rust node + mobile app
+    // (golden KAT: "abandon…about" → d9fa370374e24333242eon847d1d354dcd87fe873823e).
+    // NO Ed25519/BIP44/SHA fallback — a wrong address must never be shown.
+    const lib = (typeof window !== 'undefined') ? window.QNetDilithiumLib
+              : (typeof self !== 'undefined') ? self.QNetDilithiumLib : null;
+    const Q = lib && lib.QNetDilithium;
+    if (!Q || typeof Q.deriveWallet !== 'function') {
+        throw new Error('QNetDilithium bundle not loaded — lib/noble-pq-ml-dsa.js must load before setup.js');
     }
+    return Q.deriveWallet(seedPhrase.trim()).address;
 }
 
 /**

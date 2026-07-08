@@ -219,7 +219,12 @@ pub struct GossipEngine {
 }
 ```
 
-### 3. Add Sharding Support
+### 3. Add Sharding Support (future option — single-shard today)
+
+> Note: QNet runs SINGLE-shard by design; one shard already reaches ~50k TPS and
+> the sharding auto-arm is gated OFF. The snippet below is a forward-looking
+> design sketch, not a current or in-progress feature.
+
 ```rust
 // Shard the network state
 pub struct ShardedState {
@@ -242,7 +247,7 @@ pub struct ShardedState {
 4. **Implement Adaptive Intervals** - Save bandwidth and battery
 5. **Use DHT for Discovery** - Scalable peer discovery
 6. **Add Geographic Clustering** - Reduce latency by preferring nearby nodes
-7. **Implement State Sharding** - Distribute storage load
+7. **State Sharding (future option)** - Deferred by design; single-shard already serves ~50k TPS, so this is a future lever rather than a required change
 
 ## 📊 Expected Results
 

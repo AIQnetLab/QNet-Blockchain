@@ -4,8 +4,8 @@
 
 This directory contains smart contracts for the QNet ecosystem:
 
-1. **1DEV Token Contract (Solana)** - Token burning and node activation
-2. **QNet Core Contracts (Native)** - Main blockchain functionality
+1. **1DEV Token Contract (Solana)** - Token burning (proof-of-burn) and node activation
+2. **QNet Core Contracts (Native)** - Main blockchain functionality, plus on-chain QRC-20 tokens, QRC-721 NFTs, and general-purpose WASM contracts (deterministic `wasmi` VM, fuel = gas)
 
 ## 1DEV Token Contract (Solana)
 
@@ -79,7 +79,9 @@ anchor deploy --provider.cluster devnet
 ## Contract Addresses
 
 ### Mainnet
-- 1DEV Burn Contract: `TBD`
+- 1DEV SPL Token Mint (Solana): `4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump`
+- 1DEV Burn Contract (program ID): `TBD`
 
-### Devnet
-- 1DEV Burn Contract: `TBD` 
+### Devnet / Testnet
+- 1DEV SPL Token Mint: Solana devnet mint (testnet)
+- 1DEV Burn Contract (program ID): `TBD` 

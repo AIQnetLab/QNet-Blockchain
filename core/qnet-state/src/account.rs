@@ -99,14 +99,9 @@ pub struct Account {
     //     adversary recording today's traffic and decrypting it under a
     //     future CRQC cannot replay or forge TXs from these accounts because
     //     the Dilithium3 binding remains unbroken.
-    #[serde(default)]
-    pub require_pq_signature: bool,
-
-    /// Registered Dilithium3 (ML-DSA-65) public key for this account, hex-encoded
-    /// (3904 chars / 1952 bytes). Set once via `SetPQRequirement`; immutable
-    /// thereafter. `None` until the wallet opts into post-quantum enforcement.
-    #[serde(default)]
-    pub dilithium_public_key: Option<String>,
+    // PURE DILITHIUM (F0.1): per-account `require_pq_signature` + `dilithium_public_key`
+    // removed — PQ signing is mandatory network-wide and the address IS the key binding,
+    // so a per-wallet opt-in flag + registered-key field are obsolete.
 
     // ═══════════════════════════════════════════════════════════════════════════
     // v34: UNFORGEABLE LIVENESS COUNTER (replaces self-attested HeartbeatCommitment)
@@ -188,8 +183,6 @@ impl Default for AccountState {
             is_contract: false,
             contract_code_hash: None,
             contract_storage: HashMap::new(),
-            require_pq_signature: false,
-            dilithium_public_key: None,
             heartbeat_epoch: 0,
             heartbeat_slots: 0,
             heartbeat_final_epoch: 0,
@@ -263,8 +256,6 @@ impl Account {
             is_contract: false,
             contract_code_hash: None,
             contract_storage: HashMap::new(),
-            require_pq_signature: false,
-            dilithium_public_key: None,
             heartbeat_epoch: 0,
             heartbeat_slots: 0,
             heartbeat_final_epoch: 0,
@@ -289,8 +280,6 @@ impl Account {
             is_contract: false,
             contract_code_hash: None,
             contract_storage: HashMap::new(),
-            require_pq_signature: false,
-            dilithium_public_key: None,
             heartbeat_epoch: 0,
             heartbeat_slots: 0,
             heartbeat_final_epoch: 0,
@@ -307,37 +296,5 @@ impl Account {
         self.updated_at = timestamp;
     }
 
-    /// Check whether this account requires post-quantum (Dilithium3) signatures.
-    /// One-way upgrade: once true, cannot be set false.
-    pub fn requires_pq_signature(&self) -> bool {
-        self.require_pq_signature
-    }
-
-    /// Lock this account into post-quantum-only mode AND register the Dilithium3
-    /// public key that all future TXs from this account must use.
-    ///
-    /// One-way upgrade — calling on an already-locked account is a no-op (the
-    /// existing registered key is preserved). Caller MUST verify the
-    /// `SetPQRequirement` transaction was signed with both Ed25519 and Dilithium3
-    /// (proving the account holder owns both keypairs) before invoking, and that
-    /// the Dilithium3 public key on the TX is well-formed (3904 hex chars).
-    ///
-    /// `registered_dilithium_pk` is the hex-encoded ML-DSA-65 public key (3904
-    /// chars / 1952 bytes). Stored verbatim and used for byte-equal comparison
-    /// at every subsequent TX apply.
-    pub fn lock_pq_signature_required(&mut self, registered_dilithium_pk: String) {
-        if !self.require_pq_signature {
-            // First time lock — register the key
-            self.require_pq_signature = true;
-            self.dilithium_public_key = Some(registered_dilithium_pk);
-        }
-        // If already locked, dilithium_public_key is preserved (no rebinding).
-    }
-
-    /// Get the registered Dilithium3 public key for this account, if any.
-    /// `None` for accounts that haven't opted into PQ enforcement.
-    pub fn registered_dilithium_pk(&self) -> Option<&str> {
-        self.dilithium_public_key.as_deref()
-    }
 }
 

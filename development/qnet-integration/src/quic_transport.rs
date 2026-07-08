@@ -3139,7 +3139,7 @@ mod tests_v19_handshake {
 
     /// A non-UTF-8 proof byte slice is rejected with `Err`. Real Dilithium3
     /// signatures from `create_consensus_signature` are ASCII-prefixed
-    /// strings (`hybrid_p2p_bin:...`, `compact_bin:...`, `dilithium_sig_...`)
+    /// strings (`pq_p2p_bin:...`, `compact_bin:...`, `dilithium_sig_...`)
     /// — anything that is not valid UTF-8 cannot be one of those formats
     /// and is structurally invalid. Returning `Err` here is what causes
     /// the receiver to drop the connection (handshake abort).

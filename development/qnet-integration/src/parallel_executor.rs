@@ -141,10 +141,9 @@ impl ParallelExecutor {
                         from_shard: self.shard_coordinator.get_shard(&tx.from),
                         to_shard: self.shard_coordinator.get_shard(to),
                         amount: tx.amount,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
+                        // Deterministic: ordering comes from the dependency graph, not this field.
+                        // No wall-clock in a would-be state-transition path.
+                        timestamp: 0,
                     };
                     self.shard_coordinator.process_cross_shard_tx(cross_tx).await
                         .map_err(|e| e.to_string())?;

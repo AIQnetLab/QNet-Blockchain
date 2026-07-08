@@ -69,12 +69,13 @@ export class NodeOwnershipManager {
                 throw new Error('Device already has an active node');
             }
 
-            // Create device migration transaction
+            // Create device migration transaction.
+            // SECURITY (pure-Dilithium): the migration is authorized by a client-side signature
+            // (createMigrationSignature) — the raw private key is NEVER sent to the node.
             const migrationTx = await this.qnetIntegration.makeRPCCall('migrate_device', {
                 activation_code: activationCode,
                 wallet_address: walletAddress,
                 new_device_signature: newDeviceSignature,
-                private_key: privateKey,
                 timestamp: Date.now(),
                 signature: await this.createMigrationSignature(activationCode, walletAddress, newDeviceSignature, privateKey)
             });

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { getRateLimitKey } from '../../../../../lib/rate-limit';
 
 // ============================================================================
 // Faucet Claim API - 1DEV (Solana SPL) + SOL + QNC
@@ -18,6 +19,28 @@ const FAUCET_CONFIG = {
 
 const rateLimitStore = new Map<string, { count: number; lastReset: number }>();
 const addressCooldowns = new Map<string, number>();
+
+// ---------------------------------------------------------------------------
+// Faucet signing key loader
+// ---------------------------------------------------------------------------
+// The key is read ONLY from the runtime secret FAUCET_PRIVATE_KEY (a JSON
+// byte-array, injected by the deploy's secrets manager). It is never logged
+// and there is no on-disk fallback — the wallet must not be recoverable from
+// repo/config files. Returns null when unset/malformed so callers fail closed.
+function loadFaucetWallet(
+  Keypair: typeof import('@solana/web3.js').Keypair,
+): import('@solana/web3.js').Keypair | null {
+  const raw = process.env.FAUCET_PRIVATE_KEY;
+  if (!raw) return null;
+  try {
+    const bytes = JSON.parse(raw);
+    if (!Array.isArray(bytes) || bytes.length === 0) return null;
+    return Keypair.fromSecretKey(new Uint8Array(bytes));
+  } catch {
+    // Never surface the key material in the error path.
+    return null;
+  }
+}
 
 function validateSolanaAddress(address: string): boolean {
   const base58Regex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -64,36 +87,6 @@ function checkAddressCooldown(
   }
 
   return { allowed: false, nextClaimTime: lastClaim + cooldownMs };
-}
-
-// ---------------------------------------------------------------------------
-// v14.5: SECURE CLIENT IP DETECTION
-// ---------------------------------------------------------------------------
-// Previous implementation trusted x-forwarded-for / x-real-ip / cf-connecting-ip
-// headers blindly. An attacker could send any value and defeat per-IP rate
-// limits by rotating the header on every request.
-//
-// New rule: proxy-supplied headers are ONLY trusted when the deployment
-// explicitly opts in via FAUCET_TRUSTED_PROXY=1 (set by the reverse-proxy
-// operator who controls the edge). Without that flag we always rely on the
-// direct socket address (NextRequest.ip, populated by the runtime) and never
-// on attacker-controlled headers.
-// ---------------------------------------------------------------------------
-function getClientIP(request: NextRequest): string {
-  const trustProxy = process.env.FAUCET_TRUSTED_PROXY === '1';
-  if (trustProxy) {
-    // Operator asserts the edge strips/normalises the header chain.
-    const forwarded = request.headers.get('x-forwarded-for');
-    if (forwarded) return forwarded.split(',')[0].trim();
-    const realIP = request.headers.get('x-real-ip');
-    if (realIP) return realIP;
-    const cfIP = request.headers.get('cf-connecting-ip');
-    if (cfIP) return cfIP;
-  }
-  // Default path: direct socket address (not forgeable over the network).
-  // Next.js populates `ip` from the underlying connection when no trusted
-  // proxy chain is configured.
-  return (request as unknown as { ip?: string }).ip || 'unknown';
 }
 
 // ---------------------------------------------------------------------------
@@ -151,33 +144,14 @@ async function send1DEVTokens(
       confirmTransactionInitialTimeout: 3000,
     });
 
-    // Load faucet private key
-    let faucetPrivateKey: number[] | undefined;
-    const faucetPrivateKeyEnv = process.env.FAUCET_PRIVATE_KEY;
-
-    if (faucetPrivateKeyEnv) {
-      faucetPrivateKey = JSON.parse(faucetPrivateKeyEnv);
-    } else {
-      const path = await import('path');
-      const fs = await import('fs');
-      const candidates = [
-        path.join(process.cwd(), '..', '..', '..', 'infrastructure', 'config', 'faucet-config-testnet.json'),
-        '/var/qnet-fresh/infrastructure/config/faucet-config-testnet.json',
-      ];
-      for (const p of candidates) {
-        if (fs.existsSync(p)) {
-          const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-          faucetPrivateKey = cfg.wallet?.secretKey;
-          break;
-        }
-      }
-    }
-
-    if (!faucetPrivateKey) {
+    // Fail-closed: the signing key comes ONLY from the runtime secret (injected
+    // by the deploy's secrets manager). No on-disk fallback — a committed key
+    // file would leak the wallet to anyone with repo access.
+    const faucetWallet = loadFaucetWallet(Keypair);
+    if (!faucetWallet) {
       return { success: false, error: 'Faucet configuration error - private key not found' };
     }
 
-    const faucetWallet = Keypair.fromSecretKey(new Uint8Array(faucetPrivateKey));
     const mintPubkey = new PublicKey(TOKEN_MINT);
     const recipientPubkey = new PublicKey(address);
 
@@ -250,32 +224,13 @@ async function sendSOLTokens(
       confirmTransactionInitialTimeout: 3000,
     });
 
-    // Load faucet private key (same wallet as 1DEV)
-    let faucetPrivateKey: number[] | undefined;
-    const faucetPrivateKeyEnv = process.env.FAUCET_PRIVATE_KEY;
-    if (faucetPrivateKeyEnv) {
-      faucetPrivateKey = JSON.parse(faucetPrivateKeyEnv);
-    } else {
-      const path = await import('path');
-      const fs = await import('fs');
-      const candidates = [
-        path.join(process.cwd(), '..', '..', '..', 'infrastructure', 'config', 'faucet-config-testnet.json'),
-        '/var/qnet-fresh/infrastructure/config/faucet-config-testnet.json',
-      ];
-      for (const p of candidates) {
-        if (fs.existsSync(p)) {
-          const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-          faucetPrivateKey = cfg.wallet?.secretKey;
-          break;
-        }
-      }
-    }
-
-    if (!faucetPrivateKey) {
+    // Fail-closed: signing key sourced only from the runtime secret (same
+    // wallet as 1DEV). No on-disk fallback.
+    const faucetWallet = loadFaucetWallet(Keypair);
+    if (!faucetWallet) {
       return { success: false, error: 'Faucet configuration error - private key not found' };
     }
 
-    const faucetWallet = Keypair.fromSecretKey(new Uint8Array(faucetPrivateKey));
     const recipientPubkey = new PublicKey(address);
     const lamports = Math.round(amount * 1e9);
 
@@ -419,8 +374,18 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      const clientIP = getClientIP(request);
-      const rl = checkRateLimit(clientIP);
+      // Derive the per-IP key from trusted proxy headers. On mainnet with no
+      // trusted proxy configured this fails closed (503) instead of collapsing
+      // every caller into one shared bucket.
+      const ipKey = getRateLimitKey(request);
+      if (!ipKey.ok) {
+        return NextResponse.json(
+          { success: false, error: `Service misconfigured: ${ipKey.reason}` },
+          { status: 503 },
+        );
+      }
+
+      const rl = checkRateLimit(ipKey.ip);
       if (!rl.allowed) {
         return NextResponse.json(
           { success: false, error: 'Too many requests. Please try again later.' },

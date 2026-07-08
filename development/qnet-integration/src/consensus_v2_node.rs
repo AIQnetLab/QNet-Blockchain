@@ -9,7 +9,7 @@ use crate::storage::Storage;
 use qnet_consensus::checkpoint_bft::{Hash, QuorumCertificate, TimeoutMsg, Vote};
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 
 /// Checkpoint-BFT (v2) is the ONLY macroblock consensus since the legacy commit/reveal
@@ -285,6 +285,7 @@ pub enum V2Event {
         banned: Vec<String>,           // QC-bound cumulative ban set (binds stored banned_validators)
         reward_root: Hash,             // per-epoch reward merkle root ([0;32] off emission boundary)
         registry_root: Hash,           // deterministic Super/genesis registry digest (snapshot-forge defence)
+        logs_root: Hash,               // RESERVED WASM-event logs root (gated `logs_root_required`; [0;32] until active)
         total_supply: u64,             // QC-bound total minted supply (cold-joiner reads this, not balance sum)
     },
     // A macroblock whose checkpoint QC the apply path already verified against the correct epoch
@@ -307,6 +308,7 @@ struct WindowContent {
     banned: Vec<String>,   // QC-bound cumulative ban set (folded into epoch_commitment)
     reward_root: Hash,     // per-epoch reward merkle root, QC-certified via Checkpoint.reward_root
     registry_root: Hash,   // Super/genesis registry digest, QC-certified via Checkpoint.registry_root
+    logs_root: Hash,       // RESERVED WASM-event logs root (gated; [0;32] until logs_root_required active)
     total_supply: u64,     // total minted supply, QC-certified via Checkpoint.total_supply
 }
 
@@ -321,7 +323,7 @@ fn try_propose(
     match buf.get(&w) {
         Some(c) => {
             *committee = c.committee.clone(); // committee is per-window (epoch); QC/TC verify against it
-            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root, c.total_supply)
+            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root, c.logs_root, c.total_supply)
         }
         None => Vec::new(),
     }
@@ -345,6 +347,8 @@ fn content_ok(buf: &std::collections::HashMap<u64, WindowContent>, msg: &Consens
                 && cp.reward_root == c.reward_root
                 && (!qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height)
                     || cp.registry_root == c.registry_root)
+                && (!qnet_state::feature_gates::is_active("logs_root_required", cp.window_head_height)
+                    || cp.logs_root == c.logs_root)
                 && (!qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height)
                     || cp.total_supply == c.total_supply))
             .unwrap_or(false),
@@ -375,19 +379,48 @@ fn drain_pending(
 
 static V2_TX: OnceCell<mpsc::UnboundedSender<V2Event>> = OnceCell::new();
 
+/// Backpressure bound (BYTES) on UNPROCESSED inbound PEER consensus messages. A flooding
+/// peer cannot grow the queue past this ⇒ RAM is capped, closing the unbounded-channel OOM.
+/// Bounded by bytes, not count, because messages vary widely (a vote ≈ a few KB; a proposal
+/// carrying a QC can be hundreds of KB). Local control events (WindowEnd/Synced) are NOT
+/// counted here ⇒ never throttled. Consensus tolerates inbound loss (the pacemaker re-proposes,
+/// peers re-gossip); the driver's `verify_msg` remains the committee/validity gate. Generous
+/// vs legitimate in-flight volume (committee ≤100 × O(1) msgs/round ≪ 1 MiB), so honest traffic
+/// is never dropped outside an active flood. A MEMORY bound, not a rate — cannot throttle
+/// legitimate throughput (unlike the v17.x per-minute limit that stalled the net).
+static V2_INBOUND_BYTES: AtomicUsize = AtomicUsize::new(0);
+const V2_INBOUND_BYTE_CAP: usize = 64 * 1024 * 1024; // 64 MiB of queued inbound consensus bytes
+/// Companion BYTE bound on the driver's future-round `pending` replay buffer. The 256-ENTRY
+/// count cap alone still allows 256 × msg_size (a large-proposal flood ⇒ hundreds of MiB),
+/// so pending is independently byte-capped. Total inbound consensus memory ≤ this + the
+/// channel cap. `drain_pending` only REMOVES entries, so it can never exceed this bound —
+/// the gate lives solely at the single push site below.
+const V2_PENDING_BYTE_CAP: usize = 32 * 1024 * 1024; // 32 MiB of buffered future-round bytes
+
 /// P2P dispatch calls this for NetworkMessage::ConsensusV2 (no-op until run() starts).
 pub fn route_inbound(data: Vec<u8>) {
-    if let Some(tx) = V2_TX.get() { let _ = tx.send(V2Event::Inbound(data)); }
+    if let Some(tx) = V2_TX.get() {
+        // Reserve the message's bytes; drop under flood so a peer cannot OOM the node. The
+        // reservation is released when run() dequeues the message (or here if the send fails).
+        let n = data.len();
+        if V2_INBOUND_BYTES.fetch_add(n, Ordering::AcqRel) + n > V2_INBOUND_BYTE_CAP {
+            V2_INBOUND_BYTES.fetch_sub(n, Ordering::AcqRel);
+            return; // dropped under flood — consensus re-gossips / the pacemaker re-proposes
+        }
+        if tx.send(V2Event::Inbound(data)).is_err() {
+            V2_INBOUND_BYTES.fetch_sub(n, Ordering::AcqRel); // channel gone (shutdown)
+        }
+    }
 }
 
 /// Production loop calls this at each checkpoint-window boundary.
 pub fn signal_window_end(
     index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
     committee: Vec<String>, eligible_producers: Vec<u8>, banned: Vec<String>, reward_root: Hash,
-    registry_root: Hash, total_supply: u64,
+    registry_root: Hash, logs_root: Hash, total_supply: u64,
 ) {
     if let Some(tx) = V2_TX.get() {
-        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root, registry_root, total_supply });
+        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root, registry_root, logs_root, total_supply });
     }
 }
 
@@ -424,6 +457,9 @@ pub async fn run(
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(timeout_ms));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_index = driver.current_index();
+    let mut last_committed = driver.committed_index(); // progress signal resetting the adaptive backoff
+    let mut consec_timeouts: u32 = 0; // views timed out without a commit → grows the effective view timeout
+    let mut ticks_stuck: u32 = 0;     // base ticks accumulated toward the next backed-off on_timeout
     let mut last_signaled: u64 = 0; // highest window index we hold data for (gates idle timeouts)
     let mut pending: Vec<Vec<u8>> = Vec::new(); // inbound ahead of our round; replayed as we advance
     const MAX_PENDING: usize = 256; // DoS bound on the replay buffer
@@ -468,6 +504,11 @@ pub async fn run(
     loop {
         tokio::select! {
             Some(ev) = rx.recv() => {
+                // Release the inbound-backpressure reservation (taken in route_inbound) as soon
+                // as a PEER message leaves the queue. Control events are not counted → never gated.
+                if let V2Event::Inbound(ref d) = ev {
+                    V2_INBOUND_BYTES.fetch_sub(d.len(), Ordering::AcqRel);
+                }
                 let effects = match ev {
                     V2Event::Inbound(data) => match bincode::deserialize::<ConsensusMsg>(&data) {
                         Ok(msg) => {
@@ -476,7 +517,14 @@ pub async fn run(
                             // Buffer until we hold that committee, or for a round ahead of us (rounds
                             // skip on timeout) — replayed as we advance. Bounded against DoS.
                             if !window_buf.contains_key(&driver.next_window()) || msg_index(&msg) > driver.current_index() {
-                                if pending.len() < MAX_PENDING { pending.push(data); }
+                                // Bound the replay buffer by BYTES as well as its 256-entry count,
+                                // so a large-proposal future-round flood cannot grow it unbounded.
+                                // O(pending) sum; pushes are rare (future-round only). Over either
+                                // bound ⇒ drop (re-gossiped later; the buffer is best-effort).
+                                let cur: usize = pending.iter().map(|d| d.len()).sum();
+                                if pending.len() < MAX_PENDING && cur + data.len() <= V2_PENDING_BYTE_CAP {
+                                    pending.push(data);
+                                }
                                 Vec::new()
                             } else if verify_msg(&p2p, &committee, &msg) {
                                 // C: a proposal's epoch_commitment must match our OWN independently
@@ -547,7 +595,7 @@ pub async fn run(
                         }
                         Err(_) => Vec::new(),
                     },
-                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned, reward_root, registry_root, total_supply } => {
+                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned, reward_root, registry_root, logs_root, total_supply } => {
                         // Buffer this window's content (head microblock's real timestamp rides in
                         // the QC-agreed checkpoint). Then propose the contiguous next window if we
                         // lead, and replay buffered inbound.
@@ -555,7 +603,7 @@ pub async fn run(
                         let head_ts = storage.load_microblock_auto_format(head_height)
                             .ok().flatten().map(|m| m.timestamp).unwrap_or(0);
                         window_buf.insert(index, WindowContent {
-                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root, total_supply,
+                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root, logs_root, total_supply,
                         });
                         if window_buf.len() > MAX_WINDOW_BUF {
                             if let Some(&lo) = window_buf.keys().min() { window_buf.remove(&lo); }
@@ -588,11 +636,25 @@ pub async fn run(
                 last_index = driver.current_index();
             }
             _ = timer.tick() => {
-                // Time out only a window we have data for and are actively committing. Between
-                // windows the view idles ~90s — never time out then (would skip the next window).
+                // Adaptive view timeout (exponential backoff, reset on commit). A fixed view can't
+                // gather 2f+1 when the real round-trip exceeds it (slow node) → perpetual view-changes,
+                // no finality regardless of committee size. Grow the effective timeout 4→8→16→32→60s
+                // until a view lasts long enough to reach quorum; reset on any commit. Safety is
+                // timeout-independent (commit needs a same-round 2f+1 QC). Time out only a window we
+                // hold data for and are committing; between windows the view idles — never time out then.
+                let committed = driver.committed_index();
+                if committed > last_committed { last_committed = committed; consec_timeouts = 0; ticks_stuck = 0; }
                 if driver.current_index() == last_index && driver.next_window() <= last_signaled {
-                    let effects = driver.on_timeout();
-                    execute(effects, &node_id, &p2p, &storage).await;
+                    ticks_stuck = ticks_stuck.saturating_add(1);
+                    let need = (1u32 << consec_timeouts.min(4)).min(15); // base ticks: 4,8,16,32,60s
+                    if ticks_stuck >= need {
+                        let effects = driver.on_timeout();
+                        execute(effects, &node_id, &p2p, &storage).await;
+                        consec_timeouts = consec_timeouts.saturating_add(1);
+                        ticks_stuck = 0;
+                    }
+                } else {
+                    ticks_stuck = 0;
                 }
                 last_index = driver.current_index();
                 // LIVENESS WATCHDOG + SELF-HEAL: the applied chain tip advances via macroblock sync even

@@ -287,14 +287,18 @@ export class WalletManager {
         try {
             // Generate Solana keypair
             const solanaKeypair = await this.crypto.generateSolanaKeypair(mnemonic, index);
-            
-            // Generate QNet address
-            const qnetAddress = await this.crypto.generateQNetAddress(mnemonic, index);
+
+            // Generate the CANONICAL pure-Dilithium (ML-DSA-65) QNet wallet — address + key material.
+            // Byte-identical to the Rust node + mobile app (golden-KAT proven). The sk/pk hex are
+            // stored on the account so QNet value transfers can be signed client-side (signQNet).
+            const qnetWallet = await this.crypto.deriveQNetWallet(mnemonic);
 
             return {
                 index: index,
                 name: `Account ${index + 1}`,
-                address: qnetAddress,
+                address: qnetWallet.address,                 // EON address (from ML-DSA-65 pk)
+                qnetPublicKey: qnetWallet.publicKey,         // ML-DSA-65 pk (hex, 1952B) — verify + sign
+                qnetSecretKey: qnetWallet.secretKey,         // ML-DSA-65 sk (hex, 4032B) — sign
                 solanaAddress: solanaKeypair.publicKey.toString(),
                 derivationPath: `m/44'/501'/${index}'/0'`,
                 created: Date.now()
@@ -455,26 +459,63 @@ export class WalletManager {
     }
 
     /**
-     * Send QNet testnet transaction
+     * Send QNet transaction — pure-Dilithium signed (ML-DSA-65).
+     *
+     * Builds the canonical transfer message the node's value-TX gate verifies:
+     *   message = `transfer:${from}:${to}:${amountNano}:${nonce}:${gasPrice}:${gasLimit}`
+     * signs it with the account's ML-DSA-65 secret key via the bundle (Q.signQNet), and POSTs the
+     * wire-format signature + public key to /api/v1/transaction. `from` is the account EON address;
+     * amount is integer nano-QNC. No plaintext private key is ever transmitted.
      */
     async sendQNetTransaction(transaction) {
         try {
-            console.log('📤 Sending QNet testnet transaction:', transaction);
+            const account = this.getCurrentAccount();
+            if (!account) {
+                throw new Error('No active account');
+            }
 
-            // Real QNet testnet API integration
+            const skHex = account.qnetSecretKey;
+            const pkHex = account.qnetPublicKey;
+            if (!skHex || !pkHex) {
+                throw new Error('Account is missing Dilithium key material — cannot sign QNet transaction');
+            }
+
+            // Load the canonical signer from the bundle (window in page, self in worker).
+            const g = (typeof window !== 'undefined') ? window
+                    : (typeof self !== 'undefined') ? self
+                    : (typeof globalThis !== 'undefined') ? globalThis : null;
+            const Q = g && g.QNetDilithiumLib && g.QNetDilithiumLib.QNetDilithium;
+            if (!Q || typeof Q.signQNet !== 'function') {
+                throw new Error('QNetDilithium bundle not loaded — lib/noble-pq-ml-dsa.js must load before wallet code');
+            }
+
+            const from = account.address;                          // EON address
+            const to = transaction.to;
+            const amountNano = Math.floor(Number(transaction.amount) * 1_000_000_000); // integer nano-QNC
+            const gasPrice = 10;
+            const gasLimit = 21000;
+            const nonce = Number.isInteger(transaction.nonce) ? transaction.nonce : 1;
+
+            // Canonical message — EXACTLY the string the node re-derives and verifies against.
+            const message = `transfer:${from}:${to}:${amountNano}:${nonce}:${gasPrice}:${gasLimit}`;
+            const dilithiumSignature = Q.signQNet(message, skHex, pkHex);
+
+            console.log('📤 Sending QNet Dilithium-signed transaction:', { from, to, amountNano, nonce });
+
             const response = await fetch('http://localhost:8080/api/v1/transaction', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
-                    from: transaction.from,
-                    to: transaction.to,
-                    amount: Math.floor(transaction.amount * 1000000000), // Convert to smallest units
-                    gas_price: 10,
-                    gas_limit: 21000,
-                    nonce: 1,
-                    timestamp: transaction.timestamp
+                    from: from,
+                    to: to,
+                    amount: amountNano,
+                    dilithium_signature: dilithiumSignature,
+                    dilithium_public_key: pkHex,
+                    gas_price: gasPrice,
+                    gas_limit: gasLimit,
+                    nonce: nonce
                 })
             });
 
@@ -485,11 +526,11 @@ export class WalletManager {
             const data = await response.json();
 
             if (data.success) {
-                console.log('✅ QNet testnet transaction sent:', data.tx_hash);
+                console.log('✅ QNet transaction sent:', data.tx_hash);
                 return {
                     signature: data.tx_hash,
                     confirmed: true,
-                    network: 'qnet-testnet',
+                    network: 'qnet',
                     timestamp: Date.now()
                 };
             } else {
@@ -497,20 +538,7 @@ export class WalletManager {
             }
 
         } catch (error) {
-            console.error('QNet testnet transaction failed:', error);
-            
-            // Fallback for testnet development
-            if (error.message.includes('ECONNREFUSED') || error.message.includes('fetch')) {
-                console.log('🔄 QNet API unavailable, using testnet fallback');
-                const txHash = 'qnet_' + Date.now().toString(16) + _cryptoHex(4);
-                return {
-                    signature: txHash,
-                    confirmed: true,
-                    network: 'qnet-testnet-fallback',
-                    timestamp: Date.now()
-                };
-            }
-            
+            console.error('QNet transaction failed:', error);
             throw error;
         }
     }

@@ -338,8 +338,10 @@ impl SyncManager {
                     if let Ok(mut g) = GENESIS_HINT_CACHE.lock() { *g = Some((Instant::now(), m)); }
                     m
                 } else {
-                    // Too few genesis responses: trust a small-gap peer, else give up (delays, never corrupts).
-                    return if best > 0 && best <= local_h + 100 { best } else { heights.first().copied().unwrap_or(0) };
+                    // Never advance the sync target on a single unattested source; wait for quorum
+                    // (2+ genesis) or a signed head. Return local_h so no forward progress is made on
+                    // an unverified hint; the retry loop re-probes and the QC floor stays the safety net.
+                    return local_h;
                 }
             }
         };

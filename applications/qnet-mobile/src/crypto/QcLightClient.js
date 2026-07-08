@@ -77,8 +77,9 @@ export function quorumSize(n) {
 // Layout (checkpoint_bft.rs Checkpoint::hash): tag ++ index(u64LE)
 //   ++ [parent_qc.checkpoint_hash(32) ++ parent_qc.index(u64LE)]?  ++ window_head_height(u64LE)
 //   ++ window_mb_hashes[](32 each) ++ state_root(32) ++ beacon(32) ++ epoch_commitment(32)
-//   ++ reward_root(32) ++ registry_root(32) ++ total_supply(u64LE) ++ timestamp(u64LE)
-//   ++ proposer.utf8 → 32B hash.
+//   ++ reward_root(32) ++ registry_root(32) ++ logs_root(32) ++ total_supply(u64LE)
+//   ++ timestamp(u64LE) ++ proposer.utf8 → 32B hash.
+// logs_root is [0;32] while the contract VM is gated OFF (no window emits WASM logs).
 export function checkpointHash(cp) {
   const parts = [utf8('qnet-checkpoint-v2'), u64le(cp.index)];
   if (cp.parent_qc) {
@@ -92,6 +93,7 @@ export function checkpointHash(cp) {
   parts.push(hexToBytes(cp.epoch_commitment));
   parts.push(hexToBytes(cp.reward_root));
   parts.push(hexToBytes(cp.registry_root));
+  parts.push(hexToBytes(cp.logs_root || '0'.repeat(64)));
   parts.push(u64le(cp.total_supply));
   parts.push(u64le(cp.timestamp));
   parts.push(utf8(cp.proposer));

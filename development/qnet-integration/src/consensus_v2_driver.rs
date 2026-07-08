@@ -137,7 +137,7 @@ impl ConsensusDriver {
         &mut self, window: u64, mb_hashes: Vec<Hash>,
         state_root: Hash, beacon: Hash, head_ts: u64,
         committee: Vec<NodeId>, eligible_producers: Vec<u8>, banned: Vec<NodeId>, reward_root: Hash,
-        registry_root: Hash, total_supply: u64,
+        registry_root: Hash, logs_root: Hash, total_supply: u64,
     ) -> Vec<Effect> {
         self.set_committee(committee.clone());
         let round = self.eng.current_index;
@@ -155,7 +155,15 @@ impl ConsensusDriver {
         let head_height = window.saturating_mul(self.cp_interval);
         let cp = Checkpoint {
             index: round, parent_qc: self.eng.high_qc.clone(), window_head_height: head_height,
-            window_mb_hashes: mb_hashes, state_root, beacon, epoch_commitment: epoch_c, reward_root, registry_root, total_supply, timestamp: head_ts,
+            window_mb_hashes: mb_hashes, state_root, beacon, epoch_commitment: epoch_c, reward_root, registry_root,
+            // Consensus WASM-event logs root, threaded from the caller. Gated `logs_root_required`
+            // (dormant) ⇒ the caller passes [0;32] today, so this is deterministically [0;32] on every
+            // node and content_ok's `cp.logs_root == c.logs_root` is trivially satisfied. Once the gate
+            // activates the caller passes compute_window_logs_root(window) and content_ok enforces the
+            // merkle equivalence — giving trustless light-client EVENT proofs. Kept in Checkpoint::hash
+            // from genesis so the wire format is unchanged at activation.
+            logs_root,
+            total_supply, timestamp: head_ts,
             proposer: self.node_id.clone(), proposer_sig: Vec::new(),
         };
         self.last_proposed_round = round;
@@ -267,7 +275,29 @@ impl ConsensusDriver {
             }
         }
         self.refresh_high_window();
+        self.prune();
         out
+    }
+
+    /// Evict per-round/per-index state below the retention window so the always-on driver + engine
+    /// bound their memory to O(CONSENSUS_STATE_RETAIN·committee) instead of O(chain length). Every
+    /// live reader (next_window, committed_finalize/head, refresh_high_window, Commit, seal_if_ready)
+    /// touches indices at/above committed_index; anything pruned that a lagging node still needs is
+    /// served by §4.5 macroblock sync, never a wedge. Called at the end of `translate` — the single
+    /// funnel run after every engine step. No-op below the retention window (early boot).
+    fn prune(&mut self) {
+        let floor = self.eng.committed_index.saturating_sub(CONSENSUS_STATE_RETAIN);
+        if floor == 0 { return; }
+        self.proposals.retain(|(idx, _), _| *idx >= floor);
+        self.heads.retain(|idx, _| *idx >= floor);
+        self.state_roots.retain(|idx, _| *idx >= floor);
+        self.seal_data.retain(|idx, _| *idx >= floor);
+        // `sealed` is keyed by macroblock window; map the index floor to a window floor. A pruned
+        // window that a late relayed QC re-seals is idempotent (storage.save_macroblock skips an
+        // existing macroblock), so dropping the dedup entry costs at most one no-op write.
+        let win_floor = floor.saturating_mul(self.cp_interval) / self.macro_interval;
+        self.sealed.retain(|w| *w >= win_floor);
+        self.eng.prune_below(floor);
     }
 }
 
@@ -340,7 +370,7 @@ mod tests {
         for index in 1..=8u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], 0);
+                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
@@ -368,7 +398,7 @@ mod tests {
         for index in 1..=6u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], 0);
+                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
@@ -387,7 +417,7 @@ mod tests {
         let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
         let cp = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 10, window_mb_hashes: vec![[1u8; 32]],
-            state_root: [1u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![9, 9],
+            state_root: [1u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![9, 9],
         };
         // forged proposer_sig fails node verify ⇒ never reaches the driver
         assert!(!verify_msg(&c, &ConsensusMsg::Proposal(cp)));
@@ -410,7 +440,7 @@ mod tests {
         fn step(nodes: &mut Vec<Node>, c: &[NodeId], w: u64) {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], 0);
+                let effs = nodes[k].d.build_proposal(w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(nodes, c, seed);
@@ -454,7 +484,7 @@ mod tests {
             let cp = Checkpoint {
                 index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
-                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
                 proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
             };
             let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
@@ -503,7 +533,7 @@ mod tests {
             let cp = Checkpoint {
                 index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
-                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
                 proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
             };
             let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
@@ -541,7 +571,7 @@ mod tests {
             let cp = Checkpoint {
                 index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
-                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
                 proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
             };
             let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
@@ -556,7 +586,7 @@ mod tests {
         let poison = Checkpoint {
             index: 6, parent_qc: prev_qc.clone(), window_head_height: 10_000 * 90,
             window_mb_hashes: vec![[6u8; 32]], state_root: [6u8; 32],
-            beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], total_supply: 0, timestamp: 0,
+            beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
             proposer: c[0].clone(), proposer_sig: Vec::new(),
         };
         let effs = d.handle(&ConsensusMsg::Proposal(poison.clone()));
@@ -567,5 +597,42 @@ mod tests {
         let qc6 = QuorumCertificate { checkpoint_hash: poison.hash(), index: 6, sig_merkle_root: sig_merkle_root(&sigs), signers, sigs };
         let _ = d.handle(&ConsensusMsg::Qc(qc6));
         assert_eq!(d.next_window(), 6, "poisoned head must never latch high_window: next_window stays 6");
+    }
+
+    // Pruning bounds the always-on driver maps to O(RETAIN): per-index state below
+    // committed_index−CONSENSUS_STATE_RETAIN is evicted, the retention window is kept, and the
+    // committed frontier is untouched. (Direct seed — driving 128+ real commits in a unit sim just
+    // to reach the floor is unnecessary; engine map eviction is covered separately by
+    // checkpoint_consensus::prune_below_evicts_buried_index_state.)
+    #[test]
+    fn prune_bounds_driver_maps() {
+        let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
+        let mut d = ConsensusDriver::new("n0".into(), c.clone(), [7u8; 32]);
+        d.set_intervals(90, 90);
+        let total = CONSENSUS_STATE_RETAIN + 10;
+        for i in 1..=total {
+            let cp = Checkpoint {
+                index: i, parent_qc: None, window_head_height: i * 90,
+                window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32],
+                registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                proposer: "n0".into(), proposer_sig: Vec::new(),
+            };
+            d.proposals.insert((i, cp.hash()), cp);
+            d.heads.insert(i, i * 90);
+            d.state_roots.insert(i, [i as u8; 32]);
+            d.seal_data.insert(i, (Vec::new(), Vec::new()));
+            d.sealed.insert(i);
+        }
+        d.eng.committed_index = total;
+        d.prune();
+        let floor = total - CONSENSUS_STATE_RETAIN; // 10
+        assert!(d.heads.keys().all(|k| *k >= floor), "heads pruned below floor");
+        assert!(d.proposals.keys().all(|(idx, _)| *idx >= floor), "proposals pruned below floor");
+        assert!(d.state_roots.keys().all(|k| *k >= floor), "state_roots pruned below floor");
+        assert!(d.seal_data.keys().all(|k| *k >= floor), "seal_data pruned below floor");
+        assert!(d.sealed.iter().all(|w| *w >= floor), "sealed windows pruned below floor");
+        assert!(d.heads.len() <= CONSENSUS_STATE_RETAIN as usize + 1, "bounded, not O(chain length)");
+        assert_eq!(d.eng.committed_index, total, "prune never regresses committed_index");
     }
 }

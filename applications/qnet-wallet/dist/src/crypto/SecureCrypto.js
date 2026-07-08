@@ -370,45 +370,43 @@ export class SecureCrypto {
     }
 
     /**
-     * Generate QNet address from mnemonic (PRODUCTION)
-     * Format: 19 chars + "eon" + 15 chars + 8 char checksum = 45 total
-     * Compatible with mobile app and backend validation
+     * Get the canonical, KAT-proven pure-Dilithium (ML-DSA-65) wallet derivation from the bundle.
+     * The bundle (lib/noble-pq-ml-dsa.js) exposes window/self.QNetDilithiumLib.QNetDilithium and is
+     * byte-identical to the Rust node + mobile app (golden KAT: "abandon…about" →
+     * d9fa370374e24333242eon847d1d354dcd87fe873823e). It MUST be loaded before wallet code.
+     */
+    _getDilithium() {
+        const g = (typeof window !== 'undefined') ? window
+                : (typeof self !== 'undefined') ? self
+                : (typeof globalThis !== 'undefined') ? globalThis : null;
+        const lib = g && g.QNetDilithiumLib;
+        const Q = lib && lib.QNetDilithium;
+        if (!Q || typeof Q.deriveWallet !== 'function') {
+            throw new Error('QNetDilithium bundle not loaded — lib/noble-pq-ml-dsa.js must load before wallet code');
+        }
+        return Q;
+    }
+
+    /**
+     * Derive the CANONICAL pure-Dilithium QNet wallet from a mnemonic.
+     * Returns { address (EON), publicKey (hex 1952B), secretKey (hex 4032B), xi (hex) }.
+     * This is the single source of truth — identical to the Rust node + mobile.
+     */
+    deriveQNetWallet(mnemonic) {
+        return this._getDilithium().deriveWallet(mnemonic);
+    }
+
+    /**
+     * Generate QNet address from mnemonic (PRODUCTION — pure Dilithium / ML-DSA-65).
+     * Format: 19 hex + "eon" + 15 hex + 8-hex SHA3-256 checksum over SHA512(pk) = 45 total.
+     * Byte-identical to the Rust node and mobile app. Address is derived from the ML-DSA-65
+     * public key via the bundle — NOT a SHA-256 hash-chain of the mnemonic.
      */
     async generateQNetAddress(mnemonic, index = 0) {
-        try {
-            // Use a deterministic seed based on mnemonic and index
-            const seedInput = `eon_${mnemonic}_${index}`;
-            const hash = await this.hashData(seedInput);
-
-            // PRODUCTION FORMAT: 19 + 3 + 15 + 8 = 45 characters
-            // Extract hex characters from hash
-            const part1 = hash.substring(0, 19).toLowerCase();
-            const part2 = hash.substring(19, 34).toLowerCase();
-
-            // Generate checksum (first 8 hex chars = 4 bytes)
-            const addressWithoutChecksum = part1 + 'eon' + part2;
-            const checksumHash = await this.hashData(addressWithoutChecksum);
-            const checksum = checksumHash.substring(0, 8).toLowerCase();
-
-            return `${part1}eon${part2}${checksum}`;
-
-        } catch (error) {
-            console.error('Error generating EON address:', error);
-            // Fallback: generate secure random address in correct format
-            const randomBytes = new Uint8Array(64);
-            crypto.getRandomValues(randomBytes);
-            const hex = Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-            const part1 = hex.substring(0, 19).toLowerCase();
-            const part2 = hex.substring(19, 34).toLowerCase();
-            const checksumInput = part1 + 'eon' + part2;
-            // Simple checksum for fallback (8 hex chars)
-            let checksumNum = 0;
-            for (let i = 0; i < checksumInput.length; i++) {
-                checksumNum = ((checksumNum * 31) + checksumInput.charCodeAt(i)) >>> 0;
-            }
-            const checksum = checksumNum.toString(16).padStart(8, '0');
-            return `${part1}eon${part2}${checksum}`;
-        }
+        // NOTE: `index` is retained for signature compatibility. The canonical QNet wallet is the
+        // account-0 ML-DSA-65 keypair derived from the mnemonic; there is no per-index HD tree for
+        // the pure-Dilithium path (same as node/mobile), so `index` does not alter derivation.
+        return this.deriveQNetWallet(mnemonic).address;
     }
 
     /**

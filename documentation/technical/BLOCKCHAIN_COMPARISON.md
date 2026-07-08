@@ -34,10 +34,10 @@
    - Equal chance for all qualified nodes (NO WEIGHTING)
 
 4. **Reputation System**:
-   - Simple binary threshold: qualified (≥70%) or not qualified (<70%)
+   - Binary consensus reputation: **70 (qualified) or 0 (not qualified)** — no graduated scores
+   - The ≥70 threshold is the single gate for producer/committee eligibility
    - Real-time tracking and updates
-   - Penalty system: -25.0 for microblock failures, -30.0 for macroblock failures
-   - Reward system: +5.0 for emergency producer service
+   - (Graduated scores, jail, decay, and tiered rewards/penalties are not used)
 
 ### Advantages Over Traditional Consensus:
 
@@ -48,11 +48,10 @@
 
 ## QNet Performance Analysis
 
-### Current Architecture (Python + Rust hybrid)
+### Current Architecture (Rust core)
 - **Achieved**: 100K TPS with Rust optimization modules
-- **Bottleneck**: Python consensus and state management
 - **Latency**: 50ms API response time
-- **Finality**: 10 seconds
+- **Finality**: ~60 seconds (Checkpoint-BFT v2 two-chain macroblock finality)
 
 ### After Full Rust Migration
 - **Target**: 500K+ TPS base, 1M+ with sharding
@@ -68,7 +67,7 @@
 - **Hierarchical node structure**: Super/Full/Light nodes
 - **Optimized consensus**: Only super nodes validate
 - **Parallel transaction processing**: Rust's fearless concurrency
-- **State sharding ready**: Built-in from start
+- **Single-shard today**: sufficient for target throughput; sharding is a deferred future option (auto-arm off)
 
 ### 2. Technical Innovations
 - **Post-quantum crypto**: Hardware accelerated
@@ -83,9 +82,9 @@
 
 ## Realistic Performance Targets
 
-### Phase 1 (Current - Python/Rust Hybrid)
+### Phase 1 (Current - Rust Core)
 - **TPS**: 100,000 (achieved)
-- **Finality**: 10 seconds
+- **Finality**: ~60 seconds (Checkpoint-BFT v2, two-chain)
 - **Nodes**: 10,000
 
 ### Phase 2 (Rust Core Migration)

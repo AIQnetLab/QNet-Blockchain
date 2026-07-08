@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getTransactionsByAddress } from '../../../../../lib/db';
 import { mapTxType, formatAmount } from '@/lib/tx-mapping';
+import { formatTokenAmount } from '@/lib/token-format';
 
 // ============================================================================
 // PRODUCTION v3.0: PostgreSQL-based address data
@@ -23,7 +24,13 @@ export interface AddressData {
     activatedAt: number;
     isActive: boolean;
   };
-  tokens: Array<{ symbol: string; balance: string }>;
+  tokens: Array<{
+    symbol: string;
+    name: string;
+    contract_address: string;
+    decimals: number;
+    balance: string;
+  }>;
   transactions: Array<{
     hash: string;
     type: string;
@@ -35,6 +42,57 @@ export interface AddressData {
     block: number;
     status: 'confirmed' | 'pending';
   }>;
+}
+
+// Mapped QRC-20 token holding for the address page. Balance is scaled by the
+// token's OWN decimals (u64 base units → human string, exact BigInt math).
+type AddressToken = AddressData['tokens'][number];
+
+// Raw token entry as returned by the node: GET /api/v1/account/{addr}/tokens
+// -> { tokens: [{ contract_address, balance, name, symbol, decimals }] }
+interface NodeTokenEntry {
+  contract_address?: string;
+  balance?: string | number;
+  name?: string;
+  symbol?: string;
+  decimals?: number;
+}
+
+// Fetch and map this address's QRC-20 holdings from the node. Returns [] on any
+// error (never throws) so it can run in parallel with the balance/tx fetch
+// without failing the whole address response.
+async function fetchAddressTokens(
+  address: string,
+  nodeApi: string,
+  nodeHeaders: Record<string, string>
+): Promise<AddressToken[]> {
+  try {
+    const res = await fetch(`${nodeApi}/api/v1/account/${address}/tokens`, {
+      headers: nodeHeaders,
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return [];
+    const body = await res.json().catch(() => null);
+    const rawList: unknown = body?.tokens;
+    if (!Array.isArray(rawList)) return [];
+
+    return rawList.map((raw): AddressToken => {
+      const t = raw as NodeTokenEntry;
+      // Each token scales by ITS OWN decimals (default 9 to match the node).
+      const decimals = typeof t.decimals === 'number' ? t.decimals : 9;
+      return {
+        symbol: t.symbol || '',
+        name: t.name || '',
+        contract_address: t.contract_address || '',
+        decimals,
+        // Node returns u64 base units; format with this token's decimals (no float, no 1e9).
+        balance: formatTokenAmount(t.balance, decimals),
+      };
+    // Drop entries with no contract address (cannot link/identify them).
+    }).filter(t => t.contract_address);
+  } catch {
+    return [];
+  }
 }
 
 // Create system address data
@@ -78,24 +136,22 @@ export async function GET(
     return NextResponse.json({ success: false, error: 'Invalid EON address' }, { status: 400 });
   }
   
+  // v3.50: Node API is the single source of truth for balance; PostgreSQL for TX
+  // history. NODE_API/headers are declared here (not inside the try) so the catch
+  // path can still make a best-effort token fetch when the DB read fails.
+  const NODE_API = process.env.QNET_API_URL || 'https://162.244.25.114:8001';
+  const API_KEY = process.env.QNET_API_KEY || '';
+  const nodeHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (API_KEY) nodeHeaders['X-API-Key'] = API_KEY;
+
   try {
-    // v3.50: Fetch REAL balance from node API (single source of truth)
-    // Previous approach: calculating balance from TX history was WRONG because:
-    // 1. PostgreSQL BIGINT → JS string → "balance += string" = string concatenation → -Infinity
-    // 2. Failed TXs (e.g. duplicate reward claims) are in blocks but didn't change state
-    // 3. Gas fees not accounted for properly
-    // NOW: Use node API for balance, PostgreSQL only for TX history
-    const NODE_API = process.env.QNET_API_URL || 'https://162.244.25.114:8001';
-    const API_KEY = process.env.QNET_API_KEY || '';
-    const nodeHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (API_KEY) nodeHeaders['X-API-Key'] = API_KEY;
-    
-    // Parallel: fetch balance from node + TX history from PostgreSQL
-    const [accountResponse, txResult] = await Promise.all([
+    // Parallel: node balance + node QRC-20 token holdings + PostgreSQL TX history
+    const [accountResponse, tokens, txResult] = await Promise.all([
       fetch(`${NODE_API}/api/v1/account/${address}`, {
         headers: nodeHeaders,
         signal: AbortSignal.timeout(10000),
       }).then(r => r.ok ? r.json() : null).catch(() => null),
+      fetchAddressTokens(address, NODE_API, nodeHeaders),
       getTransactionsByAddress(address, 1, 100),
     ]);
     
@@ -136,7 +192,7 @@ export async function GET(
     // Map transactions to response format
     const txData = transactions.map(tx => ({
       hash: tx.hash,
-      type: mapTxType(tx.tx_type, tx.from_address),
+      type: mapTxType(tx.tx_type, tx.from_address, tx.data),
       from: tx.from_address,
       to: tx.to_address || 'N/A',
       amount: formatAmount(Number(tx.amount) || 0),
@@ -162,11 +218,14 @@ export async function GET(
         txCount: total,
         firstSeen: firstSeen,
         lastActive: lastActive,
-        tokens: [],
+        tokens,
         transactions: txData,
       },
     });
   } catch (err) {
+    // DB read (TX history) failed. The node may still be reachable, so make a
+    // best-effort token fetch instead of hardcoding an empty list.
+    const tokens = await fetchAddressTokens(address, NODE_API, nodeHeaders);
     return NextResponse.json({
       success: false,
       error: 'Failed to load address data',
@@ -176,7 +235,7 @@ export async function GET(
         txCount: 0,
         firstSeen: 0,
         lastActive: 0,
-        tokens: [],
+        tokens,
         transactions: [],
       },
     }, { status: 500 });

@@ -97,7 +97,7 @@ export async function detectPushProvider() {
 /**
  * Register Light node with detected push provider
  */
-export async function registerLightNode(nodeId, walletAddress, quantumPubkey, quantumSignature, burnTxHash = null, burnAmount = null, burnWallet = null, ed25519Signature = null, signatureTimestamp = null, ed25519GossipSignature = null, ed25519GossipPubkey = null, pingPubkey = null, pingDelegationCert = null) {
+export async function registerLightNode(nodeId, walletAddress, quantumPubkey, quantumSignature, burnTxHash = null, burnAmount = null, burnWallet = null, ed25519Signature = null, signatureTimestamp = null, pingPubkey = null, pingDelegationCert = null) {
   const pushProvider = await detectPushProvider();
   const apiUrl = await getRandomBootstrapNodeAsync();
 
@@ -122,13 +122,6 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
   // Prevents stolen code reuse — attacker cannot sign without Solana private key
   if (ed25519Signature) registrationData.ed25519_signature = ed25519Signature;
   if (signatureTimestamp != null) registrationData.signature_timestamp = signatureTimestamp;
-  // HYBRID v6.1: Ed25519 gossip signature is MANDATORY for P2P authentication.
-  // Server rejects registration without both fields.
-  if (!ed25519GossipSignature || !ed25519GossipPubkey) {
-    throw new Error('Ed25519 gossip signature and pubkey are required for hybrid registration (v6.1)');
-  }
-  registrationData.ed25519_gossip_signature = ed25519GossipSignature;
-  registrationData.ed25519_gossip_pubkey = ed25519GossipPubkey;
   // PING DELEGATION v7.0 (optional — graceful degradation if Keychain unavailable)
   if (pingPubkey)        registrationData.ping_pubkey = pingPubkey;
   if (pingDelegationCert) registrationData.ping_delegation_cert = pingDelegationCert;
@@ -432,7 +425,11 @@ export async function selfAttestIfNeeded(nodeId) {
     const br = await fetch(`${apiUrl}/api/v1/microblock/${anchor + 1}`);
     const block = await br.json();
     if (!Array.isArray(block?.previous_hash)) return false;
-    const hash = block.previous_hash.map(b => b.toString(16).padStart(2, '0')).join('');
+    // Server-supplied bytes: reject any non-integer / out-of-[0,255] element so a
+    // malformed array can't produce a garbage hash (e.g. "nan") or a bad challenge.
+    const phBytes = block.previous_hash;
+    if (!phBytes.every(b => Number.isInteger(b) && b >= 0 && b <= 255)) return false;
+    const hash = phBytes.map(b => b.toString(16).padStart(2, '0')).join('');
     const ok = await respondToChallenge(pingNodeId, `selfattest:${anchor}:${hash}`, apiUrl);
     if (ok) {
       await AsyncStorage.setItem('qnet_last_self_attest_epoch', String(epoch));
@@ -442,6 +439,37 @@ export async function selfAttestIfNeeded(nodeId) {
   } catch (error) {
     console.warn('[SelfAttest] failed:', error.message || error);
     return false;
+  }
+}
+
+/**
+ * Fully tear down the light-node attestation identity + background task.
+ * MUST be called on wallet delete: otherwise the scheduled `qnet-ping-check` wake, the periodic
+ * background-fetch handler, and the surviving ping key keep the "deleted" device attesting (and
+ * earning eligibility) for another epoch or two, and leave the Dilithium ping secret key on device.
+ */
+export async function teardownLightNode() {
+  try {
+    const pingNodeId = await AsyncStorage.getItem('qnet_ping_node_id');
+    // Stop the precise scheduled wake AND the periodic configured fetch (both call selfAttest).
+    try { await BackgroundFetch.stop('qnet-ping-check'); } catch (e) {}
+    try { await BackgroundFetch.stop(); } catch (e) {}
+    if (pingNodeId) {
+      // Wipe the Dilithium ping signing key (Keychain secret + its public half).
+      try {
+        const Keychain = require('react-native-keychain');
+        await Keychain.resetGenericPassword({ service: `qnet_ping_sk_${pingNodeId}` });
+      } catch (e) {}
+      await AsyncStorage.removeItem(`qnet_ping_dilithium_pk_${pingNodeId}`);
+    }
+    await AsyncStorage.multiRemove([
+      'qnet_light_node_info',
+      'qnet_ping_node_id',
+      'qnet_last_self_attest_epoch',
+    ]);
+    console.log('[LightNode] teardown complete: attestation stopped, ping key wiped');
+  } catch (error) {
+    console.warn('[LightNode] teardown failed:', error.message || error);
   }
 }
 
@@ -544,13 +572,15 @@ const TOKEN_REFRESH_DEBOUNCE_SEC = 3600; // 1 hour
 
 /**
  * Refresh FCM token on all genesis nodes (via a single endpoint).
+ * Auth is rooted in the Dilithium3 ping-delegation key (same key path as ping
+ * responses / reactivation), NOT the Ed25519 gossip key. Background-safe:
+ * the ping SK lives in Keychain (AFTER_FIRST_UNLOCK), so no wallet unlock needed.
  * @param {string} nodeId — light-node pseudonym
- * @param {Uint8Array} ed25519SecretKey64 — 64-byte Ed25519 secret key (seed+pub)
  * @returns {{ success, updated, reason? }}
  */
-export async function refreshFcmTokenOnServer(nodeId, ed25519SecretKey64) {
+export async function refreshFcmTokenOnServer(nodeId) {
   try {
-    if (!nodeId || !ed25519SecretKey64) {
+    if (!nodeId) {
       return { success: false, error: 'missing_params' };
     }
 
@@ -574,13 +604,29 @@ export async function refreshFcmTokenOnServer(nodeId, ed25519SecretKey64) {
       return { success: true, updated: false, reason: 'debounced' };
     }
 
-    // Ed25519 signature: "token_refresh:{node_id}:{timestamp}"
-    const nacl = require('tweetnacl');
+    // Dilithium3 ping-delegation signature: "token_refresh:{node_id}:{timestamp}".
+    // Load ping SK from Keychain + ping PK from AsyncStorage (same path as reactivateNode).
+    const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+    if (!isDilithiumAvailable()) {
+      return { success: false, error: 'Dilithium3 module required for token refresh' };
+    }
+    const Keychain = require('react-native-keychain');
+    const keychainEntry = await Keychain.getGenericPassword({
+      service: `qnet_ping_sk_${nodeId}`,
+    });
+    if (!keychainEntry || !keychainEntry.password) {
+      return { success: false, error: 'Ping delegation key unavailable' };
+    }
+    const pingSkHex = keychainEntry.password;
+    const pingPkHex = await AsyncStorage.getItem(`qnet_ping_dilithium_pk_${nodeId}`);
+    if (!pingPkHex) {
+      return { success: false, error: 'Ping public key not found' };
+    }
+
     const timestamp = now;
     const message = `token_refresh:${nodeId}:${timestamp}`;
-    const messageBytes = Buffer.from(message, 'utf8');
-    const sig = nacl.sign.detached(messageBytes, new Uint8Array(ed25519SecretKey64));
-    const signatureHex = Buffer.from(sig).toString('hex');
+    const dilithiumSig = await signWithDilithium(message, pingSkHex, pingPkHex, nodeId);
+    const signatureStr = `ping_dilithium:${dilithiumSig}`;
 
     const apiUrl = await getRandomBootstrapNodeAsync();
     const controller = new AbortController();
@@ -595,7 +641,7 @@ export async function refreshFcmTokenOnServer(nodeId, ed25519SecretKey64) {
         device_token: currentToken,
         push_type: pushProvider.type,
         endpoint: pushProvider.endpoint || undefined,
-        signature: signatureHex,
+        signature: signatureStr,
         timestamp,
       }),
     });
@@ -621,22 +667,16 @@ export async function refreshFcmTokenOnServer(nodeId, ed25519SecretKey64) {
 
 /**
  * Background-safe FCM token refresh (v7.1).
- * Called from onTokenRefresh — loads Ed25519 gossip key from Keychain
- * so the refresh works without the wallet being unlocked.
+ * Called from onTokenRefresh — refreshFcmTokenOnServer now signs with the
+ * Dilithium3 ping-delegation key (Keychain AFTER_FIRST_UNLOCK), so the refresh
+ * works without the wallet being unlocked. No gossip-key load here.
  */
 export async function backgroundRefreshFcmToken() {
   try {
-    const Keychain = require('react-native-keychain');
     const nodeId = await AsyncStorage.getItem('qnet_ping_node_id');
     if (!nodeId) return;
 
-    const keychainEntry = await Keychain.getGenericPassword({
-      service: `qnet_gossip_sk_${nodeId}`,
-    });
-    if (!keychainEntry || !keychainEntry.password) return;
-
-    const skBytes = new Uint8Array(Buffer.from(keychainEntry.password, 'hex'));
-    await refreshFcmTokenOnServer(nodeId, skBytes);
+    await refreshFcmTokenOnServer(nodeId);
     console.log('[Push] ✅ FCM token refreshed in background');
   } catch (e) {
     console.warn('[Push] Background token refresh failed (will retry on foreground):', e.message);

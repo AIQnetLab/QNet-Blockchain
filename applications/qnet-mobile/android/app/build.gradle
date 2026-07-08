@@ -46,11 +46,15 @@ android {
         versionName "1.0.8"
         manifestPlaceholders = [usesCleartextTraffic: "true"]
 
-        // NDK: pqclean Dilithium3 reference C code (same as pqcrypto-dilithium 0.5)
+        // NDK: pqclean Dilithium3 reference C code (same as pqcrypto-dilithium 0.5).
+        // Build ALL ABIs so libdilithium_native.so is present on every device: many low-end
+        // Android (Go) phones run a 32-bit userspace on a 64-bit CPU, so an arm64-only lib made
+        // the app crash at launch (UnsatisfiedLinkError from DilithiumModule's static loader).
+        // armeabi-v7a = 32-bit real devices; x86/x86_64 = emulators. pqclean ref C is portable.
         externalNativeBuild {
             cmake {
                 cppFlags ""
-                abiFilters "arm64-v8a", "x86_64"
+                abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
             }
         }
     }

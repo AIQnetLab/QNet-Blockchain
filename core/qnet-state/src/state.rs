@@ -97,6 +97,50 @@ pub const MAX_QNC_SUPPLY_NANO: u64 = MAX_QNC_SUPPLY * 1_000_000_000;
 const HASH_SIZE: usize = 32;
 const TREE_DEPTH: usize = 256; // v32.14: full address bit-width — guarantees ALL leaves converge to ONE root
 
+/// Default read-through node cache cap when a store is attached. Bounds the
+/// in-mem `leaves`/`intermediate_nodes` maps so a 10M-account super-node need
+/// not hold the whole tree in RAM; cold entries reload via the store on demand.
+const DEFAULT_NODE_CACHE_CAP: usize = 2_000_000;
+
+/// Optional disk-backed store for merkle leaves + internal nodes. The seam that
+/// lets a super-node stream the tree from disk instead of holding it all in RAM.
+/// qnet-state stays dependency-free — an integration-layer impl (e.g. RocksDB)
+/// plugs in via `set_node_store`. The root is a pure function of the leaf set
+/// (BTreeMap → order-independent), so read-through caching / eviction cannot
+/// change the produced root: a DB-backed root is byte-identical to the in-mem one.
+pub trait MerkleNodeStore: Send + Sync {
+    /// Point read of a leaf (addr_hash → account_hash). None = absent.
+    fn get_leaf(&self, key: &[u8; 32]) -> Option<[u8; 32]>;
+    /// Point read of a non-default internal node at (depth, key). None = default subtree.
+    fn get_node(&self, depth: u32, key: &[u8; 32]) -> Option<[u8; 32]>;
+    /// Bulk read of the full leaf set — used only for a full rebuild (recompute_root).
+    fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])>;
+    /// Durably persist one finalize's delta: leaf upserts, leaf deletes, node
+    /// upserts, node deletes. ORDERING CONTRACT: a full rebuild can emit both a
+    /// delete and a re-put for the same NODE key in one delta (clear-then-
+    /// repopulate); the impl MUST apply `node_dels` BEFORE `node_puts` so a
+    /// re-put wins — resulting node state is (existing ∖ node_dels) ∪ node_puts.
+    /// For LEAVES the caller guarantees `leaf_puts` and `leaf_dels` are disjoint
+    /// (a key ending the finalize present appears only in puts, absent only in
+    /// dels), so their relative order is irrelevant — resulting leaf state is
+    /// (existing ∖ leaf_dels) ∪ leaf_puts.
+    ///
+    /// `wipe_all_nodes` (set on a full rebuild): the impl MUST delete its ENTIRE
+    /// node set BEFORE applying `node_puts` — `node_puts` then carries the
+    /// COMPLETE non-default node set. This replaces (not merges) the node store
+    /// so an evicted node orphaned by a removal can't survive. LEAVES are never
+    /// wiped (they are maintained precisely via leaf_puts/leaf_dels every
+    /// finalize); only the node set is rebuilt.
+    fn put_batch(
+        &self,
+        leaf_puts: &[([u8; 32], [u8; 32])],
+        leaf_dels: &[[u8; 32]],
+        node_puts: &[((u32, [u8; 32]), [u8; 32])],
+        node_dels: &[(u32, [u8; 32])],
+        wipe_all_nodes: bool,
+    ) -> Result<(), String>;
+}
+
 /// State Merkle Tree for account proofs
 /// Optimized for QNet's account structure with batch operations for 100K+ TPS
 /// 
@@ -132,6 +176,34 @@ pub struct StateMerkleTree {
     /// v32.14: switch between full-rebuild and incremental. Default true.
     /// Full-rebuild kept for migration / verification of intermediate cache.
     pub(crate) incremental_enabled: bool,
+    /// Optional disk-backed store. None (default) → `leaves`/`intermediate_nodes`
+    /// are the sole authority and every accessor is a direct map op (behavior
+    /// byte-identical to the pre-store code). Some → those maps become bounded
+    /// read-through caches over the store, which holds the authoritative set.
+    node_store: Option<std::sync::Arc<dyn MerkleNodeStore>>,
+    /// Soft cap on cached leaves + nodes when a store is attached. 0 = unbounded.
+    /// Ignored entirely when `node_store` is None.
+    node_cache_cap: usize,
+    /// Per-finalize write-delta buffered while a store is attached, flushed once
+    /// at the end of finalize via `put_batch`. Empty / unused when store is None.
+    delta_leaf_puts: Vec<([u8; HASH_SIZE], [u8; HASH_SIZE])>,
+    delta_node_puts: Vec<((u32, [u8; HASH_SIZE]), [u8; HASH_SIZE])>,
+    delta_node_dels: Vec<(u32, [u8; HASH_SIZE])>,
+    /// Leaves removed THIS finalize but not yet flushed to the store. Serves two
+    /// roles while a store is attached (empty / unused when store is None):
+    /// (1) live read-through TOMBSTONE — `leaf_get` returns None for these so a
+    ///     deleted leaf can't resurrect from the still-stale store mid-rebuild;
+    /// (2) the `leaf_dels` batch flushed at finalize so `all_leaves()` on a later
+    ///     full rebuild doesn't re-surface the removed leaf. A re-insert of the
+    ///     same key (`leaf_put`) cancels its pending deletion.
+    pending_leaf_dels: HashSet<[u8; HASH_SIZE]>,
+    /// Set by `recompute_root` (full rebuild) while a store is attached: the pass
+    /// recomputes the COMPLETE non-default node set into `delta_node_puts`, so the
+    /// flush must WIPE all store nodes before applying them — otherwise evicted
+    /// nodes orphaned by a removal (which `clear_nodes` can't enumerate) would
+    /// survive and poison later incremental sibling reads. Consumed + reset at
+    /// flush. Leaves are unaffected (maintained precisely via leaf_puts/leaf_dels).
+    node_wipe_pending: bool,
 }
 
 impl StateMerkleTree {
@@ -162,7 +234,127 @@ impl StateMerkleTree {
             intermediate_nodes: HashMap::new(),
             dirty_paths: HashSet::new(),
             incremental_enabled: true,
+            // Store OFF by default → in-mem authority, byte-for-byte legacy behavior.
+            node_store: None,
+            node_cache_cap: 0,
+            delta_leaf_puts: Vec::new(),
+            delta_node_puts: Vec::new(),
+            delta_node_dels: Vec::new(),
+            pending_leaf_dels: HashSet::new(),
+            node_wipe_pending: false,
         }
+    }
+
+    /// Attach a disk-backed node store, switching `leaves`/`intermediate_nodes`
+    /// into bounded read-through caches. Sets a sane default cache cap if none
+    /// was chosen. Consensus-neutral: the produced root is unchanged.
+    pub fn set_node_store(&mut self, store: std::sync::Arc<dyn MerkleNodeStore>) {
+        self.node_store = Some(store);
+        if self.node_cache_cap == 0 {
+            self.node_cache_cap = DEFAULT_NODE_CACHE_CAP;
+        }
+    }
+
+    /// Override the read-through cache cap (0 = unbounded). No effect unless a
+    /// store is attached.
+    pub fn set_node_cache_cap(&mut self, cap: usize) {
+        self.node_cache_cap = cap;
+    }
+
+    // ── Read/write accessors: the single seam through which every leaf/node
+    // access flows. When `node_store` is None each is EXACTLY the direct map
+    // op it replaces (no store branch taken), so the default path is unchanged.
+
+    /// Read a leaf. Cache hit → return; else store fallback (populate cache).
+    /// Store None → exactly `self.leaves.get(key).copied()`.
+    fn leaf_get(&mut self, key: &[u8; HASH_SIZE]) -> Option<[u8; HASH_SIZE]> {
+        if let Some(v) = self.leaves.get(key).copied() {
+            return Some(v);
+        }
+        if self.node_store.is_some() {
+            // Deleted this finalize but not yet flushed: the store still holds a
+            // stale copy — treat as absent so a rebuild/path-walk can't resurrect
+            // it. Inert when store is None (set is empty and unused).
+            if self.pending_leaf_dels.contains(key) {
+                return None;
+            }
+            if let Some(ref store) = self.node_store {
+                if let Some(v) = store.get_leaf(key) {
+                    self.leaves.insert(*key, v); // populate read-through cache
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    /// Read an internal node. Cache hit → return; else store fallback (populate).
+    /// Store None → exactly `self.intermediate_nodes.get(&(depth,key)).copied()`.
+    fn node_get(&mut self, depth: u32, key: &[u8; HASH_SIZE]) -> Option<[u8; HASH_SIZE]> {
+        if let Some(v) = self.intermediate_nodes.get(&(depth, *key)).copied() {
+            return Some(v);
+        }
+        if let Some(ref store) = self.node_store {
+            if let Some(v) = store.get_node(depth, key) {
+                self.intermediate_nodes.insert((depth, *key), v);
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// Upsert a leaf. Store None → exactly `self.leaves.insert(key,val)`.
+    fn leaf_put(&mut self, key: [u8; HASH_SIZE], val: [u8; HASH_SIZE]) {
+        self.leaves.insert(key, val);
+        if self.node_store.is_some() {
+            self.delta_leaf_puts.push((key, val));
+            // A re-insert cancels a same-finalize pending deletion so the flush
+            // emits puts∩dels = ∅ and the tombstone stops suppressing reads.
+            self.pending_leaf_dels.remove(&key);
+        }
+    }
+
+    /// Remove a leaf. Store None → exactly `self.leaves.remove(&key)` (the legacy
+    /// direct op). Store Some → also tombstone the key until flush so the still-
+    /// stale store can't resurrect it, and record it for the `leaf_dels` batch.
+    fn leaf_del(&mut self, key: [u8; HASH_SIZE]) {
+        self.leaves.remove(&key);
+        if self.node_store.is_some() {
+            self.pending_leaf_dels.insert(key);
+        }
+    }
+
+    /// Upsert an internal node. Store None → exactly `intermediate_nodes.insert`.
+    fn node_put(&mut self, depth: u32, key: [u8; HASH_SIZE], val: [u8; HASH_SIZE]) {
+        self.intermediate_nodes.insert((depth, key), val);
+        if self.node_store.is_some() {
+            self.delta_node_puts.push(((depth, key), val));
+        }
+    }
+
+    /// Delete an internal node (subtree became default). Store None → exactly
+    /// `intermediate_nodes.remove`.
+    fn node_del(&mut self, depth: u32, key: [u8; HASH_SIZE]) {
+        self.intermediate_nodes.remove(&(depth, key));
+        if self.node_store.is_some() {
+            self.delta_node_dels.push((depth, key));
+        }
+    }
+
+    /// Clear the internal-node set ahead of a full rebuild. Store None → exactly
+    /// `self.intermediate_nodes.clear()` (unchanged). Store Some → also record a
+    /// delete for every currently-cached node so the delta wipes them from the
+    /// store; the rebuild then re-puts the live nodes. Nodes resident ONLY on
+    /// disk (evicted from cache) are not enumerated here — they are provably
+    /// never read (they sit on default paths with no populated leaf beneath), so
+    /// leaving them as harmless dead keys cannot change the root or any proof.
+    fn clear_nodes(&mut self) {
+        if self.node_store.is_some() {
+            for (depth, key) in self.intermediate_nodes.keys().copied().collect::<Vec<_>>() {
+                self.delta_node_dels.push((depth, key));
+            }
+        }
+        self.intermediate_nodes.clear();
     }
     
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -175,10 +367,12 @@ impl StateMerkleTree {
     pub fn insert(&mut self, address: &str, account: &Account) -> [u8; HASH_SIZE] {
         let addr_hash = Self::hash_address(address);
         let account_hash = Self::hash_account(account);
-        self.leaves.insert(addr_hash, account_hash);
+        self.leaf_put(addr_hash, account_hash); // records store delta when attached
         self.recompute_root();
         self.dirty = false;
         self.pending_updates = 0;
+        // Persist + bound caches when a store is attached (mirrors finalize).
+        self.flush_delta_and_evict();
         self.root
     }
     
@@ -189,14 +383,16 @@ impl StateMerkleTree {
         let addr_hash = Self::hash_address(address);
         let account_hash = Self::hash_account(account);
 
-        // v3.40: Diagnostic log for first account (to debug state_root mismatch)
-        if self.leaves.is_empty() {
+        // v3.40: Diagnostic log for first account (to debug state_root mismatch).
+        // Gate on `node_store.is_none()` so the store path (where `leaves` is a
+        // cache that may be empty despite existing accounts) can't spuriously log.
+        if self.node_store.is_none() && self.leaves.is_empty() {
             println!("[DBG][MERKLE] first_account addr={} bal={} nonce={} addr_hash={} acct_hash={}",
                      &address[..20.min(address.len())], account.balance, account.nonce,
                      hex::encode(&addr_hash[..8]), hex::encode(&account_hash[..8]));
         }
 
-        self.leaves.insert(addr_hash, account_hash);
+        self.leaf_put(addr_hash, account_hash);
         self.dirty = true;
         self.pending_updates += 1;
         self.dirty_paths.insert(addr_hash); // v32.14: incremental path tracking
@@ -209,7 +405,7 @@ impl StateMerkleTree {
         for (address, account) in updates {
             let addr_hash = Self::hash_address(address);
             let account_hash = Self::hash_account(account);
-            self.leaves.insert(addr_hash, account_hash);
+            self.leaf_put(addr_hash, account_hash);
             self.dirty_paths.insert(addr_hash); // v32.14
         }
         self.dirty = true;
@@ -245,8 +441,71 @@ impl StateMerkleTree {
                     hex::encode(&self.root[..8]),
                 );
             }
+            // Store attached → persist this finalize's delta, then bound the
+            // read-through caches. No-op when store is None (default path).
+            self.flush_delta_and_evict();
         }
         self.root
+    }
+
+    /// Persist the buffered write-delta to the store and evict cold cache
+    /// entries down to `node_cache_cap`. Called only from finalize. When
+    /// `node_store` is None every branch is skipped — default path unchanged.
+    fn flush_delta_and_evict(&mut self) {
+        // Take the delta first to end the immutable borrow of `self` held by
+        // the `if let Some(ref store)` before we mutate the cache maps.
+        if self.node_store.is_none() {
+            // Deltas are never recorded without a store, but stay defensive.
+            self.delta_leaf_puts.clear();
+            self.delta_node_puts.clear();
+            self.delta_node_dels.clear();
+            self.pending_leaf_dels.clear();
+            self.node_wipe_pending = false;
+            return;
+        }
+        let mut leaf_puts = std::mem::take(&mut self.delta_leaf_puts);
+        let node_puts = std::mem::take(&mut self.delta_node_puts);
+        let node_dels = std::mem::take(&mut self.delta_node_dels);
+        let leaf_dels_set = std::mem::take(&mut self.pending_leaf_dels);
+        let wipe_nodes = std::mem::take(&mut self.node_wipe_pending);
+        // Enforce the trait's disjointness contract: a key deleted-last this
+        // finalize (still in the tombstone set) must not also be re-put — drop
+        // any such put so final leaf state is (existing ∖ leaf_dels) ∪ leaf_puts
+        // regardless of how the impl orders the two.
+        if !leaf_dels_set.is_empty() {
+            leaf_puts.retain(|(k, _)| !leaf_dels_set.contains(k));
+        }
+        let leaf_dels: Vec<[u8; HASH_SIZE]> = leaf_dels_set.into_iter().collect();
+        if let Some(ref store) = self.node_store {
+            if let Err(e) = store.put_batch(&leaf_puts, &leaf_dels, &node_puts, &node_dels, wipe_nodes) {
+                // Persist failure is non-fatal to the in-mem root (still correct
+                // for this finalize); surface it so the operator can react.
+                println!("[WARN][MERKLE] node_store put_batch failed: {}", e);
+            }
+        }
+        // Bound the caches. Entries are re-loadable via get_leaf/get_node, so a
+        // simple drain of the excess is safe and never changes the root.
+        let cap = self.node_cache_cap;
+        if cap > 0 {
+            if self.leaves.len() > cap {
+                let excess = self.leaves.len() - cap;
+                // Drain the smallest keys (deterministic pick; any subset is
+                // re-loadable). BTreeMap has no cheap "drain N" — collect keys.
+                let victims: Vec<[u8; HASH_SIZE]> =
+                    self.leaves.keys().take(excess).copied().collect();
+                for k in victims {
+                    self.leaves.remove(&k);
+                }
+            }
+            if self.intermediate_nodes.len() > cap {
+                let excess = self.intermediate_nodes.len() - cap;
+                let victims: Vec<(u32, [u8; HASH_SIZE])> =
+                    self.intermediate_nodes.keys().take(excess).copied().collect();
+                for k in victims {
+                    self.intermediate_nodes.remove(&k);
+                }
+            }
+        }
     }
     
     /// v3.22: Check if tree needs finalization
@@ -262,7 +521,7 @@ impl StateMerkleTree {
     /// Remove account with immediate root recomputation
     pub fn remove(&mut self, address: &str) -> [u8; HASH_SIZE] {
         let addr_hash = Self::hash_address(address);
-        self.leaves.remove(&addr_hash);
+        self.leaf_del(addr_hash); // tombstones + records store delta when attached
         self.dirty = true;
         self.pending_updates += 1;
         self.finalize()
@@ -273,7 +532,7 @@ impl StateMerkleTree {
     /// Call finalize() once after all rollback operations complete
     pub fn remove_lazy(&mut self, address: &str) {
         let addr_hash = Self::hash_address(address);
-        self.leaves.remove(&addr_hash);
+        self.leaf_del(addr_hash); // tombstones + records store delta when attached
         self.dirty = true;
         self.pending_updates += 1;
         self.dirty_paths.insert(addr_hash); // v32.14: path-walk needed for default-fill
@@ -299,7 +558,10 @@ impl StateMerkleTree {
     /// level-D key (bits 0..D-1 of leaf address cleared, bit D flipped).
     /// Empty subtree → `default_hashes[D]`. Proof verifies against the root
     /// produced by recompute_root / recompute_levels.
-    pub fn generate_proof(&self, address: &str) -> Vec<([u8; HASH_SIZE], bool)> {
+    /// Takes `&mut self`: sibling reads route through the read-through
+    /// accessors (leaf_get/node_get), which may populate the cache from the
+    /// store. When store is None those are pure map reads → `&mut` is inert.
+    pub fn generate_proof(&mut self, address: &str) -> Vec<([u8; HASH_SIZE], bool)> {
         let addr_hash = Self::hash_address(address);
         let mut proof = Vec::with_capacity(TREE_DEPTH);
         let mut key = addr_hash;
@@ -309,12 +571,10 @@ impl StateMerkleTree {
             Self::flip_bit(&mut sibling_key, depth);
 
             let sibling_hash = if depth == 0 {
-                self.leaves.get(&sibling_key).copied()
+                self.leaf_get(&sibling_key)
                     .unwrap_or(self.default_hashes[0])
             } else {
-                self.intermediate_nodes
-                    .get(&(depth as u32, sibling_key))
-                    .copied()
+                self.node_get(depth as u32, &sibling_key)
                     .unwrap_or(self.default_hashes[depth])
             };
 
@@ -452,16 +712,49 @@ impl StateMerkleTree {
     }
     
     fn recompute_root(&mut self) {
-        if self.leaves.is_empty() {
+        // Full rebuild recomputes the ENTIRE non-default node set below; under a
+        // store the flush must replace (not merge) the persisted node set so no
+        // removal-orphaned evicted node survives. Signal the wipe; inert (and
+        // reset at flush) when no store is attached.
+        if self.node_store.is_some() {
+            self.node_wipe_pending = true;
+        }
+        // Working leaf set: store None → clone the in-mem authority (unchanged);
+        // store Some → bulk-read the full set from disk, then OVERLAY the in-mem
+        // cache. The overlay is load-bearing: this finalize's fresh leaf_puts sit
+        // in `self.leaves` (+ the delta) but are NOT flushed to the store until
+        // the END of finalize, so `all_leaves()` alone would miss them. In-mem
+        // wins on key collisions — it holds the newest value. BTreeMap keeps the
+        // set sorted → order-independent, so the root is byte-identical to None.
+        let mut current_level: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> =
+            match self.node_store {
+                None => self.leaves.clone(),
+                Some(ref store) => {
+                    let mut set: BTreeMap<[u8; HASH_SIZE], [u8; HASH_SIZE]> =
+                        store.all_leaves().into_iter().collect();
+                    // Subtract leaves removed this finalize (still stale in the
+                    // store) BEFORE overlaying the in-mem cache, so a removal is
+                    // honored: final set = (all_leaves ∖ pending_dels) ∪ in-mem.
+                    for k in self.pending_leaf_dels.iter() {
+                        set.remove(k);
+                    }
+                    for (k, v) in self.leaves.iter() {
+                        set.insert(*k, *v);
+                    }
+                    set
+                }
+            };
+
+        if current_level.is_empty() {
             self.root = self.default_hashes[TREE_DEPTH];
-            self.intermediate_nodes.clear();
+            // Clear the node set via the helper so a store delta records the wipe.
+            self.clear_nodes();
             return;
         }
 
         // v32.14: full rebuild also populates intermediate_nodes cache so
         // subsequent finalize calls use the incremental path-walk.
-        self.intermediate_nodes.clear();
-        let mut current_level = self.leaves.clone();
+        self.clear_nodes();
         let mut buffer = [0u8; HASH_SIZE * 2];
 
         for depth in 0..TREE_DEPTH {
@@ -503,10 +796,11 @@ impl StateMerkleTree {
 
                 next_level.insert(actual_parent, parent_hash);
                 // v32.14: cache parent in intermediate_nodes (keyed by level depth+1).
-                // Skip storing default values to keep the map sparse.
+                // Skip storing default values to keep the map sparse. Routed
+                // through node_put so a store delta records the write.
                 let parent_level = (depth + 1) as u32;
                 if parent_hash != self.default_hashes[depth + 1] {
-                    self.intermediate_nodes.insert((parent_level, actual_parent), parent_hash);
+                    self.node_put(parent_level, actual_parent, parent_hash);
                 }
                 processed.insert(*key);
                 processed.insert(sibling_key);
@@ -562,22 +856,20 @@ impl StateMerkleTree {
                     right_key[byte_idx] |= 1 << bit_idx;
                 }
 
+                // Reads routed through accessors: pure map reads when store is
+                // None, read-through (cache-populating) when store is Some.
                 let left_hash = if depth == 0 {
-                    self.leaves.get(&left_key).copied()
+                    self.leaf_get(&left_key)
                         .unwrap_or(self.default_hashes[0])
                 } else {
-                    self.intermediate_nodes
-                        .get(&(depth as u32, left_key))
-                        .copied()
+                    self.node_get(depth as u32, &left_key)
                         .unwrap_or(self.default_hashes[depth])
                 };
                 let right_hash = if depth == 0 {
-                    self.leaves.get(&right_key).copied()
+                    self.leaf_get(&right_key)
                         .unwrap_or(self.default_hashes[0])
                 } else {
-                    self.intermediate_nodes
-                        .get(&(depth as u32, right_key))
-                        .copied()
+                    self.node_get(depth as u32, &right_key)
                         .unwrap_or(self.default_hashes[depth])
                 };
 
@@ -591,9 +883,9 @@ impl StateMerkleTree {
 
                 let parent_level = (depth + 1) as u32;
                 if parent_hash == self.default_hashes[depth + 1] {
-                    self.intermediate_nodes.remove(&(parent_level, parent_key));
+                    self.node_del(parent_level, parent_key);
                 } else {
-                    self.intermediate_nodes.insert((parent_level, parent_key), parent_hash);
+                    self.node_put(parent_level, parent_key, parent_hash);
                 }
             }
 
@@ -602,9 +894,7 @@ impl StateMerkleTree {
 
         // TREE_DEPTH = address bit-width → all paths converge to the all-zero
         // canonical key at the top level. Empty/default subtree → default root.
-        self.root = self.intermediate_nodes
-            .get(&(TREE_DEPTH as u32, [0u8; HASH_SIZE]))
-            .copied()
+        self.root = self.node_get(TREE_DEPTH as u32, &[0u8; HASH_SIZE])
             .unwrap_or(self.default_hashes[TREE_DEPTH]);
     }
 }
@@ -932,6 +1222,24 @@ impl StateManager {
     /// and pass it here at startup.
     pub fn set_cache_capacity(&self, capacity: usize) {
         self.cache_capacity.store(capacity, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Phase C: attach a disk-backed merkle node store so the SMT streams
+    /// leaves/nodes from disk instead of holding the full ~2.5 GB (at 10 M
+    /// accounts) in RAM. DEFAULT OFF — the integration layer wires this only
+    /// when explicitly enabled. Consensus-neutral: the produced state_root is
+    /// byte-identical to the all-in-RAM tree (the store is a bounded read-
+    /// through cache; the root is a pure function of the leaf set). Install
+    /// once at startup, before any block is applied.
+    pub fn set_merkle_node_store(&self, store: Arc<dyn MerkleNodeStore>) {
+        self.merkle_tree.write().set_node_store(store);
+    }
+
+    /// Override the merkle node-store read-through cache cap (0 = unbounded).
+    /// No effect unless a node store is attached. Typically read from
+    /// `QNET_MERKLE_NODE_CACHE_CAP` at startup.
+    pub fn set_merkle_node_cache_cap(&self, cap: usize) {
+        self.merkle_tree.write().set_node_cache_cap(cap);
     }
 
     /// Best-effort warm of a single account: if `address` is already in
@@ -1279,9 +1587,32 @@ impl StateManager {
             _ => {} // Non-commitment TXs — nothing to mark
         }
     }
+    /// Read an account for a QUERY path (get_account / get_balance / proof) with
+    /// `disk_store` read-through on a cache miss, WITHOUT populating the cache.
+    /// The bounded account cache (cap ~500k) can evict a live account whose
+    /// canonical copy remains in `disk_store` (a complete mirror via persist-
+    /// before-evict); a bare `accounts.get` would then wrongly report it
+    /// absent/zero once the working set exceeds the cap. Non-populating so a cold
+    /// scan of millions of distinct addresses can't grow the cache unbounded —
+    /// the apply path uses `warm_account` (which populates) for the addresses it
+    /// will mutate. No store wired (tests/tooling) → exactly `accounts.get`, so
+    /// behavior is unchanged below the cap and on non-disk deployments.
+    fn read_account(&self, address: &str) -> Option<Account> {
+        if let Some(acc) = self.accounts.get(address) {
+            return Some(acc.clone());
+        }
+        let store_guard = self.disk_store.read();
+        if let Some(ref store) = *store_guard {
+            if let Some(account) = store.load_account(address) {
+                return Some(account);
+            }
+        }
+        None
+    }
+
     /// Get account
     pub fn get_account(&self, address: &str) -> Option<Account> {
-        self.accounts.get(address).map(|acc| acc.clone())
+        self.read_account(address)
     }
     
     /// Update account
@@ -1315,10 +1646,15 @@ impl StateManager {
     /// # Returns
     /// BalanceProof that can be verified without full blockchain
     pub fn get_balance_with_proof(&self, address: &str) -> Option<BalanceProof> {
-        let account = self.accounts.get(address)?;
+        // Resolve the account (with disk read-through) BEFORE taking the merkle
+        // lock — releases disk_store's lock first, avoiding lock nesting. The
+        // account's canonical copy hashes to the same merkle leaf (persist-
+        // before-evict keeps disk a complete mirror), so the proof verifies even
+        // when the account was evicted from the hot cache.
+        let account = self.read_account(address)?;
         let mut tree = self.merkle_tree.write();
         let chain_state = self.chain_state.read();
-        
+
         let proof = tree.generate_proof(address);
         let state_root = tree.root(); // v3.22: Finalize if dirty
         
@@ -1350,8 +1686,6 @@ impl StateManager {
             is_contract: false,
             contract_code_hash: None,
             contract_storage: std::collections::HashMap::new(),
-            require_pq_signature: false,
-            dilithium_public_key: None,
             heartbeat_epoch: 0,
             heartbeat_slots: 0,
             heartbeat_final_epoch: 0,
@@ -1380,7 +1714,7 @@ impl StateManager {
     
     /// Get balance
     pub fn get_balance(&self, address: &str) -> u64 {
-        self.accounts.get(address).map(|acc| acc.balance).unwrap_or(0)
+        self.read_account(address).map(|acc| acc.balance).unwrap_or(0)
     }
     
     /// v3.18: Credit block fees directly to producer's wallet
@@ -1516,26 +1850,37 @@ impl StateManager {
     /// v3.22: Apply transaction with LAZY Merkle update (no root recomputation)
     /// Use during block processing - call finalize_merkle() once after all TX applied
     /// Performance: O(1) per TX instead of O(n) per TX
+    ///
+    /// Height-agnostic entry (block height 0). The consensus block-apply loop uses
+    /// `apply_transaction_lazy_at` with the real height so the WASM host's
+    /// `get_block_height()` is correct; every other caller (mempool pre-check, tests)
+    /// is height-independent and stays on this wrapper.
     pub fn apply_transaction_lazy(&self, tx: &Transaction) -> StateResult<()> {
+        self.apply_transaction_lazy_at(tx, 0)
+    }
+
+    /// Lazy apply at a known block height, threaded into `apply_to_state_at` so the
+    /// WASM host sees the height of the block that contains this TX.
+    pub fn apply_transaction_lazy_at(&self, tx: &Transaction, block_height: u64) -> StateResult<()> {
         // PROTOCOL: Check for duplicate commitment TXs before applying
         // Deterministic: same check on all nodes → same accept/reject decisions
         self.check_duplicate_commitment(tx)?;
-        
+
         // v3.34: Load ALL affected accounts (not just from/to)
         // CRITICAL: Without this, BatchTransfers recipients lose existing balance!
         // apply_to_state uses accounts.entry().or_insert_with(Account::new) which
         // creates balance=0 accounts — if not pre-loaded, existing balances are overwritten
         let mut accounts_map = HashMap::new();
-        
+
         for address in tx.get_all_affected_addresses() {
             if let Some(acc) = self.accounts.get(&address) {
                 accounts_map.insert(address, acc.clone());
             }
         }
-        
+
         // Apply transaction
-        tx.apply_to_state(&mut accounts_map)?;
-        
+        tx.apply_to_state_at(&mut accounts_map, block_height)?;
+
         // PROTOCOL: Mark commitment as applied after successful apply_to_state
         self.mark_commitment_from_tx(tx);
         
@@ -1560,11 +1905,15 @@ impl StateManager {
     /// ACTIVATION: Only for blocks at height >= GAS_METERING_ACTIVATION_HEIGHT.
     /// Deterministic: compute_gas_used() is pure function of TX type → identical on all nodes.
     /// Must be called AFTER apply_transaction_lazy() for each TX.
-    pub fn apply_gas_refund(&self, tx: &Transaction, block_height: u64) -> StateResult<()> {
+    pub fn apply_gas_refund(&self, tx: &Transaction, block_height: u64, wasm_fuel: u64) -> StateResult<()> {
         if block_height < GAS_METERING_ACTIVATION_HEIGHT {
             return Ok(());
         }
-        let refund = tx.compute_gas_refund();
+        // Metered fee = (compute_gas_used + wasm_fuel) * price. The sender prepaid gas_limit*price, so
+        // the refund is the UNUSED remainder: the flat refund (gas_limit - compute_gas_used)*price MINUS
+        // the WASM compute fee. wasm_fuel <= the exec-fuel budget (gas_limit - intrinsic) the VM was
+        // given, so this can never underflow the flat refund. wasm_fuel is 0 for every non-WASM tx.
+        let refund = tx.compute_gas_refund().saturating_sub(tx.wasm_fuel_fee(wasm_fuel));
         if refund == 0 {
             return Ok(());
         }
@@ -1605,7 +1954,9 @@ impl StateManager {
                 Ok(_) => {
                     applied += 1;
                     // v3.42: Gas refund for metered blocks (EIP-1559)
-                    let _ = self.apply_gas_refund(tx, block_height);
+                    // Genesis-only batch path (all callers apply height-0 genesis blocks): below the
+                    // metering-activation height and carrying no WASM ContractCalls, so no fuel to bill.
+                    let _ = self.apply_gas_refund(tx, block_height, 0);
                 }
                 Err(e) => {
                     failed += 1;
@@ -1634,98 +1985,6 @@ impl StateManager {
         }
         
         Ok(applied)
-    }
-    
-    /// v3.26: ATOMIC block processing with fee crediting - TOP L1 PATTERN
-    /// This is the SINGLE POINT where fees are credited to producer
-    /// Ensures idempotency: calling multiple times with same block = same result
-    /// Ensures determinism: all nodes get identical state_root
-    /// v3.42: Added block_height for gas refund (EIP-1559)
-    /// 
-    /// # Arguments
-    /// * `transactions` - Block transactions to apply
-    /// * `producer_wallet` - Wallet address of block producer (for fee credit)
-    /// * `fees_collected` - Total fees from all transactions in block
-    /// * `block_height` - Block height (for gas refund activation check)
-    /// 
-    /// # Returns
-    /// * `(applied_count, state_root)` - Number of applied TXs and final state root
-    pub fn apply_block_with_fees(
-        &self,
-        transactions: &[Transaction],
-        producer_wallet: &str,
-        fees_collected: u64,
-    ) -> StateResult<(usize, [u8; HASH_SIZE])> {
-        self.apply_block_with_fees_at_height(transactions, producer_wallet, fees_collected, 0)
-    }
-    
-    /// v3.42: ATOMIC block processing with fee crediting + gas refund
-    pub fn apply_block_with_fees_at_height(
-        &self,
-        transactions: &[Transaction],
-        producer_wallet: &str,
-        fees_collected: u64,
-        block_height: u64,
-    ) -> StateResult<(usize, [u8; HASH_SIZE])> {
-        let mut applied = 0;
-        
-        // 1. Apply all transactions with lazy merkle updates
-        for tx in transactions {
-            match self.apply_transaction_lazy(tx) {
-                Ok(_) => {
-                    applied += 1;
-                    // v3.42: Gas refund for metered blocks (EIP-1559)
-                    let _ = self.apply_gas_refund(tx, block_height);
-                }
-                Err(e) => {
-                    // Log but don't fail - some TX may be invalid
-                    if applied == 0 || transactions.len() < 100 {
-                        println!("[WARN][STATE] tx_apply_failed hash={} err={}", tx.hash, e);
-                    }
-                }
-            }
-        }
-        
-        // 2. Credit fees to producer (SINGLE POINT - atomic with TX application)
-        // This replaces the separate credit_producer_fees calls in node.rs
-        if fees_collected > 0 && !producer_wallet.is_empty() {
-            // Get or create producer account
-            let mut account = self.accounts
-                .entry(producer_wallet.to_string())
-                .or_insert_with(|| Account::new(producer_wallet.to_string()))
-                .clone();
-            
-            // Credit fees (saturating to prevent overflow)
-            account.balance = account.balance.saturating_add(fees_collected);
-            
-            // Lazy merkle update for producer balance
-            {
-                let mut tree = self.merkle_tree.write();
-                tree.insert_lazy(producer_wallet, &account);
-            }
-            
-            // Update account
-            self.accounts.insert(producer_wallet.to_string(), account);
-        }
-        
-        // 3. Single Merkle finalization (includes producer balance!)
-        let state_root = self.finalize_merkle();
-        
-        // v3.50: Update chain_state.height so balance proofs return correct block_height
-        if block_height > 0 {
-            let mut chain_state = self.chain_state.write();
-            if block_height > chain_state.height {
-                chain_state.height = block_height;
-            }
-        }
-        
-        if transactions.len() > 10 || fees_collected > 0 {
-            println!("[INF][STATE] block_with_fees applied={}/{} fees={} producer={}",
-                     applied, transactions.len(), fees_collected,
-                     if producer_wallet.len() > 16 { &producer_wallet[..16] } else { producer_wallet });
-        }
-        
-        Ok((applied, state_root))
     }
     
     /// v3.22: Finalize Merkle tree after batch operations
@@ -1806,108 +2065,6 @@ impl StateManager {
     /// v3.38: Get number of accounts in state
     pub fn account_count(&self) -> usize {
         self.accounts.len()
-    }
-    
-    /// v3.39: Apply block with state_root verification
-    /// For Genesis block (h=0): clears state first to ensure clean application
-    /// 
-    /// # Performance
-    /// - Block snapshot: O(n) ONLY if block has state_root (v3.27+ blocks)
-    /// - TX apply: O(1) each (atomic, no rollback needed)
-    pub fn apply_block_verified(
-        &self,
-        transactions: &[Transaction],
-        expected_state_root: [u8; 32],
-        producer_wallet: &str,
-        fees_collected: u64,
-        block_height: u64
-    ) -> StateResult<(usize, [u8; 32])> {
-        let tx_count = transactions.len();
-        let has_state_root = expected_state_root != [0u8; 32];
-        
-        // v3.39: Create snapshot ONLY if block has state_root (v3.27+ blocks)
-        // For old blocks without state_root - no snapshot needed (saves ~200MB RAM)
-        let block_snapshot = if has_state_root {
-            Some(self.create_block_snapshot(block_height))
-        } else {
-            None
-        };
-        
-        // v3.38: For Genesis block - ALWAYS start with clean state
-        if block_height == 0 {
-            let existing_accounts = self.accounts.len();
-            if existing_accounts > 0 {
-                println!("[INFO][STATE] genesis_clear existing_accounts={}", existing_accounts);
-                self.clear();
-            }
-        }
-        
-        // Apply each TX - no TX-level rollback needed!
-        // apply_transaction_lazy is atomic (works with local copy)
-        let mut applied = 0;
-        let mut failed = 0;
-        for tx in transactions {
-            match self.apply_transaction_lazy(tx) {
-                Ok(_) => applied += 1,
-                Err(e) => {
-                    failed += 1;
-                    if failed <= 10 {
-                        println!("[WARN][STATE] tx_failed h={} hash={} err={}",
-                                 block_height, &tx.hash[..16.min(tx.hash.len())], e);
-                    }
-                }
-            }
-        }
-        
-        // Credit fees to producer (if any)
-        if fees_collected > 0 && !producer_wallet.is_empty() {
-            if let Err(e) = self.credit_producer_fees_once(block_height, producer_wallet, fees_collected) {
-                println!("[ERR][STATE] credit_producer_fees_failed h={} wallet={} fees={} err={:?}",
-                         block_height, producer_wallet, fees_collected, e);
-                return Err(e);
-            }
-        }
-        
-        // Finalize Merkle tree
-        let computed_root = self.finalize_merkle();
-        
-        // Verify state_root (skip for blocks without state_root)
-        if has_state_root && computed_root != expected_state_root {
-            // STATE ROOT MISMATCH - FULL BLOCK ROLLBACK
-            println!("[ERR][STATE] state_root_mismatch h={} expected={} computed={} applied={}/{}",
-                     block_height,
-                     hex::encode(&expected_state_root[..8]),
-                     hex::encode(&computed_root[..8]),
-                     applied, tx_count);
-            
-            // Rollback entire block using block snapshot
-            if let Some(ref snapshot) = block_snapshot {
-                self.rollback_block(snapshot);
-            }
-            
-            return Err(StateError::InvalidTransaction(format!(
-                "state_root_mismatch h={} expected={} computed={}", 
-                block_height,
-                hex::encode(&expected_state_root[..8]),
-                hex::encode(&computed_root[..8])
-            )));
-        }
-        
-        // v3.50: Update chain_state.height so balance proofs return correct block_height
-        {
-            let mut chain_state = self.chain_state.write();
-            if block_height > chain_state.height {
-                chain_state.height = block_height;
-            }
-        }
-        
-        if block_height == 0 || tx_count > 100 || failed > 0 {
-            println!("[INFO][STATE] block_verified h={} applied={}/{} failed={} root={}",
-                     block_height, applied, tx_count, failed,
-                     hex::encode(&computed_root[..8]));
-        }
-        
-        Ok((applied, computed_root))
     }
     
     /// Apply block (legacy - uses apply_transaction which is O(n²))
@@ -2043,31 +2200,38 @@ impl StateManager {
     /// without activating the fork. The fork flag must ONLY be activated by
     /// accrue_pending_rewards() during deterministic block replay.
     /// This prevents state_root_mismatch on every node restart.
-    pub fn restore_accounts(&self, accounts: Vec<(String, Account)>) -> StateResult<()> {
-        let count = accounts.len();
+    /// Streaming restore: clear once, insert each (address, account) from the iterator into the merkle
+    /// tree + accounts cache (no intermediate full Vec; account is moved, not cloned), finalize once.
+    /// Returns the merkle root. Root is byte-identical to restore_accounts for the same set — the tree
+    /// is leaf-set-keyed (BTreeMap), so any insertion order yields the same finalized root. Lets a
+    /// cold-join stream the accounts CF instead of materializing all N accounts in one Vec.
+    pub fn restore_accounts_streamed<I>(&self, accounts: I) -> StateResult<[u8; 32]>
+    where I: IntoIterator<Item = (String, Account)> {
         self.accounts.clear();
 
-        // v7.1: Do NOT activate fork here. Let block replay handle it correctly.
-        // The fork flag (PENDING_REWARDS_IN_MERKLE) will be activated when replay
-        // encounters a block with non-empty v2 emission accruals.
-
-        // v3.22: Rebuild merkle tree with batch inserts
+        // Fork flag (PENDING_REWARDS_IN_MERKLE) is left for block replay to activate on a v2-emission
+        // block; hashing already always includes those fields, so it does not affect the root here.
         let mut tree = self.merkle_tree.write();
         *tree = StateMerkleTree::new();
 
-        // v3.22: Use insert_lazy for O(1) per account instead of O(n)
-        for (address, account) in &accounts {
-            tree.insert_lazy(address, account);
-            self.accounts.insert(address.clone(), account.clone());
+        let mut count: usize = 0;
+        for (address, account) in accounts {
+            tree.insert_lazy(&address, &account);
+            self.accounts.insert(address, account); // move, no clone
+            count += 1;
         }
-        
-        // v3.22: Single finalization at the end - O(n) total instead of O(n²)
+
+        // Single finalize over the full leaf set (one cold recompute_root) — the only remaining O(N).
         let root = tree.finalize();
-        
-        println!("[INF][STATE] restored_accounts count={} merkle_root={}...", 
-                 count,
-                 hex::encode(&root[..8]));
-        Ok(())
+        println!("[INF][STATE] restored_accounts count={} merkle_root={}...",
+                 count, hex::encode(&root[..8]));
+        Ok(root)
+    }
+
+    /// Bulk restore from a materialized Vec. Thin wrapper over restore_accounts_streamed so the Vec and
+    /// streaming paths share one merkle-rebuild contract (byte-identical roots).
+    pub fn restore_accounts(&self, accounts: Vec<(String, Account)>) -> StateResult<()> {
+        self.restore_accounts_streamed(accounts).map(|_| ())
     }
     
     /// Calculate state root hash
@@ -2190,6 +2354,7 @@ impl StateManager {
 mod merkle_equiv_tests {
     use super::*;
     use crate::Account;
+    use std::collections::{BTreeMap, HashMap};
 
     // Deterministic pseudo-account at index i (no rand-crate dependency).
     fn mk(i: u64) -> Account {
@@ -2247,6 +2412,248 @@ mod merkle_equiv_tests {
         a.recompute_root();
         let b = StateMerkleTree::new();
         assert_eq!(a.root, b.root, "empty-tree root must be the canonical default-hash root");
+    }
+
+    // Streaming restore (accounts fed one-at-a-time from an iterator, in ANY order) must produce a
+    // byte-identical merkle root to the Vec restore for the same leaf set. This is the safety
+    // guarantee for the cold-join streaming rehydrate (no full-Vec allocation → no root drift → no fork).
+    #[test]
+    fn streamed_restore_root_equals_vec_restore() {
+        let accts: Vec<(String, Account)> =
+            (0..64u64).map(|i| { let a = mk(i); (a.address.clone(), a) }).collect();
+
+        let sm_vec = StateManager::new();
+        sm_vec.restore_accounts(accts.clone()).unwrap();
+        let root_vec = sm_vec.finalize_merkle();
+
+        // Stream in REVERSED order to prove order-independence.
+        let sm_stream = StateManager::new();
+        let mut rev = accts.clone();
+        rev.reverse();
+        let root_stream = sm_stream.restore_accounts_streamed(rev.into_iter()).unwrap();
+
+        assert_eq!(root_vec, root_stream,
+                   "streamed restore root must equal Vec restore root (leaf-set-keyed, order-independent)");
+        assert_eq!(root_stream, sm_stream.finalize_merkle(),
+                   "returned root must equal finalize_merkle after streaming restore");
+    }
+
+    // A4 invariant: the snapshot-verify recompute streams the CF row-by-row (insert_lazy) instead of
+    // building a Vec + insert_batch. Both must yield the same finalized root over the same leaf set.
+    #[test]
+    fn insert_batch_equals_streamed_inserts() {
+        let accts: Vec<Account> = (0..48u64).map(mk).collect();
+        let pairs: Vec<(String, Account)> = accts.iter().map(|a| (a.address.clone(), a.clone())).collect();
+
+        let mut batched = StateMerkleTree::new();
+        batched.insert_batch(&pairs);
+        let root_batch = batched.finalize();
+
+        // Streamed one-at-a-time, reversed order — proves order-independence of the streamed recompute.
+        let mut streamed = StateMerkleTree::new();
+        for a in accts.iter().rev() { streamed.insert_lazy(&a.address, a); }
+        let root_stream = streamed.finalize();
+
+        assert_eq!(root_batch, root_stream,
+                   "streamed per-row insert must equal insert_batch root (leaf-set-keyed)");
+    }
+
+    // In-memory MerkleNodeStore mock: a durable mirror behind a Mutex. Exercises
+    // the read-through/eviction path without any external dependency.
+    struct MockNodeStore {
+        inner: std::sync::Mutex<(
+            BTreeMap<[u8; 32], [u8; 32]>,          // leaves
+            HashMap<(u32, [u8; 32]), [u8; 32]>,    // nodes
+        )>,
+    }
+    impl MockNodeStore {
+        fn new() -> Self {
+            Self { inner: std::sync::Mutex::new((BTreeMap::new(), HashMap::new())) }
+        }
+    }
+    impl MerkleNodeStore for MockNodeStore {
+        fn get_leaf(&self, key: &[u8; 32]) -> Option<[u8; 32]> {
+            self.inner.lock().unwrap().0.get(key).copied()
+        }
+        fn get_node(&self, depth: u32, key: &[u8; 32]) -> Option<[u8; 32]> {
+            self.inner.lock().unwrap().1.get(&(depth, *key)).copied()
+        }
+        fn all_leaves(&self) -> Vec<([u8; 32], [u8; 32])> {
+            self.inner.lock().unwrap().0.iter().map(|(k, v)| (*k, *v)).collect()
+        }
+        fn put_batch(
+            &self,
+            leaf_puts: &[([u8; 32], [u8; 32])],
+            leaf_dels: &[[u8; 32]],
+            node_puts: &[((u32, [u8; 32]), [u8; 32])],
+            node_dels: &[(u32, [u8; 32])],
+            wipe_all_nodes: bool,
+        ) -> Result<(), String> {
+            let mut g = self.inner.lock().unwrap();
+            // leaf_puts/leaf_dels are disjoint by contract → order-independent.
+            for k in leaf_dels { g.0.remove(k); }
+            for (k, v) in leaf_puts { g.0.insert(*k, *v); }
+            // Full rebuild → replace the entire node set with node_puts (the
+            // complete non-default set); otherwise apply the incremental delta
+            // (dels BEFORE puts so a re-put wins).
+            if wipe_all_nodes {
+                g.1.clear();
+            } else {
+                for (d, k) in node_dels { g.1.remove(&(*d, *k)); }
+            }
+            for ((d, k), v) in node_puts { g.1.insert((*d, *k), *v); }
+            Ok(())
+        }
+    }
+
+    // CONSENSUS GUARD: the DB-backed tree (with a tiny cache cap forcing
+    // read-through + eviction on every finalize) MUST produce a byte-identical
+    // root to the plain in-mem tree for the SAME operation sequence. If they
+    // ever diverged, a super-node streaming from disk would compute a different
+    // state_root than an all-in-RAM peer → finality stall. Deterministic ops
+    // (LCG, no rand crate): brand-new inserts, updates of existing leaves, and
+    // re-inserts of identical values, interleaved with finalize().
+    #[test]
+    fn db_backed_root_equals_in_mem_root() {
+        let mut tree_a = StateMerkleTree::new();                 // plain in-mem (store None)
+        let mut tree_b = StateMerkleTree::new();                 // DB-backed, tiny cap
+        let store = std::sync::Arc::new(MockNodeStore::new());
+        tree_b.set_node_store(store.clone());
+        tree_b.set_node_cache_cap(8); // force read-through + eviction each finalize
+
+        // Track live addresses so "update existing" picks a real leaf, plus the
+        // latest account value per address so the post-loop proof uses the value
+        // actually resident in the tree (not a stale mid-run snapshot).
+        let mut live: Vec<String> = Vec::new();
+        let mut latest: HashMap<String, Account> = HashMap::new();
+
+        // LCG (Numerical Recipes constants) — deterministic, no rand dependency.
+        let mut lcg: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || { lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); lcg };
+
+        for op in 0..200u64 {
+            let r = next();
+            let kind = r % 3;
+            let (addr, acct) = if kind == 0 || live.is_empty() {
+                // brand-new insert
+                let a = mk(1000 + op);
+                live.push(a.address.clone());
+                (a.address.clone(), a)
+            } else if kind == 1 {
+                // update existing (perturb balance/nonce)
+                let idx = (next() as usize) % live.len();
+                let addr = live[idx].clone();
+                let mut a = Account::new(addr.clone());
+                a.balance = r.wrapping_mul(7);
+                a.nonce = op % 11;
+                a.pending_rewards = r % 17;
+                (addr, a)
+            } else {
+                // re-write an existing address with a deterministic index-derived
+                // value (often a no-op-shaped repeat). Both trees receive the SAME
+                // (addr,acct), so equivalence must hold regardless of the value.
+                let idx = (next() as usize) % live.len();
+                let addr = live[idx].clone();
+                let mut a = Account::new(addr.clone());
+                a.balance = (idx as u64).wrapping_mul(1_000_003);
+                a.nonce = (idx as u64) % 7;
+                (addr, a)
+            };
+
+            tree_a.insert_lazy(&addr, &acct);
+            tree_b.insert_lazy(&addr, &acct);
+            latest.insert(addr.clone(), acct.clone());
+
+            if op % 5 == 0 {
+                let ra = tree_a.finalize();
+                let rb = tree_b.finalize();
+                assert_eq!(ra, rb,
+                    "op {}: db-backed root diverged from in-mem root under read-through+eviction", op);
+            }
+        }
+
+        // Final finalize + equality after the loop.
+        let ra = tree_a.finalize();
+        let rb = tree_b.finalize();
+        assert_eq!(ra, rb, "final db-backed root must equal in-mem root");
+
+        // Proof from the DB-backed tree (its cache is evicted to ≤8 entries)
+        // must verify against its own root — proving reads reload correctly
+        // from the store and the produced tree is byte-consistent under caching.
+        // Sample a deterministic live address at its FINAL value.
+        let saddr = live[live.len() / 2].clone();
+        let sacct = latest.get(&saddr).expect("sampled address has a latest value").clone();
+        let proof = tree_b.generate_proof(&saddr);
+        assert!(
+            StateMerkleTree::verify_proof(&saddr, &sacct, &proof, &rb),
+            "proof from evicted DB-backed tree must verify against its root"
+        );
+    }
+
+    // CONSENSUS GUARD (leaf_dels): removal under a store MUST NOT resurrect a
+    // leaf. A leaf deleted this finalize is still stale in the store (all_leaves
+    // + get_leaf return it) until the leaf_dels batch flushes — so the full-
+    // rebuild overlay, the incremental path-walk, AND a later cold rebuild from
+    // the persisted store must all honor the deletion. Without the tombstone /
+    // leaf_dels a removed account would silently re-appear → divergent state_root
+    // vs an all-in-RAM peer. Covers: full-rebuild remove, incremental
+    // del-then-put (put wins) and put-then-del (del wins), and a fresh tree
+    // rebuilt purely from the persisted store.
+    #[test]
+    fn db_backed_removal_matches_in_mem() {
+        let store = std::sync::Arc::new(MockNodeStore::new());
+        let mut tb = StateMerkleTree::new();
+        tb.set_node_store(store.clone());
+        tb.set_node_cache_cap(4); // tiny cap → eviction + read-through + cold rebuilds
+        let mut ta = StateMerkleTree::new(); // plain in-mem reference (store None)
+
+        let accts: Vec<Account> = (0..24u64).map(mk).collect();
+
+        // 1) bulk insert
+        for a in &accts { ta.insert_lazy(&a.address, a); tb.insert_lazy(&a.address, a); }
+        assert_eq!(ta.finalize(), tb.finalize(), "roots equal after bulk insert");
+
+        // 2) remove a spread of leaves, each its own finalize (full rebuild path,
+        //    since remove() does not populate dirty_paths). The store keeps stale
+        //    copies that the all_leaves() overlay must subtract via the tombstone.
+        for i in (0..24usize).step_by(3) {
+            let addr = accts[i].address.clone();
+            ta.remove(&addr);
+            tb.remove(&addr);
+            assert_eq!(ta.root(), tb.root(), "op remove {}: db-backed root diverged", i);
+        }
+
+        // 3) del-then-put in ONE finalize (re-create a removed leaf) — put wins.
+        //    remove_lazy populates dirty_paths → incremental leaf_get tombstone path.
+        let re = accts[0].address.clone();
+        let mut v = Account::new(re.clone()); v.balance = 999; v.nonce = 3;
+        ta.remove_lazy(&re); ta.insert_lazy(&re, &v);
+        tb.remove_lazy(&re); tb.insert_lazy(&re, &v);
+        assert_eq!(ta.finalize(), tb.finalize(), "del-then-put: put must win, roots equal");
+
+        // 4) put-then-del in ONE finalize on a currently-absent leaf — del wins.
+        let pd = accts[6].address.clone(); // removed in step 2 → absent
+        let mut v2 = Account::new(pd.clone()); v2.balance = 5;
+        ta.insert_lazy(&pd, &v2); ta.remove_lazy(&pd);
+        tb.insert_lazy(&pd, &v2); tb.remove_lazy(&pd);
+        assert_eq!(ta.finalize(), tb.finalize(), "put-then-del: del must win, roots equal");
+
+        let ra = ta.root();
+        assert_eq!(ra, tb.root(), "reference roots equal before cold-rebuild check");
+
+        // 5) DEFINITIVE: a FRESH tree pointed at the same persisted store, rebuilt
+        //    from scratch (empty caches → recompute_root reads all_leaves()), must
+        //    equal the in-mem root. This holds ONLY if every deletion was persisted
+        //    as a leaf_del — otherwise the store still holds the removed leaves and
+        //    this cold root diverges. Models a cold-joining super-node.
+        let mut tc = StateMerkleTree::new();
+        tc.set_node_store(store.clone());
+        tc.dirty = true;
+        tc.pending_updates = 1;
+        let rc = tc.finalize();
+        assert_eq!(ra, rc,
+            "fresh tree rebuilt purely from the persisted store must equal in-mem root \
+             (deletions persisted via leaf_dels, no resurrection)");
     }
 }
 

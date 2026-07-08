@@ -102,11 +102,13 @@ export class QNetIntegration {
         try {
             const amountInUnits = Math.floor(amount * Math.pow(10, this.qncDecimals));
 
+            // SECURITY (pure-Dilithium): NEVER transmit the private key to the RPC. If a signature is
+            // required, it must be produced client-side with QNetDilithium.signQNet(message, sk, pk)
+            // and only the signature + public key sent. `privateKey` is intentionally NOT included.
             const response = await this.makeRPCCall('send_to_pool3', {
                 amount: amountInUnits,
                 node_type: nodeType,
                 from: fromAddress,
-                private_key: privateKey, // In production, this would be signed client-side
                 timestamp: Date.now()
             });
 
@@ -187,11 +189,13 @@ export class QNetIntegration {
      */
     async migrateDevice(nodeId, walletAddress, newDeviceSignature, privateKey) {
         try {
+            // SECURITY (pure-Dilithium): do NOT transmit the private key. Device migration must be
+            // authorized by a client-side ML-DSA-65 signature (new_device_signature / signQNet), not
+            // by shipping the raw secret key to the node.
             const response = await this.makeRPCCall('migrate_device', {
                 node_id: nodeId,
                 wallet_address: walletAddress,
                 new_device_signature: newDeviceSignature,
-                private_key: privateKey,
                 timestamp: Date.now()
             });
 
@@ -256,12 +260,16 @@ export class QNetIntegration {
         try {
             const amountInUnits = Math.floor(amount * Math.pow(10, this.qncDecimals));
 
+            // SECURITY (pure-Dilithium): NEVER transmit the private key. For QNC value transfers the
+            // canonical, node-verified path is WalletManager.sendQNetTransaction, which signs
+            //   transfer:{from}:{to}:{amountNano}:{nonce}:{gasPrice}:{gasLimit}
+            // with QNetDilithium.signQNet and POSTs { dilithium_signature, dilithium_public_key, ... }
+            // to /api/v1/transaction. `private_key` is intentionally NOT included here.
             const response = await this.makeRPCCall('send_qnc', {
                 from: fromAddress,
                 to: toAddress,
                 amount: amountInUnits,
                 memo: memo,
-                private_key: privateKey,
                 timestamp: Date.now()
             });
 
@@ -378,10 +386,11 @@ export class QNetIntegration {
      */
     async pingNode(nodeId, ownerAddress, privateKey) {
         try {
+            // SECURITY (pure-Dilithium): do NOT transmit the private key. A ping that needs
+            // authorization must be signed client-side (signQNet) and sent as signature + public key.
             const response = await this.makeRPCCall('ping_node', {
                 node_id: nodeId,
                 owner: ownerAddress,
-                private_key: privateKey,
                 timestamp: Date.now()
             });
 

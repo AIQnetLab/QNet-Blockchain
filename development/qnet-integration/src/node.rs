@@ -524,230 +524,26 @@ static CLOCK_DRIFT_EMA_MILLIS: AtomicU64 = AtomicU64::new(0);
 /// Peak observed drift (seconds). Informational, never cleared.
 static CLOCK_DRIFT_PEAK_SECS: AtomicU64 = AtomicU64::new(0);
 
-// Self-pause on drift was removed: pausing drifted nodes killed the 2f+1
-// quorum on small committees and froze the network. Drift is instead
-// absorbed by median-aware timestamp generation, the wide future-tolerance
-// window, the Median-Past rule, and BFT-signed rotation — so drifted nodes
-// stay productive without endangering quorum or safety.
-
-// Median-LBPT network-time self-calibration. A wall clock behind the
-// network pins local_delay at 0 (saturating_sub), so the node never votes
-// timeout during a real stall and starves f+1 aggregation. Fix:
-// effective_now() = max(wall, median(32 on-chain producer-signed ts) +
-// elapsed_blocks). Used ONLY in local stall-detection timing — NEVER in
-// signed fields (those use raw wall clock via get_timestamp_safe() for
-// network-wide TIMESTAMP_FUTURE_TOLERANCE agreement). Ring update is
-// monotonic; 32-sample median tolerates 15 Byzantine in-window. O(1)/call.
-
-/// Size of the on-chain timestamp ring buffer used for median network-time
-/// estimation. 32 samples covers ~32 seconds of history at 1 s block
-/// cadence — long enough to tolerate short-lived drift spikes, short
-/// enough to stay responsive during live catch-up.
-const NETWORK_TIME_WINDOW: usize = 32;
-
-/// Single global slot for the median network-time ring. Writers take the
-/// mutex only during `update_network_time_sample`; readers do a brief
-/// copy and drop the lock.
-static NETWORK_TIME_RING: once_cell::sync::Lazy<parking_lot::Mutex<NetworkTimeRing>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(NetworkTimeRing::new()));
-
-struct NetworkTimeRing {
-    /// Ring buffer of (block_height, block_timestamp) pairs.
-    samples: [(u64, u64); NETWORK_TIME_WINDOW],
-    /// Next write index (mod NETWORK_TIME_WINDOW).
-    head: usize,
-    /// Count of valid samples (capped at NETWORK_TIME_WINDOW).
-    len: usize,
-    /// Highest block height observed — prevents regressions when blocks
-    /// arrive out of order from sync paths.
-    max_height: u64,
-}
-
-impl NetworkTimeRing {
-    fn new() -> Self {
-        Self {
-            samples: [(0, 0); NETWORK_TIME_WINDOW],
-            head: 0,
-            len: 0,
-            max_height: 0,
-        }
-    }
-
-    fn insert(&mut self, height: u64, ts: u64) {
-        // Reject out-of-order / duplicate samples to keep the window monotonic.
-        if height <= self.max_height {
-            return;
-        }
-        self.max_height = height;
-        self.samples[self.head] = (height, ts);
-        self.head = (self.head + 1) % NETWORK_TIME_WINDOW;
-        if self.len < NETWORK_TIME_WINDOW {
-            self.len += 1;
-        }
-    }
-
-    /// Returns (median_timestamp, height_at_median) over the valid window,
-    /// or None if the window is empty.
-    fn median_sample(&self) -> Option<(u64, u64)> {
-        if self.len == 0 {
-            return None;
-        }
-        // Collect the valid prefix and sort by timestamp.
-        let mut valid: Vec<(u64, u64)> = self.samples[..self.len].to_vec();
-        valid.sort_by_key(|(_, ts)| *ts);
-        let mid = valid.len() / 2;
-        let (height_at_median, median_ts) = valid[mid];
-        Some((median_ts, height_at_median))
-    }
-}
-
-/// Record an on-chain block timestamp sample for network-time estimation.
-/// Safe to call from any thread; called by `observe_clock_drift`.
-pub fn update_network_time_sample(block_height: u64, block_ts: u64) {
-    let mut ring = NETWORK_TIME_RING.lock();
-    ring.insert(block_height, block_ts);
-}
-
-/// Returns the "effective now" — max of raw wall clock and network-time
-/// estimate derived from median of recent on-chain block timestamps.
-///
-/// Intended use: LOCAL decision timing only (stall detection, grace
-/// adjustment). MUST NOT be used for any signed field — signed fields
-/// require raw `get_timestamp_safe()` for cross-network agreement.
-///
-/// Behaviour:
-///   * If wall clock is ahead of the network-time estimate (normal case,
-///     or clock-ahead drift): returns wall clock. No-op for healthy nodes.
-///   * If wall clock is BEHIND network-time estimate (clock-behind drift):
-///     returns the estimate. Lets a drifted node still detect stalls.
-///   * If ring is empty (fresh boot, pre-block-1): falls back to wall clock.
-pub fn effective_now() -> u64 {
-    let wall = get_timestamp_safe();
-    let ring = NETWORK_TIME_RING.lock();
-    let sample = ring.median_sample();
-    let chain_tip = ring.max_height;
-    drop(ring);
-
-    if let Some((median_ts, height_at_median)) = sample {
-        // Conservative forward projection: every block after the median
-        // is worth ~1 s (microblock cadence). Gives an honest network-time
-        // estimate that tracks real-time progression without assuming
-        // precision we don't have.
-        let blocks_ahead = chain_tip.saturating_sub(height_at_median);
-        let network_estimate = median_ts.saturating_add(blocks_ahead);
-        if network_estimate > wall {
-            return network_estimate;
-        }
-    }
-    wall
-}
-
-// Median-Past rule: block.timestamp > median(last 11 on-chain timestamps).
-// Prevents a producer rewriting the near-past with a below-median ts; with
-// parent-monotonicity and the future-tolerance window an attacker can only
-// push forward, within tolerance. Microblock-layer backstop complementing
-// (not replacing) 2f+1 macroblock finality. First ~11 blocks: ring
-// undersized → None → parent+1 fallback (safe; hash-chain prevents
-// rewrite). O(window) sort.
-
-/// Compute the Median-Past timestamp for a block being verified or produced
-/// at `target_height`. Median is taken over the canonical parent-chain
-/// segment `[target_height - MEDIAN_PAST_WINDOW, target_height)` —
-/// i.e. the WINDOW blocks immediately preceding `target_height` BY HEIGHT.
-///
-/// Returns `None` if the ring lacks enough samples within that height
-/// range, in which case the caller falls back to `parent+1` monotonicity
-/// alone.
-///
-/// v15.15: height-ordered (BIP-113) — median over ring entries whose
-/// heights lie in [target_height-WINDOW, target_height), NOT the last
-/// WINDOW insertions (the old insertion-order median produced false
-/// median_past_violation rejections when blocks re-arrived out of
-/// height order during post-rollback catch-up). O(WINDOW=32).
-pub fn median_past_timestamp_at_height(target_height: u64) -> Option<u64> {
-    // The rule cannot apply to the genesis-adjacent prefix where there
-    // are not yet WINDOW prior heights to take a median over.
-    if target_height < MEDIAN_PAST_WINDOW as u64 {
-        return None;
-    }
-
-    let lower: u64 = target_height - MEDIAN_PAST_WINDOW as u64;  // inclusive
-    let upper: u64 = target_height;                              // exclusive
-
-    let ring = NETWORK_TIME_RING.lock();
-
-    // Collect timestamps for heights in [lower, upper). Dedupe by height
-    // — the canonical chain produces exactly one timestamp per height; if
-    // duplicates exist (replay / rollback artifacts) we keep the FIRST
-    // sample observed (insertion-time entry) which corresponds to the
-    // accepted-into-ring chain version.
-    let mut by_height: std::collections::BTreeMap<u64, u64> =
-        std::collections::BTreeMap::new();
-    for (h, ts) in ring.samples[..ring.len.min(NETWORK_TIME_WINDOW)].iter() {
-        if *h >= lower && *h < upper {
-            by_height.entry(*h).or_insert(*ts);
-        }
-    }
-    drop(ring);
-
-    // Need EXACTLY WINDOW samples in the canonical parent segment to
-    // compute the median. If the ring is missing some (e.g., the node has
-    // not yet observed all parents of `target_height` due to a recent
-    // rollback or rewind), fall back to None — caller relies on parent+1
-    // monotonicity instead, which is still a strict ordering rule.
-    if by_height.len() < MEDIAN_PAST_WINDOW {
-        return None;
-    }
-
-    // Take the WINDOW most recent heights below `target_height`. With
-    // BTreeMap ordering, that's the highest-key tail.
-    let mut window: Vec<u64> = by_height.values().rev().take(MEDIAN_PAST_WINDOW).copied().collect();
-    window.sort_unstable();
-    // Median of an odd-size (11) slice: the middle element.
-    Some(window[MEDIAN_PAST_WINDOW / 2])
-}
-
-/// LEGACY wrapper for callers that do not yet pass a target height.
-/// Retained for source-level compatibility; new callers MUST use
-/// `median_past_timestamp_at_height(target_height)` for correct
-/// height-ordered semantics.
-///
-/// Without a target height we cannot compute a canonical parent-segment
-/// median — return None and let the caller fall back to parent+1.
-#[deprecated(note = "Use median_past_timestamp_at_height(target_height) for canonical BIP-113 semantics")]
-pub fn median_past_timestamp() -> Option<u64> {
-    None
-}
+// Clock drift is a non-issue for consensus: block_ts is slot-anchored
+// (genesis + height*SLOT, exact-match validated), so timing is deterministic
+// per height and a drifted clock can neither fork nor stall the network —
+// nothing to self-calibrate and no reason to self-pause. The former median
+// network-time ring / effective_now / Median-Past machinery was inert (no
+// live callers) and has been removed; observe_clock_drift below survives only
+// as an operator-facing drift monitor with no consensus effect.
 
 /// Feed an observation into the drift monitor.
 /// `block_ts`  — on-chain timestamp of a just-applied network block.
 /// `local_now` — wall clock when the block was applied.
 /// Pure observational — safe to call from any thread.
 ///
-/// v14.8.11: Monitoring-only. Thresholds:
-///   EMA > 10 s : [WARN][DRIFT] log — operator notice, no consensus effect
-///
-/// All consensus-side drift compensation lives in:
-///   * `effective_now()` — used in local stall detection
-///   * Median-aware block timestamp generation (see block construction)
-///   * Wide validation window (`TIMESTAMP_FUTURE_TOLERANCE`)
-///   * Median-Past rule (see `median_past_timestamp_at_height`)
-///
-/// The monitor never pauses production or blocks voting — a drifted node
-/// remains productive, its block timestamps are pulled back to the canonical
-/// network range by the median rule, and it keeps contributing to the BFT
-/// quorum. This preserves liveness on small committees (5-node genesis)
-/// while scaling cleanly to thousands of super-nodes.
+/// Monitoring-only: tracks an EMA of |wall - block_ts| and its peak, and logs
+/// [WARN][PACING] when the EMA crosses ~10 s. It never pauses production, gates
+/// voting, or feeds any consensus decision, so it cannot cause or prevent a
+/// fork — a drifted node stays productive and keeps contributing to the BFT
+/// quorum. Consensus timing safety is structural (slot-anchored timestamps),
+/// not a product of this monitor.
 pub fn observe_clock_drift(block_ts: u64, local_now: u64) {
-    // Feed the on-chain timestamp into the network-time ring so
-    // `effective_now()` and median-aware generation can self-calibrate.
-    // Height is derived from LAST_BLOCK_PRODUCED_HEIGHT which is updated
-    // in the same pipeline path that calls this function. Safe to call
-    // before or after height update — the ring rejects non-monotonic
-    // heights.
-    let observed_height = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
-    update_network_time_sample(observed_height, block_ts);
-
     // Signed drift in seconds. Positive = our clock ahead of network.
     let abs_drift_secs: u64 = if local_now >= block_ts {
         local_now - block_ts
@@ -770,11 +566,8 @@ pub fn observe_clock_drift(block_ts: u64, local_now: u64) {
     }
 
     // Monitoring: log when EMA crosses the operator-attention threshold.
-    // Purely informational — no consensus side-effect. The actual clock-drift
-    // defence is structural: the producer loop reads `effective_now()` which
-    // takes `max(wall_clock, network_time_estimate)` from the 32-sample
-    // median ring, so a drifted node already converges with the network on
-    // the slot-offset computation without any process-exit gate.
+    // Purely informational — no consensus side-effect (block_ts is
+    // slot-anchored, so timing correctness never depends on the wall clock).
     let ema_secs = next / 1000;
     // Sampled (1 per PACING_LOG_EVERY blocks, ~5 min): the lag is informational — block_ts is
     // slot-anchored/deterministic, so it cannot fork; logging every block just spams.
@@ -789,11 +582,10 @@ pub fn observe_clock_drift(block_ts: u64, local_now: u64) {
     }
 }
 
-// v14.8.11: auto NTP re-sync trigger REMOVED. The in-container invocations
-// required SYS_TIME capability we do not grant, so every call logged
-// "ntp_resync_unavailable" without any effect. Real drift correction is
-// now handled structurally by the median-aware timestamp rules; operator
-// NTP hygiene is monitored via the `[WARN][DRIFT]` logs above.
+// Auto NTP re-sync trigger was removed: the in-container invocations required
+// a SYS_TIME capability we do not grant, so every call was a no-op. Drift needs
+// no correction now that timestamps are slot-anchored; operator NTP hygiene is
+// surfaced via the [WARN][PACING] log above.
 
 /// Read current drift EMA in seconds (for metrics/health endpoints).
 pub fn get_clock_drift_ema_secs() -> u64 {
@@ -947,6 +739,44 @@ fn light_roster_cutoff(epoch: u64) -> u64 {
 fn recent_heartbeat_senders(storage: &crate::storage::Storage, scan_end: u64) -> std::collections::HashSet<String> {
     let (cur_idx, prev_idx) = recency_subwindow_indices(scan_end);
     storage.recent_heartbeat_senders_indexed(cur_idx, prev_idx, scan_end).unwrap_or_default()
+}
+
+/// Phase-2A eligible additions: the registered-Super nodes that are recently live (on-chain Heartbeat
+/// in cur/prev subwindow), registration-confirmed by scan_end, and at/above the reputation floor —
+/// excluding ids already in `already_eligible`. Returned in node_id-ascending order (the consensus
+/// canonical key; feeds epoch_commitment→QC so it MUST be identical on every node).
+///
+/// SCALE: the recent-HB membership (O(1), in-memory) gates the per-candidate reg-height DISK point-read,
+/// so only the recent∩registered set (a few thousand) hits disk — NOT the full 100k+ registrant set. This
+/// is a pure predicate reorder of an AND, so the output is byte-identical to gating on reg-height first.
+fn phase2a_eligible_additions(
+    storage: &crate::storage::Storage,
+    registered_super_nodes: &std::collections::HashSet<String>,
+    recent_hb: &std::collections::HashSet<String>,
+    already_eligible: &std::collections::HashSet<String>,
+    reputation_map: &std::collections::HashMap<String, f64>,
+    scan_end: u64,
+    min_reputation_bp: u32,
+) -> Vec<qnet_state::EligibleProducer> {
+    let mut regs: Vec<&String> = registered_super_nodes.iter().collect();
+    regs.sort();
+    let mut out: Vec<qnet_state::EligibleProducer> = Vec::new();
+    for reg in regs {
+        if already_eligible.contains(reg) { continue; }
+        if !recent_hb.contains(reg) { continue; }
+        // Bound each candidate to a registration confirmed by scan_end (the live srtr_ pool can run
+        // ahead of scan_end under async production); genesis nodes carry reg_height=0 ⇒ always pass.
+        match storage.node_reg_height(reg) {
+            Ok(Some(h)) if h <= scan_end => {}
+            _ => continue,
+        }
+        let rep = (reputation_map.get(reg).copied()
+            .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION)
+            .clamp(0.0, 100.0) * 100.0).round() as u32;
+        if rep < min_reputation_bp { continue; }
+        out.push(qnet_state::EligibleProducer { node_id: reg.clone(), reputation: rep });
+    }
+    out
 }
 
 /// Reference body scan (test oracle for the lhb_ index; not on any production path).
@@ -1478,11 +1308,6 @@ pub fn attestation_layer_warmed_up() -> bool {
 // FIX R22-T5: Made pub(crate) for unified usage in block_pipeline.rs
 // Single source of truth — prevents inconsistent tolerance windows.
 pub const TIMESTAMP_FUTURE_TOLERANCE: u64 = 7200;  // 2 hours (absolute, wall clock)
-
-/// Median-Past rule window size. Block timestamp must be strictly greater than
-/// the median of the last `MEDIAN_PAST_WINDOW` block timestamps. Canonical
-/// value 11 taken from long-running PoW L1 consensus rules.
-pub const MEDIAN_PAST_WINDOW: usize = 11;
 
 /// v27 HOLE2: forward cap — block_ts may lead the raw network median by
 /// ≤ this (breaks the old unbounded max(effective_now) drift ratchet).
@@ -3439,11 +3264,17 @@ impl BlockchainNode {
         while s * Self::REWARD_SHARD_SIZE < wallets.len() {
             let start = s * Self::REWARD_SHARD_SIZE;
             let end = ((s + 1) * Self::REWARD_SHARD_SIZE).min(wallets.len());
-            let _ = storage.save_epoch_reward_shard(epoch, s, &wallets[start..end]);
+            // Not a fork: reward_root is QC-authoritative and a dropped shard self-heals via
+            // backfill on boot/post-cold-join. Surface the drop at WARN, don't fail the mint.
+            if let Err(e) = storage.save_epoch_reward_shard(epoch, s, &wallets[start..end]) {
+                println!("[WARN][REWARD] shard_persist_failed epoch={} shard={} err={}", epoch, s, e);
+            }
             bounds.push(wallets[start].0.clone());
             s += 1;
         }
-        let _ = storage.save_epoch_shard_meta(epoch, &roots, &bounds);
+        if let Err(e) = storage.save_epoch_shard_meta(epoch, &roots, &bounds) {
+            println!("[WARN][REWARD] shard_persist_failed epoch={} kind=meta err={}", epoch, e);
+        }
     }
 
     /// Resolve a wallet's claim for an epoch against the SHARDED reward structure, verified against the
@@ -3604,6 +3435,25 @@ impl BlockchainNode {
         [0u8; 32]
     }
 
+    /// Checkpoint.logs_root for a window — RESERVED, gated by `logs_root_required` (dormant ⇒ the
+    /// caller passes [0;32]). Deterministic: reads the OFF-consensus per-block WASM log receipts for
+    /// every height in [start,end] in height order (and emit order within each block — both agreed by
+    /// every node since block apply is sequential), hashes each into a canonical leaf, and merkle-roots
+    /// them. The leaves derive ONLY from committed contract execution (identical on every node), so the
+    /// root is byte-identical across nodes — the property a 2f+1 QC over logs_root relies on. The exact
+    /// window bounds are finalised WITH the live equivalence run when the gate is activated.
+    fn compute_window_logs_root(storage: &crate::storage::Storage, start_height: u64, end_height: u64) -> [u8; 32] {
+        let mut leaves: Vec<Vec<u8>> = Vec::new();
+        let mut h = start_height;
+        while h <= end_height {
+            for (_tx_hash, contract, data) in storage.get_block_logs(h) {
+                leaves.push(qnet_state::wasm_exec::log_leaf(&contract, &data));
+            }
+            h = h.saturating_add(1);
+        }
+        qnet_consensus::checkpoint_bft::logs_merkle_root(&leaves)
+    }
+
     // Single apply_block_to_state() for ALL paths (startup replay, recovery
     // fast-forward, normal sync) → no replay-vs-live divergence. Caller
     // handles pre-image recording, state_root verify, rollback, deferred
@@ -3648,6 +3498,10 @@ impl BlockchainNode {
         _processed_emission_mbs: Option<&std::collections::HashSet<u64>>,
     ) -> BlockApplyResult {
         let h = microblock.height;
+
+        // Reset the off-consensus WASM log sink for THIS block so a prior block's logs never leak
+        // into this block's persisted receipts. Filled during Phase 2's SEQUENTIAL tx apply.
+        qnet_state::wasm_exec::clear_wasm_logs();
 
         let mut result = BlockApplyResult {
             merkle_root: [0u8; 32],
@@ -3717,6 +3571,10 @@ impl BlockchainNode {
         }
 
         // ── Phase 2: Apply all transactions + gas refund on success ──
+        // Metered WASM-compute fees accrued across this block's txs (heights >= the metering-activation
+        // height); credited to the producer in Phase 3 on top of the flat fees_collected. Identical on
+        // every node: it sums per-tx wasmi fuel (deterministic) × effective_gas_price (pure fn).
+        let mut block_wasm_fuel_fees: u64 = 0;
         for tx in &microblock.transactions {
             // Record pre-images BEFORE mutation (for rollback support)
             if let Some(ref mut snap) = block_snapshot {
@@ -3728,7 +3586,11 @@ impl BlockchainNode {
             // producer-inline path) so the emission recompute reads ≤5 keys, not a 14400-block scan.
             Self::index_light_eligibility_bitmap(storage, h, tx);
 
-            if let Err(e) = state_guard.apply_transaction_lazy(tx) {
+            let apply_result = state_guard.apply_transaction_lazy_at(tx, h);
+            // Take this tx's WASM fuel ONCE, on the same thread, right after apply (resets the slot for
+            // the next tx — WASM or not) so the metered fee matches the producer-inline path exactly.
+            let tx_wasm_fuel = qnet_state::wasm_exec::take_last_tx_wasm_fuel();
+            if let Err(e) = apply_result {
                 if is_debug() {
                     println!("[DBG][STATE] tx_skip h={} err={}", h, e);
                 }
@@ -3737,7 +3599,12 @@ impl BlockchainNode {
                 if let Some(ref mut snap) = block_snapshot {
                     snap.record_pre_images(&[tx.from.clone()], &state_guard.accounts);
                 }
-                let _ = state_guard.apply_gas_refund(tx, h);
+                let _ = state_guard.apply_gas_refund(tx, h, tx_wasm_fuel);
+                // Accrue the metered WASM-compute fee (above activation) for the Phase 3 producer credit.
+                if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT
+                    && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
+                    block_wasm_fuel_fees = block_wasm_fuel_fees.saturating_add(tx.wasm_fuel_fee(tx_wasm_fuel));
+                }
 
                 // Collect deferred side effects from successful TXs
                 match &tx.tx_type {
@@ -3798,6 +3665,16 @@ impl BlockchainNode {
             }
         }
 
+        // OFF-CONSENSUS: persist this block's captured WASM event logs for RPC getLogs. Drained in
+        // tx-apply order (the Phase-2 loop is sequential). Non-fatal — the receipt store never
+        // blocks or fails block apply — and never hashed, so it cannot affect state_root.
+        {
+            let block_logs = qnet_state::wasm_exec::drain_wasm_logs();
+            if !block_logs.is_empty() {
+                let _ = storage.save_block_logs(h, &block_logs);
+            }
+        }
+
         // Epoch-boundary super reward-eligibility snapshot (deterministic; replaces per-TX writer).
         Self::populate_super_elig_at_boundary(state_guard, storage, h);
 
@@ -3812,19 +3689,34 @@ impl BlockchainNode {
         // ── Phase 3: Credit producer fees (with recalculation) ──
         if microblock.fees_collected > 0 {
             // Recalculate actual fees from transactions to prevent overclaim
+            // Recompute the producer's flat fee total BYTE-IDENTICALLY to its block-build fill loop:
+            // SAME filter (!system && gas_price>0 && gas_limit>0) and SAME charged_gas (compute_gas_used
+            // at/above the metering-activation height, else gas_limit). Mapping all txs / a fixed formula
+            // here would diverge from the producer for a gas_limit==0 fee tx or below activation — and
+            // since we now credit this value DIRECTLY (no min(header,·) clamp), any divergence would fork
+            // the state_root. Plus the metered WASM compute measured during Phase 2 apply (same on every
+            // node). This sum equals the producer's block_fees_collected + block_wasm_fuel_fees exactly.
             let actual_fees: u64 = microblock.transactions.iter()
+                .filter(|tx| !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0)
                 .map(|tx| {
-                    let gas_used = tx.compute_gas_used();
-                    tx.effective_gas_price().saturating_mul(gas_used)
+                    let charged_gas = if h >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT {
+                        tx.compute_gas_used()
+                    } else {
+                        tx.gas_limit
+                    };
+                    tx.effective_gas_price().saturating_mul(charged_gas)
                 })
-                .fold(0u64, |acc, fee| acc.saturating_add(fee));
-            let validated_fees = if microblock.fees_collected > actual_fees {
-                println!("[WARN][VALIDATION] fees_overclaimed h={} claimed={} actual={} producer={}",
+                .fold(0u64, |acc, fee| acc.saturating_add(fee))
+                .saturating_add(block_wasm_fuel_fees);
+            // The header's fees_collected is the producer's FLAT pre-execution estimate; the
+            // AUTHORITATIVE credit is this deterministically recomputed metered total (flat + measured
+            // fuel), which a malicious producer cannot inflate — it is recomputed, not read from the
+            // header. Log only a genuine overclaim (header exceeds the recomputed metered total).
+            if microblock.fees_collected > actual_fees {
+                println!("[WARN][VALIDATION] fees_overclaimed h={} claimed={} metered_actual={} producer={}",
                          h, microblock.fees_collected, actual_fees, microblock.producer);
-                actual_fees
-            } else {
-                microblock.fees_collected
-            };
+            }
+            let validated_fees = actual_fees;
 
             let producer_wallet = match storage.load_node_registration(&microblock.producer) {
                 Ok(Some((_, wallet, _))) => wallet,
@@ -4216,6 +4108,20 @@ impl BlockchainNode {
         rep
     }
 
+    /// Canonicalize stored macroblock bytes to the plaintext bincode preimage.
+    /// Fail-CLOSED: a zstd-magic prefix that fails to decompress is a corrupt block —
+    /// return None so it fails identically on every node. NEVER pass raw compressed
+    /// bytes into parsing (that would diverge per-impl). Absent magic ⇒ stored
+    /// uncompressed (see storage save_macroblock), bytes used as-is.
+    fn macroblock_plaintext(raw: Vec<u8>) -> Option<Vec<u8>> {
+        const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+        if raw.len() >= 4 && raw[0..4] == ZSTD_MAGIC {
+            zstd::decode_all(&raw[..]).ok()
+        } else {
+            Some(raw)
+        }
+    }
+
     /// Loads the cumulative ban-set stored in macroblock `mb_index`'s body
     /// (`consensus_data.banned_validators`). `None` ⇒ macroblock absent OR no anchor field
     /// (pre-feature chain) — the caller then rebuilds via full scan. `Some(set)` ⇒ the
@@ -4224,7 +4130,7 @@ impl BlockchainNode {
     fn load_macroblock_ban_set(storage: &Storage, mb_index: u64) -> Option<std::collections::HashSet<String>> {
         if mb_index == 0 { return Some(std::collections::HashSet::new()); }
         let raw = storage.get_macroblock_by_height(mb_index).ok().flatten()?;
-        let bytes = zstd::decode_all(&raw[..]).unwrap_or(raw);
+        let bytes = Self::macroblock_plaintext(raw)?;
         let mb = bincode::deserialize::<qnet_state::MacroBlock>(&bytes).ok()?;
         let ser = mb.consensus_data.banned_validators?;
         bincode::deserialize::<Vec<String>>(&ser).ok().map(|v| v.into_iter().collect())
@@ -4438,28 +4344,14 @@ impl BlockchainNode {
                 // (NOT the async-lagging accounts CF, whose per-node persist lag gave a divergent eligible
                 // set → epoch_commitment split → finality stall). Computed once; identical on every member.
                 let recent_hb = recent_heartbeat_senders(storage, scan_end);
-                let mut regs: Vec<&String> = registered_super_nodes.iter().collect();
-                regs.sort();
-                let mut added_tally = 0usize;
-                for reg in regs {
-                    if eligible_ids.contains(reg) { continue; }
-                    // Determinism: the srtr_ candidate pool is read at the live applied tip, which under
-                    // async production can run ahead of end_height; bound each re-entry candidate to a
-                    // registration CONFIRMED by end_height so every committee member admits the SAME set
-                    // (an ahead-of-end_height registration is excluded identically everywhere). Genesis
-                    // nodes carry reg_height=0 ⇒ always pass.
-                    match storage.node_reg_height(reg) {
-                        Ok(Some(h)) if h <= scan_end => {}
-                        _ => continue,
-                    }
-                    if !recent_hb.contains(reg) { continue; }
-                    let rep = (reputation_map.get(reg).copied()
-                        .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION)
-                        .clamp(0.0, 100.0) * 100.0).round() as u32;
-                    if rep < MIN_REPUTATION_BP { continue; }
-                    eligible.push(qnet_state::EligibleProducer { node_id: reg.clone(), reputation: rep });
-                    eligible_ids.insert(reg.clone());
-                    added_tally += 1;
+                let additions = phase2a_eligible_additions(
+                    storage, &registered_super_nodes, &recent_hb, &eligible_ids,
+                    &reputation_map, scan_end, MIN_REPUTATION_BP,
+                );
+                let added_tally = additions.len();
+                for p in additions {
+                    eligible_ids.insert(p.node_id.clone());
+                    eligible.push(p);
                 }
                 if added_tally > 0 {
                     println!("[INFO][SNAP] L1_TALLY added={} epoch={} subwin={} total={}",
@@ -4968,15 +4860,16 @@ impl BlockchainNode {
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
-    // v9.4: NodeReactivation TX — returning nodes signal they're back online
-    // Pattern: IDENTICAL to NodeRegistration TX flow (sync, not async)
-    //   Genesis nodes: unsigned system TX (same as genesis NodeRegistration)
-    //   Super nodes: hybrid Ed25519+Dilithium3 signed (same as super NodeRegistration)
+    // v9.4: NodeReactivation TX — returning nodes signal they're back online.
+    // Flow mirrors NodeRegistration (sync, not async); both sign pure Dilithium3:
+    //   Genesis nodes: unsigned system TX
+    //   Super nodes: Dilithium3 (ML-DSA-65) signed via sign_reactivation_tx (no Ed25519 leg,
+    //     same as sign_node_registration_tx)
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Create base NodeReactivation TX (unsigned).
     /// Signing is done separately by the caller via sign_reactivation_tx().
-    /// ALL nodes (Genesis + Super) sign with hybrid Ed25519 (BIP44) + Dilithium3 (WalletIdentity).
+    /// ALL nodes (Genesis + Super) sign with pure Dilithium3 / ML-DSA-65 (WalletIdentity).
     pub fn create_node_reactivation_tx(
         node_id: &str,
         current_height: u64,
@@ -5032,23 +4925,9 @@ impl BlockchainNode {
         let canonical_msg = format!("node_reactivation:{}:{}",
             node_id, tx.timestamp);
 
-        // Layer 1: Ed25519 from BIP44 m/44'/9999'/0'/0'/0' (same as NodeRegistration line 27248)
-        let mnemonic = std::env::var("QNET_WALLET_SEED").unwrap_or_default();
-        if !mnemonic.is_empty() {
-            use ed25519_dalek::Signer;
-            match crate::crypto::solana_derivation::derive_qnet_signing_key_from_mnemonic(&mnemonic) {
-                Ok(signing_key) => {
-                    let ed_sig = signing_key.sign(canonical_msg.as_bytes());
-                    tx.signature = Some(hex::encode(ed_sig.to_bytes()));
-                    tx.public_key = Some(hex::encode(signing_key.verifying_key().as_bytes()));
-                }
-                Err(e) => {
-                    eprintln!("[WARN][REACTIVATION] ed25519_sign_failed: {}", e);
-                }
-            }
-        }
-
-        // Layer 2: Dilithium3 from WalletIdentity (same as NodeRegistration line 27262)
+        // Pure ML-DSA-65: NodeReactivation is authenticated solely by the node's registered
+        // Dilithium3 identity key (verified against the on-chain VRF key at block validation).
+        // Ed25519 was an illusory second leg — quantum-breakable, no identity binding — removed.
         if let Some(identity) = wallet_identity {
             match identity.sign_consensus(node_id, canonical_msg.as_bytes()) {
                 Ok(consensus_sig) => {
@@ -5061,11 +4940,11 @@ impl BlockchainNode {
             }
         }
 
-        // Recalculate hash after signing (same as NodeRegistration line 27277)
+        // Recalculate hash after signing.
         tx.hash = tx.calculate_hash();
 
-        println!("[INFO][REACTIVATION] signed ed25519={} dilithium3={} node={}",
-            tx.signature.is_some(), tx.dilithium_signature.is_some(), node_id);
+        println!("[INFO][REACTIVATION] signed dilithium3={} node={}",
+            tx.dilithium_signature.is_some(), node_id);
     }
 
     /// v12.0: Get consensus hash of macroblock from storage.
@@ -5076,14 +4955,11 @@ impl BlockchainNode {
         for idx in [mb_index, mb_index.saturating_sub(1)] {
             if idx == 0 { continue; }
             if let Ok(Some(data)) = storage.get_macroblock_by_height(idx) {
-                // Decompress if zstd-compressed
-                let decompressed = if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
-                    zstd::decode_all(&data[..]).unwrap_or_else(|_| data.to_vec())
-                } else {
-                    data
-                };
-                if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&decompressed) {
-                    return hex::encode(mb.hash());
+                // Fail-closed decompress: corrupt compressed block yields None, never raw bytes.
+                if let Some(decompressed) = Self::macroblock_plaintext(data) {
+                    if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&decompressed) {
+                        return hex::encode(mb.hash());
+                    }
                 }
             }
         }
@@ -5701,7 +5577,7 @@ impl BlockchainNode {
     /// `tx_type.signature` is the consensus Dilithium sig over the anchor (verified by
     /// `verify_heartbeat_tx`: anchor must equal a real recent block hash + be timely + sig valid
     /// vs the node's registry PK ⇒ an offline node cannot fabricate it). The envelope carries the
-    /// standard hybrid sig like every system TX. Returns None if the anchor hash is unavailable or
+    /// standard Dilithium3 sig like every system TX. Returns None if the anchor hash is unavailable or
     /// signing fails (caller skips this tick, retries next).
     async fn create_heartbeat_tx_static(
         storage: &Arc<Storage>,
@@ -6145,8 +6021,8 @@ impl BlockchainNode {
             },
             timestamp: current_time,
             hash: String::new(),
-            signature: None,      // Will be filled with hybrid signature
-            public_key: None,     // Will be filled with ephemeral Ed25519 pubkey
+            signature: None,      // Unused: PingCommitment is authenticated by the Dilithium3 leg below
+            public_key: None,     // Unused: pure ML-DSA-65; no ephemeral pubkey for QNet signing
             gas_price: u64::MAX,
             gas_limit: 0,
             nonce: 0,
@@ -6156,9 +6032,8 @@ impl BlockchainNode {
             chain_id: 0,
         };
         
-        // PRODUCTION v2.82: Add HYBRID signature (Ed25519 + Dilithium) for L1 security
+        // PRODUCTION v2.82: Add pure Dilithium3 (ML-DSA-65) signature for L1 security
         // CRITICAL: Use SAME format as verify functions expect!
-        // - Ed25519: verify_ed25519_tx_signature_async expects canonical message
         // - Dilithium: verify_dilithium_tx_signature expects canonical message
         
         let to_str = commitment_tx.to.clone().unwrap_or_default();
@@ -6166,21 +6041,11 @@ impl BlockchainNode {
             commitment_tx.from, to_str, commitment_tx.amount, commitment_tx.nonce,
             commitment_tx.gas_price, commitment_tx.gas_limit, commitment_tx.timestamp);
         
-        // Step 1: Ed25519 signature with ephemeral key (forward secrecy)
-        use ed25519_dalek::{SigningKey, Signer};
-        use rand::rngs::OsRng;
-        
-        let mut csprng = OsRng{};
-        let ephemeral_signing_key = SigningKey::generate(&mut csprng);
-        let ephemeral_public_key = ephemeral_signing_key.verifying_key();
-        let ed25519_signature = ephemeral_signing_key.sign(canonical_message.as_bytes());
-        
-        commitment_tx.signature = Some(hex::encode(ed25519_signature.to_bytes()));
-        commitment_tx.public_key = Some(hex::encode(ephemeral_public_key.as_bytes()));
-        
-        // Step 2: Dilithium signature (quantum-resistant) using quantum_crypto
-        // CRITICAL v2.85: Dilithium is MANDATORY for commitment TX (L1 security requirement)
-        // This provides post-quantum security linked to node identity
+        // Pure ML-DSA-65: the PingCommitment is authenticated solely by the node's Dilithium3
+        // consensus key (looked up via CONSENSUS_PK_REGISTRY). The former ephemeral Ed25519 leg
+        // proved no identity and is quantum-breakable — removed.
+        // Dilithium is MANDATORY for commitment TX (L1 security requirement) and links the
+        // commitment to the node's post-quantum identity.
         let crypto = try_get_quantum_crypto()
             .ok_or_else(|| QNetError::SecurityError("Quantum crypto not initialized - REQUIRED for commitment TX".to_string()))?;
         
@@ -6190,7 +6055,7 @@ impl BlockchainNode {
                 commitment_tx.dilithium_public_key = Some(node_id.to_string());
                 
                 if is_info() {
-                    println!("[INFO][PING-COMMIT] TX signed with HYBRID crypto: Ed25519(ephemeral) + Dilithium(node) node={}", node_id);
+                    println!("[INFO][PING-COMMIT] TX signed with Dilithium3(node) node={}", node_id);
                 }
             }
             Err(e) => {
@@ -7331,6 +7196,48 @@ impl BlockchainNode {
             let state_setup = state.read().await;
             state_setup.set_disk_store(storage.clone() as Arc<dyn qnet_state::AccountStore>);
             state_setup.set_cache_capacity(cache_capacity);
+            // Phase C: opt-in disk-backed Merkle node store (DEFAULT OFF).
+            // "1" forces ON; "auto" flips ON only once persisted accounts cross
+            // the threshold (merkle RAM ~0.25GB/1M accounts — ~2.5M is where a
+            // 4-8GB super-node meets the ~0.6GB floor, ahead of the 10M cliff).
+            // Any other value or unset preserves relaunch behavior untouched.
+            let merkle_mode = std::env::var("QNET_MERKLE_NODE_STORE").unwrap_or_default();
+            let auto_threshold: usize = std::env::var("QNET_MERKLE_NODE_STORE_AUTO_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(2_500_000);
+            // Estimate is only needed for "auto"; O(1) RocksDB accounts CF probe.
+            let (enable, mode, est) = match merkle_mode.as_str() {
+                "1" => (true, "1", 0u64),
+                "auto" => {
+                    let est = storage.estimate_account_count();
+                    (est >= auto_threshold as u64, "auto", est)
+                }
+                _ => (false, "", 0u64),
+            };
+            if enable {
+                let node_cache_cap: usize = std::env::var("QNET_MERKLE_NODE_CACHE_CAP")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(2_000_000);
+                state_setup.set_merkle_node_store(storage.merkle_node_store());
+                state_setup.set_merkle_node_cache_cap(node_cache_cap);
+                if is_info() {
+                    println!(
+                        "[INFO][MERKLE] node_store=rocksdb mode={} accounts~={} threshold={} cache_cap={}",
+                        mode, est, auto_threshold, node_cache_cap,
+                    );
+                }
+            } else if merkle_mode == "auto" {
+                if is_debug() {
+                    println!(
+                        "[DEBUG][MERKLE] node_store=in-mem accounts~={} < threshold={}",
+                        est, auto_threshold,
+                    );
+                }
+            } else if is_debug() {
+                println!("[DEBUG][MERKLE] node_store=in-mem (authority path)");
+            }
             drop(state_setup);
             if is_info() {
                 println!(
@@ -8080,7 +7987,7 @@ impl BlockchainNode {
                 .or_else(|_| std::env::var("HOST_IP"))
                 .unwrap_or_else(|_| "0.0.0.0".to_string());
             
-            // Get certificate serial from hybrid crypto
+            // Get certificate serial from PQ crypto
             let cert_serial = format!("cert_{}_{}", node_id, 
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -8132,20 +8039,22 @@ impl BlockchainNode {
             false
         };
         
-        // Initialize sharding components for production
-        let shard_coordinator = if perf_config.enable_sharding || auto_enable_sharding() {
-            // QUANTUM OPTIMIZATION: Connect sharding to P2P network
-            let coordinator = Arc::new(qnet_sharding::ShardCoordinator::new());
-            
-            // Register P2P shard info with coordinator
-            if is_info() { println!("[INFO][SHARD] connect shard_id={}", unified_p2p.get_shard_id()); }
-            // Coordinator knows which shard this node handles
-            // for efficient cross-shard communication
-            
-            Some(coordinator)
-        } else {
-            None
-        };
+        // Initialize sharding components for production.
+        // SHARDING DEFERRED (user decision: single-shard 50k TPS is sufficient). The coordinator is
+        // pinned OFF (`if false`) so the unhardened cross-shard path can NEVER auto-arm at scale: with
+        // shard_coordinator == None, adjust_shard_count (its sole caller is behind a Some(..) guard) is
+        // unreachable so total_shards stays 1, and cross-shard TX routing (also Some-guarded) is skipped
+        // — network-wide, deterministically, regardless of node count or QNET_ENABLE_SHARDING. The
+        // qnet_sharding crate + auto_enable_sharding stay intact; re-arm later by restoring the guard
+        // (after SHARD-1/2/3 hardening).
+        let shard_coordinator: Option<Arc<qnet_sharding::ShardCoordinator>> =
+            if false && (perf_config.enable_sharding || auto_enable_sharding()) {
+                let coordinator = Arc::new(qnet_sharding::ShardCoordinator::new());
+                if is_info() { println!("[INFO][SHARD] connect shard_id={}", unified_p2p.get_shard_id()); }
+                Some(coordinator)
+            } else {
+                None
+            };
         
         let parallel_validator = if perf_config.parallel_validation {
             Some(Arc::new(qnet_sharding::ParallelValidator::new(
@@ -9922,6 +9831,7 @@ impl BlockchainNode {
         // high-gas transactions that pass byte-size limit but exceed computation budget.
         {
             let mut cumulative_gas: u64 = 0;
+            let mut cumulative_fuel: u64 = 0;
             let gas_activation = qnet_state::GAS_METERING_ACTIVATION_HEIGHT;
             for tx in &microblock.transactions {
                 if !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
@@ -9931,6 +9841,12 @@ impl BlockchainNode {
                         tx.gas_limit
                     };
                     cumulative_gas = cumulative_gas.saturating_add(tx_gas);
+                    // SEPARATE CPU budget: gas prices bytes/base cost but does NOT bound compute — a
+                    // metered WASM call can burn up to gas_limit-intrinsic fuel while contributing only
+                    // its flat intrinsic to the gas total. Bound the block's summed RESERVED fuel (pure
+                    // fn of the signed gas_limit ⇒ identical on every node, no execution needed) so a
+                    // block can never force more interpreter work than the ~1s slot allows.
+                    cumulative_fuel = cumulative_fuel.saturating_add(tx.reserved_fuel());
                 }
             }
             if cumulative_gas > qnet_state::gas_limits::BLOCK_GAS_LIMIT {
@@ -9938,6 +9854,13 @@ impl BlockchainNode {
                     "BLOCK_GAS_LIMIT_EXCEEDED:h={}:gas={}:limit={}:producer={}",
                     microblock.height, cumulative_gas,
                     qnet_state::gas_limits::BLOCK_GAS_LIMIT, microblock.producer
+                ));
+            }
+            if cumulative_fuel > qnet_state::gas_limits::BLOCK_FUEL_LIMIT {
+                return Err(format!(
+                    "BLOCK_FUEL_LIMIT_EXCEEDED:h={}:fuel={}:limit={}:producer={}",
+                    microblock.height, cumulative_fuel,
+                    qnet_state::gas_limits::BLOCK_FUEL_LIMIT, microblock.producer
                 ));
             }
         }
@@ -11458,24 +11381,14 @@ impl BlockchainNode {
                                     total_assigned,
                                 ) {
                                     Ok(mut tx) => {
-                                        // HYBRID SIGNATURE (Ed25519 + Dilithium3). Sign the SINGLE
-                                        // canonical message the verifier uses (Self::build_canonical_verify_message)
-                                        // so the bitmap content (genesis_id/epoch/counts/bitmap) is bound, not
-                                        // just the header — closes the unsigned-field forgery (P1).
+                                        // Pure ML-DSA-65: sign the SINGLE canonical message the verifier uses
+                                        // (Self::build_canonical_verify_message) so the bitmap content
+                                        // (genesis_id/epoch/counts/bitmap) is bound, not just the header —
+                                        // closes the unsigned-field forgery (P1). The former ephemeral Ed25519
+                                        // leg proved no identity and is quantum-breakable — removed.
                                         let canonical_msg = Self::build_canonical_verify_message(&tx);
 
-                                        // Step 1: Ed25519 ephemeral signature (forward secrecy)
-                                        {
-                                            use ed25519_dalek::{SigningKey, Signer};
-                                            use rand::rngs::OsRng;
-                                            let signing_key = SigningKey::generate(&mut OsRng);
-                                            let vk = signing_key.verifying_key();
-                                            let sig = signing_key.sign(canonical_msg.as_bytes());
-                                            tx.signature  = Some(hex::encode(sig.to_bytes()));
-                                            tx.public_key = Some(hex::encode(vk.as_bytes()));
-                                        }
-
-                                        // Step 2: Dilithium3 signature (quantum-resistant, linked to node identity)
+                                        // Dilithium3 signature (quantum-resistant, linked to node identity)
                                         if let Some(crypto) = try_get_quantum_crypto() {
                                             match crypto.create_consensus_signature(&node_id, &canonical_msg).await {
                                                 Ok(dilithium_sig) => {
@@ -11494,7 +11407,7 @@ impl BlockchainNode {
 
                                         if is_info() {
                                             let has_dil = tx.dilithium_signature.is_some();
-                                            println!("[INFO][LIGHT-BITMAP] TX created hash={} hybrid_sig=Ed25519+Dilithium3({})",
+                                            println!("[INFO][LIGHT-BITMAP] TX created hash={} sig=Dilithium3({})",
                                                      &tx.hash[..16], has_dil);
                                         }
                                         
@@ -12349,9 +12262,9 @@ impl BlockchainNode {
                                                 // CRITICAL FIX: Broadcast certificate AFTER Genesis creation
                                                 // This ensures Genesis exists before certificate propagation
                                                 if let Some(ref p2p) = unified_p2p {
-                                                    use crate::hybrid_crypto::{GLOBAL_HYBRID_INSTANCES, HybridCrypto};
+                                                    use crate::pq_crypto::{GLOBAL_PQ_INSTANCES, PqCrypto};
                                                     
-                                                    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                                                    let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
                                                         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
                                                     }).await;
                                                     
@@ -12361,18 +12274,18 @@ impl BlockchainNode {
                                                     
                                                     // CRITICAL: Always create/get instance for certificate broadcast
                                                     if !instances_guard.contains_key(&normalized_id) {
-                                                        let mut hybrid = HybridCrypto::new(normalized_id.clone());
-                                                        if let Err(e) = hybrid.initialize().await {
-                                                            println!("[WARN][GEN] Failed to initialize hybrid crypto: {}", e);
+                                                        let mut pq = PqCrypto::new(normalized_id.clone());
+                                                        if let Err(e) = pq.initialize().await {
+                                                            println!("[WARN][GEN] Failed to initialize PQ crypto: {}", e);
                                                         } else {
-                                                            instances_guard.insert(normalized_id.clone(), hybrid);
+                                                            instances_guard.insert(normalized_id.clone(), pq);
                                                         }
                                                     }
-                                                    
+
                                                     // CRITICAL: ALWAYS broadcast certificate after Genesis, even if instance existed
                                                     // ARCHITECTURE: Delay broadcast to ensure all Genesis nodes are ready
-                                                    if let Some(hybrid) = instances_guard.get(&normalized_id) {
-                                                        if let Some(cert) = hybrid.get_current_certificate() {
+                                                    if let Some(pq) = instances_guard.get(&normalized_id) {
+                                                        if let Some(cert) = pq.get_current_certificate() {
                                                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
                                                                 // CRITICAL FIX: Wait for all Genesis nodes to be connected
                                                                 println!("[INFO][GEN] cert_broadcast_wait reason=peer_connection");
@@ -12516,9 +12429,9 @@ impl BlockchainNode {
                                 // CRITICAL FIX: Broadcast certificate AFTER Genesis reception
                                 // This ensures ALL Genesis nodes have certificates for verification
                                 if let Some(ref p2p) = unified_p2p {
-                                    use crate::hybrid_crypto::{GLOBAL_HYBRID_INSTANCES, HybridCrypto};
+                                    use crate::pq_crypto::{GLOBAL_PQ_INSTANCES, PqCrypto};
                                     
-                                    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                                    let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
                                         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
                                     }).await;
                                     
@@ -12528,18 +12441,18 @@ impl BlockchainNode {
                                     
                                     // CRITICAL: Always create/get instance for certificate broadcast
                                     if !instances_guard.contains_key(&normalized_id) {
-                                        let mut hybrid = HybridCrypto::new(normalized_id.clone());
-                                        if let Err(e) = hybrid.initialize().await {
-                                            println!("[WARN][GEN] Failed to initialize hybrid crypto: {}", e);
+                                        let mut pq = PqCrypto::new(normalized_id.clone());
+                                        if let Err(e) = pq.initialize().await {
+                                            println!("[WARN][GEN] Failed to initialize PQ crypto: {}", e);
                                         } else {
-                                            instances_guard.insert(normalized_id.clone(), hybrid);
+                                            instances_guard.insert(normalized_id.clone(), pq);
                                         }
                                     }
-                                    
+
                                     // CRITICAL: ALWAYS broadcast certificate after Genesis, even if instance existed
                                     // ARCHITECTURE: Ensure all peers are connected before certificate broadcast
-                                    if let Some(hybrid) = instances_guard.get(&normalized_id) {
-                                        if let Some(cert) = hybrid.get_current_certificate() {
+                                    if let Some(pq) = instances_guard.get(&normalized_id) {
+                                        if let Some(cert) = pq.get_current_certificate() {
                                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
                                                 // CRITICAL FIX: Wait for all Genesis nodes to be connected
                                                 println!("[INFO][GEN] cert_broadcast_wait reason=peer_connection_reception");
@@ -12835,11 +12748,11 @@ impl BlockchainNode {
                                 // Normal case: wait until correct Unix time for this block slot
                                 tokio::time::sleep(Duration::from_secs(wait_secs)).await;
                             } else {
-                                // RATE LIMIT v2.42.1: If late (QUIC init took >15 sec), still wait 1 sec
-                                // This prevents overwhelming QUIC with burst of catch-up blocks
-                                // Not a hack - this is network capacity protection (like TCP congestion control)
-                                // Max 1 block/sec is the network's design limit
-                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                // LATE vs the slot schedule: produce with a short floor, NOT a flat 1s
+                                // (that made lag monotonic — it could only grow). The floor lets lag
+                                // SHRINK (catch-up >1/s) while capping the burst (network-capacity guard);
+                                // real production cost still dominates, so this is a ceiling, not a rate.
+                                tokio::time::sleep(Duration::from_millis(200)).await; // <=5 blk/s catch-up
                             }
                         } else {
                             // No genesis timestamp yet - use simple 1 second interval
@@ -12869,32 +12782,32 @@ impl BlockchainNode {
                     match tokio::runtime::Handle::try_current() {
                         Ok(handle) => {
                             handle.spawn(async move {
-                                use crate::crypto::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+                                use crate::crypto::pq_crypto::{PqCrypto, GLOBAL_PQ_INSTANCES};
                                 
-                                let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                                let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
                                     std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
                                 }).await;
                                 
                                 let mut instances_guard = instances.lock().await;
                                 
-                                // Get or create hybrid instance for this node
+                                // Get or create PQ crypto instance for this node
                                 if !instances_guard.contains_key(&node_id_for_rotation) {
-                                    let mut hybrid = HybridCrypto::new(node_id_for_rotation.clone());
-                                    if let Err(e) = hybrid.initialize().await {
-                                        println!("[WARN][CERT] Hybrid init failed: {}", e);
+                                    let mut pq = PqCrypto::new(node_id_for_rotation.clone());
+                                    if let Err(e) = pq.initialize().await {
+                                        println!("[WARN][CERT] PQ crypto init failed: {}", e);
                                         return;
                                     }
-                                    instances_guard.insert(node_id_for_rotation.clone(), hybrid);
+                                    instances_guard.insert(node_id_for_rotation.clone(), pq);
                                 }
-                                
-                                if let Some(hybrid) = instances_guard.get_mut(&node_id_for_rotation) {
-                                    if hybrid.needs_rotation() {
-                                        if let Err(e) = hybrid.rotate_certificate().await {
+
+                                if let Some(pq) = instances_guard.get_mut(&node_id_for_rotation) {
+                                    if pq.needs_rotation() {
+                                        if let Err(e) = pq.rotate_certificate().await {
                                             println!("[WARN][CERT] Periodic rotation failed: {}", e);
                                         } else {
                                             // v3.50: Broadcast immediately after rotation
                                             // Ensures peers always have our latest cert
-                                            if let Some(cert) = hybrid.get_current_certificate() {
+                                            if let Some(cert) = pq.get_current_certificate() {
                                                 if let Ok(cert_bytes) = bincode::serialize(&cert) {
                                                     if let Some(ref p2p) = p2p_for_rotation {
                                                         if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
@@ -13196,18 +13109,18 @@ impl BlockchainNode {
                     
                 // Broadcast certificate if we have one
                 if let Some(ref p2p) = unified_p2p {
-                    use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
+                    use crate::pq_crypto::GLOBAL_PQ_INSTANCES;
                     
                     // Get our node's certificate from global instances
-                    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                    let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
                         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
                     }).await;
                     
                     let instances_guard = instances.lock().await;
                     let normalized_id = Self::normalize_node_id(&node_id);
                     
-                    if let Some(hybrid) = instances_guard.get(&normalized_id) {
-                        if let Some(cert) = hybrid.get_current_certificate() {
+                    if let Some(pq) = instances_guard.get(&normalized_id) {
+                        if let Some(cert) = pq.get_current_certificate() {
                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
                                 println!("[INFO][CERT] periodic_broadcast serial={}", cert.serial_number);
                                 if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number, cert_bytes) {
@@ -14769,19 +14682,18 @@ impl BlockchainNode {
                     }
                 }
 
-                // Production ceiling — throttle if we outrun EITHER bound, evaluated TOGETHER so neither
-                // short-circuits the other: (1) BFT finality (BFT-divergence guard, ~2-checkpoint trail +
-                // 1 headroom) and (2) the last SEALED macroblock/QC frontier (candidate-derivation guard).
-                // Both are committed-state-derived ⇒ deterministic same-on-all-nodes. The finality marker
-                // advances on the intra-K local commit path INDEPENDENT of the macroblock SEAL, so alone it
-                // never bound a seal-stalled producer (a runaway overran ~900 blocks past the last seal);
-                // OR-ing the seal bound caps that at +3 macroblocks. Both derive from the interval consts so
-                // the gate auto-tracks the cadence (90 finality / 270 seal at defaults).
+                // Production ceiling: pause (never wedge) if the microblock tip outruns finality or the
+                // last SEALED macroblock. Seal bound K=2 keeps the N-2 producer anchor always sealed
+                // (tip_epoch-2 <= last_sealed). last_sealed = TRUE contiguous seal frontier (not
+                // chain_height/90, which never bound a seal-stalled producer → the ~900-block runaway).
+                // Committed-state-derived ⇒ every node pauses at the same height.
                 {
                     const MAX_UNFINALIZED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
-                    const MAX_UNSEALED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                    const MAX_UNSEALED_BLOCKS: u64 = 2 * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
                     let last_finalized = LAST_FINALIZED_CONSENSUS_ROUND.load(Ordering::SeqCst);
-                    let last_sealed = qc_verified_frontier_cached();
+                    let last_sealed = try_get_storage()
+                        .map(|s| s.last_sealed_mb_index().saturating_mul(90))
+                        .unwrap_or(0);
                     let fin_over = last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS;
                     let seal_over = last_sealed > 0 && next_block_height > last_sealed + MAX_UNSEALED_BLOCKS;
                     if fin_over || seal_over {
@@ -15546,65 +15458,43 @@ impl BlockchainNode {
                         }
                     }
                 }
-                // v3.33: Removed v3.32 conflict detection window (800ms sleep) — dead code.
-                // Entropy consensus (above) handles ALL nodes at the rotation boundary, so
-                // the separate 800ms producer sleep is unnecessary. The attestation-based
-                // competing-producer yield in the production loop remains as a secondary
-                // safety net; round-based fork-choice is the primary path.
-                
+                // The v3.32 conflict-detection window (800ms sleep) and the attestation-based
+                // competing-producer yield were both removed: entropy consensus (above) handles all
+                // nodes at the rotation boundary, and round-based fork-choice (2f+1 TimeoutCertificate
+                // + certified-round supersede + 2f+1 macroblock Checkpoint) is the sole authority.
+
                 if is_my_turn_to_produce {
-                    // v3.35: BFT-based competing producer check (replaces v3.32 flag)
-                    // Yield ONLY when 2/3+ of connected peers attested to a competing block
-                    // at our height. Single-block flag was too aggressive (caused genesis deadlock).
-                    let competing_attestations = crate::unified_p2p::get_attestation_count(next_block_height);
-                    if competing_attestations > 0 {
-                        let peer_count = if let Some(ref p2p) = unified_p2p {
-                            p2p.get_peer_count()
-                        } else { 0 };
-                        if peer_count >= 2 {
-                            let bft_threshold = (peer_count * 2 + 2) / 3;
-                            if competing_attestations >= bft_threshold {
-                                if is_info() {
-                                    println!("[INFO][CONS] competing_producer_bft h={} attestations={}/{} threshold={} → yielding",
-                                             next_block_height, competing_attestations, peer_count, bft_threshold);
-                                }
-                                is_my_turn_to_produce = false;
-                                *is_leader.write().await = false;
-                                set_node_state(NodeState::Idle { last_height: microblock_height });
-                                crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                                continue;
-                            } else if is_debug() {
-                                println!("[DBG][CONS] competing_attestations h={} count={}/{} threshold={} — producing",
-                                         next_block_height, competing_attestations, peer_count, bft_threshold);
-                            }
-                        }
-                    }
-                    
+                    // Fork-choice authority is round-based: a same-round 2f+1 TimeoutCertificate rotates
+                    // the producer and the 2f+1 macroblock Checkpoint settles the winner. The old
+                    // attestation-based competing-producer yield was retired — no honest node emits a
+                    // BlockAttestation (its store was never populated benignly), so the check could only
+                    // ever fire on adversarial gossip, censoring the honest producer's own slot.
+
                     // PRODUCTION: This node is selected as microblock producer for this round
                     *is_leader.write().await = true;
                     
-                    // CRITICAL FIX v2.19.16: Initialize HybridCrypto BEFORE broadcasting certificate
+                    // CRITICAL FIX v2.19.16: Initialize PqCrypto BEFORE broadcasting certificate
                     // This fixes race condition where certificate broadcast fails because
-                    // HybridCrypto instance doesn't exist yet (it was created later during signing)
-                    use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+                    // PqCrypto instance doesn't exist yet (it was created later during signing)
+                    use crate::pq_crypto::{PqCrypto, GLOBAL_PQ_INSTANCES};
                     
-                    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                    let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
                         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
                     }).await;
                     
                     let normalized_id = Self::normalize_node_id(&node_id);
                     
-                    // CRITICAL: Ensure HybridCrypto is initialized BEFORE certificate broadcast
+                    // CRITICAL: Ensure PqCrypto is initialized BEFORE certificate broadcast
                     {
                         let mut instances_guard = instances.lock().await;
                         if !instances_guard.contains_key(&normalized_id) {
-                            println!("[INFO][CERT] hybrid_crypto_init producer={} phase=pre_broadcast", normalized_id);
-                            let mut hybrid = HybridCrypto::new(normalized_id.clone());
-                            if let Err(e) = hybrid.initialize().await {
-                                println!("[WARN][CRYPTO] Failed to initialize HybridCrypto: {}", e);
+                            println!("[INFO][CERT] pq_crypto_init producer={} phase=pre_broadcast", normalized_id);
+                            let mut pq = PqCrypto::new(normalized_id.clone());
+                            if let Err(e) = pq.initialize().await {
+                                println!("[WARN][CRYPTO] Failed to initialize PqCrypto: {}", e);
                             } else {
-                                instances_guard.insert(normalized_id.clone(), hybrid);
-                                println!("[INFO][CERT] hybrid_crypto_ready");
+                                instances_guard.insert(normalized_id.clone(), pq);
+                                println!("[INFO][CERT] pq_crypto_ready");
                             }
                         }
                     }
@@ -15622,8 +15512,8 @@ impl BlockchainNode {
                         if let Some(ref p2p) = unified_p2p {
                             let instances_guard = instances.lock().await;
                             
-                            if let Some(hybrid) = instances_guard.get(&normalized_id) {
-                                if let Some(cert) = hybrid.get_current_certificate() {
+                            if let Some(pq) = instances_guard.get(&normalized_id) {
+                                if let Some(cert) = pq.get_current_certificate() {
                                     if let Ok(cert_bytes) = bincode::serialize(&cert) {
                                         // v3.4 CRITICAL: Set broadcast-in-progress flag BEFORE certificate broadcast
                                         // This prevents emergency messages from interrupting mid-broadcast
@@ -16020,21 +15910,20 @@ impl BlockchainNode {
                         
                         for bundle in valid_bundles {
                             if block_txs.len() + bundle.transactions.len() <= bundle_allocation {
-                                // ATOMICITY: Check ALL TXs exist before including bundle
+                                // ATOMICITY: bundle owns its tx bytes (captured at submit time),
+                                // so eviction between submit and build cannot drop a valid bundle.
                                 let mut all_txs_exist = true;
                                 let mut bundle_txs: Vec<(String, Vec<u8>)> = Vec::new();
-                                
-                                for tx_hash in &bundle.transactions {
-                                    // PRODUCTION v2.26: Use binary transactions with hash for cleanup
-                                    // v2.26: Direct access - SimpleMempool is already thread-safe
-                                    if let Some(tx_bytes) = mempool.get_binary_transaction(tx_hash) {
-                                        bundle_txs.push((tx_hash.clone(), tx_bytes));
-                                    } else {
-                                        println!("[WARN][MB] mev_bundle_rejected bundle={} missing_tx={}",
-                                                 bundle.bundle_id, tx_hash);
-                                        all_txs_exist = false;
-                                        break; // Stop checking
+
+                                if bundle.tx_bytes.len() == bundle.transactions.len() {
+                                    for (tx_hash, tx_bytes) in bundle.transactions.iter().zip(bundle.tx_bytes.iter()) {
+                                        bundle_txs.push((tx_hash.clone(), tx_bytes.clone()));
                                     }
+                                } else {
+                                    // Malformed bundle (missing owned bytes): skip, do not partially include.
+                                    println!("[WARN][MB] mev_bundle_rejected bundle={} reason=missing_owned_bytes",
+                                             bundle.bundle_id);
+                                    all_txs_exist = false;
                                 }
                                 
                                 // Only include bundle if ALL TXs exist (atomic!)
@@ -16809,7 +16698,7 @@ impl BlockchainNode {
                     // QUANTUM RANDOMNESS BEACON (QRB) v3.0
                     // Generate randomness contribution for epoch accumulation (RANDAO-style)
                     // Each producer contributes signed randomness to beacon
-                    // CRITICAL FIX: Use EXISTING HybridCrypto instance (don't create new cert!)
+                    // CRITICAL FIX: Use EXISTING PqCrypto instance (don't create new cert!)
                     // ═══════════════════════════════════════════════════════════════════════════
                     // Note: Fields named vrf_output/vrf_proof for serialization compatibility
                     // ═══════════════════════════════════════════════════════════════════
@@ -16871,6 +16760,8 @@ impl BlockchainNode {
                     // ═══════════════════════════════════════════════════════════════════
                     let mut block_fees_collected: u64 = 0;
                     let mut block_gas_used: u64 = 0;
+                    let mut block_fuel_used: u64 = 0;
+                    let block_fuel_limit = qnet_state::gas_limits::BLOCK_FUEL_LIMIT;
                     let mut gas_limited_idx: Option<usize> = None;
                     for (idx, tx) in txs.iter().enumerate() {
                         // QUANTUM v2.25: Use effective_gas_price() for +50% Dilithium TX fee
@@ -16881,22 +16772,28 @@ impl BlockchainNode {
                             } else {
                                 tx.gas_limit
                             };
-                            // FIX R22-B5: Enforce cumulative BLOCK_GAS_LIMIT
+                            // FIX R22-B5: Enforce cumulative BLOCK_GAS_LIMIT + the SEPARATE wasm-fuel
+                            // budget (bounds per-block compute independent of gas; see verify path +
+                            // BLOCK_FUEL_LIMIT). Stop filling at whichever ceiling this tx would breach;
+                            // the validator enforces the SAME two bounds, so a produced block always
+                            // re-verifies. reserved_fuel() is a pure fn of the signed gas_limit.
                             let new_gas = block_gas_used.saturating_add(charged_gas);
-                            if new_gas > block_gas_limit {
+                            let new_fuel = block_fuel_used.saturating_add(tx.reserved_fuel());
+                            if new_gas > block_gas_limit || new_fuel > block_fuel_limit {
                                 gas_limited_idx = Some(idx);
                                 break;
                             }
                             block_gas_used = new_gas;
+                            block_fuel_used = new_fuel;
                             let fee_amount = tx.effective_gas_price().saturating_mul(charged_gas);
                             block_fees_collected = block_fees_collected.saturating_add(fee_amount);
                         }
                     }
-                    // FIX R22-B5: Truncate TX list if block gas limit exceeded
+                    // FIX R22-B5: Truncate TX list if the block gas OR fuel limit was reached
                     if let Some(limit_idx) = gas_limited_idx {
                         if is_info() {
-                            println!("[INFO][BLOCK] gas_limit_applied total_tx={} included_tx={} gas_used={} max_gas={}",
-                                     txs.len(), limit_idx, block_gas_used, block_gas_limit);
+                            println!("[INFO][BLOCK] gas_limit_applied total_tx={} included_tx={} gas_used={} max_gas={} fuel_used={} max_fuel={}",
+                                     txs.len(), limit_idx, block_gas_used, block_gas_limit, block_fuel_used, block_fuel_limit);
                         }
                         txs.truncate(limit_idx);
                     }
@@ -16959,6 +16856,20 @@ impl BlockchainNode {
                     {
                         let state_guard = state.write().await;
 
+                        // Per-block WASM event logs, captured the SAME way the validator path does
+                        // (apply_block_to_state) so getLogs is complete and the gated window logs_root
+                        // will match at activation. Drained PER-TX because this loop has an await (claim
+                        // path) and WASM_LOG_SINK is a thread-local: on the multi-threaded runtime a
+                        // clear-once/drain-once bracket could straddle a worker-thread migration and
+                        // strand entries. clear→(sync)apply→drain around each tx keeps push+drain on one
+                        // thread; the accumulator is a plain Vec, so it survives awaits safely.
+                        let mut block_logs: Vec<(String, String, Vec<u8>)> = Vec::new();
+                        // Metered WASM-compute fees for THIS producer's own block (heights >= metering
+                        // activation), credited on top of the flat block_fees_collected — computed the
+                        // SAME way the validator does in apply_block_to_state so both credit the identical
+                        // total (no reward / state_root divergence between producer and validators).
+                        let mut block_wasm_fuel_fees: u64 = 0;
+
                         // 1. Apply all transactions
                         for tx in &txs {
                             // Index Light eligibility bitmaps via the SHARED helper (byte-identical to
@@ -17009,12 +16920,29 @@ impl BlockchainNode {
                                 }
                             }
 
-                            if let Err(e) = state_guard.apply_transaction_lazy(tx) {
+                            // Apply at the REAL block height (not the height-0 convenience wrapper): the
+                            // WASM host's get_block_height() must return the same value the validator sees,
+                            // or a height-dependent contract's storage writes (and event logs) diverge the
+                            // producer's state_root from every validator (apply_block_to_state uses _at(h)).
+                            // clear→apply→drain brackets THIS tx's WASM logs on one thread (see block_logs).
+                            qnet_state::wasm_exec::clear_wasm_logs();
+                            let apply_result = state_guard.apply_transaction_lazy_at(tx, next_block_height);
+                            // Take this tx's WASM fuel ONCE, same thread, right after apply (resets the
+                            // slot for the next tx) — byte-identical to the validator apply path.
+                            let tx_wasm_fuel = qnet_state::wasm_exec::take_last_tx_wasm_fuel();
+                            if let Err(e) = apply_result {
                                 if is_warn() {
                                     println!("[WARN][STATE] producer_tx_apply_failed hash={} err={}", tx.hash, e);
                                 }
                             } else {
-                                let _ = state_guard.apply_gas_refund(tx, next_block_height);
+                                block_logs.extend(qnet_state::wasm_exec::drain_wasm_logs());
+                                let _ = state_guard.apply_gas_refund(tx, next_block_height, tx_wasm_fuel);
+                                // Accrue the metered WASM-compute fee (above activation), mirroring the
+                                // validator so both credit the identical flat+fuel producer total.
+                                if next_block_height >= qnet_state::GAS_METERING_ACTIVATION_HEIGHT
+                                    && !tx.from.starts_with("system_") && tx.gas_price > 0 && tx.gas_limit > 0 {
+                                    block_wasm_fuel_fees = block_wasm_fuel_fees.saturating_add(tx.wasm_fuel_fee(tx_wasm_fuel));
+                                }
                                 // Track BOTH NodeRegistration AND NodeActivation: the producer materialises
                                 // the SAME registry rows the validator's deferred_registrations does (incl.
                                 // the super-activation pseudonym), so it must know which of each applied Ok.
@@ -17024,6 +16952,13 @@ impl BlockchainNode {
                                     applied_reg_hashes.insert(tx.hash.clone());
                                 }
                             }
+                        }
+
+                        // Persist this producer's OWN block WASM logs (validators persist theirs via
+                        // apply_block_to_state's drain) — closes the producer-side getLogs hole and makes
+                        // the producer's window logs_root match peers at activation. Plain Vec ⇒ await-safe.
+                        if !block_logs.is_empty() {
+                            let _ = storage.save_block_logs(next_block_height, &block_logs);
                         }
 
                         // Epoch-boundary super reward-eligibility snapshot (same fn as the apply path).
@@ -17052,12 +16987,15 @@ impl BlockchainNode {
                             _ => String::new()
                         };
                         
-                        // 3. Credit fees to producer (atomic)
-                        if block_fees_collected > 0 && !producer_wallet.is_empty() {
+                        // 3. Credit fees to producer (atomic): flat fees + metered WASM compute. The
+                        // validator recomputes the IDENTICAL total in apply_block_to_state Phase 3, so
+                        // producer and validators agree (no reward / state_root divergence).
+                        let producer_credit = block_fees_collected.saturating_add(block_wasm_fuel_fees);
+                        if producer_credit > 0 && !producer_wallet.is_empty() {
                             match state_guard.credit_producer_fees_once(
                                 next_block_height,
                                 &producer_wallet,
-                                block_fees_collected
+                                producer_credit
                             ) {
                                 Ok(true) => {
                                     if is_info() && block_fees_collected > 10_000_000 {
@@ -17200,17 +17138,17 @@ impl BlockchainNode {
                             // ARCHITECTURE: Aligns with certificate lifetime (270s = 3 macroblocks)
                             if microblock.height > 10 && microblock.height % 270 == 1 {
                                 if let Some(ref p2p) = unified_p2p {
-                                    use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
+                                    use crate::pq_crypto::GLOBAL_PQ_INSTANCES;
                                     
-                                    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                                    let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
                                         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
                                     }).await;
                                     
                                     let instances_guard = instances.lock().await;
                                     let normalized_id = Self::normalize_node_id(&node_id);
                                     
-                                    if let Some(hybrid) = instances_guard.get(&normalized_id) {
-                                        if let Some(cert) = hybrid.get_current_certificate() {
+                                    if let Some(pq) = instances_guard.get(&normalized_id) {
+                                        if let Some(cert) = pq.get_current_certificate() {
                                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
                                                 println!("[INFO][CERT] rotation_broadcast h={} serial={}",
                                                     microblock.height, cert.serial_number);
@@ -17292,44 +17230,15 @@ impl BlockchainNode {
                                         return false;
                                     }
                                     // NodeRegistration has amount=0 by protocol — exempt from amount check.
-                                    // NodeReactivation has amount=0 + hybrid signature — verify both layers.
-                                    // All other user TX must have non-zero amount and Ed25519 signature.
+                                    // NodeReactivation has amount=0 + a single Dilithium3 signature — verify it.
+                                    // All other user TX must have non-zero amount and a Dilithium3 (ML-DSA-65) signature.
                                     let is_node_reactivation = matches!(tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. });
                                     if is_client_nodereg {
-                                        // v9.4: Full Ed25519 + Dilithium3 verification for client-signed NodeRegistration
-                                        // Canonical: "client_node_reg:{node_id}:{wallet}:{proof}:{timestamp}"
-                                        let reg_ed25519_ok = (|| -> Option<bool> {
-                                            let sig_hex = tx.signature.as_ref()?;
-                                            let pk_hex = tx.public_key.as_ref()?;
-                                            if sig_hex.is_empty() || pk_hex.is_empty() { return None; }
-
-                                            // Reconstruct canonical message from TX fields
-                                            let (node_id, wallet_address, registration_proof) = match &tx.tx_type {
-                                                qnet_state::TransactionType::NodeRegistration {
-                                                    node_id, wallet_address, registration_proof, ..
-                                                } => (node_id.as_str(), wallet_address.as_str(), registration_proof.as_str()),
-                                                _ => return None,
-                                            };
-                                            let canonical_msg = format!("client_node_reg:{}:{}:{}:{}",
-                                                node_id, wallet_address, registration_proof, tx.timestamp);
-
-                                            let sig_bytes = hex::decode(sig_hex).ok()?;
-                                            let pk_bytes = hex::decode(pk_hex).ok()?;
-                                            let sig = ed25519_dalek::Signature::from_bytes(
-                                                sig_bytes.as_slice().try_into().ok()?
-                                            );
-                                            let pk = ed25519_dalek::VerifyingKey::from_bytes(
-                                                pk_bytes.as_slice().try_into().ok()?
-                                            ).ok()?;
-                                            use ed25519_dalek::Verifier;
-                                            pk.verify(canonical_msg.as_bytes(), &sig).ok()?;
-                                            Some(true)
-                                        })().unwrap_or(false);
-                                        if !reg_ed25519_ok {
-                                            println!("[WARN][BLOCK-VALIDATION] NodeRegistration Ed25519 FAILED from={}", tx.from);
-                                            return false;
-                                        }
-
+                                        // Pure ML-DSA-65 verification for client-signed NodeRegistration.
+                                        // Ed25519 was an illusory leg — quantum-breakable, no identity binding
+                                        // — removed. Identity is bound by the Dilithium checks below: the
+                                        // registered-key match if the VRF key is already on-chain, else the
+                                        // first-reg native_bound (self-signed ML-DSA + eon==wallet_address).
                                         // Dilithium3: verify against VRF_PK_REGISTRY if key is registered
                                         // (first registration won't have a registered key yet — skip in that case)
                                         if let qnet_state::TransactionType::NodeRegistration { node_id, wallet_address, registration_proof, .. } = &tx.tx_type {
@@ -17361,40 +17270,30 @@ impl BlockchainNode {
                                                     println!("[WARN][BLOCK-VALIDATION] NodeRegistration Dilithium3 FAILED from={}", tx.from);
                                                     return false;
                                                 }
+                                            } else {
+                                                // FIRST registration: no VRF key on-chain yet, so the
+                                                // registered-key Dilithium check above cannot run. Identity
+                                                // is anchored deterministically by the 2f+1 burn-attestation
+                                                // quorum (verify_burn_attestation_quorum, enforced on both the
+                                                // gossip and block-apply paths), which binds burn_tx↔wallet.
+                                                // A dpk→wallet native_bound is intentionally NOT enforced: it
+                                                // is non-deterministic on the receive path (get_vrf_public_key
+                                                // reads gossip-seeded RAM, not committed state → fork risk)
+                                                // AND incompatible with Solana-imported wallets
+                                                // (wallet == eon(solana_address) ≠ eon(dpk)).
                                             }
-                                            // No registered key = first registration — Dilithium3 check skipped
-                                            // (key gets registered from THIS tx via cache_node_registrations)
+                                            // First registration key gets registered from THIS tx via
+                                            // cache_node_registrations once the block is accepted.
                                         }
                                     } else if is_node_reactivation {
-                                        // v9.4: NodeReactivation — FULL cryptographic verification
-                                        // Layer 1: Ed25519 (BIP44) — mathematical signature check
-                                        // Layer 2: Dilithium3 — crypto verify against REGISTERED VRF key (identity binding)
+                                        // Pure ML-DSA-65: NodeReactivation is authenticated solely by the node's
+                                        // registered Dilithium3 identity key (crypto verify against the on-chain
+                                        // VRF key = identity binding). Ed25519 was an illusory leg —
+                                        // quantum-breakable, no identity binding — removed.
                                         let node_id = &tx.from;
                                         let canonical_msg = format!("node_reactivation:{}:{}", node_id, tx.timestamp);
 
-                                        // ── Layer 1: Ed25519 cryptographic verification ──
-                                        let ed25519_ok = (|| -> Option<bool> {
-                                            let sig_hex = tx.signature.as_ref()?;
-                                            let pk_hex = tx.public_key.as_ref()?;
-                                            if sig_hex.is_empty() || pk_hex.is_empty() { return None; }
-                                            let sig_bytes = hex::decode(sig_hex).ok()?;
-                                            let pk_bytes = hex::decode(pk_hex).ok()?;
-                                            let sig = ed25519_dalek::Signature::from_bytes(
-                                                sig_bytes.as_slice().try_into().ok()?
-                                            );
-                                            let pk = ed25519_dalek::VerifyingKey::from_bytes(
-                                                pk_bytes.as_slice().try_into().ok()?
-                                            ).ok()?;
-                                            use ed25519_dalek::Verifier;
-                                            pk.verify(canonical_msg.as_bytes(), &sig).ok()?;
-                                            Some(true)
-                                        })().unwrap_or(false);
-                                        if !ed25519_ok {
-                                            println!("[WARN][BLOCK-VALIDATION] NodeReactivation Ed25519 FAILED from={}", node_id);
-                                            return false;
-                                        }
-
-                                        // ── Layer 2: Dilithium3 cryptographic verification against registered VRF key ──
+                                        // ── Dilithium3 cryptographic verification against registered VRF key ──
                                         let dilithium_ok = (|| -> Option<bool> {
                                             let dil_sig_str = tx.dilithium_signature.as_ref()?;
                                             if dil_sig_str.is_empty() { return None; }
@@ -17433,6 +17332,24 @@ impl BlockchainNode {
                                         if !dilithium_ok {
                                             println!("[WARN][BLOCK-VALIDATION] NodeReactivation Dilithium3 FAILED from={} (sig invalid or key not registered)",
                                                 node_id);
+                                            return false;
+                                        }
+                                    } else if matches!(tx.tx_type,
+                                        qnet_state::TransactionType::Transfer { .. } |
+                                        qnet_state::TransactionType::ContractDeploy |
+                                        qnet_state::TransactionType::ContractCall |
+                                        qnet_state::TransactionType::Swap { .. }
+                                    ) {
+                                        // Pure ML-DSA-65 value TX (signature:None). Verify the mandatory
+                                        // Dilithium sig + API-1 identity bind on the producer path too
+                                        // (verify_user_tx_dilithium folds in eon(dpk)==from). amount==0 is
+                                        // illegal only for Transfer (ContractDeploy/Call/Swap may be 0).
+                                        if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty())
+                                            || !Self::verify_user_tx_dilithium(&tx)
+                                        {
+                                            return false;
+                                        }
+                                        if matches!(tx.tx_type, qnet_state::TransactionType::Transfer { .. }) && tx.amount == 0 {
                                             return false;
                                         }
                                     } else if tx.signature.as_ref().map_or(true, |s| s.is_empty()) || tx.amount == 0 {
@@ -17904,11 +17821,10 @@ impl BlockchainNode {
                                         // Upload to IPFS synchronously (avoids Send issues)
                                         match storage.upload_snapshot_to_ipfs(microblock_height).await {
                                             Ok(cid) => {
+                                                // IPFS snapshot upload retained; the dead peer-announce
+                                                // (receiver only logged it) was removed — GALC + the
+                                                // QC-anchored snapshot path handle state sync.
                                                 println!("[INFO][NODE] ipfs_upload cid={}", cid);
-                                                // Announce to peers
-                                                if let Some(ref p2p) = unified_p2p {
-                                                    storage.announce_snapshot_to_peers(microblock_height, &cid, p2p).await;
-                                                }
                                             },
                                             Err(e) => {
                                                 println!("[WARN][NODE] ipfs_upload_failed err={}", e);
@@ -19586,157 +19502,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                      stable_candidates.len(), failed_producer);
             }
             
-            if stable_candidates.is_empty() {
-                println!("[WARN][EMERGENCY] no_valid_candidates=true");
-                
-                // EMERGENCY MODE: Use existing Progressive Degradation Protocol
-                if false { // Deprecated - no longer using phases
-                    // Genesis phase: Try progressively lower reputation thresholds
-                    println!("[WARN][MB] emergency_degradation mode=genesis");
-                    
-                    // Get Genesis nodes list
-                    let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
-                    
-                    // Try with 50% threshold
-                    let mut emergency_candidates = Vec::new();
-                    for (i, _ip) in genesis_ips.iter().enumerate() {
-                        let peer_node_id = format!("genesis_node_{:03}", i + 1);
-                        if peer_node_id == failed_producer {
-                            continue;
-                        }
-                        let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
-                        if reputation >= 0.50 {
-                            emergency_candidates.push((peer_node_id.clone(), reputation));
-                            println!("[INFO][MB] emergency_candidate node={} threshold=50 rep={:.1}",
-                                     peer_node_id, reputation * 100.0);
-                        }
-                    }
-                    
-                    if !emergency_candidates.is_empty() {
-                        // CRITICAL: Sort for deterministic selection when multiple nodes have same reputation
-                        let mut sorted_degraded = emergency_candidates.clone();
-                        sorted_degraded.sort_by(|a, b| {
-                            // SECURITY: Use unwrap_or to handle NaN safely (prevents panic)
-                            match b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal) {
-                                std::cmp::Ordering::Equal => a.0.cmp(&b.0), // Tie-break by node_id
-                                other => other,
-                            }
-                        });
-                        
-                        let best = &sorted_degraded[0];
-                        println!("[WARN][MB] degraded_selection node={} rep={:.1}",
-                                 best.0, best.1 * 100.0);
-                        return best.0.clone();
-                    }
-                    
-                    // Last resort: Bootstrap recovery with reputation reset
-                    println!("[WARN][MB] genesis_bootstrap_recovery");
-                    
-                    // Find ANY responding Genesis node
-                    for (i, _ip) in genesis_ips.iter().enumerate() {
-                        let peer_node_id = format!("genesis_node_{:03}", i + 1);
-                        if peer_node_id != failed_producer {
-                            // Genesis nodes have fixed 70% reputation in deterministic system
-                            println!("[INFO][MB] recovery_candidate node={} rep=70_fixed", peer_node_id);
-                            
-                            // Check if now eligible
-                            let new_reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
-                            if new_reputation >= 0.50 {
-                                return peer_node_id.clone();
-                            }
-                        }
-                    }
-                    
-                    // Ultimate fallback: First Genesis node that isn't failed
-                    for (i, _ip) in genesis_ips.iter().enumerate() {
-                        let peer_node_id = format!("genesis_node_{:03}", i + 1);
-                        if peer_node_id != failed_producer {
-                            println!("[WARN][MB] forced_recovery node={}", peer_node_id);
-                            return peer_node_id.clone();
-                        }
-                    }
-                    
-                    // If even that fails, use genesis_node_001 as hardcoded fallback
-                    println!("[WARN][MB] final_fallback node=genesis_node_001");
-                    return "genesis_node_001".to_string();
-                } else {
-                    // Production phase: Use Progressive Degradation similar to microblock production
-                    println!("[WARN][MB] emergency_degradation mode=network_wide");
-                    
-                    // CRITICAL FIX: Maintain 70% minimum for emergency producers to prevent forks
-                    // Only degrade if absolutely necessary for network survival
-                    let thresholds = [0.70, 0.60, 0.50];  // Never go below 50% to prevent chaos
-                    
-                    for threshold in &thresholds {
-                        let mut emergency_candidates = Vec::new();
-                        let peers = p2p.get_validated_active_peers();
-                        
-                        for peer in peers {
-                            let peer_node_id = peer.id.clone();
-                            if peer_node_id == failed_producer {
-                                continue;
-                            }
-                            
-                            let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
-                            if reputation >= *threshold {
-                                emergency_candidates.push((peer_node_id.clone(), reputation));
-                                println!("[INFO][MB] emergency_candidate node={} threshold={:.0} rep={:.1}",
-                                         peer_node_id, threshold * 100.0, reputation * 100.0);
-                            }
-                        }
-                        
-                        if !emergency_candidates.is_empty() {
-                            // CRITICAL: Only use emergency producer if reputation >= 50%
-                            // This prevents fork creation from low-reputation nodes
-                            let mut eligible: Vec<_> = emergency_candidates.iter()
-                                .filter(|(_, rep)| *rep >= 0.50)  // Hard minimum 50%
-                                .collect();
-                            
-                            if !eligible.is_empty() {
-                                // CRITICAL: Sort for deterministic selection when multiple nodes have same reputation
-                                // Sort by reputation DESC, then by node_id ASC for tie-breaking
-                                eligible.sort_by(|a, b| {
-                                    // SECURITY: Use unwrap_or to handle NaN safely (prevents panic)
-                                    match b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal) {
-                                        std::cmp::Ordering::Equal => a.0.cmp(&b.0), // Tie-break by node_id
-                                        other => other,
-                                    }
-                                });
-                                
-                                let selected = eligible[0];
-                                println!("[WARN][MB] emergency_selected node={} rep={:.1} threshold={:.0}",
-                                         selected.0, selected.1 * 100.0, threshold * 100.0);
-                                return selected.0.clone();
-                            }
-                        }
-                    }
-                    
-                    // Critical: Network halt protection - give emergency boost to any responding node
-                    println!("[CRIT][MB] network_halt_detected action=emergency_recovery");
-                    
-                    let mut peers = p2p.get_validated_active_peers();
-                    if !peers.is_empty() {
-                        // CRITICAL: Sort peers to ensure ALL nodes boost SAME peer (network recovery consensus)
-                        peers.sort_by(|a, b| a.id.cmp(&b.id));
-                        
-                        // CRITICAL FIX v2.64: Exclude only failed_producer from emergency recovery
-                        for peer in &peers {
-                            if peer.id != failed_producer {
-                                // Reward processed via DeterministicReputationState when block is produced
-                                println!("[INFO][MB] network_recovery_select node={}", peer.id);
-                                return peer.id.clone();
-                            }
-                        }
-                        println!("[WARN][EMERGENCY] All peers excluded (failed producer)");
-                    }
-                    
-                    // Ultimate fallback: Return failed producer to prevent complete halt
-                    // It might recover or at least keep trying
-                    println!("[CRIT][MB] no_alternatives keeping_failed_producer={}", failed_producer);
-                    return failed_producer.to_string();
-                }
-            }
-            
+            // Empty candidate set is resolved deterministically by the SHA3 selection
+            // below (its empty-guard returns failed_producer). No per-node reputation
+            // degradation path — that reads local peer state and would fork on a split.
+
             let candidates = stable_candidates;
             
             // CRITICAL: Apply MAX_VALIDATORS limit BEFORE sorting (for scalability)
@@ -21054,7 +20823,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         };
                                         crate::consensus_v2_node::signal_window_end(
                                             cp_index, b, h_vec, state_root, beacon, committee, Vec::new(), Vec::new(), [0u8; 32],
-                                            registry_root, total_supply,
+                                            registry_root, [0u8; 32], total_supply,
                                         );
                                         if crate::node::is_info() {
                                             println!("[INFO][BFT2] intra_checkpoint_signalled cp_index={} head={} k={}", cp_index, b, k);
@@ -21484,11 +21253,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             Some(t) => t,
                                             None => return,
                                         };
+                                        // RESERVED consensus WASM-event logs_root — gated OFF (`logs_root_required`
+                                        // dormant) ⇒ [0;32] today; recomputed identically on every node once activated.
+                                        let logs_root = if qnet_state::feature_gates::is_active("logs_root_required", end_height) {
+                                            Self::compute_window_logs_root(&storage_cons, start_height, end_height)
+                                        } else { [0u8; 32] };
                                         active_guard.signalled = true; // content delivered → keep the lock held
                                         crate::consensus_v2_node::signal_window_end(
                                             end_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL,
                                             end_height, mb_hashes, state_root, beacon, committee, eligible_bytes, banned_for_epoch, reward_root,
-                                            registry_root, total_supply,
+                                            registry_root, logs_root, total_supply,
                                         );
                                         return;
                                     }
@@ -21845,10 +21619,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
-    /// PRODUCTION: Sign microblock with HYBRID cryptography (compact signatures)
+    /// PRODUCTION: Sign microblock with PQ cryptography (Dilithium3, compact signatures)
     // ═══════════════════════════════════════════════════════════════════
     // v4.0: PRODUCTION — Pure Dilithium3 Block Signing
-    // No HybridCrypto, no Ed25519, no certificates
+    // No PqCrypto, no Ed25519, no certificates
     // Uses WalletIdentity from QNET_WALLET_SEED (detached_sign)
     // Signature: ~3309 bytes (ML-DSA-65 NIST FIPS 204 Level 3)
     // ═══════════════════════════════════════════════════════════════════
@@ -21928,14 +21702,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         Ok(prefixed.as_bytes().to_vec())
     }
     
-    /// PRODUCTION: Verify HYBRID signature for received microblock (supports compact)
+    /// PRODUCTION: Verify PQ (Dilithium3) signature for received microblock (supports compact)
     pub async fn verify_microblock_signature(
         microblock: &qnet_state::MicroBlock, 
         _producer_pubkey: &str,
         p2p: Option<&Arc<SimplifiedP2P>>
     ) -> Result<bool, String> {
         
-        // CRITICAL FIX: Genesis block uses deterministic hash, not hybrid format
+        // CRITICAL FIX: Genesis block uses deterministic hash, not the standard Dilithium3 format
         if microblock.height == 0 && microblock.producer == "genesis" {
             // Verify Genesis block signature deterministically
             let mut hasher = Sha3_256::new();
@@ -22045,7 +21819,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
 
         // Legacy: compact_bin / compact signature formats (for pre-v4 blocks)
         use base64::{Engine as _, engine::general_purpose};
-        let compact_sig: crate::hybrid_crypto::CompactHybridSignature = if sig_str.starts_with("compact_bin:") {
+        let compact_sig: crate::pq_crypto::CompactPqSignature = if sig_str.starts_with("compact_bin:") {
             // v2.24: Parse binary compact signature (bincode+zstd+base64)
             let base64_data = &sig_str[12..]; // Skip "compact_bin:" prefix
             let binary_data = match general_purpose::STANDARD.decode(base64_data) {
@@ -22055,7 +21829,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     return Ok(false);
                 }
             };
-            match crate::hybrid_crypto::CompactHybridSignature::from_binary_compressed(&binary_data) {
+            match crate::pq_crypto::CompactPqSignature::from_binary_compressed(&binary_data) {
                 Ok(sig) => sig,
                 Err(e) => {
                     println!("[ERR][CRYPTO] Failed to parse compact_bin signature: {}", e);
@@ -22094,25 +21868,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         hasher.update(microblock.producer.as_bytes());
         let message_hash_str = hex::encode(hasher.finalize());
         
-        // PRODUCTION: REAL cryptographic verification for post-quantum blockchain
-        // CRITICAL: Both Ed25519 AND Dilithium MUST be verified for NIST/Cisco compliance
-        
-        // Basic size validation
-        if compact_sig.message_signature.len() != 64 {
-            println!("[ERR][CRYPTO] Invalid Ed25519 signature size: {}", compact_sig.message_signature.len());
-            return Ok(false);
-        }
-        
-        // OPTIMIZED v2.23: RAW bytes format with single Dilithium signature
-        // dilithium_message_signature removed (redundant - message_hash is in encapsulated_data)
-        
-        // STEP 1: Get certificate from P2P cache for Ed25519 verification
+        // PRODUCTION: REAL cryptographic verification for post-quantum blockchain (pure ML-DSA-65)
+
+        // STEP 1: Get certificate from P2P cache (cache-trusted, Dilithium-verified at admission)
         println!("[INFO][CERT] compact_sig_verify h={}", microblock.height);
-        
-        // STEP 2: Verify Ed25519 signature with certificate
-        // For decentralized post-quantum blockchain, we need BOTH signatures valid
-        use crate::hybrid_crypto::{HybridCrypto, HybridCertificate};
-        use ed25519_dalek::Signature as Ed25519Signature;
+
+        // STEP 2: Validate the certificate binds to this producer and is unexpired
+        use crate::pq_crypto::PqCertificate;
         
         // Get certificate from P2P cache
         // v2.96: CRITICAL FIX - minimize lock holding time!
@@ -22128,7 +21890,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if let Some(cert_data) = cert_data_option {
                 
                 // Deserialize certificate
-                if let Ok(certificate) = bincode::deserialize::<HybridCertificate>(&cert_data) {
+                if let Ok(certificate) = bincode::deserialize::<PqCertificate>(&cert_data) {
                     // Verify certificate belongs to the producer
                     if certificate.node_id != compact_sig.node_id {
                         println!("[ERR][CRYPTO] Certificate node_id mismatch: {} != {}", 
@@ -22166,38 +21928,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             if skip_expiry_for_sync && now > expires_with_grace {
                                 println!("[INFO][CRYPTO] Skipping expiry check for sync block (age={}s, sync=true)", block_age);
                             }
-                            // Verify Ed25519 signature using ephemeral public key (NIST/Cisco requirement)
-                            if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
-                                let ed_sig_array: [u8; 64] = ed_sig_bytes;
-                                
-                                // Use HybridCrypto's verify_ed25519_signature method
-                                // CRITICAL: Sign the raw hash bytes, not the hex string
-                                // CRITICAL: Use EPHEMERAL public key, not certificate key!
-                                let message_hash_bytes = hex::decode(&message_hash_str)
-                                    .map_err(|_| "Invalid hex in message hash")?;
-                                match HybridCrypto::verify_ed25519_signature(
-                                    &message_hash_bytes,
-                                    &ed_sig_array,
-                                    &compact_sig.ephemeral_public_key  // Use ephemeral key per NIST/Cisco
-                                ) {
-                                    Ok(true) => {
-                                        println!("[INFO][CERT] ed25519_verified serial={} producer={}",
-                                                 certificate.serial_number, certificate.node_id);
-                                        true
-                                    }
-                                    Ok(false) => {
-                                        println!("[ERR][CRYPTO] Ed25519 signature verification failed!");
-                                        false
-                                    }
-                                    Err(e) => {
-                                        println!("[ERR][CRYPTO] Ed25519 verification error: {}", e);
-                                        false
-                                    }
-                                }
-                            } else {
-                                println!("[ERR][CRYPTO] Ed25519 signature wrong size!");
-                                false
-                            }
+                            // Pure ML-DSA-65 (P8): the certificate is cache-trusted (Dilithium-verified
+                            // at admission); message authenticity is proven by the Dilithium key
+                            // signature in STEP 3 below.
+                            println!("[INFO][CERT] cert_valid serial={} producer={}",
+                                     certificate.serial_number, certificate.node_id);
+                            true
                         }
                     }
                 } else {
@@ -22209,7 +21945,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 println!("[WARN][CRYPTO] Certificate {} not found in RAM cache", compact_sig.cert_serial);
                 
                 // ═══════════════════════════════════════════════════════════════════
-                // v4.0: Dilithium3-VRF proof verification (replaces HybridCrypto cert)
+                // v4.0: Dilithium3-VRF proof verification (replaces PqCrypto cert)
                 // vrf_proof contains ML-DSA-65 detached signature (~3309 bytes)
                 // Verified against producer's registered VRF public key
                 // ═══════════════════════════════════════════════════════════════════
@@ -22286,16 +22022,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         } else {
             println!("[WARN][CRYPTO] No P2P instance available for certificate verification");
-            // Fallback: only check signature format
-            if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
-                let ed_sig_array: [u8; 64] = ed_sig_bytes;
-                let _signature = Ed25519Signature::from_bytes(&ed_sig_array);
-                println!("[WARN][CRYPTO] Ed25519 signature format valid but not cryptographically verified");
-                false // Conservative: reject if we can't fully verify
-            } else {
-                println!("[ERR][CRYPTO] Ed25519 signature wrong size!");
-                false
-            }
+            false // Conservative: reject if we can't verify against a certificate
         };
         
         if !ed25519_verified {
@@ -22323,21 +22050,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Ok(false);
         }
         
-        // Verify Dilithium signature of encapsulated_data (ephemeral_key || message_hash || timestamp)
-        // This single signature proves:
-        // 1. Ephemeral key binding (key is bound to this message)
-        // 2. Message integrity (message_hash is inside)
-        // 3. Freshness (timestamp is inside)
+        // Verify Dilithium signature of the re-rooted preimage (message_hash || timestamp).
+        // Proves message integrity (message_hash inside) and freshness (timestamp inside).
         let message_hash_bytes = hex::decode(&message_hash_str)
             .map_err(|_| "Invalid hex in message hash")?;
         let mut encapsulated_data = Vec::new();
-        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
         encapsulated_data.extend_from_slice(&message_hash_bytes);
         encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
         let encapsulated_hex = hex::encode(&encapsulated_data);
         
         // OPTIMIZED v2.23: Convert RAW bytes to signature string
-        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+        use crate::crypto::pq_crypto::encode_dilithium_signature;
         let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
         
         let dilithium_key_sig = DilithiumSignature {
@@ -22349,7 +22072,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
             Ok(true) => {
-                println!("[INFO][CERT] sig_verified algo=ed25519+dilithium producer={} serial={} pq=compliant",
+                println!("[INFO][CERT] sig_verified algo=dilithium producer={} serial={} pq=compliant",
                          compact_sig.node_id, compact_sig.cert_serial);
                 return Ok(true);
             }
@@ -22823,12 +22546,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Macroblock #1 = blocks 1-90, #2 = blocks 91-180, etc.
         match self.storage.get_macroblock_by_height(index) {
             Ok(Some(data)) => {
-                // Try to decompress first (macroblock might be compressed)
-                let decompressed_data = match zstd::decode_all(&data[..]) {
-                    Ok(decompressed) => decompressed,
-                    Err(_) => data, // Not compressed, use as-is
-                };
-                
+                // Fail-closed: a zstd-magic block that won't decompress is corrupt — hard reject,
+                // never fall through to raw bytes (that would parse-diverge across nodes).
+                let decompressed_data = Self::macroblock_plaintext(data)
+                    .ok_or_else(|| QNetError::StorageError(
+                        format!("[REJECT][BLOCK] macroblock_decompress_failed index={}", index)))?;
+
                 // Deserialize MacroBlock
                 match bincode::deserialize::<qnet_state::MacroBlock>(&decompressed_data) {
                     Ok(macroblock) => Ok(Some(macroblock)),
@@ -22881,6 +22604,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     "[REJECT][RPC] BatchTransfers is unused — not accepted via RPC".to_string()
                 ));
             }
+            // Swap/DEX is dormant: apply is fail-closed (no on-chain pool pricing deployed), so an
+            // admitted Swap would be gossiped + block-included then silently dropped — wasted block
+            // space + a cheap spam lever. Reject at BOTH ingress points (mirrored in the gossip path)
+            // so it never reaches the mempool; block-apply keeps its fail-close as defense-in-depth.
+            qnet_state::TransactionType::Swap { .. } => {
+                return Err(QNetError::ValidationError(
+                    "[REJECT][RPC] Swap/DEX is not enabled — on-chain pool pricing is not deployed".to_string()
+                ));
+            }
             _ => {} // All other variants pass through to standard validation
         }
 
@@ -22919,76 +22651,71 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // v2.70: Reward claims from system_rewards_pool
                 // Signature was already verified by API endpoint on message "claim_rewards:{node_id}:{wallet}"
                 // Here we just verify the TX has the required fields (signature, pubkey, data)
-                if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
-                    return Err(QNetError::ValidationError("Reward claim must have signature".to_string()));
+                // PURE DILITHIUM: the claim's authorisation is the mandatory ML-DSA-65 sig (verified at the
+                // RPC endpoint over "claim_rewards:{node}:{wallet}") + the per-proof merkle re-verify below
+                // against the QC-certified reward_root (apply re-verifies as the final gate). Require the
+                // Dilithium sig present; Ed25519 is Solana-only and is not carried on this TX.
+                if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
+                    return Err(QNetError::ValidationError("Reward claim requires dilithium_signature".to_string()));
                 }
-                if tx.public_key.as_ref().map_or(true, |k| k.is_empty()) {
-                    return Err(QNetError::ValidationError("Reward claim requires public_key".to_string()));
-                }
-                // Merkle reward-claim: verify each proof against the QC-certified reward_root so junk is
-                // rejected at the door (apply re-verifies as the final gate). Sig checked by the RPC endpoint.
                 if !Self::claim_proofs_admissible(&self.get_storage(), &tx) {
                     return Err(QNetError::ValidationError("Reward claim has no valid merkle proofs".to_string()));
                 }
-                let has_quantum = tx.dilithium_signature.as_ref().map_or(false, |s| !s.is_empty());
-                if is_info() { 
-                    println!("[INFO][REWARDS] claim_tx_accepted from=system_rewards_pool quantum_safe={}", has_quantum); 
-                }
+                if is_info() { println!("[INFO][REWARDS] claim_tx_accepted from=system_rewards_pool quantum_safe=true"); }
             } else if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) {
-                // Other RewardDistribution TX (not from system_rewards_pool) - verify signature on TX hash
-                if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
-                    return Err(QNetError::ValidationError("Reward TX must be signed".to_string()));
-                }
-                if tx.public_key.as_ref().map_or(true, |k| k.is_empty()) {
-                    return Err(QNetError::ValidationError("Reward TX requires public_key".to_string()));
-                }
-                
-                if let Some(ref sig) = tx.signature {
-                    if let Some(ref pubkey) = tx.public_key {
-                        if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
-                            return Err(QNetError::ValidationError(
-                                "Invalid Ed25519 signature for reward TX".to_string()
-                            ));
-                        }
-                    }
-                }
-                if is_info() { println!("[INFO][REWARDS] reward_tx_signature_verified"); }
+                // No live producer emits a RewardDistribution from a non-system address. The only
+                // legitimate reward source is system_rewards_pool (handled above); reject everything else
+                // (this was a self-consistent Ed25519 verify that bound nothing to an authorised emitter).
+                return Err(QNetError::ValidationError(
+                    "RewardDistribution must originate from system_rewards_pool".to_string()));
             }
         } else {
-            // Regular transactions MUST have signature
-            if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
-                return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
-            }
-            
-            // v3.35: ALWAYS verify signature cryptographically — no shortcuts!
-            // Previous v2.95.3 used "signature_verified":true in data field as shortcut,
-            // which was a security anti-pattern (string match in user-accessible field).
-            // Now that build_canonical_verify_message() ensures consistent formats
-            // across RPC and gossip paths, we always verify.
-            
-            // CRITICAL SECURITY: Cryptographic signature verification
-            // Step 1: Ed25519 signature (ALWAYS required)
-            if let Some(ref sig) = tx.signature {
-                if let Some(ref pubkey) = tx.public_key {
-                    if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
-                        return Err(QNetError::ValidationError(
-                            "Invalid Ed25519 signature".to_string()
-                        ));
-                    }
-                } else {
-                    return Err(QNetError::ValidationError("public_key required".to_string()));
-                }
-            }
-            
-            // Step 2: Dilithium signature (OPTIONAL - quantum TX)
-            if tx.dilithium_signature.is_some() {
-                if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+            // PURE DILITHIUM (F0.1): value-moving user classes are authorized by ONE mandatory
+            // ML-DSA-65 signature whose key derives to `from` — the address IS the from<->key
+            // binding (closes API-1 forge-from-any-address) and PQ is mandatory (closes AC-3).
+            // Ed25519 is NOT the authorization for these classes. Non-value user TX (registration/
+            // activation/proofs) keep the existing signature path (migrated in later F0.1 sub-steps).
+            let is_value_tx = matches!(tx.tx_type,
+                qnet_state::TransactionType::Transfer { .. } |
+                qnet_state::TransactionType::ContractDeploy |
+                qnet_state::TransactionType::ContractCall
+            );
+            if is_value_tx {
+                let dpk = match tx.dilithium_public_key.as_ref().filter(|k| !k.is_empty()) {
+                    Some(k) => k,
+                    None => return Err(QNetError::ValidationError(
+                        "[REJECT][AUTH] value TX requires dilithium_public_key (pure-PQ)".to_string())),
+                };
+                if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
                     return Err(QNetError::ValidationError(
-                        "Invalid Dilithium signature".to_string()
-                    ));
+                        "[REJECT][AUTH] value TX requires dilithium_signature (pure-PQ)".to_string()));
                 }
-                if is_info() {
-                    println!("[INFO][SIGVERIFY] dilithium_verified tx={}", &tx.hash[..16.min(tx.hash.len())]);
+                // Address binding: `from` MUST be the address derived from the signing PQ key.
+                match crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(dpk) {
+                    Some(derived) if derived == tx.from => {}
+                    _ => return Err(QNetError::ValidationError(
+                        "[REJECT][AUTH] from_pubkey_mismatch (dilithium)".to_string())),
+                }
+                if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                    return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
+                }
+            } else {
+                // Non-value user TX — QNet is pure post-quantum: Ed25519 is a Solana-only credential
+                // and is NEVER verified here. Self-verifying consensus proofs carry embedded sigs;
+                // every other user TX (registration/activation/etc.) needs a mandatory ML-DSA-65 sig.
+                let self_verifying = matches!(tx.tx_type,
+                    qnet_state::TransactionType::EquivocationProof { .. } |
+                    qnet_state::TransactionType::VoteEquivocationProof { .. }
+                );
+                if !self_verifying {
+                    if tx.dilithium_public_key.as_ref().map_or(true, |k| k.is_empty())
+                        || tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
+                        return Err(QNetError::ValidationError(
+                            "[REJECT][AUTH] user TX requires dilithium_signature + dilithium_public_key (pure-PQ)".to_string()));
+                    }
+                    if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                        return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
+                    }
                 }
             }
         }
@@ -23166,53 +22893,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         Ok(tx_hash)
     }
     
-    /// PRODUCTION v2.57: Verify Ed25519 on SIGVERIFY_RUNTIME
-    /// ═══════════════════════════════════════════════════════════════════════════
-    /// ISOLATION: Runs on dedicated SIGVERIFY_RUNTIME (not main event loop)
-    /// PERFORMANCE: ~10,000 verifications/sec/core
-    /// ═══════════════════════════════════════════════════════════════════════════
-    async fn verify_ed25519_tx_signature_async(
-        tx: &qnet_state::Transaction,
-        signature_hex: &str,
-        public_key_hex: &str
-    ) -> Result<bool, QNetError> {
-        let sig_hex = signature_hex.to_string();
-        let pk_hex = public_key_hex.to_string();
-        
-        // CRITICAL FIX v3.31: Use type-aware canonical message
-        let canonical_msg = Self::build_canonical_verify_message(tx);
-        
-        let handle = crate::unified_p2p::spawn_sigverify(async move {
-            tokio::task::spawn_blocking(move || {
-                use ed25519_dalek::{Signature, VerifyingKey, Verifier};
-                
-                let message = canonical_msg;
-                let message_bytes = message.as_bytes();
-                
-                let sig_bytes = hex::decode(&sig_hex).map_err(|e| format!("Invalid sig hex: {}", e))?;
-                if sig_bytes.len() != 64 { return Err(format!("Invalid sig len: {}", sig_bytes.len())); }
-                let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| "Sig conversion failed")?;
-                let signature = Signature::from_bytes(&sig_array);
-                
-                let pk_bytes = hex::decode(&pk_hex).map_err(|e| format!("Invalid pk hex: {}", e))?;
-                if pk_bytes.len() != 32 { return Err(format!("Invalid pk len: {}", pk_bytes.len())); }
-                let pk_array: [u8; 32] = pk_bytes.try_into().map_err(|_| "PK conversion failed")?;
-                let vk = VerifyingKey::from_bytes(&pk_array).map_err(|e| format!("Invalid pk: {}", e))?;
-                
-                match vk.verify(message_bytes, &signature) {
-                    Ok(()) => Ok(true),
-                    Err(_) => Ok(false),
-                }
-            }).await.map_err(|e| format!("Task panic: {}", e))?
-        });
-        
-        match handle.await {
-            Ok(Ok(r)) => Ok(r),
-            Ok(Err(e)) => Err(QNetError::ValidationError(e)),
-            Err(e) => Err(QNetError::ValidationError(format!("Runtime error: {}", e))),
-        }
-    }
-    
     /// PRODUCTION v2.25.2: Batch verify Ed25519 signatures for high TPS
     /// Uses ed25519_dalek::verify_batch for 2-3x faster verification
     /// Returns indices of valid transactions
@@ -23233,10 +22913,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // - CreateAccount: internal system op, never gossiped individually
             // - BatchRewardClaims / BatchNodeActivations: DEPRECATED, never instantiated
             //
-            // REMOVED from skip list (v6.1):
-            // - NodeRegistration: client-signed NodeReg HAS Ed25519+Dilithium → verify early
-            // - NodeActivation: now signed with ephemeral Ed25519 (v6.1) → verify early
-            // - LightNodeEligibilityBitmap: now signed with ephemeral Ed25519 (v6.1) → verify early
+            // Dilithium-only (pure-PQ migration Phase 2): these carry authenticity via a
+            // MANDATORY ML-DSA-65 re-verify at gossip ingest (validate_and_add_network_transaction)
+            // + block_pipeline, so the Ed25519 batch here NO LONGER requires an Ed25519 sig for them.
+            // Adding them is a strict tightening: a later phase drops the client Ed25519 producer
+            // without these TXs then failing this batch. Until then both sigs pass.
+            // - NodeRegistration / NodeActivation / NodeReactivation: node lifecycle, Dilithium-signed
+            // - PingCommitmentWithSampling / LightNodeEligibilityBitmap: validator liveness, Dilithium-signed
             //
             // EquivocationProof carries NO submitter Ed25519 sig — its authenticity is the
             // offender's OWN Dilithium3 block signatures embedded in both headers. Those are
@@ -23250,9 +22933,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 qnet_state::TransactionType::BatchNodeActivations { .. } |
                 qnet_state::TransactionType::EquivocationProof { .. } |
                 qnet_state::TransactionType::VoteEquivocationProof { .. } |
+                // Phase 2: Dilithium-only — verified in validate_and_add_network_transaction + block_pipeline.
+                qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
+                qnet_state::TransactionType::LightNodeEligibilityBitmap { .. } |
+                qnet_state::TransactionType::NodeReactivation { .. } |
+                qnet_state::TransactionType::NodeRegistration { .. } |
+                qnet_state::TransactionType::NodeActivation { .. } |
                 // v35: Heartbeat is Dilithium-only (no Ed25519) — skip the Ed25519
                 // batch; its Dilithium sig is verified in validate_and_add.
-                qnet_state::TransactionType::Heartbeat { .. }
+                qnet_state::TransactionType::Heartbeat { .. } |
+                // Pure ML-DSA-65 user value TXs (signature:None): Ed25519 not carried. Authenticated
+                // by the MANDATORY ML-DSA-65 verify (verify_user_tx_dilithium: sig over the canonical
+                // message + eon(dpk)==from identity bind) at BOTH gossip admission
+                // (validate_and_add_network_transaction is_value_tx) AND block_pipeline receive-verify,
+                // so exempting them from this Ed25519 batch does not weaken authenticity — it is the
+                // fix that lets pure-PQ transfers enter a block at all (they carry no Ed25519).
+                qnet_state::TransactionType::Transfer { .. } |
+                qnet_state::TransactionType::ContractDeploy |
+                qnet_state::TransactionType::ContractCall |
+                qnet_state::TransactionType::Swap { .. }
             );
 
             if is_unsigned_system_tx {
@@ -23354,7 +23053,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     ///   Transfer        transfer:{from}:{to}:{amount}:{nonce}:{gas_price}:{gas}
     ///   BatchTransfers  batch_transfer:{from}:{total}:{count}:{batch_id}
     ///   ContractDeploy  contract_deploy:{from}:{code_hash}:{nonce}
-    ///   ContractCall    contract_call:{from}:{contract}:{method}:{nonce}
+    ///   ContractCall    contract_call:{from}:{sha3(raw tx.data calldata)}:{nonce}
     ///   Heartbeat/Ping  {from}|{to}|{amount}|{nonce}|{gas_price}|{gas}|{ts}
     ///   RewardClaim     claim_rewards:{node_id}:{wallet}
     /// System/unsigned TXs (emission RewardDistribution, NodeRegistration,
@@ -23402,22 +23101,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 format!("contract_deploy:{}:{}:{}", tx.from, code_hash, tx.nonce)
             }
             
-            // ContractCall: matches rpc.rs:11179
-            // CRITICAL FIX v3.31.1: method is stored in tx.data JSON, NOT tx.data itself!
-            // RPC signs: contract_call:{from}:{contract}:{method}:{nonce}
-            // tx.data is JSON: {"contract":"...","method":"transfer","args":[...],"security":{...}}
+            // ContractCall: contract/method/args ALL live inside tx.data (JSON
+            // {"contract":..,"method":..,"args":..}). Bind the signature to the EXACT bytes the
+            // client sent — a SHA3-256 over the raw tx.data string — NOT a re-serialization of a
+            // parsed args value. Re-serializing diverges cross-implementation (number formatting
+            // 1000 vs 1000.0, object-key order, unicode escaping) so a mobile-signed honest call
+            // would fail the Rust verifier. Hashing the literal calldata covers method+args+contract
+            // as transmitted; only from+nonce come from outside tx.data.
             qnet_state::TransactionType::ContractCall => {
-                let contract = to_str;
-                let method = if let Some(ref data) = tx.data {
-                    // tx.data is a JSON string — extract "method" field
-                    serde_json::from_str::<serde_json::Value>(data)
-                        .ok()
-                        .and_then(|v| v.get("method").and_then(|m| m.as_str().map(String::from)))
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                format!("contract_call:{}:{}:{}:{}", tx.from, contract, method, tx.nonce)
+                let data_bytes = tx.data.as_deref().unwrap_or("").as_bytes();
+                let data_hash = format!("{:x}", Sha3_256::digest(data_bytes));
+                format!("contract_call:{}:{}:{}", tx.from, data_hash, tx.nonce)
             }
             
             // system_rewards_pool merkle claims are sig-exempt (authorized by per-proof re-verify
@@ -23425,10 +23119,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
 
             // === NODEREGISTRATION ===
             // Two signing paths:
-            // 1. SERVER-SIGNED (legacy): hybrid Ed25519 (ephemeral) + Dilithium3 (producer key)
+            // 1. SERVER-SIGNED (legacy): pure Dilithium3 (ML-DSA-65, producer key)
             //    data field does NOT start with "client_node_reg:"
             //    Canonical: pipe-separated to match sign_node_registration_tx() in rpc.rs
-            // 2. CLIENT-SIGNED (new flow): wallet Ed25519 key
+            // 2. CLIENT-SIGNED (new flow): wallet Dilithium3 (ML-DSA-65) key
             //    data field starts with "client_node_reg:" — set by handle_node_registration_client_submit
             //    Canonical: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
             qnet_state::TransactionType::NodeRegistration { node_id, wallet_address, registration_proof, .. } => {
@@ -23442,10 +23136,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
             
-            // === NODEACTIVATION (system TX, hybrid-signed by producer) ===
+            // === NODEACTIVATION (system TX, Dilithium-signed by producer) ===
             qnet_state::TransactionType::NodeActivation { .. } => {
                 format!("{}|{}|{}|{}|{}|{}|{}",
                     tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp)
+            }
+
+            // NodeReactivation (Dilithium-signed by the returning node over its OWN canonical
+            // message). node_id == tx.from for reactivation; the producer (sign_reactivation_tx)
+            // and all three verify paths MUST reconstruct this identical preimage, else the sole
+            // ML-DSA-65 leg mismatches and honest reactivations are dropped.
+            qnet_state::TransactionType::NodeReactivation { .. } => {
+                format!("node_reactivation:{}:{}", tx.from, tx.timestamp)
             }
 
             // v35: Heartbeat carries ONE Dilithium sig (in dilithium_signature) over the anchor.
@@ -23467,7 +23169,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 format!("light_bitmap:{}:{}:{}:{}:{}", genesis_id, epoch, total_assigned, eligible_count, bm)
             }
 
-            // === NODE-SIGNED SYSTEM TRANSACTIONS (signed with ephemeral Ed25519 + Dilithium) ===
+            // === NODE-SIGNED SYSTEM TRANSACTIONS (signed with pure Dilithium3 / ML-DSA-65) ===
             // HeartbeatCommitment, PingCommitmentWithSampling — use pipe-separated format
             // This matches node.rs:2817/2997 where nodes sign with:
             //   format!("{}|{}|{}|{}|{}|{}|{}", from, to, amount, nonce, gas_price, gas_limit, timestamp)
@@ -23502,7 +23204,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// only needs to be handled here, and both paths pick it up.
     pub(crate) async fn verify_dilithium_tx_signature_async(tx: &qnet_state::Transaction) -> Result<bool, QNetError> {
         use crate::quantum_crypto::DilithiumSignature;
-        
+
+        // PURE DILITHIUM (F0.1): value-moving user TX are authorised by a DIRECT ML-DSA-65 verify
+        // against the claimed wallet key — identity is the address binding enforced at ingest
+        // (eon_from_qnet_dilithium_pubkey(dpk)==from), NOT the consensus node_id->pk registry path
+        // below (which is for node identities, with its own squat-guard). Registration/activation
+        // keep the existing path (their own message format + handler proof).
+        if matches!(tx.tx_type,
+            qnet_state::TransactionType::Transfer { .. } |
+            qnet_state::TransactionType::ContractDeploy |
+            qnet_state::TransactionType::ContractCall |
+            qnet_state::TransactionType::Swap { .. }) {
+            return Ok(Self::verify_user_tx_dilithium(tx));
+        }
+
         let dilithium_sig = match &tx.dilithium_signature {
             Some(sig) if !sig.is_empty() => sig.clone(),
             _ => return Ok(true),
@@ -23554,6 +23269,151 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             Ok(Err(e)) => Err(QNetError::ValidationError(e)),
             Err(e) => Err(QNetError::ValidationError(format!("Runtime error: {}", e))),
         }
+    }
+
+    /// PURE DILITHIUM (F0.1): direct ML-DSA-65 verification for USER value transactions. A user
+    /// wallet's key is NOT a registered node identity, so the consensus node_id->pk registry path is
+    /// wrong here. Proves BOTH that the ML-DSA-65 signature is valid over the canonical message under
+    /// the claimed key AND the API-1 identity bind eon_from_qnet_dilithium_pubkey(dpk) == tx.from —
+    /// so the guarantee travels WITH the verify to every path (admission, rpc, block-verify, producer),
+    /// not just ingest.
+    /// Wire format (produced by the mobile/ext wallet, signer_id = raw pubkey hex):
+    ///   `dilithium_sig_{pk_hex}_{base64([sig_len:4LE][SignedMessage][pk_len:4LE][pk])}`
+    pub(crate) fn verify_user_tx_dilithium(tx: &qnet_state::Transaction) -> bool {
+        use base64::engine::general_purpose;
+        use base64::Engine;
+        use pqcrypto_mldsa::mldsa65 as dilithium3;
+        use pqcrypto_traits::sign::{SignedMessage as SmTrait, PublicKey as PkTrait};
+
+        let sig_str = match tx.dilithium_signature.as_ref() {
+            Some(s) if !s.is_empty() => s,
+            _ => return false,
+        };
+        let pk_hex = match tx.dilithium_public_key.as_ref() {
+            Some(p) if !p.is_empty() => p,
+            _ => return false,
+        };
+        let pk_bytes = match hex::decode(pk_hex) {
+            Ok(b) if b.len() == 1952 => b,
+            _ => return false,
+        };
+        // The client wraps the signature with signer_id = the raw ML-DSA-65 public-key hex.
+        let prefix = format!("dilithium_sig_{}_", pk_hex);
+        let b64 = match sig_str.strip_prefix(&prefix) {
+            Some(x) => x,
+            None => return false,
+        };
+        let combined = match general_purpose::STANDARD.decode(b64) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        // Layout: [sig_len:4LE][SignedMessage][pk_len:4LE][pk]
+        if combined.len() < 8 { return false; }
+        let sig_len = match combined[0..4].try_into() {
+            Ok(a) => u32::from_le_bytes(a) as usize,
+            Err(_) => return false,
+        };
+        if combined.len() < 4 + sig_len { return false; }
+        let sm_bytes = &combined[4..4 + sig_len];
+
+        let signed_msg = match dilithium3::SignedMessage::from_bytes(sm_bytes) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let pk = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        // open() verifies the signature AND returns the embedded message.
+        let opened = match dilithium3::open(&signed_msg, &pk) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        if opened != Self::build_canonical_verify_message(tx).as_bytes() {
+            return false;
+        }
+        // API-1 identity bind — enforced HERE so EVERY value-TX verify path (gossip admission, rpc
+        // submit, block_pipeline receive-verify, producer-local) requires it, not just ingest: the
+        // signing key MUST derive to the sender. Without it a Byzantine producer could block-include
+        // a transfer signed by an attacker key over `transfer:{victim}:...` (theft) that never passed
+        // admission. Pure/deterministic (SHA512(pk) derivation + tx.from), safe on the apply path.
+        crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(pk_hex).as_deref()
+            == Some(tx.from.as_str())
+    }
+
+    /// Shared system-TX identity binds — enforced on BOTH the gossip-admission path
+    /// (validate_and_add_network_transaction) AND the block-apply path (block_pipeline verify stage),
+    /// so a Byzantine PRODUCER cannot embed in a block a system TX that the gossip path would reject.
+    /// The Dilithium signature VALIDITY (open + registry/TOFV binding) is checked separately by
+    /// verify_dilithium_tx_signature_async on both paths; THIS fn enforces (a) the PRESENCE of that
+    /// signature for node-signed system TXs that carry no alternate authenticator, and (b) the
+    /// signer↔credited-identity binds that keep apply's per-account keying honest:
+    ///   - LightNodeEligibilityBitmap: signer == genesis_id       (no cross-shard bitmap hijack)
+    ///   - PingCommitmentWithSampling:  signer == from            (apply dedups on `from`)
+    ///   - Heartbeat:                   from == node_id == signer  (apply keys liveness on `from`
+    ///                                  while the sig binds node_id — decoupling forges a dead node's
+    ///                                  liveness onto another super's reward/eligibility account)
+    /// STRICTLY DETERMINISTIC: a pure function of the TX bytes ONLY — NO node-local / gossip-seeded
+    /// state (e.g. the VRF-key registry, which is seeded by gossip before commit and differs across
+    /// validators) — so the verdict is byte-identical on every node, as required on the apply path.
+    /// NodeRegistration / NodeActivation are deliberately NOT gated here: they carry an alternate
+    /// authenticator (a Solana owner_signature for imported wallets, whose wallet == eon(solana_addr)
+    /// ≠ eon(dpk)) and/or a deferred Dilithium sig, and their Sybil anchor is the deterministic 2f+1
+    /// burn-attestation quorum (verify_burn_attestation_quorum), not a signature-presence check.
+    pub(crate) fn verify_system_tx_binds(tx: &qnet_state::Transaction) -> Result<(), String> {
+        use qnet_state::TransactionType as TT;
+        // Node-signed system TXs whose sole authenticator is ML-DSA-65 — a signature MUST be present.
+        let requires_dilithium = matches!(tx.tx_type,
+            TT::PingCommitmentWithSampling { .. } |
+            TT::LightNodeEligibilityBitmap { .. } |
+            TT::HeartbeatCommitment { .. } |
+            TT::Heartbeat { .. } |
+            TT::NodeReactivation { .. }
+        );
+        if requires_dilithium && tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
+            return Err(format!("system TX requires a Dilithium3 signature (type={:?})",
+                std::mem::discriminant(&tx.tx_type)));
+        }
+        match &tx.tx_type {
+            // Bitmap: signer MUST be the genesis whose shard it declares (anti cross-shard hijack).
+            TT::LightNodeEligibilityBitmap { genesis_id, .. } => {
+                if tx.dilithium_public_key.as_deref() != Some(genesis_id.as_str()) {
+                    return Err(format!(
+                        "LightNodeEligibilityBitmap genesis_id={} != signer={:?} (cross-shard forbidden)",
+                        genesis_id, tx.dilithium_public_key));
+                }
+            }
+            // Ping: signer MUST be the node the commitment is attributed to (apply dedups on `from`).
+            TT::PingCommitmentWithSampling { .. } => {
+                if tx.dilithium_public_key.as_deref() != Some(tx.from.as_str()) {
+                    return Err(format!(
+                        "PingCommitment from={} != signer={:?} (slot-squat forbidden)",
+                        tx.from, tx.dilithium_public_key));
+                }
+            }
+            // Heartbeat: apply keys the liveness bitmask on `from`, but the sig binds `node_id`; bind
+            // from == node_id == signer so a producer can't re-wrap its OWN valid heartbeat onto a DEAD
+            // super's account (forged reward / producer eligibility). Legit producer sets all three
+            // equal (create_heartbeat_tx: from=node_id, dilithium_public_key=node_id).
+            TT::Heartbeat { node_id, .. } => {
+                if tx.from.as_str() != node_id.as_str()
+                    || tx.dilithium_public_key.as_deref() != Some(node_id.as_str())
+                {
+                    return Err(format!(
+                        "Heartbeat identity split: from={} node_id={} signer={:?} (must be equal)",
+                        tx.from, node_id, tx.dilithium_public_key));
+                }
+            }
+            // KeyRotation is INERT (apply is a no-op; old_key_signature is never verified). Fail-closed at
+            // the shared gate so a forged rotation can never be gossiped or block-included. Before it can be
+            // wired live, add a state-aware verifier that checks old_key_signature against the node's
+            // registered Dilithium key, THEN remove this hard-reject.
+            TT::KeyRotation { .. } => {
+                return Err("KeyRotation is not enabled: needs a registered-old-key Dilithium verifier before activation".to_string());
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// N-2 committee needed to burn-gate `height` isn't locally present ⇒ node is BEHIND (post-genesis).
@@ -23873,7 +23733,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         //   * Transfer, ContractDeploy, ContractCall, Swap     (user TXs)
         //   * NodeRegistration, NodeReactivation, NodeActivation (node lifecycle)
         //   * KeyRotation                                       (PQ key hygiene)
-        //   * SetPQRequirement                                  (PQ wallet lock)
         //   * RewardDistribution (claim, NOT system_emission)   (user reward claims)
         //   * HeartbeatCommitment, PingCommitmentWithSampling   (node commitments)
         //   * LightNodeEligibilityBitmap                        (Genesis ping aggregation)
@@ -23923,8 +23782,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     "[REJECT][GOSSIP] BatchTransfers is unused — must not arrive via gossip".to_string()
                 ));
             }
+            // Mirror of the RPC-path Swap reject: dormant, apply-fail-closed. Drop at gossip admission
+            // so a crafted Swap can't be relayed or block-included; block-apply keeps its fail-close.
+            qnet_state::TransactionType::Swap { .. } => {
+                if crate::node::is_warn() {
+                    println!("[WARN][TX-GOSSIP] reject_gossip_swap reason=dex_not_enabled");
+                }
+                return Err(QNetError::ValidationError(
+                    "[REJECT][GOSSIP] Swap/DEX is not enabled — on-chain pool pricing is not deployed".to_string()
+                ));
+            }
             _ => {} // All other variants pass through to standard validation
         }
+
+        // Shared system-TX identity binds (presence + signer↔declared-identity) — the SAME gate
+        // enforced on the block-apply path (block_pipeline), so gossip admission and block validation
+        // agree on what a valid system TX is. Closes ping-slot squat / cross-shard bitmap / unbound
+        // first-registration at the door, not just at block apply.
+        Self::verify_system_tx_binds(&tx)
+            .map_err(|e| QNetError::ValidationError(format!("[REJECT][GOSSIP] {}", e)))?;
 
         // Advisory mirror of the block-validation burn-attestation gate
         // (verify_burn_attestation_quorum): reject an invalid NodeRegistration at admission so a
@@ -23999,18 +23875,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         ));
                     }
                 } else {
-                    // Other RewardDistribution: full Ed25519 verify on the canonical message.
-                    let (sig, pubkey) = match (&tx.signature, &tx.public_key) {
-                        (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => (s, p),
-                        _ => return Err(QNetError::ValidationError(
-                            "Reward TX must have Ed25519 signature and public_key".to_string()
-                        )),
-                    };
-                    if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
-                        return Err(QNetError::ValidationError(
-                            "Invalid Ed25519 signature on reward TX (gossip)".to_string()
-                        ));
-                    }
+                    // Pure ML-DSA-65: a RewardDistribution is ONLY ever produced as system_emission
+                    // (block-level, rejected above) or a system_rewards_pool merkle claim (handled
+                    // above). Any other `from` has no legitimate producer — reject at the door.
+                    return Err(QNetError::ValidationError(
+                        "RewardDistribution must be from system_emission or system_rewards_pool".to_string()
+                    ));
                 }
                 
                 if is_info() { 
@@ -24019,32 +23889,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
             
-            // PRODUCTION v2.85: MANDATORY hybrid signature verification for commitment TXs
-            // L1 security requirement: Both Ed25519 AND Dilithium signatures MUST be present and valid
-            if matches!(tx.tx_type, 
-                qnet_state::TransactionType::HeartbeatCommitment { .. } | 
+            // Pure ML-DSA-65: commitment TXs are authenticated solely by their Dilithium3
+            // signature (linked to the node's on-chain consensus identity via
+            // CONSENSUS_PK_REGISTRY). Ed25519 was an illusory second leg — quantum-breakable,
+            // ephemeral, no identity binding — removed with the pure-Dilithium migration.
+            if matches!(tx.tx_type,
+                qnet_state::TransactionType::HeartbeatCommitment { .. } |
                 qnet_state::TransactionType::PingCommitmentWithSampling { .. } |
                 qnet_state::TransactionType::LightNodeEligibilityBitmap { .. }
             ) {
-                // MANDATORY: Ed25519 signature REQUIRED
-                let (sig, pubkey) = match (&tx.signature, &tx.public_key) {
-                    (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => (s, p),
-                    _ => return Err(QNetError::ValidationError(
-                        "Commitment TX REQUIRES Ed25519 signature (hybrid security)".to_string()
-                    )),
-                };
-                
-                if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
-                    return Err(QNetError::ValidationError("Invalid Ed25519 signature on commitment TX".to_string()));
-                }
-                
                 // MANDATORY: Dilithium signature REQUIRED for post-quantum security
                 if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
                     return Err(QNetError::ValidationError(
                         "Commitment TX REQUIRES Dilithium signature (post-quantum security)".to_string()
                     ));
                 }
-                
+
                 if !Self::verify_dilithium_tx_signature_async(&tx).await? {
                     return Err(QNetError::ValidationError("Invalid Dilithium signature on commitment TX".to_string()));
                 }
@@ -24064,13 +23924,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
 
                 if is_info() {
-                    println!("[INFO][VERIFY] commitment_tx_hybrid_verified type={:?}",
+                    println!("[INFO][VERIFY] commitment_tx_pq_verified type={:?}",
                              std::mem::discriminant(&tx.tx_type));
                 }
             }
 
-            // v35: Heartbeat is Dilithium-only (no Ed25519, unlike the hybrid commitment
-            // TXs above). Verify its Dilithium sig here; anchor freshness is re-checked at
+            // v35: Heartbeat carries a single Dilithium sig, like the commitment
+            // TXs above. Verify its Dilithium sig here; anchor freshness is re-checked at
             // production and on receive.
             if matches!(tx.tx_type, qnet_state::TransactionType::Heartbeat { .. }) {
                 if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
@@ -24085,31 +23945,50 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
         } else {
-            // SECURITY v6.1: Ed25519 signature AND public_key are BOTH mandatory for user TXs.
-            // Previously: if public_key was None, verification was silently skipped despite
-            // signature being present — a TX with garbage signature + no public_key would pass.
-            let sig = match tx.signature.as_ref().filter(|s| !s.is_empty()) {
-                Some(s) => s,
-                None => return Err(QNetError::ValidationError(
-                    format!("Transaction signature is empty (type={:?})", std::mem::discriminant(&tx.tx_type))
-                )),
-            };
-            let pubkey = match tx.public_key.as_ref().filter(|p| !p.is_empty()) {
-                Some(p) => p,
-                None => return Err(QNetError::ValidationError(
-                    "Transaction has signature but public_key is missing — cannot verify Ed25519".to_string()
-                )),
-            };
-
-            if !Self::verify_ed25519_tx_signature_async(&tx, sig, pubkey).await? {
-                return Err(QNetError::ValidationError(format!(
-                    "Invalid Ed25519 signature (type={:?})", std::mem::discriminant(&tx.tx_type)
-                )));
-            }
-
-            if tx.dilithium_signature.is_some() {
+            // PURE DILITHIUM (F0.1): mirror the RPC ingest — value-moving user classes require ONE
+            // mandatory ML-DSA-65 signature bound to `from` via the address (API-1 + AC-3). A forged
+            // TX must never even enter the mempool, so the same gate runs on the gossip path.
+            let is_value_tx = matches!(tx.tx_type,
+                qnet_state::TransactionType::Transfer { .. } |
+                qnet_state::TransactionType::ContractDeploy |
+                qnet_state::TransactionType::ContractCall
+            );
+            if is_value_tx {
+                let dpk = match tx.dilithium_public_key.as_ref().filter(|k| !k.is_empty()) {
+                    Some(k) => k,
+                    None => return Err(QNetError::ValidationError(
+                        "[REJECT][AUTH] value TX requires dilithium_public_key (pure-PQ)".to_string())),
+                };
+                if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
+                    return Err(QNetError::ValidationError(
+                        "[REJECT][AUTH] value TX requires dilithium_signature (pure-PQ)".to_string()));
+                }
+                match crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(dpk) {
+                    Some(derived) if derived == tx.from => {}
+                    _ => return Err(QNetError::ValidationError(
+                        "[REJECT][AUTH] from_pubkey_mismatch (dilithium)".to_string())),
+                }
                 if !Self::verify_dilithium_tx_signature_async(&tx).await? {
                     return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
+                }
+            } else {
+                // Non-value user TX — pure post-quantum (mirror the RPC ingest). Ed25519 is Solana-only
+                // and never verified; self-verifying proofs carry embedded sigs; all other user TX
+                // require a mandatory ML-DSA-65 signature. A forged TX must not enter the mempool.
+                let self_verifying = matches!(tx.tx_type,
+                    qnet_state::TransactionType::EquivocationProof { .. } |
+                    qnet_state::TransactionType::VoteEquivocationProof { .. }
+                );
+                if !self_verifying {
+                    if tx.dilithium_public_key.as_ref().map_or(true, |k| k.is_empty())
+                        || tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
+                        return Err(QNetError::ValidationError(format!(
+                            "[REJECT][AUTH] user TX requires dilithium sig+pubkey (pure-PQ) (type={:?})",
+                            std::mem::discriminant(&tx.tx_type))));
+                    }
+                    if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                        return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
+                    }
                 }
             }
         }
@@ -24346,15 +24225,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         Ok(confirmed)
     }
     
-    /// BENCHMARK HYBRID: Submit batch with full Ed25519 + Dilithium3 (ML-DSA-65) dual verification.
+    /// BENCHMARK PQ: Submit batch with pure Dilithium3 (ML-DSA-65) verification.
     /// This is the honest post-quantum benchmark path:
-    ///   - Ed25519 signature verified (same as production)
-    ///   - Dilithium3 signature verified (quantum-resistant layer)
+    ///   - Dilithium3 (ML-DSA-65) signature verified (pure post-quantum, same as production)
     ///   - Accepted into mempool
     ///   - P2P broadcast (batch QUIC)
-    /// Throughput reflects REAL dual-crypto overhead — no shortcuts.
+    /// Throughput reflects REAL ML-DSA-65 verification overhead — no shortcuts.
     /// SECURITY: Requires QNET_BENCHMARK_MODE=true
-    pub async fn submit_benchmark_batch_hybrid(&self, transactions: Vec<qnet_state::Transaction>) -> Result<usize, QNetError> {
+    pub async fn submit_benchmark_batch_pq(&self, transactions: Vec<qnet_state::Transaction>) -> Result<usize, QNetError> {
         use crate::benchmark::BenchmarkManager;
         use pqcrypto_mldsa::mldsa65 as dilithium3;
         use pqcrypto_traits::sign::{PublicKey as PqPublicKey, SignedMessage as PqSignedMessage};
@@ -24372,25 +24250,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Ok(0);
         }
 
-        // Phase 1: Ed25519 batch verification (same as production path)
-        let ed_valid_set: std::collections::HashSet<usize> =
-            Self::verify_ed25519_batch(&transactions).into_iter().collect();
-
         let mut valid_txs: Vec<(Vec<u8>, String, u64)> = Vec::with_capacity(transactions.len());
         let mut confirmed = 0usize;
 
-        for (idx, tx) in transactions.iter().enumerate() {
-            // Ed25519 must pass
-            if !ed_valid_set.contains(&idx) {
-                continue;
-            }
-
+        for tx in transactions.iter() {
             // Only benchmark accounts
             if !BenchmarkManager::is_benchmark_account(&tx.from) {
                 continue;
             }
 
-            // Phase 2: Dilithium3 verification — TX must carry both signatures
+            // Pure ML-DSA-65 verification — TX must carry the Dilithium signature + pubkey
             let pq_ok = match (&tx.dilithium_signature, &tx.dilithium_public_key) {
                 (Some(sig_hex), Some(pk_hex)) => {
                     let sig_bytes = hex::decode(sig_hex).unwrap_or_default();
@@ -24417,7 +24286,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         _ => false,
                     }
                 }
-                _ => false, // Hybrid TX must have both dilithium fields
+                _ => false, // PQ TX must have both dilithium fields
             };
 
             if !pq_ok {
@@ -26065,7 +25934,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if !env_burn_tx.is_empty() && env_burn_amount > 0 {
                 // Stateless path: wallet derived from code via XOR decryption
                 let wallet = self.get_wallet_address();
-                let phase = if env_burn_tx.len() == 88 || env_burn_tx.len() == 87 { 1 } else { 1 };
+                // An env-provided burn_tx is always a 1DEV burn = activation Phase 1.
+                let phase = 1;
                 println!("[INFO][ACTIVATION] using_env_burn_data tx={}... amount={} phase={}",
                     &env_burn_tx[..16.min(env_burn_tx.len())], env_burn_amount, phase);
                 (wallet, env_burn_tx, phase, env_burn_amount)
@@ -26293,29 +26163,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
 
-            // v6.1: Hybrid Ed25519+Dilithium3 signing for User Super Nodes
-            // Keys are created ON THIS NODE — sign locally before submitting to mempool.
-            // This prevents any block producer from forging a NodeRegistration for a foreign wallet.
+            // Pure ML-DSA-65 signing for User Super Nodes. Keys are created ON THIS NODE — sign
+            // locally before submitting to mempool. This prevents any block producer from forging
+            // a NodeRegistration for a foreign wallet: the wallet MUST be the EON derived from this
+            // Dilithium key (native_bound, verified at block validation). Ed25519 was an illusory
+            // leg — quantum-breakable, no identity binding — removed.
             {
-                use ed25519_dalek::Signer;
-
                 let canonical_msg = format!("client_node_reg:{}:{}:{}:{}",
                     self.node_id, wallet_address, registration_proof, registration_tx.timestamp);
 
-                // Layer 1: Ed25519 from BIP44 m/44'/9999'/0'/0'/0'
-                let mnemonic = std::env::var("QNET_WALLET_SEED").unwrap_or_default();
-                match crate::crypto::solana_derivation::derive_qnet_signing_key_from_mnemonic(&mnemonic) {
-                    Ok(signing_key) => {
-                        let ed_sig = signing_key.sign(canonical_msg.as_bytes());
-                        registration_tx.signature = Some(hex::encode(ed_sig.to_bytes()));
-                        registration_tx.public_key = Some(hex::encode(signing_key.verifying_key().as_bytes()));
-                    }
-                    Err(e) => {
-                        eprintln!("[WARN][REG] ed25519_sign_failed: {} — falling back to unsigned", e);
-                    }
-                }
-
-                // Layer 2: Dilithium3 from WalletIdentity (post-quantum)
+                // Dilithium3 from WalletIdentity (post-quantum)
                 // Uses consensus-compatible format: "dilithium_sig_{node_id}_{base64(...)}"
                 // PK is embedded inside the base64 payload — TX is self-contained.
                 if let Some(ref identity) = self.wallet_identity {
@@ -26335,8 +26192,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     self.node_id, wallet_address, registration_proof));
                 registration_tx.hash = registration_tx.calculate_hash();
 
-                println!("[INFO][REG] hybrid_signed ed25519={} dilithium3={} node={}",
-                    registration_tx.signature.is_some(),
+                println!("[INFO][REG] signed dilithium3={} node={}",
                     registration_tx.dilithium_signature.is_some(),
                     self.node_id);
             }
@@ -27890,6 +27746,84 @@ mod tests {
         assert_eq!(recency_subwindow_indices(2 * 14400), (20, 19));      // epoch2 boundary bridges
     }
 
+    // E1 determinism: the SCALE-inverted Phase-2A additions (recent-HB-gated point-reads) MUST be
+    // byte-identical in membership AND order to the old full-scan reference (reg-height point-read
+    // first, then recent-HB check). If they diverge the committee + epoch_commitment fork.
+    #[test]
+    fn phase2a_additions_equal_full_scan_reference() {
+        use std::collections::{HashMap, HashSet};
+        const FLOOR: u32 = 7000;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+
+        // scan_end mid-epoch 5 → recency subwindows (5,4); heartbeats anchored in those pass recency.
+        let scan_end = 5 * 1440 + 100;
+        let (cur, prev) = recency_subwindow_indices(scan_end);
+        let sw_anchor = |sw: u64| sw * 1440 + 10; // an anchor height inside subwindow sw
+
+        // Registered supers (srtr_ index) at varied reg_heights. Deliberately NOT alphabetical insert
+        // order so a broken sort would surface. Genesis carries reg_height 0.
+        storage.save_node_registration_at_height("genesis_node_001", "super", "wG", 80.0, 0).unwrap();
+        storage.save_node_registration_at_height("super_c", "super", "wC", 90.0, 100).unwrap();
+        storage.save_node_registration_at_height("super_a", "super", "wA", 90.0, 200).unwrap();
+        storage.save_node_registration_at_height("super_b", "super", "wB", 90.0, 300).unwrap();
+        // Registered but low reputation → filtered by the floor.
+        storage.save_node_registration_at_height("super_lowrep", "super", "wL", 50.0, 150).unwrap();
+        // Registered AFTER scan_end → confirmed-by-scan_end gate excludes it.
+        storage.save_node_registration_at_height("super_future", "super", "wF", 90.0, scan_end + 500).unwrap();
+        // A light node that also heartbeats: NOT in srtr_, must never be admitted as a super.
+        storage.save_node_registration_at_height("light_x", "light", "wLX", 90.0, 120).unwrap();
+
+        // Heartbeats (lhb_ index). Recent (cur/prev subwindow) vs stale (older subwindow).
+        for (id, sw) in [
+            ("genesis_node_001", cur), ("super_c", prev), ("super_a", cur),
+            ("super_lowrep", cur), ("super_future", cur), ("light_x", cur),
+            ("super_b", prev.saturating_sub(2)), // STALE → super_b not recently live → excluded
+        ] {
+            storage.index_heartbeat_inclusion(id, sw_anchor(sw), scan_end.min(sw_anchor(sw) + 5)).unwrap();
+        }
+
+        let registered_super_nodes: HashSet<String> = storage.super_registrations_sorted()
+            .unwrap().into_iter().map(|(id, _w)| id).collect();
+        let recent_hb = recent_heartbeat_senders(&storage, scan_end);
+        // Consensus reputation supplied directly (this test isolates the eligibility predicates).
+        let reputation_map: HashMap<String, f64> = [
+            ("genesis_node_001", 80.0), ("super_c", 90.0), ("super_a", 90.0),
+            ("super_b", 90.0), ("super_lowrep", 50.0), ("super_future", 90.0), ("light_x", 90.0),
+        ].iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        let already: HashSet<String> = HashSet::new();
+
+        // Inverted (production) path.
+        let got = phase2a_eligible_additions(
+            &storage, &registered_super_nodes, &recent_hb, &already, &reputation_map, scan_end, FLOOR,
+        );
+
+        // OLD full-scan reference: iterate ALL registrants sorted, reg-height point-read FIRST, then the
+        // recent-HB membership check (the pre-inversion evaluation order).
+        let mut regs: Vec<&String> = registered_super_nodes.iter().collect();
+        regs.sort();
+        let mut want: Vec<qnet_state::EligibleProducer> = Vec::new();
+        for reg in regs {
+            if already.contains(reg) { continue; }
+            match storage.node_reg_height(reg) {
+                Ok(Some(h)) if h <= scan_end => {}
+                _ => continue,
+            }
+            if !recent_hb.contains(reg) { continue; }
+            let rep = (reputation_map.get(reg).copied()
+                .unwrap_or(qnet_consensus::deterministic_reputation::INITIAL_REPUTATION)
+                .clamp(0.0, 100.0) * 100.0).round() as u32;
+            if rep < FLOOR { continue; }
+            want.push(qnet_state::EligibleProducer { node_id: reg.clone(), reputation: rep });
+        }
+
+        assert_eq!(got, want, "inverted additions must equal full-scan reference (membership AND order)");
+        // Expected eligible: genesis_node_001, super_a, super_c (sorted). Excluded: super_b (stale HB),
+        // super_lowrep (floor), super_future (reg > scan_end), light_x (not in srtr_).
+        let ids: Vec<&str> = got.iter().map(|p| p.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["genesis_node_001", "super_a", "super_c"]);
+    }
+
     // Light-reward roster cutoff. light_reg_epoch_roster is genesis-active (gate=0) for a fresh genesis,
     // so EVERY epoch (incl. 0) freezes the roster at the commit-window open (epoch_start + 14350) — a light
     // node registered mid-epoch earns for that epoch. Creator + reader call it identically (no divergence).
@@ -28341,26 +28275,14 @@ mod tests {
         assert_eq!(BlockchainNode::v2_committee_anchor_index(10), Some(8));
     }
 
-    /// Test CompactHybridSignature deserialization
+    /// Test CompactPqSignature deserialization
     /// OPTIMIZED v2.23: RAW bytes format, dilithium_message_signature removed
     #[test]
     fn test_compact_signature_parsing() {
-        use base64::{Engine as _, engine::general_purpose};
-        
-        // Create valid base64 for 32-byte array (ephemeral_public_key)
-        let ephemeral_pk = [0u8; 32];
-        let _ephemeral_b64 = general_purpose::STANDARD.encode(&ephemeral_pk);
-        
-        // Create valid base64 for 64-byte array (message_signature)
-        let msg_sig = [0u8; 64];
-        let _msg_sig_b64 = general_purpose::STANDARD.encode(&msg_sig);
-        
-        // OPTIMIZED v2.23: Create signature directly (JSON with byte arrays is complex)
-        let sig = crate::crypto::CompactHybridSignature {
+        // Pure ML-DSA-65 (P8): Create signature directly (RAW bytes format)
+        let sig = crate::crypto::CompactPqSignature {
             node_id: "test_node".to_string(),
             cert_serial: "CERT-123".to_string(),
-            ephemeral_public_key: ephemeral_pk,
-            message_signature: msg_sig,
             dilithium_key_signature: vec![1, 2, 3, 4, 5],  // RAW bytes
             signed_at: 1234567890,
         };
@@ -28372,7 +28294,7 @@ mod tests {
         
         // Test roundtrip
         let json = serde_json::to_string(&sig).expect("Serialization failed");
-        let restored: crate::crypto::CompactHybridSignature = serde_json::from_str(&json)
+        let restored: crate::crypto::CompactPqSignature = serde_json::from_str(&json)
             .expect("Deserialization failed");
         assert_eq!(sig.node_id, restored.node_id);
         assert_eq!(sig.dilithium_key_signature, restored.dilithium_key_signature);
@@ -28382,14 +28304,14 @@ mod tests {
     #[test]
     fn test_signature_prefix_detection() {
         let compact_sig = "compact:{\"node_id\":\"test\"}";
-        let hybrid_sig = "hybrid:{\"cert\":{}}";
+        let pq_sig = "pq:{\"cert\":{}}";
         let dilithium_sig = "dilithium_sig_abc123";
-        let p2p_sig = "hybrid_p2p:{\"node_id\":\"test\"}";
-        
+        let p2p_sig = "pq_p2p:{\"node_id\":\"test\"}";
+
         assert!(compact_sig.starts_with("compact:"));
-        assert!(hybrid_sig.starts_with("hybrid:"));
+        assert!(pq_sig.starts_with("pq:"));
         assert!(dilithium_sig.starts_with("dilithium_sig_"));
-        assert!(p2p_sig.starts_with("hybrid_p2p:"));
+        assert!(p2p_sig.starts_with("pq_p2p:"));
     }
     
     /// Test microblock hash computation
@@ -28420,24 +28342,22 @@ mod tests {
         assert!(crypto.is_some(), "Global crypto should be initialized");
     }
     
-    /// Test encapsulated data format for NIST/Cisco compliance
+    /// Test re-rooted encapsulated data format (pure ML-DSA-65, P8)
     #[test]
     fn test_encapsulated_data_format() {
-        let ephemeral_pk = [0u8; 32]; // 32 bytes
         let message_hash = [1u8; 32]; // 32 bytes SHA3-256
         let timestamp: u64 = 1234567890;
-        
+
         let mut encapsulated = Vec::new();
-        encapsulated.extend_from_slice(&ephemeral_pk);
         encapsulated.extend_from_slice(&message_hash);
         encapsulated.extend_from_slice(&timestamp.to_le_bytes());
-        
-        // NIST/Cisco format: 32 + 32 + 8 = 72 bytes
-        assert_eq!(encapsulated.len(), 72);
+
+        // Pure ML-DSA-65 preimage: 32 + 8 = 40 bytes
+        assert_eq!(encapsulated.len(), 40);
 
         // Verify hex encoding works
         let hex = hex::encode(&encapsulated);
-        assert_eq!(hex.len(), 144); // 72 * 2
+        assert_eq!(hex.len(), 80); // 40 * 2
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -28507,6 +28427,7 @@ mod tests {
             epoch_commitment: [0u8; 32],
             reward_root: [0u8; 32],
             registry_root: [0u8; 32],
+            logs_root: [0u8; 32],
             total_supply: 0,
             timestamp: 1000,
             proposer: node.to_string(),

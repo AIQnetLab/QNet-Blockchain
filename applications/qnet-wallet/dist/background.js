@@ -11,6 +11,10 @@ try {
         // Service worker context - load required libraries
         importScripts('lib/tweetnacl.min.js');
         importScripts('lib/crypto-js.min.js');
+        // PURE DILITHIUM (F0.2): canonical ML-DSA-65 wallet derivation + signing. Sets the global
+        // self.QNetDilithiumLib (esbuild var QNetDilithiumLib=...). A service worker has NO `window`,
+        // so downstream code accesses it via self/globalThis. Must load before any wallet derivation.
+        importScripts('lib/noble-pq-ml-dsa.js');
         
         // Check if nacl is now available globally
         if (typeof self !== 'undefined' && typeof self.nacl !== 'undefined') {
@@ -2666,40 +2670,12 @@ class ProductionCrypto {
         return this.base58Encode(publicKey);
     }
     
-    // Generate QNet address from Solana address (for simple display)
-    // PRODUCTION FORMAT: 19 chars + "eon" + 15 chars + 8 char checksum = 45 total
-    static generateQNetAddressFromSolana(solanaAddress) {
-        try {
-            // Generate deterministic QNet address from Solana address
-            const encoder = new TextEncoder();
-            const data = encoder.encode(solanaAddress + 'qnet_eon_bridge');
+    // REMOVED: dead generateQNetAddressFromSolana(). It derived a QNet EON address from the Solana
+    // address via SHA-512("...qnet_eon_bridge") — a DIVERGENT identity unrelated to the ML-DSA-65 key,
+    // which the Rust node + mobile reject (the unlock path explicitly warns "NEVER derive the QNet
+    // address from the Solana address"). It had zero callers. The only valid QNet EON address comes from
+    // ProductionCrypto.generateQNetAddress(mnemonic) → QNetDilithium.deriveWallet(mnemonic).address.
 
-            // Use SHA-512 hash
-            return crypto.subtle.digest('SHA-512', data).then(hashBuffer => {
-                const hash = Array.from(new Uint8Array(hashBuffer));
-                const fullHex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
-
-                // PRODUCTION FORMAT: 19 + 3 + 15 + 8 = 45 characters
-                const part1 = fullHex.substring(0, 19).toLowerCase();
-                const part2 = fullHex.substring(19, 34).toLowerCase();
-
-                // Generate checksum (4 bytes = 8 hex chars)
-                const addressWithoutChecksum = part1 + 'eon' + part2;
-                const checksumEncoder = new TextEncoder();
-
-                return crypto.subtle.digest('SHA-256', checksumEncoder.encode(addressWithoutChecksum)).then(checksumBuffer => {
-                    const checksumHash = Array.from(new Uint8Array(checksumBuffer));
-                    const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
-                    const checksum = checksumHex.substring(0, 8).toLowerCase();
-
-                    return `${part1}eon${part2}${checksum}`;
-                });
-            });
-        } catch (error) {
-            return null;
-        }
-    }
-    
     // Migrate QNet address - preserve old addresses, add keypairs for new
     static async migrateQNetAddress(wallet) {
         try {
@@ -2708,15 +2684,27 @@ class ProductionCrypto {
             
             // Check if wallet has QNet address
             if (!wallet.qnetAddress || !wallet.networks?.qnet?.address) {
-                // No existing address - generate from Solana as fallback
-                if (wallet.networks?.solana?.address) {
-                    const newAddress = await CryptoService.generateQNetAddressFromSolana(wallet.networks.solana.address);
-                    if (newAddress) {
-                        if (wallet.networks && wallet.networks.qnet) {
-                            wallet.networks.qnet.address = newAddress;
-                        }
-                        wallet.qnetAddress = newAddress;
+                // No existing address. Derive the CANONICAL pure-Dilithium (ML-DSA-65) address from
+                // the mnemonic. Do NOT derive from the Solana address (that produced a divergent,
+                // WRONG address that node/mobile reject).
+                if (wallet.mnemonic) {
+                    const result = await ProductionCrypto.generateQNetAddress(wallet.mnemonic, 0);
+                    if (wallet.networks && wallet.networks.qnet) {
+                        wallet.networks.qnet.address = result.address;
                     }
+                    wallet.qnetAddress = result.address;
+                    wallet.qnetKeypair = {
+                        publicKey: Array.from(result.keypair.publicKey),
+                        privateKey: Array.from(result.keypair.privateKey),
+                        publicKeyHex: result.keypair.publicKeyHex,
+                        privateKeyHex: result.keypair.privateKeyHex,
+                        algorithm: result.keypair.algorithm,
+                        path: result.keypair.path
+                    };
+                } else {
+                    // No mnemonic → cannot derive the canonical ML-DSA-65 wallet. Leave the address
+                    // unset rather than mint a divergent SHA-based address the network would reject.
+                    console.warn('[MIGRATION] No mnemonic available — cannot derive canonical QNet address');
                 }
                 return wallet;
             }
@@ -2726,16 +2714,18 @@ class ProductionCrypto {
             // If wallet has mnemonic, ALWAYS migrate to BIP44 address
             if (wallet.mnemonic) {
                 try {
-                    // Generate proper BIP44 address and keypair
-                    const seed = await ProductionCrypto.mnemonicToSeed(wallet.mnemonic);
-                    const result = await ProductionCrypto.generateQNetAddress(seed, 0);
-                    
+                    // Canonical pure-Dilithium (ML-DSA-65) derivation — from the MNEMONIC, via the bundle.
+                    const result = await ProductionCrypto.generateQNetAddress(wallet.mnemonic, 0);
+
                     // UPDATE to new address (breaking change but necessary)
                     const oldAddress = currentAddress;
                     wallet.qnetAddress = result.address;
                     wallet.qnetKeypair = {
                         publicKey: Array.from(result.keypair.publicKey),
                         privateKey: Array.from(result.keypair.privateKey),
+                        publicKeyHex: result.keypair.publicKeyHex,
+                        privateKeyHex: result.keypair.privateKeyHex,
+                        algorithm: result.keypair.algorithm,
                         path: result.keypair.path
                     };
                     
@@ -2753,12 +2743,15 @@ class ProductionCrypto {
             if (currentAddress && currentAddress.length < 40) {
                 // This is very old format, need to regenerate
                 if (wallet.mnemonic) {
-                    const seed = await ProductionCrypto.mnemonicToSeed(wallet.mnemonic);
-                    const result = await ProductionCrypto.generateQNetAddress(seed, 0);
+                    // Canonical pure-Dilithium (ML-DSA-65) derivation — from the MNEMONIC, via the bundle.
+                    const result = await ProductionCrypto.generateQNetAddress(wallet.mnemonic, 0);
                     wallet.qnetAddress = result.address;
                     wallet.qnetKeypair = {
                         publicKey: Array.from(result.keypair.publicKey),
                         privateKey: Array.from(result.keypair.privateKey),
+                        publicKeyHex: result.keypair.publicKeyHex,
+                        privateKeyHex: result.keypair.privateKeyHex,
+                        algorithm: result.keypair.algorithm,
                         path: result.keypair.path
                     };
                     if (wallet.networks && wallet.networks.qnet) {
@@ -2849,45 +2842,56 @@ class ProductionCrypto {
         }
     }
     
-    // Generate QNet EON address from keypair
-    static async generateQNetAddress(seed, accountIndex = 0) {
-        try {
-            // Generate keypair first using BIP44
-            const keypair = await ProductionCrypto.generateQNetKeypair(seed, accountIndex);
-            
-            // Create address from public key
-            const publicKeyHex = Array.from(keypair.publicKey)
-                .map(b => b.toString(16).padStart(2, '0'))
-                .join('');
-            
-            // Use SHA-512 of public key for address generation
-            const addressData = await crypto.subtle.digest('SHA-512', keypair.publicKey);
-            const addressHash = Array.from(new Uint8Array(addressData));
-            const fullHex = addressHash.map(b => b.toString(16).padStart(2, '0')).join('');
-            
-            // Create deterministic address from hash
-            // Format: 19 chars + "eon" + 15 chars + 8 char checksum = 45 total
-            const part1 = fullHex.substring(0, 19).toLowerCase();
-            const part2 = fullHex.substring(19, 34).toLowerCase();
+    // Access the canonical pure-Dilithium (ML-DSA-65) bundle. In the MV3 service worker there is NO
+    // `window`; the esbuild `var QNetDilithiumLib` global lives on self/globalThis (loaded above via
+    // importScripts('lib/noble-pq-ml-dsa.js')).
+    static getDilithium() {
+        const g = (typeof self !== 'undefined') ? self
+                : (typeof globalThis !== 'undefined') ? globalThis
+                : (typeof window !== 'undefined') ? window : null;
+        const lib = g && g.QNetDilithiumLib;
+        const Q = lib && lib.QNetDilithium;
+        if (!Q || typeof Q.deriveWallet !== 'function') {
+            throw new Error('QNetDilithium bundle not loaded — importScripts(lib/noble-pq-ml-dsa.js) must run before wallet derivation');
+        }
+        return Q;
+    }
 
-            // Generate checksum (4 bytes = 8 hex chars)
-            const addressWithoutChecksum = part1 + 'eon' + part2;
-            const encoder = new TextEncoder();
-            const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
-            const checksumHash = Array.from(new Uint8Array(checksumBuffer));
-            const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
-            const checksum = checksumHex.substring(0, 8).toLowerCase();
-            
-            const address = `${part1}eon${part2}${checksum}`;
-            
-            // Return both address and keypair for storage
+    // Generate the CANONICAL pure-Dilithium (ML-DSA-65) QNet EON address + key material from a
+    // BIP39 MNEMONIC. Byte-identical to the Rust node + mobile app (golden-KAT proven:
+    // "abandon…about" → d9fa370374e24333242eon847d1d354dcd87fe873823e). The address is derived from
+    // the ML-DSA-65 public key by the bundle — it is NOT re-hashed from a raw seed.
+    //
+    // NOTE: callers now pass the MNEMONIC (not a raw 32-byte seed). The pure-Dilithium wallet is the
+    // account-0 ML-DSA-65 keypair; there is no per-index HD tree (same as node/mobile), so
+    // `accountIndex` is retained only for signature compatibility and does not alter derivation.
+    static async generateQNetAddress(mnemonic, accountIndex = 0) {
+        try {
+            if (typeof mnemonic !== 'string' || mnemonic.trim().split(/\s+/).length < 12) {
+                throw new Error('generateQNetAddress requires a BIP39 mnemonic (pure-Dilithium derivation)');
+            }
+            const Q = ProductionCrypto.getDilithium();
+            const w = Q.deriveWallet(mnemonic); // { address, publicKey(hex 1952B), secretKey(hex 4032B), xi }
+
+            const pkBytes = Uint8Array.from(w.publicKey.match(/../g).map(x => parseInt(x, 16)));
+            const skBytes = Uint8Array.from(w.secretKey.match(/../g).map(x => parseInt(x, 16)));
+
+            // Return address + keypair for storage. publicKey/privateKey are ML-DSA-65 byte arrays;
+            // publicKeyHex/privateKeyHex are the hex forms the signer (Q.signQNet) consumes directly.
             return {
-                address: address,
-                keypair: keypair
+                address: w.address,
+                keypair: {
+                    publicKey: pkBytes,
+                    privateKey: skBytes,
+                    publicKeyHex: w.publicKey,
+                    privateKeyHex: w.secretKey,
+                    algorithm: 'ML-DSA-65',
+                    path: 'QNET_WALLET_MLDSA65_v1'
+                }
             };
         } catch (error) {
             // Error:('QNet address generation failed:', error);
-            throw new Error('Failed to generate QNet address');
+            throw new Error('Failed to generate QNet address: ' + (error && error.message ? error.message : error));
         }
     }
     
@@ -5049,27 +5053,47 @@ async function handleMessage(request, sender, sendResponse) {
                 try {
                     // Get stored wallet data
                     const encryptedWalletData = await chrome.storage.local.get(['wallet', 'isUnlocked']);
-                    
+
                     if (!encryptedWalletData.wallet || !encryptedWalletData.isUnlocked) {
                         return sendResponse({
                             success: false,
                             error: 'Wallet not found or locked'
                         });
                     }
-                    
+
+                    // Resolve the CANONICAL QNet EON address. NEVER fall back to a random getRandomValues
+                    // address (that produced funds-losing divergent identities). If the stored wallet has
+                    // no derived address, derive it deterministically from the wallet mnemonic via the
+                    // pure-Dilithium bundle; if neither is available, return an explicit error.
+                    let qnetAddress = encryptedWalletData.wallet.qnetAddress;
+                    if (!qnetAddress) {
+                        const mnemonic = encryptedWalletData.wallet.mnemonic
+                            || (walletState.decryptedWalletData && walletState.decryptedWalletData.mnemonic);
+                        if (mnemonic) {
+                            const derived = await ProductionCrypto.generateQNetAddress(mnemonic, 0);
+                            qnetAddress = derived.address;
+                        }
+                    }
+                    if (!qnetAddress) {
+                        return sendResponse({
+                            success: false,
+                            error: 'QNet address unavailable — wallet is missing a derived EON address and no mnemonic to derive it from'
+                        });
+                    }
+
                     // Return account list with addresses
                     const accounts = [{
                         id: 'primary',
                         name: 'Account 1',
-                        qnetAddress: encryptedWalletData.wallet.qnetAddress || generateEONAddress(),
+                        qnetAddress: qnetAddress,
                         solanaAddress: encryptedWalletData.wallet.solanaAddress || generateSolanaAddress()
                     }];
-                    
+
                     return sendResponse({
                         success: true,
                         accounts: accounts
                     });
-                    
+
                 } catch (error) {
                     // Error: ( Failed to get accounts:', error);
                     return sendResponse({
@@ -5321,7 +5345,8 @@ async function createWallet(password, mnemonic) {
         
         // Generate keypairs for both networks
         const solanaKeypair = await ProductionCrypto.generateSolanaKeypair(seed, 0);
-        const qnetResult = await ProductionCrypto.generateQNetAddress(seed, 0);
+        // QNet: canonical pure-Dilithium (ML-DSA-65) — derive from the MNEMONIC (not the raw seed).
+        const qnetResult = await ProductionCrypto.generateQNetAddress(seedPhrase, 0);
         
         // Create wallet data
         const walletData = {
@@ -5338,6 +5363,9 @@ async function createWallet(password, mnemonic) {
                 qnetKeypair: {
                     publicKey: Array.from(qnetResult.keypair.publicKey),
                     privateKey: Array.from(qnetResult.keypair.privateKey),
+                    publicKeyHex: qnetResult.keypair.publicKeyHex,
+                    privateKeyHex: qnetResult.keypair.privateKeyHex,
+                    algorithm: qnetResult.keypair.algorithm,
                     path: qnetResult.keypair.path
                 }
             }],
@@ -5418,13 +5446,9 @@ async function importWallet(password, mnemonic) {
         
         // Use createWallet with provided mnemonic
         const result = await createWallet(password, mnemonic);
-        
-        if (result.success) {
-            }
-        }
-        
+
         return result;
-        
+
     } catch (error) {
                 // console.error('[ImportWallet] ❌ Wallet import failed:', error);
         return { success: false, error: error.message };
@@ -5478,59 +5502,34 @@ async function unlockWallet(password) {
             return { success: false, error: decryptError.message || 'Invalid password or corrupted wallet' };
         }
         
-        // Migrate old QNet address format to new if needed (inline implementation)
+        // Migrate old QNet address to the CANONICAL pure-Dilithium (ML-DSA-65) address if needed.
+        // NEVER derive the QNet address from the Solana address (that produced a divergent, WRONG
+        // address rejected by node/mobile). The only valid source is the mnemonic → ML-DSA-65 pk.
         try {
-            // Check if wallet has QNet address
-            if (!walletData.qnetAddress) {
-                // Generate new address from Solana address
-                const solanaAddr = walletData.solanaAddress || walletData.address || (walletData.accounts && walletData.accounts[0]);
-                if (solanaAddr) {
-                    // Generate deterministic QNet address from Solana address
-                    const encoder = new TextEncoder();
-                    const data = encoder.encode(solanaAddr + 'qnet_eon_bridge');
-                    const hashBuffer = await crypto.subtle.digest('SHA-512', data);
-                    const hashArray = Array.from(new Uint8Array(hashBuffer));
-                    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    
-                    // Format: 19 chars + "eon" + 15 chars + 8 char checksum = 45 total
-                    const part1 = hashHex.substring(0, 19).toLowerCase();
-                    const part2 = hashHex.substring(19, 34).toLowerCase();
-
-                    // Generate checksum (4 bytes = 8 hex chars)
-                    const addressWithoutChecksum = part1 + 'eon' + part2;
-                    const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
-                    const checksumArray = Array.from(new Uint8Array(checksumBuffer));
-                    const checksumHex = checksumArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    const checksum = checksumHex.substring(0, 8).toLowerCase();
-                    
-                    walletData.qnetAddress = `${part1}eon${part2}${checksum}`;
-                    //console.log('[UnlockWallet] Generated new QNet address');
-                }
-            } else if (walletData.qnetAddress.length !== 45) {
-                // Migrate old format (41 or other) to 45-char format
-                const solanaAddr = walletData.solanaAddress || walletData.address || (walletData.accounts && walletData.accounts[0]);
-                if (solanaAddr) {
-                    // Regenerate in correct 45-char format
-                    const encoder = new TextEncoder();
-                    const data = encoder.encode(solanaAddr + 'qnet_eon_bridge');
-                    const hashBuffer = await crypto.subtle.digest('SHA-512', data);
-                    const hashArray = Array.from(new Uint8Array(hashBuffer));
-                    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
-                    const part1 = hashHex.substring(0, 19).toLowerCase();
-                    const part2 = hashHex.substring(19, 34).toLowerCase();
-
-                    const addressWithoutChecksum = part1 + 'eon' + part2;
-                    const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
-                    const checksumArray = Array.from(new Uint8Array(checksumBuffer));
-                    const checksumHex = checksumArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    const checksum = checksumHex.substring(0, 8).toLowerCase();
-
-                    walletData.qnetAddress = `${part1}eon${part2}${checksum}`;
+            const needsQNetAddr = !walletData.qnetAddress || walletData.qnetAddress.length !== 45;
+            if (needsQNetAddr) {
+                if (walletData.mnemonic) {
+                    const result = await ProductionCrypto.generateQNetAddress(walletData.mnemonic, 0);
+                    walletData.qnetAddress = result.address;
+                    walletData.qnetKeypair = {
+                        publicKey: Array.from(result.keypair.publicKey),
+                        privateKey: Array.from(result.keypair.privateKey),
+                        publicKeyHex: result.keypair.publicKeyHex,
+                        privateKeyHex: result.keypair.privateKeyHex,
+                        algorithm: result.keypair.algorithm,
+                        path: result.keypair.path
+                    };
+                    // Also keep the canonical address on the first account for callers that read it there.
+                    if (walletData.accounts && walletData.accounts[0]) {
+                        walletData.accounts[0].qnetAddress = result.address;
+                        walletData.accounts[0].qnetKeypair = walletData.qnetKeypair;
+                    }
+                } else {
+                    // No mnemonic → cannot derive the canonical address. Leave as-is rather than mint
+                    // a divergent SHA-from-Solana address the network would reject.
+                    console.warn('[UnlockWallet] No mnemonic — cannot derive canonical QNet address');
                 }
             }
-            
-            //console.log('[UnlockWallet] QNet address migration checked');
         } catch (migrateError) {
             // console.error('[UnlockWallet] Migration error:', migrateError);
             // Continue without migration
@@ -6180,6 +6179,65 @@ async function getTransactionHistory(address) {
 }
 
 /**
+ * Resolve the active account's CANONICAL QNet identity + ML-DSA-65 key material for signing.
+ * Source of truth is the decrypted wallet cache (set at create/unlock). Returns hex pk/sk that
+ * QNetDilithium.signQNet consumes directly, plus the canonical EON `from` address. Throws if the
+ * wallet is locked or the account has no Dilithium key material (never fabricate a key/address).
+ */
+function getActiveQNetKeys() {
+    const data = walletState.decryptedWalletData;
+    if (!data) {
+        throw new Error('Wallet is locked — no decrypted key material available');
+    }
+    const acct = (data.accounts && data.accounts[0]) ? data.accounts[0] : null;
+    const kp = (acct && acct.qnetKeypair) || data.qnetKeypair || null;
+    const from = (acct && acct.qnetAddress) || data.qnetAddress || null;
+    const skHex = kp && kp.privateKeyHex;
+    const pkHex = kp && kp.publicKeyHex;
+    if (!from || !skHex || !pkHex) {
+        throw new Error('Account is missing Dilithium key material — cannot sign QNet transaction');
+    }
+    return { from, skHex, pkHex };
+}
+
+/**
+ * Access the canonical pure-Dilithium (ML-DSA-65) signer from the bundle. In the MV3 service worker
+ * the esbuild global lives on self/globalThis (importScripts('lib/noble-pq-ml-dsa.js') runs at top).
+ */
+function getQNetSigner() {
+    const g = (typeof self !== 'undefined') ? self
+            : (typeof globalThis !== 'undefined') ? globalThis
+            : (typeof window !== 'undefined') ? window : null;
+    const Q = g && g.QNetDilithiumLib && g.QNetDilithiumLib.QNetDilithium;
+    if (!Q || typeof Q.signQNet !== 'function') {
+        throw new Error('QNetDilithium bundle not loaded — importScripts(lib/noble-pq-ml-dsa.js) must run before signing');
+    }
+    return Q;
+}
+
+/**
+ * Fetch the account's current on-chain nonce from the node (used as the transfer nonce). Falls back
+ * to 1 if unavailable. The node re-derives and verifies the signed message against this exact nonce.
+ */
+async function getQNetAccountNonce(nodeUrl, address) {
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        const response = await fetch(`${nodeUrl}/api/v1/account/${address}/balance`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        if (response.ok) {
+            const data = await response.json();
+            if (Number.isInteger(data.nonce)) return data.nonce;
+        }
+    } catch (e) { /* fall through to default */ }
+    return 1;
+}
+
+/**
  * Send transaction
  */
 async function sendTransaction(transactionData) {
@@ -6187,22 +6245,81 @@ async function sendTransaction(transactionData) {
         if (!walletState.isUnlocked) {
             throw new Error('Wallet is locked');
         }
-        
+
         if (walletState.currentNetwork === 'solana') {
             // TODO: Implement real Solana transaction
             // Log: ( Sending Solana transaction:', transactionData);
-            
+
             // For now, simulate transaction
             const txHash = 'sol_' + cryptoRandomHex(32);
             return { signature: txHash, confirmed: true };
-            
+
         } else {
-            // QNet transaction (simulated)
-            // Log: ( Sending QNet transaction:', transactionData);
-            const txHash = 'qnet_' + cryptoRandomHex(32);
-            return { signature: txHash, confirmed: true };
+            // QNet transaction — pure-Dilithium signed (ML-DSA-65). No more random stub.
+            // Build the canonical transfer message the node's value-TX gate verifies, sign it with the
+            // account's ML-DSA-65 secret key via the bundle, and POST the wire-format signature + public
+            // key to /api/v1/transaction. `from` is the canonical EON address; amount is integer nano-QNC.
+            // No plaintext private key is ever transmitted.
+            const { from, skHex, pkHex } = getActiveQNetKeys();
+            const Q = getQNetSigner();
+            const nodeUrl = await getQNetNodeUrl();
+
+            const to = transactionData.to;
+            if (!to || typeof to !== 'string') {
+                throw new Error('Invalid recipient address');
+            }
+            const amountNano = Math.floor(Number(transactionData.amount) * 1_000_000_000); // integer nano-QNC
+            if (!Number.isFinite(amountNano) || amountNano <= 0) {
+                throw new Error('Invalid transaction amount');
+            }
+            const gasPrice = Number.isInteger(transactionData.gasPrice) ? transactionData.gasPrice : 10;
+            const gasLimit = Number.isInteger(transactionData.gasLimit) ? transactionData.gasLimit : 21000;
+            const nonce = Number.isInteger(transactionData.nonce)
+                ? transactionData.nonce
+                : await getQNetAccountNonce(nodeUrl, from);
+
+            // Canonical message — EXACTLY the string the node re-derives and verifies against.
+            const message = `transfer:${from}:${to}:${amountNano}:${nonce}:${gasPrice}:${gasLimit}`;
+            const dilithiumSignature = Q.signQNet(message, skHex, pkHex);
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 15000);
+            let response;
+            try {
+                response = await fetch(`${nodeUrl}/api/v1/transaction`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    signal: controller.signal,
+                    body: JSON.stringify({
+                        from: from,
+                        to: to,
+                        amount: amountNano,
+                        dilithium_signature: dilithiumSignature,
+                        dilithium_public_key: pkHex,
+                        gas_price: gasPrice,
+                        gas_limit: gasLimit,
+                        nonce: nonce
+                    })
+                });
+            } finally {
+                clearTimeout(timeoutId);
+            }
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            const data = await response.json();
+            if (data && (data.success || data.tx_hash)) {
+                return {
+                    signature: data.tx_hash,
+                    confirmed: true,
+                    network: 'qnet',
+                    timestamp: Date.now()
+                };
+            }
+            throw new Error((data && data.error) || 'QNet transaction failed');
         }
-        
+
     } catch (error) {
         // Error: ( Transaction failed:', error);
         throw error;
@@ -6228,10 +6345,10 @@ async function signMessage(message) {
             // Log: ( Message signed with Solana key');
             return signature;
         } else {
-            // QNet signing (simulated)
-            const signature = 'qnet_signature_' + cryptoRandomHex(32);
-            // Log: ( Message signed with QNet key');
-            return signature;
+            // QNet signing — pure-Dilithium (ML-DSA-65) via the bundle. No more random stub.
+            const { skHex, pkHex } = getActiveQNetKeys();
+            const Q = getQNetSigner();
+            return Q.signQNet(message, skHex, pkHex);
         }
         
     } catch (error) {
@@ -6883,55 +7000,10 @@ async function getNetworkAgeYears() {
     }
 }
 
-/**
- * Generate EON address using professional crypto approach
- * Format: 19 chars + "eon" + 15 chars + 8 char SHA3-256 checksum = 45 total
- */
-function generateEONAddress() {
-    const charset = '123456789abcdefghijkmnopqrstuvwxyz'; // Safe chars without confusion
-    
-    // Generate secure random parts
-    const generateSecureRandom = (length) => {
-        const randomBytes = new Uint8Array(length);
-        crypto.getRandomValues(randomBytes);
-        
-        let result = '';
-        for (let i = 0; i < length; i++) {
-            result += charset[randomBytes[i] % charset.length];
-        }
-        return result;
-    };
-    
-    // Calculate checksum
-    const calculateChecksum = async (data) => {
-        const encoder = new TextEncoder();
-        const dataBytes = encoder.encode(data);
-        const hashBuffer = await crypto.subtle.digest('SHA-256', dataBytes);
-        const hashArray = new Uint8Array(hashBuffer);
-        
-        let checksum = '';
-        for (let i = 0; i < 8; i++) {
-            checksum += charset[hashArray[i] % charset.length];
-        }
-        return checksum;
-    };
-    
-    // Generate parts for new format
-    const part1 = generateSecureRandom(19);  // 19 chars before "eon"
-    const part2 = generateSecureRandom(15);  // 15 chars after "eon"
-    
-    // For synchronous compatibility, use simple checksum
-    const simpleChecksum = (part1 + part2).split('').reduce((acc, char, i) => {
-        return acc + char.charCodeAt(0) * (i + 1);
-    }, 0);
-    
-    let checksum = '';
-    for (let i = 0; i < 8; i++) {
-        checksum += charset[(simpleChecksum + i) % charset.length];
-    }
-    
-    return `${part1}eon${part2}${checksum}`;
-}
+// REMOVED: dead random generateEONAddress(). It minted a QNet EON address from crypto.getRandomValues
+// (unrelated to the wallet's ML-DSA-65 key), which the node/mobile reject and which loses funds. All
+// QNet EON addresses now come exclusively from ProductionCrypto.generateQNetAddress(mnemonic) →
+// QNetDilithium.deriveWallet(mnemonic).address (the canonical bundle).
 
 /**
  * Generate Solana address for demo

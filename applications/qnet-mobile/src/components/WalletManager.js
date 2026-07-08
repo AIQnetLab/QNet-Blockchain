@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import CryptoJS from 'crypto-js'; // Required for generateQNetKeypair, generateQNetAddress, generateMnemonic
+import { AppState } from 'react-native'; // Clear in-memory derived key when app backgrounds
+import CryptoJS from 'crypto-js'; // Required for generateQNetAddress, generateMnemonic
 import 'react-native-get-random-values'; // Must be imported first — polyfills crypto.getRandomValues
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { derivePath } from 'ed25519-hd-key';
@@ -21,6 +22,7 @@ export class WalletManager {
     this._failedAttempts = 0;
     this._lockoutUntil = 0;
     this._rateLimitLoaded = false;
+    this._appStateSub = null;   // AppState subscription (clears keyCache on background)
 
     // BIP39 wordlist (2048 words)
     this.BIP39_WORDLIST = [
@@ -2073,6 +2075,21 @@ export class WalletManager {
       "zone",
       "zoo"
     ];
+
+    // Drop the derived AES key from heap the moment the app leaves the foreground,
+    // so a backgrounded/locked process never holds the vault key in memory.
+    this._appStateSub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') this._clearCachedKey();
+    });
+  }
+
+  // Detach the AppState listener (call when tearing down this manager instance).
+  dispose() {
+    if (this._appStateSub) {
+      this._appStateSub.remove();
+      this._appStateSub = null;
+    }
+    this._clearCachedKey();
   }
 
   // Generate QNet address from mnemonic (extension-compatible)
@@ -2166,136 +2183,40 @@ export class WalletManager {
     }
   }
 
-  // Generate QNet keypair using BIP44 standard with proper SLIP-0010
-  // SECURITY: This follows the same standard as hardware wallets (Ledger, Trezor)
-  // OPTIMIZED: Minimized conversions between formats for speed
-  generateQNetKeypair(seed, accountIndex = 0) {
-    try {
-      // BIP44 path for QNet: m/44'/9999'/accountIndex'/0'/0'
-      
-      // Step 1: Generate master key from seed (SLIP-0010)
-      // HMAC-SHA512(Key = "ed25519 seed", Data = seed)
-      // CRITICAL: Must match browser extension exactly!
-      const seedWordArray = CryptoJS.lib.WordArray.create(seed);
-      const ed25519SeedKey = CryptoJS.enc.Utf8.parse("ed25519 seed");
-      const masterHmac = CryptoJS.HmacSHA512(seedWordArray, ed25519SeedKey);
-      
-      // Split into key and chain code (64 bytes total = 16 words)
-      let currentKeyBytes = new Uint8Array(32);
-      let currentChainCodeBytes = new Uint8Array(32);
-      
-      // Convert masterHmac (WordArray) to Uint8Array
-      for (let i = 0; i < 8; i++) {
-        const word = masterHmac.words[i];
-        currentKeyBytes[i * 4] = (word >>> 24) & 0xff;
-        currentKeyBytes[i * 4 + 1] = (word >>> 16) & 0xff;
-        currentKeyBytes[i * 4 + 2] = (word >>> 8) & 0xff;
-        currentKeyBytes[i * 4 + 3] = word & 0xff;
-      }
-      for (let i = 0; i < 8; i++) {
-        const word = masterHmac.words[i + 8];
-        currentChainCodeBytes[i * 4] = (word >>> 24) & 0xff;
-        currentChainCodeBytes[i * 4 + 1] = (word >>> 16) & 0xff;
-        currentChainCodeBytes[i * 4 + 2] = (word >>> 8) & 0xff;
-        currentChainCodeBytes[i * 4 + 3] = word & 0xff;
-      }
-      
-      // Step 2: Derive path m/44'/9999'/accountIndex'/0'/0'
-      const levels = [
-        0x8000002C, // 44' (hardened)
-        0x8000270F, // 9999' (hardened) - 0x270F = 9999
-        0x80000000 + accountIndex, // accountIndex' (hardened)
-        0x80000000, // 0' (hardened change)
-        0x80000000  // 0' (hardened address index)
-      ];
-      
-      // Step 3: Derive each level (FIXED: match browser extension format exactly)
-      for (const index of levels) {
-        // HMAC-SHA512(Key = chainCode, Data = 0x00 || privateKey || index)
-        // Build data: 0x00 || key (32 bytes) || index (4 bytes) = 37 bytes total
-        const dataBytes = new Uint8Array(37);
-        dataBytes[0] = 0x00; // Prefix byte
-        dataBytes.set(currentKeyBytes, 1); // Copy 32 bytes of key
-        dataBytes[33] = (index >>> 24) & 0xff;
-        dataBytes[34] = (index >>> 16) & 0xff;
-        dataBytes[35] = (index >>> 8) & 0xff;
-        dataBytes[36] = index & 0xff;
-        
-        // HMAC-SHA512 with chainCode as key
-        const dataWordArray = CryptoJS.lib.WordArray.create(dataBytes);
-        const chainCodeWordArray = CryptoJS.lib.WordArray.create(currentChainCodeBytes);
-        const derivedHmac = CryptoJS.HmacSHA512(dataWordArray, chainCodeWordArray);
-        
-        // Extract new key and chain code (64 bytes = 16 words)
-        const derivedBytes = new Uint8Array(64);
-        for (let i = 0; i < 16; i++) {
-          const word = derivedHmac.words[i];
-          derivedBytes[i * 4] = (word >>> 24) & 0xff;
-          derivedBytes[i * 4 + 1] = (word >>> 16) & 0xff;
-          derivedBytes[i * 4 + 2] = (word >>> 8) & 0xff;
-          derivedBytes[i * 4 + 3] = word & 0xff;
-        }
-        
-        currentKeyBytes = derivedBytes.slice(0, 32);
-        currentChainCodeBytes = derivedBytes.slice(32, 64);
-      }
-      
-      // Step 4: Generate Ed25519 keypair from seed (private key)
-      // CRITICAL FIX v2.66: Use nacl.sign.keyPair.fromSeed() for proper Ed25519!
-      // Old code used SHA256(privateKey) which is cryptographically WRONG!
-      // Ed25519 public key = privateKey * G (elliptic curve multiplication)
-      const privateKey = new Uint8Array(32);
-      privateKey.set(currentKeyBytes);
-      
-      // Generate proper Ed25519 keypair
-      const ed25519Keypair = nacl.sign.keyPair.fromSeed(privateKey);
-      
-      // ed25519Keypair.publicKey = 32 bytes (the actual Ed25519 public key)
-      // ed25519Keypair.secretKey = 64 bytes (privateKey + publicKey concatenated)
-      
-      return {
-        privateKey: privateKey,  // 32-byte seed
-        publicKey: ed25519Keypair.publicKey,  // 32-byte Ed25519 public key
-        path: `m/44'/9999'/${accountIndex}'/0'/0'`,
-        chainCode: new Uint8Array(32) // Not needed for address generation
-      };
-    } catch (error) {
-      // console.error('Error generating QNet keypair:', error);
-      throw new Error('Failed to generate QNet keypair');
-    }
-  }
-  
-  // Generate QNet EON address (compatible with extension wallet)
+  // Generate QNet EON address — PURE DILITHIUM (ML-DSA-65, F0.1). The QNet identity is the
+  // post-quantum key derived from the mnemonic; the address commits to it. Byte-identical to the
+  // node (genesis_key.rs): the native module SHAKE-256s the canonical seed string into the 32-byte
+  // ML-DSA-65 KeyGen seed, then EON = SHA512(pk) formatted. Ed25519/Solana keys are derived
+  // separately (m/44'/501') and are UNTOUCHED — Ed25519 is a Solana-only credential.
   async generateQNetAddress(seed, accountIndex = 0) {
     try {
-      // Generate keypair first using BIP44 (now synchronous for speed)
-      const keypair = this.generateQNetKeypair(seed, accountIndex);
-      
-      // Generate address from public key
-      const publicKeyWordArray = CryptoJS.lib.WordArray.create(keypair.publicKey);
-      const addressHash = CryptoJS.SHA512(publicKeyWordArray);
+      // Canonical wallet seed string — MUST byte-match the node's WALLET_SEED_PREFIX + hex(bip39_seed64).
+      const seedHex = Array.from(seed).map(b => b.toString(16).padStart(2, '0')).join('');
+      const seedString = `QNET_WALLET_MLDSA65_v1:${seedHex}`;
+
+      // Native ML-DSA-65 keygen: shake256(seedString) -> 32-byte xi -> keypair (hex pk 1952B / sk 4032B).
+      const { generateRawDilithiumKeypair } = require('../crypto/DilithiumCrypto');
+      const kp = await generateRawDilithiumKeypair(seedString);
+      const pkBytes = Uint8Array.from(kp.publicKey.match(/.{1,2}/g).map(h => parseInt(h, 16)));
+      const skBytes = Uint8Array.from(kp.secretKey.match(/.{1,2}/g).map(h => parseInt(h, 16)));
+
+      // EON = SHA512(raw ML-DSA-65 pk bytes), formatted: 19 + "eon" + 15 + 8-hex SHA3-256 checksum.
+      const addressHash = CryptoJS.SHA512(CryptoJS.lib.WordArray.create(pkBytes));
       const fullHash = addressHash.toString(CryptoJS.enc.Hex);
-      
-      // Format: 19 chars + "eon" + 15 chars + 8 char SHA3-256 checksum = 45 total
       const part1 = fullHash.substring(0, 19).toLowerCase();
       const part2 = fullHash.substring(19, 34).toLowerCase();
-
-      // Generate SHA3-256 checksum (MUST match server! 4 bytes = 8 hex chars)
       const { sha3_256 } = require('js-sha3');
-      const addressWithoutChecksum = part1 + 'eon' + part2;
-      const checksumHex = sha3_256(addressWithoutChecksum);
-      const checksum = checksumHex.substring(0, 8).toLowerCase();
-      
+      const checksum = sha3_256(part1 + 'eon' + part2).substring(0, 8).toLowerCase();
       const address = `${part1}eon${part2}${checksum}`;
-      
-      // Return both address and keypair for storage
+
+      // keypair keeps a byte-array shape (publicKey/privateKey Uint8Array) so existing storage sites
+      // (Array.from(...)) keep working; the bytes are now the ML-DSA-65 wallet key, not Ed25519.
       return {
-        address: address,
-        keypair: keypair
+        address,
+        keypair: { publicKey: pkBytes, privateKey: skBytes, path: 'QNET_WALLET_MLDSA65_v1' },
       };
     } catch (error) {
-      // console.error('Error generating QNet address:', error);
-      throw new Error('Failed to generate QNet address');
+      throw new Error('Failed to generate QNet address (pure Dilithium): ' + ((error && error.message) || error));
     }
   }
 
@@ -2338,6 +2259,34 @@ export class WalletManager {
   }
 
   // Generate new wallet with BIP39 mnemonic
+  // EVM (secp256k1) derivation from the SAME BIP39 seed — standard Ethereum path m/44'/60'/0'/0/0.
+  // Additive + independent: the same mnemonic also yields an EVM address (byte-identical to
+  // MetaMask/ethers). QNet (ML-DSA-65) + Solana (Ed25519) derivations are UNTOUCHED. KAT: mnemonic
+  // "abandon…about" → 0x9858EfFD232B4033E47d90003D41EC34EcaEda94.
+  async deriveEvmWallet(seed) {
+    // EVM is an ADDITIVE sub-feature. @noble/curves is now a direct dependency, but if it is ever
+    // unresolvable (nested/strict install layout, or a future @scure/bip32 that vendors curves),
+    // degrade gracefully (return null) instead of throwing out of core wallet creation. QNet +
+    // Solana identity must still be created even if the EVM address cannot be derived.
+    try {
+      const { HDKey } = require('@scure/bip32');
+      const { secp256k1 } = require('@noble/curves/secp256k1');
+      const { keccak256 } = require('js-sha3');
+      const seedBytes = seed instanceof Uint8Array ? seed : new Uint8Array(seed);
+      const hd = HDKey.fromMasterSeed(seedBytes).derive("m/44'/60'/0'/0/0");
+      const priv = hd.privateKey;
+      const pub = secp256k1.getPublicKey(priv, false); // 65B uncompressed 0x04||X||Y
+      const addrHex = keccak256(pub.slice(1)).slice(-40); // keccak256(pubkey[1:])[-20 bytes]
+      const hashHex = keccak256(addrHex); // EIP-55 checksum over the lowercase hex
+      let address = '0x';
+      for (let i = 0; i < 40; i++) address += (parseInt(hashHex[i], 16) >= 8 ? addrHex[i].toUpperCase() : addrHex[i]);
+      return { address, privateKey: Buffer.from(priv).toString('hex'), publicKey: Buffer.from(pub).toString('hex'), path: "m/44'/60'/0'/0/0" };
+    } catch (error) {
+      // console.warn('EVM derivation unavailable, omitting evm field:', error);
+      return null;
+    }
+  }
+
   async generateWallet() {
     try {
       // Generate BIP39 mnemonic with checksum using bip39 library
@@ -2354,7 +2303,10 @@ export class WalletManager {
       
       // Generate QNet address and keypair using BIP44 derivation (reuse seed!)
       const qnetResult = await this.generateQNetAddress(seed, 0);
-      
+
+      // EVM address from the SAME seed (m/44'/60') — mnemonic portability to Ethereum/EVM networks.
+      const evmResult = await this.deriveEvmWallet(seed);
+
       // Store mnemonic temporarily for wallet creation flow
       const wallet = {
         publicKey: keypair.publicKey.toString(),
@@ -2367,9 +2319,13 @@ export class WalletManager {
           publicKey: Array.from(qnetResult.keypair.publicKey),
           privateKey: Array.from(qnetResult.keypair.privateKey),
           path: qnetResult.keypair.path
-        }
+        },
+        // EVM is additive: if deriveEvmWallet returned null (curves unresolvable), omit it —
+        // core QNet + Solana wallet creation still succeeds.
+        evmAddress: evmResult ? evmResult.address : null,
+        evmKeypair: evmResult ? { publicKey: evmResult.publicKey, privateKey: evmResult.privateKey, path: evmResult.path } : null
       };
-      
+
       // Temporarily attach mnemonic for storage only
       wallet._tempMnemonic = mnemonic;
       return wallet;
@@ -2541,7 +2497,10 @@ export class WalletManager {
       
       // Generate QNet address and keypair using BIP44 derivation
       const qnetResult = await this.generateQNetAddress(seed, 0);
-      
+
+      // EVM address from the SAME seed (m/44'/60') — mnemonic portability to Ethereum/EVM networks.
+      const evmResult = await this.deriveEvmWallet(seed);
+
       // Store mnemonic temporarily for import flow
       const wallet = {
         publicKey: keypair.publicKey.toString(),
@@ -2555,6 +2514,10 @@ export class WalletManager {
           privateKey: Array.from(qnetResult.keypair.privateKey),
           path: qnetResult.keypair.path
         },
+        // EVM is additive: if deriveEvmWallet returned null (curves unresolvable), omit it —
+        // core QNet + Solana wallet import still succeeds.
+        evmAddress: evmResult ? evmResult.address : null,
+        evmKeypair: evmResult ? { publicKey: evmResult.publicKey, privateKey: evmResult.privateKey, path: evmResult.path } : null,
         imported: true
       };
       
@@ -2800,6 +2763,11 @@ export class WalletManager {
   }
 
   _hexToBytes(hex) {
+    // Reject malformed hex up front — a bad char/odd length would otherwise
+    // make parseInt return NaN, which coerces to 0 and silently corrupts crypto input.
+    if (typeof hex !== 'string' || hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
+      throw new Error('Invalid hex input');
+    }
     const bytes = new Uint8Array(hex.length / 2);
     for (let i = 0; i < bytes.length; i++) {
       bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
@@ -3125,15 +3093,20 @@ export class WalletManager {
     WalletManager.nonceCache[address] = { next: usedNonce + 1, at: Date.now() };
   }
 
-  // Stable per-wallet secret (Ed25519 private key hex, deterministic from the mnemonic) used to bind
-  // the node's Dilithium identity seed to a secret the owner holds — never public chain data.
-  async _walletSecretHex(password, walletData = null) {
+  // PURE DILITHIUM (F0.1): the light node's on-chain attestation root, ping delegation, and reward-claim
+  // proofs are ALL signed by the ML-DSA-65 WALLET key (the key whose SHA512 IS wallet_address). Returns it
+  // as hex {secretKey, publicKey} for signWithDilithium — replaces the legacy per-node identity key so the
+  // RAM quantum_pubkey == the on-chain root (load_vrf_public_key) and background/foreground pings verify.
+  async _walletDilithiumKeys(password, walletData = null) {
     const wd = walletData || await this.loadWallet(password);
-    const priv = wd?.qnetKeypair?.privateKey
-      ? new Uint8Array(wd.qnetKeypair.privateKey)
-      : (wd?.secretKey ? new Uint8Array(wd.secretKey.slice(0, 32)) : null);
-    if (!priv || priv.length < 32) throw new Error('wallet secret unavailable for key derivation');
-    return Buffer.from(priv).toString('hex');
+    const qk = wd && wd.qnetKeypair;
+    if (!qk || !qk.privateKey || !qk.publicKey) {
+      throw new Error('No ML-DSA-65 QNet key in wallet (pure-Dilithium identity unavailable)');
+    }
+    return {
+      secretKey: Buffer.from(new Uint8Array(qk.privateKey)).toString('hex'),
+      publicKey: Buffer.from(new Uint8Array(qk.publicKey)).toString('hex'),
+    };
   }
 
   // Async node getter with guaranteed fresh data
@@ -3513,6 +3486,137 @@ export class WalletManager {
       ok: true, balance: balanceQNC, balanceNano: balanceNanoStr, nonce: nonceStr,
       verified, blockHeight: data.block_height, stateRoot: data.state_root, proof: data.merkle_proof,
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // QRC-20 token READ path — hedged/health-ranked GETs (mirror getQNCBalanceWithProof)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Scale a raw u64 base-unit string to a human decimal string using ITS OWN decimals.
+  // Pure BigInt/string math — NEVER float, so full u64 precision survives (a token can hold
+  // far more than 2^53 base units). Trailing fractional zeros are trimmed; integer-only tokens
+  // (decimals=0) return the integer as-is. Matches the on-chain u64 semantics exactly.
+  _formatBaseUnits(baseUnitsStr, decimals) {
+    const d = Number(decimals) || 0;
+    let s = String(baseUnitsStr == null ? '0' : baseUnitsStr).trim();
+    if (!/^\d+$/.test(s)) s = '0';
+    if (d <= 0) return s;
+    s = s.replace(/^0+(?=\d)/, ''); // strip leading zeros but keep a single 0
+    const padded = s.padStart(d + 1, '0');
+    const intPart = padded.slice(0, padded.length - d);
+    const fracPart = padded.slice(padded.length - d).replace(/0+$/, '');
+    return fracPart ? `${intPart}.${fracPart}` : intPart;
+  }
+
+  // Held QRC-20 tokens for a QNet account.
+  //   GET /api/v1/account/{addr}/tokens -> [{contract_address, balance, name, symbol, decimals}]
+  // Returns [{contract, name, symbol, decimals, balance}] with `balance` a HUMAN decimal string
+  // scaled by 10**decimals (BigInt-safe). Raw text parse keeps u64 balances exact past 2^53.
+  async getTokenHoldings(qnetAddress) {
+    if (!qnetAddress || typeof qnetAddress !== 'string') return [];
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/account/${qnetAddress}/tokens`, { timeoutMs: 5000, hedgeMs: 800, raw: true });
+    } catch (e) {
+      console.warn('[QRC20] holdings fetch failed:', e.message);
+      return [];
+    }
+    if (!res.ok || !res.data) return [];
+    let list;
+    try {
+      const parsed = JSON.parse(res.data);
+      list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.tokens) ? parsed.tokens : []);
+    } catch (_) {
+      return [];
+    }
+    // Balances are u64 base units — pull them as exact strings from the raw text so a JSON number
+    // never truncates above 2^53. Contract addresses are hex (no regex-special chars), so match each
+    // holding's balance to its own contract directly in the untouched text.
+    return list.map((t) => {
+      const contract = t.contract_address || t.contract || '';
+      const decimals = Number(t.decimals) || 0;
+      // Prefer the string-exact balance the node emits; JSON.parse of a large number loses precision.
+      let balanceStr = t.balance != null ? String(t.balance) : '0';
+      if (contract && /^[0-9a-fA-F]+$/.test(contract)) {
+        // Re-extract this contract's balance as a raw string (BigInt-safe) from the untouched text.
+        const re = new RegExp(`"contract_address"\\s*:\\s*"${contract}"[^}]*?"balance"\\s*:\\s*"?(\\d+)"?`);
+        const alt = new RegExp(`"balance"\\s*:\\s*"?(\\d+)"?[^}]*?"contract_address"\\s*:\\s*"${contract}"`);
+        const m = re.exec(res.data) || alt.exec(res.data);
+        if (m) balanceStr = m[1];
+      }
+      return {
+        contract,
+        name: t.name || t.symbol || 'Token',
+        symbol: t.symbol || '',
+        decimals,
+        balance: this._formatBaseUnits(balanceStr, decimals),
+      };
+    }).filter((t) => t.contract);
+  }
+
+  // Token metadata for a contract.
+  //   GET /api/v1/token/{addr} -> {name, symbol, decimals, total_supply, deployer}
+  // Returns {contract, name, symbol, decimals, totalSupply, deployer} or null when the contract
+  // is not a token / not found (so the Add-Token flow can reject an invalid address honestly).
+  async getTokenInfo(contractAddress) {
+    if (!contractAddress || typeof contractAddress !== 'string') return null;
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/token/${contractAddress}`, { timeoutMs: 5000, hedgeMs: 800 });
+    } catch (e) {
+      console.warn('[QRC20] token info fetch failed:', e.message);
+      return null;
+    }
+    if (!res.ok || !res.data || typeof res.data !== 'object') return null;
+    const d = res.data;
+    // A miss returns an error body or an empty object — require the token identity fields.
+    if (d.error || (d.symbol == null && d.name == null)) return null;
+    return {
+      contract: contractAddress,
+      name: d.name || d.symbol || 'Token',
+      symbol: d.symbol || '',
+      decimals: Number(d.decimals) || 0,
+      totalSupply: d.total_supply != null ? String(d.total_supply) : null,
+      deployer: d.deployer || null,
+    };
+  }
+
+  // Raw + scaled QRC-20 balance for a single holder of a single contract.
+  //   GET /api/v1/token/{contract}/balance/{holder}
+  // `decimals` is optional; when supplied the returned `balance` is the human decimal string.
+  // Returns { ok, balanceBaseUnits (string), balance (string|null) }.
+  async getTokenBalanceOf(contractAddress, holder, decimals = null) {
+    if (!contractAddress || !holder) return { ok: false, balanceBaseUnits: '0', balance: null };
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/token/${contractAddress}/balance/${holder}`, { timeoutMs: 5000, hedgeMs: 800, raw: true });
+    } catch (e) {
+      console.warn('[QRC20] token balance fetch failed:', e.message);
+      return { ok: false, balanceBaseUnits: '0', balance: null };
+    }
+    if (!res.ok || !res.data) return { ok: false, balanceBaseUnits: '0', balance: null };
+    // u64 base units as an exact string — never JSON.parse the number.
+    const m = /"balance"\s*:\s*"?(\d+)"?/.exec(res.data);
+    const baseUnits = m ? m[1] : '0';
+    return {
+      ok: true,
+      balanceBaseUnits: baseUnits,
+      balance: decimals != null ? this._formatBaseUnits(baseUnits, decimals) : null,
+    };
+  }
+
+  // Scale a human decimal amount string to a u64 base-unit STRING using the token's decimals.
+  // Pure string math (no float) so full u64 precision survives — feeds qrc20Transfer's _amt().
+  // Throws on a malformed amount or more fractional digits than the token supports.
+  toBaseUnits(amountStr, decimals) {
+    const d = Number(decimals) || 0;
+    let s = String(amountStr == null ? '' : amountStr).trim().replace(',', '.');
+    if (!/^\d+(\.\d+)?$/.test(s)) throw new Error('Invalid token amount');
+    let [intPart, fracPart = ''] = s.split('.');
+    if (fracPart.length > d) throw new Error(`Amount has more than ${d} decimal places`);
+    fracPart = fracPart.padEnd(d, '0');
+    const combined = (intPart + fracPart).replace(/^0+(?=\d)/, '');
+    return combined === '' ? '0' : combined;
   }
 
   /**
@@ -3900,6 +4004,11 @@ export class WalletManager {
 
   // Helper: Hex string to bytes
   hexToBytes(hex) {
+    // Reject malformed hex up front — a bad char/odd length would otherwise
+    // make parseInt return NaN, which coerces to 0 and silently corrupts crypto input.
+    if (typeof hex !== 'string' || hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
+      throw new Error('Invalid hex input');
+    }
     const bytes = new Uint8Array(hex.length / 2);
     for (let i = 0; i < hex.length; i += 2) {
       bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
@@ -5260,67 +5369,7 @@ export class WalletManager {
       walletAddress: walletAddress
     }));
     await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, burnPseudonym);
-    
-    try {
-      // Create registration message for P2P network
-      // v4.3: Include burn_tx_hash + burn_amount for STATELESS code ownership verification
-      // v4.7: Include Ed25519 signature + burn_wallet for wallet ownership proof
-      const sigTimestamp = Math.floor(Date.now() / 1000);
-      const ed25519Message = `qnet_register:${activationCode}:${sigTimestamp}`;
-      const ed25519MsgBytes = Buffer.from(ed25519Message, 'utf8');
-      const ed25519Sig = nacl.sign.detached(ed25519MsgBytes, new Uint8Array(walletData.secretKey));
-      const ed25519SigHex = Array.from(ed25519Sig).map(b => b.toString(16).padStart(2, '0')).join('');
-      
-      const registrationMessage = {
-        node_id: activationCode,
-        public_key: walletData.publicKey,
-        host: '0.0.0.0', // Mobile nodes don't have fixed IP
-        port: 0, // Mobile nodes don't listen on ports
-        node_type: 'light',
-        activation_tx: burnResult.signature,
-        burn_tx_hash: burnResult.signature,
-        burn_amount: pricing.cost,
-        activation_code: activationCode,
-        wallet_address: walletAddress,
-        burn_wallet: walletData.publicKey, // v4.7: Solana address for XOR + sender verification
-        ed25519_signature: ed25519SigHex, // v4.7: Proves ownership of burn_wallet
-        signature_timestamp: sigTimestamp, // v4.7: Replay protection
-        timestamp: Date.now()
-      };
-      
-      // Sign the registration
-      const messageStr = JSON.stringify(registrationMessage, Object.keys(registrationMessage).sort());
-      const messageHash = CryptoJS.SHA256(messageStr).toString();
-      const signature = nacl.sign.detached(
-        Buffer.from(messageHash, 'hex'),
-        new Uint8Array(walletData.secretKey)
-      );
-      
-      // Register node with P2P network
-      const response = await fetch(`${apiUrl}/api/v1/nodes`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          ...registrationMessage,
-          signature: bs58.encode(signature)
-        })
-      });
-      
-      if (!response.ok) {
-        console.warn('P2P registration failed:', response.status);
-        // Don't fail - node is activated, just not registered for pings yet
-      }
-      
-      // Store initial ping time
-      await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
-      
-    } catch (apiError) {
-      // P2P registration failed but node is activated on-chain
-      console.warn('P2P registration error:', apiError.message);
-    }
-    
+
     return {
       success: true,
       signature: burnResult.signature,
@@ -5374,21 +5423,18 @@ export class WalletManager {
       throw new Error('Cannot sign NodeRegistration TX: wallet not loaded');
     }
 
-    const qnetKeypair = walletData.qnetKeypair;
-    const privateKeyBytes = qnetKeypair?.privateKey
-      ? new Uint8Array(qnetKeypair.privateKey)
-      : new Uint8Array(walletData.secretKey.slice(0, 32));
-    const regeneratedKeypair = nacl.sign.keyPair.fromSeed(privateKeyBytes);
-    const publicKeyBytes = regeneratedKeypair.publicKey;
-    const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
-    const fullSecretKey = new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
+    // PURE DILITHIUM (F0.1): wallet control is proven by the ML-DSA-65 WALLET key (which derives to
+    // wallet_address — the node checks eon_from_qnet_dilithium_pubkey(dilithium_public_key)==wallet_address).
+    // Ed25519 is a Solana-only credential and is NOT sent for a QNet registration.
+    const qk = walletData.qnetKeypair;
+    if (!qk || !qk.privateKey || !qk.publicKey) {
+      throw new Error('No ML-DSA-65 QNet key in wallet — required for pure-Dilithium registration');
+    }
+    const walletDilPkHex = Buffer.from(new Uint8Array(qk.publicKey)).toString('hex');
+    const walletDilSkHex = Buffer.from(new Uint8Array(qk.privateKey)).toString('hex');
 
     const timestamp = Math.floor(Date.now() / 1000);
     const message = `client_node_reg:${nodeId}:${walletAddress}:${registrationProof}:${timestamp}`;
-    const messageBytes = Buffer.from(message, 'utf8');
-
-    const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
-    const signature = Buffer.from(ed25519Sig).toString('hex');
 
     const payload = {
       from: walletAddress,
@@ -5397,8 +5443,6 @@ export class WalletManager {
       wallet_address: walletAddress,
       registration_proof: registrationProof,
       timestamp,
-      signature,
-      public_key: publicKeyHex,
     };
 
     // Option A: carry the Solana 1DEV burn so the server can build a burn-attested ON-CHAIN Light
@@ -5409,16 +5453,18 @@ export class WalletManager {
     if (burnAmount) payload.burn_amount = burnAmount;
     if (burnWallet) payload.burn_wallet = burnWallet;
 
-    // MANDATORY: the Dilithium public key is this node's IMMUTABLE on-chain attestation root — the node
-    // verifies every liveness attestation (ping delegation cert) against it. Without it the node can
-    // never attest, so fail hard rather than silently registering an un-attestable node.
-    if (!dilithiumKeys) throw new Error('Dilithium keypair required (on-chain attestation root)');
+    // MANDATORY: the WALLET Dilithium public key is this node's IMMUTABLE on-chain attestation root and
+    // ALSO its wallet-control proof — the node checks eon_from_qnet_dilithium_pubkey(dilithium_public_key)
+    // == wallet_address and verifies every liveness attestation against it. Fail hard if the key is absent.
     {
+      // Sign client_node_reg with the WALLET Dilithium key; signer_id = the raw pubkey hex so the node
+      // verifies via the same "dilithium_sig_{pk}_{b64}" wire format. Proves control of the wallet whose
+      // address == wallet_address, and pins that key as the node's attestation root.
       const { signWithDilithium } = require('../crypto/DilithiumCrypto');
-      const dilSig = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
-      if (!dilSig) throw new Error('Dilithium proof-of-possession signature failed');
+      const dilSig = await signWithDilithium(message, walletDilSkHex, walletDilPkHex, walletDilPkHex);
+      if (!dilSig) throw new Error('Dilithium registration signature failed');
       payload.dilithium_signature = dilSig;
-      payload.dilithium_public_key = dilithiumKeys.publicKey;
+      payload.dilithium_public_key = walletDilPkHex;
     }
 
     // Proof-of-ownership of the burning Solana wallet: sign with the Solana key, node verifies against
@@ -5463,12 +5509,12 @@ export class WalletManager {
       let quantumSecured = false;
 
       try {
-        const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+        const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
         const { registerLightNode } = require('../services/PushService');
 
         if (isDilithiumAvailable()) {
           // Generate or load Dilithium3 keypair
-          const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password, await this._walletSecretHex(password));
+          const dilithiumKeys = await this._walletDilithiumKeys(password);
 
           // Part 1 (Dilithium3): Sign wallet_address — quantum-resistant identity proof
           // Server verifies: verify_mobile_dilithium_signature(wallet_address, sig, pubkey)
@@ -5480,46 +5526,8 @@ export class WalletManager {
             systemPseudonym
           );
 
-          // Part 2 (Ed25519): HYBRID v6.1 — gossip classical ownership proof (MANDATORY)
-          // Signs "light_node_gossip:{pseudonym}:{walletAddress}" with QNet wallet Ed25519 key.
-          // Server rejects registration if this signature is missing or invalid.
-          let ed25519GossipSignature = null;
-          let ed25519GossipPubkey = null;
-          {
-            const wd = await this.loadWallet(password);
-            if (!wd) {
-              throw new Error('Cannot load wallet — required for hybrid gossip signature');
-            }
-            const qnetKeypair = wd.qnetKeypair;
-            // nacl secretKey = 64 bytes (seed[32] + pubkey[32]). Always slice to get seed.
-            const rawKeyBytes = qnetKeypair?.privateKey
-              ? new Uint8Array(qnetKeypair.privateKey)
-              : new Uint8Array(wd.secretKey || []);
-            const privateKeyBytes = rawKeyBytes.slice(0, 32);
-            if (privateKeyBytes.length !== 32) {
-              throw new Error('Ed25519 seed must be 32 bytes — wallet data corrupted');
-            }
-            const kp = nacl.sign.keyPair.fromSeed(privateKeyBytes);
-            ed25519GossipPubkey = Buffer.from(kp.publicKey).toString('hex');
-            const fullSk = new Uint8Array([...privateKeyBytes, ...kp.publicKey]);
-            const gossipMsg = `light_node_gossip:${systemPseudonym}:${walletAddress}`;
-            const sig = nacl.sign.detached(Buffer.from(gossipMsg, 'utf8'), fullSk);
-            ed25519GossipSignature = Buffer.from(sig).toString('hex');
-            console.log('[Registration] Ed25519 gossip signature created (hybrid v6.1)');
-
-            // v7.1: Store ed25519 gossip key in Keychain for background FCM token refresh
-            try {
-              const KeychainGossip = require('react-native-keychain');
-              await KeychainGossip.setGenericPassword(
-                `gossip_key_${systemPseudonym}`,
-                Buffer.from(fullSk).toString('hex'),
-                {
-                  service: `qnet_gossip_sk_${systemPseudonym}`,
-                  accessible: KeychainGossip.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
-                }
-              );
-            } catch (_) {}
-          }
+          // Pure ML-DSA-65: the Dilithium3 Part-1 signature above is the sole gossip authenticator.
+          // The former Part-2 Ed25519 (light_node_gossip:...) proof is removed.
 
           // ── PING DELEGATION v7.1: Dilithium3 (full quantum safety) ──────
           // Dedicated Dilithium3 ping keypair stored in Keychain (hardware-encrypted).
@@ -5666,8 +5674,6 @@ export class WalletManager {
             burnWallet,
             ed25519Signature,
             signatureTimestamp,
-            ed25519GossipSignature,   // HYBRID v2.90: gossip Ed25519 sig
-            ed25519GossipPubkey,      // HYBRID v2.90: gossip Ed25519 pubkey
             pingPubkeyHex,            // PING DELEGATION v7.0: ping hot key pubkey
             pingDelegationCert,       // PING DELEGATION v7.0: Dilithium cert
           );
@@ -5814,7 +5820,7 @@ export class WalletManager {
   // PRODUCTION: Uses /api/v1/light-node/ping-response with HYBRID signature
   async pingNode(activationCode, walletAddress, nodeType, password) {
     try {
-      const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+      const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
 
       // Get pseudonym (stored during registration)
       const storedPseudonym = await AsyncStorage.getItem(`node_pseudonym_${activationCode}`);
@@ -5834,7 +5840,7 @@ export class WalletManager {
       }
 
       // Load Dilithium3 keys (mandatory — no Ed25519 fallback)
-      const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password, await this._walletSecretHex(password));
+      const dilithiumKeys = await this._walletDilithiumKeys(password);
 
       // Sign challenge with Dilithium3
       const dilithiumSig = await signWithDilithium(
@@ -5908,46 +5914,19 @@ export class WalletManager {
         throw new Error('Failed to load wallet for signing');
       }
       
-      // Get keypair for signing (prefer qnetKeypair, fallback to secretKey)
-      const qnetKeypair = walletData.qnetKeypair;
-      const privateKeyBytes = qnetKeypair?.privateKey 
-        ? new Uint8Array(qnetKeypair.privateKey) 
-        : (walletData.secretKey ? new Uint8Array(walletData.secretKey.slice(0, 32)) : null);
-      
-      if (!privateKeyBytes || privateKeyBytes.length !== 32) {
-        throw new Error('No valid 32-byte private key available in wallet');
-      }
-      
-      // CRITICAL FIX v2.66: ALWAYS regenerate publicKey from privateKey!
-      // Old wallets have WRONG publicKey (SHA256 instead of Ed25519 curve)
-      // nacl.sign.keyPair.fromSeed() generates the CORRECT Ed25519 public key
-      const regeneratedKeypair = nacl.sign.keyPair.fromSeed(privateKeyBytes);
-      const publicKeyBytes = regeneratedKeypair.publicKey;
-      
-      // Hybrid signature: Ed25519 (ownership) + Dilithium3 (quantum-safe)
-      // Format matches validator's create_client_signing_message: "claim_rewards:from:to"
+      // PURE DILITHIUM (F0.2): the reward claim is authorised ONLY by the ML-DSA-65 signature below over
+      // "claim_rewards:{node_id}:{wallet_address}" (the node also matches the on-chain wallet + re-verifies
+      // the merkle proof). Ed25519 is Solana-only and no longer sent on this QNet path.
       const message = `claim_rewards:${nodeId}:${walletAddress}`;
-      const messageBytes = Buffer.from(message, 'utf8');
-      
-      // Ed25519 signature (nacl needs 64-byte secret key = privateKey + publicKey)
-      const fullSecretKey = privateKeyBytes.length === 64 
-        ? privateKeyBytes 
-        : new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
-      
-      const ed25519Sig = nacl.sign.detached(messageBytes, fullSecretKey);
-      const quantumSignature = Buffer.from(ed25519Sig).toString('hex');
-      
-      // Get public key for verification (32 bytes hex)
-      const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
 
       // Dilithium3 signature — quantum-safe proof of node ownership (NIST FIPS 204)
       // Activation code is used as seed so the same keypair is deterministically recovered
       let dilithiumSignature = null;
       let dilithiumPublicKey = null;
       try {
-        const { getOrCreateDilithiumKeypair, signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
+        const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
         if (isDilithiumAvailable()) {
-          const dilithiumKeys = await getOrCreateDilithiumKeypair(activationCode, password, await this._walletSecretHex(password));
+          const dilithiumKeys = await this._walletDilithiumKeys(password);
           dilithiumSignature = await signWithDilithium(message, dilithiumKeys.secretKey, dilithiumKeys.publicKey, nodeId);
           dilithiumPublicKey = dilithiumKeys.publicKey;
         }
@@ -5963,8 +5942,6 @@ export class WalletManager {
         body: {
           node_id: nodeId,
           wallet_address: walletAddress,
-          quantum_signature: quantumSignature,   // Ed25519 (hex)
-          public_key: publicKeyHex,              // Ed25519 pubkey (hex)
           ...(dilithiumSignature && { dilithium_signature: dilithiumSignature }),
           ...(dilithiumPublicKey && { dilithium_public_key: dilithiumPublicKey }),
         },
@@ -6013,7 +5990,10 @@ export class WalletManager {
     }
   }
 
-  // Universal send transaction function (routes to appropriate network)
+  // Universal send transaction function (routes to appropriate network).
+  // Native QNC → sendQNC. QRC-20 tokens are sent via qrc20Transfer directly from the UI
+  // (contract address + per-token decimals are threaded through the send modal), so this
+  // function only handles the native asset; any other symbol here is a caller bug.
   async sendTransaction(fromAddress, toAddress, amount, tokenSymbol, password) {
     try {
       // Route to appropriate network handler
@@ -6023,7 +6003,8 @@ export class WalletManager {
         // Solana transactions not supported in this app
         throw new Error('Solana transactions are not supported. Use a Solana wallet.');
       } else {
-        throw new Error(`Unknown token: ${tokenSymbol}`);
+        // QRC-20 tokens do not reach here — the UI calls qrc20Transfer(contract, ...) directly.
+        throw new Error(`sendTransaction is for native QNC only; use qrc20Transfer for token ${tokenSymbol}`);
       }
     } catch (error) {
       return {
@@ -6080,47 +6061,35 @@ export class WalletManager {
         }
       }
       
-      // Get private key bytes (either from qnetKeypair or legacy secretKey, always 32 bytes)
-      const privateKeyBytes = qnetKeypair?.privateKey 
-        ? new Uint8Array(qnetKeypair.privateKey) 
-        : new Uint8Array(walletData.secretKey.slice(0, 32));
-      
-      if (privateKeyBytes.length !== 32) {
-        throw new Error('Invalid private key length');
+      // PURE DILITHIUM (F0.1): the QNet wallet key is ML-DSA-65 (pk 1952B / sk 4032B). Ed25519 is a
+      // Solana-only credential and is NOT used to sign QNet TX. Load the Dilithium wallet key.
+      const qk = walletData.qnetKeypair;
+      if (!qk || !qk.privateKey || !qk.publicKey) {
+        throw new Error('No ML-DSA-65 QNet key in wallet — re-create/import to derive the pure-Dilithium key');
       }
-      
-      // CRITICAL FIX v2.66: ALWAYS regenerate publicKey from privateKey!
-      // Old wallets have WRONG publicKey (SHA256 instead of Ed25519 curve)
-      const regeneratedKeypair = nacl.sign.keyPair.fromSeed(privateKeyBytes);
-      const publicKeyBytes = regeneratedKeypair.publicKey;
-      
-      // PRODUCTION: Create Ed25519 signature for transaction
-      // v2.77: Format includes nonce for replay protection (Ethereum-style)
-      // Format: "transfer:from:to:amount:nonce:gas_price:gas_limit"
-      // v2.101: Use Math.round() to avoid floating point precision loss
-      // Example: Math.floor(0.1 * 1e9) = 99999999, but Math.round() = 100000000
-      const amountSmallest = Math.round(amount * 1_000_000_000); // QNC → nano (9 decimals)
+      const dilPkHex = Buffer.from(new Uint8Array(qk.publicKey)).toString('hex');
+      const dilSkHex = Buffer.from(new Uint8Array(qk.privateKey)).toString('hex');
+
+      // v2.101: Math.round() to avoid float precision loss (QNC → nano, 9 decimals).
+      const amountSmallest = Math.round(amount * 1_000_000_000);
       if (!Number.isSafeInteger(amountSmallest)) {
         throw new Error('Amount too large or imprecise'); // beyond 2^53 nano — would lose precision
       }
-      const gasPrice = 10; // nanoQNC/gas — matches node MIN_GAS_PRICE (fee = 10 * 10000 = 0.0001 QNC/transfer)
+      const gasPrice = 10;   // nanoQNC/gas — matches node MIN_GAS_PRICE (fee = 10 * 10000 = 0.0001 QNC)
       const gasLimit = 10_000;
-      
-      // Get public key for verification (32 bytes hex)
-      const publicKeyHex = Buffer.from(publicKeyBytes).toString('hex');
-      
-      // Ed25519 secret = 32-byte priv ++ 32-byte pub (nacl format).
-      const fullSecretKey = privateKeyBytes.length === 64
-        ? privateKeyBytes
-        : new Uint8Array([...privateKeyBytes, ...publicKeyBytes]);
 
-      // Sign + submit for a nonce. Message: "transfer:from:to:amount:nonce:gas_price:gas_limit".
+      const { signWithDilithium } = require('../crypto/DilithiumCrypto');
+
+      // Sign + submit for a nonce. The canonical message MUST byte-match the node's
+      // build_canonical_verify_message Transfer arm: "transfer:from:to:amount:nonce:gas_price:gas_limit".
+      // signer_id = raw pubkey hex ⇒ wire format "dilithium_sig_{pk}_{b64([sig_len][SignedMessage][pk_len][pk])}",
+      // which the node verifies via verify_user_tx_dilithium (open() under dilithium_public_key).
       const buildAndSubmit = async (txNonce) => {
         const message = `transfer:${fromAddress}:${toAddress}:${amountSmallest}:${txNonce}:${gasPrice}:${gasLimit}`;
-        const sig = nacl.sign.detached(Buffer.from(message, 'utf8'), fullSecretKey);
+        const dilSig = await signWithDilithium(message, dilSkHex, dilPkHex, dilPkHex);
         return this.submitSignedTx({
           from: fromAddress, to: toAddress, amount: amountSmallest,
-          signature: Buffer.from(sig).toString('hex'), public_key: publicKeyHex,
+          dilithium_signature: dilSig, dilithium_public_key: dilPkHex,
           gas_price: gasPrice, gas_limit: gasLimit, nonce: txNonce,
         });
       };
@@ -6152,6 +6121,269 @@ export class WalletManager {
       console.warn('[WalletManager] Send QNC error:', error.message || error);
       throw error;
     }
+  }
+
+  // ===========================================================================
+  // QRC-20 SDK — client-side ContractCall/ContractDeploy convenience wrappers
+  // ===========================================================================
+  // Same wallet-load, ML-DSA-65 signer, local-nonce and hedged-submit path as
+  // sendQNC. The node builds tx.data server-side from the request fields, so the
+  // signature MUST bind the EXACT byte string it will reproduce:
+  //   ContractCall   canonical: contract_call:{from}:{sha3_256_hex(dataStr)}:{nonce}
+  //                  dataStr = serde_json::to_string(json!({"contract","method","args"})).
+  //                  serde_json here has preserve_order OFF (Map = BTreeMap), so the node
+  //                  emits keys ALPHABETICALLY: `{"args":..,"contract":..,"method":..}`.
+  //                  The client MUST hash that exact ordering (not JS insertion order).
+  //                  Args are strings (addresses, decimal amounts, NFT token_ids) + the
+  //                  occasional small integer; JSON.stringify then matches serde's compact
+  //                  form byte-for-byte. QRC-20 amounts + QRC-721 token_ids are passed as
+  //                  STRINGS (node reads string-or-number) so full u64 values survive exactly
+  //                  — a JSON number would truncate above 2^53 and bake the loss into the
+  //                  signed digest (see qrc20*/_amt and the nft* wrappers).
+
+  // Load the ML-DSA-65 wallet key as {from, dilPkHex, dilSkHex} — mirrors sendQNC.
+  async _loadContractSigner(password) {
+    const walletData = await this.loadWallet(password);
+    if (!walletData) throw new Error('Failed to load wallet for signing');
+    const from = walletData.qnetAddress || walletData.address;
+    if (!from) throw new Error('Wallet has no QNet address');
+    const qk = walletData.qnetKeypair;
+    if (!qk || !qk.privateKey || !qk.publicKey) {
+      throw new Error('No ML-DSA-65 QNet key in wallet — re-create/import to derive the pure-Dilithium key');
+    }
+    return {
+      from,
+      dilPkHex: Buffer.from(new Uint8Array(qk.publicKey)).toString('hex'),
+      dilSkHex: Buffer.from(new Uint8Array(qk.privateKey)).toString('hex'),
+    };
+  }
+
+  // Build + sign + submit a ContractCall. `args` is the method's positional argument
+  // array (see the qrc20* wrappers for each method's shape). Returns the node's
+  // { success, tx_hash, ... } JSON; throws only on an unaffirmed submit.
+  async buildContractCall(contractAddress, method, args, password, opts = {}) {
+    if (!contractAddress || !method) throw new Error('contractAddress and method are required');
+    const argList = Array.isArray(args) ? args : [];
+    const { from, dilPkHex, dilSkHex } = await this._loadContractSigner(password);
+
+    const gasPrice = opts.gasPrice != null ? opts.gasPrice : 10;   // nanoQNC/gas — node MIN_GAS_PRICE
+    const gasLimit = opts.gasLimit != null ? opts.gasLimit : 10_000; // node call min gas_limit
+
+    const { signWithDilithium } = require('../crypto/DilithiumCrypto');
+    const { sha3_256 } = require('js-sha3');
+
+    const buildAndSubmit = async (txNonce) => {
+      // Byte-exact match to the node's json! serialization: serde_json (preserve_order OFF)
+      // sorts object keys, so the keys MUST be alphabetical — args, contract, method.
+      const dataStr = JSON.stringify({ args: argList, contract: contractAddress, method });
+      const dataHash = sha3_256(dataStr); // hex; matches Rust Sha3_256::digest(tx.data)
+      const message = `contract_call:${from}:${dataHash}:${txNonce}`;
+      const dilSig = await signWithDilithium(message, dilSkHex, dilPkHex, dilPkHex);
+      const res = await this._hedged('/api/v1/contract/call', {
+        method: 'POST', timeoutMs: 5000, hedgeMs: 900,
+        body: {
+          from, contract_address: contractAddress, method, args: argList,
+          gas_price: gasPrice, gas_limit: gasLimit, nonce: txNonce,
+          dilithium_signature: dilSig, dilithium_public_key: dilPkHex,
+        },
+      });
+      return res.data || {};
+    };
+
+    // Local nonce → hedged submit; one retry with a chain-fresh nonce on drift (mirrors sendQNC).
+    let txNonce = await this.resolveNonce(from);
+    let result = await buildAndSubmit(txNonce);
+    if (result && result.success === false && !result.tx_hash &&
+        /nonce/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      txNonce = await this.resolveNonce(from, true);
+      result = await buildAndSubmit(txNonce);
+    }
+    const accepted = !!(result && (result.tx_hash || result.success === true));
+    if (!accepted) {
+      const errorMsg = result && result.details
+        ? `${result.error}: ${result.details}`
+        : (result && result.error) || 'Node did not acknowledge the contract call';
+      console.warn('[QRC20] call not accepted:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    this._bumpNonce(from, txNonce);
+    return result;
+  }
+
+  // QRC-20 convenience wrappers — amounts are raw token base-units (u64), NOT decimal
+  // token amounts; scale by 10**decimals in the UI before calling. Args mirror the
+  // node's apply arms: transfer[to,amt] approve[spender,amt] transferFrom[from,to,amt]
+  // mint[to,amt] burn[amt].
+  //
+  // Amounts are passed as DECIMAL STRINGS (not JSON numbers): the node's amount reader
+  // now accepts string-or-number, and a string carries the full u64 range exactly. A JSON
+  // number would silently lose precision above 2^53 (JS doubles) — and the loss would be
+  // baked into the AC-1 signature digest (sha3 of the calldata), so the node would apply a
+  // truncated amount. _amt() normalizes any caller input (Number/BigInt/string) to the
+  // canonical base-10 integer string that serde serializes byte-identically here and node-side.
+  _amt(amount) {
+    if (typeof amount === 'string') {
+      if (!/^\d+$/.test(amount)) throw new Error('amount must be a non-negative integer string');
+      return amount;
+    }
+    if (typeof amount === 'bigint') {
+      if (amount < 0n) throw new Error('amount must be non-negative');
+      return amount.toString();
+    }
+    if (typeof amount === 'number') {
+      if (!Number.isInteger(amount) || amount < 0) throw new Error('amount must be a non-negative integer');
+      if (!Number.isSafeInteger(amount)) throw new Error('amount exceeds 2^53 — pass a string for full u64 exactness');
+      return String(amount);
+    }
+    throw new Error('amount must be a string, number, or bigint');
+  }
+  async qrc20Transfer(contract, to, amount, password, opts) {
+    return this.buildContractCall(contract, 'transfer', [to, this._amt(amount)], password, opts);
+  }
+  async qrc20Approve(contract, spender, amount, password, opts) {
+    return this.buildContractCall(contract, 'approve', [spender, this._amt(amount)], password, opts);
+  }
+  async qrc20TransferFrom(contract, from, to, amount, password, opts) {
+    return this.buildContractCall(contract, 'transferFrom', [from, to, this._amt(amount)], password, opts);
+  }
+  async qrc20Mint(contract, to, amount, password, opts) {
+    return this.buildContractCall(contract, 'mint', [to, this._amt(amount)], password, opts);
+  }
+  async qrc20Burn(contract, amount, password, opts) {
+    return this.buildContractCall(contract, 'burn', [this._amt(amount)], password, opts);
+  }
+
+  // QRC-721 (NFT) convenience wrappers — same ContractCall path/signature as QRC-20, so the
+  // AC-1 digest (sha3 of the alphabetical {"args","contract","method"} calldata) is produced
+  // identically. token_id is ALWAYS a decimal STRING (node reads it from a contract_storage
+  // string key and via string-or-number amount parsing) — a JSON number would truncate above
+  // 2^53 and bake the loss into the signed digest. Args mirror the node apply arms exactly:
+  //   mint[to,token_id] transfer[to,token_id] approve[spender,token_id]
+  //   transferFrom[from,to,token_id]
+  // _tokenId() normalizes Number/BigInt/string to the canonical base-10 integer string.
+  _tokenId(tokenId) {
+    // Reuses the amount normalizer: a token_id is a non-negative integer with the same
+    // full-u64 string-exactness requirement.
+    return this._amt(tokenId);
+  }
+  async nftMint(contract, to, tokenId, password, opts) {
+    return this.buildContractCall(contract, 'mint', [to, this._tokenId(tokenId)], password, opts);
+  }
+  async nftTransfer(contract, to, tokenId, password, opts) {
+    return this.buildContractCall(contract, 'transfer', [to, this._tokenId(tokenId)], password, opts);
+  }
+  async nftApprove(contract, spender, tokenId, password, opts) {
+    return this.buildContractCall(contract, 'approve', [spender, this._tokenId(tokenId)], password, opts);
+  }
+  async nftTransferFrom(contract, from, to, tokenId, password, opts) {
+    return this.buildContractCall(contract, 'transferFrom', [from, to, this._tokenId(tokenId)], password, opts);
+  }
+
+  // Deploy a QRC-20 token via the node's /api/v1/token/deploy endpoint. The node
+  // derives the on-chain contract address (derive_contract_address(from, nonce)) and
+  // builds tx.data itself, so the signature binds the canonical deploy message it
+  // reproduces: contract_deploy:{from}:{code_hash}:{nonce} with
+  //   code_hash = sha3_256_hex("QRC20:" + name + ":" + symbol).
+  // NOTE: the current node token/deploy handler hardcodes tx.data WITHOUT the
+  // mintable/burnable flags, so those keys are inert until the node forwards them
+  // (state.rs already reads them from tx.data). We send them anyway for
+  // forward-compatibility; today a token deploys as immutable-supply.
+  async deployToken({ name, symbol, decimals = 9, initialSupply, mintable = false, burnable = false }, password, opts = {}) {
+    if (!name || !symbol) throw new Error('name and symbol are required');
+    if (!(initialSupply > 0)) throw new Error('initialSupply must be greater than 0');
+    const { from, dilPkHex, dilSkHex } = await this._loadContractSigner(password);
+
+    const { signWithDilithium } = require('../crypto/DilithiumCrypto');
+    const { sha3_256 } = require('js-sha3');
+
+    const buildAndSubmit = async (txNonce) => {
+      // code_hash the node signs over: sha3("QRC20:"+name+":"+symbol) — NIST FIPS 202.
+      const codeHash = sha3_256(`QRC20:${name}:${symbol}`);
+      const message = `contract_deploy:${from}:${codeHash}:${txNonce}`;
+      const dilSig = await signWithDilithium(message, dilSkHex, dilPkHex, dilPkHex);
+      const res = await this._hedged('/api/v1/token/deploy', {
+        method: 'POST', timeoutMs: 5000, hedgeMs: 900,
+        body: {
+          from, name, symbol, decimals, initial_supply: initialSupply, nonce: txNonce,
+          mintable, burnable, // inert on the current node handler (see NOTE above)
+          dilithium_signature: dilSig, dilithium_public_key: dilPkHex,
+        },
+      });
+      return res.data || {};
+    };
+
+    let txNonce = await this.resolveNonce(from);
+    let result = await buildAndSubmit(txNonce);
+    if (result && result.success === false && !result.tx_hash &&
+        /nonce/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      txNonce = await this.resolveNonce(from, true);
+      result = await buildAndSubmit(txNonce);
+    }
+    const accepted = !!(result && (result.tx_hash || result.success === true));
+    if (!accepted) {
+      const errorMsg = result && result.details
+        ? `${result.error}: ${result.details}`
+        : (result && result.error) || 'Node did not acknowledge the token deploy';
+      console.warn('[QRC20] deploy not accepted:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    this._bumpNonce(from, txNonce);
+    return result;
+  }
+
+  // Deploy a QRC-721 (NFT) collection. Mirrors deployToken's ContractDeploy path exactly:
+  // the node derives the on-chain contract address (derive_contract_address(from, nonce)),
+  // builds tx.data server-side as {"qrc721":true,"name":..,"symbol":..}, and the value-TX gate
+  // rebuilds the SAME canonical deploy message this signs — contract_deploy:{from}:{code_hash}:{nonce}
+  // with code_hash = sha3_256_hex("QRC721:"+name+":"+symbol) — then binds the ML-DSA-65 key to `from`.
+  // The digest prefix mirrors the node's token/deploy scheme (QRC20:) with the qrc721 discriminant;
+  // it must byte-match the node's nft/deploy handler's code_hash construction (name/symbol UTF-8,
+  // ':' separators, NIST FIPS 202).
+  //
+  // NOTE: this targets a dedicated /api/v1/nft/deploy endpoint. The current node exposes only
+  // token/deploy (hardcoded qrc20) and contract/deploy (WASM); neither emits the qrc721 tx.data
+  // that qnet-state's deploy branch parses. Until that handler lands, this wrapper is byte-correct
+  // but will 404 — see the SDK stage report. NFT *method calls* (nftMint/Transfer/Approve/
+  // TransferFrom) go through the live contract/call path and work today.
+  async deployNftCollection({ name, symbol }, password, opts = {}) {
+    if (!name || !symbol) throw new Error('name and symbol are required');
+    const { from, dilPkHex, dilSkHex } = await this._loadContractSigner(password);
+
+    const { signWithDilithium } = require('../crypto/DilithiumCrypto');
+    const { sha3_256 } = require('js-sha3');
+
+    const buildAndSubmit = async (txNonce) => {
+      // code_hash the node signs over: sha3("QRC721:"+name+":"+symbol) — NIST FIPS 202.
+      const codeHash = sha3_256(`QRC721:${name}:${symbol}`);
+      const message = `contract_deploy:${from}:${codeHash}:${txNonce}`;
+      const dilSig = await signWithDilithium(message, dilSkHex, dilPkHex, dilPkHex);
+      const res = await this._hedged('/api/v1/nft/deploy', {
+        method: 'POST', timeoutMs: 5000, hedgeMs: 900,
+        body: {
+          from, name, symbol, nonce: txNonce,
+          dilithium_signature: dilSig, dilithium_public_key: dilPkHex,
+        },
+      });
+      return res.data || {};
+    };
+
+    let txNonce = await this.resolveNonce(from);
+    let result = await buildAndSubmit(txNonce);
+    if (result && result.success === false && !result.tx_hash &&
+        /nonce/i.test(`${result.error || ''} ${result.details || ''}`)) {
+      txNonce = await this.resolveNonce(from, true);
+      result = await buildAndSubmit(txNonce);
+    }
+    const accepted = !!(result && (result.tx_hash || result.success === true));
+    if (!accepted) {
+      const errorMsg = result && result.details
+        ? `${result.error}: ${result.details}`
+        : (result && result.error) || 'Node did not acknowledge the NFT collection deploy';
+      console.warn('[NFT] deploy not accepted:', errorMsg);
+      throw new Error(errorMsg);
+    }
+    this._bumpNonce(from, txNonce);
+    return result;
   }
 
   // Check if wallet exists and is valid

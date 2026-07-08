@@ -1,0 +1,18 @@
+[package]
+name = "qnet-vm"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic on-chain smart-contract VM (P1: deploy-time WASM validation). Leaf crate — NO consensus-code deps; NOT wired into apply yet."
+
+[dependencies]
+# Deploy-time module validation (P1).
+wasmparser = "0.252"
+# Execution interpreter (P2). Pinned to the latest STABLE line (NOT the 2.0 beta):
+# a deterministic, fuel-metered, pure-Rust interpreter. CONSENSUS-CRITICAL once P3
+# flips execution on — a version bump is a hard fork (re-equivalence-test required).
+wasmi = "0.47"
+
+[dev-dependencies]
+# Compile readable WAT test contracts → WASM in unit tests (already in the tree
+# transitively via wasmi's dev deps). Test-only — NOT a runtime/consensus dep.
+wat = "1"

@@ -7,34 +7,88 @@ import { mapTxType, formatAmount } from '@/lib/tx-mapping';
 const RATE_LIMIT_MAX = 200;
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 
-// Validate and sanitize NODE_RPC_URL to prevent SSRF
-function getNodeRpcUrl(): string {
-  const url = process.env.QNET_API_URL || 'https://162.244.25.114:8001';
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new Error('Invalid protocol');
-    }
-    const hostname = parsed.hostname;
-    if (hostname === 'localhost' || hostname === '127.0.0.1' || 
-        hostname.startsWith('192.168.') || hostname.startsWith('10.') ||
-        hostname.startsWith('172.16.') || hostname.startsWith('172.17.') ||
-        hostname.startsWith('172.18.') || hostname.startsWith('172.19.') ||
-        hostname.startsWith('172.20.') || hostname.startsWith('172.21.') ||
-        hostname.startsWith('172.22.') || hostname.startsWith('172.23.') ||
-        hostname.startsWith('172.24.') || hostname.startsWith('172.25.') ||
-        hostname.startsWith('172.26.') || hostname.startsWith('172.27.') ||
-        hostname.startsWith('172.28.') || hostname.startsWith('172.29.') ||
-        hostname.startsWith('172.30.') || hostname.startsWith('172.31.')) {
-      return 'https://162.244.25.114:8001';
-    }
-    return url;
-  } catch {
-    return 'https://162.244.25.114:8001';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+// Dev/testnet only: no production host is ever baked into source, so in a
+// production build QNET_API_URL is REQUIRED (see resolveNodeRpc).
+const NODE_RPC_DEV_FALLBACK = 'http://127.0.0.1:8001';
+
+// True if hostname is a private, loopback, link-local, or CGNAT address (SSRF guard).
+function isBlockedHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  // IPv6 loopback / unspecified / unique-local / link-local
+  if (h === '::1' || h === '::' || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80')) return true;
+  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const [a, b] = [Number(m[1]), Number(m[2])];
+    if (a === 127 || a === 0 || a === 10) return true;               // loopback, "this network", private
+    if (a === 192 && b === 168) return true;                          // private
+    if (a === 169 && b === 254) return true;                          // link-local (incl. cloud metadata)
+    if (a === 172 && b >= 16 && b <= 31) return true;                 // private
+    if (a === 100 && b >= 64 && b <= 127) return true;                // CGNAT
   }
+  return false;
 }
 
-const NODE_RPC_URL = getNodeRpcUrl();
+// Resolve the node RPC base URL once at module load.
+//   - Production REQUIRES a valid, publicly-routable QNET_API_URL. If it is
+//     unset, malformed, or points at a private/loopback host, we resolve to an
+//     error rather than '' — an empty base would turn every RPC fetch into a
+//     relative URL that throws "Failed to parse URL" and silently 404s any tx
+//     not in the local DB. The handler surfaces this as a 503 naming the
+//     misconfiguration instead of failing silently.
+//   - Dev/testnet falls back to loopback (http://127.0.0.1:8001) so local runs
+//     work without any env; a blocked/loopback QNET_API_URL is likewise allowed
+//     in dev (that is the intended local target).
+function resolveNodeRpc(): { url: string | null; error: string | null } {
+  const configured = process.env.QNET_API_URL;
+
+  if (!configured) {
+    if (IS_PRODUCTION) {
+      return {
+        url: null,
+        error:
+          'QNET_API_URL is not set. A production build requires an explicit, ' +
+          'publicly-routable node RPC endpoint (no host is baked into source).',
+      };
+    }
+    return { url: NODE_RPC_DEV_FALLBACK, error: null };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(configured);
+  } catch {
+    return IS_PRODUCTION
+      ? { url: null, error: `QNET_API_URL is not a valid URL: "${configured}".` }
+      : { url: NODE_RPC_DEV_FALLBACK, error: null };
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return IS_PRODUCTION
+      ? { url: null, error: `QNET_API_URL has an unsupported protocol: "${parsed.protocol}".` }
+      : { url: NODE_RPC_DEV_FALLBACK, error: null };
+  }
+
+  if (isBlockedHost(parsed.hostname)) {
+    // Private/loopback host: fine in dev (intended local target), but in
+    // production it is either an SSRF target or a now-blocked internal host —
+    // refuse rather than silently degrade to an unreachable/empty base.
+    return IS_PRODUCTION
+      ? {
+          url: null,
+          error:
+            `QNET_API_URL points at a private/loopback host ("${parsed.hostname}") ` +
+            'which is not reachable in production. Configure a public node RPC endpoint.',
+        }
+      : { url: configured, error: null };
+  }
+
+  return { url: configured, error: null };
+}
+
+const { url: NODE_RPC_URL, error: NODE_RPC_ERROR } = resolveNodeRpc();
 
 // Normalize type-specific public data (JSONB object or JSON string) → object|null; null if empty.
 function parseTxTypeData(raw: unknown): Record<string, unknown> | null {
@@ -154,8 +208,18 @@ export async function GET(
     });
   }
   
+  // Fail loudly on RPC misconfiguration instead of silently 404ing every tx
+  // that is not already in the local DB (an empty base URL would make each
+  // fallback fetch a relative URL that throws "Failed to parse URL").
+  if (NODE_RPC_ERROR || !NODE_RPC_URL) {
+    return NextResponse.json({
+      success: false,
+      error: `Node RPC misconfigured: ${NODE_RPC_ERROR ?? 'QNET_API_URL is not configured'}`,
+    }, { status: 503 });
+  }
+
   const { hash } = await params;
-  
+
   // Validate hash
   if (!hash || typeof hash !== 'string') {
     return NextResponse.json({
@@ -249,7 +313,7 @@ export async function GET(
         source: 'postgresql',
         data: {
           hash: dbTx.hash,
-          type: mapTxType(dbTx.tx_type, dbTx.from_address),
+          type: mapTxType(dbTx.tx_type, dbTx.from_address, dbTx.data),
           tx_type: dbTx.tx_type,
           status: dbTx.status || 'confirmed',
           block: dbTx.block,
@@ -361,7 +425,7 @@ export async function GET(
       source: 'rocksdb',
       data: {
         hash: tx.hash as string,
-        type: mapTxType((tx.tx_type || tx.type) as string, (tx.from_address || tx.from) as string),
+        type: mapTxType((tx.tx_type || tx.type) as string, (tx.from_address || tx.from) as string, tx.data),
         tx_type: tx.tx_type || tx.type,
         status: (tx.status as string) || 'confirmed',
         block: blockHeight,

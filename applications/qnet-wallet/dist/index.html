@@ -466,6 +466,11 @@
         }
     </script>
     
+    <!-- noble-pq-ml-dsa.js sets window.QNetDilithiumLib (canonical ML-DSA-65 wallet derivation).
+         Classic script MUST load before the main.js module so QNetDualWallet.generateQNetWallet()
+         can read window.QNetDilithiumLib at runtime. -->
+    <script src="./lib/noble-pq-ml-dsa.js"></script>
+
     <!-- Main Application -->
     <script type="module" src="./src/main.js"></script>
     

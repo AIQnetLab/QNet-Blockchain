@@ -22,7 +22,12 @@ pub struct TxBundle {
     
     /// Transactions in bundle (executed atomically - all or nothing)
     pub transactions: Vec<String>,  // TX hashes
-    
+
+    /// Captured tx bytes at submit time, positional-parallel to `transactions`.
+    /// WHY: own the data so eviction between submit and block-build cannot invalidate a valid bundle.
+    #[serde(default)]
+    pub tx_bytes: Vec<Vec<u8>>,
+
     /// Minimum block timestamp (don't include before this time)
     pub min_timestamp: u64,
     
@@ -246,47 +251,55 @@ impl MevProtectedMempool {
         // v2.26: Direct access - SimpleMempool is already thread-safe
         let min_gas_price = self.public_pool.get_min_gas_price();
         let required_gas_price = ((min_gas_price as f64) * self.config.gas_premium) as u64;
-        
+
+        // Own the tx bytes at submit time so later eviction cannot invalidate a valid bundle.
+        // Bounded: max_txs_per_bundle enforced above (CONSTRAINT 1).
+        let mut captured_bytes: Vec<Vec<u8>> = Vec::with_capacity(bundle.transactions.len());
         for tx_hash in &bundle.transactions {
             // v2.26: Use binary transactions with bincode (not JSON!)
-            if let Some(tx_bytes) = self.public_pool.get_binary_transaction(tx_hash) {
-                // Try bincode first (new format), then JSON (legacy)
-                let gas_price_opt = if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
-                    Some(tx.gas_price)
-                } else if let Ok(json_str) = String::from_utf8(tx_bytes) {
-                    // Fallback: legacy JSON format
-                    serde_json::from_str::<serde_json::Value>(&json_str)
-                        .ok()
-                        .and_then(|tx_data| tx_data["gas_price"].as_u64())
-                } else {
-                    None
-                };
-                
-                if let Some(gas_price) = gas_price_opt {
-                    if gas_price < required_gas_price {
-                        return Err(format!(
-                            "TX {} gas price too low: {} (required: {} with {}% premium)",
-                            tx_hash,
-                            gas_price,
-                            required_gas_price,
-                            ((self.config.gas_premium - 1.0) * 100.0) as u64
-                        ));
-                    }
-                } else {
-                    return Err(format!("TX {} has invalid format (bincode/JSON parse failed)", tx_hash));
-                }
+            let Some(tx_bytes) = self.public_pool.get_binary_transaction(tx_hash) else {
+                return Err(format!("[MEV][BUNDLE] tx_not_found tx={}", tx_hash));
+            };
+
+            // Try bincode first (new format), then JSON (legacy)
+            let gas_price_opt = if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+                Some(tx.gas_price)
+            } else if let Ok(json_str) = String::from_utf8(tx_bytes.clone()) {
+                // Fallback: legacy JSON format
+                serde_json::from_str::<serde_json::Value>(&json_str)
+                    .ok()
+                    .and_then(|tx_data| tx_data["gas_price"].as_u64())
             } else {
-                return Err(format!("TX {} not found in public mempool", tx_hash));
+                None
+            };
+
+            let Some(gas_price) = gas_price_opt else {
+                return Err(format!("[MEV][BUNDLE] tx_bad_format tx={}", tx_hash));
+            };
+            if gas_price < required_gas_price {
+                return Err(format!(
+                    "[MEV][BUNDLE] gas_too_low tx={} gas={} required={} premium_pct={}",
+                    tx_hash,
+                    gas_price,
+                    required_gas_price,
+                    ((self.config.gas_premium - 1.0) * 100.0) as u64
+                ));
             }
+
+            captured_bytes.push(tx_bytes);
         }
-        
-        println!("[MEV] ✅ All bundle TXs meet gas premium requirement (+{}%)", 
+
+        println!("[MEV] ✅ All bundle TXs meet gas premium requirement (+{}%)",
                  ((self.config.gas_premium - 1.0) * 100.0) as u64);
-        
+
         // Store bundle
         let bundle_id = bundle.bundle_id.clone();
         let total_gas = bundle.total_gas_price;
-        
+
+        // Capture owned bytes into the bundle (positional-parallel to `transactions`).
+        let mut bundle = bundle;
+        bundle.tx_bytes = captured_bytes;
+
         self.bundles.insert(bundle_id.clone(), bundle);
         
         // Add to priority queue (sorted by total_gas_price descending)
@@ -481,6 +494,7 @@ mod tests {
         let bundle = TxBundle {
             bundle_id: "test".to_string(),
             transactions: vec!["0xabc".to_string()],
+            tx_bytes: vec![],
             min_timestamp: 100,
             max_timestamp: 200,
             reverting_tx_hashes: vec![],

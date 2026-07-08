@@ -340,6 +340,16 @@ pub fn eon_from_qnet_pubkey(pubkey_hex: &str) -> Option<String> {
 
 /// Solana-imported QNet EON: SHA512(solana_address_str + "qnet-eon-bridge") → EON.
 /// Mirrors mobile `generateQNetAddressFromSolana`.
+/// Pure post-quantum EON: SHA512(ML-DSA-65 public-key bytes) -> EON. This is the
+/// user wallet's on-chain identity under the pure-Dilithium migration (F0.1). Same
+/// 45-char layout as the Ed25519 path -- the derivation is agnostic to key size, only
+/// the input key material differs (PQ pk instead of Ed25519 pk). Because the address
+/// commits to the signing key, it IS the from<->key binding (closes API-1). Returns
+/// None on bad hex. `dilithium_pubkey_hex` = hex of the 1952-byte ML-DSA-65 pk.
+pub fn eon_from_qnet_dilithium_pubkey(dilithium_pubkey_hex: &str) -> Option<String> {
+    eon_from_qnet_pubkey(dilithium_pubkey_hex)
+}
+
 pub fn eon_from_solana_address(solana_address: &str) -> String {
     use sha2::{Sha512, Digest as Sha2Digest};
     let mut h = Sha512::new();

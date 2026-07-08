@@ -26,7 +26,7 @@
 //! ## Security Model
 //!
 //! 1. **Transport Encryption**: QUIC with TLS 1.3
-//! 2. **Peer Authentication**: HybridCertificate (Ed25519 + Dilithium)
+//! 2. **Peer Authentication**: PqCertificate (Ed25519 + Dilithium)
 //! 3. **Message Integrity**: Dilithium signatures on all messages
 //! 4. **Post-Quantum**: NIST FIPS 204 compliant (ML-DSA/Dilithium)
 //!
@@ -47,7 +47,7 @@ use async_trait::async_trait;
 use serde::{Serialize, Deserialize};
 
 use crate::unified_p2p::{PeerInfo, NetworkMessage};
-use crate::crypto::hybrid_crypto::HybridCertificate;
+use crate::crypto::pq_crypto::PqCertificate;
 
 // ============================================================================
 // CONSTANTS - ALIGNED WITH HTTP AND QUIC TRANSPORT
@@ -354,8 +354,8 @@ impl WireMessage {
 pub struct HandshakeMessage {
     /// Node ID
     pub node_id: String,
-    /// HybridCertificate for verification
-    pub certificate: HybridCertificate,
+    /// PqCertificate for verification
+    pub certificate: PqCertificate,
     /// Protocol version supported
     pub protocol_version: u8,
     /// Timestamp (Unix epoch)
@@ -376,7 +376,7 @@ pub struct ConnectionInfo {
     /// Peer node ID
     pub peer_node_id: String,
     /// Peer certificate (verified)
-    pub peer_certificate: HybridCertificate,
+    pub peer_certificate: PqCertificate,
     /// Connection established time
     pub connected_at: Instant,
     /// Last activity time
@@ -402,7 +402,7 @@ pub struct BroadcastResult {
 #[async_trait]
 pub trait P2PTransport: Send + Sync {
     /// Initialize the transport
-    async fn init(&mut self, bind_addr: SocketAddr, node_id: &str, certificate: &HybridCertificate) -> TransportResult<()>;
+    async fn init(&mut self, bind_addr: SocketAddr, node_id: &str, certificate: &PqCertificate) -> TransportResult<()>;
     
     /// Connect to a peer
     async fn connect(&self, peer_addr: SocketAddr) -> TransportResult<ConnectionInfo>;

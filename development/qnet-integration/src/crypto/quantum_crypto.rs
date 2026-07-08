@@ -598,7 +598,7 @@ impl QNetQuantumCrypto {
         //    accept or reject a Dilithium3 signature for an identity-bearing
         //    wire message. It performs the FULL chain of checks:
         //      a) Decodes the on-the-wire format ("dilithium_sig_<id>_<b64>",
-        //         "compact_bin:<b64>", "hybrid_bin:<b64>", etc.);
+        //         "compact_bin:<b64>", "pq_bin:<b64>", etc.);
         //      b) Parses the combined `[sig_len][SignedMessage][pk_len][pk]`
         //         payload and validates structural invariants;
         //      c) ENFORCES THE (node_id → public_key) BINDING via the

@@ -85,26 +85,30 @@ export default function ClientWrapper({
     super: [1500, 150]
   });
   const totalPhase1Supply = 1_000_000_000;        // 1 billion 1DEV total supply (pump.fun standard)
-  const activeNodes = 156;                          // TODO: fetch real active node count
-  
+  // Live active-node count; 0 until fetched so pricing never keys off a stale placeholder.
+  const [activeNodes, setActiveNodes] = useState(0);
+
   // Circulating supply state
   const [circulatingSupply, setCirculatingSupply] = useState('—');
-  
-  // Fetch circulating supply
+
+  // Fetch circulating supply + active node count
   useEffect(() => {
-    const fetchCirculatingSupply = async () => {
+    const fetchNetworkStats = async () => {
       try {
         const res = await fetch('/api/network/stats', { cache: 'no-store' });
         if (res.ok) {
           const data = await res.json();
           setCirculatingSupply(data.data?.circulatingFormatted || '0');
+          // Network-size for pricing = all active nodes (super + light).
+          const nodes = Number(data.data?.activeNodes || 0) + Number(data.data?.activeLightNodes || 0);
+          if (Number.isFinite(nodes) && nodes > 0) setActiveNodes(nodes);
         }
       } catch (err) {
         /* log disabled */
       }
     };
-    fetchCirculatingSupply();
-    const interval = setInterval(fetchCirculatingSupply, 60000);
+    fetchNetworkStats();
+    const interval = setInterval(fetchNetworkStats, 60000);
     return () => clearInterval(interval);
   }, []);
   

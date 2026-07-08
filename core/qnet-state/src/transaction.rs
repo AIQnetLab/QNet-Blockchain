@@ -163,11 +163,19 @@ pub const GAS_METERING_ACTIVATION_HEIGHT: u64 = 100_000;
 /// mobile-cheap rather than punitive. System TXs (activation/heartbeat/reward) bypass the floor.
 pub const MIN_GAS_PRICE: u64 = BASE_FEE_NANO_QNC / gas_limits::TRANSFER;
 
-/// v3.42: Maximum entries in a single contract's contract_storage HashMap.
-/// Prevents unbounded growth of Account → Merkle tree for popular QRC-20 tokens.
-/// At 1M entries (~80 bytes per KV pair) this is ~80 MB per contract — safe for testnet.
-/// Mainnet will use sharded storage (separate trie per contract) to remove this limit.
-pub const MAX_CONTRACT_STORAGE_ENTRIES: usize = 1_000_000;
+/// Anti-OOM backstop ONLY — not the economic anti-spam mechanism. State-growth spam is
+/// bounded economically by STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC (a refundable per-entry deposit);
+/// this cap sits far above any reachable honest holder count so it never bricks a real token.
+pub const MAX_CONTRACT_STORAGE_ENTRIES: usize = 50_000_000;
+
+/// Refundable deposit moved sender→escrow when a NEW contract_storage entry (balance/allowance)
+/// is created, and escrow→sender when a balance entry is removed (goes to zero). Pure native-QNC
+/// account MOVE — conservation preserved, never minted or burned. 0.01 QNC per entry.
+pub const STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC: u64 = 10_000_000;
+
+/// Reserved system escrow holding storage-rent deposits. Not a valid user (eon) sender address,
+/// so no user can own it or derive its key — verified against is_valid_sender_format at test time.
+pub const STORAGE_RENT_ESCROW_ADDR: &str = "system_storage_rent_escrow";
 
 /// Gas price in nanoQNC (QNet native units)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -247,6 +255,20 @@ pub mod gas_limits {
     /// Defense-in-depth: block byte limit (80MB) + block gas limit (10B) together
     /// prevent both size-based and computation-based DoS.
     pub const BLOCK_GAS_LIMIT: u64 = 10_000_000_000; // 10 billion gas units
+
+    /// Maximum cumulative WASM fuel a block may RESERVE (protocol constant).
+    /// The intrinsic gas (BLOCK_GAS_LIMIT) prices bytes/base cost, but a metered WASM call can burn
+    /// up to `gas_limit - intrinsic` fuel of real CPU while contributing only its flat intrinsic to
+    /// the gas total — so gas alone does NOT bound compute. This is a SEPARATE budget over the fuel
+    /// each contract call reserves (see `Transaction::reserved_fuel`): the producer stops filling and
+    /// every validator rejects once a block's summed reserved fuel exceeds this ceiling. Because
+    /// wasmi fuel is a deterministic instruction count, the bound is identical on every node (no fork)
+    /// and needs no execution to enforce — it reads only the signed `gas_limit`.
+    /// CALIBRATION: sized so a fully-fuel-packed block still executes AND re-validates well inside the
+    /// ~1s microblock slot on the weakest permitted node. Conservative starting value; the live-soak
+    /// fuel/sec benchmark on reference hardware is the authority for the final number. With per-tx
+    /// MAX_GAS_LIMIT=1M (≤~0.9M reserved fuel/call), 50M admits ~55 max-compute calls per block.
+    pub const BLOCK_FUEL_LIMIT: u64 = 50_000_000;
 }
 
 /// Transaction hash type
@@ -527,42 +549,8 @@ pub enum TransactionType {
         effective_height: u64,
     },
 
-    /// Per-wallet post-quantum enforcement upgrade.
-    ///
-    /// Once accepted, the sender account's `require_pq_signature` flag is set
-    /// to `true` permanently. Every subsequent transaction from this account
-    /// MUST carry a valid Dilithium3 signature in addition to the standard
-    /// Ed25519 signature, or it is rejected at apply time.
-    ///
-    /// SECURITY REQUIREMENTS
-    ///   * The submitting `Transaction` MUST have BOTH `tx.signature` (Ed25519)
-    ///     AND `tx.dilithium_signature` (Dilithium3) populated and valid. This
-    ///     proves the sender owns BOTH keypairs at the moment of upgrade —
-    ///     prevents an attacker who only has one key from locking the wallet
-    ///     into an unusable state.
-    ///   * One-way upgrade: account.require_pq_signature transitions
-    ///     `false → true` and never the reverse. Even a SetPQRequirement TX
-    ///     issued from an account already locked is a no-op.
-    ///   * Nonce monotonicity is enforced by apply path (same as any other TX).
-    ///
-    /// USE CASES
-    ///   * Exchanges, treasuries, smart-contract escrow: lock high-value
-    ///     wallets into mandatory PQ-signing in advance of CRQC arrival.
-    ///   * Privacy-conscious users: opt into post-quantum protection without
-    ///     waiting for a network-wide policy change.
-    ///   * Smart contract owners: protect contract-controlling accounts that
-    ///     hold long-lived authority.
-    ///
-    /// SCALABILITY
-    ///   * Free system-side check: one bool comparison at apply time per TX
-    ///     from a flagged account. O(1) regardless of validator count.
-    ///   * Zero impact on accounts that don't opt in.
-    SetPQRequirement {
-        // No payload fields — the upgrade is account-scoped and the sender is
-        // identified by tx.from. The transaction-level signature pair (Ed25519
-        // + Dilithium3) carries the cryptographic proof that the holder owns
-        // both keypairs.
-    },
+    // PURE DILITHIUM (F0.1): SetPQRequirement removed — post-quantum signing is now
+    // mandatory network-wide, so a per-wallet opt-in upgrade TX is obsolete.
 }
 
 /// Individual ping sample with Merkle proof
@@ -734,6 +722,182 @@ impl Default for LocalFinalizationConfig {
     }
 }
 
+/// Deterministic contract address in eon format, from the authenticated deployer + monotonic nonce
+/// with a domain separator. SINGLE SOURCE OF TRUTH — apply and every deploy-side caller (RPC/producer)
+/// derive with this exact fn so the client-returned address equals the on-chain address. Never
+/// caller-supplied (no address squatting). Eon shape keeps it valid for downstream address validation.
+pub fn derive_contract_address(from: &str, nonce: u64) -> String {
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"qnet_contract_v1");
+    hasher.update(from.as_bytes());
+    hasher.update(nonce.to_le_bytes());
+    let hash = hex::encode(hasher.finalize());
+    let part1 = &hash[0..19];
+    let part2 = &hash[19..34];
+    let checksum = hex::encode(&Sha3_256::digest(format!("{}eon{}", part1, part2).as_bytes())[..4]);
+    format!("{}eon{}{}", part1, part2, checksum)
+}
+
+/// Fail-loud read of a numeric contract_storage entry (QRC-20 balance/allowance).
+/// Absent key = 0 (never held). Present-but-unparseable = corruption: reject, NEVER coerce to 0,
+/// so silent data corruption can never mint or mask a loss. u128 so callers use checked u128 math.
+fn read_balance(store: &HashMap<String, String>, key: &str) -> Result<u128, StateError> {
+    match store.get(key) {
+        None => Ok(0),
+        Some(val) => val.parse::<u128>().map_err(|_| {
+            StateError::InvalidTransaction(format!("[REJECT][QRC20] corrupted_balance key={}", key))
+        }),
+    }
+}
+
+/// Parse a QRC-20 amount arg as u64, accepting EITHER a JSON number (as_u64) OR a JSON string
+/// (decimal, parsed as u64). String form kills the >2^53 JS-float precision limit so a client can
+/// send the full u64 range exactly; number form stays valid for small amounts. Anything else (float,
+/// bool, null, negative, overflow, non-numeric string, absent) rejects fail-loud — no silent 0.
+fn parse_amount(v: Option<&serde_json::Value>) -> Result<u64, StateError> {
+    match v {
+        Some(serde_json::Value::Number(n)) => n.as_u64().ok_or_else(|| {
+            StateError::InvalidTransaction("[REJECT][QRC20] bad_amount_arg".to_string())
+        }),
+        Some(serde_json::Value::String(s)) => s.parse::<u64>().map_err(|_| {
+            StateError::InvalidTransaction("[REJECT][QRC20] bad_amount_arg".to_string())
+        }),
+        _ => Err(StateError::InvalidTransaction("[REJECT][QRC20] bad_amount_arg".to_string())),
+    }
+}
+
+/// QRC-721 ownership move shared by transfer/transferFrom — the SINGLE place a token changes hands,
+/// so both entry points enforce identical count/deposit/approval accounting (ownership integrity).
+/// Preconditions (checked by the caller): `from` currently owns `owner_key`, and the caller is
+/// authorized. Effects: set owner_key=to; dec bal:{from} (remove+refund on 0); inc bal:{to}
+/// (new-entry deposit if needed); clear approved (refund if it existed). `payer` funds new-entry
+/// deposits (the tx sender). ALIASING-SAFE: when from==to the dec-then-reread-inc nets to a no-op and
+/// counts stay consistent, so a self-transfer can neither mint nor drop a holding.
+fn nft_move_token(
+    accounts: &mut HashMap<String, Account>,
+    contract_addr: &str,
+    payer: &str,
+    from: &str,
+    to: &str,
+    owner_key: &str,
+    approved_key: &str,
+) -> Result<(), StateError> {
+    let from_bal_key = format!("bal:{}", from);
+    let to_bal_key = format!("bal:{}", to);
+
+    // New recipient count entry ⇒ charge deposit (bound to contains_key BEFORE writes). Skip when
+    // from==to: the entry already exists (from owns the token ⇒ its count is present), so no new key.
+    let to_is_new = {
+        let store = &accounts.get(contract_addr).unwrap().contract_storage;
+        if from_bal_key != to_bal_key
+            && store.len() >= MAX_CONTRACT_STORAGE_ENTRIES && !store.contains_key(&to_bal_key) {
+            return Err(StateError::InvalidTransaction(format!(
+                "[REJECT][NFT] transfer_storage_limit_reached entries={} max={}",
+                store.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
+        }
+        from_bal_key != to_bal_key && !store.contains_key(&to_bal_key)
+    };
+    if to_is_new {
+        charge_storage_deposit(accounts, payer, 1)?;
+    }
+
+    // Ownership pointer flips first.
+    accounts.get_mut(contract_addr).unwrap()
+        .contract_storage.insert(owner_key.to_string(), to.to_string());
+
+    // Decrement from's count (checked); RE-READ + increment to's count. For from==to both operate on
+    // the same key: dec writes n-1, the reread sees n-1, inc writes n — a clean no-op, no special case.
+    let from_bal = read_balance(
+        &accounts.get(contract_addr).unwrap().contract_storage, &from_bal_key)?;
+    let new_from_bal = from_bal.checked_sub(1)
+        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][NFT] balance_underflow".into()))?;
+    accounts.get_mut(contract_addr).unwrap()
+        .contract_storage.insert(from_bal_key.clone(), new_from_bal.to_string());
+
+    let to_bal = read_balance(
+        &accounts.get(contract_addr).unwrap().contract_storage, &to_bal_key)?;
+    let new_to_bal = to_bal.checked_add(1)
+        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][NFT] balance_overflow".into()))?;
+    accounts.get_mut(contract_addr).unwrap()
+        .contract_storage.insert(to_bal_key.clone(), new_to_bal.to_string());
+
+    // Drained sender count (only when NOT a self-transfer): remove the key (no "0" residue) + refund.
+    if from_bal_key != to_bal_key && new_from_bal == 0 {
+        accounts.get_mut(contract_addr).unwrap().contract_storage.remove(&from_bal_key);
+        refund_storage_deposit(accounts, payer, 1)?;
+    }
+
+    // Clear approval on any ownership change (+refund its deposit if it existed).
+    let had_approval = accounts.get(contract_addr).unwrap()
+        .contract_storage.contains_key(approved_key);
+    if had_approval {
+        accounts.get_mut(contract_addr).unwrap().contract_storage.remove(approved_key);
+        refund_storage_deposit(accounts, payer, 1)?;
+    }
+    Ok(())
+}
+
+/// Move `n_entries` worth of storage-rent deposit from `payer` native balance to the reserved
+/// escrow — a pure account-to-account MOVE (no mint/burn). Deterministic: bound only to the count
+/// of NEW storage entries created by this op. Rejects if the payer cannot cover the deposit.
+fn charge_storage_deposit(
+    accounts: &mut HashMap<String, Account>,
+    payer: &str,
+    n_entries: u64,
+) -> Result<(), StateError> {
+    if n_entries == 0 { return Ok(()); }
+    let total = (n_entries as u128)
+        .checked_mul(STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC as u128)
+        .and_then(|t| u64::try_from(t).ok())
+        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] deposit_overflow".into()))?;
+    let payer_acct = accounts.get_mut(payer)
+        .ok_or_else(|| StateError::AccountNotFound(payer.to_string()))?;
+    if payer_acct.balance < total {
+        return Err(StateError::InvalidTransaction(format!(
+            "[REJECT][QRC20] insufficient_deposit have={} need={}", payer_acct.balance, total)));
+    }
+    payer_acct.balance -= total;
+    let escrow = accounts.entry(STORAGE_RENT_ESCROW_ADDR.to_string())
+        .or_insert_with(|| Account::new(STORAGE_RENT_ESCROW_ADDR.to_string()));
+    escrow.balance = escrow.balance.checked_add(total)
+        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] escrow_overflow".into()))?;
+    Ok(())
+}
+
+/// Refund `n_entries` worth of deposit from escrow back to `payee` when storage entries are removed.
+/// Saturating on the escrow side so it can never underflow (refund is capped at escrow holdings).
+fn refund_storage_deposit(
+    accounts: &mut HashMap<String, Account>,
+    payee: &str,
+    n_entries: u64,
+) -> Result<(), StateError> {
+    if n_entries == 0 { return Ok(()); }
+    let want = (n_entries as u128)
+        .checked_mul(STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC as u128)
+        .and_then(|t| u64::try_from(t).ok())
+        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] refund_overflow".into()))?;
+    let escrow_bal = accounts.get(STORAGE_RENT_ESCROW_ADDR).map(|a| a.balance).unwrap_or(0);
+    // CONSERVATION INVARIANT: every refundable entry is charged on creation (charge_storage_deposit),
+    // so the escrow ALWAYS holds at least the deposit for any entry now being removed. If this fails,
+    // an entry was created without a matching charge (accounting bug) or was double-refunded — FAIL
+    // LOUD and deterministically (all nodes read the same escrow balance ⇒ same reject ⇒ no fork)
+    // instead of silently paying `min(want, escrow_bal)`, which masked the break and let honest
+    // holders' refunds shrink to zero once the pool was under-funded.
+    if escrow_bal < want {
+        return Err(StateError::InvalidTransaction(format!(
+            "[REJECT][QRC20] escrow_underfunded have={} need={} — storage-deposit accounting invariant violated",
+            escrow_bal, want)));
+    }
+    if let Some(escrow) = accounts.get_mut(STORAGE_RENT_ESCROW_ADDR) {
+        escrow.balance = escrow.balance.saturating_sub(want);
+    }
+    let payee_acct = accounts.entry(payee.to_string())
+        .or_insert_with(|| Account::new(payee.to_string()));
+    payee_acct.balance = payee_acct.balance.checked_add(want)
+        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] refund_credit_overflow".into()))?;
+    Ok(())
+}
+
 impl Transaction {
     /// Calculate transaction hash as Vec<u8>
     pub fn hash(&self) -> StateResult<Vec<u8>> {
@@ -832,7 +996,36 @@ impl Transaction {
                 if !addresses.contains(pool_address) { addresses.push(pool_address.clone()); }
             }
             TransactionType::ContractCall => {
-                // tx.to (contract address) is already added above
+                // tx.to (contract address) already added above. The QRC-20 storage-rent deposit MOVES
+                // native QNC to/from the reserved escrow, so it MUST be in the lazy working set — else
+                // apply_transaction_lazy builds a fresh balance-0 escrow whose merge-back clobbers the
+                // real one (burning accrued deposits and zeroing refunds).
+                let escrow = STORAGE_RENT_ESCROW_ADDR.to_string();
+                if !addresses.contains(&escrow) { addresses.push(escrow); }
+                // WASM cross-contract access list (EIP-2930-style): the SIGNED tx declares the
+                // contracts a call may reach, so every node pre-loads the SAME working set and the
+                // VM resolves cross-calls deterministically. Harmless when the VM is gated off (the
+                // extra pre-loaded accounts merge back unchanged); capped to bound pre-load work.
+                if let Some(ref data) = self.data {
+                    if data.contains("accessList") {
+                        if let Ok(p) = serde_json::from_str::<serde_json::Value>(data) {
+                            if let Some(list) = p.get("accessList").and_then(|v| v.as_array()) {
+                                for it in list.iter().take(crate::wasm_exec::MAX_WASM_ACCESS_LIST) {
+                                    if let Some(s) = it.as_str() {
+                                        let s = s.to_string();
+                                        if !addresses.contains(&s) { addresses.push(s); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            TransactionType::ContractDeploy => {
+                // Load the derived contract account so the init-once guard sees an existing contract in
+                // the lazy path regardless of the caller-supplied tx.to.
+                let derived = derive_contract_address(&self.from, self.nonce);
+                if !addresses.contains(&derived) { addresses.push(derived); }
             }
             _ => {} // Other types only touch tx.from / tx.to
         }
@@ -1068,11 +1261,6 @@ impl Transaction {
             }
             // FIX R23-K1: Key rotation is a system operation (free gas)
             TransactionType::KeyRotation { .. } => 0,
-            // PQ-enforcement upgrade is a per-account configuration change.
-            // No fee — it is a one-time security upgrade and we do not want
-            // gas costs to deter quantum-readiness adoption. Rate-limited via
-            // per-account nonce monotonicity (one upgrade per account, ever).
-            TransactionType::SetPQRequirement {} => 0,
             // Equivocation slashing proofs: system TX, free (no gas, no balance effect).
             TransactionType::EquivocationProof { .. } => 0,
             TransactionType::VoteEquivocationProof { .. } => 0,
@@ -1095,7 +1283,35 @@ impl Transaction {
             0
         }
     }
-    
+
+    /// WASM compute (fuel) this TX is allowed to RESERVE for the metered VM — the CPU-DoS budget
+    /// unit summed against `gas_limits::BLOCK_FUEL_LIMIT` at block build and block verify.
+    /// Equals the fuel budget the apply path hands the interpreter: `gas_limit - intrinsic`
+    /// (the SAME `gas_limit.saturating_sub(compute_gas_used())` used to seed execute_wasm_calltree),
+    /// so bounding the block's summed reserved fuel bounds its worst-case interpreter work. Only a
+    /// ContractCall runs the fuel-metered VM; every other type (incl. ContractDeploy, which only
+    /// validates a bounded module) reserves none. A native QRC-20 ContractCall never reaches the VM,
+    /// so counting its reservation is merely conservative (safe over-count) — and it correctly
+    /// rewards tight `gas_limit`s. Pure function of signed fields ⇒ identical on every node.
+    pub fn reserved_fuel(&self) -> u64 {
+        match &self.tx_type {
+            TransactionType::ContractCall => self.gas_limit.saturating_sub(self.compute_gas_used()),
+            _ => 0,
+        }
+    }
+
+    /// Metered WASM-compute fee (nanoQNC) for `fuel` units this call actually burned:
+    /// `fuel * effective_gas_price`. Applied ONLY at heights >= GAS_METERING_ACTIVATION_HEIGHT (where
+    /// the flat gas refund would otherwise let a compute-heavy call pay the same flat intrinsic as a
+    /// trivial one). It is a SYMMETRIC account MOVE — subtracted from the sender's gas refund and added
+    /// to the producer's fee credit — so total supply is unchanged and conservation holds by
+    /// construction. `fuel` is a wasmi instruction count (deterministic), and effective_gas_price is a
+    /// pure fn of the signed tx, so every node computes the identical fee (no state_root split).
+    /// Zero for fuel==0, i.e. every non-WASM tx.
+    pub fn wasm_fuel_fee(&self, fuel: u64) -> u64 {
+        fuel.saturating_mul(self.effective_gas_price())
+    }
+
     /// Calculate transaction hash as hex string
     /// Get canonical serialization for hash calculation (excludes hash and signatures)
     /// PRODUCTION: Deterministic bincode serialization ensures consistent hashing
@@ -1669,12 +1885,6 @@ impl Transaction {
                 }
                 let _ = effective_height; // effective_height=0 means immediate
             }
-            TransactionType::SetPQRequirement {} => {
-                // Sender must be present (the upgrade is account-scoped).
-                // Validation of dual-signature presence happens in apply_to_state
-                // because it inspects fields on the parent Transaction struct.
-                // Empty sender is already caught at the top of `validate()`.
-            }
             TransactionType::EquivocationProof { offender, block_a, block_b, .. } => {
                 // Structural check only — the cryptographic verification (Dilithium3 over
                 // the Block_Sig_v23.1 digest against the offender's registry PK) runs at the
@@ -1709,8 +1919,15 @@ impl Transaction {
         Ok(())
     }
 
-    /// Apply transaction to state
+    /// Apply transaction to state. Non-consensus / height-agnostic callers use this
+    /// (block height 0). The WASM VM's get_block_height reads the threaded height, so
+    /// the consensus block-apply path calls `apply_to_state_at` with the real height.
     pub fn apply_to_state(&self, accounts: &mut HashMap<String, Account>) -> Result<(), StateError> {
+        self.apply_to_state_at(accounts, 0)
+    }
+
+    /// Apply transaction to state at a known block height (threaded to the WASM host).
+    pub fn apply_to_state_at(&self, accounts: &mut HashMap<String, Account>, block_height: u64) -> Result<(), StateError> {
         // SECURITY: Out-of-gas check — reject TX if compute_gas_used() > gas_limit
         // System TXs (gas_limit=0, gas_used=0) are exempt
         if self.gas_limit > 0 {
@@ -1752,39 +1969,10 @@ impl Transaction {
         // enforces presence + key binding only; signature validity is already
         // proven before apply.
         // ═══════════════════════════════════════════════════════════════════════
-        if !self.is_system_tx() {
-            if let Some(sender_account) = accounts.get(&self.from) {
-                if sender_account.require_pq_signature {
-                    // STAGE 1: presence
-                    let tx_dilithium_pk = match self.dilithium_public_key.as_ref() {
-                        Some(p) if !p.is_empty() => p,
-                        _ => {
-                            return Err(StateError::InvalidTransaction(format!(
-                                "[REJECT][PQ-LOCK] account={} require_pq_signature=true got_only_ed25519",
-                                &self.from[..self.from.len().min(20)]
-                            )));
-                        }
-                    };
-                    let has_dilithium_sig = self.dilithium_signature.as_ref().map_or(false, |s| !s.is_empty());
-                    if !has_dilithium_sig {
-                        return Err(StateError::InvalidTransaction(format!(
-                            "[REJECT][PQ-LOCK] account={} require_pq_signature=true missing_dilithium_signature",
-                            &self.from[..self.from.len().min(20)]
-                        )));
-                    }
-
-                    // STAGE 2: key binding (registered key must match)
-                    if let Some(registered_pk) = sender_account.registered_dilithium_pk() {
-                        if registered_pk != tx_dilithium_pk {
-                            return Err(StateError::InvalidTransaction(format!(
-                                "[REJECT][PQ-LOCK] account={} dilithium_pk_mismatch (TX uses unregistered key)",
-                                &self.from[..self.from.len().min(20)]
-                            )));
-                        }
-                    }
-                }
-            }
-        }
+        // PURE DILITHIUM (F0.1): the former opt-in PQ-LOCK apply-time gate is removed.
+        // Post-quantum signing is now MANDATORY for all value TX and the address itself is
+        // the from<->key binding (enforced at ingest), so a per-account opt-in flag +
+        // registered-key check is redundant. No apply-time PQ gate is needed.
 
         match &self.tx_type {
             TransactionType::Transfer { from, to, amount } => {
@@ -2028,15 +2216,10 @@ impl Transaction {
                 sender.nonce = sender.nonce.checked_add(1)
                     .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
 
-                // Compute contract address from deployer + nonce (deterministic)
-                let contract_address = if let Some(to) = &self.to {
-                    to.clone()
-                } else {
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(self.from.as_bytes());
-                    hasher.update(self.nonce.to_le_bytes());
-                    format!("contract_{}", hex::encode(&hasher.finalize()[..20]))
-                };
+                // Address is ALWAYS derived from authenticated sender + monotonic nonce with a
+                // domain separator — never caller-supplied, so a deployer cannot squat/overwrite
+                // an arbitrary address (the old self.to branch let any address be named).
+                let contract_address = derive_contract_address(&self.from, self.nonce);
 
                 // Parse tx.data to determine contract type
                 let data_str = self.data.as_ref().ok_or_else(|| {
@@ -2048,7 +2231,17 @@ impl Transaction {
                     .ok()
                     .and_then(|v| v.get("qrc20").and_then(|q| q.as_bool()))
                     .unwrap_or(false);
-                
+                // QRC-721 (NFT) is a CONTAINED standard on the SAME tx types, flagged by "qrc721": true.
+                let is_qrc721 = serde_json::from_str::<serde_json::Value>(data_str)
+                    .ok()
+                    .and_then(|v| v.get("qrc721").and_then(|q| q.as_bool()))
+                    .unwrap_or(false);
+                // Generic WASM contract, flagged by "wasm": true (P3, GATED default-OFF).
+                let is_wasm = serde_json::from_str::<serde_json::Value>(data_str)
+                    .ok()
+                    .and_then(|v| v.get("wasm").and_then(|q| q.as_bool()))
+                    .unwrap_or(false);
+
                 // Compute code hash
                 let code_hash = {
                     let mut hasher = Sha3_256::new();
@@ -2056,6 +2249,22 @@ impl Transaction {
                     hex::encode(hasher.finalize())
                 };
 
+                // INIT-ONCE: never overwrite a live deployed contract. Unreachable on honest paths
+                // (nonce-derived address is unique per (sender,nonce)) but makes overwrite of an
+                // existing token structurally impossible even under a nonce/address collision.
+                if let Some(existing) = accounts.get(&contract_address) {
+                    if existing.is_smart_contract() {
+                        return Err(StateError::InvalidTransaction(format!(
+                            "[REJECT][DEPLOY] address_already_deployed addr={}", contract_address)));
+                    }
+                }
+
+                // Refundable storage deposits owed by the deployer for entries THIS deploy creates,
+                // charged AFTER the &mut contract borrow ends (see below). QRC-20 seeds the creator's
+                // balance entry, which is refundable on drain — so it must be charged on creation like
+                // every other entry (transfer/mint), or its later removal drains the shared escrow it
+                // never paid into.
+                let mut deployer_deposit_entries: u64 = 0;
                 // Create or update the contract account in blockchain state
                 let contract = accounts.entry(contract_address.clone())
                     .or_insert_with(|| Account::new(contract_address.clone()));
@@ -2079,17 +2288,35 @@ impl Transaction {
                         let symbol = parsed.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
                         let decimals = parsed.get("decimals").and_then(|v| v.as_u64()).unwrap_or(9);
                         let initial_supply = parsed.get("initial_supply").and_then(|v| v.as_u64()).unwrap_or(0);
-                        
+                        // Supply is IMMUTABLE by default: mint/burn stay disabled unless the deployer
+                        // explicitly opts in. Absent flag ⇒ false, so an unset field can never enable them.
+                        let mintable = parsed.get("mintable").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let burnable = parsed.get("burnable").and_then(|v| v.as_bool()).unwrap_or(false);
+
                         // Token metadata — stored on-chain, readable by all nodes
                         contract.contract_storage.insert("type".to_string(), "qrc20".to_string());
                         contract.contract_storage.insert("name".to_string(), name.to_string());
                         contract.contract_storage.insert("symbol".to_string(), symbol.to_string());
                         contract.contract_storage.insert("decimals".to_string(), decimals.to_string());
+                        // Opt-in supply-mutation flags — canonical "true"/"false" strings; the mint/burn
+                        // arms gate on an exact "true" match, so any other value keeps them disabled.
+                        contract.contract_storage.insert("mintable".to_string(), mintable.to_string());
+                        contract.contract_storage.insert("burnable".to_string(), burnable.to_string());
+                        // INVARIANT: total_supply is written ONCE here. Only future mint/burn ops may
+                        // adjust it, each 1:1 with the balance delta via checked arithmetic. Conservative
+                        // ops (transfer/transferFrom/approve) must NEVER write it.
                         contract.contract_storage.insert("total_supply".to_string(), initial_supply.to_string());
-                        // Creator receives initial supply — ON-CHAIN balance
-                        contract.contract_storage.insert(
-                            format!("balance:{}", self.from), initial_supply.to_string()
-                        );
+                        // Creator receives initial supply — ON-CHAIN balance. Materialize (and charge
+                        // the refundable deposit for) the balance entry ONLY when non-zero: a zero entry
+                        // is pointless, and an unbacked entry whose later removal refunds would drain the
+                        // shared escrow. A creator who starts at 0 gets a charged entry on first receipt
+                        // via the transfer arm, so every live entry stays backed 1:1.
+                        if initial_supply > 0 {
+                            contract.contract_storage.insert(
+                                format!("balance:{}", self.from), initial_supply.to_string()
+                            );
+                            deployer_deposit_entries = 1;
+                        }
                         
                         if is_info_log() {
                             println!("[INFO][TOKEN] qrc20_deployed name={} symbol={} supply={} addr={} by={}",
@@ -2097,6 +2324,48 @@ impl Transaction {
                                 &contract_address[..contract_address.len().min(20)],
                                 &self.from[..self.from.len().min(16)]);
                         }
+                    }
+                } else if is_qrc721 {
+                    // QRC-721 (NFT) init — CONTAINED standard modeled on QRC-20 but with NO total_supply
+                    // (NFTs are minted individually via owner-only mint). Ownership lives in per-token
+                    // "owner:{token_id}" entries created at mint; the "deployer" gates mint authority.
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data_str) {
+                        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let symbol = parsed.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+
+                        contract.contract_storage.insert("type".to_string(), "qrc721".to_string());
+                        contract.contract_storage.insert("name".to_string(), name.to_string());
+                        contract.contract_storage.insert("symbol".to_string(), symbol.to_string());
+                        // "deployer" is written by the base-metadata block above; mint gates on it.
+
+                        if is_info_log() {
+                            println!("[INFO][NFT] qrc721_deployed name={} symbol={} addr={} by={}",
+                                name, symbol,
+                                &contract_address[..contract_address.len().min(20)],
+                                &self.from[..self.from.len().min(16)]);
+                        }
+                    }
+                } else if is_wasm {
+                    // Generic WASM contract deploy (P3, GATED default-OFF). Disabled →
+                    // reject, so no type=="wasm" contract can exist and the call-side
+                    // wasm path stays unreachable (whole VM path inert). When enabled:
+                    // validate the module (float-free + bounded) and store the code.
+                    if !crate::wasm_exec::wasm_vm_enabled() {
+                        return Err(StateError::InvalidTransaction("[REJECT][VM] wasm_disabled".to_string()));
+                    }
+                    let code_hex = serde_json::from_str::<serde_json::Value>(data_str).ok()
+                        .and_then(|v| v.get("code").and_then(|c| c.as_str().map(String::from)))
+                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][VM] missing_code".to_string()))?;
+                    let code = hex::decode(&code_hex)
+                        .map_err(|_| StateError::InvalidTransaction("[REJECT][VM] code_not_hex".to_string()))?;
+                    qnet_vm::validate_wasm_module(&code, &qnet_vm::VmLimits::default())
+                        .map_err(|e| StateError::InvalidTransaction(format!("[REJECT][VM] {}", e)))?;
+                    contract.contract_storage.insert("type".to_string(), "wasm".to_string());
+                    contract.contract_storage.insert("code".to_string(), code_hex);
+                    if is_info_log() {
+                        println!("[INFO][VM] wasm_deployed addr={} code_bytes={} by={}",
+                            &contract_address[..contract_address.len().min(20)], code.len(),
+                            &self.from[..self.from.len().min(16)]);
                     }
                 } else {
                     // Generic contract (WASM) — just store code_hash + deployer
@@ -2106,6 +2375,15 @@ impl Transaction {
                             &code_hash[..8], &code_hash[code_hash.len()-8..],
                             fee, &self.from[..self.from.len().min(16)]);
                     }
+                }
+
+                // The &mut contract borrow is now released — charge the deployer's refundable storage
+                // deposit for the balance entry created above (QRC-20 with non-zero supply). Symmetric
+                // with transfer/mint (charge on create, refund on remove). On insufficient balance this
+                // Err rolls back the whole deploy (lazy-apply discards the working copy), so no entry is
+                // ever left unbacked. Deterministic: bound to entries created, not to wall state.
+                if deployer_deposit_entries > 0 {
+                    charge_storage_deposit(accounts, &self.from, deployer_deposit_entries)?;
                 }
             }
             TransactionType::ContractCall => {
@@ -2151,25 +2429,37 @@ impl Transaction {
                     StateError::InvalidTransaction("[REJECT][CONTRACT] missing_to_address".to_string())
                 })?.clone();
 
-                let contract = accounts.entry(contract_addr.clone())
-                    .or_insert_with(|| Account::new(contract_addr.clone()));
-
-                if !contract.is_contract {
-                    return Err(StateError::InvalidTransaction(format!(
-                        "[REJECT][CONTRACT] not_a_contract addr={}", contract_addr
-                    )));
-                }
-
-                // Credit contract with sent value (if any)
-                if self.amount > 0 {
-                    contract.balance = contract.balance.checked_add(self.amount)
-                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][CONTRACT] balance_overflow".into()))?;
+                // Ensure the contract account exists, then verify + credit value in a short borrow
+                // scope. We deliberately do NOT hold a &mut contract across the QRC-20 dispatch:
+                // the refundable storage deposit is a native-QNC MOVE between OTHER accounts (sender
+                // and escrow), so each contract_storage read/write is re-acquired in its own scope.
+                {
+                    let contract = accounts.entry(contract_addr.clone())
+                        .or_insert_with(|| Account::new(contract_addr.clone()));
+                    if !contract.is_contract {
+                        return Err(StateError::InvalidTransaction(format!(
+                            "[REJECT][CONTRACT] not_a_contract addr={}", contract_addr
+                        )));
+                    }
+                    if self.amount > 0 {
+                        contract.balance = contract.balance.checked_add(self.amount)
+                            .ok_or_else(|| StateError::InvalidTransaction("[REJECT][CONTRACT] balance_overflow".into()))?;
+                    }
                 }
 
                 // v3.40: Execute QRC-20 operations ON-CHAIN (deterministic on all nodes)
-                let is_qrc20 = contract.contract_storage.get("type")
+                let is_qrc20 = accounts.get(&contract_addr)
+                    .and_then(|c| c.contract_storage.get("type"))
                     .map(|t| t == "qrc20").unwrap_or(false);
-                
+                // QRC-721 (NFT) dispatch — parallel to qrc20, keyed on the same contract_storage["type"].
+                let is_qrc721 = accounts.get(&contract_addr)
+                    .and_then(|c| c.contract_storage.get("type"))
+                    .map(|t| t == "qrc721").unwrap_or(false);
+                // Generic WASM contract dispatch (P3, GATED default-OFF).
+                let is_wasm = accounts.get(&contract_addr)
+                    .and_then(|c| c.contract_storage.get("type"))
+                    .map(|t| t == "wasm").unwrap_or(false);
+
                 if is_qrc20 {
                     if let Some(ref data) = self.data {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
@@ -2182,61 +2472,63 @@ impl Transaction {
                                     let to = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
                                         .ok_or_else(|| StateError::InvalidTransaction(
                                             "[REJECT][QRC20] transfer_missing_to_arg".to_string()))?;
-                                    let amount = args.and_then(|a| a.get(1)).and_then(|v| v.as_u64())
-                                        .ok_or_else(|| StateError::InvalidTransaction(
-                                            "[REJECT][QRC20] transfer_missing_amount_arg".to_string()))?;
+                                    // amount accepted as string OR number (string kills the >2^53 limit).
+                                    let amount = parse_amount(args.and_then(|a| a.get(1)))?;
 
                                     if amount == 0 {
                                         return Err(StateError::InvalidTransaction("[REJECT][QRC20] zero_amount_transfer".into()));
                                     }
 
                                     let from_key = format!("balance:{}", sender_addr);
-                                    // FIX R24-L1: Log corrupted contract_storage instead of silent 0.
-                                    // unwrap_or(0) masked data corruption — now we detect and log it.
-                                    let from_bal: u64 = match contract.contract_storage.get(&from_key) {
-                                        Some(val) => match val.parse::<u64>() {
-                                            Ok(b) => b,
-                                            Err(_) => {
-                                                println!("[ERR][QRC20] corrupted_balance key={} val={}", from_key, &val[..32.min(val.len())]);
-                                                return Err(StateError::InvalidTransaction(
-                                                    format!("[REJECT][QRC20] corrupted_balance key={}", from_key)));
-                                            }
-                                        },
-                                        None => 0,
-                                    };
-                                    
+                                    let to_key = format!("balance:{}", to);
+                                    let amount = amount as u128;
+
+                                    // ALIASING-SAFE DEBIT-THEN-CREDIT-WITH-REREAD on the single live map.
+                                    // Read from_bal; debit and WRITE it first; then RE-READ to_key from the
+                                    // now-updated map and write the credit. When from_key == to_key (self-
+                                    // transfer) the reread sees the debited value and the credit nets to a
+                                    // no-op automatically — no special case, so the alias mint bug cannot exist.
+                                    let from_bal = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, &from_key)?;
                                     if from_bal < amount {
                                         return Err(StateError::InvalidTransaction(format!(
                                             "[REJECT][QRC20] insufficient_balance have={} need={}", from_bal, amount)));
                                     }
-                                    
-                                    let to_key = format!("balance:{}", to);
-                                    let to_bal: u64 = match contract.contract_storage.get(&to_key) {
-                                        Some(val) => match val.parse::<u64>() {
-                                            Ok(b) => b,
-                                            Err(_) => {
-                                                println!("[ERR][QRC20] corrupted_balance key={} val={}", to_key, &val[..32.min(val.len())]);
-                                                return Err(StateError::InvalidTransaction(
-                                                    format!("[REJECT][QRC20] corrupted_balance key={}", to_key)));
-                                            }
-                                        },
-                                        None => 0,
-                                    };
-
-                                    // v3.42: Cap contract_storage to prevent unbounded Merkle growth
-                                    // Only reject if this is a NEW holder (existing holders can always receive)
-                                    if to_bal == 0 && contract.contract_storage.len() >= MAX_CONTRACT_STORAGE_ENTRIES {
-                                        return Err(StateError::InvalidTransaction(format!(
-                                            "[REJECT][QRC20] storage_limit_reached entries={} max={}",
-                                            contract.contract_storage.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
-                                    }
-                                    
-                                    let new_to_bal = to_bal.checked_add(amount)
-                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] recipient_balance_overflow".into()))?;
                                     let new_from_bal = from_bal.checked_sub(amount)
-                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] sender_balance_underflow".into()))?;
-                                    contract.contract_storage.insert(from_key, new_from_bal.to_string());
-                                    contract.contract_storage.insert(to_key, new_to_bal.to_string());
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] balance_overflow".into()))?;
+
+                                    // NEW-entry deposit accounting bound to `store.contains_key` BEFORE writes
+                                    // (NOT value==0), so all nodes agree. Backstop cap only as anti-OOM.
+                                    let to_is_new = {
+                                        let store = &accounts.get(&contract_addr).unwrap().contract_storage;
+                                        if store.len() >= MAX_CONTRACT_STORAGE_ENTRIES && !store.contains_key(&to_key) {
+                                            return Err(StateError::InvalidTransaction(format!(
+                                                "[REJECT][QRC20] storage_limit_reached entries={} max={}",
+                                                store.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
+                                        }
+                                        !store.contains_key(&to_key)
+                                    };
+                                    // New recipient entry ⇒ charge refundable deposit before writing it.
+                                    if to_is_new {
+                                        charge_storage_deposit(accounts, &sender_addr, 1)?;
+                                    }
+
+                                    // Debit from_key first.
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert(from_key.clone(), new_from_bal.to_string());
+                                    // Re-read to_key from the updated map, credit (always > 0 since amount > 0), write.
+                                    let to_bal = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, &to_key)?;
+                                    let new_to_bal = to_bal.checked_add(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] balance_overflow".into()))?;
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert(to_key.clone(), new_to_bal.to_string());
+                                    // Sender entry drained to zero (only when NOT aliased to to_key, i.e. not a
+                                    // self-transfer): remove the key (no "0" residue) and refund its deposit.
+                                    if from_key != to_key && new_from_bal == 0 {
+                                        accounts.get_mut(&contract_addr).unwrap().contract_storage.remove(&from_key);
+                                        refund_storage_deposit(accounts, &sender_addr, 1)?;
+                                    }
 
                                     if is_info_log() {
                                         println!("[INFO][QRC20] transfer {} -> {} amount={} contract={}",
@@ -2250,22 +2542,27 @@ impl Transaction {
                                     let spender = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
                                         .ok_or_else(|| StateError::InvalidTransaction(
                                             "[REJECT][QRC20] approve_missing_spender_arg".to_string()))?;
-                                    let amount = args.and_then(|a| a.get(1)).and_then(|v| v.as_u64())
-                                        .ok_or_else(|| StateError::InvalidTransaction(
-                                            "[REJECT][QRC20] approve_missing_amount_arg".to_string()))?;
-                                    
+                                    let amount = parse_amount(args.and_then(|a| a.get(1)))?;
+
                                     let allowance_key = format!("allowance:{}:{}", sender_addr, spender);
-                                    
-                                    // v3.42: Cap contract_storage — only reject NEW allowance entries
-                                    let is_new_entry = !contract.contract_storage.contains_key(&allowance_key);
-                                    if is_new_entry && contract.contract_storage.len() >= MAX_CONTRACT_STORAGE_ENTRIES {
-                                        return Err(StateError::InvalidTransaction(format!(
-                                            "[REJECT][QRC20] approve_storage_limit_reached entries={} max={}",
-                                            contract.contract_storage.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
+
+                                    // NEW allowance entry ⇒ charge refundable deposit (bound to contains_key).
+                                    let is_new_entry = {
+                                        let store = &accounts.get(&contract_addr).unwrap().contract_storage;
+                                        if store.len() >= MAX_CONTRACT_STORAGE_ENTRIES && !store.contains_key(&allowance_key) {
+                                            return Err(StateError::InvalidTransaction(format!(
+                                                "[REJECT][QRC20] approve_storage_limit_reached entries={} max={}",
+                                                store.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
+                                        }
+                                        !store.contains_key(&allowance_key)
+                                    };
+                                    if is_new_entry {
+                                        charge_storage_deposit(accounts, &sender_addr, 1)?;
                                     }
-                                    
-                                    contract.contract_storage.insert(allowance_key, amount.to_string());
-                                    
+
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert(allowance_key, amount.to_string());
+
                                     if is_info_log() {
                                         println!("[INFO][QRC20] approve owner={} spender={} amount={}",
                                             &sender_addr[..sender_addr.len().min(16)],
@@ -2280,63 +2577,71 @@ impl Transaction {
                                     let to = args.and_then(|a| a.get(1)).and_then(|v| v.as_str())
                                         .ok_or_else(|| StateError::InvalidTransaction(
                                             "[REJECT][QRC20] transfer_from_missing_to_arg".to_string()))?;
-                                    let amount = args.and_then(|a| a.get(2)).and_then(|v| v.as_u64())
-                                        .ok_or_else(|| StateError::InvalidTransaction(
-                                            "[REJECT][QRC20] transfer_from_missing_amount_arg".to_string()))?;
+                                    let amount = parse_amount(args.and_then(|a| a.get(2)))?;
 
                                     if amount == 0 {
                                         return Err(StateError::InvalidTransaction("[REJECT][QRC20] zero_amount_transfer".into()));
                                     }
 
-                                    // Check allowance
+                                    let amount = amount as u128;
                                     let allowance_key = format!("allowance:{}:{}", from, sender_addr);
-                                    let allowance: u64 = contract.contract_storage.get(&allowance_key)
-                                        .and_then(|s| s.parse().ok()).unwrap_or(0);
+                                    let from_key = format!("balance:{}", from);
+                                    let to_key = format!("balance:{}", to);
+
+                                    // TVC-4: ALL allowance + balance reads go through the fail-loud helper
+                                    // (absent=0, corrupt=reject, NEVER coerce-to-0 which masked corruption).
+                                    let allowance = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, &allowance_key)?;
                                     if allowance < amount {
                                         return Err(StateError::InvalidTransaction(format!(
                                             "[REJECT][QRC20] insufficient_allowance have={} need={}", allowance, amount)));
                                     }
-                                    
-                                    // Check balance of 'from'
-                                    let from_key = format!("balance:{}", from);
-                                    let from_bal: u64 = contract.contract_storage.get(&from_key)
-                                        .and_then(|s| s.parse().ok()).unwrap_or(0);
+                                    let from_bal = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, &from_key)?;
                                     if from_bal < amount {
                                         return Err(StateError::InvalidTransaction(format!(
                                             "[REJECT][QRC20] transfer_from_insufficient_balance have={} need={}", from_bal, amount)));
                                     }
-                                    
-                                    // Execute transfer + deduct allowance
-                                    let to_key = format!("balance:{}", to);
-                                    let to_bal: u64 = match contract.contract_storage.get(&to_key) {
-                                        Some(val) => match val.parse::<u64>() {
-                                            Ok(b) => b,
-                                            Err(_) => {
-                                                println!("[ERR][QRC20] corrupted_balance key={} val={}", to_key, &val[..32.min(val.len())]);
-                                                return Err(StateError::InvalidTransaction(
-                                                    format!("[REJECT][QRC20] corrupted_balance key={}", to_key)));
-                                            }
-                                        },
-                                        None => 0,
-                                    };
-
-                                    // v3.42: Cap contract_storage — only reject if NEW holder
-                                    if to_bal == 0 && contract.contract_storage.len() >= MAX_CONTRACT_STORAGE_ENTRIES {
-                                        return Err(StateError::InvalidTransaction(format!(
-                                            "[REJECT][QRC20] transfer_from_storage_limit_reached entries={} max={}",
-                                            contract.contract_storage.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
-                                    }
-                                    
-                                    let new_to_bal = to_bal.checked_add(amount)
-                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] recipient_balance_overflow".into()))?;
                                     let new_from_bal = from_bal.checked_sub(amount)
-                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] sender_balance_underflow".into()))?;
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] balance_overflow".into()))?;
                                     let new_allowance = allowance.checked_sub(amount)
-                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] allowance_underflow".into()))?;
-                                    contract.contract_storage.insert(from_key, new_from_bal.to_string());
-                                    contract.contract_storage.insert(to_key, new_to_bal.to_string());
-                                    contract.contract_storage.insert(allowance_key, new_allowance.to_string());
-                                    
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] balance_overflow".into()))?;
+
+                                    // NEW recipient entry ⇒ charge refundable deposit (bound to contains_key).
+                                    // Deposit payer is the tx sender (the spender), consistent with the fee payer.
+                                    let to_is_new = {
+                                        let store = &accounts.get(&contract_addr).unwrap().contract_storage;
+                                        if store.len() >= MAX_CONTRACT_STORAGE_ENTRIES && !store.contains_key(&to_key) {
+                                            return Err(StateError::InvalidTransaction(format!(
+                                                "[REJECT][QRC20] transfer_from_storage_limit_reached entries={} max={}",
+                                                store.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
+                                        }
+                                        !store.contains_key(&to_key)
+                                    };
+                                    if to_is_new {
+                                        charge_storage_deposit(accounts, &sender_addr, 1)?;
+                                    }
+
+                                    // ALIASING-SAFE DEBIT-THEN-CREDIT-WITH-REREAD: debit from_key, then re-read
+                                    // to_key from the updated map. from==to nets to a no-op with no special case.
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert(from_key.clone(), new_from_bal.to_string());
+                                    let to_bal = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, &to_key)?;
+                                    let new_to_bal = to_bal.checked_add(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] balance_overflow".into()))?;
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert(to_key.clone(), new_to_bal.to_string());
+                                    // Drained sender entry (not a self-transfer): remove + refund deposit.
+                                    if from_key != to_key && new_from_bal == 0 {
+                                        accounts.get_mut(&contract_addr).unwrap().contract_storage.remove(&from_key);
+                                        refund_storage_deposit(accounts, &sender_addr, 1)?;
+                                    }
+                                    // Allowance decrement (checked); allowance keys are never deposit-refunded
+                                    // here — only balance entries participate in the zero→remove refund path.
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert(allowance_key, new_allowance.to_string());
+
                                     if is_info_log() {
                                         println!("[INFO][QRC20] transferFrom {} -> {} amount={} spender={}",
                                             &from[..from.len().min(16)],
@@ -2344,19 +2649,434 @@ impl Transaction {
                                             &sender_addr[..sender_addr.len().min(16)]);
                                     }
                                 }
-                                _ => {
-                                    // Unknown QRC-20 method — record as generic call
-                                    if is_debug_log() {
-                                        println!("[DBG][QRC20] unknown_method={} contract={}",
-                                            method, &contract_addr[..contract_addr.len().min(16)]);
+                                "mint" => {
+                                    // QRC-20 mint: owner-only supply increase, ONLY on an opt-in mintable token.
+                                    // Gate on exact "true"; absent/any-other value ⇒ disabled (immutable supply).
+                                    let mintable = accounts.get(&contract_addr).unwrap()
+                                        .contract_storage.get("mintable").map(|v| v == "true").unwrap_or(false);
+                                    if !mintable {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "[REJECT][QRC20] mint_disabled contract={}", contract_addr)));
                                     }
+                                    // Only the recorded deployer may mint; absent deployer ⇒ reject (never mint).
+                                    let deployer = accounts.get(&contract_addr).unwrap()
+                                        .contract_storage.get("deployer").cloned()
+                                        .ok_or_else(|| StateError::InvalidTransaction(
+                                            "[REJECT][QRC20] mint_not_owner".to_string()))?;
+                                    if sender_addr != deployer {
+                                        return Err(StateError::InvalidTransaction(
+                                            "[REJECT][QRC20] mint_not_owner".to_string()));
+                                    }
+
+                                    let to = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
+                                        .ok_or_else(|| StateError::InvalidTransaction(
+                                            "[REJECT][QRC20] mint_missing_to_arg".to_string()))?;
+                                    let amount = parse_amount(args.and_then(|a| a.get(1)))?;
+                                    if amount == 0 {
+                                        return Err(StateError::InvalidTransaction("[REJECT][QRC20] zero_amount_mint".into()));
+                                    }
+
+                                    let to_key = format!("balance:{}", to);
+                                    let amount = amount as u128;
+
+                                    // NEW-entry deposit accounting bound to contains_key BEFORE the write
+                                    // (same MAX guard as transfer), so all nodes agree deterministically.
+                                    let to_is_new = {
+                                        let store = &accounts.get(&contract_addr).unwrap().contract_storage;
+                                        if store.len() >= MAX_CONTRACT_STORAGE_ENTRIES && !store.contains_key(&to_key) {
+                                            return Err(StateError::InvalidTransaction(format!(
+                                                "[REJECT][QRC20] mint_storage_limit_reached entries={} max={}",
+                                                store.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
+                                        }
+                                        !store.contains_key(&to_key)
+                                    };
+                                    if to_is_new {
+                                        charge_storage_deposit(accounts, &sender_addr, 1)?;
+                                    }
+
+                                    // Aliasing-safe: re-read to_key from the live map, credit (checked), write.
+                                    let to_bal = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, &to_key)?;
+                                    let new_to_bal = to_bal.checked_add(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] balance_overflow".into()))?;
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert(to_key.clone(), new_to_bal.to_string());
+
+                                    // total_supply 1:1 with the balance delta (checked). Mint is the only op
+                                    // besides burn allowed to touch it — see the deploy-time INVARIANT.
+                                    let supply = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, "total_supply")?;
+                                    let new_supply = supply.checked_add(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] supply_overflow".into()))?;
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert("total_supply".to_string(), new_supply.to_string());
+
+                                    if is_info_log() {
+                                        println!("[INFO][QRC20] mint to={} amount={} supply={} contract={}",
+                                            &to[..to.len().min(16)], amount, new_supply,
+                                            &contract_addr[..contract_addr.len().min(16)]);
+                                    }
+                                }
+                                "burn" => {
+                                    // QRC-20 burn: holder destroys their OWN tokens (no owner check), ONLY on
+                                    // an opt-in burnable token. Gate on exact "true"; else disabled.
+                                    let burnable = accounts.get(&contract_addr).unwrap()
+                                        .contract_storage.get("burnable").map(|v| v == "true").unwrap_or(false);
+                                    if !burnable {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "[REJECT][QRC20] burn_disabled contract={}", contract_addr)));
+                                    }
+
+                                    let amount = parse_amount(args.and_then(|a| a.get(0)))?;
+                                    if amount == 0 {
+                                        return Err(StateError::InvalidTransaction("[REJECT][QRC20] zero_amount_burn".into()));
+                                    }
+
+                                    let from_key = format!("balance:{}", sender_addr);
+                                    let amount = amount as u128;
+
+                                    // Debit the sender's own balance (checked). Reject if it cannot cover.
+                                    let from_bal = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, &from_key)?;
+                                    if from_bal < amount {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "[REJECT][QRC20] insufficient_balance have={} need={}", from_bal, amount)));
+                                    }
+                                    let new_from_bal = from_bal.checked_sub(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] balance_overflow".into()))?;
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert(from_key.clone(), new_from_bal.to_string());
+                                    // Drained-to-zero entry: remove the key (no "0" residue) + refund deposit,
+                                    // mirroring transfer's drained-entry path.
+                                    if new_from_bal == 0 {
+                                        accounts.get_mut(&contract_addr).unwrap().contract_storage.remove(&from_key);
+                                        refund_storage_deposit(accounts, &sender_addr, 1)?;
+                                    }
+
+                                    // total_supply 1:1 with the balance delta (checked). balance <= supply
+                                    // always holds, so this cannot underflow — checked as defense-in-depth.
+                                    let supply = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, "total_supply")?;
+                                    let new_supply = supply.checked_sub(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] supply_underflow".into()))?;
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert("total_supply".to_string(), new_supply.to_string());
+
+                                    if is_info_log() {
+                                        println!("[INFO][QRC20] burn from={} amount={} supply={} contract={}",
+                                            &sender_addr[..sender_addr.len().min(16)], amount, new_supply,
+                                            &contract_addr[..contract_addr.len().min(16)]);
+                                    }
+                                }
+                                _ => {
+                                    // Unknown method: fail-loud so a typo/unsupported call cannot silently
+                                    // succeed after the fee was already charged.
+                                    return Err(StateError::InvalidTransaction(format!(
+                                        "[REJECT][QRC20] unknown_method method={} contract={}", method, contract_addr)));
                                 }
                             }
                         }
                     }
+                } else if is_qrc721 {
+                    // QRC-721 (NFT) ON-CHAIN dispatch. Ownership integrity is the #1 property:
+                    // no path lets a non-owner/non-approved move a token, and mint cannot overwrite
+                    // an existing owner. token_id is a STRING (no numeric-precision limit); addresses
+                    // are strings. Per-token ownership lives in "owner:{token_id}"; per-owner holdings
+                    // count in "bal:{addr}" (via read_balance, checked); approvals in "approved:{token_id}".
+                    if let Some(ref data) = self.data {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                            let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                            let args = parsed.get("args");
+
+                            // token_id is ALWAYS a string arg — reject non-string fail-loud so a numeric
+                            // (float-lossy) id can never alias a different token's key.
+                            let token_id_at = |i: usize| -> Result<String, StateError> {
+                                args.and_then(|a| a.get(i)).and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .ok_or_else(|| StateError::InvalidTransaction(
+                                        "[REJECT][NFT] bad_token_id_arg".to_string()))
+                            };
+                            let addr_at = |i: usize| -> Result<String, StateError> {
+                                args.and_then(|a| a.get(i)).and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .ok_or_else(|| StateError::InvalidTransaction(
+                                        "[REJECT][NFT] bad_address_arg".to_string()))
+                            };
+
+                            match method {
+                                "mint" => {
+                                    // OWNER-ONLY: only the recorded deployer may mint. Absent deployer ⇒
+                                    // reject (never mint), mirroring qrc20 mint's fail-loud owner gate.
+                                    let deployer = accounts.get(&contract_addr).unwrap()
+                                        .contract_storage.get("deployer").cloned()
+                                        .ok_or_else(|| StateError::InvalidTransaction(
+                                            "[REJECT][NFT] mint_not_owner".to_string()))?;
+                                    if sender_addr != deployer {
+                                        return Err(StateError::InvalidTransaction(
+                                            "[REJECT][NFT] mint_not_owner".to_string()));
+                                    }
+
+                                    let to = addr_at(0)?;
+                                    let token_id = token_id_at(1)?;
+                                    let owner_key = format!("owner:{}", token_id);
+                                    let bal_key = format!("bal:{}", to);
+
+                                    // A token may be minted ONCE: existing owner ⇒ reject (no overwrite).
+                                    if accounts.get(&contract_addr).unwrap()
+                                        .contract_storage.contains_key(&owner_key) {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "[REJECT][NFT] already_minted token_id={}", token_id)));
+                                    }
+
+                                    // Deposit accounting bound to contains_key BEFORE writes (all nodes
+                                    // agree). owner_key is ALWAYS new here; bal_key new only for a first-
+                                    // time holder. MAX guard gates each new key as anti-OOM backstop.
+                                    let bal_is_new = {
+                                        let store = &accounts.get(&contract_addr).unwrap().contract_storage;
+                                        // owner_key always new (checked above) + bal_key if absent.
+                                        let new_entries = 1 + if store.contains_key(&bal_key) { 0 } else { 1 };
+                                        if store.len().saturating_add(new_entries) > MAX_CONTRACT_STORAGE_ENTRIES {
+                                            return Err(StateError::InvalidTransaction(format!(
+                                                "[REJECT][NFT] mint_storage_limit_reached entries={} max={}",
+                                                store.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
+                                        }
+                                        !store.contains_key(&bal_key)
+                                    };
+                                    // Charge one deposit for owner_key (always) + one for bal_key if new.
+                                    charge_storage_deposit(accounts, &sender_addr, 1)?;
+                                    if bal_is_new {
+                                        charge_storage_deposit(accounts, &sender_addr, 1)?;
+                                    }
+
+                                    // Owner count for `to`: read (checked_add 1), write.
+                                    let bal = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, &bal_key)?;
+                                    let new_bal = bal.checked_add(1)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][NFT] balance_overflow".into()))?;
+                                    {
+                                        let store = &mut accounts.get_mut(&contract_addr).unwrap().contract_storage;
+                                        store.insert(owner_key, to.clone());
+                                        store.insert(bal_key, new_bal.to_string());
+                                    }
+
+                                    if is_info_log() {
+                                        println!("[INFO][NFT] mint to={} token_id={} contract={}",
+                                            &to[..to.len().min(16)], token_id,
+                                            &contract_addr[..contract_addr.len().min(16)]);
+                                    }
+                                }
+                                "transfer" => {
+                                    // Caller must own the token. Absent owner ⇒ not_owner (fail-loud).
+                                    let to = addr_at(0)?;
+                                    let token_id = token_id_at(1)?;
+                                    let owner_key = format!("owner:{}", token_id);
+                                    let approved_key = format!("approved:{}", token_id);
+
+                                    let cur_owner = accounts.get(&contract_addr).unwrap()
+                                        .contract_storage.get(&owner_key).cloned();
+                                    if cur_owner.as_deref() != Some(sender_addr.as_str()) {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "[REJECT][NFT] not_owner token_id={}", token_id)));
+                                    }
+
+                                    nft_move_token(
+                                        accounts, &contract_addr, &sender_addr, &sender_addr, &to,
+                                        &owner_key, &approved_key)?;
+
+                                    if is_info_log() {
+                                        println!("[INFO][NFT] transfer {} -> {} token_id={} contract={}",
+                                            &sender_addr[..sender_addr.len().min(16)],
+                                            &to[..to.len().min(16)], token_id,
+                                            &contract_addr[..contract_addr.len().min(16)]);
+                                    }
+                                }
+                                "approve" => {
+                                    // Caller must own the token to approve a spender for it.
+                                    let spender = addr_at(0)?;
+                                    let token_id = token_id_at(1)?;
+                                    let owner_key = format!("owner:{}", token_id);
+                                    let approved_key = format!("approved:{}", token_id);
+
+                                    let cur_owner = accounts.get(&contract_addr).unwrap()
+                                        .contract_storage.get(&owner_key).cloned();
+                                    if cur_owner.as_deref() != Some(sender_addr.as_str()) {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "[REJECT][NFT] approve_not_owner token_id={}", token_id)));
+                                    }
+
+                                    // New approval entry ⇒ charge refundable deposit (bound to contains_key).
+                                    let is_new_entry = {
+                                        let store = &accounts.get(&contract_addr).unwrap().contract_storage;
+                                        if store.len() >= MAX_CONTRACT_STORAGE_ENTRIES && !store.contains_key(&approved_key) {
+                                            return Err(StateError::InvalidTransaction(format!(
+                                                "[REJECT][NFT] approve_storage_limit_reached entries={} max={}",
+                                                store.len(), MAX_CONTRACT_STORAGE_ENTRIES)));
+                                        }
+                                        !store.contains_key(&approved_key)
+                                    };
+                                    if is_new_entry {
+                                        charge_storage_deposit(accounts, &sender_addr, 1)?;
+                                    }
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert(approved_key, spender.clone());
+
+                                    if is_info_log() {
+                                        println!("[INFO][NFT] approve owner={} spender={} token_id={}",
+                                            &sender_addr[..sender_addr.len().min(16)],
+                                            &spender[..spender.len().min(16)], token_id);
+                                    }
+                                }
+                                "transferFrom" | "transfer_from" => {
+                                    let from = addr_at(0)?;
+                                    let to = addr_at(1)?;
+                                    let token_id = token_id_at(2)?;
+                                    let owner_key = format!("owner:{}", token_id);
+                                    let approved_key = format!("approved:{}", token_id);
+
+                                    // Token must currently be owned by `from`.
+                                    let cur_owner = accounts.get(&contract_addr).unwrap()
+                                        .contract_storage.get(&owner_key).cloned();
+                                    if cur_owner.as_deref() != Some(from.as_str()) {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "[REJECT][NFT] transfer_from_wrong_owner token_id={}", token_id)));
+                                    }
+                                    // Sender must be authorized: the approved spender OR the owner itself.
+                                    let approved = accounts.get(&contract_addr).unwrap()
+                                        .contract_storage.get(&approved_key).cloned();
+                                    let authorized = approved.as_deref() == Some(sender_addr.as_str())
+                                        || sender_addr == from;
+                                    if !authorized {
+                                        return Err(StateError::InvalidTransaction(format!(
+                                            "[REJECT][NFT] transfer_from_not_approved token_id={}", token_id)));
+                                    }
+
+                                    nft_move_token(
+                                        accounts, &contract_addr, &sender_addr, &from, &to,
+                                        &owner_key, &approved_key)?;
+
+                                    if is_info_log() {
+                                        println!("[INFO][NFT] transferFrom {} -> {} token_id={} spender={}",
+                                            &from[..from.len().min(16)],
+                                            &to[..to.len().min(16)], token_id,
+                                            &sender_addr[..sender_addr.len().min(16)]);
+                                    }
+                                }
+                                _ => {
+                                    // Unknown method: fail-loud, mirroring qrc20.
+                                    return Err(StateError::InvalidTransaction(format!(
+                                        "[REJECT][NFT] unknown_method method={} contract={}", method, contract_addr)));
+                                }
+                            }
+                        }
+                    }
+                } else if is_wasm {
+                    // Generic WASM contract call (P3, GATED default-OFF). When enabled:
+                    // run the (possibly cross-contract) call tree over the access-list
+                    // working set, commit EACH contract's delta ONLY on a non-trap tree;
+                    // a trap consumes the fee (charged above) and commits nothing
+                    // (call-level atomicity; reentrancy + depth bounded inside qnet_vm).
+                    //
+                    // The gate Err below is defense-in-depth and unreachable on a from-genesis
+                    // network while gated: reaching this branch needs a type=="wasm" contract,
+                    // which the deploy path (same compile-time flag) cannot create when OFF. And
+                    // even if hit, the fee charged above does NOT persist — the lazy-apply caller
+                    // mutates a throwaway working copy and discards it on any Err (no leak).
+                    if !crate::wasm_exec::wasm_vm_enabled() {
+                        return Err(StateError::InvalidTransaction("[REJECT][VM] wasm_disabled".to_string()));
+                    }
+                    // Entry (method), args, and the declared access list come from the SIGNED tx
+                    // data (identical on every node → deterministic resolution). Every reachable
+                    // contract is already pre-loaded (get_all_affected_addresses added the list).
+                    let mut entry = "run".to_string();
+                    let mut args: Vec<u8> = Vec::new();
+                    let mut call_set: Vec<String> = Vec::new();
+                    if let Some(ref data) = self.data {
+                        if let Ok(p) = serde_json::from_str::<serde_json::Value>(data) {
+                            if let Some(m) = p.get("method").and_then(|v| v.as_str()) { entry = m.to_string(); }
+                            if let Some(a) = p.get("args").and_then(|v| v.as_str()) {
+                                if let Ok(b) = hex::decode(a) { args = b; }
+                            }
+                            if let Some(list) = p.get("accessList").and_then(|v| v.as_array()) {
+                                for it in list.iter().take(crate::wasm_exec::MAX_WASM_ACCESS_LIST) {
+                                    if let Some(s) = it.as_str() { call_set.push(s.to_string()); }
+                                }
+                            }
+                        }
+                    }
+                    if !call_set.contains(&contract_addr) { call_set.push(contract_addr.clone()); }
+                    // Fuel budget = gas remaining after the intrinsic. GAS MODEL: a wasm call is
+                    // METERED — the sender pays the flat intrinsic PLUS fuel_consumed * price. The
+                    // fuel fee is published here (set_last_tx_wasm_fuel below) and settled at apply as
+                    // a SYMMETRIC account move: apply_gas_refund subtracts it from the sender's gas
+                    // refund and the producer credit adds it back (both apply paths recompute the
+                    // identical total), so QNC conservation holds byte-for-byte. Separately, the
+                    // block's summed RESERVED fuel is bounded by BLOCK_FUEL_LIMIT (anti-DoS).
+                    let exec_fuel = self.gas_limit.saturating_sub(self.compute_gas_used());
+                    let result = crate::wasm_exec::execute_wasm_calltree(
+                        accounts, &contract_addr, &call_set, &entry,
+                        &sender_addr, self.amount, block_height, args, exec_fuel,
+                    );
+                    // Bill the compute: publish the fuel this call burned (trap or not — consumed work
+                    // is paid) so the apply caller prices it into the metered fee (moves fuel*price from
+                    // the sender's gas refund to the producer's fee credit; net supply unchanged).
+                    crate::wasm_exec::set_last_tx_wasm_fuel(result.fuel_consumed);
+                    // Per-contract storage-entry ceiling (anti-bloat, parity with QRC-20).
+                    // If ANY touched contract would exceed it, commit NOTHING — the fee is
+                    // already consumed (like a trap), and the check is deterministic on all
+                    // nodes (projected size = current entries + new keys in the delta).
+                    let over_cap = result.writes.iter().any(|(addr, delta)| {
+                        accounts.get(addr).map(|acc| {
+                            let new_keys = delta.iter()
+                                .filter(|(k, _)| !acc.contract_storage.contains_key(&hex::encode(k)))
+                                .count();
+                            acc.contract_storage.len().saturating_add(new_keys) > MAX_CONTRACT_STORAGE_ENTRIES
+                        }).unwrap_or(false)
+                    });
+                    if !result.trapped && !over_cap {
+                        for (addr, delta) in &result.writes {
+                            if let Some(acc) = accounts.get_mut(addr) {
+                                for (k, v) in delta {
+                                    acc.contract_storage.insert(hex::encode(k), hex::encode(v));
+                                }
+                            }
+                        }
+                        // OFF-CONSENSUS receipt capture (RPC getLogs): emit-ordered logs from the
+                        // committed call tree, tagged with this tx's hash. NEVER hashed / never
+                        // affects state_root — a pure side-index, only on a non-trapped committed tree.
+                        for (contract, data) in &result.logs {
+                            crate::wasm_exec::push_wasm_log(&self.hash, contract, data.clone());
+                        }
+                    } else {
+                        // TRAP or storage-cap: commit NOTHING (call-level atomicity — result.writes is
+                        // already empty/discarded). REVERT SEMANTICS: the msg.value credited to the
+                        // target before execution must be RETURNED to the caller — value sent to a
+                        // reverting call is not consumed; only the gas/fee is (pay for the work done).
+                        // The VM never touches native balances (WasmTreeResult carries only storage
+                        // writes), so reversing the single pre-execution credit fully restores value.
+                        // Deterministic: trap/over_cap are identical on every node, and this is a plain
+                        // balance move folded into the same state_root all nodes recompute.
+                        if self.amount > 0 {
+                            if let Some(c) = accounts.get_mut(&contract_addr) {
+                                c.balance = c.balance.saturating_sub(self.amount);
+                            }
+                            if let Some(s) = accounts.get_mut(&sender_addr) {
+                                s.balance = s.balance.saturating_add(self.amount);
+                            }
+                        }
+                        if over_cap && is_info_log() {
+                            println!("[WARN][VM] wasm_storage_cap_exceeded contract={} — commit skipped, value returned (fee consumed)",
+                                &contract_addr[..contract_addr.len().min(20)]);
+                        }
+                    }
+                    if is_info_log() {
+                        println!("[INFO][VM] wasm_calltree contract={} fuel={} trapped={} contracts={} h={}",
+                            &contract_addr[..contract_addr.len().min(20)], result.fuel_consumed,
+                            result.trapped, result.writes.len(), block_height);
+                    }
                 } else {
                     // Generic contract call — record in storage (capped)
                     const MAX_CALL_RECORDS: usize = 10_000;
+                    let contract = accounts.get_mut(&contract_addr).unwrap();
                     if contract.contract_storage.len() < MAX_CALL_RECORDS {
                         let call_key = format!("call:{}:{}", self.timestamp, &sender_addr[..sender_addr.len().min(16)]);
                         let call_value = format!("value={},gas={},data_len={}",
@@ -2373,113 +3093,13 @@ impl Transaction {
                         fee, self.amount);
                 }
             }
-            TransactionType::Swap { from, token_in, token_out, amount_in, amount_out_min, amount_out, pool_address } => {
-                // Token swap via DEX
-                // v3.18: Gas fee goes directly to block producer (Pool 2 removed)
-                // DEFENCE-IN-DEPTH: see Transfer arm above for full rationale.
-                // Payload `from` MUST equal TX-level `self.from` — the canonical
-                // signing message binds `self.from`, not `Swap.from`, so a
-                // mismatch is an attempted wallet-impersonation drain. The
-                // matching `validate()` check is the primary gate; this is
-                // the locally-provable invariant for future apply-only paths
-                // (snapshot recovery, internal construction).
-                if from != &self.from {
-                    return Err(StateError::InvalidTransaction(format!(
-                        "[REJECT][SWAP] sender_mismatch_at_apply tx_from={} payload_from={}",
-                        &self.from[..self.from.len().min(20)],
-                        &from[..from.len().min(20)]
-                    )));
-                }
-                let sender = accounts.get_mut(from)
-                    .ok_or_else(|| StateError::AccountNotFound(from.clone()))?;
-
-                // IDEMPOTENT APPLY — see Transfer arm for full rationale.
-                if self.nonce <= sender.nonce {
-                    return Ok(());
-                }
-                // CRITICAL SECURITY: Check nonce to prevent replay attacks
-                if self.nonce != sender.nonce + 1 {
-                    return Err(StateError::InvalidTransaction(format!(
-                        "[REJECT][TX] invalid_nonce expected={} got={}",
-                        sender.nonce + 1, self.nonce
-                    )));
-                }
-                
-                // Calculate gas fee (QUANTUM v2.25: +50% for Dilithium TX)
-                let fee = self.effective_gas_price().checked_mul(self.gas_limit)
-                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] gas_fee_overflow".into()))?;
-                
-                // For QNC swaps: check if user has enough balance (amount_in + fee)
-                // For other tokens: only check fee (token balance checked by DEX contract)
-                let total_cost = if token_in == "QNC" {
-                    amount_in.checked_add(fee)
-                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] total_cost_overflow".into()))?
-                } else {
-                    fee
-                };
-                
-                if sender.balance < total_cost {
-                    return Err(StateError::InsufficientBalance {
-                        have: sender.balance,
-                        need: total_cost,
-                    });
-                }
-                
-                // Slippage protection: ensure amount_out >= amount_out_min
-                if *amount_out < *amount_out_min {
-                    return Err(StateError::InvalidTransaction(format!(
-                        "[REJECT][SWAP] slippage_exceeded got={} min={} token={}",
-                        amount_out, amount_out_min, token_out
-                    )));
-                }
-                
-                // Deduct fee (always in QNC)
-                sender.balance = sender.balance.checked_sub(fee)
-                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] fee_balance_underflow".into()))?;
-
-                // If swapping QNC for another token, deduct amount_in from sender
-                if token_in == "QNC" {
-                    sender.balance = sender.balance.checked_sub(*amount_in)
-                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] sender_balance_underflow".into()))?;
-                }
-                
-                // If receiving QNC, add amount_out to sender
-                if token_out == "QNC" {
-                    sender.balance = sender.balance.checked_add(*amount_out)
-                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] sender_credit_overflow".into()))?;
-                }
-                
-                sender.nonce = sender.nonce.checked_add(1)
-                    .ok_or_else(|| StateError::InvalidTransaction("[REJECT][TX] nonce_overflow".into()))?;
-
-                // v3.34: Update pool balance (conservation of value)
-                // Without this, QNC was burned/minted instead of transferred to/from pool
-                let pool = accounts.entry(pool_address.clone())
-                    .or_insert_with(|| Account::new(pool_address.clone()));
-                
-                if token_in == "QNC" {
-                    // Pool receives QNC from sender
-                    pool.balance = pool.balance.checked_add(*amount_in)
-                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] pool_credit_overflow".into()))?;
-                }
-                if token_out == "QNC" {
-                    // Pool sends QNC to sender — must have sufficient liquidity
-                    if pool.balance < *amount_out {
-                        return Err(StateError::InsufficientBalance {
-                            have: pool.balance,
-                            need: *amount_out,
-                        });
-                    }
-                    pool.balance = pool.balance.checked_sub(*amount_out)
-                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][SWAP] pool_balance_underflow".into()))?;
-                }
-                
-                // Swap -- currently inactive (no RPC handler), logic preserved for future DEX
-                if is_info_log() {
-                    println!("[INFO][SWAP] {} swapped {} {} for {} {} via pool {} (fee: {} nanoQNC)",
-                        &from[..from.len().min(16)], amount_in, token_in, amount_out, token_out,
-                        &pool_address[..pool_address.len().min(16)], fee);
-                }
+            TransactionType::Swap { .. } => {
+                // FAIL-CLOSED (TVC-6): Swap/DEX is disabled. A priced apply MUST compute the output
+                // from on-chain pool reserves (constant-product curve) — crediting a client-supplied
+                // amount_out would be a pool drain. Dormant today (no RPC creates a Swap TX); the
+                // priced apply logic is written together with the DEX contract. The former
+                // unreachable draft was removed (no dead #[allow(unreachable_code)] block).
+                return Err(StateError::InvalidTransaction("[REJECT][SWAP] disabled_no_onchain_pricing".into()));
             }
             TransactionType::RewardDistribution => {
                 // System transaction for reward distribution
@@ -2812,122 +3432,6 @@ impl Transaction {
                 }
             }
 
-            TransactionType::SetPQRequirement {} => {
-                // ═══════════════════════════════════════════════════════════════
-                // POST-QUANTUM ENFORCEMENT UPGRADE — APPLY (two-field commit)
-                // ═══════════════════════════════════════════════════════════════
-                // Permanently lock the sender account into mandatory Dilithium3
-                // signing AND register the Dilithium3 public key on the upgrade
-                // TX as the binding key for all future TXs from this account.
-                //
-                // Both fields commit atomically:
-                //   * `account.require_pq_signature = true`            (gate ON)
-                //   * `account.dilithium_public_key = Some(tx_pk_hex)` (key bound)
-                //
-                // Authorisation: this transaction MUST itself carry both Ed25519
-                // and Dilithium3 signatures (validated at ingest time). The
-                // dual-signature requirement proves the sender owns BOTH keypairs
-                // at the moment of upgrade — preventing an adversary with only
-                // one key from locking the wallet into an unusable state.
-                //
-                // The Dilithium3 public key on this TX is what gets REGISTERED.
-                // From this moment, every hybrid TX from this account must use
-                // a Dilithium3 signature verifiable under this exact key. An
-                // attacker with a forged Ed25519 sig cannot bypass the gate by
-                // attaching their own Dilithium3 keypair — the registered-key
-                // mismatch check would reject the TX.
-                // ═══════════════════════════════════════════════════════════════
-
-                // Authorisation gate: require BOTH signature components on the
-                // upgrading TX itself. Signature *validity* is verified at ingest;
-                // here we only check presence (cheap O(1) string-empty checks).
-                let has_ed25519 = self.signature.as_ref().map_or(false, |s| !s.is_empty())
-                    && self.public_key.as_ref().map_or(false, |p| !p.is_empty());
-                let dilithium_pk_hex = match (self.dilithium_signature.as_ref(), self.dilithium_public_key.as_ref()) {
-                    (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => p.clone(),
-                    _ => {
-                        return Err(StateError::InvalidTransaction(format!(
-                            "[REJECT][PQ-UPGRADE] account={} missing_dilithium_signature_or_pubkey",
-                            &self.from[..self.from.len().min(20)]
-                        )));
-                    }
-                };
-                if !has_ed25519 {
-                    return Err(StateError::InvalidTransaction(format!(
-                        "[REJECT][PQ-UPGRADE] account={} missing_ed25519_signature_or_pubkey",
-                        &self.from[..self.from.len().min(20)]
-                    )));
-                }
-
-                // Validate Dilithium3 public key format: hex-encoded 1952 bytes.
-                if dilithium_pk_hex.len() != 3904 {
-                    return Err(StateError::InvalidTransaction(format!(
-                        "[REJECT][PQ-UPGRADE] account={} invalid_dilithium_pk_size expected=3904_hex got={}",
-                        &self.from[..self.from.len().min(20)], dilithium_pk_hex.len()
-                    )));
-                }
-                if hex::decode(&dilithium_pk_hex).is_err() {
-                    return Err(StateError::InvalidTransaction(format!(
-                        "[REJECT][PQ-UPGRADE] account={} invalid_dilithium_pk_hex",
-                        &self.from[..self.from.len().min(20)]
-                    )));
-                }
-
-                // Auto-create the account if it doesn't exist yet (e.g. first
-                // TX from a fresh wallet that wants to lock immediately).
-                if !accounts.contains_key(&self.from) {
-                    accounts.insert(self.from.clone(), Account::new(self.from.clone()));
-                }
-
-                let account = accounts.get_mut(&self.from)
-                    .expect("account just inserted");
-
-                // IDEMPOTENT APPLY for PQ-upgrade — see Transfer arm for rationale.
-                if self.nonce <= account.nonce {
-                    return Ok(());
-                }
-                // Nonce monotonicity (same as any user TX).
-                if self.nonce != account.nonce + 1 {
-                    return Err(StateError::InvalidTransaction(format!(
-                        "[REJECT][PQ-UPGRADE] invalid_nonce expected={} got={}",
-                        account.nonce + 1, self.nonce
-                    )));
-                }
-
-                // Re-locking: forbid changing the registered Dilithium3 key.
-                // If the account is already locked, the registered key must match
-                // the TX's key — this prevents an attacker who somehow forces a
-                // SetPQRequirement on a locked account from rotating the key
-                // out from under the legitimate holder.
-                let was_already_locked = account.require_pq_signature;
-                if was_already_locked {
-                    if let Some(existing_pk) = account.registered_dilithium_pk() {
-                        if existing_pk != dilithium_pk_hex {
-                            return Err(StateError::InvalidTransaction(format!(
-                                "[REJECT][PQ-UPGRADE] account={} already_locked_with_different_key — use KeyRotation TX",
-                                &self.from[..self.from.len().min(20)]
-                            )));
-                        }
-                    }
-                }
-
-                // Apply: monotonic flip false→true + register Dilithium3 key.
-                // `lock_pq_signature_required` is idempotent — if already locked,
-                // the registered key is preserved (no rebinding). The check above
-                // ensures we only reach here when the keys match.
-                account.lock_pq_signature_required(dilithium_pk_hex);
-                account.nonce = account.nonce.saturating_add(1);
-
-                if is_info_log() {
-                    if was_already_locked {
-                        println!("[INFO][PQ-UPGRADE] account={} already_locked nonce={}",
-                            &self.from[..self.from.len().min(20)], account.nonce);
-                    } else {
-                        println!("[INFO][PQ-UPGRADE] account={} pq_lock=acquired pk_registered=true one_way=true",
-                            &self.from[..self.from.len().min(20)]);
-                    }
-                }
-            }
             // Equivocation slashing proofs: no account-state effect. The penalty
             // (offender → reputation 0 + ban) is applied deterministically in the
             // reputation fold from the committed proof, not in account state.
@@ -3699,7 +4203,9 @@ mod tests_v17_swap_sender {
         );
     }
 
-    /// Fix #19 (apply, Swap): same defence-in-depth invariant for Swap.
+    /// Swap apply is fail-closed (dormant, no on-chain pricing): it rejects EVERY swap before any
+    /// state change, which subsumes the per-field mismatch defence (still covered at the validate
+    /// layer by `swap_validate_rejects_mismatched_from`).
     #[test]
     fn swap_apply_rejects_mismatched_from() {
         let tx = make_swap_tx(ATTACKER, VICTIM);
@@ -3712,11 +4218,11 @@ mod tests_v17_swap_sender {
         accounts.insert(ATTACKER.to_string(), attacker_acct);
 
         let result = tx.apply_to_state(&mut accounts);
-        assert!(result.is_err(), "apply must reject mismatched Swap.from");
+        assert!(result.is_err(), "apply must reject any Swap while disabled");
         let err_str = format!("{:?}", result.err().unwrap());
         assert!(
-            err_str.contains("sender_mismatch_at_apply"),
-            "apply-layer rejection must name the at_apply gate, got: {}", err_str
+            err_str.contains("disabled_no_onchain_pricing"),
+            "apply-layer Swap must be fail-closed, got: {}", err_str
         );
 
         // Victim balance untouched.
@@ -3724,6 +4230,748 @@ mod tests_v17_swap_sender {
             accounts.get(VICTIM).map(|a| a.balance), Some(1_000_000),
             "victim balance must be untouched after Swap apply rejection"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_qrc20_self_transfer {
+    // TVC-1/2: a QRC-20 self-transfer (to == from) must NEVER mint. Before the fix, from_key == to_key
+    // aliased and the credit insert overwrote the debit, inflating the sender's balance by `amount`.
+    use super::*;
+    use crate::account::Account;
+    use std::collections::HashMap;
+
+    fn qrc20_call(sender: &str, contract: &str, method: &str, args_json: &str) -> Transaction {
+        let mut tx = Transaction {
+            hash: String::new(),
+            from: sender.to_string(),
+            to: Some(contract.to_string()),
+            amount: 0,
+            nonce: 1,
+            timestamp: 0,
+            gas_price: 1,
+            gas_limit: 1_000_000, // ContractCall base gas is ~100k; give ample headroom
+            data: Some(format!("{{\"method\":\"{}\",\"args\":{}}}", method, args_json)),
+            signature: None,
+            public_key: None,
+            tx_type: TransactionType::ContractCall,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    fn seed(sender: &str, contract: &str, start_bal: u64) -> HashMap<String, Account> {
+        let mut accounts: HashMap<String, Account> = HashMap::new();
+        let mut s = Account::default();
+        s.balance = 100_000_000; // covers the gas fee (gas_price * gas_limit)
+        s.nonce = 0;
+        accounts.insert(sender.to_string(), s);
+        let mut c = Account::default();
+        c.is_contract = true;
+        c.contract_storage.insert("type".to_string(), "qrc20".to_string());
+        c.contract_storage.insert(format!("balance:{}", sender), start_bal.to_string());
+        accounts.insert(contract.to_string(), c);
+        accounts
+    }
+
+    fn bal(accounts: &HashMap<String, Account>, contract: &str, holder: &str) -> u64 {
+        accounts.get(contract).unwrap().contract_storage
+            .get(&format!("balance:{}", holder))
+            .and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+
+    #[test]
+    fn qrc20_self_transfer_does_not_mint() {
+        let (sender, contract) = ("alice", "tokenX");
+        let mut accounts = seed(sender, contract, 1000);
+        // transfer(to = alice, 500) — a self-transfer.
+        let tx = qrc20_call(sender, contract, "transfer", &format!("[\"{}\",500]", sender));
+        tx.apply_to_state(&mut accounts).expect("self-transfer applies (balance no-op)");
+        assert_eq!(bal(&accounts, contract, sender), 1000, "self-transfer must NOT mint (TVC-1)");
+    }
+
+    #[test]
+    fn qrc20_transferfrom_self_does_not_mint() {
+        let (sender, contract) = ("alice", "tokenX");
+        let mut accounts = seed(sender, contract, 1000);
+        // alice approves alice for 500.
+        accounts.get_mut(contract).unwrap().contract_storage
+            .insert(format!("allowance:{}:{}", sender, sender), "500".to_string());
+        // transferFrom(from = alice, to = alice, 500) — self-transfer via allowance.
+        let tx = qrc20_call(sender, contract, "transferFrom", &format!("[\"{}\",\"{}\",500]", sender, sender));
+        tx.apply_to_state(&mut accounts).expect("self transferFrom applies (balance no-op)");
+        assert_eq!(bal(&accounts, contract, sender), 1000, "self transferFrom must NOT mint (TVC-2)");
+        let allow: u64 = accounts.get(contract).unwrap().contract_storage
+            .get(&format!("allowance:{}:{}", sender, sender))
+            .and_then(|s| s.parse().ok()).unwrap_or(999);
+        assert_eq!(allow, 0, "allowance must still be consumed on self transferFrom");
+    }
+
+    #[test]
+    fn qrc20_normal_transfer_still_moves_balance() {
+        let (sender, contract, bob) = ("alice", "tokenX", "bob");
+        let mut accounts = seed(sender, contract, 1000);
+        let tx = qrc20_call(sender, contract, "transfer", &format!("[\"{}\",500]", bob));
+        tx.apply_to_state(&mut accounts).expect("normal transfer applies");
+        assert_eq!(bal(&accounts, contract, sender), 500, "sender debited");
+        assert_eq!(bal(&accounts, contract, bob), 500, "recipient credited");
+    }
+
+    // Reserved escrow id must NOT be a valid user sender, so no user can own/derive it.
+    #[test]
+    fn storage_escrow_addr_is_not_a_user_sender() {
+        assert!(!is_valid_sender_format(STORAGE_RENT_ESCROW_ADDR),
+            "escrow id must be unownable by any user");
+    }
+
+    // New recipient entry ⇒ refundable deposit MOVES sender→escrow (conservation, no mint/burn).
+    #[test]
+    fn new_entry_charges_refundable_deposit_to_escrow() {
+        let (sender, contract, bob) = ("alice", "tokenX", "bob");
+        let mut accounts = seed(sender, contract, 1000);
+        let native_before = accounts.get(sender).unwrap().balance;
+        let tx = qrc20_call(sender, contract, "transfer", &format!("[\"{}\",500]", bob));
+        tx.apply_to_state(&mut accounts).expect("transfer applies");
+        let gas = 1_000_000u64; // gas_price(1) * gas_limit(1_000_000)
+        let sender_native = accounts.get(sender).unwrap().balance;
+        assert_eq!(sender_native, native_before - gas - STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC,
+            "sender pays gas + one storage deposit");
+        assert_eq!(accounts.get(STORAGE_RENT_ESCROW_ADDR).unwrap().balance,
+            STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC, "escrow holds the deposit");
+    }
+
+    // Draining a balance to zero REMOVES the key (no "0" residue) and refunds the deposit.
+    #[test]
+    fn zeroed_balance_is_removed_and_deposit_refunded() {
+        let (sender, contract, bob) = ("alice", "tokenX", "bob");
+        let mut accounts = seed(sender, contract, 500);
+        // alice sends her entire 500 to a new holder bob: alice's balance entry hits 0.
+        let tx = qrc20_call(sender, contract, "transfer", &format!("[\"{}\",500]", bob));
+        tx.apply_to_state(&mut accounts).expect("full-drain transfer applies");
+        let store = &accounts.get(contract).unwrap().contract_storage;
+        assert!(!store.contains_key(&format!("balance:{}", sender)),
+            "emptied sender balance key is removed, not left as 0");
+        // +1 deposit for new bob, -1 refund for emptied alice ⇒ escrow nets to zero.
+        assert_eq!(accounts.get(STORAGE_RENT_ESCROW_ADDR).unwrap().balance, 0,
+            "new-entry deposit and drained-entry refund cancel");
+    }
+
+    // Insufficient native balance for the deposit rejects fail-loud (no partial state write).
+    #[test]
+    fn insufficient_deposit_rejects() {
+        let (sender, contract, bob) = ("alice", "tokenX", "bob");
+        let mut accounts = seed(sender, contract, 1000);
+        // Leave only enough to cover gas, not the deposit.
+        accounts.get_mut(sender).unwrap().balance = 1_000_000;
+        let tx = qrc20_call(sender, contract, "transfer", &format!("[\"{}\",500]", bob));
+        let err = tx.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("insufficient_deposit"),
+            "must reject with insufficient_deposit, got {:?}", err);
+    }
+
+    // apply_transaction_lazy loads only get_all_affected_addresses into its working set; the escrow
+    // MUST be among them or the merge-back clobbers accrued deposits (native-QNC conservation break).
+    #[test]
+    fn contractcall_affected_addresses_include_escrow() {
+        let tx = qrc20_call("alice", "tokenX", "transfer", "[\"bob\",500]");
+        let affected = tx.get_all_affected_addresses();
+        assert!(affected.iter().any(|a| a == STORAGE_RENT_ESCROW_ADDR),
+            "ContractCall affected set must include the storage-rent escrow, got: {:?}", affected);
+    }
+
+    // Reproduce the lazy path (filter by affected addresses -> apply -> merge back) and prove the
+    // escrow ACCUMULATES the new deposit on top of prior deposits instead of being clobbered.
+    #[test]
+    fn lazy_path_accumulates_escrow_not_clobbers() {
+        let (sender, contract, bob) = ("alice", "tokenX", "bob");
+        let mut full = seed(sender, contract, 1000);
+        let prior = 3 * STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC; // escrow already holds 3 earlier deposits
+        let mut esc = Account::default();
+        esc.balance = prior;
+        full.insert(STORAGE_RENT_ESCROW_ADDR.to_string(), esc);
+
+        let tx = qrc20_call(sender, contract, "transfer", &format!("[\"{}\",500]", bob));
+        let mut working: HashMap<String, Account> = tx.get_all_affected_addresses().into_iter()
+            .filter_map(|a| full.get(&a).map(|acc| (a, acc.clone()))).collect();
+        tx.apply_to_state(&mut working).expect("transfer applies");
+        for (a, acc) in working { full.insert(a, acc); } // merge-back, mirrors apply_transaction_lazy
+
+        assert_eq!(full.get(STORAGE_RENT_ESCROW_ADDR).unwrap().balance,
+            prior + STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC,
+            "escrow must accumulate the new deposit on top of prior deposits (no clobber)");
+    }
+
+    // ---- deploy-time deposit (audit #1/#6) + reserved fuel (audit #2) ----
+
+    // Build a QRC-20 ContractDeploy tx (contract address is derived from from+nonce).
+    fn qrc20_deploy(deployer: &str, initial_supply: u64) -> Transaction {
+        let mut tx = Transaction {
+            hash: String::new(),
+            from: deployer.to_string(),
+            to: None,
+            amount: 0,
+            nonce: 1,
+            timestamp: 0,
+            gas_price: 1,
+            gas_limit: 1_000_000,
+            data: Some(format!(
+                "{{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":{}}}",
+                initial_supply)),
+            signature: None,
+            public_key: None,
+            tx_type: TransactionType::ContractDeploy,
+            dilithium_signature: None,
+            dilithium_public_key: None,
+            chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+
+    fn seed_deployer(deployer: &str) -> HashMap<String, Account> {
+        let mut accounts: HashMap<String, Account> = HashMap::new();
+        let mut d = Account::default();
+        d.balance = 100_000_000;
+        d.nonce = 0;
+        accounts.insert(deployer.to_string(), d);
+        accounts
+    }
+
+    // #1 FIX: the QRC-20 deploy-time creator balance entry is now CHARGED a refundable deposit, so it
+    // can never later drain the shared escrow it never paid into.
+    #[test]
+    fn qrc20_deploy_charges_deployer_balance_deposit() {
+        let deployer = "alice";
+        let mut accounts = seed_deployer(deployer);
+        qrc20_deploy(deployer, 1000).apply_to_state(&mut accounts).expect("qrc20 deploy applies");
+        let contract_addr = derive_contract_address(deployer, 1);
+        assert_eq!(bal(&accounts, &contract_addr, deployer), 1000, "creator holds initial supply");
+        assert_eq!(accounts.get(STORAGE_RENT_ESCROW_ADDR).unwrap().balance,
+            STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC, "deploy charges one storage deposit for the creator entry");
+        assert_eq!(accounts.get(deployer).unwrap().balance,
+            100_000_000 - 1_000_000 - STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC,
+            "deployer debited deploy fee + one storage deposit");
+    }
+
+    // A zero-supply deploy creates NO balance entry and therefore charges NO deposit.
+    #[test]
+    fn qrc20_deploy_zero_supply_no_entry_no_charge() {
+        let deployer = "alice";
+        let mut accounts = seed_deployer(deployer);
+        qrc20_deploy(deployer, 0).apply_to_state(&mut accounts).expect("zero-supply deploy applies");
+        let contract_addr = derive_contract_address(deployer, 1);
+        assert!(!accounts.get(&contract_addr).unwrap().contract_storage
+            .contains_key(&format!("balance:{}", deployer)), "no balance entry for zero supply");
+        assert!(accounts.get(STORAGE_RENT_ESCROW_ADDR).map(|a| a.balance).unwrap_or(0) == 0,
+            "zero-supply deploy charges no deposit");
+    }
+
+    // End-to-end conservation: deploy (1 deposit) → creator drains ALL to a NEW holder → creator entry
+    // removed+refunded, new holder charged → escrow still backs exactly the one surviving entry, and
+    // the drain refund NEVER trips the underfunded guard (the deploy deposit funded it).
+    #[test]
+    fn qrc20_deploy_then_full_drain_keeps_escrow_backed() {
+        let (deployer, bob) = ("alice", "bob");
+        let mut accounts = seed_deployer(deployer);
+        qrc20_deploy(deployer, 1000).apply_to_state(&mut accounts).expect("deploy applies");
+        let contract_addr = derive_contract_address(deployer, 1);
+        assert_eq!(accounts.get(STORAGE_RENT_ESCROW_ADDR).unwrap().balance,
+            STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC, "deploy funded one deposit");
+        // creator sends the ENTIRE supply to bob (nonce 2): creator entry drains to 0 (removed+refund),
+        // bob entry is new (charge). Escrow nets to exactly one deposit — bob's surviving entry.
+        let mut xfer = qrc20_call(deployer, &contract_addr, "transfer", &format!("[\"{}\",1000]", bob));
+        xfer.nonce = 2; xfer.hash = xfer.calculate_hash();
+        xfer.apply_to_state(&mut accounts).expect("full-drain transfer applies (refund funded)");
+        assert!(!accounts.get(&contract_addr).unwrap().contract_storage
+            .contains_key(&format!("balance:{}", deployer)), "drained creator entry removed");
+        assert_eq!(bal(&accounts, &contract_addr, bob), 1000, "bob holds the supply");
+        assert_eq!(accounts.get(STORAGE_RENT_ESCROW_ADDR).unwrap().balance,
+            STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC, "escrow backs exactly the one surviving entry");
+    }
+
+    // #6 FIX: refunding against an under-funded escrow is a conservation-invariant violation and must
+    // fail LOUD (deterministic on every node), not silently pay less.
+    #[test]
+    fn refund_storage_deposit_underfunded_fails_loud() {
+        let mut accounts: HashMap<String, Account> = HashMap::new();
+        let err = refund_storage_deposit(&mut accounts, "bob", 1).unwrap_err();
+        assert!(format!("{:?}", err).contains("escrow_underfunded"),
+            "under-funded refund must fail loud, got {:?}", err);
+    }
+
+    // #2 FIX: reserved_fuel() = the fuel a metered ContractCall may burn (gas_limit - intrinsic), ZERO
+    // for every non-VM type. This is the pure, per-node-identical unit the block ceiling sums.
+    #[test]
+    fn reserved_fuel_contractcall_is_gaslimit_minus_intrinsic() {
+        let call = qrc20_call("alice", "tokenX", "transfer", "[\"bob\",1]");
+        assert_eq!(call.reserved_fuel(), call.gas_limit - call.compute_gas_used(),
+            "reserved fuel is gas_limit minus the intrinsic");
+        assert!(call.reserved_fuel() > 0, "a headroom call reserves fuel");
+    }
+
+    #[test]
+    fn reserved_fuel_zero_for_non_contractcall() {
+        assert_eq!(qrc20_deploy("alice", 1000).reserved_fuel(), 0, "ContractDeploy reserves no fuel");
+    }
+
+    // METERED-FEE CONSERVATION (audit #2 economics): a WASM call is billed for the fuel it actually
+    // burned. The fee is a symmetric account MOVE — the sender's gas refund drops by fuel*price and the
+    // producer's credit rises by fuel*price — so what the sender pays EQUALS what the producer receives
+    // (total supply unchanged), and the sender pays exactly (intrinsic + consumed fuel) * price.
+    #[test]
+    fn metered_fee_conservation_wasm_call() {
+        let call = qrc20_call("alice", "tokenX", "run", "[]"); // ContractCall, gas_limit=1M, gas_price=1
+        let fuel = 500_000u64;
+        let price = call.effective_gas_price();
+        let intrinsic = call.compute_gas_used();
+        // Sender prepays gas_limit*price upfront; the metered refund is the flat refund minus the fuel fee.
+        let metered_refund = call.compute_gas_refund().saturating_sub(call.wasm_fuel_fee(fuel));
+        let sender_paid = price.saturating_mul(call.gas_limit) - metered_refund;
+        // Producer receives the flat intrinsic fee + the metered fuel fee.
+        let producer_credit = price.saturating_mul(intrinsic) + call.wasm_fuel_fee(fuel);
+        assert_eq!(sender_paid, producer_credit,
+            "metered fee: the sender pays EXACTLY what the producer receives (conservation)");
+        assert_eq!(sender_paid, (intrinsic + fuel).saturating_mul(price),
+            "sender pays for intrinsic + actually-consumed fuel");
+    }
+
+    // With zero fuel (every non-WASM tx, and a WASM call that burned nothing), the metered fee collapses
+    // to the existing flat behaviour — no refund reduction, no extra producer credit.
+    #[test]
+    fn metered_fee_zero_fuel_is_flat() {
+        let call = qrc20_call("alice", "tokenX", "transfer", "[\"bob\",1]");
+        assert_eq!(call.wasm_fuel_fee(0), 0, "no fuel ⇒ no compute fee");
+        assert_eq!(call.compute_gas_refund().saturating_sub(call.wasm_fuel_fee(0)),
+            call.compute_gas_refund(), "zero-fuel refund equals the flat refund");
+    }
+
+    // ---- mint / burn / unknown-method ----
+
+    // Extend a seeded qrc20 contract with the fields mint/burn read: deployer, total_supply,
+    // and the opt-in mintable/burnable flags. `seed` gives the deployer `start_bal` tokens.
+    fn seed_mintburn(
+        sender: &str, contract: &str, start_bal: u64, mintable: bool, burnable: bool,
+    ) -> HashMap<String, Account> {
+        let mut accounts = seed(sender, contract, start_bal);
+        let store = &mut accounts.get_mut(contract).unwrap().contract_storage;
+        store.insert("deployer".to_string(), sender.to_string());
+        store.insert("total_supply".to_string(), start_bal.to_string());
+        store.insert("mintable".to_string(), mintable.to_string());
+        store.insert("burnable".to_string(), burnable.to_string());
+        accounts
+    }
+
+    fn total_supply(accounts: &HashMap<String, Account>, contract: &str) -> u64 {
+        accounts.get(contract).unwrap().contract_storage
+            .get("total_supply").and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+
+    #[test]
+    fn mint_by_owner_increases_supply_and_balance() {
+        let (owner, contract, bob) = ("alice", "tokenX", "bob");
+        let mut accounts = seed_mintburn(owner, contract, 1000, true, false);
+        let tx = qrc20_call(owner, contract, "mint", &format!("[\"{}\",250]", bob));
+        tx.apply_to_state(&mut accounts).expect("owner mint applies");
+        assert_eq!(bal(&accounts, contract, bob), 250, "recipient credited minted amount");
+        assert_eq!(total_supply(&accounts, contract), 1250, "supply bumped 1:1 with mint");
+    }
+
+    #[test]
+    fn mint_by_non_owner_rejected() {
+        let (owner, contract, mallory) = ("alice", "tokenX", "mallory");
+        let mut accounts = seed_mintburn(owner, contract, 1000, true, false);
+        // Fund mallory so the tx passes fee/nonce checks and reaches the owner gate.
+        let mut m = Account::default();
+        m.balance = 100_000_000;
+        accounts.insert(mallory.to_string(), m);
+        let tx = qrc20_call(mallory, contract, "mint", &format!("[\"{}\",250]", mallory));
+        let err = tx.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("mint_not_owner"),
+            "non-owner mint must reject, got {:?}", err);
+        assert_eq!(total_supply(&accounts, contract), 1000, "supply unchanged on rejected mint");
+    }
+
+    #[test]
+    fn mint_on_non_mintable_rejected() {
+        let (owner, contract, bob) = ("alice", "tokenX", "bob");
+        let mut accounts = seed_mintburn(owner, contract, 1000, false, false);
+        let tx = qrc20_call(owner, contract, "mint", &format!("[\"{}\",250]", bob));
+        let err = tx.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("mint_disabled"),
+            "mint on non-mintable token must reject, got {:?}", err);
+        assert_eq!(total_supply(&accounts, contract), 1000, "supply unchanged on rejected mint");
+    }
+
+    #[test]
+    fn burn_reduces_supply_and_balance() {
+        let (owner, contract) = ("alice", "tokenX");
+        let mut accounts = seed_mintburn(owner, contract, 1000, false, true);
+        let tx = qrc20_call(owner, contract, "burn", "[300]");
+        tx.apply_to_state(&mut accounts).expect("burn applies");
+        assert_eq!(bal(&accounts, contract, owner), 700, "burner debited own balance");
+        assert_eq!(total_supply(&accounts, contract), 700, "supply reduced 1:1 with burn");
+    }
+
+    #[test]
+    fn burn_more_than_balance_rejected() {
+        let (owner, contract) = ("alice", "tokenX");
+        let mut accounts = seed_mintburn(owner, contract, 1000, false, true);
+        let tx = qrc20_call(owner, contract, "burn", "[2000]");
+        let err = tx.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("insufficient_balance"),
+            "burning more than balance must reject, got {:?}", err);
+        assert_eq!(total_supply(&accounts, contract), 1000, "supply unchanged on rejected burn");
+    }
+
+    #[test]
+    fn burn_on_non_burnable_rejected() {
+        let (owner, contract) = ("alice", "tokenX");
+        let mut accounts = seed_mintburn(owner, contract, 1000, false, false);
+        let tx = qrc20_call(owner, contract, "burn", "[300]");
+        let err = tx.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("burn_disabled"),
+            "burn on non-burnable token must reject, got {:?}", err);
+        assert_eq!(total_supply(&accounts, contract), 1000, "supply unchanged on rejected burn");
+    }
+
+    #[test]
+    fn unknown_qrc20_method_rejected() {
+        let (owner, contract) = ("alice", "tokenX");
+        let mut accounts = seed_mintburn(owner, contract, 1000, false, false);
+        let tx = qrc20_call(owner, contract, "frobnicate", "[1]");
+        let err = tx.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("unknown_method"),
+            "unknown method must fail-loud, got {:?}", err);
+    }
+
+    // ---- QRC-20 string-amount (kill the >2^53 JS-float limit) ----
+
+    #[test]
+    fn qrc20_transfer_accepts_string_amount() {
+        // A value > 2^53 that a JS number cannot represent exactly. As a STRING it round-trips.
+        let (sender, contract, bob) = ("alice", "tokenX", "bob");
+        let big: u64 = 10_000_000_000_000_000_000; // ~1e19, > 2^53
+        let mut accounts = seed(sender, contract, 0);
+        // seed writes balance as u64 string; overwrite with the big start balance exactly.
+        accounts.get_mut(contract).unwrap().contract_storage
+            .insert(format!("balance:{}", sender), big.to_string());
+        // args amount sent as a JSON STRING.
+        let tx = qrc20_call(sender, contract, "transfer", &format!("[\"{}\",\"{}\"]", bob, big));
+        tx.apply_to_state(&mut accounts).expect("string amount transfer applies");
+        assert_eq!(bal(&accounts, contract, bob), big, "recipient gets exact >2^53 amount");
+        assert_eq!(bal(&accounts, contract, sender), 0, "sender fully debited");
+    }
+
+    #[test]
+    fn qrc20_transfer_accepts_number_amount() {
+        // Small amount as a JSON number stays valid (unchanged behavior).
+        let (sender, contract, bob) = ("alice", "tokenX", "bob");
+        let mut accounts = seed(sender, contract, 1000);
+        let tx = qrc20_call(sender, contract, "transfer", &format!("[\"{}\",500]", bob));
+        tx.apply_to_state(&mut accounts).expect("number amount transfer applies");
+        assert_eq!(bal(&accounts, contract, bob), 500, "recipient credited");
+        assert_eq!(bal(&accounts, contract, sender), 500, "sender debited");
+    }
+
+    #[test]
+    fn qrc20_bad_amount_arg_rejected() {
+        // A non-numeric string is neither a number nor a parseable u64 ⇒ fail-loud.
+        let (sender, contract, bob) = ("alice", "tokenX", "bob");
+        let mut accounts = seed(sender, contract, 1000);
+        let tx = qrc20_call(sender, contract, "transfer", &format!("[\"{}\",\"notanumber\"]", bob));
+        let err = tx.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("bad_amount_arg"),
+            "non-numeric amount must reject, got {:?}", err);
+        assert_eq!(bal(&accounts, contract, sender), 1000, "balance unchanged on rejected transfer");
+    }
+
+    // ---- QRC-721 (NFT) ----
+
+    // Seed a qrc721 contract with `deployer` set + fund a caller with nonce=0 (qrc20_call sends nonce=1).
+    fn seed_nft(deployer: &str, contract: &str) -> HashMap<String, Account> {
+        let mut accounts: HashMap<String, Account> = HashMap::new();
+        let mut d = Account::default();
+        d.balance = 100_000_000;
+        d.nonce = 0;
+        accounts.insert(deployer.to_string(), d);
+        let mut c = Account::default();
+        c.is_contract = true;
+        c.contract_storage.insert("type".to_string(), "qrc721".to_string());
+        c.contract_storage.insert("deployer".to_string(), deployer.to_string());
+        accounts.insert(contract.to_string(), c);
+        accounts
+    }
+
+    fn fund(accounts: &mut HashMap<String, Account>, who: &str) {
+        let mut a = Account::default();
+        a.balance = 100_000_000;
+        a.nonce = 0;
+        accounts.insert(who.to_string(), a);
+    }
+
+    fn owner_of(accounts: &HashMap<String, Account>, contract: &str, token_id: &str) -> Option<String> {
+        accounts.get(contract).unwrap().contract_storage
+            .get(&format!("owner:{}", token_id)).cloned()
+    }
+
+    fn nft_count(accounts: &HashMap<String, Account>, contract: &str, holder: &str) -> u64 {
+        accounts.get(contract).unwrap().contract_storage
+            .get(&format!("bal:{}", holder))
+            .and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+
+    #[test]
+    fn nft_mint_by_owner_sets_owner() {
+        let (owner, contract, bob) = ("alice", "nftX", "bob");
+        let mut accounts = seed_nft(owner, contract);
+        // token_id is a STRING.
+        let tx = qrc20_call(owner, contract, "mint", &format!("[\"{}\",\"tok1\"]", bob));
+        tx.apply_to_state(&mut accounts).expect("owner mint applies");
+        assert_eq!(owner_of(&accounts, contract, "tok1").as_deref(), Some(bob), "owner set to `to`");
+        assert_eq!(nft_count(&accounts, contract, bob), 1, "holder count incremented");
+    }
+
+    #[test]
+    fn nft_mint_non_owner_rejected() {
+        let (owner, contract, mallory) = ("alice", "nftX", "mallory");
+        let mut accounts = seed_nft(owner, contract);
+        fund(&mut accounts, mallory); // pass fee/nonce checks to reach the owner gate
+        let tx = qrc20_call(mallory, contract, "mint", &format!("[\"{}\",\"tok1\"]", mallory));
+        let err = tx.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("mint_not_owner"),
+            "non-owner mint must reject, got {:?}", err);
+        assert!(owner_of(&accounts, contract, "tok1").is_none(), "no token minted on reject");
+    }
+
+    #[test]
+    fn nft_mint_duplicate_rejected() {
+        let (owner, contract, bob) = ("alice", "nftX", "bob");
+        let mut accounts = seed_nft(owner, contract);
+        let tx1 = qrc20_call(owner, contract, "mint", &format!("[\"{}\",\"tok1\"]", bob));
+        tx1.apply_to_state(&mut accounts).expect("first mint applies");
+        // Second mint of the same token_id: qrc20_call uses nonce=1, so bump owner's nonce back down
+        // is not needed — build a fresh tx with the next nonce.
+        let mut tx2 = qrc20_call(owner, contract, "mint", &format!("[\"{}\",\"tok1\"]", "carol"));
+        tx2.nonce = 2;
+        tx2.hash = tx2.calculate_hash();
+        let err = tx2.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("already_minted"),
+            "re-mint of existing token_id must reject, got {:?}", err);
+        assert_eq!(owner_of(&accounts, contract, "tok1").as_deref(), Some(bob),
+            "original owner unchanged after rejected re-mint");
+    }
+
+    #[test]
+    fn nft_transfer_by_owner_moves_and_clears_approval() {
+        let (owner, contract, bob) = ("alice", "nftX", "bob");
+        let mut accounts = seed_nft(owner, contract);
+        // Mint tok1 to alice (the owner), approve carol, then transfer to bob.
+        let m = qrc20_call(owner, contract, "mint", &format!("[\"{}\",\"tok1\"]", owner));
+        m.apply_to_state(&mut accounts).expect("mint applies");
+        let mut ap = qrc20_call(owner, contract, "approve", "[\"carol\",\"tok1\"]");
+        ap.nonce = 2; ap.hash = ap.calculate_hash();
+        ap.apply_to_state(&mut accounts).expect("approve applies");
+        assert_eq!(accounts.get(contract).unwrap().contract_storage
+            .get("approved:tok1").map(|s| s.as_str()), Some("carol"), "approval set");
+
+        let mut tr = qrc20_call(owner, contract, "transfer", &format!("[\"{}\",\"tok1\"]", bob));
+        tr.nonce = 3; tr.hash = tr.calculate_hash();
+        tr.apply_to_state(&mut accounts).expect("transfer applies");
+        assert_eq!(owner_of(&accounts, contract, "tok1").as_deref(), Some(bob), "owner moved to bob");
+        assert_eq!(nft_count(&accounts, contract, owner), 0, "sender count drops to 0");
+        assert_eq!(nft_count(&accounts, contract, bob), 1, "recipient count is 1");
+        assert!(!accounts.get(contract).unwrap().contract_storage.contains_key("approved:tok1"),
+            "approval cleared on transfer");
+    }
+
+    #[test]
+    fn nft_transfer_non_owner_rejected() {
+        let (owner, contract, mallory, bob) = ("alice", "nftX", "mallory", "bob");
+        let mut accounts = seed_nft(owner, contract);
+        fund(&mut accounts, mallory);
+        let m = qrc20_call(owner, contract, "mint", &format!("[\"{}\",\"tok1\"]", owner));
+        m.apply_to_state(&mut accounts).expect("mint applies");
+        // mallory (not the owner) tries to transfer tok1.
+        let tx = qrc20_call(mallory, contract, "transfer", &format!("[\"{}\",\"tok1\"]", bob));
+        let err = tx.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("not_owner"),
+            "non-owner transfer must reject, got {:?}", err);
+        assert_eq!(owner_of(&accounts, contract, "tok1").as_deref(), Some(owner),
+            "owner unchanged on rejected transfer");
+    }
+
+    #[test]
+    fn nft_approve_then_transfer_from_by_spender() {
+        let (owner, contract, spender, bob) = ("alice", "nftX", "spender", "bob");
+        let mut accounts = seed_nft(owner, contract);
+        fund(&mut accounts, spender);
+        let m = qrc20_call(owner, contract, "mint", &format!("[\"{}\",\"tok1\"]", owner));
+        m.apply_to_state(&mut accounts).expect("mint applies");
+        let mut ap = qrc20_call(owner, contract, "approve", &format!("[\"{}\",\"tok1\"]", spender));
+        ap.nonce = 2; ap.hash = ap.calculate_hash();
+        ap.apply_to_state(&mut accounts).expect("approve applies");
+        // spender moves the token owner→bob via transferFrom.
+        let tx = qrc20_call(spender, contract, "transferFrom",
+            &format!("[\"{}\",\"{}\",\"tok1\"]", owner, bob));
+        tx.apply_to_state(&mut accounts).expect("approved transferFrom applies");
+        assert_eq!(owner_of(&accounts, contract, "tok1").as_deref(), Some(bob), "token moved to bob");
+        assert_eq!(nft_count(&accounts, contract, owner), 0, "owner count drops to 0");
+        assert_eq!(nft_count(&accounts, contract, bob), 1, "bob count is 1");
+        assert!(!accounts.get(contract).unwrap().contract_storage.contains_key("approved:tok1"),
+            "approval cleared after transferFrom");
+    }
+
+    #[test]
+    fn nft_transfer_from_unapproved_rejected() {
+        let (owner, contract, mallory, bob) = ("alice", "nftX", "mallory", "bob");
+        let mut accounts = seed_nft(owner, contract);
+        fund(&mut accounts, mallory);
+        let m = qrc20_call(owner, contract, "mint", &format!("[\"{}\",\"tok1\"]", owner));
+        m.apply_to_state(&mut accounts).expect("mint applies");
+        // mallory is neither the owner nor approved.
+        let tx = qrc20_call(mallory, contract, "transferFrom",
+            &format!("[\"{}\",\"{}\",\"tok1\"]", owner, bob));
+        let err = tx.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("transfer_from_not_approved"),
+            "unapproved transferFrom must reject, got {:?}", err);
+        assert_eq!(owner_of(&accounts, contract, "tok1").as_deref(), Some(owner),
+            "owner unchanged on rejected transferFrom");
+    }
+}
+
+// End-to-end WASM contract tests through the REAL apply_to_state path (only exercisable
+// now that WASM_VM_ENABLED=true): deploy → call → cross-call, verifying committed storage.
+#[cfg(test)]
+mod tests_wasm_e2e {
+    use super::*;
+
+    // Contract that writes storage key "k" = "v".
+    const WRITE_KV: &str = r#"(module
+        (import "env" "storage_write" (func $sw (param i32 i32 i32 i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "kv")
+        (func (export "run") (call $sw (i32.const 0)(i32.const 1)(i32.const 1)(i32.const 1))))"#;
+    // B writes "bk"="bv".
+    const B_WRITES: &str = r#"(module
+        (import "env" "storage_write" (func $sw (param i32 i32 i32 i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "bkbv")
+        (func (export "run") (call $sw (i32.const 0)(i32.const 2)(i32.const 2)(i32.const 2))))"#;
+    // A calls "B" then writes "ak"="av".
+    const A_CALLS_B: &str = r#"(module
+        (import "env" "call_contract" (func $call (param i32 i32 i32 i32 i32 i32 i64 i32 i32)(result i32)))
+        (import "env" "storage_write" (func $sw (param i32 i32 i32 i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "Brunakav")
+        (func (export "run")(local $n i32)
+            (local.set $n (call $call
+                (i32.const 0)(i32.const 1) (i32.const 1)(i32.const 3)
+                (i32.const 0)(i32.const 0) (i64.const 0) (i32.const 64)(i32.const 32)))
+            (call $sw (i32.const 4)(i32.const 2)(i32.const 6)(i32.const 2))))"#;
+
+    fn funded(bal: u64) -> Account {
+        let mut a = Account::default();
+        a.balance = bal;
+        a
+    }
+    fn wasm_contract_acc(wat: &str) -> Account {
+        let code = wat::parse_str(wat).unwrap();
+        let mut a = Account::default();
+        a.is_contract = true;
+        a.contract_storage.insert("type".to_string(), "wasm".to_string());
+        a.contract_storage.insert("code".to_string(), hex::encode(&code));
+        a
+    }
+    fn wasm_call(sender: &str, contract: &str, nonce: u64, data: &str) -> Transaction {
+        let mut tx = Transaction {
+            hash: String::new(), from: sender.to_string(), to: Some(contract.to_string()),
+            amount: 0, nonce, timestamp: 0, gas_price: 1, gas_limit: 2_000_000,
+            data: Some(data.to_string()), signature: None, public_key: None,
+            tx_type: TransactionType::ContractCall,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+    fn wasm_deploy(sender: &str, nonce: u64, wat: &str) -> Transaction {
+        let code = wat::parse_str(wat).unwrap();
+        let data = format!("{{\"wasm\":true,\"code\":\"{}\"}}", hex::encode(&code));
+        let mut tx = Transaction {
+            hash: String::new(), from: sender.to_string(), to: None,
+            amount: 0, nonce, timestamp: 0, gas_price: 1, gas_limit: 2_000_000,
+            data: Some(data), signature: None, public_key: None,
+            tx_type: TransactionType::ContractDeploy,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        tx
+    }
+    fn hexk(k: &[u8]) -> String { hex::encode(k) }
+    fn stored<'a>(accounts: &'a HashMap<String, Account>, c: &str, k: &[u8]) -> Option<&'a String> {
+        accounts.get(c).and_then(|a| a.contract_storage.get(&hexk(k)))
+    }
+
+    #[test]
+    fn deploy_creates_wasm_contract() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        wasm_deploy("alice", 1, WRITE_KV).apply_to_state(&mut accounts).expect("wasm deploy applies");
+        let addr = derive_contract_address("alice", 1);
+        let c = accounts.get(&addr).expect("contract account created at derived address");
+        assert_eq!(c.contract_storage.get("type").map(|s| s.as_str()), Some("wasm"));
+        assert!(c.contract_storage.contains_key("code"), "code blob stored");
+    }
+
+    #[test]
+    fn call_executes_and_commits_storage() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        accounts.insert("c".to_string(), wasm_contract_acc(WRITE_KV));
+        wasm_call("alice", "c", 1, r#"{"method":"run"}"#)
+            .apply_to_state(&mut accounts).expect("wasm call applies");
+        assert_eq!(stored(&accounts, "c", b"k").map(|s| s.as_str()), Some(hexk(b"v").as_str()),
+            "the contract's storage write committed (hex-encoded)");
+    }
+
+    #[test]
+    fn cross_contract_call_commits_both_when_declared() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        accounts.insert("A".to_string(), wasm_contract_acc(A_CALLS_B));
+        accounts.insert("B".to_string(), wasm_contract_acc(B_WRITES));
+        wasm_call("alice", "A", 1, r#"{"method":"run","accessList":["B"]}"#)
+            .apply_to_state(&mut accounts).expect("cross-call applies");
+        assert_eq!(stored(&accounts, "A", b"ak").map(|s| s.as_str()), Some(hexk(b"av").as_str()));
+        assert_eq!(stored(&accounts, "B", b"bk").map(|s| s.as_str()), Some(hexk(b"bv").as_str()),
+            "declared callee B's write committed");
+    }
+
+    #[test]
+    fn undeclared_callee_is_not_reached() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        accounts.insert("A".to_string(), wasm_contract_acc(A_CALLS_B));
+        accounts.insert("B".to_string(), wasm_contract_acc(B_WRITES));
+        // accessList omitted → A's call to B is unresolvable; A still commits its own write.
+        wasm_call("alice", "A", 1, r#"{"method":"run"}"#)
+            .apply_to_state(&mut accounts).expect("call applies");
+        assert_eq!(stored(&accounts, "A", b"ak").map(|s| s.as_str()), Some(hexk(b"av").as_str()));
+        assert!(stored(&accounts, "B", b"bk").is_none(), "undeclared B is never reached or written");
+    }
+
+    #[test]
+    fn deploy_then_call_full_pipeline() {
+        let mut accounts = HashMap::new();
+        accounts.insert("alice".to_string(), funded(100_000_000));
+        wasm_deploy("alice", 1, WRITE_KV).apply_to_state(&mut accounts).expect("deploy applies");
+        let addr = derive_contract_address("alice", 1);
+        wasm_call("alice", &addr, 2, r#"{"method":"run"}"#)
+            .apply_to_state(&mut accounts).expect("call on freshly deployed contract applies");
+        assert_eq!(stored(&accounts, &addr, b"k").map(|s| s.as_str()), Some(hexk(b"v").as_str()),
+            "deploy→call end-to-end committed the contract's write");
     }
 }
 

@@ -5,7 +5,7 @@ pub mod rust;
 
 // Re-export main crypto functions
 pub use rust::{
-    ProductionCrypto, DilithiumParams, SphincsParams, CryptoError, CryptoErrorKind,
+    ProductionCrypto, DilithiumParams, DilithiumLevel, SphincsParams, CryptoError, CryptoErrorKind,
     generate_keypair, sign as rust_sign, verify as rust_verify, merkle
 };
 
@@ -166,7 +166,7 @@ mod tests {
         ];
         
         for kind in kinds {
-            let error = CryptoErrorWithKind {
+            let error = CryptoError {
                 kind: kind.clone(),
                 message: "test error".to_string(),
             };
@@ -187,7 +187,13 @@ mod tests {
         ];
         
         for level in levels {
-            let params = DilithiumParams { level };
+            let params = DilithiumParams {
+                security_level: level,
+                // sizes are irrelevant to this variant/Debug check
+                public_key_size: 0,
+                private_key_size: 0,
+                signature_size: 0,
+            };
             let debug_str = format!("{:?}", params);
             assert!(!debug_str.is_empty());
         }

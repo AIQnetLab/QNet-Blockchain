@@ -490,10 +490,10 @@ docker run -d --name qnet-genesis-001 --restart=always \
 
 #### **Quantum Resistance**
 - **Consensus Signatures**: CRYSTALS-Dilithium3 (NIST FIPS 204, ML-DSA-65) — 2420-byte signatures
-- **Hybrid P2P**: Ed25519 (ephemeral) + Dilithium3 (certificate binding)
+- **P2P Message Signatures**: pure ML-DSA-65 (Dilithium3) — the ephemeral Ed25519 leg was removed; the Dilithium key signature is the sole authenticator (certificate binding)
 - **Hash Functions**: SHA3-256 (NIST FIPS 202) for all derivations
 - **Key Storage**: AES-256-GCM encrypted Dilithium3 keypairs
-- **P2P Key Exchange**: ML-KEM-768 (Kyber) active in QUIC TLS 1.3 hybrid handshake (v4.8)
+- **P2P Key Exchange**: ML-KEM-768 (Kyber) active in QUIC TLS 1.3 hybrid handshake (X25519Kyber768Draft00, v4.8)
 
 #### **Anti-Fraud Mechanisms**
 - **1 Wallet = 1 Node**: Enforced via persistent RocksDB scan (any node type)
@@ -648,8 +648,8 @@ User super nodes support **seamless server migration** — same activation code 
 - CRYSTALS-Dilithium3 (NIST FIPS 204) for all on-chain signatures
 - SHA3-256 (NIST FIPS 202) for all hash operations
 - AES-256-GCM (NIST FIPS 197) for key storage encryption
-- Hybrid Ed25519 + Dilithium3 for P2P message authentication
-- ML-KEM-768 (Kyber) active for P2P key exchange via QUIC TLS 1.3
+- Pure ML-DSA-65 (Dilithium3) for P2P message authentication (ephemeral Ed25519 leg removed)
+- ML-KEM-768 (Kyber) active for P2P key exchange via QUIC TLS 1.3 hybrid handshake (X25519Kyber768Draft00)
 
 ### **Anti-Fraud Measures**
 - Wallet ownership cryptographically verified (Ed25519 + mnemonic derivation)

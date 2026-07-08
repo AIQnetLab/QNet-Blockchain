@@ -48,6 +48,17 @@ pub const REGISTRY_ROOT_GATE_HEIGHT: u64 = 0;
 /// bitmap/reward_root. On a fresh genesis all nodes agree from h=0, so no staging window is needed.
 pub const LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT: u64 = 0;
 
+/// Activation height for the consensus WASM-event `logs_root` rule (`logs_root_required`): at/after
+/// this height a checkpoint's `logs_root` (merkle root over the window's committed WASM event logs,
+/// recomputed identically on every node from the deterministic per-block log receipts) MUST match
+/// the validator's independent recompute in content_ok, giving trustless light-client event proofs.
+/// u64::MAX = DORMANT: the OFF-consensus RPC log store (`getLogs`) is already live, but committing
+/// logs into the QC hash is deferred until a live multi-node equivalence run confirms a byte-identical
+/// window logs_root on every node — the same bar state_root/reward_root cleared. Until then every node
+/// computes [0;32] and content_ok's `cp.logs_root == c.logs_root` is trivially satisfied ([0;32]==[0;32]),
+/// so a fresh genesis is unaffected. TO ACTIVATE: set to a coordinated future height AFTER that run.
+pub const LOGS_ROOT_GATE_HEIGHT: u64 = u64::MAX;
+
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
 /// without on-chain governance. Genesis-active rules need no entry (the default is active);
 /// only rules that must stay dormant until a coordinated height are listed.
@@ -55,6 +66,7 @@ const ACTIVATIONS: &[(&str, u64)] = &[
     ("burn_attestation_required", BURN_ATTESTATION_GATE_HEIGHT),
     ("registry_root_required", REGISTRY_ROOT_GATE_HEIGHT),
     ("light_reg_epoch_roster", LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT),
+    ("logs_root_required", LOGS_ROOT_GATE_HEIGHT),
 ];
 
 /// Core gate: active iff `feature` is unlisted (genesis-active default) or `height` has reached

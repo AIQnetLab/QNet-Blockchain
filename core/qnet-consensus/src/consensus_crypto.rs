@@ -1,8 +1,8 @@
 //! # Consensus Cryptography Module (v2.24)
 //!
 //! ## Overview
-//! Provides quantum-resistant signature verification for Byzantine consensus with hybrid
-//! Ed25519 + CRYSTALS-Dilithium cryptography. Defense-in-depth: both P2P and Consensus
+//! Provides quantum-resistant signature verification for Byzantine consensus with a
+//! single pure CRYSTALS-Dilithium3 (ML-DSA-65) signature. Defense-in-depth: both P2P and Consensus
 //! layers perform cryptographic verification.
 //!
 //! ## Architecture (Defense-in-Depth)
@@ -14,25 +14,23 @@
 //!
 //! ### Development Layer (qnet-integration)
 //! - **Purpose**: Full cryptographic verification at P2P level
-//! - **Validates**: Dilithium signatures, Ed25519 signatures, certificates
+//! - **Validates**: Dilithium3 signatures, certificates
 //! - **Location**: `node.rs::verify_microblock_signature()`
 //!
 //! ## Signature Formats (v2.24 - Bincode + Zstd)
 //!
 //! ### Wire Format Prefixes
 //! - `compact_bin:` - Compact signature (bincode+zstd) - **PRODUCTION**
-//! - `hybrid_bin:` - Full signature (bincode+zstd) - **PRODUCTION**
+//! - `pq_bin:` - Full signature (bincode+zstd) - **LEGACY** (parse-only)
 //! - `compact:` - Compact signature (JSON) - **LEGACY**
-//! - `hybrid:` - Full signature (JSON) - **LEGACY**
-//! - `dilithium_sig_` - Pure Dilithium fallback
+//! - `pq:` - Full signature (JSON) - **LEGACY**
+//! - `dilithium_sig_` - Pure Dilithium (PRODUCTION)
 //!
 //! ### 1. Compact Signatures (Microblocks - ~2.6KB bincode)
 //! ```text
-//! CompactHybridSignature {
+//! CompactPqSignature {
 //!   node_id: String,
 //!   cert_serial: String,
-//!   ephemeral_public_key: [u8; 32],   // RAW bytes
-//!   message_signature: [u8; 64],       // Ed25519 RAW bytes
 //!   dilithium_key_signature: Vec<u8>,  // Dilithium RAW bytes (~2500 bytes)
 //!   signed_at: u64,
 //! }
@@ -42,17 +40,15 @@
 //! - **Certificate**: Referenced by serial, cached at P2P layer
 //! - **Used for**: High-frequency microblocks (1/sec)
 //!
-//! ### 2. Full Hybrid Signatures (Macroblocks - ~5KB bincode)
+//! ### 2. Full Signatures (Macroblocks - ~5KB bincode)
 //! ```text
-//! HybridSignature {
-//!   certificate: HybridCertificate,
-//!   ephemeral_public_key: [u8; 32],
-//!   message_signature: [u8; 64],
+//! PqSignature {
+//!   certificate: PqCertificate,
 //!   dilithium_key_signature: Vec<u8>,  // RAW bytes
 //!   signed_at: u64,
 //! }
 //! ```
-//! - **Wire format**: `hybrid_bin:<base64(zstd(bincode(sig)))>`
+//! - **Wire format**: `pq_bin:<base64(zstd(bincode(sig)))>`
 //! - **Bandwidth**: ~5KB bincode (was 27KB JSON)
 //! - **Used for**: Low-frequency macroblocks (every 90 blocks)
 //! - **Verification**: Immediate (certificate embedded)
@@ -61,10 +57,9 @@
 //!
 //! ### Layer 1: P2P Verification (node.rs)
 //! 1. All received blocks verified with full crypto
-//! 2. CRYSTALS-Dilithium signature verification (NIST post-quantum)
-//! 3. Ed25519 signature format validation
-//! 4. Certificate validation from cache/network
-//! 5. **Only verified blocks enter consensus**
+//! 2. CRYSTALS-Dilithium3 signature verification (NIST post-quantum) — sole authenticator
+//! 3. Certificate validation from cache/network
+//! 4. **Only verified blocks enter consensus**
 //!
 //! ### Layer 2: Consensus Validation (This Module)
 //! 1. Structural validation of pre-verified blocks
@@ -73,10 +68,9 @@
 //! 4. **Malicious blocks cannot reach consensus threshold**
 //!
 //! ## NIST/Cisco Compliance
-//! - **Post-Quantum**: CRYSTALS-Dilithium (NIST standard)
-//! - **Classical**: Ed25519 (legacy compatibility)
+//! - **Post-Quantum**: CRYSTALS-Dilithium3 / ML-DSA-65 (NIST standard) — sole authenticator
 //! - **Hashing**: SHA3-256 (NIST approved)
-//! - **Hybrid**: Both signatures required for validity
+//! - **Signature**: a single pure Dilithium3 signature establishes validity
 //!
 //! ## Performance
 //! - **Compact signatures**: 75% bandwidth reduction
@@ -492,11 +486,11 @@ pub fn record_attacker_pk(extracted_pk: &[u8], claimed_node_id: &str) -> (Attack
 /// rotation (e.g. v2 with timestamp binding) cannot replay v1 registrations.
 pub const PK_REGISTER_CHALLENGE_PREFIX: &str = "qnet-pk-register-v1:";
 
-/// Default registry cap when the env override is absent.
-/// v20: raised from 50 000 to 100 000 to match expected mid-term growth
-/// (Y1-Y5: 5 → 50 000 active super-nodes). Operators running larger
-/// deployments override at boot via `QNET_PK_REGISTRY_CAP`.
-const DEFAULT_PK_REGISTRY_CAP: usize = 100_000;
+/// Default registry cap when the env override is absent. Memory-budget knob, not a correctness
+/// bound: the durable on-chain PK registration is the source of truth and an evicted entry
+/// re-resolves on the next apply. Set to the active-super ceiling so it does not thrash at
+/// hundreds-of-thousands of nodes. Operators override at boot via `QNET_PK_REGISTRY_CAP`.
+const DEFAULT_PK_REGISTRY_CAP: usize = 1_000_000;
 
 /// Hard upper bound on the cap, regardless of env override. At 1M entries
 /// the registry consumes ~2 GB RAM; we refuse caps higher than that until
@@ -1028,7 +1022,7 @@ pub fn set_genesis_anchor_pks(anchors: std::collections::HashMap<String, Vec<u8>
     true
 }
 
-/// Verify consensus signature using hybrid cryptography
+/// Verify consensus signature using pure Dilithium3 (ML-DSA-65) cryptography
 pub async fn verify_consensus_signature(
     node_id: &str,
     message: &str,
@@ -1047,14 +1041,14 @@ pub async fn verify_consensus_signature(
         // OPTIMIZED v2.24: Binary compact signature (2.6KB vs 5KB JSON!)
         verify_compact_binary_signature(node_id, message, signature).await
     } else if signature.starts_with("compact:") {
-        // Legacy: Compact hybrid signature JSON (5KB)
-        verify_compact_hybrid_signature(node_id, message, signature).await
-    } else if signature.starts_with("hybrid_bin:") {
-        // OPTIMIZED v2.24: Binary hybrid signature (5KB vs 27KB JSON!)
-        verify_hybrid_binary_signature(node_id, message, signature).await
-    } else if signature.starts_with("hybrid:") {
-        // This is a full hybrid signature with certificate (legacy JSON, 12KB)
-        verify_hybrid_signature(node_id, message, signature).await
+        // Legacy: Compact PQ signature JSON (5KB)
+        verify_compact_pq_signature(node_id, message, signature).await
+    } else if signature.starts_with("pq_bin:") {
+        // Binary signature (5KB vs 27KB JSON)
+        verify_pq_binary_signature(node_id, message, signature).await
+    } else if signature.starts_with("pq:") {
+        // Legacy: full signature with certificate JSON (parse-only; no current producer)
+        verify_pq_signature(node_id, message, signature).await
     } else if signature.starts_with("dilithium_sig_") {
         // This is a pure Dilithium signature
         verify_dilithium_signature(node_id, message, signature).await
@@ -1093,7 +1087,7 @@ async fn verify_compact_binary_signature(
     // `zstd::decode_all` allocates whatever the stream demands; an adversarial
     // input ~1000× its on-the-wire size could OOM every receiver. Honest
     // compact_bin signatures are ~2.6 KB; the largest plausible variant
-    // (`hybrid_bin` with embedded certificate) is ~5 KB. A 256 KB ceiling
+    // (`pq_bin` with embedded certificate) is ~5 KB. A 256 KB ceiling
     // is ~50× the largest legitimate payload — generous head-room for future
     // protocol additions while making decompression-bomb DoS impossible
     // in this code path.
@@ -1116,10 +1110,6 @@ async fn verify_compact_binary_signature(
         node_id: String,
         cert_serial: String,  // Used for certificate lookup
         #[serde(with = "serde_bytes")]
-        ephemeral_public_key: Vec<u8>,
-        #[serde(with = "serde_bytes")]
-        message_signature: Vec<u8>,
-        #[serde(with = "serde_bytes")]
         dilithium_key_signature: Vec<u8>,
         signed_at: u64,
     }
@@ -1138,51 +1128,15 @@ async fn verify_compact_binary_signature(
         return false;
     }
     
-    // Validate sizes
-    if compact_sig.ephemeral_public_key.len() != 32 {
-        println!("[ERR][CONSENSUS_CRYPTO] invalid_ephemeral_key_length len={}", compact_sig.ephemeral_public_key.len());
-        return false;
-    }
-    if compact_sig.message_signature.len() != 64 {
-        println!("[ERR][CONSENSUS_CRYPTO] invalid_ed25519_sig_length len={}", compact_sig.message_signature.len());
-        return false;
-    }
-    
     // Decode message hash
     let message_hash = match hex::decode(message) {
         Ok(hash) => hash,
         Err(_) => message.as_bytes().to_vec(),
     };
-    
-    // Verify Ed25519 signature
-    let ephemeral_pk = match ed25519_dalek::VerifyingKey::from_bytes(
-        &compact_sig.ephemeral_public_key.as_slice().try_into().unwrap_or([0u8; 32])
-    ) {
-        Ok(pk) => pk,
-        Err(e) => {
-            println!("[ERR][CONSENSUS_CRYPTO] invalid_ephemeral_public_key err={}", e);
-            return false;
-        }
-    };
-    
-    let ed25519_sig = match ed25519_dalek::Signature::from_slice(&compact_sig.message_signature) {
-        Ok(sig) => sig,
-        Err(e) => {
-            println!("[ERR][CONSENSUS_CRYPTO] invalid_ed25519_sig_format err={}", e);
-            return false;
-        }
-    };
-    
-    use ed25519_dalek::Verifier;
-    if ephemeral_pk.verify(&message_hash, &ed25519_sig).is_err() {
-        println!("[ERR][CONSENSUS_CRYPTO] ed25519_verification_failed format=compact_bin");
-        return false;
-    }
-    
-    // Verify Dilithium: signs (ephemeral_key || message_hash || timestamp)
-    // CRITICAL FIX: Must use to_le_bytes() to match hybrid_crypto.rs signing!
+
+    // Pure ML-DSA-65 (P8): Dilithium signs the re-rooted preimage message_hash || signed_at.
+    // Must use to_le_bytes() to match pq_crypto.rs signing byte-for-byte.
     let mut encapsulated_data = Vec::new();
-    encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
     encapsulated_data.extend_from_slice(&message_hash);
     encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
     let encapsulated_hex = hex::encode(&encapsulated_data);
@@ -1203,9 +1157,9 @@ async fn verify_compact_binary_signature(
     true
 }
 
-/// LEGACY: Verify compact JSON signature for microblocks  
-/// For macroblocks, full signatures are used (verified by verify_hybrid_signature)
-async fn verify_compact_hybrid_signature(
+/// LEGACY: Verify compact JSON signature for microblocks
+/// For macroblocks, full signatures are used (verified by verify_pq_signature)
+async fn verify_compact_pq_signature(
     node_id: &str,
     message: &str,
     signature: &str,
@@ -1218,19 +1172,17 @@ async fn verify_compact_hybrid_signature(
     
     let json_data = &signature[8..]; // Skip "compact:" prefix
     
-    // HYBRID ARCHITECTURE:
-    // - Microblocks: Compact signatures with certificate lookup  
+    // SIGNATURE ARCHITECTURE:
+    // - Microblocks: Compact signatures with certificate lookup
     // - Macroblocks: Full signatures with embedded certificate
     // - This function only handles microblock verification
     
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
         // Verify structure has required fields (NIST/Cisco compliance)
-        // OPTIMIZED v2.23: RAW bytes format, dilithium_message_signature removed
-        if parsed.get("node_id").is_some() && 
+        // Pure ML-DSA-65: RAW bytes format (Dilithium is the sole authenticator)
+        if parsed.get("node_id").is_some() &&
            parsed.get("cert_serial").is_some() &&
-           parsed.get("ephemeral_public_key").is_some() &&  // NIST/Cisco: ephemeral key per message
-           parsed.get("message_signature").is_some() &&
-           parsed.get("dilithium_key_signature").is_some() {  // NIST/Cisco: Dilithium signs ephemeral key + message_hash
+           parsed.get("dilithium_key_signature").is_some() {  // Pure ML-DSA-65: Dilithium is the sole authenticator
             
             // Extract fields from compact signature
             if let (Some(sig_node_id), Some(cert_serial)) = 
@@ -1246,27 +1198,7 @@ async fn verify_compact_hybrid_signature(
                 // PRODUCTION: Cryptographic verification with certificate lookup
                 // For microblocks, we need the certificate to verify compact signatures
                 
-                // Extract signature components
-                let ed25519_sig_bytes = parsed.get("message_signature")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| {
-                        // Convert JSON array to Vec<u8>
-                        let mut bytes = Vec::new();
-                        for val in arr {
-                            if let Some(n) = val.as_u64() {
-                                if n <= 255 {
-                                    bytes.push(n as u8);
-                                } else {
-                                    return None; // Invalid byte value
-                                }
-                            } else {
-                                return None; // Not a number
-                            }
-                        }
-                        Some(bytes)
-                    });
-                
-                // OPTIMIZED v2.23: dilithium_key_signature is now RAW bytes (array of u8 in JSON)
+                // dilithium_key_signature is RAW bytes (array of u8 in JSON)
                 let dilithium_key_bytes: Option<Vec<u8>> = parsed.get("dilithium_key_signature")
                     .and_then(|v| v.as_array())
                     .and_then(|arr| {
@@ -1285,46 +1217,21 @@ async fn verify_compact_hybrid_signature(
                         Some(bytes)
                     });
                 
-                // OPTIMIZED v2.23: ephemeral_public_key is now RAW bytes (array of u8 in JSON)
-                let ephemeral_pk_bytes: Option<Vec<u8>> = parsed.get("ephemeral_public_key")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| {
-                        let mut bytes = Vec::new();
-                        for val in arr {
-                            if let Some(n) = val.as_u64() {
-                                if n <= 255 {
-                                    bytes.push(n as u8);
-                                } else {
-                                    return None;
-                                }
-                            } else {
-                                return None;
-                            }
-                        }
-                        if bytes.len() == 32 { Some(bytes) } else { None }
-                    });
-                
                 // Extract signed_at timestamp for encapsulated_data reconstruction
                 let signed_at = parsed.get("signed_at")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 
-                // OPTIMIZED v2.23: Check RAW bytes fields
-                if ed25519_sig_bytes.is_none() || dilithium_key_bytes.is_none() || ephemeral_pk_bytes.is_none() || signed_at == 0 {
-                    println!("[ERR][CONSENSUS_CRYPTO] compact_sig_missing_components ed25519={} ephemeral_pk={} dilithium={} timestamp={}",
-                        if ed25519_sig_bytes.is_some() {"ok"} else {"missing"},
-                        if ephemeral_pk_bytes.is_some() {"ok"} else {"missing"},
+                // Pure ML-DSA-65 (P8): only the Dilithium sig + timestamp are required
+                if dilithium_key_bytes.is_none() || signed_at == 0 {
+                    println!("[ERR][CONSENSUS_CRYPTO] compact_sig_missing_components dilithium={} timestamp={}",
                         if dilithium_key_bytes.is_some() {"ok"} else {"missing"},
                         if signed_at > 0 {"ok"} else {"missing"});
                     return false;
                 }
-                
+
                 let dilithium_key_raw = dilithium_key_bytes.expect("Checked above");
-                let ephemeral_pk_raw = ephemeral_pk_bytes.expect("Checked above");
-                
-                let ed25519_sig = ed25519_sig_bytes.expect("Checked is_none above");
-                let ed25519_sig_len = ed25519_sig.len();  // Save length before ownership transfer
-                
+
                 // PRODUCTION: Real cryptographic verification with certificates
                 // CRITICAL FIX: message is HEX string, must decode to bytes first!
                 // sign_message_compact() uses RAW message bytes for hash
@@ -1350,44 +1257,14 @@ async fn verify_compact_hybrid_signature(
                 //    - All blocks entering consensus are pre-verified
                 // 4. This provides defense-in-depth with clean architecture
                 
-                // Validate Ed25519 signature component
-                if ed25519_sig_len != 64 {
-                    println!("[ERR][CONSENSUS_CRYPTO] invalid_ed25519_sig_size size={} expected=64", ed25519_sig_len);
-                    return false;
-                }
-                
-                // OPTIMIZED v2.23: Validate RAW bytes Dilithium signature
+                // Validate RAW bytes Dilithium signature
                 if dilithium_key_raw.len() < 2500 {
-                    println!("[ERR][CONSENSUS_CRYPTO] invalid_dilithium_key_sig_size size={} min=4500", dilithium_key_raw.len());
+                    println!("[ERR][CONSENSUS_CRYPTO] invalid_dilithium_key_sig_size size={} min=2500", dilithium_key_raw.len());
                     return false;
                 }
-                
-                // Basic Ed25519 signature format check (can parse as valid signature)
-                use ed25519_dalek::Signature as Ed25519Signature;
-                let ed_sig_array: Result<[u8; 64], _> = ed25519_sig.try_into();
-                match ed_sig_array {
-                    Ok(arr) => {
-                        if Ed25519Signature::try_from(arr.as_ref()).is_err() {
-                            println!("[ERR][CONSENSUS_CRYPTO] ed25519_signature_malformed");
-                            return false;
-                        }
-                    },
-                    Err(_) => {
-                        println!("[ERR][CONSENSUS_CRYPTO] ed25519_signature_wrong_size");
-                        return false;
-                    }
-                }
-                
-                // CRITICAL: Real Dilithium verification at CONSENSUS level
-                // OPTIMIZED v2.23: Single Dilithium signature as RAW bytes
-                // ephemeral_key || message_hash || timestamp
-                // This provides both key binding AND message integrity
-                
-                println!("[INFO][CONSENSUS_CRYPTO] verifying_dilithium_key_signature standard=NIST_Cisco");
-                
-                // OPTIMIZED v2.23: Use RAW bytes directly
+
+                // Pure ML-DSA-65 (P8): Dilithium signs the re-rooted preimage message_hash || signed_at
                 let mut encapsulated_data = Vec::new();
-                encapsulated_data.extend_from_slice(&ephemeral_pk_raw);
                 encapsulated_data.extend_from_slice(&message_hash);
                 encapsulated_data.extend_from_slice(&signed_at.to_le_bytes());
                 let encapsulated_hex = hex::encode(&encapsulated_data);
@@ -1411,7 +1288,7 @@ async fn verify_compact_hybrid_signature(
                     return false;
                 }
                 
-                println!("[INFO][CONSENSUS_CRYPTO] signatures_verified node={} cert={} ed25519=ok dilithium=ok nist_cisco=ok", node_id, cert_serial);
+                println!("[INFO][CONSENSUS_CRYPTO] signatures_verified node={} cert={} dilithium=ok", node_id, cert_serial);
                 
                 return true;
             }
@@ -1422,31 +1299,32 @@ async fn verify_compact_hybrid_signature(
     false
 }
 
-/// OPTIMIZED v2.24: Verify binary hybrid signature (bincode+zstd instead of JSON)
+/// OPTIMIZED v2.24: Verify binary PQ (Dilithium3) signature (bincode+zstd instead of JSON)
 /// Size: ~5KB vs 27KB JSON - 81% reduction!
-async fn verify_hybrid_binary_signature(
+async fn verify_pq_binary_signature(
     node_id: &str,
     message: &str,
     signature: &str,
 ) -> bool {
-    // Parse binary signature format: "hybrid_bin:<base64_bincode_data>"
-    if !signature.starts_with("hybrid_bin:") {
-        println!("[ERR][CONSENSUS_CRYPTO] invalid_hybrid_bin_format");
-        return false;
-    }
-    
-    let base64_data = &signature[11..]; // Skip "hybrid_bin:" prefix
+    // Parse binary signature format: "pq_bin:<base64_bincode_data>" (strip_prefix — no length coupling)
+    let base64_data = match signature.strip_prefix("pq_bin:") {
+        Some(rest) => rest,
+        None => {
+            println!("[ERR][CONSENSUS_CRYPTO] invalid_pq_bin_format");
+            return false;
+        }
+    };
     
     // Decode base64
     let binary_data = match general_purpose::STANDARD.decode(base64_data) {
         Ok(data) => data,
         Err(e) => {
-            println!("[ERR][CONSENSUS_CRYPTO] hybrid_bin_base64_decode_failed err={}", e);
+            println!("[ERR][CONSENSUS_CRYPTO] pq_bin_base64_decode_failed err={}", e);
             return false;
         }
     };
     
-    println!("[INFO][CONSENSUS_CRYPTO] verifying_hybrid_bin_signature size_kb={}", binary_data.len() / 1024);
+    println!("[INFO][CONSENSUS_CRYPTO] verifying_pq_bin_signature size_kb={}", binary_data.len() / 1024);
     
     // Decompress and deserialize
     use std::io::Read;
@@ -1466,31 +1344,24 @@ async fn verify_hybrid_binary_signature(
     // Deserialize bincode to get signature components
     // We use serde_json::Value as intermediate since bincode struct may differ
     #[derive(serde::Deserialize)]
-    struct BinaryHybridSignature {
+    struct BinaryPqSignature {
         certificate: BinaryCertificate,
-        #[serde(with = "serde_bytes")]
-        ephemeral_public_key: Vec<u8>,
-        #[serde(with = "serde_bytes")]
-        message_signature: Vec<u8>,
         #[serde(with = "serde_bytes")]
         dilithium_key_signature: Vec<u8>,
         signed_at: u64,
     }
-    
+
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
     struct BinaryCertificate {
         node_id: String,
-        ed25519_public_key: [u8; 32],
         dilithium_signature: String,
         issued_at: u64,
         expires_at: u64,  // Used for certificate expiration check
         serial_number: String,
-        #[serde(default)]
-        rotation_signature: Option<String>,
     }
     
-    let sig: BinaryHybridSignature = match bincode::deserialize(&decompressed) {
+    let sig: BinaryPqSignature = match bincode::deserialize(&decompressed) {
         Ok(s) => s,
         Err(e) => {
             println!("[ERR][CONSENSUS_CRYPTO] bincode_deserialize_failed err={}", e);
@@ -1528,9 +1399,8 @@ async fn verify_hybrid_binary_signature(
     hasher.update(&message_bytes);
     let message_hash = hasher.finalize();
     
-    // Build encapsulated data: ephemeral_key || message_hash || timestamp
+    // Pure ML-DSA-65 (P8): Dilithium signs the re-rooted preimage message_hash || signed_at
     let mut encapsulated_data = Vec::new();
-    encapsulated_data.extend_from_slice(&sig.ephemeral_public_key);
     encapsulated_data.extend_from_slice(&message_hash);
     encapsulated_data.extend_from_slice(&sig.signed_at.to_le_bytes());
     let encapsulated_hex = hex::encode(&encapsulated_data);
@@ -1542,7 +1412,7 @@ async fn verify_hybrid_binary_signature(
         general_purpose::STANDARD.encode(&sig.dilithium_key_signature)
     );
     
-    // Verify Dilithium KEY signature (covers ephemeral_key + message_hash + timestamp)
+    // Verify Dilithium KEY signature (covers message_hash + timestamp)
     let dilithium_key_valid = verify_dilithium_signature(
         node_id,
         &encapsulated_hex,
@@ -1554,55 +1424,33 @@ async fn verify_hybrid_binary_signature(
         return false;
     }
     
-    // Verify Ed25519 message signature
-    use ed25519_dalek::{VerifyingKey, Signature, Verifier};
-    let ephemeral_pk = match VerifyingKey::from_bytes(&sig.ephemeral_public_key.try_into().unwrap_or([0u8; 32])) {
-        Ok(pk) => pk,
-        Err(e) => {
-            println!("[ERR][CONSENSUS_CRYPTO] invalid_ephemeral_public_key err={}", e);
-            return false;
-        }
-    };
-    
-    let ed25519_sig = match Signature::from_slice(&sig.message_signature) {
-        Ok(s) => s,
-        Err(e) => {
-            println!("[ERR][CONSENSUS_CRYPTO] invalid_ed25519_signature err={}", e);
-            return false;
-        }
-    };
-    
-    // CRITICAL: Ed25519 signed RAW message bytes, not HEX string
-    if ephemeral_pk.verify(&message_bytes, &ed25519_sig).is_err() {
-        println!("[ERR][CONSENSUS_CRYPTO] ed25519_message_sig_verification_failed");
-        return false;
-    }
-    
-    println!("[INFO][CONSENSUS_CRYPTO] hybrid_bin_signature_verified format=bincode");
+    // Pure ML-DSA-65 (P8): the Dilithium key signature (sole authenticator) covers the re-rooted
+    // preimage message_hash || signed_at. Ed25519 legs and struct fields are fully removed.
+    println!("[INFO][CONSENSUS_CRYPTO] pq_bin_signature_verified format=bincode");
     true
 }
 
-/// Verify hybrid signature (Dilithium certificate + Ed25519)
+/// Verify PQ signature (pure Dilithium3 / ML-DSA-65 with certificate)
 /// CRITICAL FIX: Now performs REAL Dilithium verification per NIST/Cisco requirements
-async fn verify_hybrid_signature(
+async fn verify_pq_signature(
     node_id: &str,
     message: &str,
     signature: &str,
 ) -> bool {
-    // Parse hybrid signature format: "hybrid:<json_data>"
-    if !signature.starts_with("hybrid:") {
-        println!("[ERR][CONSENSUS_CRYPTO] invalid_hybrid_signature_format");
-        return false;
-    }
-    
-    let json_data = &signature[7..]; // Skip "hybrid:" prefix
+    // Parse signature format: "pq:<json_data>" (strip_prefix — no length coupling)
+    let json_data = match signature.strip_prefix("pq:") {
+        Some(rest) => rest,
+        None => {
+            println!("[ERR][CONSENSUS_CRYPTO] invalid_pq_signature_format");
+            return false;
+        }
+    };
     
     // Parse JSON to extract signature components
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
         // Check required fields
         let has_certificate = parsed.get("certificate").is_some();
-        let has_message_sig = parsed.get("message_signature").is_some();
-        
+
         // OPTIMIZED v2.23: Parse RAW bytes from JSON array
         let dilithium_key_bytes: Option<Vec<u8>> = parsed.get("dilithium_key_signature")
             .and_then(|v| v.as_array())
@@ -1622,37 +1470,19 @@ async fn verify_hybrid_signature(
                 Some(bytes)
             });
             
-        let ephemeral_pk_bytes: Option<Vec<u8>> = parsed.get("ephemeral_public_key")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| {
-                let mut bytes = Vec::new();
-                for val in arr {
-                    if let Some(n) = val.as_u64() {
-                        if n <= 255 {
-                            bytes.push(n as u8);
-                        } else {
-                            return None;
-                        }
-                    } else {
-                        return None;
-                    }
-                }
-                if bytes.len() == 32 { Some(bytes) } else { None }
-            });
-            
         let signed_at = parsed.get("signed_at")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         
-        if !has_certificate || !has_message_sig {
-            println!("[ERR][CONSENSUS_CRYPTO] hybrid_sig_missing_required_fields");
+        if !has_certificate {
+            println!("[ERR][CONSENSUS_CRYPTO] pq_sig_missing_required_fields");
             return false;
         }
-        
-        // OPTIMIZED v2.23: Verify with RAW bytes
-        if let (Some(dilithium_raw), Some(ephemeral_raw)) = (dilithium_key_bytes, ephemeral_pk_bytes) {
+
+        // Pure ML-DSA-65: verify with the Dilithium sig (sole authenticator)
+        if let Some(dilithium_raw) = dilithium_key_bytes {
             if signed_at > 0 {
-                println!("[INFO][CONSENSUS_CRYPTO] verifying_hybrid_dilithium_signature");
+                println!("[INFO][CONSENSUS_CRYPTO] verifying_pq_dilithium_signature");
                 
                 // Compute message hash
                 // CRITICAL FIX: message is HEX string, must decode to bytes first!
@@ -1666,7 +1496,6 @@ async fn verify_hybrid_signature(
                 let message_hash = hasher.finalize();
                 
                 let mut encapsulated_data = Vec::new();
-                encapsulated_data.extend_from_slice(&ephemeral_raw);
                 encapsulated_data.extend_from_slice(&message_hash);
                 encapsulated_data.extend_from_slice(&signed_at.to_le_bytes());
                 let encapsulated_hex = hex::encode(&encapsulated_data);
@@ -1678,7 +1507,7 @@ async fn verify_hybrid_signature(
                     general_purpose::STANDARD.encode(&dilithium_raw)
                 );
                 
-                // Verify Dilithium KEY signature (covers ephemeral_key + message_hash + timestamp)
+                // Verify Dilithium KEY signature (covers message_hash + timestamp)
                 let dilithium_key_valid = verify_dilithium_signature(
                     node_id,
                     &encapsulated_hex,
@@ -1686,22 +1515,22 @@ async fn verify_hybrid_signature(
                 ).await;
                 
                 if !dilithium_key_valid {
-                    println!("[ERR][CONSENSUS_CRYPTO] hybrid_dilithium_signature_failed");
+                    println!("[ERR][CONSENSUS_CRYPTO] pq_dilithium_signature_failed");
                     return false;
                 }
                 
-                println!("[INFO][CONSENSUS_CRYPTO] hybrid_signature_verified node={} dilithium=ok", node_id);
+                println!("[INFO][CONSENSUS_CRYPTO] pq_signature_verified node={} dilithium=ok", node_id);
                 return true;
             }
         }
         
         // SECURITY: Legacy bypass REMOVED — Dilithium verification is MANDATORY
-        // Hybrid signatures without valid Dilithium fields are rejected
-        println!("[WARN][CONSENSUS_CRYPTO] hybrid_sig_rejected reason=missing_dilithium_fields");
+        // PQ signatures without valid Dilithium fields are rejected
+        println!("[WARN][CONSENSUS_CRYPTO] pq_sig_rejected reason=missing_dilithium_fields");
         return false;
     }
-    
-    println!("[ERR][CONSENSUS_CRYPTO] invalid_hybrid_signature_structure");
+
+    println!("[ERR][CONSENSUS_CRYPTO] invalid_pq_signature_structure");
     false
 }
 

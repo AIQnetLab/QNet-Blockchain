@@ -26,8 +26,8 @@ use crate::errors::*;
 // The verification authority pattern is standard for bridge-style flows
 // where full tx verification is too expensive to do on-chain: the authority
 // is typically a multisig / threshold signer operated by the protocol,
-// bound at tracker initialization and rotatable via a separate admin
-// instruction.
+// bound at tracker initialization and immutable thereafter (this program
+// exposes no rotate instruction — re-deploy/re-init is the only path).
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(Accounts)]

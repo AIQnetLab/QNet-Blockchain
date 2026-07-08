@@ -65,16 +65,14 @@ Explorer → Node RPC (RocksDB)
     - 100% data coverage
 ```
 
-### 🔭 **Consensus v2 — "Checkpoint-BFT" (in progress, flag `QNET_CONSENSUS_V2`)**
+### 🔭 **Consensus — "Checkpoint-BFT v2" (LIVE, always on)**
 
-The commit/reveal macroblock + microblock-rotation handshake are being unified into
-ONE pipelined post-quantum BFT: a single leader streams microblocks (1/s), the
-committee finalizes each window with ONE 2f+1 QC per checkpoint (2-chain commit).
-This removes the three recurring failure classes (determinism forks, liveness
-freezes, finality-coupling stalls) by construction; randomness is VRF-only (RANDAO
-commit/reveal removed). Engine + driver + node runtime implemented behind the flag;
-170 unit tests green; pending fault-injection stand validation. **Flag OFF ⇒ the
-v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
+Checkpoint-BFT v2 is the ONLY macroblock consensus and is always active. A single leader
+streams microblocks (1/s, 30 per producer); every 90-microblock window is finalized by ONE
+2f+1 quorum certificate (QC) per checkpoint (two-chain commit, ~60s to irreversibility). This
+removes the three recurring failure classes (determinism forks, liveness freezes,
+finality-coupling stalls) by construction; randomness is VRF-only. The legacy commit/reveal
+macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`.
 
 ### 🛡️ **Previous Updates (v2.62.0 - December 30, 2025)**
 
@@ -102,7 +100,7 @@ v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
 
 **⚡ Stage Pipeline (Full Runtime Isolation):**
 - **BROADCAST_RUNTIME**: Dedicated threads for Shred protocol
-- **SIGVERIFY_RUNTIME**: Isolated Ed25519/Dilithium verification
+- **SIGVERIFY_RUNTIME**: Isolated ML-DSA-65 (Dilithium3) signature verification
 - **BANKING_RUNTIME**: Transaction intake and mempool ops
 - **REPLAY_RUNTIME**: State machine execution
 - **Adaptive Threading**: 2 cores→4t, 4 cores→5t, 8 cores→10t, 16 cores→20t
@@ -116,7 +114,7 @@ v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
 - **Round Update at Save Only**: Prevents premature round advancement causing desync
 - **Reveal Loss Prevention**: Participant nodes don't reset consensus engine mid-round
 - **Dynamic Height Threshold**: 5/10/20 blocks based on network size (scalable resync)
-- **Signed Reveal Messages**: SHA3-256 + Dilithium hybrid signatures for reveals
+- **Signed Consensus Votes**: pure Dilithium3 signatures over Checkpoint-BFT v2 votes (there are no "reveals")
 
 ### 🛡️ **Previous Updates (v2.44.0 - December 24, 2025)**
 
@@ -172,11 +170,12 @@ v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
 - **Graceful Shutdown**: Certificate persistence on Ctrl+C/SIGTERM
 - **No Fallback Policy**: Desynchronized nodes excluded from production
 
-**🔐 NIST/Cisco Compliant Hybrid Cryptography:**
-- **Ephemeral Keys**: NEW Ed25519 keypair for EACH message (forward secrecy)
-- **Dual Dilithium Signatures**: Signs ephemeral key binding + message hash
-- **Quantum Protection**: Ed25519 broken? Dilithium still protects!
-- **Compliance**: NIST SP 800-208, Cisco Post-Quantum recommendations
+**🔐 NIST/Cisco Compliant Post-Quantum Cryptography:**
+- **Pure ML-DSA-65 Signatures**: EVERY QNet signature — transactions, consensus votes, node identity, P2P gossip — is pure CRYSTALS-Dilithium3 (ML-DSA-65, FIPS 204). No classical signature is involved in any on-chain path.
+- **Quantum Protection**: No Ed25519 fallback on any QNet signing path — post-quantum by default, so nothing breaks if classical curves fall.
+- **Transport Confidentiality**: QUIC/TLS 1.3 uses the X25519Kyber768 hybrid KEX (ML-KEM-768, FIPS 203) for key exchange only — the sole "hybrid" primitive in the stack, and a key-exchange step, not a signature.
+- **Ed25519 Scope**: Ed25519 appears ONLY off-chain, on the Solana side, as the credential for the Phase 1 1DEV proof-of-burn — never for QNet transaction, consensus, or identity signing.
+- **Compliance**: NIST SP 800-208, FIPS 203/204, Cisco Post-Quantum recommendations
 
 **🚀 QUIC Transport Layer:**
 - TLS 1.3 encryption (NIST SP 800-52 compliant)
@@ -199,12 +198,12 @@ v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
 ### 🛡️ **Latest Update (v2.27.0 - December 11, 2025)**
 - **Epoch-Based Validator Set**: Deterministic producer selection from MacroBlock snapshots
 - **No Gossip Race Conditions**: All nodes use same producer list from blockchain
-- **EligibleProducer Struct**: `{ node_id, reputation, stake }` stored in MacroBlock
+- **EligibleProducer Struct**: `{ node_id, reputation }` stored in MacroBlock (no staking; selection is reputation + VRF)
 - **Genesis Epoch Static**: Blocks 1-90 use `genesis_constants.rs` hardcoded list
 - **MAX_VALIDATORS_PER_EPOCH = 1000**: Scalable deterministic sampling
 
 ### 🛡️ **Previous Update (v2.25.2 - December 9, 2025)**
-- **Batch Ed25519 Verification**: 3x faster signature verification using ed25519-dalek batch API
+- **Batch Signature Verification**: 3x faster ML-DSA-65 (Dilithium3) verification via batched signature checks
 - **Batch Mempool Operations**: 1 lock per 1000 TX instead of per-TX (1000x reduction)
 - **TX Accumulator**: Batch 1000 TX for verification, 100ms timeout
 - **Skip Self-Broadcast**: Producer doesn't broadcast TX to itself
@@ -219,7 +218,7 @@ v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
 - **Cascade Prevention**: Prevents false accusations from network desync
 
 ### 🛡️ **Previous Updates (v2.23 - December 6, 2025)**
-- **Heartbeat with HYBRID signatures**: Full quantum protection (Ed25519 + Dilithium per heartbeat)
+- **Heartbeat with quantum signatures**: Full quantum protection (pure ML-DSA-65 (Dilithium3) per heartbeat)
 - **RAW bytes signatures**: 88% size reduction (~2.6KB vs 22KB)
 - **Shred Protocol ALWAYS**: Block propagation uses Shred Protocol for ALL network sizes
 - **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing (K=3)
@@ -251,9 +250,9 @@ v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
 
 ### 🛡️ **Previous Updates (v2.19.6 - November 26, 2025)**
 - **WebSocket Real-time Events**: Live updates for blocks, balances, contracts, and transactions
-- **Smart Contract REST API**: Deploy, call, query WASM contracts with hybrid signatures
+- **Smart Contract REST API**: Deploy, call, query WASM contracts with ML-DSA-65 (Dilithium3) signatures
 - **Smart Polling for Light Nodes**: Battery-efficient polling (~94% fewer wake-ups)
-- **Mandatory Transaction Signatures**: All transfers require Ed25519 verification
+- **Mandatory Transaction Signatures**: All transfers require pure ML-DSA-65 (Dilithium3) verification — post-quantum by default, no classical (Ed25519) signature accepted on any QNet transaction path
 - **Enhanced Rate Limiting**: IP-based DDoS protection for all API endpoints
 
 ### 🛡️ **Previous Updates (v2.19.3 - November 23, 2025)**
@@ -305,7 +304,7 @@ v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
   - Escalation: Repeated failures increase blacklist duration
   - Auto-removal: Hard blacklist cleared when consensus_score ≥ 70%
 - **Peer Prioritization**: Optimized block synchronization (NEW!)
-  - Priority by node type: Super > Full (Light nodes excluded from sync sources)
+  - Priority by node type: Super nodes only (Light nodes excluded from sync sources)
   - Blacklist filtering: Offline/malicious peers skipped
   - Reputation-based ordering: consensus_score + network_score (latency)
   - Top-20 peer sampling: Avoids stuck sync on single unavailable peer
@@ -337,8 +336,8 @@ v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
   - Conservative estimates for Pool 2 & Pool 3
   - Partial determinism by design (±1-5% acceptable)
   - Byzantine consensus ensures security
-- **Compact Hybrid Signatures v2.23**: Optimized microblock signatures (~2.6KB RAW bytes)
-  - Ed25519 + CRYSTALS-Dilithium hybrid cryptography
+- **Compact ML-DSA-65 signatures v2.23**: Optimized microblock signatures (~2.6KB RAW bytes)
+  - Pure CRYSTALS-Dilithium3 (ML-DSA-65) cryptography
   - RAW bytes format via `serde_bytes` (88% reduction from 22KB)
   - Defense-in-depth: real Dilithium verification at P2P + Consensus layers
   - NIST/Cisco post-quantum compliance
@@ -362,7 +361,6 @@ v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
   - Prevents memory exhaustion attacks
 - **Node Type Filtering**: Consensus participation optimization
   - Light nodes: transactions only (no consensus)
-  - Full nodes: partial consensus participation
   - Super nodes: full consensus (max 1000 validators)
   - Validator sampling for network scaling
 - **Architectural Cleanup**: Resolved circular dependencies
@@ -478,17 +476,17 @@ v2.62 design below remains active.** Full design: `docs/ARCHITECTURE_v2.19.md`.
 
 **QNet production testnet is ready for deployment with advanced consensus and synchronization.**
 
-- ✅ **Post-Quantum Cryptography**: CRYSTALS-Dilithium3 with NIST/Cisco encapsulated keys (nodes)
-- ✅ **Client Cryptography**: Ed25519 signatures for mobile/browser (20μs operations)
+- ✅ **Post-Quantum Cryptography**: Pure ML-DSA-65 / CRYSTALS-Dilithium3 signatures (nodes)
+- ✅ **Client Cryptography**: Pure ML-DSA-65 (Dilithium3) signatures for mobile/browser
 - ✅ **Entropy-Based Consensus**: True decentralization with unpredictable producer rotation
 - ✅ **Reputation System**: Economic incentives for network participation
 - ✅ **State Snapshots**: Full & incremental snapshots with LZ4 compression
 - ✅ **Parallel Synchronization**: Multi-worker downloads for fast sync
 - ✅ **Deadlock Prevention**: Guard patterns & health monitors implemented
 - ✅ **Two-Phase Activation**: 1DEV burn (Phase 1) → QNC Pool 3 (Phase 2)
-- ✅ **Microblock Architecture**: 1-second blocks, 400k+ TPS (256 shards)
+- ✅ **Microblock Architecture**: 1-second blocks, 400k+ TPS (single-shard today; sharding deferred, auto-arm gated OFF)
 - ✅ **Production Rust Nodes**: Server deployment with real blockchain nodes
-- ✅ **Browser Extension Wallet**: Production-ready with full-screen interface
+- ✅ **Browser Extension Wallet**: Full-screen interface with working node activation and 1DEV burn flows; QNC/token transfers become functional once the Send action is wired to the node submit endpoint
 - ✅ **Mobile Applications**: iOS/Android apps for Light nodes only
 - ✅ **Docker Env Activation**: Server nodes activated via environment variables (same as Genesis)
 - ✅ **IPFS Integration**: Optional P2P snapshot distribution
@@ -502,7 +500,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 ### 🎯 Key Features
 
-- **🔐 Post-Quantum Security**: NIST/Cisco encapsulated keys with Dilithium3 + Ed25519 (nodes) | Ed25519-only for clients (mobile/browser)
+- **🔐 Post-Quantum Security**: Pure ML-DSA-65 (Dilithium3) signatures everywhere (nodes + clients) | X25519Kyber768 hybrid KEX for TLS transport
 - **⚡ Ultra-High Performance**: 424,411 TPS with zero-downtime consensus
 - **🎲 True Decentralization**: Deterministic producer selection (finality window + SHA3) with Byzantine fairness and quantum resistance
 - **💰 Reputation Economics**: Rewards for block production (+1 micro, +10/+5 macro)
@@ -537,7 +535,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 | **Block Capacity** | 5,000 TX/block | ~1 MB per microblock (200 bytes avg TX) |
 | **Downtime** | ZERO | Swiss watch precision, continuous flow |
 | **Energy Efficiency** | 99.9% less than Bitcoin | Eco-friendly consensus |
-| **Node Types** | Full, Super, Light | Flexible participation |
+| **Node Types** | Light, Super | Light (mobile) + Super (server) |
 | **Storage Efficiency** | 50-100 GB typical | Sliding window + snapshots |
 
 ### 🔬 Technical Specifications (Honest Assessment)
@@ -549,12 +547,11 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 - **Network**: WAN-optimized with adaptive timeouts (7s-20s)
 
 **Cryptographic Approach:**
-- ✅ **Consensus Layer**: Real CRYSTALS-Dilithium3 (pqcrypto-dilithium 0.5) - fully post-quantum
-- ✅ **Node Signatures**: Hybrid Dilithium3 + Ed25519 with NIST/Cisco encapsulated keys
-- ✅ **Client Transactions (v2.25)**: Ed25519 required + **optional Dilithium3** for quantum protection
-  - Standard TX: Ed25519 only (fast, low gas)
-  - Quantum TX: Ed25519 + Dilithium3 (+50% gas premium, post-quantum security)
-- 🔐 **Enterprise Option**: Optional Dilithium signatures for high-value transfers
+- ✅ **Consensus Layer**: Real CRYSTALS-Dilithium3 / ML-DSA-65 (pqcrypto-dilithium 0.5) - fully post-quantum
+- ✅ **Node Signatures**: Pure ML-DSA-65 (Dilithium3) for consensus, node identity and P2P gossip (Ed25519 removed)
+- ✅ **Client Transactions**: Pure ML-DSA-65 (Dilithium3) required — post-quantum by default, no classical fallback
+- ✅ **Transport Key Exchange**: QUIC/TLS 1.3 X25519Kyber768 hybrid KEX (ML-KEM-768, FIPS 203) — the ONLY remaining "hybrid" in the stack
+- 🔐 **Addresses**: A QNet address is the hash of the Dilithium public key; keys derive from a BIP39 seed
 
 **Consensus Architecture:**
 - ⚠️ **Producer Selection**: Deterministic SHA3-512 (finality window), NOT true VRF with private keys
@@ -602,7 +599,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
   - **Recalculation on restart**: Every node startup reads fresh network size
   - No manual configuration - system adapts to network growth automatically
 - **EfficientMicroBlocks**: Store transaction hashes instead of full transactions
-- **Sliding Window Storage**: Full nodes keep only last 100K blocks (~1 day) + snapshots
+- **Sliding Window Storage**: Super nodes keep full history (archival); the sliding-window + snapshot mechanism bounds hot on-disk working set (~100K recent blocks) while older blocks stay in compressed cold storage
 - **Smart Pruning**: Automatic deletion of blocks AND transactions outside retention window
   - Block pruning: Removes microblocks and macroblocks
   - **Transaction pruning**: Removes transactions + tx_index + tx_by_address (v2.19.7)
@@ -618,10 +615,10 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
     client. Balance / TX history fetched via REST API on Super nodes;
     wallet app stores user TX list in AsyncStorage / localStorage.
   - Super nodes (archival): **~2 TB** (full history, no pruning)
-  - Storage with Zstd-3 (~50% reduction):
-    - 100 TPS: ~220 GB/year (Super), ~18 GB (Full 30d)
-    - 500 TPS: ~1.1 TB/year (Super), ~90 GB (Full 30d)
-    - 1000 TPS: ~2.2 TB/year (Super), ~180 GB (Full 30d)
+  - Super-node storage with Zstd-3 (~50% reduction):
+    - 100 TPS: ~220 GB/year
+    - 500 TPS: ~1.1 TB/year
+    - 1000 TPS: ~2.2 TB/year
   - Note: Sharding is for parallel TX processing, NOT storage partitioning
 - **Distributed Archival**: Super nodes archive 3-8 chunks each as network obligation
 - **Triple Replication**: Every data chunk replicated across 3+ nodes minimum
@@ -635,24 +632,25 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │                    QNet Blockchain                         │
 ├─────────────────────────────────────────────────────────────┤
 │  Post-Quantum Crypto Layer                                 │
-│  ├── CRYSTALS-Dilithium3 (NIST FIPS 204 Signatures)       │
-│  ├── Hybrid Ed25519 + Dilithium3 (P2P Messages)           │
+│  ├── ML-DSA-65 / CRYSTALS-Dilithium3 (FIPS 204 Signatures) │
+│  ├── Pure ML-DSA-65 for consensus, identity & P2P gossip   │
+│  ├── X25519Kyber768 KEX (ML-KEM-768, FIPS 203) for TLS     │
 │  └── SHA3-256 (NIST FIPS 202 Hashing)                     │
 ├─────────────────────────────────────────────────────────────┤
 │  Consensus Layer with Deterministic Selection              │
 │  ├── Microblock Production (1s intervals)                  │
-│  │   ├── Deterministic selection (finality window entropy) │
-│  │   ├── Dilithium + Ed25519 hybrid signatures             │
+│  │   ├── Deterministic VRF selection (finality entropy)    │
+│  │   ├── Pure ML-DSA-65 (Dilithium3) signatures            │
 │  │   ├── 30-block rotation with SHA3-512 entropy           │
 │  │   ├── Race-free at boundaries (no delays)               │
 │  │   ├── Producer rewards: +1 reputation per block         │
-│  │   └── Super nodes only (reputation >= 70%)        │
-│  ├── Macroblock Consensus (90s intervals)                  │
-│  │   ├── Byzantine consensus with 1000 validators          │
-│  │   ├── Active listener on all Super nodes (1s poll) │
-│  │   ├── Consensus window: blocks 61-90 (early start)      │
+│  │   └── Super nodes only (reputation >= 70)         │
+│  ├── Macroblock Consensus — Checkpoint-BFT v2 (per 90 mb)  │
+│  │   ├── VRF committee (<=100 of up to 1000 eligible)      │
+│  │   ├── One 2f+1 QC per window seals the macroblock       │
+│  │   ├── ~60s finality (two-chain commit, no commit/reveal)│
 │  │   ├── Leader: +10 reputation, Participants: +5 each     │
-│  │   ├── Deterministic initiator selection                 │
+│  │   ├── Deterministic committee selection (N-2 beacon)    │
 │  │   └── 67% honest validator requirement                  │
 │  └── Advanced Synchronization                              │
 │      ├── State snapshots: Full (12h) & Incremental (1h)    │
@@ -686,7 +684,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  ├── Kademlia DHT with K-bucket management                 │
 │  ├── Lock-Free DashMap for O(1) operations                 │
 │  ├── Dual Indexing (by address & ID)                       │
-│  ├── 256 Shards with Cross-Shard Routing                   │
+│  ├── Single-shard today (sharding deferred, auto-arm OFF)  │
 │  ├── Auto-Scaling (5→100→10K→1M+ nodes)                    │
 │  ├── Gossip Protocol (QUIC-based)                          │
 │  ├── Regional Node Clustering                              │
@@ -765,7 +763,7 @@ QNet implements production-grade failover mechanisms for zero-downtime operation
 
 ### **Microblock Producer Failover**
 - **Rotation Schedule**: Every 30 blocks (30 seconds) for stability
-- **Participant Filter**: Only Full and Super nodes (Light nodes excluded for mobile optimization)
+- **Participant Filter**: Only Super nodes (Light nodes excluded for mobile optimization)
 - **Producer Readiness Validation**: Pre-creation checks (reputation ≥70%, network health, connectivity)
 - **Fixed Timeout Detection**: 5 seconds (deterministic for consensus safety across all nodes)
 - **Emergency Selection**: Deterministic fallback selection from qualified backup producers (SHA3-512 hash, v2.36 unified)
@@ -795,9 +793,15 @@ When all nodes fall below 70% reputation threshold:
 - **Progressive Penalties**: Escalating reputation penalties prevent repeated failures
 - **Network Transparency**: All failover events logged and broadcast to peers
 
-## 💎 Reputation System (v2.24 - Deterministic Snapshots)
+## 💎 Reputation System (Deterministic, Binary for Consensus)
 
-**ARCHITECTURE v2.24:** Blockchain-based reputation with full state snapshots
+> **Status (2026-07): binary consensus reputation.** Live consensus reputation is BINARY —
+> a node is eligible (70) or excluded (0). The graduated scores, progressive jail ladder,
+> passive decay/recovery, and tiered reward/penalty tables in this section are LEGACY and no
+> longer active; they are retained for historical context. Current rule: reputation ≥ 70 ⇒
+> consensus- and reward-eligible; otherwise excluded.
+
+**ARCHITECTURE:** Blockchain-based reputation with full state snapshots
 - All nodes compute identical reputation from on-chain data
 - Sybil-resistant: Cannot fake reputation via gossip
 - Deterministic: Verifiable by replaying blockchain from genesis
@@ -823,7 +827,7 @@ pub struct FullReputationSnapshot {
 | Action | Rep Points | Source | Requirement |
 |--------|------------|--------|-------------|
 | **Full Rotation** | +2.0 | block producer | **30/30 blocks only!** |
-| **Consensus Participation** | +1.0 | macroblock commit+reveal | Full participation |
+| **Consensus Participation** | +1.0 | macroblock checkpoint QC signature | Full participation |
 | **Double-Sign** | -100% + BAN | SlashingEvent | 2 signatures at same height |
 | **Invalid Block** | -20% | SlashingEvent | Invalid signature/hash |
 | **Chain Fork** | -100% + BAN | SlashingEvent | Conflicting signed blocks |
@@ -870,7 +874,7 @@ Fair penalties - equal for ALL nodes (including Genesis):
 | **Invalid Block** | Failed cryptographic verification | -30.0 points |
 | **Time Manipulation** | Block timestamp >5s in future | -20.0 points |
 | **Network Flooding** | >100 msgs/sec from single node | -10.0 points |
-| **Invalid Consensus** | Malformed commit/reveal | -5.0 points |
+| **Invalid Consensus** | Malformed checkpoint/QC vote | -5.0 points |
 
 ### **Dilithium3-VRF Secret Leader Election (v4.0)**
 ```rust
@@ -1070,7 +1074,7 @@ sudo iptables -A INPUT -p udp --dport 10876 -j ACCEPT
 
 ⚠️ **Real Pricing Data**: When configured, the node fetches real burn percentage and network size from the Solana contract to show accurate pricing.
 
-⚠️ **1DEV Token**: Real token address `Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi` on Solana devnet (Phase 1 ready).
+⚠️ **1DEV Token**: Mainnet mint `4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump` (Solana, pump.fun); testnet uses a Solana devnet mint (Phase 1 ready).
 
 ⚠️ **Activation Codes**: Real activation codes are still generated through browser extension or mobile app, regardless of displayed pricing.
 
@@ -1323,21 +1327,19 @@ Welcome to QNet Blockchain Network!
 ⚠️  SERVERS ONLY SUPPORT SUPER NODES
 📱 Light nodes are restricted to mobile devices only
 
-Choose your server node type:
-1. Full Node   - Servers/desktops, full validation
-2. Super Node  - High-performance servers, maximum rewards
+Server node type:
+1. Super Node  - High-performance servers, maximum rewards
 
 💰 Current Pricing:
-   1. Full Node  : 900 1DEV
-   2. Super Node : 900 1DEV
+   1. Super Node : 900 1DEV
 
-Enter your choice (1-2): 
+Press Enter to continue with Super Node:
 ```
 
 #### Setup Steps
 
 1. **Auto-Configuration**: System automatically detects region, ports, and performance settings
-2. **Select Node Type**: Choose between Full Node (1) or Super Node (2) 
+2. **Select Node Type**: Servers run the Super Node only (Light nodes are mobile-only)
 3. **Enter Activation Code**: Provide your activation code from QNet wallet app
 4. **Node Starts**: Fully optimized node with 100k+ TPS capabilities begins sync
 
@@ -1345,7 +1347,7 @@ Enter your choice (1-2):
 
 - **Get activation code**: Use QNet Browser Extension or Mobile App
 - **Purchase node license**: Burn 1DEV tokens (Phase 1) or transfer QNC to Pool 3 (Phase 2) 
-- **Server restriction**: Full and Super nodes only for servers
+- **Server restriction**: Super nodes only for servers
 - **Light nodes**: Mobile devices only - use QNet mobile app
 
 ### 🔧 System Optimization (Optional)
@@ -1472,8 +1474,7 @@ docker run -d --name qnet-super --restart=always \
 #### Migration Scenarios
 1. **Server Migration**: Move Super node to new hardware
 2. **Hardware Upgrade**: Seamless transition to more powerful server
-3. **Node Type Upgrade**: Full → Super activation replaces Full node
-4. **Disaster Recovery**: Reactivate on new server after hardware failure
+3. **Disaster Recovery**: Reactivate on new server after hardware failure
 
 #### Example: Server Migration
 ```bash
@@ -1649,7 +1650,7 @@ docker run -d --name qnet-genesis-005 --restart=always \
 ```
 
 **Auto-Configured Production Settings (QNET_PRODUCTION=1):**
-- ✅ Sharding: 256 shards enabled
+- ✅ Sharding: single-shard (auto-arm gated OFF; sufficient for ~50k TPS)
 - ✅ Parallel validation: 16 threads
 - ✅ P2P compression: enabled
 - ✅ Batch size: 10,000 transactions
@@ -1927,9 +1928,9 @@ curl http://localhost:8003/api/v1/transactions/{hash}
 ```javascript
 // Production-ready client with multiple node support
 const qnetNodes = [
-    'http://node1.example.com:8001',  // Full node
+    'http://node1.example.com:8001',  // Super node
     'http://node2.example.com:8002',  // Super node  
-    'http://node3.example.com:8003'   // Full node
+    'http://node3.example.com:8003'   // Super node
 ];
 
 async function qnetApiCall(endpoint, data = null) {
@@ -2071,7 +2072,6 @@ docker run ... -e QNET_MAX_THREADS=8 ...
 | Node Type | Lock-Free Activation | Sharding Activation | Max Capacity |
 |-----------|---------------------|---------------------|--------------|
 | Light | 500+ peers | 10,000+ peers | 1M+ peers |
-| Full | 100+ peers | 5,000+ peers | 10M+ peers |
 | Super | 50+ peers | 5,000+ peers | 10M+ peers |
 
 ### 📁 Distributed Data Management
@@ -2088,9 +2088,9 @@ docker run ... -e QNET_MAX_THREADS=8 ...
 > **Light Node Architecture (v3.0)**: Light nodes are mobile apps (thin clients). They do NOT sync or store any blockchain data. All data (balance, TX history) is fetched via RPC from Super nodes.
 
 - **Smart Defaults**: Automatically detects node type via `QNET_NODE_TYPE` environment variable
-- **Adaptive Sliding Window**: Full nodes auto-scale storage window with network growth (100K × active_shards)
+- **Adaptive Sliding Window**: Super nodes auto-scale their hot storage window with network growth (100K × active_shards) while retaining full history in compressed cold storage
 - **Growth Pattern**: **~36 GB/year** for Super nodes (full history with advanced compression)
-- **Automatic Pruning**: Full nodes prune old blocks every 10,000 blocks (~2.7 hours)
+- **Automatic Pruning**: hot-set pruning runs every 10,000 blocks (~2.7 hours); Super nodes keep full archival history (only the hot working set is bounded)
 - **Emergency Handling**: Automatic cleanup when storage reaches 70-85-95% thresholds
 - **Advanced Compression**: 5-level adaptive temporal compression (Zstd 0-22) based on block age (80% savings)
 - **Delta Encoding**: ~95% space savings for sequential blocks (every 1000th block = checkpoint)
@@ -2102,12 +2102,12 @@ docker run ... -e QNET_MAX_THREADS=8 ...
 
 #### 📦 **Adaptive Archival Responsibilities by Network Size:**
 
-| Network Size | Full Node Quota | Super Node Quota | Min Replicas |
-|--------------|-----------------|------------------|--------------|
-| **5-15 nodes** (Emergency) | 8 chunks | 15 chunks | 1 replica |
-| **16-30 nodes** (Small) | 6 chunks | 12 chunks | 2 replicas |
-| **31-50 nodes** (Medium) | 4 chunks | 10 chunks | 3 replicas |
-| **50+ nodes** (Large) | 3 chunks | 8 chunks | 3 replicas |
+| Network Size | Super Node Quota | Min Replicas |
+|--------------|------------------|--------------|
+| **5-15 nodes** (Emergency) | 15 chunks | 1 replica |
+| **16-30 nodes** (Small) | 12 chunks | 2 replicas |
+| **31-50 nodes** (Medium) | 10 chunks | 3 replicas |
+| **50+ nodes** (Large) | 8 chunks | 3 replicas |
 
 - **Light Nodes**: Always 0 chunks (mobile-optimized)
 - **Genesis Nodes**: Variable based on network critical needs
@@ -2130,7 +2130,7 @@ docker run ... -e QNET_MAX_THREADS=8 ...
 # Only enable if ALL conditions are met:
 ✅ Disk space critically low (< 50 GB available)
 ✅ Network has 50+ Super nodes maintaining full archive
-✅ Full node type (not Light or Super)
+✅ Light storage mode only (Super nodes are archival and ignore this flag)
 ✅ You understand dependency on Super nodes for historical data
 
 # Check network status first:
@@ -2241,7 +2241,7 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 - **Starting Reputation**: 70% for Super nodes (consensus threshold)
 - **Light Node Reputation**: Fixed at 70% (immutable by design)
 - **No Special Protection**: Genesis nodes = Regular nodes
-- **Full Penalties Apply**: Any FSuper node can be reduced to 0% and banned
+- **Full Penalties Apply**: Any Super node can be reduced to 0% and banned
 - **Merit-Based System**: Super nodes must maintain good behavior
 - **Consensus Participation**: ≥70% required for Super nodes
 - **Light Nodes**: Never participate in consensus (rewards only)
@@ -2455,7 +2455,7 @@ Prevents repeat attacks: attackers can't instantly rejoin after penalty
 **November 15, 2025 - "Deterministic Producer Selection & Macroblock Consensus Listener"**
 
 This release introduces critical improvements for quantum-resistant consensus:
-- **Deterministic Producer Selection** with Dilithium + Ed25519 hybrid cryptography and finality window entropy
+- **Deterministic Producer Selection** with pure ML-DSA-65 (Dilithium3) and finality window entropy
 - **Race-Free Rotation**: No delays at block boundaries (31, 61, 91)
 - **Active Macroblock Consensus**: All Super nodes run 1-second polling listener
 - **Deterministic Validator Selection**: 1000 validators per macroblock round

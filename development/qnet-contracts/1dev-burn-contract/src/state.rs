@@ -70,8 +70,8 @@ pub struct BurnTracker {
     pub bump: u8,
     /// v14.5: Authority that attests off-chain RPC verification of burn txs.
     /// Required signer on `record_burn` and `execute_phase_transition` to
-    /// close the anyone-can-call hole. Set at tracker initialization and
-    /// rotatable only via admin instruction (not defined here).
+    /// close the anyone-can-call hole. Pinned at tracker initialization and
+    /// immutable thereafter — no rotate instruction exists in this program.
     pub verification_authority: Pubkey,
 }
 

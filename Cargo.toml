@@ -5,6 +5,7 @@ members = [
     "core/qnet-mempool",
     "core/qnet-state",
     "core/qnet-sharding",
+    "core/qnet-vm",
     "development/qnet-integration",
     "audit"
 ]

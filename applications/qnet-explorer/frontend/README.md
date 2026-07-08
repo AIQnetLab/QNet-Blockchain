@@ -186,7 +186,7 @@ Navigate to [http://localhost:3000](http://localhost:3000)
 - [ ] **Performance metrics** dashboard
 
 ### Phase 4: Solana Integration
-- [ ] **1DEV token staking** interface
+- [ ] **1DEV burn / node activation** interface (proof-of-burn)
 - [ ] **Cross-chain bridge** visualization  
 - [ ] **Activation history** tracking
 - [ ] **Multi-wallet management** for node operators

@@ -146,7 +146,7 @@ qnet-network (Go) ←→ qnet-consensus (Rust)
 - Sharding: 10,000 shards planned
 
 ### Security
-- Ed25519 signatures
+- Pure ML-DSA-65 (Dilithium3) signatures
 - 256-bit entropy
 - Replay protection
 - Memory encryption

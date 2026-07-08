@@ -541,6 +541,40 @@ export async function getTransactionsByAddress(
   };
 }
 
+// Raw ContractDeploy row for the token directory. Only the columns the token
+// list needs (contract address = to_address, deployer = from_address, the
+// deploy `data` JSON with QRC-20 metadata, and deploy block/time).
+export interface ContractDeployRow {
+  hash: string;
+  from_address: string;
+  to_address: string | null;
+  block: number;
+  timestamp: number;
+  data: string | null;
+}
+
+// Fetch every ContractDeploy transaction the explorer has indexed, newest first.
+// The node stores the derived contract address as the tx `to_address` and the
+// QRC-20 metadata ({"qrc20":true,"name","symbol","decimals","initial_supply"})
+// as the tx `data` JSON, so the caller can build the full token record without
+// any node round-trip or address re-derivation. Parsing/dedup/qrc20-filtering is
+// done in the route (JS) because `data` is a TEXT column, not JSONB.
+export async function getContractDeploys(limit: number = 1000): Promise<ContractDeployRow[]> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 5000) {
+    throw new Error('Invalid limit: must be between 1 and 5000');
+  }
+
+  const result = await query<ContractDeployRow>(
+    `SELECT hash, from_address, to_address, block, timestamp, data
+     FROM transactions
+     WHERE tx_type = 'ContractDeploy'
+     ORDER BY block DESC, timestamp DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return result.rows;
+}
+
 export async function closePool(): Promise<void> {
   if (pool) {
     await pool.end();

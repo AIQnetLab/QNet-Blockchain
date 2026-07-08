@@ -77,15 +77,15 @@ export default function TestnetPage() {
         </div>
 
         <div style={{ maxWidth: '1000px', margin: '0 auto' }}>
-          <div className="explorer-card" style={{ padding: '3rem' }}>
-            <div className="card-header" style={{ marginBottom: '2rem', textAlign: 'center' }}>
+          <div className="explorer-card" style={{ padding: 'clamp(1.25rem, 5vw, 3rem)' }}>
+            <div className="card-header" style={{ marginBottom: '2rem', textAlign: 'center', flexDirection: 'column', alignItems: 'center' }}>
               <h3 style={{ fontSize: '1.8rem', marginBottom: '1rem' }}>Token Faucet</h3>
               <div className="faucet-heading" style={{ fontSize: '1.1rem', color: '#e5e5e5', lineHeight: '1.5' }}>
                 Get 1,500 1DEV tokens + 0.001 SOL for QNet node activation testing
               </div>
             </div>
 
-            <div className="faucet-row" style={{ display: 'flex', gap: '1rem', alignItems: 'stretch', width: '100%' }}>
+            <div className="faucet-row" style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', alignItems: 'stretch', width: '100%' }}>
               <input 
                 type="text" 
                 placeholder="Enter your Solana testnet address" 
@@ -93,17 +93,17 @@ export default function TestnetPage() {
                 value={faucetAddress}
                 onChange={(e) => setFaucetAddress(e.target.value)}
                 disabled={isLoading}
-                style={{ flex: '1', fontSize: '1rem', padding: '1rem', height: '3.5rem', boxSizing: 'border-box' }}
+                style={{ flex: '1 1 260px', minWidth: 0, fontSize: '1rem', padding: '1rem', height: '3.5rem', boxSizing: 'border-box' }}
               />
               <button 
                 className="qnet-button" 
                 onClick={handleFaucetClaim}
                 disabled={isLoading || !faucetAddress.trim()}
-                style={{ 
-                  flex: '1', 
-                  fontSize: '1rem', 
-                  padding: '1rem', 
-                  fontWeight: 'bold', 
+                style={{
+                  flex: '1 1 200px',
+                  fontSize: '1rem',
+                  padding: '1rem',
+                  fontWeight: 'bold',
                   height: '3.5rem', 
                   boxSizing: 'border-box',
                   opacity: isLoading || !faucetAddress.trim() ? 0.6 : 1,
@@ -121,7 +121,8 @@ export default function TestnetPage() {
                 background: 'rgba(244, 67, 54, 0.1)',
                 border: '1px solid rgba(244, 67, 54, 0.3)',
                 borderRadius: '8px',
-                color: '#f44336'
+                color: '#f44336',
+                wordBreak: 'break-word'
               }}>
                 {errorMessage}
               </div>

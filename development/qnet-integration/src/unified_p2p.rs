@@ -662,88 +662,16 @@ pub fn release_sync_slot(from_height: u64) {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// v3.33: BLOCK ATTESTATION — committee-based microblock confirmation
-// After receiving a valid microblock, validators broadcast attestation (hash signature).
-// Producer collects attestations; blocks with 2/3+ attestations have higher fork-choice weight.
-// Scalability: Only qualified producers attest (≤1000 per round, not all light nodes).
+// Block-validity attestation (v3.33) — RETIRED. Fork-choice is round-based: a same-round 2f+1
+// TimeoutCertificate rotates the producer, certified-round supersede (block_pipeline) resolves a
+// same-height dispute, and the 2f+1 macroblock Checkpoint is finality. No honest node ever emitted a
+// BlockAttestation, and the per-height store admitted an entry from any registered (non-committee)
+// VRF identity — an ungated memory-DoS + producer-censorship surface — so the whole mechanism (store
+// + submit/count/broadcast helpers + inbound-handler body) was removed. EmptySlotAttestation below is
+// a SEPARATE, live producer-failover mechanism.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 use dashmap::DashMap as AttestDashMap;
-
-/// Single block attestation from a validator
-#[derive(Debug, Clone)]
-pub struct BlockAttestation {
-    pub block_height: u64,
-    pub block_hash: [u8; 32],
-    pub attester_id: String,
-    pub signature: Vec<u8>,
-    pub timestamp: u64,
-}
-
-/// Attestation store: (block_height) -> Vec<BlockAttestation>
-/// DashMap for lock-free concurrent access from P2P message handlers
-static BLOCK_ATTESTATIONS: once_cell::sync::Lazy<AttestDashMap<u64, Vec<BlockAttestation>>> =
-    once_cell::sync::Lazy::new(|| AttestDashMap::new());
-
-/// Submit an attestation for a block.
-/// Deduplication: one entry per (height, attester_id) — ignores re-sends from same node.
-pub fn submit_block_attestation(attestation: BlockAttestation) {
-    let height = attestation.block_height;
-    let mut entry = BLOCK_ATTESTATIONS
-        .entry(height)
-        .or_insert_with(Vec::new);
-    // Dedup: skip if this attester already submitted for this height
-    if !entry.iter().any(|a| a.attester_id == attestation.attester_id) {
-        entry.push(attestation);
-    }
-}
-
-/// Get total attestation count for a height (all hashes combined).
-pub fn get_attestation_count(block_height: u64) -> usize {
-    BLOCK_ATTESTATIONS
-        .get(&block_height)
-        .map(|v| v.len())
-        .unwrap_or(0)
-}
-
-/// Get attestation count for a SPECIFIC block hash at a given height.
-/// Used in fork choice: only count attestations that confirm OUR local block.
-pub fn get_attestation_count_for_hash(block_height: u64, block_hash: &[u8; 32]) -> usize {
-    BLOCK_ATTESTATIONS
-        .get(&block_height)
-        .map(|v| v.iter().filter(|a| &a.block_hash == block_hash).count())
-        .unwrap_or(0)
-}
-
-/// Get all attestations for a block height.
-pub fn get_attestations(block_height: u64) -> Vec<BlockAttestation> {
-    BLOCK_ATTESTATIONS
-        .get(&block_height)
-        .map(|v| v.clone())
-        .unwrap_or_default()
-}
-
-/// Check if block has sufficient attestations (2/3+ of qualified validators)
-/// for a SPECIFIC block hash — not just any attestations at that height.
-pub fn has_sufficient_attestations_for_hash(block_height: u64, block_hash: &[u8; 32], total_qualified: usize) -> bool {
-    let count = get_attestation_count_for_hash(block_height, block_hash);
-    let threshold = (total_qualified * 2 + 2) / 3; // Byzantine 2/3+ threshold
-    count >= threshold
-}
-
-/// Legacy: check sufficient attestations by height (kept for API compatibility)
-pub fn has_sufficient_attestations(block_height: u64, total_qualified: usize) -> bool {
-    let count = get_attestation_count(block_height);
-    let threshold = (total_qualified * 2 + 2) / 3;
-    count >= threshold
-}
-
-/// Cleanup old attestations (keep only last 100 blocks)
-pub fn cleanup_old_attestations(current_height: u64) {
-    if current_height <= 100 { return; }
-    let cutoff = current_height - 100;
-    BLOCK_ATTESTATIONS.retain(|h, _| *h > cutoff);
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // EMPTY-SLOT ATTESTATION — DETERMINISTIC PRODUCER FAILOVER FOR MICROBLOCKS
@@ -2263,7 +2191,7 @@ pub struct SimplifiedP2P {
     wallet_identity: Arc<parking_lot::RwLock<Option<Arc<crate::crypto::vrf::WalletIdentity>>>>,
 }
 
-/// HYBRID: Simplified certificate manager for microblocks only
+/// PQ: Simplified certificate manager for microblocks only
 /// Macroblocks use full signatures with embedded certificates
 #[derive(Debug, Clone)]
 pub struct CertificateManager {
@@ -2922,7 +2850,7 @@ pub struct ShredProtocolChunk {
 pub struct ProducerCertificate {
     pub serial_number: String,
     pub node_id: String,
-    pub certificate_bytes: Vec<u8>,  // Serialized HybridCertificate
+    pub certificate_bytes: Vec<u8>,  // Serialized PqCertificate
 }
 
 /// ShredProtocol block assembly state
@@ -11474,8 +11402,8 @@ impl SimplifiedP2P {
                         if let Ok((len, _)) = socket.recv_from(&mut buf) {
                             // Parse STUN response for XOR-MAPPED-ADDRESS
                             if len >= 32 {
-                                // Simple parsing - look for XOR-MAPPED-ADDRESS (0x0020)
-                                for i in 20..len-7 {
+                                // Bound so every buf[i+11] access stays within the received bytes.
+                                for i in 20..len.saturating_sub(11) {
                                     if buf[i] == 0x00 && buf[i+1] == 0x20 {
                                         // Found XOR-MAPPED-ADDRESS
                                         let port = u16::from_be_bytes([buf[i+6], buf[i+7]]) ^ 0x2112;
@@ -11584,13 +11512,6 @@ pub struct LightNodeRegistrationData {
     pub consecutive_failures: u8,     // Failed pings in a row (max 255)
     #[serde(default = "default_true")]
     pub is_active: bool,              // Node is active and should be pinged
-    // HYBRID SIGNATURE v2.90: Ed25519 + Dilithium3 for gossip authentication
-    // Message signed: "light_node_gossip:{node_id}:{wallet_address}"
-    #[serde(default)]
-    pub ed25519_signature: String,    // Ed25519 signature (QNet wallet key, 128 hex chars)
-    #[serde(default)]
-    pub ed25519_public_key: String,   // Ed25519 public key (32 bytes = 64 hex chars)
-
     // PING DELEGATION v7.1: Dedicated Dilithium3 ping key for background pings.
     // Allows device to sign ping responses without unlocking the wallet.
     // ping_pubkey is authorized by wallet Dilithium at registration via delegation_cert.
@@ -11605,15 +11526,15 @@ fn default_true() -> bool { true }
 
 /// PRODUCTION: Light Node Attestation - proof that Light node responded to ping
 /// Created by pinger after receiving signed response from Light node
-/// ARCHITECTURE v2.78: Both signatures use HYBRID compact_bin format
+/// ARCHITECTURE v2.78: Both signatures use PQ compact_bin format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightNodeAttestation {
     pub light_node_id: String,        // Light node that was pinged
     pub pinger_id: String,            // Super node that pinged
     pub slot: u64,                    // Time slot (4h window / 240 = 1 min slots)
     pub timestamp: u64,               // When attestation was created
-    pub light_node_signature: String, // HYBRID compact_bin (Ed25519+Dilithium, ~2.6KB)
-    pub pinger_signature: String,     // HYBRID compact_bin (Ed25519+Dilithium, ~2.6KB)
+    pub light_node_signature: String, // PQ compact_bin (Dilithium3, ~2.6KB)
+    pub pinger_signature: String,     // PQ compact_bin (Dilithium3, ~2.6KB)
     pub challenge: String,            // Original challenge (for verification)
     pub block_height: u64,            // v2.59: Block height for epoch-based filtering
 }
@@ -12066,11 +11987,11 @@ pub enum NetworkMessage {
         timeout_round: u64,  // Include timeout_round for deterministic verification
     },
     
-    /// PRODUCTION: Hybrid certificate announcement for compact signatures
+    /// PRODUCTION: PQ certificate announcement for compact signatures
     CertificateAnnounce {
         node_id: String,
         cert_serial: String,
-        certificate: Vec<u8>,  // Serialized HybridCertificate - bincode handles natively
+        certificate: Vec<u8>,  // Serialized PqCertificate - bincode handles natively
         timestamp: u64,
     },
     
@@ -12086,13 +12007,13 @@ pub enum NetworkMessage {
     CertificateResponse {
         node_id: String,
         cert_serial: String,
-        certificate: Vec<u8>,  // Serialized HybridCertificate - bincode handles natively
+        certificate: Vec<u8>,  // Serialized PqCertificate - bincode handles natively
         timestamp: u64,
     },
     
     /// PRODUCTION: Light Node registration gossip for decentralized registry sync
     /// All Super nodes maintain synchronized Light Node registry via gossip
-    /// HYBRID SIGNATURE v2.90: Ed25519 + Dilithium3 for double authentication
+    /// Pure ML-DSA-65: Dilithium3 quantum signature authentication
     LightNodeRegistration {
         node_id: String,              // Privacy-preserving pseudonym (hash-based)
         wallet_address: String,       // Owner wallet for reward claims
@@ -12111,11 +12032,6 @@ pub enum NetworkMessage {
         consecutive_failures: u8,     // Failed pings counter
         #[serde(default = "default_true")]
         is_active: bool,              // Node activity status
-        // HYBRID: Ed25519 part (message: "light_node_gossip:{node_id}:{wallet_address}")
-        #[serde(default)]
-        ed25519_signature: String,    // Ed25519 signature (128 hex chars)
-        #[serde(default)]
-        ed25519_public_key: String,   // Ed25519 public key (64 hex chars)
         // PING DELEGATION v7.1
         #[serde(default)]
         ping_pubkey: String,          // Dilithium3 ping pubkey (3904 hex) or legacy Ed25519 (64 hex)
@@ -13529,86 +13445,14 @@ impl SimplifiedP2P {
                 self.handle_find_node_response(&closest_peers);
             }
 
-            // v3.33: Block Attestation — validator confirms block validity
-            NetworkMessage::BlockAttestationMsg { block_height, block_hash, attester_id, signature, timestamp } => {
+            // Block-validity attestation — RETIRED. Fork-choice is round-based (same-round 2f+1
+            // TimeoutCertificate) and finality is the 2f+1 macroblock Checkpoint; no honest node emits
+            // a BlockAttestation. Accepted on the wire for backward-compat but dropped WITHOUT storing:
+            // the former per-height store admitted an entry from any registered (non-committee) VRF
+            // identity, so a flood could bloat memory and force an honest producer to yield its slot.
+            // (EmptySlotAttestation below is a separate, live mechanism.)
+            NetworkMessage::BlockAttestationMsg { .. } => {
                 self.update_peer_last_seen(from_peer);
-
-                // v9.5: Drop stale attestations from unsynced peers (same logic as timeout votes).
-                // saturating_add prevents overflow from malicious height values.
-                let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-                if local_h > 20 && block_height.saturating_add(20) < local_h {
-                    return;
-                }
-
-                // Skip unsigned attestations (empty sig = invalid)
-                if signature.is_empty() {
-                    return;
-                }
-
-                // v17.1: IP-anchor gate intentionally NOT applied here.
-                // BlockAttestation is broadcast/gossiped, so `from_peer` is
-                // a relay rather than the attester. Identity binding is
-                // enforced by the Dilithium3 verification below against the
-                // attester's registered PK — a non-genesis spoofer cannot
-                // mint a signature under a genesis PK once Fix #2/#3
-                // closed the legacy bootstrap fallback.
-
-                // Verify Dilithium3 signature: "QNET_ATTEST:{height}:{hash_hex}"
-                //
-                // No "bootstrap grace" branch. The historical bypass accepted
-                // unsigned attestations from un-registered identities during
-                // the first 100 blocks, which let a peer flood phantom block
-                // attestations early in chain life. There is no legitimate
-                // reason to skip math verification for an attestation —
-                // honest nodes always have a registered PK before they can
-                // attest a block (self-register at boot + VrfKeyAnnounce
-                // cross-register peers within seconds). Reject anything
-                // signed by an identity we cannot cryptographically bind.
-                let sig_ok = if let Some(pk_bytes) = crate::genesis_constants::get_vrf_public_key(&attester_id) {
-                    use pqcrypto_mldsa::mldsa65 as dilithium3;
-                    use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
-                    let attest_msg = format!("QNET_ATTEST:{}:{}", block_height, hex::encode(&block_hash));
-                    let pk_ok = dilithium3::PublicKey::from_bytes(&pk_bytes).ok();
-                    let sig_ok = dilithium3::DetachedSignature::from_bytes(&signature).ok();
-                    match (pk_ok, sig_ok) {
-                        (Some(pk), Some(sig)) => dilithium3::verify_detached_signature(&sig, attest_msg.as_bytes(), &pk).is_ok(),
-                        _ => false,
-                    }
-                } else {
-                    if crate::node::is_warn() {
-                        println!(
-                            "[WARN][ATTEST] attester_pk_unknown attester={} h={} action=reject",
-                            attester_id, block_height
-                        );
-                    }
-                    false
-                };
-
-                if !sig_ok {
-                    if crate::node::is_warn() {
-                        println!("[WARN][ATTEST] invalid_sig h={} from={}", block_height, attester_id);
-                    }
-                    return;
-                }
-
-                let hash_arr: [u8; 32] = if block_hash.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&block_hash);
-                    arr
-                } else {
-                    [0u8; 32]
-                };
-                submit_block_attestation(BlockAttestation {
-                    block_height,
-                    block_hash: hash_arr,
-                    attester_id: attester_id.clone(),
-                    signature,
-                    timestamp,
-                });
-                if crate::node::is_debug() {
-                    println!("[DBG][ATTEST] verified h={} from={} total={}",
-                             block_height, attester_id, get_attestation_count(block_height));
-                }
             }
 
             // Empty-slot attestation — committee declares producer at slot_height failed
@@ -14188,7 +14032,7 @@ impl SimplifiedP2P {
                 
                 // SECURITY FIX: Verify certificate BEFORE storing to prevent spoofing attacks
                 // Deserialize and validate certificate structure first
-                let cert: crate::hybrid_crypto::HybridCertificate = match bincode::deserialize(&certificate) {
+                let cert: crate::pq_crypto::PqCertificate = match bincode::deserialize(&certificate) {
                     Ok(c) => c,
                     Err(e) => {
                         if crate::node::is_info() {
@@ -14329,9 +14173,8 @@ impl SimplifiedP2P {
                 let reputation_system_clone = self.reputation_system.clone();
                 
                 handle.spawn(async move {
-                    // Recreate encapsulated data for verification (same as in hybrid_crypto.rs)
+                    // Recreate cert preimage for verification (P8 re-root: node_id || issued_at)
                     let mut encapsulated_data = Vec::new();
-                    encapsulated_data.extend_from_slice(&cert.ed25519_public_key);
                     encapsulated_data.extend_from_slice(cert.node_id.as_bytes());
                     encapsulated_data.extend_from_slice(&cert.issued_at.to_le_bytes());
                     let encapsulated_hex = hex::encode(&encapsulated_data);
@@ -14548,7 +14391,6 @@ impl SimplifiedP2P {
                 node_id, wallet_address, device_token_hash, quantum_pubkey, 
                 registered_at, signature, gossip_hop, push_type, unified_push_endpoint,
                 last_seen, consecutive_failures, is_active,
-                ed25519_signature, ed25519_public_key,
                 ping_pubkey, ping_delegation_cert,
             } => {
                 self.update_peer_last_seen(from_peer);
@@ -14582,13 +14424,13 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                // HYBRID v2.90: Verify BOTH Dilithium3 + Ed25519 signatures
-                // Exception: genesis nodes (genesis_node_*) skip this check — they are trusted by definition.
-                // Dilithium3: mobile signs wallet_address with keypair derived from activation code
-                // Ed25519:    mobile signs "light_node_gossip:{node_id}:{wallet_address}" with QNet wallet key
+                // Pure ML-DSA-65: the mobile-signed Dilithium3 proof over wallet_address is the SOLE
+                // gossip authenticator (mandatory). Genesis nodes (genesis_*) are trusted by definition
+                // and skip it. The former Part-2 Ed25519 (light_node_gossip:...) wallet-key proof and
+                // its wire fields are fully removed in P8.
                 let is_genesis = node_id.starts_with("genesis_");
                 if !is_genesis {
-                    // Part 1: Dilithium3 (ML-DSA-65) — quantum-resistant identity proof
+                    // Dilithium3 (ML-DSA-65) — quantum-resistant identity proof (MANDATORY)
                     if !signature.is_empty() && !quantum_pubkey.is_empty() {
                         let dilithium_ok = self.verify_mobile_dilithium_gossip(&wallet_address, &signature, &quantum_pubkey);
                         if !dilithium_ok {
@@ -14604,30 +14446,6 @@ impl SimplifiedP2P {
                     } else {
                         if crate::node::is_warn() {
                             println!("[WARN][GOSSIP] dilithium_missing_rejected node={} wallet={}...",
-                                node_id, &wallet_address[..16.min(wallet_address.len())]);
-                        }
-                        return;
-                    }
-
-                    // Part 2: Ed25519 — classical wallet ownership proof (MANDATORY v6.1)
-                    // Message: "light_node_gossip:{node_id}:{wallet_address}"
-                    // Both signature and public_key MUST be present — no fallback allowed.
-                    if !ed25519_signature.is_empty() && !ed25519_public_key.is_empty() {
-                        let gossip_msg = format!("light_node_gossip:{}:{}", node_id, wallet_address);
-                        let ed25519_ok = self.verify_ed25519_gossip_signature(&gossip_msg, &ed25519_signature, &ed25519_public_key);
-                        if !ed25519_ok {
-                            if crate::node::is_warn() {
-                                println!("[WARN][GOSSIP] ed25519_invalid node={} wallet={}...",
-                                    node_id, &wallet_address[..16.min(wallet_address.len())]);
-                            }
-                            return;
-                        }
-                        if crate::node::is_debug() {
-                            println!("[DBG][GOSSIP] ed25519_ok node={}", node_id);
-                        }
-                    } else {
-                        if crate::node::is_warn() {
-                            println!("[WARN][GOSSIP] ed25519_missing_rejected node={} wallet={}...",
                                 node_id, &wallet_address[..16.min(wallet_address.len())]);
                         }
                         return;
@@ -14668,18 +14486,16 @@ impl SimplifiedP2P {
                         last_seen,
                         consecutive_failures,
                         is_active,
-                        ed25519_signature: ed25519_signature.clone(),
-                        ed25519_public_key: ed25519_public_key.clone(),
                         ping_pubkey: ping_pubkey.clone(),
                         ping_delegation_cert: ping_delegation_cert.clone(),
                     });
                 }
                 
                 if crate::node::is_info() {
-                    println!("[INFO][GOSSIP] light_node_accepted node={} hop={} hybrid=ok", node_id, gossip_hop);
+                    println!("[INFO][GOSSIP] light_node_accepted node={} hop={} dilithium=ok", node_id, gossip_hop);
                 }
-                
-                // RE-GOSSIP: Forward to other peers with incremented hop (including HYBRID sigs)
+
+                // RE-GOSSIP: Forward to other peers with incremented hop
                 let forward_msg = NetworkMessage::LightNodeRegistration {
                     node_id,
                     wallet_address,
@@ -14693,8 +14509,6 @@ impl SimplifiedP2P {
                     last_seen,
                     consecutive_failures,
                     is_active,
-                    ed25519_signature,
-                    ed25519_public_key,
                     ping_pubkey,
                     ping_delegation_cert,
                 };
@@ -15493,82 +15307,7 @@ impl SimplifiedP2P {
         }
     }
 
-    /// Verify Ed25519 signature for Light node registration
-    #[allow(dead_code)]
-    fn verify_ed25519_signature(&self, message: &str, signature_hex: &str, wallet_address: &str) -> bool {
-        use ed25519_dalek::{Signature, VerifyingKey, Verifier};
-        
-        // Derive public key from wallet address (first 32 bytes of address hash)
-        let pubkey_bytes = match hex::decode(&wallet_address[..64.min(wallet_address.len())]) {
-            Ok(bytes) if bytes.len() >= 32 => bytes[..32].to_vec(),
-            _ => return false,
-        };
-        
-        // FIX R26-H2: reject on conversion failure instead of zero-key fallback
-        let pubkey_array: [u8; 32] = match pubkey_bytes.try_into() {
-            Ok(arr) => arr,
-            Err(_) => {
-                println!("[WARN][P2P] sig_verify_pubkey_conversion_fail wallet={}...", &wallet_address[..8.min(wallet_address.len())]);
-                return false;
-            }
-        };
-        let verifying_key = match VerifyingKey::from_bytes(&pubkey_array) {
-            Ok(key) => key,
-            Err(_) => return false,
-        };
-        
-        let signature_bytes = match hex::decode(signature_hex) {
-            Ok(bytes) if bytes.len() == 64 => bytes,
-            _ => return false,
-        };
-        
-        let sig_array: [u8; 64] = match signature_bytes.try_into() {
-            Ok(arr) => arr,
-            Err(_) => return false,
-        };
-        let signature = Signature::from_bytes(&sig_array);
-        
-        verifying_key.verify(message.as_bytes(), &signature).is_ok()
-    }
-
-    /// HYBRID v2.90: Verify Ed25519 gossip signature using explicit public key (64 hex chars).
-    /// Used for Light/Super node gossip authentication (classical part of hybrid scheme).
-    /// message: "light_node_gossip:{node_id}:{wallet_address}"
-    /// public_key_hex: 32 bytes = 64 hex chars (QNet wallet Ed25519 key)
-    fn verify_ed25519_gossip_signature(&self, message: &str, signature_hex: &str, public_key_hex: &str) -> bool {
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
-        if signature_hex.len() != 128 || public_key_hex.len() != 64 {
-            return false;
-        }
-
-        let pubkey_bytes = match hex::decode(public_key_hex) {
-            Ok(b) => b,
-            Err(_) => return false,
-        };
-        let pubkey_arr: [u8; 32] = match pubkey_bytes.try_into() {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-        let verifying_key = match VerifyingKey::from_bytes(&pubkey_arr) {
-            Ok(k) => k,
-            Err(_) => return false,
-        };
-
-        let sig_bytes = match hex::decode(signature_hex) {
-            Ok(b) if b.len() == 64 => b,
-            _ => return false,
-        };
-        let sig_arr: [u8; 64] = match sig_bytes.try_into() {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-        let sig = Signature::from_bytes(&sig_arr);
-
-        verifying_key.verify(message.as_bytes(), &sig).is_ok()
-    }
-
-    /// HYBRID v2.90: Verify Dilithium3 (ML-DSA-65) gossip signature.
+    /// PQ v2.90: Verify Dilithium3 (ML-DSA-65) gossip signature.
     /// Mobile app signs wallet_address with Dilithium3 keypair derived from activation code.
     /// format: "dilithium_sig_{nodeId}_{base64([sig_len_LE][sig+msg][pk_len_LE][pk])}"
     /// expected_message: wallet_address (the original message signed by the mobile app)
@@ -15622,7 +15361,7 @@ impl SimplifiedP2P {
     }
 
     /// Verify signature for heartbeat (ASYNC version)
-    /// PRODUCTION: Supports BOTH hybrid (NIST/Cisco) and legacy Dilithium formats
+    /// PRODUCTION: Supports pure Dilithium3 (ML-DSA-65) formats (binary, JSON, legacy)
     pub async fn verify_dilithium_heartbeat_signature_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
         use crate::quantum_crypto::DilithiumSignature;
                 // Check for empty/invalid signatures
@@ -15633,22 +15372,22 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // OPTIMIZED v2.24: Binary hybrid P2P signature (bincode+zstd)
-        if signature.starts_with("hybrid_p2p_bin:") {
-            return self.verify_hybrid_p2p_binary_async(message, signature, node_id).await;
+        // Binary compact P2P signature (bincode+zstd)
+        if signature.starts_with("pq_p2p_bin:") {
+            return self.verify_pq_p2p_binary_async(message, signature, node_id).await;
         }
-        
-        // LEGACY: JSON hybrid P2P signature
-        if signature.starts_with("hybrid_p2p:") {
-            return self.verify_hybrid_p2p_signature_async(message, signature, node_id).await;
+
+        // LEGACY: JSON P2P signature (parse-only; no current producer)
+        if signature.starts_with("pq_p2p:") {
+            return self.verify_pq_p2p_signature_async(message, signature, node_id).await;
         }
-        
-        // v2.49.2: FULL hybrid binary signature (used for MACROBLOCK consensus)
-        if signature.starts_with("hybrid_bin:") {
-            return self.verify_hybrid_bin_signature_sync(message, signature, node_id);
+
+        // LEGACY: full binary signature (parse-only; no current producer)
+        if signature.starts_with("pq_bin:") {
+            return self.verify_pq_bin_signature_sync(message, signature, node_id);
         }
-        
-        // v2.49.2: COMPACT hybrid binary signature
+
+        // v2.49.2: COMPACT PQ binary signature
         if signature.starts_with("compact_bin:") {
             return self.verify_compact_bin_signature_sync(message, signature, node_id);
         }
@@ -15711,16 +15450,19 @@ impl SimplifiedP2P {
         }
     }
 
-    /// OPTIMIZED v2.24: Verify HYBRID P2P BINARY signature (bincode+zstd)
-    async fn verify_hybrid_p2p_binary_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
-        use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
+    /// OPTIMIZED v2.24: Verify PQ P2P BINARY signature (bincode+zstd)
+    async fn verify_pq_p2p_binary_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
+        use crate::pq_crypto::CompactPqSignature;
         use crate::quantum_crypto::DilithiumSignature;
                 use sha3::{Sha3_256, Digest};
         use base64::engine::general_purpose;
         use base64::Engine;
         
-        // Parse hybrid_p2p_bin signature
-        let base64_data = &signature[15..]; // Skip "hybrid_p2p_bin:" prefix
+        // Parse pq_p2p_bin signature (strip_prefix — no length coupling)
+        let base64_data = match signature.strip_prefix("pq_p2p_bin:") {
+            Some(rest) => rest,
+            None => return false,
+        };
         let binary_data = match general_purpose::STANDARD.decode(base64_data) {
             Ok(data) => data,
             Err(e) => {
@@ -15731,7 +15473,7 @@ impl SimplifiedP2P {
             }
         };
         
-        let compact_sig: CompactHybridSignature = match CompactHybridSignature::from_binary_compressed(&binary_data) {
+        let compact_sig: CompactPqSignature = match CompactPqSignature::from_binary_compressed(&binary_data) {
             Ok(sig) => sig,
             Err(e) => {
                 if crate::node::is_info() {
@@ -15749,68 +15491,39 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // Step 1: Verify ephemeral key is present
-        if compact_sig.ephemeral_public_key.iter().all(|&b| b == 0) {
-            if crate::node::is_info() {
-                println!("[ERR][P2P] Ephemeral public key is all zeros!");
-            }
-            return false;
-        }
-        
-        // Step 2: Verify Ed25519 signature with ephemeral key
+        // Pure ML-DSA-65 (P8): hash the message; Dilithium is the sole authenticator
         let mut hasher = Sha3_256::new();
         hasher.update(message.as_bytes());
         let message_hash = hasher.finalize();
-        
-        match HybridCrypto::verify_ed25519_signature(
-            &message_hash,
-            &compact_sig.message_signature,
-            &compact_sig.ephemeral_public_key
-        ) {
-            Ok(true) => {} // OK
-            Ok(false) => {
-                if crate::node::is_info() {
-                    println!("[ERR][P2P] Ed25519 signature INVALID!");
-                }
-                return false;
-            }
-            Err(e) => {
-                if crate::node::is_info() {
-                    println!("[ERR][P2P] Ed25519 verification error: {}", e);
-                }
-                return false;
-            }
-        }
-        
-        // Step 3: Verify Dilithium signature
+
+        // Verify Dilithium signature
         if compact_sig.dilithium_key_signature.is_empty() {
             if crate::node::is_info() {
                 println!("[ERR][P2P] REJECTED: No Dilithium key signature!");
             }
             return false;
         }
-        
+
         // PRODUCTION v2.50: Lock-free quantum crypto
         use crate::node::try_get_quantum_crypto;
         let crypto = match try_get_quantum_crypto() {
             Some(c) => c,
             None => {
                 if crate::node::is_warn() {
-                    println!("[WARN][P2P] hybrid_p2p_bin_verify_skip reason=crypto_not_initialized");
+                    println!("[WARN][P2P] pq_p2p_bin_verify_skip reason=crypto_not_initialized");
                 }
                 return false;
             }
         };
-        
-        // Verify Dilithium key signature (encapsulated_data = ephemeral_key || message_hash || timestamp)
+
+        // Verify Dilithium key signature (re-rooted preimage = message_hash || signed_at)
         let mut encapsulated_data = Vec::new();
-        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
         encapsulated_data.extend_from_slice(&message_hash);
         encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
         let encapsulated_hex = hex::encode(&encapsulated_data);
         
         // Convert RAW bytes to signature string
-        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+        use crate::crypto::pq_crypto::encode_dilithium_signature;
         let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
         
         let dilithium_key_sig = DilithiumSignature {
@@ -15842,24 +15555,27 @@ impl SimplifiedP2P {
         }
     }
     
-    /// LEGACY: Verify HYBRID P2P JSON signature (NIST/Cisco compliant with ephemeral keys)
-    async fn verify_hybrid_p2p_signature_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
-        use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
+    /// LEGACY: Verify PQ P2P JSON signature (pure Dilithium3)
+    async fn verify_pq_p2p_signature_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
+        use crate::pq_crypto::CompactPqSignature;
         use crate::quantum_crypto::DilithiumSignature;
                 use sha3::{Sha3_256, Digest};
         
-        // Parse hybrid_p2p signature
-        let json_str = &signature[11..]; // Skip "hybrid_p2p:" prefix
-        let compact_sig: CompactHybridSignature = match serde_json::from_str(json_str) {
+        // Parse pq_p2p signature (strip_prefix — no length coupling)
+        let json_str = match signature.strip_prefix("pq_p2p:") {
+            Some(rest) => rest,
+            None => return false,
+        };
+        let compact_sig: CompactPqSignature = match serde_json::from_str(json_str) {
             Ok(sig) => sig,
             Err(e) => {
                 if crate::node::is_info() {
-                    println!("[ERR][P2P] Failed to parse hybrid signature: {}", e);
+                    println!("[ERR][P2P] Failed to parse PQ signature: {}", e);
                 }
                 return false;
             }
         };
-        
+
         // v2.24: Direct node_id comparison
         if compact_sig.node_id != node_id {
             if crate::node::is_info() {
@@ -15868,39 +15584,11 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // Step 1: Verify ephemeral key is present
-        if compact_sig.ephemeral_public_key.iter().all(|&b| b == 0) {
-            if crate::node::is_info() {
-                println!("[ERR][P2P] Ephemeral public key is all zeros!");
-            }
-            return false;
-        }
-        
-        // Step 2: Verify Ed25519 signature with ephemeral key
+        // Pure ML-DSA-65 (P8): hash the message; Dilithium is the sole authenticator
         let mut hasher = Sha3_256::new();
         hasher.update(message.as_bytes());
         let message_hash = hasher.finalize();
-        
-        match HybridCrypto::verify_ed25519_signature(
-            &message_hash,
-            &compact_sig.message_signature,
-            &compact_sig.ephemeral_public_key
-        ) {
-            Ok(true) => println!("[INFO][P2P] Ed25519 signature verified with ephemeral key"),
-            Ok(false) => {
-                if crate::node::is_info() {
-                    println!("[ERR][P2P] Ed25519 signature INVALID!");
-                }
-                return false;
-            }
-            Err(e) => {
-                if crate::node::is_info() {
-                    println!("[ERR][P2P] Ed25519 verification error: {}", e);
-                }
-                return false;
-            }
-        }
-        
+
         // OPTIMIZED v2.23: RAW bytes, single Dilithium signature (includes message_hash)
         if compact_sig.dilithium_key_signature.is_empty() {
             if crate::node::is_info() {
@@ -15908,7 +15596,7 @@ impl SimplifiedP2P {
             }
             return false;
         }
-        
+
         // PRODUCTION v2.50: Lock-free quantum crypto
         use crate::node::try_get_quantum_crypto;
         let crypto = match try_get_quantum_crypto() {
@@ -15920,16 +15608,15 @@ impl SimplifiedP2P {
                 return false;
             }
         };
-        
-        // Verify Dilithium key signature (encapsulated_data = ephemeral_key || message_hash || timestamp)
+
+        // Verify Dilithium key signature (re-rooted preimage = message_hash || signed_at)
         let mut encapsulated_data = Vec::new();
-        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
         encapsulated_data.extend_from_slice(&message_hash);
         encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
         let encapsulated_hex = hex::encode(&encapsulated_data);
         
         // OPTIMIZED v2.23: Convert RAW bytes to signature string
-        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+        use crate::crypto::pq_crypto::encode_dilithium_signature;
         let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
         
         let dilithium_key_sig = DilithiumSignature {
@@ -15942,7 +15629,7 @@ impl SimplifiedP2P {
         match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
             Ok(true) => {
                 if crate::node::is_info() {
-                    println!("[INFO][P2P] Signature verified (NIST/Cisco hybrid)");
+                    println!("[INFO][P2P] Signature verified (Dilithium3)");
                 }
                 true
             }
@@ -15963,7 +15650,7 @@ impl SimplifiedP2P {
     
     /// Verify signature for heartbeat (SYNC version)
     /// SAFE: Uses std::thread::spawn to isolate runtime, avoiding nested runtime panic
-    /// Supports BOTH hybrid (NIST/Cisco) and legacy Dilithium formats
+    /// Supports pure Dilithium3 (ML-DSA-65) formats (binary, JSON, legacy)
     pub fn verify_dilithium_heartbeat_signature(&self, message: &str, signature: &str, node_id: &str) -> bool {
         use crate::quantum_crypto::DilithiumSignature;
         
@@ -15975,23 +15662,23 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // OPTIMIZED v2.24: Binary hybrid P2P signature (bincode+zstd)
-        if signature.starts_with("hybrid_p2p_bin:") {
-            return self.verify_hybrid_p2p_binary_sync(message, signature, node_id);
+        // Binary compact P2P signature (bincode+zstd)
+        if signature.starts_with("pq_p2p_bin:") {
+            return self.verify_pq_p2p_binary_sync(message, signature, node_id);
         }
-        
-        // LEGACY: JSON hybrid P2P signature
-        if signature.starts_with("hybrid_p2p:") {
-            return self.verify_hybrid_p2p_signature_sync(message, signature, node_id);
+
+        // LEGACY: JSON P2P signature (parse-only; no current producer)
+        if signature.starts_with("pq_p2p:") {
+            return self.verify_pq_p2p_signature_sync(message, signature, node_id);
         }
-        
-        // v2.49.2: FULL hybrid binary signature (used for MACROBLOCK consensus)
-        // Format: "hybrid_bin:<base64_bincode_zstd>" with embedded certificate
-        if signature.starts_with("hybrid_bin:") {
-            return self.verify_hybrid_bin_signature_sync(message, signature, node_id);
+
+        // LEGACY: full binary signature (parse-only; no current producer)
+        // Format: "pq_bin:<base64_bincode_zstd>" with embedded certificate
+        if signature.starts_with("pq_bin:") {
+            return self.verify_pq_bin_signature_sync(message, signature, node_id);
         }
-        
-        // v2.49.2: COMPACT hybrid binary signature  
+
+        // v2.49.2: COMPACT PQ binary signature
         // Format: "compact_bin:<base64_bincode_zstd>" requires pre-shared certificate
         if signature.starts_with("compact_bin:") {
             return self.verify_compact_bin_signature_sync(message, signature, node_id);
@@ -16157,22 +15844,25 @@ impl SimplifiedP2P {
         }
     }
     
-    /// OPTIMIZED v2.24: Verify HYBRID P2P BINARY signature (SYNC version)
-    fn verify_hybrid_p2p_binary_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
+    /// OPTIMIZED v2.24: Verify PQ P2P BINARY signature (SYNC version)
+    fn verify_pq_p2p_binary_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
         let message = message.to_string();
         let signature = signature.to_string();
         let node_id = node_id.to_string();
         
         // Use std::thread::spawn to isolate runtime
         let handle = std::thread::spawn(move || {
-            use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
+            use crate::pq_crypto::CompactPqSignature;
             use crate::quantum_crypto::DilithiumSignature;
             use sha3::{Sha3_256, Digest};
             use base64::engine::general_purpose;
             use base64::Engine;
             
-            // Parse binary signature
-            let base64_data = &signature[15..]; // Skip "hybrid_p2p_bin:" prefix
+            // Parse binary signature (strip_prefix — no length coupling)
+            let base64_data = match signature.strip_prefix("pq_p2p_bin:") {
+                Some(rest) => rest,
+                None => return false,
+            };
             let binary_data = match general_purpose::STANDARD.decode(base64_data) {
                 Ok(data) => data,
                 Err(e) => {
@@ -16183,7 +15873,7 @@ impl SimplifiedP2P {
                 }
             };
             
-            let compact_sig: CompactHybridSignature = match CompactHybridSignature::from_binary_compressed(&binary_data) {
+            let compact_sig: CompactPqSignature = match CompactPqSignature::from_binary_compressed(&binary_data) {
                 Ok(sig) => sig,
                 Err(e) => {
                     if crate::node::is_info() {
@@ -16201,25 +15891,11 @@ impl SimplifiedP2P {
                 return false;
             }
             
-            // Verify Ed25519 signature
+            // Pure ML-DSA-65 (P8): hash the message; Dilithium is the sole authenticator
             let mut hasher = Sha3_256::new();
             hasher.update(message.as_bytes());
             let message_hash = hasher.finalize();
-            
-            match HybridCrypto::verify_ed25519_signature(
-                &message_hash,
-                &compact_sig.message_signature,
-                &compact_sig.ephemeral_public_key
-            ) {
-                Ok(true) => {} // OK
-                _ => {
-                    if crate::node::is_info() {
-                        println!("[ERR][P2P] Ed25519 signature INVALID (sync)!");
-                    }
-                    return false;
-                }
-            }
-            
+
             // Verify Dilithium via runtime
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => {
@@ -16230,14 +15906,13 @@ impl SimplifiedP2P {
                             Some(c) => c.as_ref(),
                             None => return false,
                         };
-                        
+
                         let mut encapsulated_data = Vec::new();
-                        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
                         encapsulated_data.extend_from_slice(&message_hash);
                         encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
                         let encapsulated_hex = hex::encode(&encapsulated_data);
                         
-                        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+                        use crate::crypto::pq_crypto::encode_dilithium_signature;
                         let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
                         
                         let dilithium_key_sig = DilithiumSignature {
@@ -16265,39 +15940,42 @@ impl SimplifiedP2P {
         handle.join().unwrap_or(false)
     }
     
-    /// v2.49.2: Verify FULL hybrid binary signature (with embedded certificate)
-    /// Format: "hybrid_bin:<base64_bincode_zstd>" - used for MACROBLOCK consensus
-    fn verify_hybrid_bin_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
-        use crate::hybrid_crypto::{HybridSignature, HybridCrypto};
+    /// v2.49.2: Verify FULL PQ binary signature (with embedded certificate)
+    /// Format: "pq_bin:<base64_bincode_zstd>" - legacy full-signature parse (no current producer)
+    fn verify_pq_bin_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
+        use crate::pq_crypto::{PqSignature, PqCrypto};
         use base64::{Engine as _, engine::general_purpose};
-        
-        // Parse binary signature: "hybrid_bin:<base64_bincode_zstd>"
-        let base64_data = &signature[11..]; // Skip "hybrid_bin:" prefix
+
+        // Parse binary signature: "pq_bin:<base64_bincode_zstd>" (strip_prefix — no length coupling)
+        let base64_data = match signature.strip_prefix("pq_bin:") {
+            Some(rest) => rest,
+            None => return false,
+        };
         let binary_data = match general_purpose::STANDARD.decode(base64_data) {
             Ok(data) => data,
             Err(e) => {
                 if crate::node::is_warn() {
-                    println!("[WARN][CONS] hybrid_bin base64 decode failed: {}", e);
+                    println!("[WARN][CONS] pq_bin base64 decode failed: {}", e);
                 }
                 return false;
             }
         };
-        
-        let hybrid_sig: HybridSignature = match HybridSignature::from_binary_compressed(&binary_data) {
+
+        let pq_sig: PqSignature = match PqSignature::from_binary_compressed(&binary_data) {
             Ok(sig) => sig,
             Err(e) => {
                 if crate::node::is_warn() {
-                    println!("[WARN][CONS] hybrid_bin signature parse failed: {}", e);
+                    println!("[WARN][CONS] pq_bin signature parse failed: {}", e);
                 }
                 return false;
             }
         };
-        
+
         // Verify node_id matches certificate
-        if hybrid_sig.certificate.node_id != node_id {
+        if pq_sig.certificate.node_id != node_id {
             if crate::node::is_warn() {
-                println!("[WARN][CONS] hybrid_bin node_id mismatch: {} vs {}", 
-                         hybrid_sig.certificate.node_id, node_id);
+                println!("[WARN][CONS] pq_bin node_id mismatch: {} vs {}",
+                         pq_sig.certificate.node_id, node_id);
             }
             return false;
         }
@@ -16315,8 +15993,8 @@ impl SimplifiedP2P {
         // v2.49.3: Use thread with TIMEOUT to prevent deadlock
         // Previous version caused deadlock when all tokio workers blocked on join()
         let (tx, rx) = std::sync::mpsc::channel();
-        let node_id_clone = hybrid_sig.certificate.node_id.clone();
-        let serial_clone = hybrid_sig.certificate.serial_number.clone();
+        let node_id_clone = pq_sig.certificate.node_id.clone();
+        let serial_clone = pq_sig.certificate.serial_number.clone();
         
         std::thread::spawn(move || {
             let result = match tokio::runtime::Builder::new_current_thread()
@@ -16325,11 +16003,11 @@ impl SimplifiedP2P {
             {
                 Ok(rt) => {
                     rt.block_on(async move {
-                        let verifier = HybridCrypto::new(node_id_clone.clone());
-                        match verifier.verify_signature(&message_bytes, &hybrid_sig).await {
+                        let verifier = PqCrypto::new(node_id_clone.clone());
+                        match verifier.verify_signature(&message_bytes, &pq_sig).await {
                             Ok(true) => {
                                 if crate::node::is_debug() {
-                                    println!("[DBG][CONS] hybrid_bin_verified node={} cert={}", 
+                                    println!("[DBG][CONS] pq_bin_verified node={} cert={}",
                                              node_id_clone,
                                              &serial_clone[..8.min(serial_clone.len())]);
                                 }
@@ -16337,13 +16015,13 @@ impl SimplifiedP2P {
                             }
                             Ok(false) => {
                                 if crate::node::is_warn() {
-                                    println!("[WARN][CONS] hybrid_bin_invalid node={}", node_id_clone);
+                                    println!("[WARN][CONS] pq_bin_invalid node={}", node_id_clone);
                                 }
                                 false
                             }
                             Err(e) => {
                                 if crate::node::is_warn() {
-                                    println!("[WARN][CONS] hybrid_bin_error node={} err={}", node_id_clone, e);
+                                    println!("[WARN][CONS] pq_bin_error node={} err={}", node_id_clone, e);
                                 }
                                 false
                             }
@@ -16360,17 +16038,17 @@ impl SimplifiedP2P {
             Ok(result) => result,
             Err(_) => {
                 if crate::node::is_warn() {
-                    println!("[WARN][CONS] hybrid_bin verification timeout for node={}", node_id);
+                    println!("[WARN][CONS] pq_bin verification timeout for node={}", node_id);
                 }
                 false
             }
         }
     }
     
-    /// v2.49.2: Verify COMPACT hybrid binary signature (requires pre-shared certificate)
+    /// v2.49.2: Verify COMPACT PQ binary signature (requires pre-shared certificate)
     /// Format: "compact_bin:<base64_bincode_zstd>" - used for microblock signatures
     fn verify_compact_bin_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
-        use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
+        use crate::pq_crypto::CompactPqSignature;
         use crate::quantum_crypto::DilithiumSignature;
         use sha3::{Sha3_256, Digest};
         use base64::{Engine as _, engine::general_purpose};
@@ -16387,7 +16065,7 @@ impl SimplifiedP2P {
             }
         };
         
-        let compact_sig: CompactHybridSignature = match CompactHybridSignature::from_binary_compressed(&binary_data) {
+        let compact_sig: CompactPqSignature = match CompactPqSignature::from_binary_compressed(&binary_data) {
             Ok(sig) => sig,
             Err(e) => {
                 if crate::node::is_warn() {
@@ -16416,37 +16094,19 @@ impl SimplifiedP2P {
             }
         };
         
-        // Verify Ed25519 signature on message hash
+        // Verify Dilithium signature on message hash (pure ML-DSA-65)
         let mut hasher = Sha3_256::new();
         hasher.update(&message_bytes);
         let message_hash = hasher.finalize();
-        
-        match HybridCrypto::verify_ed25519_signature(
-            &message_hash,
-            &compact_sig.message_signature,
-            &compact_sig.ephemeral_public_key
-        ) {
-            Ok(true) => {
-                if crate::node::is_debug() {
-                    println!("[DBG][CONS] compact_bin Ed25519 verified");
-                }
-            }
-            _ => {
-                if crate::node::is_warn() {
-                    println!("[WARN][CONS] compact_bin Ed25519 signature INVALID");
-                }
-                return false;
-            }
-        }
-        
-        // v2.49.3: Verify Dilithium signature on ephemeral key with TIMEOUT to prevent deadlock
+
+        // v2.49.3: Verify Dilithium signature with TIMEOUT to prevent deadlock
         let node_id_clone = node_id.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
-        
+
         std::thread::spawn(move || {
             let result = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
-                .build() 
+                .build()
             {
                 Ok(rt) => {
                     rt.block_on(async move {
@@ -16456,14 +16116,13 @@ impl SimplifiedP2P {
                             Some(c) => c.as_ref(),
                             None => return false,
                         };
-                        
+
                         let mut encapsulated_data = Vec::new();
-                        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
                         encapsulated_data.extend_from_slice(&message_hash);
                         encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
                         let encapsulated_hex = hex::encode(&encapsulated_data);
                         
-                        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+                        use crate::crypto::pq_crypto::encode_dilithium_signature;
                         let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
                         
                         let dilithium_key_sig = DilithiumSignature {
@@ -16512,85 +16171,64 @@ impl SimplifiedP2P {
         }
     }
     
-    /// LEGACY: Verify HYBRID P2P JSON signature (SYNC version) - NIST/Cisco compliant
-    fn verify_hybrid_p2p_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
+    /// LEGACY: Verify PQ P2P JSON signature (SYNC version) - pure Dilithium3
+    fn verify_pq_p2p_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
         let message = message.to_string();
         let signature = signature.to_string();
         let _node_id = node_id.to_string();
         
         // Use std::thread::spawn to isolate runtime
         let handle = std::thread::spawn(move || {
-            use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
+            use crate::pq_crypto::CompactPqSignature;
             use crate::quantum_crypto::DilithiumSignature;
             use sha3::{Sha3_256, Digest};
             
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => {
                     rt.block_on(async move {
-                        // Parse hybrid_p2p signature
-                        let json_str = &signature[11..]; // Skip "hybrid_p2p:" prefix
-                        let compact_sig: CompactHybridSignature = match serde_json::from_str(json_str) {
+                        // Parse pq_p2p signature (strip_prefix — no length coupling)
+                        let json_str = match signature.strip_prefix("pq_p2p:") {
+                            Some(rest) => rest,
+                            None => return false,
+                        };
+                        let compact_sig: CompactPqSignature = match serde_json::from_str(json_str) {
                             Ok(sig) => sig,
                             Err(e) => {
                                 if crate::node::is_info() {
-                                    println!("[ERR][P2P] Failed to parse hybrid signature: {}", e);
+                                    println!("[ERR][P2P] Failed to parse PQ signature: {}", e);
                                 }
                                 return false;
                             }
                         };
-                        
-                        // Verify ephemeral key present
-                        if compact_sig.ephemeral_public_key.iter().all(|&b| b == 0) {
-                            if crate::node::is_info() {
-                                println!("[ERR][P2P] Ephemeral public key is all zeros!");
-                            }
-                            return false;
-                        }
-                        
-                        // OPTIMIZED v2.23: RAW bytes, only key signature required
+
+                        // Pure ML-DSA-65 (P8): Dilithium is the sole authenticator
                         if compact_sig.dilithium_key_signature.is_empty() {
                             if crate::node::is_info() {
                                 println!("[ERR][P2P] Missing Dilithium key signature!");
                             }
                             return false;
                         }
-                        
+
                         // Create message hash
                         let mut hasher = Sha3_256::new();
                         hasher.update(message.as_bytes());
                         let message_hash = hasher.finalize();
-                        
-                        // Verify Ed25519 with ephemeral key
-                        match HybridCrypto::verify_ed25519_signature(
-                            &message_hash,
-                            &compact_sig.message_signature,
-                            &compact_sig.ephemeral_public_key
-                        ) {
-                            Ok(true) => {}
-                            _ => {
-                                if crate::node::is_info() {
-                                    println!("[ERR][P2P] Ed25519 signature INVALID!");
-                                }
-                                return false;
-                            }
-                        }
-                        
+
                         // PRODUCTION v2.50: Lock-free quantum crypto for Dilithium verification
                         use crate::node::try_get_quantum_crypto;
                         let crypto = match try_get_quantum_crypto() {
                             Some(c) => c.as_ref(),
                             None => return false,
                         };
-                        
-                        // Verify Dilithium key signature
+
+                        // Verify Dilithium key signature (re-rooted preimage = message_hash || signed_at)
                         let mut encapsulated_data = Vec::new();
-                        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
                         encapsulated_data.extend_from_slice(&message_hash);
                         encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
                         let encapsulated_hex = hex::encode(&encapsulated_data);
                         
                         // OPTIMIZED v2.23: Convert RAW bytes to signature string
-                        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+                        use crate::crypto::pq_crypto::encode_dilithium_signature;
                         let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
                         
                         let dilithium_key_sig = DilithiumSignature {
@@ -16604,7 +16242,7 @@ impl SimplifiedP2P {
                         match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
                             Ok(true) => {
                                 if crate::node::is_info() {
-                                    println!("[INFO][P2P] HYBRID signature verified (NIST/Cisco)");
+                                    println!("[INFO][P2P] PQ signature verified (Dilithium3)");
                                 }
                                 true
                             }
@@ -16630,7 +16268,7 @@ impl SimplifiedP2P {
             Ok(result) => result,
             Err(_) => {
                 if crate::node::is_info() {
-                    println!("[ERR][P2P] Hybrid verification thread panicked");
+                    println!("[ERR][P2P] PQ verification thread panicked");
                 }
                 false
             }
@@ -16677,64 +16315,64 @@ impl SimplifiedP2P {
         self.peer_id_to_addr.get(node_id).map(|r| r.value().clone())
     }
     
-    /// Sign P2P message with HYBRID cryptography (ASYNC version) - NIST/Cisco compliant
+    /// Sign P2P message with PQ cryptography (ASYNC version) - pure Dilithium3
     /// PRODUCTION: Use this in async contexts (warp handlers, tokio tasks)
-    /// CRITICAL: Generates NEW ephemeral Ed25519 key for EACH message per NIST/Cisco
-    /// Returns compact hybrid signature JSON string
+    /// CRITICAL: Single ML-DSA-65 (Dilithium3) signature per message
+    /// Returns compact PQ signature JSON string
     /// NO FALLBACK - unsigned messages are rejected by the network
     pub async fn sign_dilithium_async(&self, message: &str, node_id: &str) -> Option<String> {
-        use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+        use crate::pq_crypto::{PqCrypto, GLOBAL_PQ_INSTANCES};
         use std::sync::Arc;
-        
-        // Get or create hybrid crypto instance (thread-safe global cache)
-        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+
+        // Get or create PQ crypto instance (thread-safe global cache)
+        let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
         }).await;
-        
+
         let mut instances_guard = instances.lock().await;
-        
+
         // v2.24: Use node_id directly
         let normalized_node_id = node_id.to_string();
 
         // Create instance if not exists
         if !instances_guard.contains_key(&normalized_node_id) {
-            let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
-            if let Err(e) = hybrid.initialize().await {
+            let mut pq = PqCrypto::new(normalized_node_id.clone());
+            if let Err(e) = pq.initialize().await {
                 if crate::node::is_info() {
-                    println!("[ERR][CRYPTO] CRITICAL: Hybrid crypto init failed: {} - SKIPPING OPERATION", e);
+                    println!("[ERR][CRYPTO] CRITICAL: PQ crypto init failed: {} - SKIPPING OPERATION", e);
                 }
                 return None;
             }
-            instances_guard.insert(normalized_node_id.clone(), hybrid);
+            instances_guard.insert(normalized_node_id.clone(), pq);
         }
 
-        let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+        let pq = match instances_guard.get_mut(&normalized_node_id) {
             Some(h) => h,
             None => return None, // Should never happen but prevents panic
         };
 
         // Check certificate rotation
-        if hybrid.needs_rotation() {
-            if let Err(e) = hybrid.rotate_certificate().await {
+        if pq.needs_rotation() {
+            if let Err(e) = pq.rotate_certificate().await {
                 if crate::node::is_info() {
                     println!("[WARN][CRYPTO] Certificate rotation failed: {}", e);
                 }
             }
         }
 
-        // CRITICAL: Sign RAW message with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
+        // CRITICAL: Sign RAW message with pure Dilithium3 (ML-DSA-65)
         // Using sign_raw_message_compact which hashes the message before signing
         // This ensures consistency with verification which also hashes
         // OPTIMIZED v2.24: bincode+zstd instead of JSON
-        match hybrid.sign_raw_message_compact(message.as_bytes()).await {
+        match pq.sign_raw_message_compact(message.as_bytes()).await {
             Ok(compact_sig) => {
                 // Serialize to bincode+zstd+base64
                 match compact_sig.to_binary_compressed() {
                     Ok(binary_data) => {
                         let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
-                        let sig_with_prefix = format!("hybrid_p2p_bin:{}", base64_data);
+                        let sig_with_prefix = format!("pq_p2p_bin:{}", base64_data);
                         if crate::node::is_info() {
-                            println!("[INFO][CRYPTO] HYBRID P2P signature created (bincode v2.24)");
+                            println!("[INFO][CRYPTO] PQ P2P signature created (bincode v2.24)");
                         }
                         if crate::node::is_info() {
                             println!("[INFO][CRYPTO] Size: {} bytes (optimized)", binary_data.len());
@@ -16743,7 +16381,7 @@ impl SimplifiedP2P {
                     }
                     Err(e) => {
                         if crate::node::is_info() {
-                            println!("[ERR][CRYPTO] Failed to serialize hybrid signature: {}", e);
+                            println!("[ERR][CRYPTO] Failed to serialize PQ signature: {}", e);
                         }
                         None
                     }
@@ -16751,20 +16389,20 @@ impl SimplifiedP2P {
             }
             Err(e) => {
                 if crate::node::is_info() {
-                    println!("[ERR][CRYPTO] CRITICAL: Hybrid signing failed: {} - SKIPPING OPERATION", e);
+                    println!("[ERR][CRYPTO] CRITICAL: PQ signing failed: {} - SKIPPING OPERATION", e);
                 }
                 None
             }
         }
     }
     
-    /// Sign heartbeat message with HYBRID cryptography (SYNC version for std::thread::spawn ONLY)
+    /// Sign heartbeat message with PQ cryptography (SYNC version for std::thread::spawn ONLY)
     /// WARNING: Only use in pure sync contexts where NO tokio runtime exists!
-    /// CRITICAL: Generates NEW ephemeral Ed25519 key for EACH heartbeat per NIST/Cisco
-    /// PRODUCTION: Returns None if hybrid fails - heartbeat will be skipped
+    /// CRITICAL: Single ML-DSA-65 (Dilithium3) signature per heartbeat
+    /// PRODUCTION: Returns None if signing fails - heartbeat will be skipped
     /// NO FALLBACK - unsigned heartbeats are rejected by the network
     fn sign_heartbeat_dilithium(&self, message: &str, node_id: &str) -> Option<String> {
-        use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+        use crate::pq_crypto::{PqCrypto, GLOBAL_PQ_INSTANCES};
         use std::sync::Arc;
         
         // Create NEW runtime - safe because we're in std::thread::spawn (no existing runtime)
@@ -16774,40 +16412,40 @@ impl SimplifiedP2P {
                 let message_owned = message.to_string();
                 
                 let result = rt.block_on(async move {
-                    // Get or create hybrid crypto instance (thread-safe global cache)
-                    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                    // Get or create PQ crypto instance (thread-safe global cache)
+                    let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
                         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
                     }).await;
-                    
+
                     let mut instances_guard = instances.lock().await;
-                    
+
                     // v2.24: Use node_id directly
                     let normalized_node_id = node_id_owned.clone();
-                    
+
                     // Create instance if not exists
                     if !instances_guard.contains_key(&normalized_node_id) {
-                        let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
-                        if let Err(e) = hybrid.initialize().await {
+                        let mut pq = PqCrypto::new(normalized_node_id.clone());
+                        if let Err(e) = pq.initialize().await {
                             if crate::node::is_info() {
-                                println!("[ERR][P2P] Hybrid crypto init failed: {}", e);
+                                println!("[ERR][P2P] PQ crypto init failed: {}", e);
                             }
-                            return Err(anyhow::anyhow!("Hybrid init failed: {}", e));
+                            return Err(anyhow::anyhow!("PQ init failed: {}", e));
                         }
-                        instances_guard.insert(normalized_node_id.clone(), hybrid);
+                        instances_guard.insert(normalized_node_id.clone(), pq);
                     }
-                    
-                    let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+
+                    let pq = match instances_guard.get_mut(&normalized_node_id) {
             Some(h) => h,
-            None => return Err(anyhow::anyhow!("Hybrid instance missing")),
+            None => return Err(anyhow::anyhow!("PQ instance missing")),
         };
-                    
+
                     // Check certificate rotation
-                    if hybrid.needs_rotation() {
-                        let _ = hybrid.rotate_certificate().await;
+                    if pq.needs_rotation() {
+                        let _ = pq.rotate_certificate().await;
                     }
-                    
-                    // CRITICAL: Sign RAW message with hybrid (hashes before signing)
-                    hybrid.sign_raw_message_compact(message_owned.as_bytes()).await
+
+                    // CRITICAL: Sign RAW message with pure Dilithium3 (hashes before signing)
+                    pq.sign_raw_message_compact(message_owned.as_bytes()).await
                 });
                 
                 match result {
@@ -16816,14 +16454,14 @@ impl SimplifiedP2P {
                         match compact_sig.to_binary_compressed() {
                             Ok(binary_data) => {
                                 let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
-                                Some(format!("hybrid_p2p_bin:{}", base64_data))
+                                Some(format!("pq_p2p_bin:{}", base64_data))
                             }
                             Err(_) => None
                         }
                     }
                     Err(e) => {
                         if crate::node::is_info() {
-                            println!("[ERR][P2P] CRITICAL: Hybrid signing failed: {} - SKIPPING HEARTBEAT", e);
+                            println!("[ERR][P2P] CRITICAL: PQ signing failed: {} - SKIPPING HEARTBEAT", e);
                         }
                         None
                     }
@@ -16942,7 +16580,7 @@ impl SimplifiedP2P {
             registry.insert(registration.node_id.clone(), registration.clone());
         }
         
-        // Gossip to network (HYBRID v2.90 + PING DELEGATION v7.0)
+        // Gossip to network (pure ML-DSA-65 + PING DELEGATION v7.0)
         let msg = NetworkMessage::LightNodeRegistration {
             node_id: registration.node_id,
             wallet_address: registration.wallet_address,
@@ -16956,8 +16594,6 @@ impl SimplifiedP2P {
             last_seen: registration.last_seen,
             consecutive_failures: registration.consecutive_failures,
             is_active: registration.is_active,
-            ed25519_signature: registration.ed25519_signature,
-            ed25519_public_key: registration.ed25519_public_key,
             ping_pubkey: registration.ping_pubkey,
             ping_delegation_cert: registration.ping_delegation_cert,
         };
@@ -16995,8 +16631,6 @@ impl SimplifiedP2P {
                     last_seen: registered_at,
                     consecutive_failures: if inactive { 5 } else { 0 },
                     is_active: !inactive,
-                    ed25519_signature: String::new(),
-                    ed25519_public_key: String::new(),
                     ping_pubkey: String::new(),         // Populated on re-registration
                     ping_delegation_cert: String::new(),// Populated on re-registration
                 });
@@ -21280,59 +20914,59 @@ impl SimplifiedP2P {
     
     /// Sign audit entry with quantum-resistant Dilithium signature (ASYNC version)
     /// PRODUCTION: Use this in async contexts
-    /// Sign audit entry with HYBRID cryptography (ASYNC version) - NIST/Cisco compliant
-    /// CRITICAL: Generates NEW ephemeral Ed25519 key for each audit entry
+    /// Sign audit entry with PQ cryptography (ASYNC version) - pure Dilithium3
+    /// CRITICAL: Single ML-DSA-65 (Dilithium3) signature per audit entry
     pub async fn sign_audit_entry_async(&self, entry_hash: &str) -> String {
-        use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+        use crate::pq_crypto::{PqCrypto, GLOBAL_PQ_INSTANCES};
         use std::sync::Arc;
-        
-        // Get or create hybrid crypto instance
-        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+
+        // Get or create PQ crypto instance
+        let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
         }).await;
-        
+
         let mut instances_guard = instances.lock().await;
-        
+
         // v2.24: Use node_id directly
         let normalized_node_id = self.node_id.clone();
-        
+
         // Create instance if not exists
         if !instances_guard.contains_key(&normalized_node_id) {
-            let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
-            if let Err(e) = hybrid.initialize().await {
+            let mut pq = PqCrypto::new(normalized_node_id.clone());
+            if let Err(e) = pq.initialize().await {
                 if crate::node::is_info() {
-                    println!("[ERR][SECURITY] Hybrid crypto init failed: {}", e);
+                    println!("[ERR][SECURITY] PQ crypto init failed: {}", e);
                 }
                 return String::from("UNSIGNED_NO_HYBRID_SIG");
             }
-            instances_guard.insert(normalized_node_id.clone(), hybrid);
+            instances_guard.insert(normalized_node_id.clone(), pq);
         }
 
-        let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+        let pq = match instances_guard.get_mut(&normalized_node_id) {
             Some(h) => h,
             None => return String::from("UNSIGNED_MISSING_INSTANCE"),
         };
 
         // Check certificate rotation
-        if hybrid.needs_rotation() {
-            let _ = hybrid.rotate_certificate().await;
+        if pq.needs_rotation() {
+            let _ = pq.rotate_certificate().await;
         }
 
-        // CRITICAL: Sign RAW message with hybrid (hashes before signing)
+        // CRITICAL: Sign RAW message with pure Dilithium3 (hashes before signing)
         // OPTIMIZED v2.24: bincode+zstd - use standard compact_bin format
-        match hybrid.sign_raw_message_compact(entry_hash.as_bytes()).await {
+        match pq.sign_raw_message_compact(entry_hash.as_bytes()).await {
             Ok(compact_sig) => {
                 match compact_sig.to_binary_compressed() {
                     Ok(binary_data) => {
                         let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
                         if crate::node::is_info() {
-                            println!("[INFO][SECURITY] Generated HYBRID signature for audit entry (bincode v2.24)");
+                            println!("[INFO][SECURITY] Generated PQ signature for audit entry (bincode v2.24)");
                         }
-                        format!("compact_bin:{}", base64_data)  // CompactHybridSignature uses compact_bin
+                        format!("compact_bin:{}", base64_data)  // CompactPqSignature uses compact_bin
                     }
                     Err(e) => {
                         if crate::node::is_info() {
-                            println!("[ERR][SECURITY] Failed to serialize hybrid signature: {}", e);
+                            println!("[ERR][SECURITY] Failed to serialize PQ signature: {}", e);
                         }
                         String::from("UNSIGNED_SERIALIZE_FAILED")
                     }
@@ -21340,57 +20974,57 @@ impl SimplifiedP2P {
             }
             Err(e) => {
                 if crate::node::is_info() {
-                    println!("[ERR][SECURITY] Failed to generate hybrid signature: {}", e);
+                    println!("[ERR][SECURITY] Failed to generate PQ signature: {}", e);
                 }
                 String::from("UNSIGNED_NO_HYBRID_SIG")
             }
         }
     }
-    
-    /// Sign audit entry with HYBRID cryptography (SYNC version) - NIST/Cisco compliant
+
+    /// Sign audit entry with PQ cryptography (SYNC version) - pure Dilithium3
     /// SAFE: Uses std::thread::spawn to isolate runtime, avoiding nested runtime panic
-    /// CRITICAL: Generates NEW ephemeral Ed25519 key for each audit entry
+    /// CRITICAL: Single ML-DSA-65 (Dilithium3) signature per audit entry
     fn sign_audit_entry(&self, entry_hash: &str) -> String {
         let node_id = self.node_id.clone();
         let entry_hash = entry_hash.to_string();
         
         // CRITICAL FIX: Use std::thread::spawn to isolate runtime
         let handle = std::thread::spawn(move || {
-            use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+            use crate::pq_crypto::{PqCrypto, GLOBAL_PQ_INSTANCES};
             use std::sync::Arc;
             
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => {
                     let result = rt.block_on(async move {
-                        // Get or create hybrid crypto instance
-                        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                        // Get or create PQ crypto instance
+                        let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
                             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
                         }).await;
-                        
+
                         let mut instances_guard = instances.lock().await;
-                        
+
                         // v2.24: Use node_id directly
                         let normalized_node_id = node_id.clone();
-                        
+
                         // Create instance if not exists
                         if !instances_guard.contains_key(&normalized_node_id) {
-                            let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
-                            hybrid.initialize().await?;
-                            instances_guard.insert(normalized_node_id.clone(), hybrid);
+                            let mut pq = PqCrypto::new(normalized_node_id.clone());
+                            pq.initialize().await?;
+                            instances_guard.insert(normalized_node_id.clone(), pq);
                         }
-                        
-                        let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+
+                        let pq = match instances_guard.get_mut(&normalized_node_id) {
             Some(h) => h,
-            None => return Err(anyhow::anyhow!("Hybrid instance missing")),
+            None => return Err(anyhow::anyhow!("PQ instance missing")),
         };
-                        
+
                         // Check certificate rotation
-                        if hybrid.needs_rotation() {
-                            let _ = hybrid.rotate_certificate().await;
+                        if pq.needs_rotation() {
+                            let _ = pq.rotate_certificate().await;
                         }
-                        
-                        // Sign RAW message with hybrid (hashes before signing)
-                        hybrid.sign_raw_message_compact(entry_hash.as_bytes()).await
+
+                        // Sign RAW message with pure Dilithium3 (hashes before signing)
+                        pq.sign_raw_message_compact(entry_hash.as_bytes()).await
                     });
                     
                     match result {
@@ -21399,7 +21033,7 @@ impl SimplifiedP2P {
                             match compact_sig.to_binary_compressed() {
                                 Ok(binary_data) => {
                                     let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
-                                    format!("compact_bin:{}", base64_data)  // CompactHybridSignature
+                                    format!("compact_bin:{}", base64_data)  // CompactPqSignature
                                 }
                                 Err(_) => String::from("UNSIGNED_SERIALIZE_FAILED")
                             }
@@ -21413,9 +21047,9 @@ impl SimplifiedP2P {
         
         match handle.join() {
             Ok(sig) => {
-                if sig.starts_with("hybrid_bin:") || sig.starts_with("hybrid:") {
+                if sig.starts_with("pq_bin:") || sig.starts_with("pq:") {
                     if crate::node::is_info() {
-                        println!("[INFO][SECURITY] Generated HYBRID signature for audit entry");
+                        println!("[INFO][SECURITY] Generated PQ signature for audit entry");
                     }
                 }
                 sig
@@ -22264,7 +21898,7 @@ impl SimplifiedP2P {
     }
     
     /// Create and broadcast timeout vote for specified height/round
-    /// signature: Pre-computed hybrid signature from node's quantum_crypto
+    /// signature: Pre-computed PQ signature from node's quantum_crypto
     // VRF leader-claim broadcast with gossip TTL: send the VRF proof to
     // direct peers with a relay TTL. GOSSIP_TTL = hop budget (TTL=3 ≈ 1B
     // reach); per-hop fanout = √(connected_peers), so the full committee is
@@ -22414,64 +22048,6 @@ impl SimplifiedP2P {
 
     /// v3.33: Broadcast block attestation to all validators.
     /// Called by validators after successfully verifying a received microblock.
-    pub fn broadcast_block_attestation(
-        &self,
-        block_height: u64,
-        block_hash: [u8; 32],
-        signature: Vec<u8>,
-    ) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Store own attestation locally
-        submit_block_attestation(BlockAttestation {
-            block_height,
-            block_hash,
-            attester_id: self.node_id.clone(),
-            signature: signature.clone(),
-            timestamp: now,
-        });
-
-        let msg = NetworkMessage::BlockAttestationMsg {
-            block_height,
-            block_hash: block_hash.to_vec(),
-            attester_id: self.node_id.clone(),
-            signature,
-            timestamp: now,
-        };
-
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return,
-        };
-
-        let peers = self.get_all_validator_addresses();
-        let quic_transport = self.quic_transport.clone();
-        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
-
-        handle.spawn(async move {
-            if quic_enabled {
-                if let Some(ref qt_lock) = quic_transport {
-                    let qt = qt_lock.read().await;
-                    for peer_str in &peers {
-                        let ip = peer_str.split(':').next().unwrap_or(peer_str);
-                        let quic_addr_str = format!("{}:10876", ip);
-                        if let Ok(peer_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
-                            let _ = qt.broadcast_to(peer_addr, &msg).await;
-                        }
-                    }
-                }
-            }
-        });
-
-        if crate::node::is_debug() {
-            println!("[DBG][ATTEST] broadcast h={} hash={}",
-                     block_height, hex::encode(&block_hash[..8]));
-        }
-    }
-
     /// Broadcast an empty-slot attestation to all validators.
     ///
     /// Called by committee members when the producer for `slot_height` fails to
@@ -23955,11 +23531,11 @@ impl SimplifiedP2P {
         false
     }
     
-    /// DEPRECATED: Hybrid reputation signature verification - DISABLED
+    /// DEPRECATED: PQ reputation signature verification - DISABLED
     #[deprecated(note = "P2P reputation sync disabled")]
     #[allow(unused_variables)]
     #[allow(dead_code)]
-    async fn verify_hybrid_reputation_signature_async(&self, message: &str, compact_sig: &crate::hybrid_crypto::CompactHybridSignature, node_id: &str) -> bool {
+    async fn verify_pq_reputation_signature_async(&self, message: &str, compact_sig: &crate::pq_crypto::CompactPqSignature, node_id: &str) -> bool {
         // DISABLED: Part of P2P reputation sync which is now removed
         false
     }
@@ -23999,7 +23575,7 @@ impl SimplifiedP2P {
     /// DEPRECATED: Old SYNC implementation - preserved for reference
     #[allow(dead_code)]
     fn _broadcast_reputation_sync_legacy(&self) -> Result<(), String> {
-        use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+        use crate::pq_crypto::{PqCrypto, GLOBAL_PQ_INSTANCES};
         use std::sync::Arc;
         
         // Get current reputation state and jail statuses
@@ -24028,42 +23604,42 @@ impl SimplifiedP2P {
             message.push_str(&format!(":{}={}", node, reputation));
         }
         
-        // CRITICAL: Generate HYBRID signature (SYNC - creates new runtime)
+        // CRITICAL: Generate PQ signature (SYNC - creates new runtime)
         let node_id = self.node_id.clone();
         let message_for_sign = message.clone();
-        
+
         let signature = match tokio::runtime::Runtime::new() {
             Ok(rt) => {
                 let result = rt.block_on(async move {
-                    // Get or create hybrid crypto instance
-                    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                    // Get or create PQ crypto instance
+                    let instances = GLOBAL_PQ_INSTANCES.get_or_init(|| async {
                         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
                     }).await;
-                    
+
                     let mut instances_guard = instances.lock().await;
-                    
+
                     // v2.24: Use node_id directly
                     let normalized_node_id = node_id.clone();
-                    
+
                     // Create instance if not exists
                     if !instances_guard.contains_key(&normalized_node_id) {
-                        let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
-                        hybrid.initialize().await?;
-                        instances_guard.insert(normalized_node_id.clone(), hybrid);
+                        let mut pq = PqCrypto::new(normalized_node_id.clone());
+                        pq.initialize().await?;
+                        instances_guard.insert(normalized_node_id.clone(), pq);
                     }
-                    
-                    let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+
+                    let pq = match instances_guard.get_mut(&normalized_node_id) {
             Some(h) => h,
-            None => return Err(anyhow::anyhow!("Hybrid instance missing")),
+            None => return Err(anyhow::anyhow!("PQ instance missing")),
         };
-                    
+
                     // Check certificate rotation
-                    if hybrid.needs_rotation() {
-                        let _ = hybrid.rotate_certificate().await;
+                    if pq.needs_rotation() {
+                        let _ = pq.rotate_certificate().await;
                     }
-                    
-                    // Sign RAW message with hybrid (hashes before signing)
-                    hybrid.sign_raw_message_compact(message_for_sign.as_bytes()).await
+
+                    // Sign RAW message with pure Dilithium3 (hashes before signing)
+                    pq.sign_raw_message_compact(message_for_sign.as_bytes()).await
                 });
                 
                 match result {
@@ -24074,13 +23650,13 @@ impl SimplifiedP2P {
                                 let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
                                 let sig_with_prefix = format!("compact_bin:{}", base64_data);
                                 if crate::node::is_info() {
-                                    println!("[INFO][P2P] Generated HYBRID signature for reputation sync (bincode v2.24)");
+                                    println!("[INFO][P2P] Generated PQ signature for reputation sync (bincode v2.24)");
                                 }
                                 sig_with_prefix.as_bytes().to_vec()
                             }
                             Err(e) => {
                                 if crate::node::is_info() {
-                                    println!("[ERR][P2P] Failed to serialize hybrid signature: {}", e);
+                                    println!("[ERR][P2P] Failed to serialize PQ signature: {}", e);
                                 }
                                 Vec::new()
                             }
@@ -24088,7 +23664,7 @@ impl SimplifiedP2P {
                     }
                     Err(e) => {
                         if crate::node::is_info() {
-                            println!("[ERR][P2P] Failed to generate hybrid signature: {}", e);
+                            println!("[ERR][P2P] Failed to generate PQ signature: {}", e);
                         }
                         Vec::new()
                     }
@@ -25134,41 +24710,35 @@ mod tests {
         assert!(entry.is_active(), "Permanent blacklist should always be active");
     }
     
-    /// Test hybrid P2P signature format detection
+    /// Test PQ P2P signature format detection
     #[test]
-    fn test_hybrid_p2p_signature_format() {
-        let hybrid_sig = r#"hybrid_p2p:{"node_id":"test_node"}"#;
+    fn test_pq_p2p_signature_format() {
+        let pq_sig = r#"pq_p2p:{"node_id":"test_node"}"#;
         let legacy_sig = "dilithium_sig_abc123";
         let heartbeat_sig = "heartbeat_v2_test_node_1234567890";
-        
-        assert!(hybrid_sig.starts_with("hybrid_p2p:"));
+
+        assert!(pq_sig.starts_with("pq_p2p:"));
         assert!(legacy_sig.starts_with("dilithium_sig_"));
         assert!(heartbeat_sig.starts_with("heartbeat_v2_"));
     }
     
-    /// Test CompactHybridSignature JSON parsing for P2P
+    /// Test CompactPqSignature JSON parsing for P2P
     /// OPTIMIZED v2.23: RAW bytes, dilithium_message_signature removed
     #[test]
     fn test_compact_signature_p2p_parsing() {
-        use crate::crypto::CompactHybridSignature;
+        use crate::crypto::CompactPqSignature;
         
-        // Create valid base64 for 32-byte array (ephemeral_public_key)
-        let ephemeral_pk = [42u8; 32];
-        let msg_sig = [1u8; 64];
-        
-        // OPTIMIZED v2.23: Create signature directly (RAW bytes format)
-        let sig = CompactHybridSignature {
+        // Pure ML-DSA-65: RAW bytes format (Dilithium is the sole authenticator)
+        let sig = CompactPqSignature {
             node_id: "p2p_test".to_string(),
             cert_serial: "CERT-P2P-123".to_string(),
-            ephemeral_public_key: ephemeral_pk,
-            message_signature: msg_sig,
             dilithium_key_signature: vec![1, 2, 3],  // RAW bytes
             signed_at: 9999999999,
         };
         
         // Test roundtrip
         let json = serde_json::to_string(&sig).expect("Serialization failed");
-        let restored: CompactHybridSignature = serde_json::from_str(&json)
+        let restored: CompactPqSignature = serde_json::from_str(&json)
             .expect("Deserialization failed");
         
         assert_eq!(sig.node_id, restored.node_id);
@@ -25189,17 +24759,15 @@ mod tests {
         
         assert_eq!(message_hash.len(), 32);
         
-        // Simulate encapsulated data creation
-        let ephemeral_pk = [42u8; 32];
+        // Simulate re-rooted encapsulated data creation (P8: message_hash || timestamp)
         let timestamp: u64 = 1700000000;
-        
+
         let mut encapsulated = Vec::new();
-        encapsulated.extend_from_slice(&ephemeral_pk);
         encapsulated.extend_from_slice(&message_hash);
         encapsulated.extend_from_slice(&timestamp.to_le_bytes());
-        
-        // NIST/Cisco format: 32 + 32 + 8 = 72 bytes
-        assert_eq!(encapsulated.len(), 72);
+
+        // Pure ML-DSA-65 preimage: 32 + 8 = 40 bytes
+        assert_eq!(encapsulated.len(), 40);
     }
     
     // ═══════════════════════════════════════════════════════════════════════════

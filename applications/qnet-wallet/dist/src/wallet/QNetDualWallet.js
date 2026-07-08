@@ -195,6 +195,7 @@ export class QNetDualWallet {
                     qnet: {
                         address: qnetWallet.address,
                         privateKey: qnetWallet.privateKey,
+                        publicKey: qnetWallet.publicKey,   // ML-DSA-65 pk (hex) — needed to sign QNet TX
                         balances: { QNC: 0 },
                         activeNode: null,
                         purpose: 'Node management + Phase 2 activation',
@@ -568,17 +569,25 @@ export class QNetDualWallet {
      */
     async generateQNetWallet(mnemonic) {
         try {
-            // Generate deterministic EON address from mnemonic
-            const eonAddress = await this.eonGenerator.generateDeterministicEON(mnemonic, 0);
-            
-            // Generate QNet private key from mnemonic
-            const seed = await this.crypto.mnemonicToSeed(mnemonic);
-            const privateKey = this.crypto.derivePrivateKey(seed, 'qnet', 0);
-            
+            // PURE DILITHIUM (F0.2): canonical ML-DSA-65 wallet — byte-identical to the Rust node and the
+            // mobile app (golden-KAT proven: "abandon…about" → d9fa370374e24333242eon847d1d354dcd87fe873823e).
+            // The derivation lives in the bundled lib (lib/noble-pq-ml-dsa.js) so every client stays in
+            // lockstep: seedString = "QNET_WALLET_MLDSA65_v1:"+hex(bip39_seed); xi = SHAKE256(seedString)[..32];
+            // (pk,sk) = ML-DSA-65.keygen(xi); address = format_eon(SHA512(pk)).
+            const lib = (typeof window !== 'undefined' ? window.QNetDilithiumLib
+                       : (typeof globalThis !== 'undefined' ? globalThis.QNetDilithiumLib : null));
+            const Q = lib && lib.QNetDilithium;
+            if (!Q || typeof Q.deriveWallet !== 'function') {
+                throw new Error('QNetDilithium bundle not loaded — lib/noble-pq-ml-dsa.js must load before wallet code');
+            }
+            const w = Q.deriveWallet(mnemonic); // { address, publicKey(hex 1952B), secretKey(hex 4032B), xi }
+
             return {
-                address: eonAddress,
-                privateKey: privateKey,
-                derivationPath: 'qnet/0'
+                address: w.address,
+                privateKey: w.secretKey,        // ML-DSA-65 secret key (hex)
+                publicKey: w.publicKey,         // ML-DSA-65 public key (hex) — required to sign QNet TX
+                algorithm: 'ML-DSA-65',
+                derivationPath: 'QNET_WALLET_MLDSA65_v1'
             };
 
         } catch (error) {

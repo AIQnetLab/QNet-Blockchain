@@ -5,8 +5,9 @@
 //! All post-quantum and classical cryptography implementations.
 //!
 //! ## NIST Compliance
-//! - CRYSTALS-Dilithium (NIST Level 3) - Post-quantum signatures
-//! - Ed25519 - Classical signatures (hybrid fallback)
+//! - CRYSTALS-Dilithium3 / ML-DSA-65 (NIST FIPS 204, Level 3) - the ONLY signature scheme
+//! - X25519Kyber768 / ML-KEM-768 (NIST FIPS 203) - post-quantum TLS key exchange
+//! - Ed25519 - Solana-side only (1DEV burn wallet ownership); NOT a QNet signature
 //! - SHA3-256 - Hash functions
 //!
 //! ## Module Structure
@@ -14,11 +15,10 @@
 //! ```text
 //! crypto/
 //! ├── mod.rs              - This file (public exports)
-//! ├── hybrid_crypto.rs    - Dilithium + Ed25519 hybrid signatures
+//! ├── pq_crypto.rs        - Pure ML-DSA-65 (Dilithium3) signatures
 //! ├── quantum_crypto.rs   - Quantum-resistant cryptography core
 //! ├── poh.rs              - Verifiable Time Sequence (VTS)
 //! ├── vrf.rs              - Legacy VRF (deprecated)
-//! ├── vrf_hybrid.rs       - Hybrid VRF for QRB (NOT producer selection)
 //! ├── key_manager.rs      - Key generation and management
 //! └── crypto_integration.rs - Service integration layer
 //! ```
@@ -39,9 +39,12 @@
 // SUBMODULES
 // ============================================================================
 
-/// Hybrid cryptography: CRYSTALS-Dilithium + Ed25519
-/// Implements dual-signature system for post-quantum security with classical fallback
-pub mod hybrid_crypto;
+/// Post-quantum cryptography: pure CRYSTALS-Dilithium3 (ML-DSA-65) signatures.
+/// Ed25519 is fully removed from QNet signing. Attached-signature wire tags use the `pq_*`
+/// namespace: `pq_p2p_bin:` is the live P2P format; `pq_bin:` / `pq:` / `pq_p2p:` are
+/// legacy parse-only stubs with no current producer. Parsers use `strip_prefix` (no hardcoded
+/// byte offsets). The crypto itself is a single pure Dilithium3 signature per message.
+pub mod pq_crypto;
 
 /// Quantum-resistant cryptography core
 /// Node activation, phase management, pricing calculations
@@ -54,11 +57,6 @@ pub mod poh;
 /// Dilithium3-VRF: Post-quantum VRF for secret leader election
 /// Uses NIST FIPS 204 (ML-DSA-65) + SHA3-256
 pub mod vrf;
-
-/// Hybrid VRF for QRB (Quantum Randomness Beacon)
-/// Used for: microblock VRF outputs → RANDAO accumulation → dApp randomness
-/// NOT used for: Producer selection (uses deterministic SHA3-512 in node.rs)
-pub mod vrf_hybrid;
 
 /// Key management
 /// Dilithium key generation, storage, rotation
@@ -74,20 +72,20 @@ pub mod genesis_key;
 pub mod solana_derivation;
 
 // NOTE: crypto_integration.rs is deprecated (uses non-existent qnet_core::crypto)
-// The hybrid_crypto and quantum_crypto modules handle all production crypto needs
+// The pq_crypto and quantum_crypto modules handle all production crypto needs
 // pub mod crypto_integration;
 
 // ============================================================================
 // RE-EXPORTS FOR CONVENIENCE
 // ============================================================================
 
-// Hybrid crypto types
-pub use hybrid_crypto::{
-    HybridCrypto,
-    HybridCertificate,
-    HybridSignature,
-    CompactHybridSignature,
-    GLOBAL_HYBRID_INSTANCES,
+// Post-quantum crypto types (pure ML-DSA-65 / Dilithium3)
+pub use pq_crypto::{
+    PqCrypto,
+    PqCertificate,
+    PqSignature,
+    CompactPqSignature,
+    GLOBAL_PQ_INSTANCES,
 };
 
 // Quantum crypto types
@@ -113,12 +111,6 @@ pub use vrf::{
     QNetVrf,
     VrfOutput,
     WalletIdentity,
-};
-
-// Hybrid VRF types
-pub use vrf_hybrid::{
-    QNetHybridVrf,
-    HybridVrfOutput,
 };
 
 // Key manager types

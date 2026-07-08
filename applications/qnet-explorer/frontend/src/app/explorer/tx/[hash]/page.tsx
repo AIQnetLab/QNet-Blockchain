@@ -4,6 +4,39 @@ import React, { useState, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { setCache } from '@/lib/explorer-cache';
+import { formatTokenAmount } from '@/lib/token-format';
+
+// Decoded QRC-20 ContractCall: the contract is the tx `to`, the method + args
+// live in the tx `data` JSON ({"method","args":[...]}). Decimals must be
+// resolved from the token itself (each token has its OWN decimals) — never the
+// QNC 1e9 formatter.
+interface DecodedTokenCall {
+  method: string;
+  contract: string;   // the token contract (tx.to)
+  to: string;         // transfer recipient
+  amountRaw: string;  // u64 base units (string; may exceed 2^53)
+}
+
+// Parse tx.data for QRC-20 value-moving methods. Returns null for non-token or
+// undecodable calls so the caller falls back to the generic data card.
+function decodeTokenCall(dataStr: string | null | undefined, contract: string): DecodedTokenCall | null {
+  if (!dataStr) return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(dataStr); } catch { return null; }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const obj = parsed as { method?: unknown; args?: unknown };
+  const method = typeof obj.method === 'string' ? obj.method : '';
+  const args = Array.isArray(obj.args) ? obj.args : [];
+  const str = (v: unknown): string => (typeof v === 'string' ? v : v == null ? '' : String(v));
+
+  if (method === 'transfer') {          // [to, amount]
+    return { method, contract, to: str(args[0]), amountRaw: str(args[1]) };
+  }
+  if (method === 'transferFrom') {      // [from, to, amount]
+    return { method, contract, to: str(args[1]), amountRaw: str(args[2]) };
+  }
+  return null;
+}
 
 interface TransactionData {
   hash: string;
@@ -28,6 +61,7 @@ interface TransactionData {
   dilithium_signature?: string;
   dilithium_public_key?: string;
   tx_type_data?: Record<string, unknown> | null;
+  data?: string | null;
 }
 
 // Truncate
@@ -57,6 +91,14 @@ const formatTime = (ts: number | string | undefined): string => {
 // snake_case/genesis_id → "Genesis Id" for the data card labels
 const humanizeKey = (key: string): string =>
   key.replace(/[_-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+// Build a single, valid CSS modifier class from a display type. Display types
+// like "Token Transfer" / "Contract Call" / "Light Eligibility" contain spaces,
+// so a naive `type-${type.toLowerCase()}` would emit TWO classes (e.g.
+// "type-token transfer"). Collapse every run of non-alphanumerics to a single
+// '-' so the result is one class matching the CSS (e.g. "type-token-transfer").
+const typeBadgeClass = (type: string): string =>
+  `type-${(type || 'other').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`;
 
 // Render any tx_type_data value as a string (objects/arrays → JSON)
 const formatDataValue = (val: unknown): string => {
@@ -88,6 +130,81 @@ const CopyBtn = ({ text }: { text: string }) => {
         </svg>
       )}
     </button>
+  );
+};
+
+// Render a decoded QRC-20 transfer as a human row:
+// "Transferred X SYMBOL to <addr>", resolving decimals + symbol from the token
+// contract. Falls back to base-unit display if the token lookup fails.
+const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
+  const [meta, setMeta] = useState<{ symbol: string; decimals: number } | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const res = await fetch(`/api/token/${call.contract}`);
+        const result = await res.json();
+        if (active && result?.success && result.data) {
+          setMeta({
+            symbol: result.data.symbol || '',
+            decimals: typeof result.data.decimals === 'number' ? result.data.decimals : 9,
+          });
+        }
+      } catch {
+        // leave meta null → base-unit fallback
+      }
+    })();
+    return () => { active = false; };
+  }, [call.contract]);
+
+  // Until decimals are known, show raw base units (still exact, no float).
+  const decimals = meta ? meta.decimals : 0;
+  const symbol = meta ? meta.symbol : '';
+  const amount = formatTokenAmount(call.amountRaw, decimals);
+
+  const addrLink = (addr: string) => {
+    const isValid = addr && addr.length > 10 && addr.includes('eon');
+    return isValid ? (
+      <Link href={`/explorer/address/${addr}`} className="address-link">{truncate(addr, 12, 8)}</Link>
+    ) : (
+      <span className="address-link">{addr || 'N/A'}</span>
+    );
+  };
+
+  return (
+    <div className="block-card">
+      <h2 className="card-title">Token Transfer</h2>
+      <div className="details-grid">
+        <div className="detail-row">
+          <span className="detail-label">Action</span>
+          <span className="detail-value">
+            Transferred {amount}{symbol ? ` ${symbol}` : ''} to {addrLink(call.to)}
+          </span>
+        </div>
+        <div className="detail-row">
+          <span className="detail-label">Amount</span>
+          <span className="detail-value">{amount}{symbol ? ` ${symbol}` : ''}</span>
+        </div>
+        <div className="detail-row">
+          <span className="detail-label">Recipient</span>
+          <span className="detail-value">{addrLink(call.to)}</span>
+        </div>
+        <div className="detail-row">
+          <span className="detail-label">Token</span>
+          <span className="detail-value">
+            <Link href={`/explorer/token/${call.contract}`} className="address-link">
+              {symbol || truncate(call.contract, 12, 8)}
+            </Link>
+            <CopyBtn text={call.contract} />
+          </span>
+        </div>
+        <div className="detail-row">
+          <span className="detail-label">Method</span>
+          <span className="detail-value">{call.method}</span>
+        </div>
+      </div>
+    </div>
   );
 };
 
@@ -157,7 +274,7 @@ export default function TransactionPage() {
       <div className="block-header">
         <div className="block-header-top">
           <span className={`block-label`}>TRANSACTION</span>
-          <span className={`type-badge type-${tx.type.toLowerCase()}`}>{tx.type}</span>
+          <span className={`type-badge ${typeBadgeClass(tx.type)}`}>{tx.type}</span>
         </div>
         <div className="block-hash-display">
           <h1>{hash}</h1>
@@ -231,20 +348,28 @@ export default function TransactionPage() {
         </div>
       </div>
 
-      {/* Type-specific public data (bitmap epoch/eligible_count, reward pool, etc.) */}
-      {tx.tx_type_data && Object.keys(tx.tx_type_data).length > 0 && (
-        <div className="block-card">
-          <h2 className="card-title">Transaction Data</h2>
-          <div className="details-grid">
-            {Object.entries(tx.tx_type_data).map(([key, value]) => (
-              <div className="detail-row" key={key}>
-                <span className="detail-label">{humanizeKey(key)}</span>
-                <span className="detail-value">{formatDataValue(value)}</span>
-              </div>
-            ))}
+      {/* QRC-20 transfer: render a human "Transferred X SYMBOL to <addr>" row
+          (decimals resolved from the token) instead of dumping raw JSON. */}
+      {(() => {
+        const call = decodeTokenCall(tx.data, tx.to);
+        if (call) return <TokenTransferCard call={call} />;
+
+        // Fallback: type-specific public data (bitmap epoch/eligible_count,
+        // reward pool, etc.) for non-token transactions.
+        return tx.tx_type_data && Object.keys(tx.tx_type_data).length > 0 ? (
+          <div className="block-card">
+            <h2 className="card-title">Transaction Data</h2>
+            <div className="details-grid">
+              {Object.entries(tx.tx_type_data).map(([key, value]) => (
+                <div className="detail-row" key={key}>
+                  <span className="detail-label">{humanizeKey(key)}</span>
+                  <span className="detail-value">{formatDataValue(value)}</span>
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
-      )}
+        ) : null;
+      })()}
     </div>
   );
 }

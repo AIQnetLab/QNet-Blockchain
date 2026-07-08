@@ -20,6 +20,9 @@ interface AddressData {
   };
   tokens: Array<{
     symbol: string;
+    name: string;
+    contract_address: string;
+    decimals: number;
     balance: string;
   }>;
   transactions: Array<{
@@ -175,12 +178,17 @@ const BalanceVerification = ({ address }: { address: string }) => {
   );
 };
 
-// Other Tokens collapsible component
-const OtherTokens = ({ tokens }: { tokens: Array<{ symbol: string; balance: string }> }) => {
+// Other Tokens collapsible component — lists this address's QRC-20 holdings.
+// Each symbol links to the token detail page (/explorer/token/{contract}).
+const OtherTokens = ({
+  tokens,
+}: {
+  tokens: Array<{ symbol: string; name: string; contract_address: string; decimals: number; balance: string }>;
+}) => {
   const [expanded, setExpanded] = useState(false);
-  
+
   if (tokens.length === 0) return null;
-  
+
   return (
     <div className="block-card collapsible">
       <div className="card-header-collapsible" onClick={() => setExpanded(!expanded)}>
@@ -190,9 +198,20 @@ const OtherTokens = ({ tokens }: { tokens: Array<{ symbol: string; balance: stri
       {expanded && (
         <div className="tokens-list-expanded">
           {tokens.map((token, idx) => (
-            <div key={idx} className="token-row-expanded">
-              <span className="token-symbol">{token.symbol}</span>
-              <span className="token-balance">{token.balance}</span>
+            <div key={token.contract_address || idx} className="token-row-expanded">
+              <span className="token-symbol">
+                {token.contract_address ? (
+                  <Link href={`/explorer/token/${token.contract_address}`} className="address-link">
+                    {token.symbol || truncate(token.contract_address, 6, 4)}
+                  </Link>
+                ) : (
+                  token.symbol
+                )}
+                {token.name ? <span className="token-name">{token.name}</span> : null}
+              </span>
+              <span className="token-balance">
+                {token.balance}{token.symbol ? ` ${token.symbol}` : ''}
+              </span>
             </div>
           ))}
         </div>
@@ -365,10 +384,13 @@ export default function AddressPage() {
         */}
       </div>
 
-      {/* Other Tokens (collapsible) */}
-      {data.tokens.length > 1 && (
-        <OtherTokens tokens={data.tokens.filter(t => t.symbol !== 'QNC')} />
-      )}
+      {/* Other Tokens (collapsible) — render only when there is at least one
+          non-QNC token after filtering (fixes the old tokens.length>1 off-by-one,
+          which hid a single token and could show an empty card). */}
+      {(() => {
+        const otherTokens = data.tokens.filter(t => t.symbol !== 'QNC');
+        return otherTokens.length > 0 ? <OtherTokens tokens={otherTokens} /> : null;
+      })()}
 
       {/* Details */}
       <div className="block-card">
