@@ -11925,68 +11925,9 @@ async fn handle_p2p_message(
                     #[allow(deprecated)]
                     NetworkMessage::EmergencyProducerChange { block_height, .. } =>
                         format!("EmergencyProducerChange at block #{} (deprecated)", block_height),
-                    NetworkMessage::EntropyRequest { block_height, .. } => 
-                        format!("EntropyRequest for block #{}", block_height),
-                    NetworkMessage::EntropyResponse { block_height, .. } => 
-                        format!("EntropyResponse for block #{}", block_height),
                     _ => "Other".to_string(),
                 };
                 println!("[P2P-RPC] 📨 Received {} from {}", msg_type, peer_addr);
-                
-                // Handle entropy messages specially
-                match &message {
-                    NetworkMessage::EntropyRequest { block_height, requester_id } => {
-                    // Only respond when we actually have the block — zero-hash poisons requester cache
-                    let maybe_hash: Option<[u8; 32]> = if *block_height == 0 {
-                        Some([0u8; 32])
-                    } else {
-                        match blockchain.get_storage().load_microblock(*block_height) {
-                            Ok(Some(block_data)) => {
-                                use sha3::{Sha3_256, Digest};
-                                let mut hasher = Sha3_256::new();
-                                hasher.update(&block_data);
-                                let result = hasher.finalize();
-                                let mut hash = [0u8; 32];
-                                hash.copy_from_slice(&result);
-                                Some(hash)
-                            },
-                            _ => {
-                                if *block_height <= 10 {
-                                    let seed = format!("qnet_microblock_{}", block_height);
-                                    let seed_hash = {
-                                        use sha3::{Sha3_256, Digest};
-                                        let mut hasher = Sha3_256::new();
-                                        hasher.update(seed.as_bytes());
-                                        hasher.finalize()
-                                    };
-                                    let mut hash = [0u8; 32];
-                                    hash.copy_from_slice(&seed_hash);
-                                    Some(hash)
-                                } else {
-                                    None
-                                }
-                            }
-                        }
-                    };
-                    
-                    if let Some(entropy_hash) = maybe_hash {
-                        let response = NetworkMessage::EntropyResponse {
-                            block_height: *block_height,
-                            entropy_hash,
-                            responder_id: blockchain.get_node_id().clone(),
-                        };
-                        let peers = p2p.get_validated_active_peers();
-                        if let Some(peer_info) = peers.iter().find(|p| p.id == *requester_id) {
-                            p2p.send_network_message(&peer_info.addr, response);
-                        }
-                    }
-                    },
-                    NetworkMessage::EntropyResponse { block_height, entropy_hash, responder_id } => {
-                        // Store the response for consensus verification
-                        blockchain.handle_entropy_response(*block_height, *entropy_hash, responder_id.clone());
-                    },
-                    _ => {}
-                }
                 
                 p2p.handle_message(&peer_addr, message);
                 

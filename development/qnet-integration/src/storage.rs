@@ -31,6 +31,12 @@ static ROLLBACK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// Target height for rollback - blocks above this will not be saved
 static ROLLBACK_TARGET_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
+/// Set for the duration of rehydrate_inmem_state_from_promoted_cf: the in-mem StateManager is being
+/// repopulated from the promoted snapshot CF and is NOT yet the bound state. The apply pipeline must
+/// not write a tail block over this un-rehydrated state (wrong state_root → rollback → apply-breaker
+/// churn). Mirrors ROLLBACK_IN_PROGRESS; cleared via RAII on every rehydrate exit.
+pub static SNAPSHOT_REHYDRATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
 /// Timestamp when rollback started (for timeout protection)
 static ROLLBACK_START_TIME: AtomicU64 = AtomicU64::new(0);
 
@@ -11036,6 +11042,15 @@ impl Storage {
         state: &std::sync::Arc<tokio::sync::RwLock<crate::StateManager>>,
         anchor_height: u64,
     ) -> IntegrationResult<()> {
+        // OB1: block the apply pipeline from writing a tail block over the un-rehydrated (empty) in-mem
+        // state for the whole rehydrate — including the synchronous macroblock read below, which can
+        // stall under a compaction/flush storm and widen the adopt→rehydrate race. RAII clears on exit.
+        struct RehydrateGuard;
+        impl Drop for RehydrateGuard {
+            fn drop(&mut self) { SNAPSHOT_REHYDRATE_IN_PROGRESS.store(false, Ordering::SeqCst); }
+        }
+        SNAPSHOT_REHYDRATE_IN_PROGRESS.store(true, Ordering::SeqCst);
+        let _rehydrate_guard = RehydrateGuard;
         // Accounts are streamed row-by-row from the promoted CF into the merkle+DashMap below (no full
         // Vec materialization) — see the streaming restore after the anchor root/total_supply are read.
         // Emission watermark: highest emission macroblock already minted at/below the anchor. Derived

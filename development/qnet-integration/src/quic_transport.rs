@@ -138,7 +138,7 @@ fn max_size_for_message_type(msg_type: u8) -> usize {
         7 => 0,                        // EmergencyProducerChange (deprecated)
         9 => 0,                        // ReputationSyncDeprecated
         // Type 0 = catch-all (Transaction, VrfLeaderClaim, TimeoutVote, SyncStatus,
-        //   BlocksBatch, MacroblocksBatch, EntropyRequest/Response, heartbeats, etc.)
+        //   BlocksBatch, MacroblocksBatch, ProducerHeartbeat, etc.)
         // Use 2 MB — large enough for tx batches but not full 10 MB abuse
         2 => 1024 * 1024,             // Transaction: 1 MB
         0 => 2 * 1024 * 1024,         // Catch-all: 2 MB

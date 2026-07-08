@@ -1117,7 +1117,6 @@ pub fn complete_rollback_cleanup(target_height: u64) {
     crate::unified_p2p::clear_all_pending_sync();
     crate::unified_p2p::clear_all_pending_sync_macroblocks();
     clear_expected_producer_cache_above(target_height);
-    ENTROPY_RESPONSES.retain(|k, _| k.0 < target_height);
     PRODUCER_VOTES.retain(|k, _| k.0 < target_height);
 }
 
@@ -1550,12 +1549,6 @@ pub fn init_logging() {
 use dashmap::DashMap;
 
 lazy_static::lazy_static! {
-    /// Lock-free concurrent HashMap for entropy responses
-    /// - insert/get/contains_key are all lock-free
-    /// - No tokio runtime blocking
-    /// - Safe for high-frequency access from multiple async tasks
-    pub static ref ENTROPY_RESPONSES: DashMap<(u64, String), [u8; 32]> = DashMap::new();
-    
     /// v3.16: Lock-free concurrent HashMap for producer votes
     /// Key: (block_height, voter_node_id)
     /// Value: voted_producer_id
@@ -1902,7 +1895,7 @@ static OOT_PRODUCER_COUNT: once_cell::sync::Lazy<DashMap<String, (u64, u32)>> =
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MEMORY LEAK FIX v3.20: Periodic cleanup for global DashMaps
-// PROBLEM: ENTROPY_RESPONSES, PRODUCER_VOTES, REQUESTED_CERTIFICATES grow unbounded
+// PROBLEM: PRODUCER_VOTES, REQUESTED_CERTIFICATES grow unbounded
 // SOLUTION: Remove entries older than current_height - CLEANUP_HEIGHT_WINDOW
 // ═══════════════════════════════════════════════════════════════════════════════
 const CLEANUP_HEIGHT_WINDOW: u64 = 500; // Keep last 500 microblocks (~8 min at 1 block/sec)
@@ -1919,11 +1912,6 @@ pub fn cleanup_global_hashmaps(current_height: u64) {
     LAST_DASHMAP_CLEANUP_HEIGHT.store(current_height, StdOrdering::Relaxed);
     
     let min_valid_height = current_height.saturating_sub(CLEANUP_HEIGHT_WINDOW);
-    
-    // Cleanup ENTROPY_RESPONSES - remove entries for old heights
-    let entropy_before = ENTROPY_RESPONSES.len();
-    ENTROPY_RESPONSES.retain(|k, _| k.0 >= min_valid_height);
-    let entropy_removed = entropy_before.saturating_sub(ENTROPY_RESPONSES.len());
     
     // Cleanup PRODUCER_VOTES - remove entries for old heights
     let votes_before = PRODUCER_VOTES.len();
@@ -1956,9 +1944,14 @@ pub fn cleanup_global_hashmaps(current_height: u64) {
     // Cleanup OOT producer tracking — remove entries with stale windows
     OOT_PRODUCER_COUNT.retain(|_, (window_start, _)| *window_start >= min_valid_height);
 
-    if (entropy_removed > 0 || votes_removed > 0 || cert_removed > 0 || equivoc_removed > 0 || block_equivoc_removed > 0) && is_info() {
-        println!("[INFO][MEM] cleanup h={} entropy={} votes={} certs={} equivoc={} block_equivoc={}",
-                 current_height, entropy_removed, votes_removed, cert_removed, equivoc_removed, block_equivoc_removed);
+    // Prune the remote-producer heartbeat maps (the sole pruner was previously uncalled → the three
+    // REMOTE_PRODUCER_HEARTBEAT_* maps grew unbounded toward 100k supers). Only acts above half-cap and
+    // evicts entries not refreshed in the window, so active producers are never dropped.
+    crate::unified_p2p::evict_stale_producer_heartbeats(600_000);
+
+    if (votes_removed > 0 || cert_removed > 0 || equivoc_removed > 0 || block_equivoc_removed > 0) && is_info() {
+        println!("[INFO][MEM] cleanup h={} votes={} certs={} equivoc={} block_equivoc={}",
+                 current_height, votes_removed, cert_removed, equivoc_removed, block_equivoc_removed);
     }
 }
 
@@ -2042,13 +2035,6 @@ pub enum NodeState {
         our_hash: String,
     },
     
-    /// Waiting for entropy consensus before producing
-    WaitingForConsensus {
-        block_height: u64,
-        responses: usize,
-        threshold: usize,
-    },
-    
     /// Actively producing blocks (our turn)
     Producing { 
         round: u64, 
@@ -2083,9 +2069,7 @@ impl std::fmt::Display for NodeState {
                 write!(f, "⏳ WAITING_MACROBLOCK epoch={} mb={}", epoch, macroblock_index),
             NodeState::ResolvingFork { fork_height, our_hash } => 
                 write!(f, "🔀 RESOLVING_FORK height={} hash={}", fork_height, our_hash),
-            NodeState::WaitingForConsensus { block_height, responses, threshold } => 
-                write!(f, "🎯 WAITING_CONSENSUS block={} {}/{}", block_height, responses, threshold),
-            NodeState::Producing { round, current_height } => 
+            NodeState::Producing { round, current_height } =>
                 write!(f, "⛏️ PRODUCING round={} height={}", round, current_height),
             NodeState::Validating { current_producer, current_height } => 
                 write!(f, "✅ VALIDATING producer={} height={}", current_producer, current_height),
@@ -9977,7 +9961,6 @@ impl BlockchainNode {
                             println!("[INFO][SEC] fork_choice h={} winner=new — replacing existing block (lower sig_hash)",
                                      microblock.height);
                             // Invalidate caches for this height since block changes
-                            ENTROPY_RESPONSES.retain(|k, _| k.0 < microblock.height);
                             PRODUCER_VOTES.retain(|k, _| k.0 < microblock.height);
                             // Fall through to save the new block
                         } else {
@@ -13563,7 +13546,21 @@ impl BlockchainNode {
                         let peers_esc = unified_p2p.as_ref().map(|p| p.get_validated_active_peers().len()).unwrap_or(0);
                         let escalate_ok = timeout_escalation_allowed(our_h_esc, corroborated_h_esc, best_raw_esc, peers_esc, wall_now, boot_wall);
 
-                        if local_delay > STALL_GRACE_SECS && production_unlocked && !failover_capped && escalate_ok {
+                        // v26 D2: 180s no-progress hard ceiling = the ultimate liveness escape hatch.
+                        // Past it a meshed + past-boot node escalates even WITHOUT (f+1)-corroboration —
+                        // corroborated_h==0 (a storm aged out fresh in-set attestations) can transiently
+                        // block escalate_ok and wedge the round at f=1 (one stale window drops corroboration
+                        // below f+1). A genuinely behind node would have synced within 180s; 180s of ZERO
+                        // progress means the net is stuck for us, so escalation is correct. Rotation still
+                        // needs a 2f+1 TimeoutCertificate — a lone vote cannot rotate the producer, so a
+                        // spurious escape-hatch vote is harmless. Converts a PERMANENT wedge into bounded
+                        // 180s recovery. Node-count-agnostic (5 → 100k).
+                        const D2_PROGRESS_HARD_CEILING_SECS: u64 = 180;
+                        let meshed_esc = peers_esc >= TIMEOUT_ESCALATION_MIN_PEERS;
+                        let boot_ok_esc = wall_now.saturating_sub(boot_wall) >= TIMEOUT_ESCALATION_BOOT_FLOOR_SECS;
+                        let ceiling_escape = local_delay > D2_PROGRESS_HARD_CEILING_SECS && meshed_esc && boot_ok_esc;
+
+                        if local_delay > STALL_GRACE_SECS && production_unlocked && !failover_capped && (escalate_ok || ceiling_escape) {
                             let mb_idx = next_height / 90;
                             let now_u64 = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -13593,7 +13590,6 @@ impl BlockchainNode {
                             // fires unconditionally (pacemaker on lack of PROGRESS,
                             // not liveness). Fixes the alive-but-stuck permanent
                             // lock (h=144001 self_exclude missing_prev).
-                            const D2_PROGRESS_HARD_CEILING_SECS: u64 = 180;
                             let progress_ceiling_exceeded =
                                 local_delay > D2_PROGRESS_HARD_CEILING_SECS;
 
@@ -13606,11 +13602,22 @@ impl BlockchainNode {
                                             Some("self_expected")
                                         }
                                         Some(p) => {
-                                            match crate::unified_p2p::last_remote_producer_heartbeat_age_ms(p) {
-                                                Some(age_ms) if age_ms <= HEARTBEAT_SILENT_MS => {
-                                                    Some("heartbeat_fresh")
-                                                }
-                                                _ => None,
+                                            // Suppress only if the producer's heartbeat is FRESH and it is
+                                            // targeting our stalled slot (advertised slot_height >= next_height).
+                                            // An alive-but-stuck-below producer (targeting a lower slot — the
+                                            // common onboarding/desync case) is NOT suppressed ⇒ fast fail-over.
+                                            // A producer lying about slot_height is still bounded by the 180s
+                                            // progress ceiling above.
+                                            let fresh = crate::unified_p2p::last_remote_producer_heartbeat_age_ms(p)
+                                                .map(|age_ms| age_ms <= HEARTBEAT_SILENT_MS)
+                                                .unwrap_or(false);
+                                            let targeting_our_slot = crate::unified_p2p::last_remote_producer_heartbeat_height(p)
+                                                .map(|h| h >= next_height)
+                                                .unwrap_or(false);
+                                            if fresh && targeting_our_slot {
+                                                Some("heartbeat_fresh")
+                                            } else {
+                                                None
                                             }
                                         }
                                         None => None,
@@ -14977,512 +14984,11 @@ impl BlockchainNode {
                     }
                 }
                 
-                let is_rotation_boundary_check = next_block_height > 1 && (next_block_height - 1) % ROTATION_INTERVAL_BLOCKS == 0;
-
-                // Entropy lookahead. The rotation-boundary block (every 30)
-                // is slow — its producer must finish a synchronous entropy
-                // bft_wait (up to 3 s), blowing the 1 s budget and opening a
-                // fork window. Fix: pre-request entropy for the upcoming
-                // rotation 2 blocks ahead, fire-and-forget (no added latency);
-                // by the boundary ENTROPY_RESPONSES already has ≥60% replies
-                // so bft_wait exits on its first poll (<200 ms). 2-block
-                // lookahead ≈ 2 s WAN headroom without staleness.
-                // O(sample_size), bandwidth-neutral.
-                const ENTROPY_LOOKAHEAD_BLOCKS: u64 = 2;
-                let is_entropy_lookahead = next_block_height > 1
-                    && !is_rotation_boundary_check
-                    && (next_block_height + ENTROPY_LOOKAHEAD_BLOCKS > 1)
-                    && ((next_block_height + ENTROPY_LOOKAHEAD_BLOCKS - 1) % ROTATION_INTERVAL_BLOCKS == 0);
-                if is_entropy_lookahead {
-                    if let Some(p2p) = &unified_p2p {
-                        let future_height = next_block_height + ENTROPY_LOOKAHEAD_BLOCKS;
-                        let entropy_target_height = if future_height > FINALITY_WINDOW {
-                            future_height - FINALITY_WINDOW
-                        } else {
-                            future_height.saturating_sub(1)
-                        };
-                        let peers = p2p.get_validated_active_peers();
-                        // Match sample_size logic from main entropy path — cap by
-                        // producer count tier so 1000+ networks don't broadcast
-                        // storm. Bounds stay equal to the reactive path.
-                        let qualified = p2p.get_qualified_producers_count();
-                        let sample_size = match qualified {
-                            0..=50    => std::cmp::min(peers.len(), 50),
-                            51..=200  => std::cmp::min(peers.len(), 20),
-                            201..=1000 => std::cmp::min(peers.len(), 50),
-                            _         => std::cmp::min(peers.len(), 100),
-                        };
-                        let request = crate::unified_p2p::NetworkMessage::EntropyRequest {
-                            block_height: entropy_target_height,
-                            requester_id: node_id.clone(),
-                        };
-                        let mut sent = 0usize;
-                        for peer in peers.iter().take(sample_size) {
-                            if peer.id == node_id {
-                                continue;
-                            }
-                            if ENTROPY_RESPONSES.contains_key(&(entropy_target_height, peer.id.clone())) {
-                                continue;
-                            }
-                            p2p.send_network_message(&peer.addr, request.clone());
-                            sent += 1;
-                        }
-                        if sent > 0 && is_info() {
-                            println!("[INFO][CONS] entropy_lookahead future_rot_h={} entropy_h={} peers_queried={}",
-                                     future_height, entropy_target_height, sent);
-                        }
-                    }
-                }
-
-
-                // CRITICAL: Verify entropy consensus at rotation boundaries
-                // This prevents different nodes selecting different producers
-                // Rotation happens when creating blocks 31, 61, 91... (first block of new round)
-                //
-                // v3.33: ALL nodes (including producer) verify entropy consensus at rotation boundary.
-                // v3.3 skipped this for producers — root cause of VRF split-brain forks.
-                // Without this check, a producer elected by a minority (due to missing VRF claims)
-                // starts producing immediately while the majority elected someone else → fork.
-                // Cost: ~2-3s added to first block of each rotation (every 30 blocks).
-                if is_rotation_boundary_check {
-                    let entropy_role = if is_my_turn_to_produce { "producer" } else { "validator" };
-                    if is_info() {
-                        println!("[INFO][CONS] rotation_boundary h={} role={} entropy_check", next_block_height, entropy_role);
-                    }
-
-                    // QC-before-produce guard removed: it compared a rotation
-                    // index against a timeout-round (distinct scales) and so
-                    // always tripped after the first timeout escalation,
-                    // livelocking every rotation boundary. The real property
-                    // ("don't extend a chain whose predecessor round was
-                    // certified past us") is enforced by the pre-save stale-
-                    // round self-check + retroactive 2f+1 macroblock commit.
-
-                    if let Some(p2p) = &unified_p2p {
-                        // CRITICAL FIX: Use FINALITY_WINDOW for entropy consensus (Byzantine-safe)
-                        // This ensures ALL synchronized nodes have the same entropy block
-                        // Prevents false positives when nodes are at different heights
-                        let entropy_height = if next_block_height > FINALITY_WINDOW {
-                            next_block_height - FINALITY_WINDOW
-                        } else {
-                            // Genesis phase: use Genesis block for entropy
-                            0
-                        };
-                        
-                        // Get our entropy hash (using finalized block that all nodes should have)
-                        let our_entropy = if entropy_height == 0 {
-                            // Use Genesis block hash
-                            Self::get_previous_microblock_hash(&storage, 1).await
-                        } else {
-                            Self::get_previous_microblock_hash(&storage, entropy_height + 1).await
-                        };
-                        
-                        // v9.0 BUG-22: Sort peers deterministically before sampling.
-                        // Different nodes may have peers in different order in DashMap.
-                        // Sort by peer ID ensures ALL nodes sample the SAME peers.
-                        let mut peers = p2p.get_validated_active_peers();
-                        peers.sort_by(|a, b| a.id.cmp(&b.id));
-                        
-                        // ARCHITECTURE: Adaptive sample size for Byzantine consensus
-                        // CRITICAL: Sample from QUALIFIED PRODUCERS (reputation ≥70%, Super/Full only)
-                        // This ensures Byzantine-safe consensus (Light nodes excluded, malicious nodes excluded)
-                        // 
-                        // SCALABILITY: Network may have millions of nodes, but only ~1000 active producers per round
-                        // Sample size scales with QUALIFIED PRODUCERS, not total network size
-                        // 
-                        // Byzantine safety: Need 60%+ of sampled peers to agree
-                        // Genesis (5-50 qualified): sample all (100% coverage)
-                        // Small (51-200 qualified): sample 20 (10% minimum, Byzantine-safe)
-                        // Medium (201-1000 qualified): sample 50 (5% minimum, Byzantine-safe)
-                        // Large (1000+ qualified): sample 100 (10% of active producers, Byzantine-safe)
-                        let qualified_producers = p2p.get_qualified_producers_count();
-                        let sample_size = match qualified_producers {
-                            0..=50 => std::cmp::min(peers.len(), 50),        // Genesis: sample all
-                            51..=200 => std::cmp::min(peers.len(), 20),      // Small: 10%
-                            201..=1000 => std::cmp::min(peers.len(), 50),    // Medium: 5%
-                            _ => std::cmp::min(peers.len(), 100),            // Large: 10% of 1000 producers
-                        };
-                        
-                        let _entropy_matches = 0;
-                        let _entropy_mismatches = 0;
-                        
-                        // Log our entropy once
-                        println!("[DBG][CONS] entropy_block={} hash={:x}", 
-                                entropy_height,
-                                u64::from_le_bytes([our_entropy[0], our_entropy[1], our_entropy[2], our_entropy[3],
-                                                   our_entropy[4], our_entropy[5], our_entropy[6], our_entropy[7]]));
-                        
-                        // Count only NON-ZERO responses (zero = peer didn't have block yet)
-                        let already_have_responses = ENTROPY_RESPONSES.iter()
-                            .filter(|entry| entry.key().0 == entropy_height && *entry.value() != [0u8; 32])
-                            .count();
-                        
-                        if already_have_responses < sample_size {
-                            // Evict stale zero-responses so peers that synced up get re-queried
-                            ENTROPY_RESPONSES.retain(|k, v| !(k.0 == entropy_height && *v == [0u8; 32]));
-                            
-                            // PRODUCTION: Query peers for their entropy via P2P messages (ASYNC, non-blocking)
-                            for peer in peers.iter().take(sample_size - already_have_responses) {
-                                // v2.96: Lock-free contains_key check
-                                let peer_already_responded = ENTROPY_RESPONSES
-                                    .contains_key(&(entropy_height, peer.id.clone()));
-                                
-                                if !peer_already_responded {
-                                    // Send entropy request to peer
-                                    let entropy_request = crate::unified_p2p::NetworkMessage::EntropyRequest {
-                                        block_height: entropy_height,
-                                        requester_id: node_id.clone(),
-                                    };
-                            
-                                    // Get peer address from peer info
-                                    if let Some(peer_addr) = peers.iter()
-                                        .find(|p| p.id == peer.id)
-                                        .map(|p| p.addr.clone()) {
-                                        
-                                        // Send request (async, response will come later)
-                                        p2p.send_network_message(&peer_addr, entropy_request);
-                                    }
-                                }
-                            }
-                            
-                            // ═══════════════════════════════════════════════════════════════
-                            // SCALABILITY FIX: Always query the SELECTED PRODUCER for entropy
-                            // ═══════════════════════════════════════════════════════════════
-                            // Problem: peers.iter().take(sample_size) is a RANDOM sample.
-                            // In large networks (1000 producers, sample=100), the VRF-elected
-                            // producer may NOT be in the sample. Then:
-                            //   Node A (sampled producer): entropy=0 → fallback triggered
-                            //   Node B (didn't sample):   None     → assumes synced → NO fallback
-                            //   → Nodes disagree on producer → consensus break!
-                            //
-                            // Fix: After random sampling, explicitly query the selected producer.
-                            // ALL nodes selected the SAME producer (deterministic VRF election), so ALL
-                            // nodes query the SAME node → get SAME response → deterministic check.
-                            // ═══════════════════════════════════════════════════════════════
-                            if !ENTROPY_RESPONSES.contains_key(&(entropy_height, current_producer.clone())) {
-                                // Try to reach producer: first via peer_id_to_addr index (O(1)),
-                                // then fallback to peers list. Works even if producer is not in
-                                // the random sample — all that matters is we're connected to them.
-                                let producer_addr = p2p.get_peer_addr_by_id(&current_producer)
-                                    .or_else(|| peers.iter()
-                                        .find(|p| p.id == current_producer)
-                                        .map(|p| p.addr.clone()));
-                                
-                                if let Some(addr) = producer_addr {
-                                    let entropy_request = crate::unified_p2p::NetworkMessage::EntropyRequest {
-                                        block_height: entropy_height,
-                                        requester_id: node_id.clone(),
-                                    };
-                                    p2p.send_network_message(&addr, entropy_request);
-                                    if is_info() {
-                                        println!("[INFO][CONS] explicit_producer_query producer={} entropy_h={}", 
-                                                 current_producer, entropy_height);
-                                    }
-                                } else {
-                                    // Can't reach producer directly — will rely on BFT timeout
-                                    if is_info() { println!("[INFO][CONS] producer_not_in_peers={} — bft_timeout will handle", current_producer); }
-                                }
-                            }
-                            
-                            // CRITICAL FIX: WAIT for entropy consensus at rotation boundaries
-                            // This prevents forks by ensuring all nodes agree on entropy before proceeding
-                            println!("[INFO][CONS] entropy_requests peers={}", 
-                                    sample_size - already_have_responses);
-                            
-                            // ARCHITECTURE: Block production MUST wait for entropy consensus at rotation boundaries
-                            // This is critical for preventing forks when deterministic selection picks new producer
-                            // OPTIMIZATION: Dynamic wait instead of fixed timeout
-                            // Wait until Byzantine threshold (60%) OR max timeout (2 seconds)
-                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await; // Initial wait for network propagation
-                        } else {
-                            if is_info() { println!("[INFO][CONS] entropy_resp={} h={}", already_have_responses, entropy_height); }
-                        }
-                        
-                        // CRITICAL FIX: Dynamic wait for entropy consensus with Byzantine threshold
-                        // This blocks production until consensus is reached OR timeout
-                        {
-                            // OPTIMIZATION: Dynamic wait with adaptive timeout
-                            // Timeout scales with network size and latency for optimal performance
-                            // Byzantine threshold: 60% of sampled peers (Byzantine-safe majority)
-                            let consensus_start = std::time::Instant::now();
-                            
-                            // ARCHITECTURE: Adaptive timeout based on network conditions
-                            // Uses same logic as ShredProtocol fanout (unified_p2p.rs:5215-5243)
-                            let avg_latency = p2p.get_average_peer_latency();
-                            // ═══════════════════════════════════════════════════════════════════
-                            // v3.10: ENTROPY VOTING TIMEOUTS
-                            // ═══════════════════════════════════════════════════════════════════
-                            // CONSTRAINT: Total time < Grace Period (5 sec)
-                            //   Voting + Block creation (0.1s) + Broadcast (0.5s) < 5s
-                            //   Max safe voting timeout = 4 seconds
-                            //
-                            // LARGER VALUES = More reliable consensus but slower failover
-                            // SMALLER VALUES = Faster failover but may miss valid responses
-                            // ═══════════════════════════════════════════════════════════════════
-                            let max_consensus_wait = match (qualified_producers, avg_latency) {
-                                // GENESIS PHASE (5-50 producers):
-                                // WAN latency expected, 3 seconds for certificate + propagation
-                                (0..=50, _) => tokio::time::Duration::from_millis(3000),
-                                
-                                // SMALL NETWORK (51-200 producers):
-                                // LAN: 1.5 sec, WAN: 3 sec for reliability
-                                (51..=200, 0..=50) => tokio::time::Duration::from_millis(1500),
-                                (51..=200, _) => tokio::time::Duration::from_millis(3000),
-                                
-                                // MEDIUM NETWORK (201-1000 producers):
-                                // LAN: 1.5 sec, WAN: 2.5 sec (regional clustering assumed)
-                                (201..=1000, 0..=50) => tokio::time::Duration::from_millis(1500),
-                                (201..=1000, 51..=100) => tokio::time::Duration::from_millis(2500),
-                                (201..=1000, _) => tokio::time::Duration::from_millis(3000),
-                                
-                                // VERY LARGE (1000+ producers):
-                                // Sample = 100 nodes, need 60 responses (60%)
-                                // LAN: 2 sec, Regional: 3 sec, Global: 4 sec (max safe)
-                                (1001.., 0..=50) => tokio::time::Duration::from_millis(2000),   // LAN/Datacenter
-                                (1001.., 51..=100) => tokio::time::Duration::from_millis(3000), // Regional WAN
-                                (1001.., 101..=200) => tokio::time::Duration::from_millis(3500), // Continental WAN
-                                (1001.., _) => tokio::time::Duration::from_millis(4000),        // Global WAN (MAX SAFE)
-                            };
-                            
-                            // v14.7.2: canonical BFT safety threshold — 2f+1 for any n.
-                            // Formula `(n*2+2)/3` is the canonical ceiling form of
-                            // the 2f+1 safety bound (the minimum supermajority that
-                            // rules out two conflicting values being accepted).
-                            // Works uniformly for n=5, n=1000, n=millions.
-                            // Replaces the previous fixed 60% which was Byzantine-
-                            // safe only for n≤5 and became exploitable above that.
-                            let byzantine_threshold = ((sample_size * 2 + 2) / 3).max(1);
-
-                            // v16.1: log label fix — previously `responses=N/M` was
-                            // printed where the values were actually `threshold/sample`,
-                            // which made the 11-hour h=781 deadlock look like a healthy
-                            // "3/4 received" state in postmortem grep. The corrected
-                            // label below makes the entry intent unambiguous and emits
-                            // the actual received count below in `bft_progress` lines
-                            // so operators can distinguish entry / progress / completion.
-                            println!("[INFO][CONS] bft_wait_start sample={} threshold_2f_plus_1={}",
-                                     sample_size, byzantine_threshold);
-
-                            // STATE MACHINE: Waiting for consensus.
-                            // v16.1: `responses` field below is updated LIVE inside the
-                            // poll loop (lines below at every iteration) so the
-                            // [INFO][STATE] WAITING_CONSENSUS X/Y log reflects real
-                            // progress, not the static `0/threshold` placeholder that
-                            // confused postmortems on the v15.x deadlock.
-                            set_node_state(NodeState::WaitingForConsensus {
-                                block_height: next_block_height,
-                                responses: 0,
-                                threshold: byzantine_threshold,
-                            });
-                            
-                            // OPTIMIZATION: Dynamic wait loop - check responses every 100ms
-                            // Exit early if Byzantine threshold reached OR timeout
-                            let mut consensus_reached = false;
-                            let mut matches;
-                            let mut mismatches;
-                            
-                            loop {
-                                // Check received responses
-                                matches = 0;
-                                mismatches = 0;
-                                
-                                // v2.96: Lock-free iteration with DashMap
-                                for entry in ENTROPY_RESPONSES.iter() {
-                                    let (height, _responder) = entry.key();
-                                    let peer_entropy = entry.value();
-                                    if *height == entropy_height {
-                                        // CRITICAL FIX: Ignore peer_entropy == 0 (peer doesn't have block yet)
-                                        // This prevents false positives when nodes are at different heights
-                                        // FINALITY_WINDOW ensures synchronized nodes have this block
-                                        if *peer_entropy == [0u8; 32] {
-                                            // Don't count as mismatch - peer is just lagging
-                                            continue;
-                                        }
-                                        
-                                        if *peer_entropy == our_entropy {
-                                            matches += 1;
-                                        } else {
-                                            // REAL mismatch: peer has different entropy (potential fork!)
-                                            mismatches += 1;
-                                        }
-                                    }
-                                }
-                                
-                                // v16.1: live state-machine refresh so external watchers
-                                // (RPC, dashboards, watchdog) see the actual response
-                                // count instead of the static `0` that masked the v15.x
-                                // h=781 deadlock for ~11 hours.
-                                {
-                                    let mut state_guard = GLOBAL_NODE_STATE.write();
-                                    if let NodeState::WaitingForConsensus { responses: r, .. } = &mut *state_guard {
-                                        *r = (matches + mismatches).max(*r);
-                                    }
-                                }
-
-                                // OPTIMIZATION: Check if Byzantine threshold reached
-                                // 60% of peers must agree (3 out of 5 for Genesis)
-                                if matches >= byzantine_threshold {
-                                    let elapsed_ms = consensus_start.elapsed().as_millis();
-                                    if is_info() { println!("[INFO][CONS] bft_ok match={} ms={}", matches, elapsed_ms); }
-                                    consensus_reached = true;
-                                    break;
-                                }
-
-                                // Check timeout
-                                if consensus_start.elapsed() >= max_consensus_wait {
-                                    let elapsed_ms = consensus_start.elapsed().as_millis();
-                                    // v16.1: corrected the misleading `bft_wait responses=` log
-                                    // by emitting actual received vs threshold here; this is
-                                    // the only path that reports timeouts so operators see
-                                    // the real partition vs slow-network vs fork pattern.
-                                    println!("[WARN][CONS] bft_wait_timeout elapsed_ms={} matches={} mismatches={} threshold={} sample={}",
-                                             elapsed_ms, matches, mismatches, byzantine_threshold, sample_size);
-                                    break;
-                                }
-
-                                // Wait 100ms before checking again
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            }
-                            
-                            // Log final results with responder details
-                            // v2.96: Lock-free iteration with DashMap
-                            if consensus_reached || matches > 0 {
-                                for entry in ENTROPY_RESPONSES.iter() {
-                                    let (height, responder) = entry.key();
-                                    let peer_entropy = entry.value();
-                                    if *height == entropy_height && *peer_entropy != [0u8; 32] {
-                                        if *peer_entropy == our_entropy {
-                                            if is_debug() { println!("[DBG][CONS] entropy_match peer={}", responder); }
-                                        } else {
-                                            println!("[ERR][CONS] Entropy mismatch with {}: expected {:x}, got {:x}",
-                                                    responder,
-                                                    u64::from_le_bytes([our_entropy[0], our_entropy[1], our_entropy[2], our_entropy[3],
-                                                                       our_entropy[4], our_entropy[5], our_entropy[6], our_entropy[7]]),
-                                                    u64::from_le_bytes([peer_entropy[0], peer_entropy[1], peer_entropy[2], peer_entropy[3],
-                                                                       peer_entropy[4], peer_entropy[5], peer_entropy[6], peer_entropy[7]]));
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // v14.7.2: canonical f+1 liveness/partition gate before producing —
-                            // threshold = (n+2)/3 = ceil(n/3) = f+1 (n=sample_size). With <=f
-                            // byzantine, any f+1 distinct responders contain >=1 honest → proof this
-                            // node is NOT partitioned from the honest supermajority. LIVENESS/
-                            // partition detector, NOT a safety threshold; fork-confirmation uses the
-                            // same f+1. Genesis (h<=10) bootstrap exception. (Supersedes v3.10/v3.11
-                            // fork-detect + v3.24 min-response heuristics.)
-                            let min_production_responses = ((sample_size + 2) / 3).max(1); // f+1 canonical
-                            let min_fork_detection_responses: usize = min_production_responses;
-                            
-                            let total_responses = matches + mismatches;
-                            
-                            // v3.25: ISOLATION CHECK with dynamic threshold
-                            // Cannot produce without minimum consensus proportional to network size
-                            if total_responses < min_production_responses && next_block_height > 10 {
-                                if is_my_turn_to_produce {
-                                    // v3.33: Producer yields — don't self-exclude, BFT Timeout will select next
-                                    println!("[INFO][CONS] producer_yield_isolated h={} responses={}/{}", 
-                                             next_block_height, total_responses, min_production_responses);
-                                    is_my_turn_to_produce = false;
-                                    *is_leader.write().await = false;
-                                    set_node_state(NodeState::Idle { last_height: microblock_height });
-                                } else {
-                                    println!("[ERR][CONS] isolated_node responses={} min_required={} sample={} h={}", 
-                                             total_responses, min_production_responses, sample_size, next_block_height);
-                                    set_node_state(NodeState::Error {
-                                        reason: format!("Isolated: {} responses, need {} (40% of {})", 
-                                                        total_responses, min_production_responses, sample_size),
-                                        recoverable: true,
-                                    });
-                                }
-                                continue;
-                            }
-                            
-                            if mismatches > 0 {
-                                // v3.11 FIX: Only detect fork if we have enough responses
-                                // At startup, lagging nodes return empty entropy - NOT a real fork!
-                                if matches == 0 && total_responses >= min_fork_detection_responses && next_block_height > 10 {
-                                    // DEFINITE FORK: Multiple peers responded with DIFFERENT entropy
-                                    println!("[ERR][CONS] fork_detected mismatches={} matches=0 total={}",
-                                             mismatches, total_responses);
-
-                                    // Round-based fork-choice + macroblock-anchored recovery resolve the
-                                    // canonical chain; here we only yield production this tick so a minority
-                                    // entropy view never extends a losing fork. BFT timeout drives failover.
-                                    if is_my_turn_to_produce {
-                                        println!("[INFO][CONS] producer_yield_fork h={} mismatches={}",
-                                                 next_block_height, mismatches);
-                                        is_my_turn_to_produce = false;
-                                        *is_leader.write().await = false;
-                                        set_node_state(NodeState::Idle { last_height: microblock_height });
-                                    }
-                                    continue;
-                                } else if matches == 0 && (total_responses < min_fork_detection_responses || next_block_height <= 10) {
-                                    // v3.11: Not enough data to confirm fork - likely startup/sync phase
-                                    println!("[WARN][CONS] potential_fork responses={} need={} h={} phase=startup", 
-                                             total_responses, min_fork_detection_responses, next_block_height);
-                                } else if mismatches > matches {
-                                    // MAJORITY FORK: More peers disagree than agree
-                                    println!("[ERR][CONS] fork_detected mismatches={} matches={} majority=disagree",
-                                             mismatches, matches);
-
-                                    // Majority holds a different entropy view → we are in the minority.
-                                    // Yield production this tick; round-based fork-choice + the macroblock-
-                                    // anchored recovery path converge us back onto the canonical chain.
-                                    if is_my_turn_to_produce {
-                                        println!("[INFO][CONS] producer_yield_majority h={} mismatches={} matches={}",
-                                                 next_block_height, mismatches, matches);
-                                        is_my_turn_to_produce = false;
-                                        *is_leader.write().await = false;
-                                        set_node_state(NodeState::Idle { last_height: microblock_height });
-                                    }
-                                    continue;
-                                } else {
-                                    // Minority disagrees - continue (Byzantine resilience)
-                                    println!("[WARN][CONS] minority_disagree mismatches={} matches={}", mismatches, matches);
-                                    if is_info() { println!("[INFO][CONS] bft_majority_ok"); }
-                                }
-                            } else if matches > 0 {
-                                // All responses match - perfect consensus
-                                if is_debug() { println!("[DBG][CONS] consensus_perfect matches={}", matches); }
-                            } else {
-                                // No responses at all
-                                // v3.24: This case is now handled by isolation check above
-                                // If we reach here with 0 responses, it means h <= 10 (Genesis phase)
-                                println!("[WARN][CONS] no_responses h={} phase=genesis", next_block_height);
-                            }
-                            
-                            // v14.4: NO local producer fallback here — deliberately. The old
-                            // "sync-check → unconditional fallback_select→self" produced blocks
-                            // WITHOUT 2f+1 and caused the h=301/302 split-brain (timing race → two
-                            // producers emit h=N → divergent chains). The ONLY producer-change path
-                            // is BFT timeout: silent leader → signed TimeoutVote → 2f+1
-                            // TimeoutCertificate → HIGHEST_CERTIFIED_ROUND advances → deterministic
-                            // new producer on ALL nodes (equivocation slashed). Safety: only the
-                            // deterministically-selected leader produces; liveness bounded (<= one
-                            // timeout); no divergence. Here = observational only; the timeout-vote
-                            // handler is the single source of truth for producer change.
-                            if current_producer != node_id {
-                                let producer_entropy = ENTROPY_RESPONSES.get(&(entropy_height, current_producer.clone()));
-                                if let Some(ref entry) = producer_entropy {
-                                    if *entry.value() == [0u8; 32] && is_warn() {
-                                        // Zero-entropy is an explicit "I don't have that block" reply.
-                                        // Log only; BFT Timeout Vote path will handle the view change.
-                                        println!("[WARN][PROD] observed_zero_entropy producer={} entropy_h={} action=awaiting_bft_timeout_cert",
-                                                 current_producer, entropy_height);
-                                    }
-                                }
-                                // Silence (None) is NOT treated as not-synced. A busy leader is still
-                                // a valid leader until a signed 2f+1 timeout certificate says otherwise.
-                            }
-                        }
-                    }
-                }
-                // The v3.32 conflict-detection window (800ms sleep) and the attestation-based
-                // competing-producer yield were both removed: entropy consensus (above) handles all
-                // nodes at the rotation boundary, and round-based fork-choice (2f+1 TimeoutCertificate
-                // + certified-round supersede + 2f+1 macroblock Checkpoint) is the sole authority.
+                // Production is deterministic: the elected producer (pure fn of the
+                // buried N-2 schedule + 2f+1-certified timeout_round) produces its slot
+                // with no live entropy poll. A silent/absent leader is handled by BFT
+                // failover (local-clock slot-skip -> next N-2 producer; 2f+1 TimeoutCertificate
+                // + certified-round supersede + 2f+1 macroblock Checkpoint settle the winner).
 
                 if is_my_turn_to_produce {
                     // Fork-choice authority is round-based: a same-round 2f+1 TimeoutCertificate rotates
@@ -18937,60 +18443,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             if is_debug() { println!("[DBG][FINALITY] h={} ep={} mb={}", current_height, current_epoch, required_macroblock); }
                         }
                         
-                        match store.get_macroblock_by_height(required_macroblock) {
-                            Ok(Some(macroblock_data)) => {
-                                // CRITICAL v2.32: Hash ONLY deterministic fields!
-                                // consensus_data.next_leader can differ between nodes = FORK!
-                                let mut hasher = Sha3_256::new();
-                                hasher.update(b"QNet_Deterministic_Entropy_v2.32");
-                                
-                                // Deserialize to get deterministic fields only
-                                match bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_data) {
-                                    Ok(mb) => {
-                                        // Hash ONLY deterministic fields (same on all nodes)
-                                        hasher.update(&mb.height.to_le_bytes());
-                                        hasher.update(&mb.timestamp.to_le_bytes());
-                                        for block_hash in &mb.micro_blocks {
-                                            hasher.update(block_hash);
-                                        }
-                                        hasher.update(&mb.state_root);
-                                        hasher.update(&mb.previous_hash);
-                                        hasher.update(&mb.poh_hash);
-                                        hasher.update(&mb.poh_count.to_le_bytes());
-                                        // NOTE: consensus_data EXCLUDED - contains next_leader!
-                                    }
-                                    Err(e) => {
-                                        // v12.0: Cannot use raw bytes for entropy — format-dependent = FORK.
-                                        // If MacroBlock deserialization fails, entropy is unreliable.
-                                        println!("[ERR][FINALITY] mb_deserialize_failed mb={} err={}", required_macroblock, e);
-                                        hasher.update(&[0u8; 32]); // Zero entropy signals desync
-                                    }
+                        // Single resolver: exact N-2 or bounded walk-back to the SAME
+                        // macroblock the candidate set uses — seed and set never diverge.
+                        match Self::resolve_producer_source_macroblock(store.as_ref(), required_macroblock) {
+                            Some((used_idx, mb)) => {
+                                if used_idx != required_macroblock && is_warn() {
+                                    println!("[WARN][FINALITY] seed_fallback used_mb={} wanted_mb={} h={}",
+                                             used_idx, required_macroblock, current_height);
                                 }
-                                
-                                let result = hasher.finalize();
-                                let mut hash = [0u8; 32];
-                                hash.copy_from_slice(&result);
-                                hash
+                                Self::hash_macroblock_entropy(&mb)
                             },
-                            Ok(None) => {
-                                // MacroBlock not found - node NOT SYNCHRONIZED!
-                                // CRITICAL v2.30: NO FALLBACK TO MICROBLOCK!
-                                // Fallback causes DIFFERENT entropy on different nodes = FORK!
-                                // 
-                                // Node without MacroBlock CANNOT participate in production.
-                                // It must sync first. Return zero entropy to signal this.
-                                println!("[ERR][FINALITY] mb={} NOT_FOUND desync=true", required_macroblock);
-                                
-                                // STATE MACHINE: Node needs macroblock
+                            None => {
+                                // Not resolvable within the walk-back window → truly behind.
+                                println!("[ERR][FINALITY] mb={} unresolved desync=true", required_macroblock);
                                 set_node_state(NodeState::WaitingForMacroblock {
                                     epoch: required_macroblock,
                                     macroblock_index: required_macroblock,
                                 });
-                                
-                                [0u8; 32] // Zero entropy = node excluded from production
-                            },
-                            Err(e) => {
-                                println!("[ERR][FINALITY] mb={} err={}", required_macroblock, e);
                                 [0u8; 32]
                             }
                         }
@@ -19126,6 +18595,67 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
 
+    /// Deterministic per-macroblock VRF entropy: SHA3-256 over the macroblock's consensus-invariant
+    /// fields (domain-separated). Shared by the producer seed AND the attestation-committee seed so the
+    /// hashed-field set can change in exactly ONE place (a divergent copy would fork producer vs committee
+    /// entropy). consensus_data is EXCLUDED (it carries next_leader, which differs mid-consensus).
+    fn hash_macroblock_entropy(mb: &qnet_state::MacroBlock) -> [u8; 32] {
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"QNet_Deterministic_Entropy_v2.32");
+        hasher.update(&mb.height.to_le_bytes());
+        hasher.update(&mb.timestamp.to_le_bytes());
+        for block_hash in &mb.micro_blocks {
+            hasher.update(block_hash);
+        }
+        hasher.update(&mb.state_root);
+        hasher.update(&mb.previous_hash);
+        hasher.update(&mb.poh_hash);
+        hasher.update(&mb.poh_count.to_le_bytes());
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
+
+    /// Resolve the single finalized macroblock that seeds BOTH the producer/committee
+    /// candidate set AND the VRF entropy for epoch N (required_macroblock = N-2). Exact
+    /// N-2 when it carries an eligible-producers snapshot (or commits); else a deterministic
+    /// bounded walk-back (depth 8) to the most recent finalized macroblock with a non-empty
+    /// eligible set AND a beacon — the SAME predicate the candidate-set / beacon readers use,
+    /// so seed and set can never land on different macroblocks (no honest producer fork).
+    /// None => desync past the window (abstain from this election).
+    fn resolve_producer_source_macroblock(
+        storage: &Storage,
+        required_macroblock: u64,
+    ) -> Option<(u64, qnet_state::MacroBlock)> {
+        if required_macroblock == 0 { return None; }
+        const MAX_FALLBACK_DEPTH: u64 = 8;
+        let floor = required_macroblock.saturating_sub(MAX_FALLBACK_DEPTH).max(1);
+        let mut idx = required_macroblock;
+        loop {
+            if let Ok(Some(data)) = storage.get_macroblock_by_height(idx) {
+                if let Ok(mb) = bincode::deserialize::<qnet_state::MacroBlock>(&data) {
+                    let eligible_nonempty = mb.consensus_data.eligible_producers.as_ref()
+                        .and_then(|s| bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(s).ok())
+                        .map(|v| v.iter().any(|p| !p.node_id.is_empty()))
+                        .unwrap_or(false);
+                    // Exact N-2 mirrors the candidate set's PRIMARY(eligible)/SECONDARY(commits)
+                    // acceptance (beacon-agnostic — seed derives from deterministic fields).
+                    // Walk-back requires eligible + beacon (matches beacon/committee readers).
+                    let usable = if idx == required_macroblock {
+                        eligible_nonempty || !mb.consensus_data.commits.is_empty()
+                    } else {
+                        eligible_nonempty && mb.consensus_data.randomness_beacon.is_some()
+                    };
+                    if usable { return Some((idx, mb)); }
+                }
+            }
+            if idx <= floor { break; }
+            idx -= 1;
+        }
+        None
+    }
+
     /// Compute the deterministic per-height entropy used by both producer
     /// selection and attestation committee selection.
     ///
@@ -19177,32 +18707,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     _ => [0u8; 32],
                 }
             } else {
-                match storage.get_macroblock_by_height(required_macroblock) {
-                    Ok(Some(mb_data)) => {
-                        let mut hasher = Sha3_256::new();
-                        hasher.update(b"QNet_Deterministic_Entropy_v2.32");
-                        match bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
-                            Ok(mb) => {
-                                hasher.update(&mb.height.to_le_bytes());
-                                hasher.update(&mb.timestamp.to_le_bytes());
-                                for block_hash in &mb.micro_blocks {
-                                    hasher.update(block_hash);
-                                }
-                                hasher.update(&mb.state_root);
-                                hasher.update(&mb.previous_hash);
-                                hasher.update(&mb.poh_hash);
-                                hasher.update(&mb.poh_count.to_le_bytes());
-                            }
-                            Err(_) => {
-                                hasher.update(&[0u8; 32]);
-                            }
-                        }
-                        let result = hasher.finalize();
-                        let mut hash = [0u8; 32];
-                        hash.copy_from_slice(&result);
-                        hash
+                // Single resolver → same macroblock as the candidate set (no seed/set divergence).
+                match Self::resolve_producer_source_macroblock(storage.as_ref(), required_macroblock) {
+                    Some((_used, mb)) => {
+                        Self::hash_macroblock_entropy(&mb)
                     }
-                    _ => [0u8; 32],
+                    None => [0u8; 32],
                 }
             }
         }
@@ -19834,29 +19344,22 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             let excluded_node_ids: std::collections::HashSet<String> =
                                 std::collections::HashSet::new();
                             
-                            // PRIMARY: Use eligible_producers snapshot from macroblock
+                            // PRIMARY: eligible_producers snapshot. Filter empty node_ids so the SET's
+                            // usability predicate is byte-identical to the seed resolver's
+                            // (resolve_producer_source_macroblock: any !node_id.is_empty()) — makes the
+                            // same-macroblock invariant structural, not luck-of-honest-roster. The
+                            // excluded set stays a no-op (liveness exclusion must be on-chain/QC-bound).
                             if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
                                 if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
-                                    if !producers.is_empty() {
-                                        // v3.10: Filter out excluded producers (DETERMINISTIC!)
-                                        // v25 H9: Also filter out validators that the liveness
-                                        // tracker has marked as ejected. The ejection gate
-                                        // (`is_validator_ejected`) is a no-op unless the operator
-                                        // has explicitly enabled enforcement via
-                                        // `QNET_LIVENESS_EJECTION=1`. When disabled the tracker
-                                        // still observes misses but does not mutate candidate
-                                        // selection — the filter passes everyone through.
-                                        let mut all_qualified: Vec<(String, f64)> = producers.iter()
-                                            .filter(|p| !excluded_node_ids.contains(&p.node_id))
-                                            .map(|p| (p.node_id.clone(), p.reputation as f64 / 100.0))
-                                            .collect();
-
+                                    let mut all_qualified: Vec<(String, f64)> = producers.iter()
+                                        .filter(|p| !p.node_id.is_empty() && !excluded_node_ids.contains(&p.node_id))
+                                        .map(|p| (p.node_id.clone(), p.reputation as f64 / 100.0))
+                                        .collect();
+                                    if !all_qualified.is_empty() {
                                         all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
-
                                         if is_debug() {
-                                            println!("[DBG][CANDIDATES] ep={} prod={} excluded={} mb={}",
-                                                     current_epoch, all_qualified.len(),
-                                                     excluded_node_ids.len(), required_macroblock);
+                                            println!("[DBG][CANDIDATES] ep={} prod={} mb={}",
+                                                     current_epoch, all_qualified.len(), required_macroblock);
                                         }
                                         return all_qualified;
                                     }
@@ -19991,7 +19494,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 }
                                 if let Some(ref snap) = fb_mb.consensus_data.eligible_producers {
                                     if let Ok(prods) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snap) {
+                                        // Same empty-node_id filter as the seed resolver → identical predicate.
                                         let mut fb: Vec<(String, f64)> = prods.iter()
+                                            .filter(|p| !p.node_id.is_empty())
                                             .map(|p| (p.node_id.clone(), p.reputation as f64 / 100.0))
                                             .collect();
                                         if !fb.is_empty() {
@@ -22401,21 +21906,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// Uses coordinator state machine (preferred) with legacy flag fallback.
     pub fn is_syncing(&self) -> bool {
         coordinator_is_syncing() || !coordinator_is_synchronized()
-    }
-    
-    /// Handle incoming EntropyResponse from peer
-    pub fn handle_entropy_response(&self, block_height: u64, entropy_hash: [u8; 32], responder_id: String) {
-        if entropy_hash == [0u8; 32] {
-            return;
-        }
-        ENTROPY_RESPONSES.insert((block_height, responder_id.clone()), entropy_hash);
-        
-        if is_debug() {
-            println!("[DBG][CONS] entropy_stored h={} from={} hash={:x}", 
-                    block_height, responder_id,
-                    u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
-                                       entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
-        }
     }
     
     pub fn get_start_time(&self) -> chrono::DateTime<chrono::Utc> {

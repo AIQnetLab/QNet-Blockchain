@@ -2550,6 +2550,16 @@ impl BlockPipeline {
                 continue;
             }
 
+            // OB1: while a snapshot rehydrate is repopulating the in-mem StateManager, an above-anchor
+            // tail block would apply over empty/partial state → wrong state_root → rollback → apply-breaker
+            // churn. Skip WITHOUT clearing pending so the catch-up loop re-delivers it once rehydrate has
+            // seeded the bound state. (At/below the anchor floor is already handled by already_applied.)
+            if height > anchor_floor
+                && crate::storage::SNAPSHOT_REHYDRATE_IN_PROGRESS.load(Ordering::Acquire) {
+                metrics.mark_apply_idle();
+                continue;
+            }
+
             // State application with snapshot + rollback support.
             // Pre-warm account cache: before taking the state WRITE lock,
             // walk the block's TXs and ensure every touched address is

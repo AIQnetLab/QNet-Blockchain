@@ -1315,6 +1315,12 @@ pub static REMOTE_PRODUCER_HEARTBEAT_MS: Lazy<DashMap<String, u64>> =
 pub static REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS: Lazy<DashMap<String, u64>> =
     Lazy::new(DashMap::new);
 
+// Producer-advertised targeted slot_height (from the signed heartbeat). Lets a validator
+// distinguish an alive-and-targeting-our-slot producer (suppress fail-over) from an
+// alive-but-stuck-below producer (fail over fast). Bounded with the maps above.
+pub static REMOTE_PRODUCER_HEARTBEAT_HEIGHT: Lazy<DashMap<String, u64>> =
+    Lazy::new(DashMap::new);
+
 // Observer-based block-rejection aggregator: (height, source_peer_id) →
 // set of distinct observer_ids that signed+verified a BlockRejection;
 // ≥2f+1 → fork recovery. Keyed on (height,source) so two simultaneous
@@ -1380,6 +1386,13 @@ pub fn last_remote_producer_heartbeat_age_ms(producer_id: &str) -> Option<u64> {
         .unwrap_or_default()
         .as_millis() as u64;
     Some(now_ms.saturating_sub(observed))
+}
+
+/// Producer-advertised targeted slot_height from the last signed heartbeat, if any.
+/// Fail-over is suppressed only when this proves the producer is targeting the stalled
+/// slot (>= next_height); an alive-but-stuck-below producer fails over fast.
+pub fn last_remote_producer_heartbeat_height(producer_id: &str) -> Option<u64> {
+    REMOTE_PRODUCER_HEARTBEAT_HEIGHT.get(producer_id).map(|v| *v.value())
 }
 
 // v25: validator liveness — miss tracking + reputation penalty (H9+H16).
@@ -1582,6 +1595,9 @@ pub fn evict_stale_producer_heartbeats(max_age_ms: u64) {
     // entry without a corresponding observed entry is harmless but wastes
     // memory at the 100k-validator scale.
     REMOTE_PRODUCER_HEARTBEAT_MS.retain(|producer_id, _| {
+        REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.contains_key(producer_id)
+    });
+    REMOTE_PRODUCER_HEARTBEAT_HEIGHT.retain(|producer_id, _| {
         REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.contains_key(producer_id)
     });
 }
@@ -11966,18 +11982,6 @@ pub enum NetworkMessage {
         sender_id: String,
     },
     
-    /// Request entropy hash for rotation boundary verification
-    EntropyRequest {
-        block_height: u64,
-        requester_id: String,
-    },
-    
-    /// Response with entropy hash for consensus verification
-    EntropyResponse {
-        block_height: u64,
-        entropy_hash: [u8; 32],
-        responder_id: String,
-    },
     /// v3.16: Producer vote for Byzantine 66% consensus
     /// Sent at rotation boundaries to agree on producer selection
     ProducerVote {
@@ -12756,6 +12760,7 @@ impl SimplifiedP2P {
                     .as_millis() as u64;
                 REMOTE_PRODUCER_HEARTBEAT_MS.insert(producer_id.clone(), timestamp);
                 REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.insert(producer_id.clone(), now_ms);
+                REMOTE_PRODUCER_HEARTBEAT_HEIGHT.insert(producer_id.clone(), slot_height);
 
                 if crate::node::is_debug() {
                     println!(
@@ -13865,55 +13870,6 @@ impl SimplifiedP2P {
                 }
                 // In production: Store CID for potential snapshot download
                 // For now, just log the announcement
-            }
-            
-            NetworkMessage::EntropyRequest { block_height, requester_id } => {
-                // Only respond if we actually have the block — silence is better than a
-                // zero-hash that poisons the requester's cache and blocks consensus.
-                // v11.0: Use consensus hash (block.hash()) instead of SHA3(raw_bytes)
-                // to ensure all nodes produce identical hashes regardless of storage format.
-                let maybe_hash: Option<[u8; 32]> = if let Some(storage) = crate::node::try_get_storage() {
-                    match storage.load_microblock_auto_format(block_height) {
-                        Ok(Some(block)) => {
-                            Some(block.hash())
-                        },
-                        Ok(None) => None,
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
-                
-                if let Some(entropy_hash) = maybe_hash {
-                    let response = NetworkMessage::EntropyResponse {
-                        block_height,
-                        entropy_hash,
-                        responder_id: self.node_id.clone(),
-                    };
-                    if let Some(requester_addr) = self.get_peer_address(&requester_id) {
-                        self.send_network_message(&requester_addr, response);
-                    }
-                }
-                // No block → no response; requester will retry on next iteration
-            }
-            
-            NetworkMessage::EntropyResponse { block_height, entropy_hash, responder_id } => {
-                // Drop zero-hash responses — they mean "I don't have this block yet"
-                // and would poison the requester's cache, blocking consensus forever.
-                if entropy_hash != [0u8; 32] {
-                    // v9.0: Verify responder_id matches the transport-verified sender.
-                    // STRICT: Only exact address match. No substring fallbacks.
-                    // Better to miss 1 response than accept a spoofed one.
-                    let sender_verified = self.get_peer_address(&responder_id)
-                        .map(|addr| addr == from_peer)
-                        .unwrap_or(false);
-                    if sender_verified {
-                        crate::node::ENTROPY_RESPONSES.insert((block_height, responder_id.clone()), entropy_hash);
-                    } else if crate::node::is_warn() {
-                        println!("[WARN][ENTROPY] rejected_unverified from={} claimed={} h={}",
-                                 from_peer, responder_id, block_height);
-                    }
-                }
             }
             
             // v3.16: Producer vote for Byzantine 66% consensus on producer selection
