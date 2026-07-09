@@ -2370,7 +2370,10 @@ pub(crate) fn qc_verified_frontier_height() -> u64 {
     const MB: u64 = 90; // microblocks per macroblock (boundary granularity)
     use std::sync::atomic::Ordering::Relaxed;
     let storage = match try_get_storage() { Some(s) => s, None => return QC_VERIFIED_FRONTIER.load(Relaxed) };
-    let local_mb = storage.get_latest_macroblock_index().unwrap_or(0); // = chain_height/90 (own progress)
+    // Base = last contiguously-SEALED macroblock object, NOT chain_height/90 (the microblock tip): SYNC-ADOPT
+    // adopts finality up to this frontier, and adopting past a boundary whose 2f+1 object is not yet sealed
+    // lets the marker outrun the object and shut the macro re-propose gate (macroblock_index > last_finalized_mb).
+    let local_mb = storage.last_sealed_mb_index();
     // Hint = MAX of the served-availability oracle and the attested network-tip oracle, so the frontier
     // probe keeps pace with the applied microblock tip (a forged-high hint self-limits at the QC gate).
     let hint_mb = try_get_p2p()
