@@ -13309,8 +13309,11 @@ impl SimplifiedP2P {
                 // already emits one vote per (height,round). Spoofed/malformed
                 // votes are still rejected by the Dilithium3 sig check (~5 ms).
 
-                if crate::node::is_debug() {
-                    println!("[DBG][TIMEOUT] vote_recv h={} round={} voter={}", height, timeout_round, voter_id);
+                // INFO (not DBG): failover votes are rare (only during a stall), so this is not hot —
+                // and a received-vote line is the one signal that distinguishes "not delivered" from
+                // "delivered but not tallied" when diagnosing a failover that fails to certify.
+                if crate::node::is_info() {
+                    println!("[INFO][TIMEOUT] vote_recv h={} round={} voter={}", height, timeout_round, voter_id);
                 }
 
                 // Process timeout vote and check if certificate is ready.

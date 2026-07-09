@@ -762,10 +762,16 @@ fn recent_heartbeat_senders(storage: &crate::storage::Storage, scan_end: u64) ->
     storage.recent_heartbeat_senders_indexed(cur_idx, prev_idx, scan_end).unwrap_or_default()
 }
 
+/// Activation warmup (2 epochs): a registered super is producer-eligible only after its registration
+/// is buried this many blocks, so a freshly-joined node syncs as an observer before it can be elected.
+/// Its slot is therefore always fillable, so the epoch-boundary producer/committee membership window
+/// never forces a spurious failover on a not-yet-ready joiner. Genesis (reg_height 0) is exempt.
+const ACTIVATION_WARMUP_BLOCKS: u64 = 180;
+
 /// Phase-2A eligible additions: the registered-Super nodes that are recently live (on-chain Heartbeat
-/// in cur/prev subwindow), registration-confirmed by scan_end, and at/above the reputation floor —
-/// excluding ids already in `already_eligible`. Returned in node_id-ascending order (the consensus
-/// canonical key; feeds epoch_commitment→QC so it MUST be identical on every node).
+/// in cur/prev subwindow), registration-confirmed + warmup-buried by scan_end, and at/above the
+/// reputation floor — excluding ids already in `already_eligible`. Returned in node_id-ascending order
+/// (the consensus canonical key; feeds epoch_commitment→QC so it MUST be identical on every node).
 ///
 /// SCALE: the recent-HB membership (O(1), in-memory) gates the per-candidate reg-height DISK point-read,
 /// so only the recent∩registered set (a few thousand) hits disk — NOT the full 100k+ registrant set. This
@@ -785,10 +791,10 @@ fn phase2a_eligible_additions(
     for reg in regs {
         if already_eligible.contains(reg) { continue; }
         if !recent_hb.contains(reg) { continue; }
-        // Bound each candidate to a registration confirmed by scan_end (the live srtr_ pool can run
-        // ahead of scan_end under async production); genesis nodes carry reg_height=0 ⇒ always pass.
+        // Registration confirmed AND buried by the activation warmup before scan_end (the live srtr_
+        // pool can run ahead of scan_end under async production). Genesis (reg_height 0) is exempt.
         match storage.node_reg_height(reg) {
-            Ok(Some(h)) if h <= scan_end => {}
+            Ok(Some(h)) if h == 0 || h.saturating_add(ACTIVATION_WARMUP_BLOCKS) <= scan_end => {}
             _ => continue,
         }
         let rep = (reputation_map.get(reg).copied()
