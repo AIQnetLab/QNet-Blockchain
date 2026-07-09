@@ -119,6 +119,23 @@ pub const QUIC_PORT_OFFSET: u16 = 2875;
 /// Maximum message size (10 MB - for macroblocks/block batches)
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
+/// S2b: bulk serve-response send-concurrency bound. Reserves QUIC-stream + CPU headroom for
+/// consensus so a cold-sync flood (100k joiners) cannot starve failover/checkpoint sends — the
+/// onboarding wedge was a lost failover vote when sync churn saturated the shared streams.
+/// Only heavy block/macroblock/snapshot serve RESPONSES acquire a permit; consensus, control,
+/// and requests bypass. Bound < MAX_STREAMS_PER_CONN keeps consensus headroom on the connection.
+const BULK_SEND_CONCURRENCY: usize = 256;
+static BULK_SEND_PERMITS: once_cell::sync::Lazy<tokio::sync::Semaphore> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Semaphore::new(BULK_SEND_CONCURRENCY));
+
+/// Heavy bulk serve responses — throttled on the send side. Requests are tiny and NOT throttled
+/// (a node's own catch-up must not slow); consensus/control never reach here as bulk.
+#[inline]
+fn is_bulk_serve_send(msg: &crate::unified_p2p::NetworkMessage) -> bool {
+    use crate::unified_p2p::NetworkMessage as M;
+    matches!(msg, M::BlocksBatch { .. } | M::MacroblocksBatch { .. } | M::StateSnapshot { .. })
+}
+
 /// v9.0: Per-message-type size limits.
 /// Enforced BEFORE memory allocation to prevent OOM from oversized small messages.
 /// Type byte is extracted from wire header position [1] before deserialization.
@@ -2254,6 +2271,15 @@ impl QuicTransport {
 
     /// Send message to peer (request-response) with retry
     pub async fn send_message(&self, peer_addr: SocketAddr, msg: &NetworkMessage) -> Result<(), String> {
+        // S2b: heavy bulk serve responses take a bounded permit so a cold-sync flood cannot consume
+        // all streams/CPU and starve consensus sends. Consensus/control/requests bypass. Held for the
+        // send; on contention the bulk send defers (sync coordinator retries) — consensus never waits.
+        let _bulk_permit = if is_bulk_serve_send(msg) {
+            match tokio::time::timeout(Duration::from_secs(2), BULK_SEND_PERMITS.acquire()).await {
+                Ok(Ok(p)) => Some(p),
+                _ => return Err("bulk_send_deferred: consensus headroom reserved".to_string()),
+            }
+        } else { None };
         // Serialize message once
         let wire_data = Self::serialize_message(msg)?;
         

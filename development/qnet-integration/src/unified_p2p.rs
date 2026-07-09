@@ -21612,13 +21612,9 @@ impl SimplifiedP2P {
             let mut tasks = Vec::with_capacity(total_peers);
 
             for peer_addr in peers.into_iter() {
-                if let Some(entry) = PEER_RETRY_COOLDOWN.get(&peer_addr) {
-                    let (_, cooldown_until) = entry.value();
-                    if std::time::Instant::now() < *cooldown_until {
-                        continue;
-                    }
-                }
-
+                // Consensus-critical (heartbeat / block-rejection / producer-ready): never skip a peer
+                // for PEER_RETRY_COOLDOWN. A transiently-cooled LIVE peer that misses the producer's
+                // heartbeat treats it as silent → spurious failover. Fire-and-forget (heartbeat is 1/s).
                 let msg_clone = msg.clone();
                 let quic_transport_clone = quic_transport.clone();
 
@@ -21779,14 +21775,9 @@ impl SimplifiedP2P {
             let mut tasks = Vec::with_capacity(total_peers);
             
             for peer_addr in peers {
-                // Skip peers in cooldown
-                if let Some(entry) = PEER_RETRY_COOLDOWN.get(&peer_addr) {
-                    let (_, cooldown_until) = entry.value();
-                    if std::time::Instant::now() < *cooldown_until {
-                        continue;
-                    }
-                }
-                
+                // Consensus-critical: never skip a peer for PEER_RETRY_COOLDOWN. Cooldown is a
+                // bulk-sync send-backoff; a rare failover message (vote / proof / request) MUST
+                // reach the committee or the 2f+1 TC never forms. Send timeout still bounds delivery.
                 let msg_clone = msg.clone();
                 let quic_transport_clone = quic_transport.clone();
                 let success_count_clone = Arc::clone(&success_count);
@@ -22084,17 +22075,14 @@ impl SimplifiedP2P {
 
     pub fn broadcast_timeout_vote(&self, height: u64, timeout_round: u64, 
                                    last_block_hash: [u8; 32], signature: Vec<u8>) {
-        // Check if we already voted for this height
-        if let Some(voted_round) = TIMEOUT_VOTED_HEIGHTS.get(&height) {
-            if *voted_round >= timeout_round {
-                if crate::node::is_debug() {
-                    println!("[DBG][TIMEOUT] already_voted h={} round={}", height, timeout_round);
-                }
-                return;
-            }
+        // Retransmit until certified: suppress only once the 2f+1 TC for this (height,round) is
+        // held. The view-timeout redrive re-invokes this each tick, so a vote lost to packet loss /
+        // peer churn is re-broadcast until the TC forms. A single-shot send is not liveness-safe —
+        // one lost failover vote wedged finality on onboarding (no node received it, TC never formed).
+        if self.has_timeout_certificate(height, timeout_round) {
+            return;
         }
-        
-        // Mark as voted
+        // Highest round emitted (retain-cleanup + observability); no longer the suppression gate.
         TIMEOUT_VOTED_HEIGHTS.insert(height, timeout_round);
 
         // BFT FIX: Count own vote locally BEFORE broadcasting.
@@ -22139,14 +22127,9 @@ impl SimplifiedP2P {
             let mut tasks = Vec::with_capacity(total_peers);
             
             for peer_addr in peers {
-                // Skip peers in cooldown
-                if let Some(entry) = PEER_RETRY_COOLDOWN.get(&peer_addr) {
-                    let (_, cooldown_until) = entry.value();
-                    if std::time::Instant::now() < *cooldown_until {
-                        continue;
-                    }
-                }
-                
+                // Consensus-critical: never skip a peer for PEER_RETRY_COOLDOWN. Cooldown is a
+                // bulk-sync send-backoff; a rare failover message (vote / proof / request) MUST
+                // reach the committee or the 2f+1 TC never forms. Send timeout still bounds delivery.
                 let msg_clone = msg.clone();
                 let quic_transport_clone = quic_transport.clone();
                 let success_count_clone = Arc::clone(&success_count);
@@ -22485,14 +22468,9 @@ impl SimplifiedP2P {
             let mut tasks = Vec::with_capacity(max_peers);
             
             for peer_addr in peers.into_iter().take(max_peers) {
-                // Skip peers in cooldown
-                if let Some(entry) = PEER_RETRY_COOLDOWN.get(&peer_addr) {
-                    let (_, cooldown_until) = entry.value();
-                    if std::time::Instant::now() < *cooldown_until {
-                        continue;
-                    }
-                }
-                
+                // Consensus-critical: never skip a peer for PEER_RETRY_COOLDOWN. Cooldown is a
+                // bulk-sync send-backoff; a rare failover message (vote / proof / request) MUST
+                // reach the committee or the 2f+1 TC never forms. Send timeout still bounds delivery.
                 let msg_clone = msg.clone();
                 let quic_transport_clone = quic_transport.clone();
                 
@@ -22504,16 +22482,32 @@ impl SimplifiedP2P {
                                 let quic_addr_str = format!("{}:10876", ip);
                                 if let Ok(quic_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
                                     let t = transport.read().await;
-                                    let _ = t.send_message(quic_addr, &msg_clone).await;
+                                    // Send-fail → cooldown backoff (mirrors the vote/proof fan-outs) so a
+                                    // dead peer is exponentially backed off for the bulk lane, not re-dialed
+                                    // every redrive. Consensus paths above no longer READ cooldown to skip.
+                                    match t.send_message(quic_addr, &msg_clone).await {
+                                        Ok(_) => { PEER_RETRY_COOLDOWN.remove(&peer_addr); }
+                                        Err(_) => {
+                                            let (retry_count, _) = PEER_RETRY_COOLDOWN.get(&peer_addr)
+                                                .map(|e| *e.value()).unwrap_or((0, std::time::Instant::now()));
+                                            let new_retry_count = retry_count + 1;
+                                            let backoff_secs = std::cmp::min(
+                                                PEER_COOLDOWN_BASE_SECS * (1 << new_retry_count.min(4)),
+                                                PEER_COOLDOWN_MAX_SECS);
+                                            let cooldown_until = std::time::Instant::now()
+                                                + std::time::Duration::from_secs(backoff_secs);
+                                            PEER_RETRY_COOLDOWN.insert(peer_addr.clone(), (new_retry_count, cooldown_until));
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 });
-                
+
                 tasks.push(task);
             }
-            
+
             // Short timeout - we just need ANY peer to respond
             let timeout = tokio::time::Duration::from_secs(3);
             let _ = tokio::time::timeout(timeout, join_all(tasks)).await;
