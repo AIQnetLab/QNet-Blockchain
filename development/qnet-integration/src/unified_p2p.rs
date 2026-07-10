@@ -1091,6 +1091,11 @@ const QUIC_FALLBACK_WINDOW_SECS: u64 = 60;  // Rolling window: 60 seconds
 /// consensus lane — a flooding cold-sync peer's excess is dropped, never queued.
 pub static BULK_LANE_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// QoS finality lane drop counter (lane full → non-redundant 2f+1 checkpoint/failover
+/// frame shed). A NON-ZERO value is unrepairable consensus loss (SEV-1), unlike the
+/// benign bulk shedding above. Log-governed by the finality drain task.
+pub static FINALITY_LANE_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// QUIC Fallback Metrics (global counters for monitoring)
 pub static QUIC_FALLBACK_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static QUIC_FALLBACK_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2161,6 +2166,10 @@ pub struct SimplifiedP2P {
     /// Blocks|MacroblocksBatch/StateSnapshot) routed here, drained by a dedicated
     /// worker so a cold-sync flood can never delay the consensus lane.
     quic_bulk_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<(String, NetworkMessage)>>>>,
+    /// QoS finality lane: non-redundant 2f+1 checkpoint-BFT + round-change msgs routed
+    /// here, drained by a dedicated worker so a gossip/shred flood can never drop the
+    /// votes that assemble the finality QC.
+    quic_finality_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<(String, NetworkMessage)>>>>,
 
     /// PRODUCTION v2.19.25: Transaction processing channel
     /// Received transactions from P2P are sent here for validation and mempool
@@ -3052,6 +3061,7 @@ impl SimplifiedP2P {
             // PRODUCTION v2.19.22: QUIC message channel (set via set_quic_message_channel)
             quic_message_tx: Arc::new(Mutex::new(None)),
             quic_bulk_tx: Arc::new(Mutex::new(None)),
+            quic_finality_tx: Arc::new(Mutex::new(None)),
 
             // PRODUCTION v2.19.25: Transaction channel (set via set_transaction_channel)
             transaction_tx: Arc::new(Mutex::new(None)),
@@ -3155,6 +3165,14 @@ impl SimplifiedP2P {
         if crate::node::is_info() { println!("[INFO][QUIC] Bulk lane channel established"); }
     }
 
+    /// QoS finality lane sender: reserved for non-redundant 2f+1 msgs so a gossip flood
+    /// cannot drop them (root-cause fix for the checkpoint-QC wedge).
+    pub fn set_quic_finality_channel(&mut self, quic_finality_tx: tokio::sync::mpsc::Sender<(String, NetworkMessage)>) {
+        let mut guard = self.quic_finality_tx.lock();
+        *guard = Some(quic_finality_tx);
+        if crate::node::is_info() { println!("[INFO][QUIC] Finality lane channel established"); }
+    }
+
     /// True for floodable bulk-serving / bulk-transfer messages that must NOT
     /// share the consensus FIFO. Everything else (consensus, tip blocks,
     /// shred chunks, tx, discovery) stays on the high-priority lane.
@@ -3166,6 +3184,21 @@ impl SimplifiedP2P {
             | NetworkMessage::BlocksBatch { .. }
             | NetworkMessage::MacroblocksBatch { .. }
             | NetworkMessage::StateSnapshot { .. }
+        )
+    }
+
+    /// Reserved lane for non-redundant 2f+1 msgs with no repair path: checkpoint-BFT
+    /// (ConsensusV2 = Proposal/Vote/Qc/Timeout/Tc), failover pacemaker (TimeoutVote/
+    /// TimeoutCertificateBroadcast), round-change handshake (ProducerReady/ReadyAck).
+    /// MUST NOT share the gossip FIFO; excludes high-volume gossip and pull-repair.
+    #[inline]
+    fn is_finality_lane_message(msg: &NetworkMessage) -> bool {
+        matches!(msg,
+            NetworkMessage::ConsensusV2 { .. }
+            | NetworkMessage::TimeoutVote { .. }
+            | NetworkMessage::TimeoutCertificateBroadcast { .. }
+            | NetworkMessage::ProducerReady { .. }
+            | NetworkMessage::ReadyAck { .. }
         )
     }
 
@@ -3219,12 +3252,28 @@ impl SimplifiedP2P {
         // This ensures QUIC uses SAME logic as HTTP - no code duplication!
         let quic_message_tx = self.quic_message_tx.clone();
         let quic_bulk_tx = self.quic_bulk_tx.clone();
+        let quic_finality_tx = self.quic_finality_tx.clone();
 
         // v6.5: Share peer_id_to_addr with QUIC transport for bidirectional mapping
         transport.set_peer_id_to_addr(self.peer_id_to_addr.clone());
 
         let handler: MessageHandler = Arc::new(move |peer_addr, msg| {
             let peer_str = format!("{}:8001", peer_addr.ip());
+
+            // Finality first: non-redundant 2f+1 checkpoint/round-change frames get the
+            // reserved lane so a gossip/shred flood can never drop the votes that assemble
+            // the finality QC. Disjoint from the bulk set; kept first for future-proofing.
+            if Self::is_finality_lane_message(&msg) {
+                let fg = quic_finality_tx.lock();
+                if let Some(ref tx) = *fg {
+                    if tx.try_send((peer_str, msg)).is_err() {
+                        FINALITY_LANE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return;
+                }
+                // Lane unwired (never after boot): fall through to the gossip lane so a
+                // finality frame is never silently lost.
+            }
 
             // QoS split: bulk-serving msgs → bounded bulk lane (drop-on-full =
             // hard DoS bound, never blocks); everything consensus-critical →

@@ -7898,6 +7898,11 @@ impl BlockchainNode {
         // QoS bulk lane: bounded smaller (droppable) so a cold-sync flood is
         // shed at ingress instead of starving consensus. Drained by its own task.
         let (quic_bulk_tx, mut quic_bulk_rx) = tokio::sync::mpsc::channel::<(String, crate::unified_p2p::NetworkMessage)>(2_000);
+        // QoS finality lane: reserved for non-redundant 2f+1 checkpoint/round-change msgs.
+        // Sized to the committee(≤1000) 2f+1 rate (a full overlapping vote+timeout round +
+        // dedup dups < 4096), NOT the 10k gossip lane; a drop here is UNREPAIRABLE.
+        // INVARIANT: if the committee cap ever exceeds 1000, scale to ≥ ~4× committee.
+        let (quic_finality_tx, mut quic_finality_rx) = tokio::sync::mpsc::channel::<(String, crate::unified_p2p::NetworkMessage)>(4_096);
 
         // PRODUCTION v2.19.25: Create transaction processing channel
         let (transaction_tx, mut transaction_rx) = tokio::sync::mpsc::channel::<crate::unified_p2p::ReceivedTransaction>(50_000);
@@ -7924,6 +7929,7 @@ impl BlockchainNode {
         // PRODUCTION v2.19.22: Set QUIC message channel for full message processing
         unified_p2p_instance.set_quic_message_channel(quic_message_tx);
         unified_p2p_instance.set_quic_bulk_channel(quic_bulk_tx);
+        unified_p2p_instance.set_quic_finality_channel(quic_finality_tx);
         
         // PRODUCTION v2.19.25: Set transaction channel for mempool integration
         unified_p2p_instance.set_transaction_channel(transaction_tx);
@@ -9106,11 +9112,11 @@ impl BlockchainNode {
         tokio::spawn(async move {
             while let Some((from_peer, message)) = quic_message_rx.recv().await {
                 if let Some(ref p2p) = blockchain_for_quic.unified_p2p {
+                    // TimeoutVote/TimeoutCertificateBroadcast now arrive on the dedicated
+                    // finality lane (offloaded there), so they no longer reach this consumer.
                     let needs_offload = matches!(&message,
                         crate::unified_p2p::NetworkMessage::ConsensusCommit { .. }
                         | crate::unified_p2p::NetworkMessage::ConsensusReveal { .. }
-                        | crate::unified_p2p::NetworkMessage::TimeoutVote { .. }
-                        | crate::unified_p2p::NetworkMessage::TimeoutCertificateBroadcast { .. }
                         | crate::unified_p2p::NetworkMessage::ProducerHeartbeat { .. }
                         | crate::unified_p2p::NetworkMessage::VrfLeaderClaim { .. }
                     );
@@ -9171,6 +9177,58 @@ impl BlockchainNode {
                         let _permit = permit;
                         p2p_clone.handle_message(&from_peer, message);
                     });
+                }
+            }
+        });
+
+        // QoS finality drain — isolated from the gossip/bulk/consensus consumers. Carries only
+        // non-redundant 2f+1 frames, so a gossip/shred flood can no longer evict the votes that
+        // assemble the finality QC (root-cause fix for the checkpoint wedge). ConsensusV2 dispatches
+        // synchronously (route_inbound is µs-scale, byte-capped downstream); the crypto-heavy
+        // Timeout*/Ready* types offload via spawn_blocking (keyed-idempotent, out-of-order safe).
+        let blockchain_for_finality = blockchain.clone();
+        tokio::spawn(async move {
+            // Cap concurrent finality sig-verifies well below tokio's blocking pool so a
+            // Timeout*/Ready* flood can never exhaust it and starve the block/shred apply path
+            // (which shares that pool). acquire().await = backpressure (drain slows, the bounded
+            // channel absorbs the burst / sheds at ingress); the drain itself NEVER drops a frame.
+            const FINALITY_VERIFY_CONCURRENCY: usize = 48;
+            let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(FINALITY_VERIFY_CONCURRENCY));
+            let mut last_drop_log = std::time::Instant::now();
+            let mut last_dropped: u64 = 0;
+            while let Some((from_peer, message)) = quic_finality_rx.recv().await {
+                if last_drop_log.elapsed().as_secs() >= 30 {
+                    let d = crate::unified_p2p::FINALITY_LANE_DROPPED
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if d > last_dropped && is_warn() {
+                        println!("[WARN][QUIC] finality_lane_shed total={} delta={} window=30s reason=lane_full_dos_bound",
+                                 d, d - last_dropped);
+                    }
+                    last_dropped = d;
+                    last_drop_log = std::time::Instant::now();
+                }
+                if let Some(ref p2p) = blockchain_for_finality.unified_p2p {
+                    let needs_offload = matches!(&message,
+                        crate::unified_p2p::NetworkMessage::TimeoutVote { .. }
+                        | crate::unified_p2p::NetworkMessage::TimeoutCertificateBroadcast { .. }
+                        | crate::unified_p2p::NetworkMessage::ProducerReady { .. }
+                        | crate::unified_p2p::NetworkMessage::ReadyAck { .. }
+                    );
+                    if needs_offload {
+                        // Backpressure on the bounded verify pool; released when the task completes.
+                        let permit = match permits.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => break, // semaphore closed → runtime shutting down
+                        };
+                        let p2p_clone = p2p.clone();
+                        let from_peer_owned = from_peer.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            p2p_clone.handle_message(&from_peer_owned, message);
+                        });
+                    } else {
+                        p2p.handle_message(&from_peer, message);
+                    }
                 }
             }
         });
