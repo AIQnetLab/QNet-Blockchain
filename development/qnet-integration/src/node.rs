@@ -3659,7 +3659,6 @@ impl BlockchainNode {
                         // gets its row from NodeRegistration. No phantom tx-hash row ⇒ one wallet = one row.
                         if matches!(node_type, qnet_state::account::NodeType::Super) {
                             let pseudonym = crate::rpc::generate_super_node_pseudonym(&tx.from);
-                            crate::unified_p2p::add_registered_super_node(pseudonym.clone());
                             result.deferred_registrations.push((pseudonym, "super".to_string(), tx.from.clone(), String::new(), String::new()));
                         }
                     }
@@ -8731,24 +8730,6 @@ impl BlockchainNode {
             p2p.rebuild_light_eligible_from_storage(boot_h);
         }
 
-        // v32.15: populate REGISTERED_SUPER_NODES from on-chain state. Drives
-        // the pre-activation P2P sync gate. Scales linearly with super-node
-        // count — fine for 100k+ since this runs once at boot.
-        {
-            let state_guard = blockchain.state.read().await;
-            let accounts = state_guard.get_all_accounts();
-            drop(state_guard);
-            let mut registered = 0usize;
-            for (wallet, account) in accounts.iter() {
-                if account.is_node && account.node_type.as_deref().map(|s| s.eq_ignore_ascii_case("super")).unwrap_or(false) {
-                    let id = crate::rpc::generate_super_node_pseudonym(wallet);
-                    crate::unified_p2p::add_registered_super_node(id);
-                    registered += 1;
-                }
-            }
-            println!("[INFO][P2P] registered_super_nodes_loaded count={}", registered);
-        }
-
         
         // ═══════════════════════════════════════════════════════════════════
         // L1 ARCHITECTURE: ConsensusCoordinator + BlockPipeline + SyncManager
@@ -12077,6 +12058,7 @@ impl BlockchainNode {
                                 fees_collected: 0, // v3.18: Genesis block has no fees
                                 state_root: [0u8; 32], // v3.27: Will be set after TX application
                                 timeout_round: 0, // v14.0: Genesis has no timeout
+                                timeout_proof: None, // #80: happy path, no failover proof
                             };
                             
                             // ═══════════════════════════════════════════════════════════════════
@@ -16432,6 +16414,11 @@ impl BlockchainNode {
                         // Restores the v14.0 producer-authority-proof invariant
                         // that v22 had erased by hardcoding 0.
                         timeout_round,
+                        // #80: attach the 2f+1 TimeoutProof that certified this failover round so a
+                        // lagging receiver adopts it in-band (round 0 → None, no proof needed).
+                        timeout_proof: if timeout_round > 0 {
+                            crate::unified_p2p::certified_timeout_proof_bytes(next_block_height / 90)
+                        } else { None },
                     };
                     
                     // ═══════════════════════════════════════════════════════════════════════════
@@ -16649,7 +16636,6 @@ impl BlockchainNode {
                                 if matches!(phase, qnet_state::account::ActivationPhase::Phase2) { continue; }
                                 if matches!(ntype, qnet_state::account::NodeType::Super) {
                                     let pseudonym = crate::rpc::generate_super_node_pseudonym(&tx.from);
-                                    crate::unified_p2p::add_registered_super_node(pseudonym.clone());
                                     let _ = storage.save_node_registration_at_height_burn(
                                         &pseudonym, "super", &tx.from, 1.0, next_block_height, "");
                                 }
@@ -22795,11 +22781,26 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Ok(Self::verify_user_tx_dilithium(tx));
         }
 
+        // PURE DILITHIUM: NodeRegistration (client-signed) + NodeReactivation verify by a DIRECT
+        // ML-DSA-65 check against the WIRE key, never the gossip-seeded CONSENSUS_PK_REGISTRY (whose
+        // per-node Tier2/3 verdict forks the block). Identity authority is COMMITTED, enforced at
+        // ingest: 2f+1 burn quorum for first-reg, vrf_pk point-read for re-reg/reactivation.
+        if matches!(&tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. })
+            || matches!(&tx.tx_type, qnet_state::TransactionType::NodeRegistration { .. }
+                if tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:"))
+        {
+            return match &tx.dilithium_signature {
+                Some(s) if !s.is_empty() => Ok(Self::verify_node_lifecycle_dilithium(tx)),
+                // Sig-less imported-wallet first-reg: authority is the 2f+1 burn quorum (ingest).
+                _ => Ok(true),
+            };
+        }
+
         let dilithium_sig = match &tx.dilithium_signature {
             Some(sig) if !sig.is_empty() => sig.clone(),
             _ => return Ok(true),
         };
-        
+
         // v5.1: signer_id selection depends on TX type and signing path:
         //   1. Client-signed NodeRegistration (data starts with "client_node_reg:"):
         //      The mobile client embeds node_id (pseudonym like "light_mobile_XXXXXXXX") in the
@@ -22916,6 +22917,73 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // admission. Pure/deterministic (SHA512(pk) derivation + tx.from), safe on the apply path.
         crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(pk_hex).as_deref()
             == Some(tx.from.as_str())
+    }
+
+    /// PURE DILITHIUM: direct ML-DSA-65 verification for NodeRegistration (client-signed) +
+    /// NodeReactivation. Verifies the signature over the canonical message against the WIRE key
+    /// ONLY — no CONSENSUS_PK_REGISTRY lookup, so the verdict is byte-identical on every node
+    /// (the gossip-seeded registry's Tier2/3 split was the confirmed fork surface). Identity
+    /// authority (that this key is entitled to this node_id/wallet) is bound separately from
+    /// COMMITTED state at ingest: the 2f+1 burn quorum (first-reg) or the committed vrf_pk
+    /// point-read (re-reg/reactivation). Wire (WalletIdentity::sign_consensus): signer label is
+    /// node_id (reg) / tx.from (reactivation); b64 = [sig_len:4LE][SignedMessage][pk_len:4LE][pk].
+    pub(crate) fn verify_node_lifecycle_dilithium(tx: &qnet_state::Transaction) -> bool {
+        use base64::engine::general_purpose;
+        use base64::Engine;
+        use pqcrypto_mldsa::mldsa65 as dilithium3;
+        use pqcrypto_traits::sign::{SignedMessage as SmTrait, PublicKey as PkTrait};
+
+        let sig_str = match tx.dilithium_signature.as_ref() {
+            Some(s) if !s.is_empty() => s,
+            _ => return false,
+        };
+        let pk_hex = match tx.dilithium_public_key.as_ref() {
+            Some(p) if !p.is_empty() => p,
+            _ => return false,
+        };
+        let pk_bytes = match hex::decode(pk_hex) {
+            Ok(b) if b.len() == 1952 => b,
+            _ => return false,
+        };
+        // Signer label the client wrapped the sig with. Two live conventions produce the same
+        // `dilithium_sig_{LABEL}_{b64}` layout: the mobile/ext wallet labels with the pk hex (value-TX
+        // convention), the node binary labels with node_id (== tx.from for reactivation). The label is
+        // only a delimiter — security is the ML-DSA-65 open() below — so accept either.
+        let node_label = match &tx.tx_type {
+            qnet_state::TransactionType::NodeRegistration { node_id, .. } => node_id.as_str(),
+            qnet_state::TransactionType::NodeReactivation { .. } => tx.from.as_str(),
+            _ => return false,
+        };
+        let b64 = match sig_str.strip_prefix(&format!("dilithium_sig_{}_", pk_hex))
+            .or_else(|| sig_str.strip_prefix(&format!("dilithium_sig_{}_", node_label)))
+        {
+            Some(x) => x,
+            None => return false,
+        };
+        let combined = match general_purpose::STANDARD.decode(b64) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        if combined.len() < 8 { return false; }
+        let sig_len = match combined[0..4].try_into() {
+            Ok(a) => u32::from_le_bytes(a) as usize,
+            Err(_) => return false,
+        };
+        if combined.len() < 4 + sig_len { return false; }
+        let sm_bytes = &combined[4..4 + sig_len];
+        let signed_msg = match dilithium3::SignedMessage::from_bytes(sm_bytes) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let pk = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        // open() verifies the sig AND recovers the embedded message; bind it to the canonical preimage.
+        match dilithium3::open(&signed_msg, &pk) {
+            Ok(m) => m == Self::build_canonical_verify_message(tx).as_bytes(),
+            Err(_) => false,
+        }
     }
 
     /// Shared system-TX identity binds — enforced on BOTH the gossip-admission path
@@ -27625,6 +27693,7 @@ mod tests {
                 fees_collected: 0,
                 state_root: [0u8; 32],
                 timeout_round: 0,
+                timeout_proof: None,
             };
             let data = bincode::serialize(&mb).expect("serialize");
             storage.save_microblock(height, &data).expect("save");

@@ -256,17 +256,15 @@ export async function GET(
       const isSystemTx = from.startsWith('system_') || from === 'genesis' || dbTx.block === 0;
       const isQuantumSigned = dbTx.is_quantum_signed;
       
-      // 3 signature types:
-      // 1. System TX - for system transactions
-      // 2. Ed25519 + Dilithium3 - hybrid quantum-resistant  
-      // 3. Ed25519 - classical only
+      // Signature types (Ed25519 removed from consensus; user/consensus TXs are pure ML-DSA-65):
+      // 1. System TX  2. Dilithium3 (quantum-signed)  3. Unsigned (legacy / no PQ sig)
       let signatureType: string;
       if (isSystemTx) {
         signatureType = 'System TX';
       } else if (isQuantumSigned) {
-        signatureType = 'Ed25519 + Dilithium3';
+        signatureType = 'Dilithium3';
       } else {
-        signatureType = 'Ed25519';
+        signatureType = 'Unsigned';
       }
       
       // Calculate real fee from stored gas_price and gas_limit
@@ -403,9 +401,9 @@ export async function GET(
     if (isSystemTx) {
       signatureType = 'System TX';
     } else if (isQuantumSigned) {
-      signatureType = 'Ed25519 + Dilithium3';
+      signatureType = 'Dilithium3';
     } else {
-      signatureType = 'Ed25519';
+      signatureType = 'Unsigned';
     }
     
     // Calculate fee: gas_price * gas_limit, or 0 for genesis/system transactions

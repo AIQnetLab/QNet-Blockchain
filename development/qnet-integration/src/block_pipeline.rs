@@ -2017,6 +2017,15 @@ impl BlockPipeline {
                     // 2f+1 TimeoutCertificate, so the producer can be at round R only if the network
                     // certified R — both sides read the same map and can never disagree. A forged
                     // round isn't certified ⇒ rejected; round 0 (happy path) needs no certificate.
+                    // #80: adopt the block's ATTACHED 2f+1 TimeoutProof first (self-authenticating,
+                    // verified inside), so a node that missed the separate TC broadcast learns the
+                    // certified round in-band and authorises the block instead of wedging. A forged
+                    // or absent proof advances nothing → round stays uncertified → pull/reject below.
+                    if let (Some(pb), Some(p2p)) =
+                        (decoded.microblock.timeout_proof.as_ref(), unified_p2p.as_ref())
+                    {
+                        p2p.adopt_timeout_proof_bytes(pb);
+                    }
                     let round_certified =
                         crate::unified_p2p::failover_round_authorized(mb.height / 90, mb.timeout_round);
                     if !round_certified {
@@ -2337,6 +2346,60 @@ impl BlockPipeline {
                         }
                         metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
                         continue; // HARD REJECT — registration without a valid genesis burn quorum
+                    }
+                }
+
+                // Client-registration identity bind: node_id MUST equal the deterministic wallet
+                // pseudonym, so a third party cannot burn-and-squat another wallet's derivable node_id
+                // (DoS its future onboarding via the apply dup-guard). Genesis is server-signed (no
+                // client_node_reg prefix) and exempt. Pure fn of TX bytes → identical verdict per node.
+                {
+                    let bad = decoded.microblock.transactions.iter().find_map(|tx| {
+                        if let qnet_state::TransactionType::NodeRegistration { node_id, node_type, wallet_address, .. } = &tx.tx_type {
+                            if tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:") {
+                                let expected = match node_type {
+                                    qnet_state::account::NodeType::Light =>
+                                        crate::rpc::generate_light_node_pseudonym(wallet_address),
+                                    _ => crate::rpc::generate_super_node_pseudonym(wallet_address),
+                                };
+                                if node_id != &expected { return Some(node_id.clone()); }
+                            }
+                        }
+                        None
+                    });
+                    if let Some(nid) = bad {
+                        if is_warn() {
+                            println!("[WARN][PIPELINE] reg_node_id_not_pseudonym h={} node={} action=reject_block", mb.height, nid);
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue; // HARD REJECT — node_id must be the wallet pseudonym (anti-squat)
+                    }
+                }
+
+                // NodeReactivation identity gate: the returning node's WIRE key MUST equal the vrf_pk
+                // committed at its original registration (committed point-read) — the sole authority
+                // now the gossip RAM-registry path is gone. No committed key ⇒ unknown identity ⇒
+                // reject. Deterministic (committed CF + TX bytes); parent-continuity guarantees the
+                // original registration row is applied before this block is verified.
+                {
+                    let react_bad = decoded.microblock.transactions.iter().find_map(|tx| {
+                        if !matches!(tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. }) {
+                            return None;
+                        }
+                        let node_id = tx.from.as_str();
+                        let wire_pk = tx.dilithium_public_key.as_deref().and_then(|h| hex::decode(h).ok());
+                        match (wire_pk, storage.load_vrf_public_key(node_id)) {
+                            (Some(w), Ok(Some(c))) if !w.is_empty() && w == c => None,
+                            _ => Some(node_id.to_string()),
+                        }
+                    });
+                    if let Some(nid) = react_bad {
+                        if is_warn() {
+                            println!("[WARN][PIPELINE] reactivation_key_mismatch h={} node={} action=reject_block",
+                                     mb.height, nid);
+                        }
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                        continue; // HARD REJECT — reactivation key != committed vrf_pk (or unknown identity)
                     }
                 }
 

@@ -104,7 +104,11 @@ pub fn validate_wasm_module(bytes: &[u8], limits: &VmLimits) -> Result<(), VmErr
             Payload::MemorySection(reader) => {
                 for m in reader {
                     let m = m.map_err(|e| VmError::Invalid(e.to_string()))?;
-                    let max = m.maximum.unwrap_or(m.initial);
+                    // Require an explicit maximum ≤ page cap. An absent maximum lets a
+                    // runtime memory.grow reach the wasm32 ceiling, where success hinges on
+                    // host RAM (allocator) → divergent state_root across nodes = fork.
+                    let max = m.maximum.ok_or_else(|| VmError::LimitExceeded(
+                        "memory_max=unbounded (explicit maximum required)".to_string()))?;
                     if max > limits.max_memory_pages as u64 {
                         return Err(VmError::LimitExceeded(format!(
                             "memory_pages={} max={}", max, limits.max_memory_pages)));
@@ -116,6 +120,34 @@ pub fn validate_wasm_module(bytes: &[u8], limits: &VmLimits) -> Result<(), VmErr
                 if func_count > limits.max_functions {
                     return Err(VmError::LimitExceeded(format!(
                         "functions={} max={}", func_count, limits.max_functions)));
+                }
+            }
+            Payload::ImportSection(reader) => {
+                // Reject imported memory/table: they escape the MemorySection page-cap and the runtime
+                // linker provides neither (host fns only) → forbid at deploy so every accepted module
+                // is bounded by its own declarations. Handles all import-group encodings.
+                fn is_mem_or_table(ty: &wasmparser::TypeRef) -> bool {
+                    matches!(ty, wasmparser::TypeRef::Memory(_) | wasmparser::TypeRef::Table(_))
+                }
+                for group in reader {
+                    let bad = match group.map_err(|e| VmError::Invalid(e.to_string()))? {
+                        wasmparser::Imports::Single(_, imp) => is_mem_or_table(&imp.ty),
+                        wasmparser::Imports::Compact2 { ty, .. } => is_mem_or_table(&ty),
+                        wasmparser::Imports::Compact1 { items, .. } => {
+                            let mut found = false;
+                            for it in items {
+                                if is_mem_or_table(&it.map_err(|e| VmError::Invalid(e.to_string()))?.ty) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            found
+                        }
+                    };
+                    if bad {
+                        return Err(VmError::LimitExceeded(
+                            "imported_memory_or_table_forbidden".to_string()));
+                    }
                 }
             }
             _ => {}
@@ -513,6 +545,17 @@ struct FrameHost {
     ret: Vec<u8>,
     overlay: BTreeMap<Vec<u8>, Vec<u8>>,
     logs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Store-level growth cap (memory/tables) so grow denials are host-RAM-independent.
+    limits: wasmi::StoreLimits,
+}
+
+/// Consensus memory ceiling for an execution store: caps each linear memory at the page
+/// limit so an over-cap memory.grow fails deterministically (returns -1 on every node)
+/// instead of reaching the host allocator (RAM-dependent → state_root fork).
+fn frame_store_limits() -> wasmi::StoreLimits {
+    wasmi::StoreLimitsBuilder::new()
+        .memory_size(VmLimits::default().max_memory_pages as usize * 65536)
+        .build()
 }
 
 struct FrameResult {
@@ -695,8 +738,10 @@ fn run_frame(
     let host = FrameHost {
         state, me, caller, value, block_height, args,
         ret: Vec::new(), overlay: BTreeMap::new(), logs: Vec::new(),
+        limits: frame_store_limits(),
     };
     let mut store = wasmi::Store::new(&engine, host);
+    store.limiter(|h| &mut h.limits); // deterministic grow denial (see frame_store_limits)
     if store.set_fuel(fuel).is_err() { return dead(0); }
     let mut linker = wasmi::Linker::<FrameHost>::new(&engine);
     if bind_frame_host(&mut linker).is_err() { return dead(fuel); }
@@ -792,6 +837,37 @@ mod tests {
         assert!(validate_wasm_module(&[0, 1, 2, 3, 4, 5], &VmLimits::default()).is_err());
     }
 
+    #[test]
+    fn rejects_unbounded_memory() {
+        // Memory with no declared maximum can grow to the wasm32 ceiling at runtime, where
+        // success depends on host RAM → state_root fork. Deploy validation must reject it.
+        let wasm = wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap();
+        let e = validate_wasm_module(&wasm, &VmLimits::default()).unwrap_err();
+        assert!(matches!(e, VmError::LimitExceeded(_)), "unbounded memory must be rejected, got {:?}", e);
+        // A declared maximum within the page cap is accepted.
+        let ok = wat::parse_str(r#"(module (memory (export "memory") 1 16))"#).unwrap();
+        assert!(validate_wasm_module(&ok, &VmLimits::default()).is_ok());
+        // A declared maximum above the page cap is rejected.
+        let over = wat::parse_str(r#"(module (memory (export "memory") 1 9999))"#).unwrap();
+        assert!(matches!(validate_wasm_module(&over, &VmLimits::default()).unwrap_err(),
+                         VmError::LimitExceeded(_)));
+    }
+
+    #[test]
+    fn rejects_imported_memory_and_table() {
+        // Imported memory/table escape the MemorySection page-cap (the runtime provides neither), so
+        // they must be rejected at deploy — else a nominally-unbounded module could be stored.
+        let mem = wat::parse_str(r#"(module (import "env" "memory" (memory 1)))"#).unwrap();
+        assert!(matches!(validate_wasm_module(&mem, &VmLimits::default()).unwrap_err(),
+                         VmError::LimitExceeded(_)), "imported memory must be rejected");
+        let tbl = wat::parse_str(r#"(module (import "env" "t" (table 1 funcref)))"#).unwrap();
+        assert!(matches!(validate_wasm_module(&tbl, &VmLimits::default()).unwrap_err(),
+                         VmError::LimitExceeded(_)), "imported table must be rejected");
+        // An imported host FUNCTION is still fine.
+        let f = wat::parse_str(r#"(module (import "env" "f" (func)) (memory (export "memory") 1 4))"#).unwrap();
+        assert!(validate_wasm_module(&f, &VmLimits::default()).is_ok());
+    }
+
     // ADD1_WASM = (module (func (export "add1") (param i64) (result i64)
     //                       local.get 0 i64.const 1 i64.add))
     const ADD1_WASM: &[u8] = &[
@@ -837,7 +913,7 @@ mod tests {
         let wasm = wat::parse_str(r#"(module
             (import "env" "storage_write" (func $sw (param i32 i32 i32 i32)))
             (import "env" "emit_log" (func $log (param i32 i32)))
-            (memory (export "memory") 1)
+            (memory (export "memory") 1 16)
             (data (i32.const 0) "keyval")
             (func (export "run")
                 (call $sw (i32.const 0) (i32.const 3) (i32.const 3) (i32.const 3))
@@ -855,7 +931,7 @@ mod tests {
     fn emit_len_wasm(len: usize) -> Vec<u8> {
         wat::parse_str(&format!(r#"(module
             (import "env" "emit_log" (func $log (param i32 i32)))
-            (memory (export "memory") 2)
+            (memory (export "memory") 2 16)
             (func (export "run") (call $log (i32.const 0) (i32.const {}))))"#, len)).unwrap()
     }
 
@@ -888,7 +964,7 @@ mod tests {
         let wasm = wat::parse_str(r#"(module
             (import "env" "storage_read" (func $sr (param i32 i32 i32 i32) (result i32)))
             (import "env" "storage_write" (func $sw (param i32 i32 i32 i32)))
-            (memory (export "memory") 1)
+            (memory (export "memory") 1 16)
             (data (i32.const 0) "srcdst")
             (func (export "run") (local $n i32)
                 (local.set $n (call $sr (i32.const 0) (i32.const 3) (i32.const 64) (i32.const 32)))
@@ -906,7 +982,7 @@ mod tests {
         let wasm = wat::parse_str(r#"(module
             (import "env" "revert" (func $rev (param i32 i32)))
             (import "env" "storage_write" (func $sw (param i32 i32 i32 i32)))
-            (memory (export "memory") 1)
+            (memory (export "memory") 1 16)
             (data (i32.const 0) "keyvalnope")
             (func (export "run")
                 (call $sw (i32.const 0) (i32.const 3) (i32.const 3) (i32.const 3))
@@ -919,7 +995,7 @@ mod tests {
     fn dry_run_is_deterministic() {
         let wasm = wat::parse_str(r#"(module
             (import "env" "storage_write" (func $sw (param i32 i32 i32 i32)))
-            (memory (export "memory") 1)
+            (memory (export "memory") 1 16)
             (data (i32.const 0) "keyval")
             (func (export "run")
                 (call $sw (i32.const 0) (i32.const 3) (i32.const 3) (i32.const 3))))"#).unwrap();

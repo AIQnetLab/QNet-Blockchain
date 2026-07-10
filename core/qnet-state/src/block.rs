@@ -103,6 +103,13 @@ pub struct MicroBlock {
     #[serde(default)]
     pub timeout_round: u64,
 
+    /// #80: bincode 2f+1 TimeoutProof certifying this block's failover round (round>0 only; None on
+    /// the happy path). Excluded from `hash()` — self-authenticating via its own committee
+    /// signatures, so a strip only degrades to the pull path and a forge fails 2f+1 verify. Lets a
+    /// lagging node adopt the certified round in-band. Opaque here; verified in the consensus layer.
+    #[serde(default)]
+    pub timeout_proof: Option<Vec<u8>>,
+
     // v14.7.2: `prev_block_qc` field REMOVED. Microblock BFT safety is
     // delivered by the canonical macroblock commit/reveal path rather
     // than a per-block pipelined QC, so the header no longer needs to
@@ -883,6 +890,8 @@ impl MicroBlock {
             state_root: [0u8; 32],
             // v14.0: Timeout round (default 0 = primary leader)
             timeout_round: 0,
+            // #80: no failover proof on the happy path
+            timeout_proof: None,
         }
     }
 

@@ -4879,6 +4879,8 @@ impl Storage {
                         state_root: efficient_block.state_root,
                         // v14.0: Timeout round for producer authority
                         timeout_round: efficient_block.timeout_round,
+                        // #80: proof lives on the wire (gossip ingest); local read never re-adopts.
+                        timeout_proof: None,
                     };
                     
                     // Serialize as full MicroBlock for network transmission
@@ -5170,6 +5172,8 @@ impl Storage {
             state_root: efficient_block.state_root,
             // v14.0: Timeout round for producer authority
             timeout_round: efficient_block.timeout_round,
+            // #80: proof lives on the wire (gossip ingest); local read never re-adopts.
+            timeout_proof: None,
         };
 
         Ok(Some(microblock))

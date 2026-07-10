@@ -459,19 +459,6 @@ pub fn get_pending_sync_count() -> usize {
 pub static SYNC_PEER_COOLDOWN: Lazy<DashMap<String, (u64, u32)>> =
     Lazy::new(|| DashMap::new());
 
-// Super-node ids whose on-chain NodeActivation has been applied (from state at boot + on each
-// block apply). NOTE: no longer gates sync serving — finalized blocks/macroblocks are public,
-// QC-bound data served to any peer (sync-first, register-second). Kept as the registered-super
-// set for participation-side use (eligibility/reputation), NOT for admission.
-pub static REGISTERED_SUPER_NODES: Lazy<DashMap<String, ()>> = Lazy::new(DashMap::new);
-
-pub fn add_registered_super_node(node_id: String) {
-    REGISTERED_SUPER_NODES.insert(node_id, ());
-}
-
-pub fn is_super_node_registered(node_id: &str) -> bool {
-    REGISTERED_SUPER_NODES.contains_key(node_id)
-}
 
 /// Cool-down window for a peer based on consecutive failure count (seconds).
 /// Failure 1 → 5s, 2 → 15s, 3+ → 45s (capped).
@@ -1267,6 +1254,16 @@ pub fn get_certified_rotation_round(mb_index: u64) -> u64 {
     let baseline = get_baseline_round(mb_index);
     let certified = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
     certified.saturating_sub(baseline)
+}
+
+/// #80: serialized 2f+1 TimeoutProof certifying the current failover round for `mb_index`. The
+/// producer attaches it to a round>0 microblock so a lagging receiver adopts the round in-band
+/// instead of wedging. None on the happy path (no failover round certified). O(1) DashMap read.
+pub fn certified_timeout_proof_bytes(mb_index: u64) -> Option<Vec<u8>> {
+    let abs = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
+    if abs == 0 { return None; }
+    let proof = TIMEOUT_CERTIFICATES.get(&(mb_index, abs))?;
+    bincode::serialize(&*proof).ok()
 }
 
 /// Highest failover round for `mb_index` co-signed by ≥ `support` DISTINCT committee voters
@@ -22426,7 +22423,28 @@ impl SimplifiedP2P {
             println!("[INFO][TIMEOUT] proof_accepted h={} round={} signers={}", height, timeout_round, signers);
         }
     }
-    
+
+    /// #80: adopt a 2f+1 TimeoutProof attached to a round>0 microblock. Verifies + stores it via the
+    /// SAME path as a gossiped proof (distinct committee signers ≥ quorum), advancing
+    /// HIGHEST_CERTIFIED_ROUND so ingest authorises the block in-band — no dependence on the separate
+    /// TC broadcast. Self-authenticating: a forged/insufficient proof is rejected inside and advances
+    /// nothing (the block then falls to the pull path). Idempotent (dedup on (mb_idx, round)).
+    pub fn adopt_timeout_proof_bytes(&self, bytes: &[u8]) {
+        let proof: TimeoutProof = match bincode::deserialize(bytes) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        // DoS bound: the proof is excluded from the block hash, so a relay can swap it. The round
+        // committee is <=1000, so a proof with more votes is malformed — drop it before the O(votes)
+        // dedup/verify loop (verify_timeout_certificate would reject it anyway on the quorum check).
+        const MAX_TC_VOTES: usize = 2048;
+        if proof.votes.len() > MAX_TC_VOTES { return; }
+        let votes: Vec<(String, Vec<u8>)> = proof.votes.into_iter()
+            .map(|v| (v.voter_id, v.signature)).collect();
+        self.handle_timeout_proof_broadcast(proof.height, proof.timeout_round,
+                                            proof.last_block_hash.to_vec(), votes);
+    }
+
     /// Handle request for timeout proofs (for syncing nodes)
     fn handle_timeout_proof_request(&self, from_height: u64, to_height: u64,
                                      _requester_id: &str, requester_addr: &str) {
