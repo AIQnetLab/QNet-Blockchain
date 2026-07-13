@@ -17,8 +17,8 @@ pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 // finality). Threshold = (N*2+2)/3 on every path.
 // N per epoch: mb_idx<=2 -> genesis_node_count() (baked); mb_idx>=3 ->
 // eligible_producers.len() of macroblock (mb_idx-2) [N-2 snapshot, strict,
-// no fallback]. Eligible <= MAX_VALIDATORS=1000; VRF-subsampled to
-// CONSENSUS_COMMITTEE_SIZE=100 when > COMMITTEE_THRESHOLD=120.
+// no fallback]. Eligible <= MAX_VALIDATORS=1000 = the round committee; the BFT
+// committee == the VRF-capped round (COMMITTEE_SIZE==THRESHOLD==1000).
 // Producer & validator MUST derive N from this same per-epoch source on
 // the three agreement paths (pre-round gate / finalize_round_by_number /
 // validate_macroblock) — an honest producer cannot finalize a macroblock
@@ -905,34 +905,31 @@ pub static PRODUCTION_UNLOCKED: AtomicU64 = AtomicU64::new(0);
 /// grace is only STALL_GRACE_SECS (5s). Without a boot window a freshly-restarted node — or a whole
 /// co-restarted cohort — escalates its certified round on a phantom "producer silent" before the real
 /// block can propagate; the inflated round then permanently rejects the network's valid lower-round
-/// blocks (the rolling-upgrade escalation-lock). Escalation is suppressed until the mesh has had time
-/// to form. Normal failover (uptime ≫ grace, at head, producer genuinely silent) is unaffected.
+/// blocks (the rolling-upgrade escalation-lock). Emission is suppressed until the mesh has had time
+/// to form. Normal failover (uptime ≫ grace, meshed, producer genuinely silent) is unaffected.
 pub static NODE_BOOT_WALL: AtomicU64 = AtomicU64::new(0);
+/// Amplified failover window this node adopted (0 = none) + consecutive stuck ticks on it.
+/// Drives the 3-tick resume valve: suppress the own lower key while syncing toward the amplified
+/// window, resume it IN ADDITION if the window's blocks don't arrive (delay, never park).
+static AMPLIFIED_WINDOW: AtomicU64 = AtomicU64::new(0);
+static AMPLIFY_STUCK_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Min validated peers a node must see before it may drive view-change (real quorum reachable).
 pub const TIMEOUT_ESCALATION_MIN_PEERS: usize = 2;
 /// Short post-boot floor before any escalation — guards the first ticks against a mesh-not-yet race.
 pub const TIMEOUT_ESCALATION_BOOT_FLOOR_SECS: u64 = 15;
 
-/// Escalation eligibility (pure, testable, condition-based ⇒ scale-invariant). A node may emit a
-/// timeout-vote (drive its certified rotation round up) ONLY when meshed with a real peer quorum, past
-/// the boot floor, AND caught up to the network head. The head reference is the (f+1)-attested
-/// corroborated tip, NOT the raw monotonic-high peer height: a dead producer's un-appliable in-flight
-/// block, seen by <f+1 peers, must not read as "network ahead" and suppress the survivors' fast
-/// failover. Behind or under-connected ⇒ sync, don't escalate — that is what stops a restarted/
-/// co-restarted cohort from inflating the round and rejecting the network's valid lower-round blocks.
-/// GENESIS bootstrap (our_h==0 AND best_raw==0 ⇒ the whole visible net is still at h0) is failover-
-/// eligible: with no tip to lag there is no higher block to wrongly reject, yet failover IS needed to
-/// route around a first-block producer that never boots. A restarted node with intact storage has
-/// our_h>0 ⇒ excluded (stays gated); a lone fresh joiner to a live net sees best_raw>0 within the boot
-/// floor ⇒ excluded, and could not self-certify a genesis round alone anyway. Gates vote EMISSION only,
-/// never block acceptance ⇒ cannot fork.
-pub fn timeout_escalation_allowed(our_h: u64, corroborated_h: u64, best_raw_h: u64, peer_count: usize, wall_now: u64, boot_wall: u64) -> bool {
-    let meshed = peer_count >= TIMEOUT_ESCALATION_MIN_PEERS;
-    let genesis_bootstrap = our_h == 0 && best_raw_h == 0;
-    let at_head = genesis_bootstrap || (corroborated_h > 0 && our_h + 1 >= corroborated_h);
-    let boot_ok = wall_now.saturating_sub(boot_wall) >= TIMEOUT_ESCALATION_BOOT_FLOOR_SECS;
-    meshed && at_head && boot_ok
-}
+/// Unsealed production allowance in WINDOWS — shared by the production throttle, the failover
+/// suppression gate, and the amplification bound (derived from ONE constant so they cannot drift).
+/// Guarantees macroblock w-2 is sealed for every producible window w.
+pub(crate) const MAX_UNSEALED_WINDOWS: u64 = 2;
+
+/// Max failover round per window before it is a sync/partition problem (chronic-stall), not producer
+/// liveness. Doubles as the ACCEPTANCE bound on the round dimension so a Byzantine committee member
+/// cannot mint unbounded distinct (window, round) vote keys.
+pub const MAX_FAILOVER_ROUND: u64 = 50;
+
+// failover_slot_height REMOVED: the failover vote key derives from the voter's OWN verified tip
+// (window = (tip+1)/90) + f+1 committee-signed amplification — never from a peer-height frontier.
 
 /// v4.6: Track last height at which VRF key was announced to peers
 static LAST_VRF_KEY_ANNOUNCE_HEIGHT: AtomicU64 = AtomicU64::new(0);
@@ -1124,6 +1121,10 @@ pub fn complete_rollback_cleanup(target_height: u64) {
     crate::unified_p2p::clear_all_pending_sync_macroblocks();
     clear_expected_producer_cache_above(target_height);
     PRODUCER_VOTES.retain(|k, _| k.0 < target_height);
+    // Lower the failover view floor to the rolled-back tip's window: the rollback orphaned the
+    // blocks that higher-window TCs referenced, so the node must be able to fail over at its new
+    // tip. Single sink for every rollback path — safe (rollback needs real blocks, never ≤f-forged).
+    crate::unified_p2p::lower_tc_window_floor(target_height / 90);
 }
 
 
@@ -3600,11 +3601,22 @@ impl BlockchainNode {
             // producer-inline path) so the emission recompute reads ≤5 keys, not a 14400-block scan.
             Self::index_light_eligibility_bitmap(storage, h, tx);
 
-            let apply_result = state_guard.apply_transaction_lazy_at(tx, h);
+            // Capture QRC-20 owns-index deltas into the block journal when journaling is on (the
+            // consensus persist path), so the wallet→token reverse index is written in the same batch.
+            let owns_mark = block_snapshot.as_deref().map(|s| s.owns().len());
+            let apply_result = match block_snapshot {
+                Some(ref mut snap) => state_guard.apply_transaction_lazy_at_indexed(tx, h, snap.owns_mut()),
+                None => state_guard.apply_transaction_lazy_at(tx, h),
+            };
             // Take this tx's WASM fuel ONCE, on the same thread, right after apply (resets the slot for
             // the next tx — WASM or not) so the metered fee matches the producer-inline path exactly.
             let tx_wasm_fuel = qnet_state::wasm_exec::take_last_tx_wasm_fuel();
             if let Err(e) = apply_result {
+                // Rejected tx: drop any owns-deltas it partially emitted (its state mutations were
+                // discarded too), keeping the reverse index aligned with committed balances.
+                if let (Some(ref mut snap), Some(mark)) = (block_snapshot.as_mut(), owns_mark) {
+                    snap.owns_mut().truncate(mark);
+                }
                 if is_debug() {
                     println!("[DBG][STATE] tx_skip h={} err={}", h, e);
                 }
@@ -4126,7 +4138,7 @@ impl BlockchainNode {
     /// return None so it fails identically on every node. NEVER pass raw compressed
     /// bytes into parsing (that would diverge per-impl). Absent magic ⇒ stored
     /// uncompressed (see storage save_macroblock), bytes used as-is.
-    fn macroblock_plaintext(raw: Vec<u8>) -> Option<Vec<u8>> {
+    pub(crate) fn macroblock_plaintext(raw: Vec<u8>) -> Option<Vec<u8>> {
         const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
         if raw.len() >= 4 && raw[0..4] == ZSTD_MAGIC {
             zstd::decode_all(&raw[..]).ok()
@@ -4677,23 +4689,20 @@ impl BlockchainNode {
             return all_candidates.to_vec();
         }
 
-        // v15.0: Strict N-2 seed. If this node lacks mb=(N-2) locally it is
-        // behind the chain and MUST NOT improvise a different seed (that
-        // would put it on a different committee from the rest of the honest
-        // validators). Signal by returning the full candidate list — every
-        // similarly-behind honest node returns the same thing — and let the
-        // downstream v2 committee guard (consensus_v2_node)
-        // refuse to proceed until sync catches up.
+        // Strict N-2 seed. A node lacking mb=(N-2) is behind and MUST NOT improvise a seed (divergent
+        // committee → fork). ABSTAIN: return empty so the caller's is_committee_member gate is false and
+        // the node skips participation cleanly (matching committee_for_height None / qualified Vec::new()).
+        // Returning the full uncapped list would make it self-select onto a >cap committee no peer computes.
         let seed: [u8; 32] = match Self::try_load_macroblock_beacon(storage, macroblock_index) {
             Some(s) => s,
             None => {
                 if crate::node::is_warn() {
                     println!(
-                        "[WARN][COMMITTEE] seed_unavailable mb={} — skipping VRF subsample, node behind chain",
+                        "[WARN][COMMITTEE] seed_unavailable mb={} action=abstain node_behind_chain",
                         macroblock_index,
                     );
                 }
-                return all_candidates.to_vec();
+                return Vec::new();
             }
         };
 
@@ -4834,6 +4843,7 @@ impl BlockchainNode {
                 burn_amount: 0,
                 burn_cost: 0,
                 burn_attestors: Vec::new(),
+                attest_epoch: 0,
             },
             data: Some(format!("node_registration:{}:{}:{}:{}", node_id, wallet_address, registration_proof, final_endpoint)),
             dilithium_signature: None,
@@ -7526,6 +7536,10 @@ impl BlockchainNode {
                 // NOTE: block.state_root stores finalize_merkle() output (merkle root),
                 // NOT calculate_state_root() which includes height+total_supply.
                 if replayed > 0 {
+                    // Owns-index (NON-consensus): NOT force-dirtied here. Replay rebuilds in-memory state up
+                    // to the persisted tip, which wallet_token already covers; the durable owns-watermark
+                    // (below) lets the boot gate rebuild ONLY when it actually lags the tip (unclean shutdown
+                    // that lost the last deltas) — no multi-GB rebuild on every clean restart.
                     if let Ok(Some(last_block)) = storage.load_microblock_auto_format(pre_snapshot_chain_height) {
                         if last_block.state_root != [0u8; 32] {
                             let state_guard = state.write().await;
@@ -8677,6 +8691,35 @@ impl BlockchainNode {
                     if count > 0 { println!("[INFO][NODE] roster_index_migrated entries={}", count); }
                 }
                 Err(e) => println!("[WARN][NODE] roster_index_backfill err={}", e),
+            }
+        }
+
+        // Wallet→token index (NON-consensus): rebuild ONLY when it's not current — not built/clean, OR the
+        // durable owns-watermark lags the tip (unclean shutdown lost the last deltas). A clean restart has
+        // watermark == tip → skip the O(contracts) rebuild entirely. Rebuild from the in-memory tip (NOT the
+        // accounts CF, whose replayed tail can lag). Empty state → empty index = truth.
+        let owns_tip = blockchain.storage.get_chain_height().unwrap_or(0);
+        if blockchain.storage.owns_index_built() && blockchain.storage.owns_watermark() >= owns_tip {
+            crate::storage::OWNS_INDEX_READY.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            // Derive only the live owns KEYS under the read guard (no contract_storage clones).
+            let keys: Vec<Vec<u8>> = {
+                let sg = blockchain.state.read().await;
+                let mut keys = Vec::new();
+                for e in sg.accounts.iter() {
+                    if e.value().is_contract {
+                        keys.extend(crate::storage::Storage::owns_index_keys(e.key(), &e.value().contract_storage));
+                    }
+                }
+                keys
+            };
+            match blockchain.storage.rebuild_owns_from_keys(&keys, owns_tip) {
+                Ok(rebuilt) => { if is_info() { println!("[INFO][NODE] owns_index_rebuilt_from_state keys={} up_to={}", rebuilt, owns_tip); } }
+                Err(e) => {
+                    // Leave dirty (READY stays false) so the reader scans and the next boot retries.
+                    blockchain.storage.mark_owns_index_dirty();
+                    println!("[WARN][NODE] owns_index_rebuild_failed err={} action=scan_fallback", e);
+                }
             }
         }
 
@@ -13008,6 +13051,7 @@ impl BlockchainNode {
                                     let our_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                                         
                                         // Send HealthPing via QUIC to establish/refresh connections
+                                        let (hint_mb, hint_round) = crate::unified_p2p::current_tc_hint();
                                         let ping_msg = NetworkMessage::HealthPing {
                                             from: our_node_id.clone(),
                                             timestamp: std::time::SystemTime::now()
@@ -13015,6 +13059,8 @@ impl BlockchainNode {
                                                 .unwrap_or_default()
                                                 .as_secs(),
                                             height: our_height,
+                                            cert_mb: hint_mb,
+                                            cert_round: hint_round,
                                             signature: String::new(),
                                             public_key: String::new(),
                                         };
@@ -13520,97 +13566,98 @@ impl BlockchainNode {
                         // from leader-selection inputs too — both now structurally
                         // impossible.
 
-                        // ROTATION-ROUND TELEMETRY — strict same-round 2f+1 BFT-certified
-                        // rotation round for the current macroblock, reported into the
-                        // operator dashboard surface via
-                        // `update_failover_metrics`. Cheap O(1) DashMap read;
-                        // identical cost from 5 to 10 000 super-nodes.
-                        let current_rotation_round = {
-                            let mb_idx = next_height / 90;
-                            crate::unified_p2p::get_certified_rotation_round(mb_idx)
-                        };
-                        update_failover_metrics(local_delay, current_rotation_round);
-
-                        // Bound the failover round. >MAX consecutive elected producers failing
-                        // to produce in one window is not producer liveness (random VRF placement
-                        // makes 50 consecutive faults impossible) — it's a sync/partition issue.
-                        // Stop climbing the round (runaway: forensic cert_round=3663) and drive
-                        // the chronic-stall recovery path instead. Fixed cap → uniform across nodes.
-                        const MAX_FAILOVER_ROUND: u64 = 50;
-                        let failover_capped = current_rotation_round >= MAX_FAILOVER_ROUND;
-                        if failover_capped {
-                            if is_warn() {
-                                println!("[WARN][TIMEOUT] failover_round_capped round={} cap={} mb={} action=recovery_sync",
-                                         current_rotation_round, MAX_FAILOVER_ROUND, next_height / 90);
-                            }
-                            CHRONIC_STALL_REQUESTED.store(true, Ordering::Relaxed);
-                        }
-
-                        // v23: on slot-leader silent > grace (local_delay > STALL_GRACE_SECS)
-                        // emit a Dilithium3-signed TimeoutVote for the current macroblock at
-                        // round=certified+1. After 2f+1 co-sign the same round the receiver
-                        // aggregator advances HIGHEST_CERTIFIED_ROUND[mb_idx] → every honest node
-                        // computes the SAME fallback leader (pure fn of round + on-chain
-                        // candidates). Throttle LAST_TIMEOUT_EMIT_PER_MB (<=1/grace/mb/node);
-                        // receiver TIMEOUT_VOTES enforces (round,voter) uniqueness. Safety:
-                        // receiver verifies sig vs on-chain PK registry; <=f byzantine can't
-                        // reach 2f+1 (rotation not hijackable). Failover ≈ grace + O(log N) RTT
-                        // (3–8s) « 90s view-change. O(1).
-                        const STALL_GRACE_SECS: u64 = 5;
-
-                        // v23.2: heartbeat-gated timeout-vote emission. Pre-v23.2 the gate fired
-                        // solely on local_delay → self-perpetuating rotation cascade at macroblock
-                        // boundaries (gossip-lagged certs → nodes compute different leaders → none
-                        // produces → loop; observed h=2791). Fix: elected leader broadcasts a
-                        // Dilithium3-signed ProducerHeartbeat 1/s; if the expected producer's
-                        // heartbeat is FRESH (age ≤ HEARTBEAT_SILENT_MS) skip emission — proven
-                        // alive, just slow. Edge: self → never vote vs self; no cached/never-seen
-                        // producer → emit. Safety: heartbeat sig-verified (no forge); a Byzantine
-                        // producer signing-but-not-producing only stalls until the ≤90s macroblock
-                        // view-change routes around it (bounded liveness loss, accepted). O(1),
-                        // 1 msg/s from leader only, identical 5→100k.
-                        const HEARTBEAT_SILENT_MS: u64 = 3_000;
-
-                        // RECOVERY GUARD (restart escalation-lock fix): only escalate timeout_round when
-                        // this node is genuinely AT the network head AND past the post-boot mesh-formation
-                        // window. A node that is BEHIND (can't yet fetch the tip) or freshly (re)started
-                        // (mesh not formed) must SYNC, not vote timeout — escalating there inflates the
-                        // local certified round and makes the node permanently reject the network's valid
-                        // lower-round blocks (the rolling-upgrade stall). "At head + producer genuinely
-                        // silent" is the ONLY legitimate escalation trigger; this changes vote EMISSION
-                        // only, never block acceptance, so it cannot fork. Normal failover (uptime ≫ grace,
-                        // at head) is unaffected; the honest at-head majority still drives view-change.
+                        // CERTIFICATE-ANCHORED FAILOVER. The vote key is a pure function of this
+                        // node's OWN verified chain — never a peer-height sample (eclipse/gossip
+                        // staleness must not split honest keys) — plus f+1 committee-signed window
+                        // amplification (min-target, bounded by the SAME constant as the production
+                        // throttle). Safe: emission never touches acceptance — rotation still needs
+                        // a same-round n−f TC, ingest still gates a round>0 block on
+                        // failover_round_authorized, and a stale restart is fenced by
+                        // production_unlocked + the lbpt cap.
                         let boot_wall = {
                             let b = NODE_BOOT_WALL.load(Ordering::Relaxed);
                             if b == 0 { NODE_BOOT_WALL.store(wall_now, Ordering::Relaxed); wall_now } else { b }
                         };
-                        let our_h_esc = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
-                        // (f+1)-corroborated tip, not raw monotonic-high: a dead producer's un-appliable
-                        // in-flight block (seen by <f+1 peers) must not read as "network ahead" and defer
-                        // the survivors' fast failover to the chronic-stall path.
-                        let corroborated_h_esc = unified_p2p.as_ref().map(|p| p.corroborated_head_ceiling()).unwrap_or(0);
-                        // Raw monotonic-high peer height — used ONLY as a genesis detector (best_raw==0 ⇒
-                        // no peer reports any block yet), never as the at-head reference.
-                        let best_raw_esc = unified_p2p.as_ref().map(|p| p.get_best_peer_height()).unwrap_or(0);
                         let peers_esc = unified_p2p.as_ref().map(|p| p.get_validated_active_peers().len()).unwrap_or(0);
-                        let escalate_ok = timeout_escalation_allowed(our_h_esc, corroborated_h_esc, best_raw_esc, peers_esc, wall_now, boot_wall);
-
-                        // v26 D2: 180s no-progress hard ceiling = the ultimate liveness escape hatch.
-                        // Past it a meshed + past-boot node escalates even WITHOUT (f+1)-corroboration —
-                        // corroborated_h==0 (a storm aged out fresh in-set attestations) can transiently
-                        // block escalate_ok and wedge the round at f=1 (one stale window drops corroboration
-                        // below f+1). A genuinely behind node would have synced within 180s; 180s of ZERO
-                        // progress means the net is stuck for us, so escalation is correct. Rotation still
-                        // needs a 2f+1 TimeoutCertificate — a lone vote cannot rotate the producer, so a
-                        // spurious escape-hatch vote is harmless. Converts a PERMANENT wedge into bounded
-                        // 180s recovery. Node-count-agnostic (5 → 100k).
-                        const D2_PROGRESS_HARD_CEILING_SECS: u64 = 180;
                         let meshed_esc = peers_esc >= TIMEOUT_ESCALATION_MIN_PEERS;
                         let boot_ok_esc = wall_now.saturating_sub(boot_wall) >= TIMEOUT_ESCALATION_BOOT_FLOOR_SECS;
-                        let ceiling_escape = local_delay > D2_PROGRESS_HARD_CEILING_SECS && meshed_esc && boot_ok_esc;
+                        let failover_height = next_height; // own verified tip + 1
+                        let own_w = failover_height / 90;
+                        let tc_floor = crate::unified_p2p::observed_tc_window_floor();
+                        let bound_w = crate::unified_p2p::certified_view_bound_windows();
+                        // f+1 amplification: adopt the LOWEST committee-supported window above own
+                        // (≥1 honest witness proves it real), capped by the producibility bound. Only
+                        // scanned during an actual stall — the scan clones voter ids O(votes), and in
+                        // steady state (no failover) there is nothing to amplify toward.
+                        let amplified_w = if local_delay > STALL_GRACE_SECS {
+                            crate::unified_p2p::lowest_window_with_support(own_w)
+                                .filter(|w| bound_w == u64::MAX || *w <= bound_w.saturating_add(1))
+                        } else { None };
+                        // 3-tick resume valve: while syncing toward an amplified window suppress the
+                        // own lower key; if its blocks don't arrive, resume the own key IN ADDITION
+                        // (cross-key voting is legal) — but never below the TC floor (monotonicity:
+                        // once a window certified, no honest vote re-enters a lower window).
+                        let (mb_idx, also_emit_own_w) = match amplified_w {
+                            Some(w) => {
+                                let prev = AMPLIFIED_WINDOW.swap(w, Ordering::Relaxed);
+                                let ticks = if prev == w {
+                                    AMPLIFY_STUCK_TICKS.fetch_add(1, Ordering::Relaxed) + 1
+                                } else {
+                                    AMPLIFY_STUCK_TICKS.store(0, Ordering::Relaxed);
+                                    0
+                                };
+                                if is_warn() {
+                                    println!("[WARN][TIMEOUT] window_amplified from={} to={} floor={} ticks={}",
+                                             own_w, w, tc_floor, ticks);
+                                }
+                                let own_ok = ticks >= 3 && own_w >= tc_floor && own_w < w;
+                                (w.max(tc_floor), if own_ok { Some(own_w) } else { None })
+                            }
+                            None => {
+                                AMPLIFIED_WINDOW.store(0, Ordering::Relaxed);
+                                AMPLIFY_STUCK_TICKS.store(0, Ordering::Relaxed);
+                                (own_w.max(tc_floor), None)
+                            }
+                        };
+                        // A slot beyond the seal throttle is a FINALITY stall, not a producer stall
+                        // — no rotation can fill it; checkpoint-BFT must advance the seal instead.
+                        // Same max(seal, QC-frontier) base and skip-at-zero as the throttle itself.
+                        let seal_base = storage.last_sealed_mb_index().saturating_mul(90)
+                            .max(qc_verified_frontier_cached());
+                        let seal_throttled = seal_base > 0
+                            && failover_height > seal_base + MAX_UNSEALED_WINDOWS * 90;
+                        if seal_throttled && is_warn() {
+                            println!("[WARN][PROD] failover_suppressed reason=seal_throttle h={} seal_base={}",
+                                     failover_height, seal_base);
+                        }
+                        // Same-round 2f+1 certified rotation round for the FRONTIER macroblock — the sole
+                        // rotation input, identical on every node once the round cert propagates.
+                        let failover_round = crate::unified_p2p::get_certified_rotation_round(mb_idx);
+                        update_failover_metrics(local_delay, failover_round);
 
-                        if local_delay > STALL_GRACE_SECS && production_unlocked && !failover_capped && (escalate_ok || ceiling_escape) {
-                            let mb_idx = next_height / 90;
+                        // Bound the failover round: >MAX faults in one window is a sync/partition issue, not
+                        // producer liveness — stop climbing (runaway forensic cert_round=3663) and drive the
+                        // chronic-stall recovery instead. Keyed on the SAME frontier mb the vote uses.
+                        let failover_capped = failover_round >= MAX_FAILOVER_ROUND;
+                        if failover_capped {
+                            if is_warn() {
+                                println!("[WARN][TIMEOUT] failover_round_capped round={} cap={} mb={} action=recovery_sync",
+                                         failover_round, MAX_FAILOVER_ROUND, mb_idx);
+                            }
+                            CHRONIC_STALL_REQUESTED.store(true, Ordering::Relaxed);
+                        }
+
+                        // Silent-leader grace, heartbeat-freshness threshold, and 180s no-progress hard ceiling.
+                        const STALL_GRACE_SECS: u64 = 5;
+                        const HEARTBEAT_SILENT_MS: u64 = 3_000;
+                        const D2_PROGRESS_HARD_CEILING_SECS: u64 = 180;
+
+                        // On slot-leader silent > grace: emit a Dilithium3 TimeoutVote for (mb_idx, certified+1).
+                        // n−f co-signs advance HIGHEST_CERTIFIED_ROUND[mb_idx] → every node re-elects the same
+                        // fallback leader. Exponentially-paced per mb/node; receiver verifies sig + window
+                        // committee + anchor + voter-dedup; TC only at n−f (≤f Byzantine cannot rotate).
+                        if local_delay > STALL_GRACE_SECS && production_unlocked && !failover_capped
+                            && meshed_esc && boot_ok_esc && !seal_throttled {
                             let now_u64 = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -13628,10 +13675,14 @@ impl BlockchainNode {
                             // Deterministic leader (pure fn of height+certified round+candidates),
                             // not the evictable cache: chronic-stall clears the cache, which left the
                             // failover with expected=- and unable to re-elect a producer for the gap.
-                            let expected_producer = Some(Self::select_microblock_producer_with_round(
-                                next_height, &unified_p2p, &node_id, node_type, Some(&storage), &poh,
-                                current_rotation_round,
-                            ).await).filter(|p| !p.is_empty());
+                            // Own-window only: for an amplified (higher) target the local expected-
+                            // producer is meaningless — no suppression, no miss-recording there.
+                            let expected_producer = if mb_idx == own_w {
+                                Some(Self::select_microblock_producer_with_round(
+                                    failover_height, &unified_p2p, &node_id, node_type, Some(&storage), &poh,
+                                    failover_round,
+                                ).await).filter(|p| !p.is_empty())
+                            } else { None };
 
                             // v26 D2: heartbeat/self may only DELAY view-change,
                             // never veto it indefinitely. Suppression honoured only
@@ -13651,9 +13702,9 @@ impl BlockchainNode {
                                             Some("self_expected")
                                         }
                                         Some(p) => {
-                                            // Suppress only if the producer's heartbeat is FRESH and it is
-                                            // targeting our stalled slot (advertised slot_height >= next_height).
-                                            // An alive-but-stuck-below producer (targeting a lower slot — the
+                                            // Suppress only if the producer's heartbeat is FRESH and targeting
+                                            // the frontier slot (advertised slot_height >= failover_height). An
+                                            // alive-but-stuck-below producer (targeting a lower slot — the
                                             // common onboarding/desync case) is NOT suppressed ⇒ fast fail-over.
                                             // A producer lying about slot_height is still bounded by the 180s
                                             // progress ceiling above.
@@ -13661,7 +13712,7 @@ impl BlockchainNode {
                                                 .map(|age_ms| age_ms <= HEARTBEAT_SILENT_MS)
                                                 .unwrap_or(false);
                                             let targeting_our_slot = crate::unified_p2p::last_remote_producer_heartbeat_height(p)
-                                                .map(|h| h >= next_height)
+                                                .map(|h| h >= failover_height)
                                                 .unwrap_or(false);
                                             if fresh && targeting_our_slot {
                                                 Some("heartbeat_fresh")
@@ -13685,22 +13736,24 @@ impl BlockchainNode {
                                         .unwrap_or(-1);
                                     println!(
                                         "[INFO][TIMEOUT] emit_suppressed h={} mb={} expected={} hb_age_ms={} delay={}s reason={}",
-                                        next_height, mb_idx,
+                                        failover_height, mb_idx,
                                         expected_producer.as_deref().unwrap_or("-"),
                                         hb_age, local_delay, reason
                                     );
                                 }
                             } else {
-                                // Heartbeat stale OR no cache: proceed with the
-                                // existing per-mb throttle to bound network spam
-                                // (one signed broadcast per STALL_GRACE_SECS per
-                                // node per macroblock).
+                                // Heartbeat stale OR no cache: exponential re-emit pacing per mb —
+                                // tau(rel_round) ≈ 5s·1.5^round capped at 128s, reset naturally on
+                                // progress (round/mb change). Guarantees growing honest overlap
+                                // under unknown post-GST delay without burning MAX_FAILOVER_ROUND.
+                                const TAU_SECS: [u64; 9] = [5, 7, 11, 16, 25, 38, 56, 85, 128];
+                                let tau = TAU_SECS[failover_round.min(8) as usize];
                                 let should_emit = {
                                     let last = LAST_TIMEOUT_EMIT_PER_MB
                                         .get(&mb_idx)
                                         .map(|v| *v)
                                         .unwrap_or(0);
-                                    now_u64.saturating_sub(last) >= STALL_GRACE_SECS
+                                    now_u64.saturating_sub(last) >= tau
                                 };
                                 if should_emit {
                                     LAST_TIMEOUT_EMIT_PER_MB.insert(mb_idx, now_u64);
@@ -13712,7 +13765,7 @@ impl BlockchainNode {
                                             .unwrap_or(-1);
                                         println!(
                                             "[INFO][TIMEOUT] emit_microblock_vote h={} mb={} cert_round={} delay={}s expected={} hb_age_ms={} reason=primary_silent",
-                                            next_height, mb_idx, current_rotation_round,
+                                            failover_height, mb_idx, failover_round,
                                             local_delay,
                                             expected_producer.as_deref().unwrap_or("-"),
                                             hb_age
@@ -13736,23 +13789,31 @@ impl BlockchainNode {
                                         if !expected_id.is_empty() && expected_id != &node_id {
                                             let _ = crate::unified_p2p::record_validator_miss(
                                                 expected_id,
-                                                next_height,
+                                                failover_height,
                                             );
                                         }
                                     }
 
-                                    // Re-use the macroblock view-change emission helper:
-                                    // it signs `TIMEOUT:{mb_idx}:{cert+1}:{hash}` and
-                                    // broadcasts via `broadcast_timeout_vote`, which is
-                                    // the same path the macroblock-boundary view-change
-                                    // uses. Receivers aggregate identically; rotation
-                                    // advances on 2f+1 supermajority.
+                                    // Canonical emission helper: signs the QNET_TIMEOUT_V2 payload
+                                    // and broadcasts via `broadcast_timeout_vote` — the same path
+                                    // the macroblock-boundary view-change uses.
                                     Self::emit_macroblock_view_change_vote(
                                         mb_idx.saturating_mul(90),
                                         &node_id,
                                         &unified_p2p,
                                         Some(&storage),
                                     ).await;
+                                    // Resume valve: amplified-window sync stalled ≥3 ticks — emit
+                                    // the own-window key IN ADDITION (delay, never park; the TC
+                                    // floor above keeps this from re-entering a certified window).
+                                    if let Some(own_w) = also_emit_own_w {
+                                        Self::emit_macroblock_view_change_vote(
+                                            own_w.saturating_mul(90),
+                                            &node_id,
+                                            &unified_p2p,
+                                            Some(&storage),
+                                        ).await;
+                                    }
                                 }
                             }
                         }
@@ -13910,6 +13971,13 @@ impl BlockchainNode {
                                             _ => {}
                                         }
 
+                                        // Owns-index (NON-consensus): orphaned blocks advanced the durable
+                                        // watermark past rollback_to (incl. Clears for holdings the canonical
+                                        // chain restores). Mark dirty INSIDE the barrier so a crash before the
+                                        // heal loop forces a boot rebuild — else watermark>=tip skips it and the
+                                        // reader under-reports those holdings forever. Cleared on heal success.
+                                        storage.mark_owns_index_dirty();
+
                                         crate::storage::end_rollback_protection();
 
                                         // Clear stale caches
@@ -13936,14 +14004,46 @@ impl BlockchainNode {
                                             let tip = crate::node::qc_verified_frontier_height()
                                                 .max(p2p.get_best_peer_height());
                                             match storage.fast_sync_with_snapshot(p2p, tip, &state).await {
+                                                // fast_sync's promote rebuilds owns; the block_sync fallback
+                                                // doesn't — mark dirty so the next boot re-derives it.
                                                 Ok(()) => println!("[INFO][STATE] clean_state_sync_ok target={}", tip),
-                                                Err(se) => println!("[WARN][STATE] clean_state_sync_failed err={:?} fallback=block_sync", se),
+                                                Err(se) => {
+                                                    storage.mark_owns_index_dirty();
+                                                    println!("[WARN][STATE] clean_state_sync_failed err={:?} fallback=block_sync action=owns_dirty", se);
+                                                }
                                             }
                                         } else {
                                             println!(
                                                 "[INFO][STATE] reconcile_after_pipeline_fork_ok target={}",
                                                 rollback_to,
                                             );
+                                            // Heal the NON-consensus wallet→token reverse index against the
+                                            // reconciled truth. Owns-deltas are a best-effort background write
+                                            // that is NOT rolled back, so an orphaned block's flushed Clear for a
+                                            // balance the reorg restores would leave the pair missing → the reader
+                                            // under-reports it (the tail resync only re-emits 0→nonzero, not the
+                                            // rollback baseline holdings). Re-derive from the authoritative
+                                            // in-memory contracts (the accounts CF is best-effort/stale here);
+                                            // stale entries left behind are balance-rechecked away by the reader.
+                                            // Sibling of cbw/registry_lthash rebuild. Rare path, O(live holders).
+                                            let owns_heal: Vec<(String, std::collections::HashMap<String, String>)> = {
+                                                let sg = state.read().await;
+                                                sg.accounts.iter()
+                                                    .filter(|e| e.value().is_contract)
+                                                    .map(|e| (e.key().clone(), e.value().contract_storage.clone()))
+                                                    .collect()
+                                            };
+                                            let mut healed = 0usize;
+                                            let mut heal_ok = true;
+                                            for (contract, cs) in &owns_heal {
+                                                if storage.resync_owns_for_contract(contract, cs).is_ok() { healed += 1; }
+                                                else { heal_ok = false; }
+                                            }
+                                            // Full heal → re-stamp built+clean at the rolled-back tip (clears the
+                                            // dirty mark set above, watermark==tip → boot skips rebuild). Any Err
+                                            // leaves it dirty so the next boot rebuilds.
+                                            if heal_ok { let _ = storage.set_owns_index_built(rollback_to); }
+                                            if is_info() { println!("[INFO][FORK] owns_index_resynced contracts={} to={} clean={}", healed, rollback_to, heal_ok); }
                                         }
 
                                         println!("[INFO][FORK] rollback_ok to={} deleted={} blocks",
@@ -14766,7 +14866,7 @@ impl BlockchainNode {
                 // Committed-state-derived ⇒ every node pauses at the same height.
                 {
                     const MAX_UNFINALIZED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
-                    const MAX_UNSEALED_BLOCKS: u64 = 2 * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                    const MAX_UNSEALED_BLOCKS: u64 = MAX_UNSEALED_WINDOWS * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
                     let last_finalized = LAST_FINALIZED_CONSENSUS_ROUND.load(Ordering::SeqCst);
                     let last_sealed = try_get_storage()
                         .map(|s| s.last_sealed_mb_index().saturating_mul(90))
@@ -16434,6 +16534,9 @@ impl BlockchainNode {
                     let mut applied_reg_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
                     // total_supply as-of this head, captured under the same lock that minted it (A2 seal below).
                     let producer_supply_head: u64;
+                    // QRC-20 owns-index deltas for THIS producer's block — collected under the state lock,
+                    // persisted AFTER the block is durably saved (below), so the watermark never leads the tip.
+                    let mut block_owns: Vec<qnet_state::OwnsDelta> = Vec::new();
                     {
                         let state_guard = state.write().await;
 
@@ -16450,7 +16553,6 @@ impl BlockchainNode {
                         // SAME way the validator does in apply_block_to_state so both credit the identical
                         // total (no reward / state_root divergence between producer and validators).
                         let mut block_wasm_fuel_fees: u64 = 0;
-
                         // 1. Apply all transactions
                         for tx in &txs {
                             // Index Light eligibility bitmaps via the SHARED helper (byte-identical to
@@ -16507,11 +16609,14 @@ impl BlockchainNode {
                             // producer's state_root from every validator (apply_block_to_state uses _at(h)).
                             // clear→apply→drain brackets THIS tx's WASM logs on one thread (see block_logs).
                             qnet_state::wasm_exec::clear_wasm_logs();
-                            let apply_result = state_guard.apply_transaction_lazy_at(tx, next_block_height);
+                            let owns_mark = block_owns.len();
+                            let apply_result = state_guard.apply_transaction_lazy_at_indexed(tx, next_block_height, &mut block_owns);
                             // Take this tx's WASM fuel ONCE, same thread, right after apply (resets the
                             // slot for the next tx) — byte-identical to the validator apply path.
                             let tx_wasm_fuel = qnet_state::wasm_exec::take_last_tx_wasm_fuel();
                             if let Err(e) = apply_result {
+                                // Rejected tx: drop any owns-deltas it emitted (its mutations were discarded).
+                                block_owns.truncate(owns_mark);
                                 if is_warn() {
                                     println!("[WARN][STATE] producer_tx_apply_failed hash={} err={}", tx.hash, e);
                                 }
@@ -16541,6 +16646,11 @@ impl BlockchainNode {
                         if !block_logs.is_empty() {
                             let _ = storage.save_block_logs(next_block_height, &block_logs);
                         }
+
+                        // Owns-index (NON-consensus): persisted AFTER the block is durably saved (see the
+                        // save-ok branch below), mirroring the validator pipeline — else a crash between
+                        // apply and save would leave the durable watermark ahead of the tip and the boot
+                        // gate would skip the rebuild over a block that never landed.
 
                         // Epoch-boundary super reward-eligibility snapshot (same fn as the apply path).
                         Self::populate_super_elig_at_boundary(&state_guard, &*storage, next_block_height);
@@ -17025,6 +17135,17 @@ impl BlockchainNode {
                             height_for_storage,
                             std::sync::atomic::Ordering::Release,
                         );
+
+                        // Owns-index (NON-consensus): now that block H is durable, persist its deltas +
+                        // advance the durable watermark — same after-save order as the validator pipeline,
+                        // so the watermark never leads the tip. Watermark advances on EVERY block (empty
+                        // too) else it stalls on a token-quiet producer. On failure mark dirty (reader scans).
+                        if block_owns.is_empty() {
+                            let _ = storage.set_owns_watermark(height_for_storage);
+                        } else if storage.persist_owns_deltas(&block_owns, height_for_storage).is_err() {
+                            storage.mark_owns_index_dirty();
+                        }
+
                         if is_info() {
                             println!("[INFO][STORAGE] block_saved h={} state_root={}",
                                      height_for_storage, hex::encode(&microblock.state_root[..8]));
@@ -21065,36 +21186,71 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         storage: Option<&Arc<Storage>>,
     ) {
         let Some(p2p) = unified_p2p else { return; };
-        if round_id == 0 || round_id % 90 != 0 {
-            // Only macroblock rounds have view changes
+        // round_id == 0 is VALID: window 0 (heights 1..89) fails over with the fixed genesis-5
+        // committee and a zero anchor — no special genesis mechanics.
+        if round_id % 90 != 0 {
             return;
         }
         let mb_index = round_id / 90;
 
-        // Base = certified+1 (consensus-visible, identical on every node). f+1 amplification:
-        // also jump to the highest round ≥1 honest validator already reached, so a node lagging
-        // by the certified-round offset reconverges instead of voting certified+1 forever. The cap
-        // is the failover-round ceiling enforced by the caller; leader election still reads only the
-        // n-f-certified round, so amplifying the TARGET cannot cause dual production.
+        // Window-monotonic floor (anti-double-TC): once ANY window certified, never vote below it —
+        // resuming a lower key would let ≤f cross-window Byzantine votes certify two adjacent windows.
+        if mb_index < crate::unified_p2p::observed_tc_window_floor() {
+            if is_info() {
+                println!("[INFO][TIMEOUT] emit_suppressed mb={} reason=below_tc_floor floor={}",
+                         mb_index, crate::unified_p2p::observed_tc_window_floor());
+            }
+            return;
+        }
+
+        // Window-keyed committee (identical on every node). Refuse-and-fetch: without the sealed
+        // anchor macroblock we cannot sign a countable vote — pull it and vote next tick (it
+        // provably exists network-wide for any producible window).
+        let committee = match crate::unified_p2p::failover_committee_for_window(mb_index) {
+            Some(c) => c,
+            None => {
+                p2p.request_window_anchor(mb_index); // actually pull the anchor; vote next tick
+                if is_warn() {
+                    println!("[WARN][TIMEOUT] emit_deferred mb={} reason=anchor_absent action=fetch", mb_index);
+                }
+                return;
+            }
+        };
+        // Non-committee members don't vote: receivers drop the vote anyway, and at 100k supers
+        // with a 1000-committee the wasted flood would be the dominant stall traffic.
+        if !committee.contains(node_id) {
+            return;
+        }
+        let anchor = match crate::unified_p2p::sealed_anchor_for_window(mb_index) {
+            Some(a) => a,
+            None => { p2p.request_window_anchor(mb_index); return; } // committee cached but anchor bytes absent — pull
+        };
+
+        // Base = certified+1 (consensus-visible, identical on every node). f+1 round amplification:
+        // jump to the highest round ≥1 honest validator already reached. Leader election still reads
+        // only the n−f-certified round, so amplifying the TARGET cannot cause dual production.
         let current_cert = p2p.get_highest_certified_round(mb_index);
-        let n = p2p.get_active_validator_count();
-        let f = if n > 0 { (n - 1) / 3 } else { 0 };
+        let f = committee.len().saturating_sub(1) / 3;
         let observed = crate::unified_p2p::highest_failover_round_with_support(mb_index, f + 1);
         let next_round = current_cert.saturating_add(1).max(observed);
 
-        // Anchor the vote to the latest macroblock hash for cryptographic
-        // binding. Falls back to zeros at genesis before any macroblock exists.
-        let last_block_hash: [u8; 32] = match storage {
-            Some(s) => s.get_latest_macroblock_hash().unwrap_or([0u8; 32]),
-            None => [0u8; 32],
+        // Voter's own sync state: last sealed macroblock (high_qc) + verified tip — hints and
+        // accountability inside the signed payload; never quorum-read by verifiers.
+        let (high_qc_idx, high_qc_hash, tip_height, tip_hash) = match storage {
+            Some(s) => {
+                let qc_idx = s.last_sealed_mb_index();
+                let qc_hash = if qc_idx > 0 { s.get_latest_macroblock_hash().unwrap_or([0u8; 32]) } else { [0u8; 32] };
+                let tip = s.get_chain_height().unwrap_or(0);
+                let tip_h = if tip > 0 {
+                    crate::block_pipeline::lookup_block_hash(tip).unwrap_or([0u8; 32])
+                } else { [0u8; 32] };
+                (qc_idx, qc_hash, tip, tip_h)
+            }
+            None => (0, [0u8; 32], 0, [0u8; 32]),
         };
 
-        // Canonical signing payload — MUST match the format
-        // `handle_timeout_vote` verifies on the receiving side.
-        let vote_msg = format!(
-            "TIMEOUT:{}:{}:{}",
-            mb_index, next_round, hex::encode(&last_block_hash)
-        );
+        let vote_msg = crate::unified_p2p::timeout_vote_message(
+            mb_index, next_round, &anchor, high_qc_idx, &high_qc_hash, tip_height, &tip_hash);
 
         let crypto = match try_get_quantum_crypto() {
             Some(c) => c,
@@ -21108,13 +21264,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         match crypto.create_consensus_signature(node_id, &vote_msg).await {
             Ok(sig) => {
                 if is_info() {
-                    println!("[INFO][MB-VIEW] view_change_vote mb={} round={} cert_was={}",
-                             mb_index, next_round, current_cert);
+                    println!("[INFO][MB-VIEW] view_change_vote mb={} round={} cert_was={} tip={}",
+                             mb_index, next_round, current_cert, tip_height);
                 }
                 p2p.broadcast_timeout_vote(
                     mb_index,
                     next_round,
-                    last_block_hash,
+                    anchor,
+                    high_qc_idx,
+                    high_qc_hash,
+                    tip_height,
+                    tip_hash,
                     sig.signature.as_bytes().to_vec(),
                 );
             }
@@ -23090,11 +23250,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         height: u64,
         storage: &crate::storage::Storage,
     ) -> Result<(), QNetError> {
-        let (node_id, node_type, wallet, reg_proof, burn_tx, burn_amount, burn_cost, attestors) = match &tx.tx_type {
+        let (node_id, node_type, wallet, reg_proof, burn_tx, burn_amount, burn_cost, attest_epoch, attestors) = match &tx.tx_type {
             qnet_state::TransactionType::NodeRegistration {
-                node_id, node_type, wallet_address, registration_proof, burn_tx, burn_amount, burn_cost, burn_attestors, ..
+                node_id, node_type, wallet_address, registration_proof, burn_tx, burn_amount, burn_cost, attest_epoch, burn_attestors, ..
             } => (node_id.as_str(), node_type, wallet_address.as_str(), registration_proof.as_str(),
-                  burn_tx.as_str(), *burn_amount, *burn_cost, burn_attestors),
+                  burn_tx.as_str(), *burn_amount, *burn_cost, *attest_epoch, burn_attestors),
             _ => return Ok(()), // only NodeRegistration is gated
         };
 
@@ -23139,25 +23299,40 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         }
 
-        // Recompute the exact message the committee signed (incl. the attested cost); count DISTINCT
-        // valid committee sigs.
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, wallet, burn_amount, node_type, burn_cost);
+        // M-5: the committee is resolved at attest_epoch — the epoch the ATTESTORS used — not the apply
+        // height, so an arm-tip/apply-height straddle across an epoch boundary can't mismatch committees.
+        // Bound attest_epoch: present, not in the future, and recent (≤MAX_ATTEST_EPOCH_LAG epochs old).
+        // Recency is the ONLY needed guard: a quorum (n−f) of ANY recent committee attesting an immutable
+        // external burn is as authoritative as a larger one (committee size never lowers the honest-majority
+        // bar), and ≤2 epochs bounds retroactive compromise. NO genesis-downgrade check — it would strand a
+        // genesis-era-armed reg that lands post-genesis (the committee is still genesis-derived there) while
+        // guarding no real threat.
+        const MAX_ATTEST_EPOCH_LAG: u64 = 2;
+        let apply_epoch = height.saturating_sub(1) / 90 + 1;
+        if attest_epoch == 0 || attest_epoch > apply_epoch {
+            return Err(QNetError::ValidationError(
+                "burn_attestation_required: attest_epoch missing or in the future".to_string()));
+        }
+        if apply_epoch > attest_epoch + MAX_ATTEST_EPOCH_LAG {
+            return Err(QNetError::ValidationError(
+                "burn_attestation_required: attest_epoch stale (re-arm against the current committee)".to_string()));
+        }
+        let attest_genesis_era = attest_epoch <= 2;
 
-        // Attestor set = the deterministic consensus committee for THIS registration's epoch.
-        // Post-genesis: the N-2 VRF committee (committee_for_height). Genesis era (no N-2 snapshot
-        // yet): the genesis nodes — the ONLY consensus participants then, so the committee simply IS
-        // the genesis set. Threshold = quorum_size (n−f), the same quorum consensus uses. PK comes
+        // Recompute the exact message the committee signed (incl. attested cost AND attest_epoch); count
+        // DISTINCT valid committee sigs.
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, wallet, burn_amount, node_type, burn_cost, attest_epoch);
+
+        // Committee = the deterministic consensus committee OF attest_epoch. committee_for_height is
+        // epoch-constant, so the epoch's first height resolves the same set every node computes. PK comes
         // from on-chain state, NOT the RAM registry (deterministic + forge-proof; see bound verify).
-        // Genesis era (epochs 1-2, no N-2 snapshot) ⇒ the committee IS the genesis set — decided by
-        // HEIGHT (deterministic on every node). CRITICAL: a POST-genesis None means THIS node is
-        // BEHIND (can't read N-2), NOT that the committee is genesis. Falling back to the genesis set
-        // there would let a lagging node validate against 5 genesis while synced nodes use the real
-        // committee → block-validity divergence (FORK). So post-genesis-without-committee ⇒ REJECT:
-        // the node resyncs and re-validates once N-2 is present (it stalls, never forks).
-        let genesis_era = (height.saturating_sub(1) / 90 + 1).saturating_sub(2) == 0;
+        // Genesis era (attest_epoch ≤ 2, no N-2 snapshot) ⇒ the committee IS the genesis set. A POST-genesis
+        // None means THIS node is BEHIND (can't read N-2) ⇒ REJECT (resync, re-validate once N-2 present;
+        // it stalls, never forks) — falling to the genesis set would diverge from synced validators.
+        let attest_rep_height = attest_epoch.saturating_sub(1) * 90 + 1;
         let committee: Option<std::collections::HashSet<String>> =
-            Self::committee_for_height(storage, height).map(|v| v.into_iter().collect());
-        if committee.is_none() && !genesis_era {
+            Self::committee_for_height(storage, attest_rep_height).map(|v| v.into_iter().collect());
+        if committee.is_none() && !attest_genesis_era {
             return Err(QNetError::ValidationError(
                 "burn_attestation_required: N-2 committee unavailable (node behind chain; resync)".to_string()));
         }
@@ -23226,10 +23401,30 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     /// burn_tx is bound to ONE qnet wallet (per-genesis off-chain dedup): an honest genesis refuses
     /// to attest a reused burn for a second node, so with ≤f Byzantine genesis a reused burn can
     /// never reach the on-chain 2f+1 quorum verified by verify_burn_attestation_quorum.
+    /// True iff THIS node is in the consensus committee OF `attest_epoch` (deterministic, epoch-keyed —
+    /// committee_for_height is epoch-constant). Genesis era (attest_epoch ≤ 2): the genesis set. The
+    /// burn-attestor signs for the epoch the registrant BINDS, resolved here, so a member still attests
+    /// correctly across a boundary where its own tip has already advanced past that epoch.
+    pub fn is_committee_attestor_for_epoch(&self, attest_epoch: u64) -> bool {
+        let rep_h = attest_epoch.saturating_sub(1) * 90 + 1;
+        match Self::committee_for_height(&self.storage, rep_h) {
+            Some(c) => c.iter().any(|id| id == &self.node_id),
+            None => crate::genesis_constants::is_legacy_genesis_node(&self.node_id),
+        }
+    }
+
     pub fn sign_burn_attestation(
-        &self, burn_tx: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType, cost: u64,
+        &self, burn_tx: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType, cost: u64, attest_epoch: u64,
     ) -> Option<(String, String)> {
-        if !self.is_genesis_attestor() { return None; }
+        // M-5: attest for the epoch the registrant will BIND (not own tip). Bound recent vs own tip so a
+        // stale/forged epoch can't solicit a signature, and only if THIS node is in that epoch's committee.
+        const MAX_ATTEST_EPOCH_LAG: u64 = 2;
+        let own_epoch = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+            .load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1) / 90 + 1;
+        if attest_epoch == 0 || attest_epoch > own_epoch + 1 || own_epoch > attest_epoch + MAX_ATTEST_EPOCH_LAG {
+            return None;
+        }
+        if !self.is_committee_attestor_for_epoch(attest_epoch) { return None; }
         // One burn → one wallet, PERSISTED (survives process restart; the prior in-memory map was
         // wiped on restart, letting one burn back >1 node). Genesis-local, off-chain.
         match self.storage.attested_burn_get(burn_tx) {
@@ -23237,9 +23432,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             Ok(Some(_)) => {}                                 // same wallet ⇒ idempotent re-attest
             _ => { let _ = self.storage.attested_burn_put(burn_tx, qnet_wallet); }
         }
-        // Sign the cost the caller computed + verified against the real on-Solana burn. Bound INTO the
-        // message so the on-chain verifier trusts it by signature, never by re-reading Solana.
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, qnet_wallet, amount, &node_type, cost);
+        // Sign the cost the caller computed + verified against the real on-Solana burn, plus attest_epoch.
+        // Bound INTO the message so the on-chain verifier trusts them by signature, never re-reading Solana.
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, qnet_wallet, amount, &node_type, cost, attest_epoch);
         let sig = self.wallet_identity.as_ref()?.sign_consensus(&self.node_id, msg.as_bytes()).ok()?;
         Some((self.node_id.clone(), sig))
     }
@@ -23257,12 +23452,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     pub async fn collect_burn_attestations(
         burn_tx: &str, solana_wallet: &str, qnet_wallet: &str, amount: u64, node_type: qnet_state::NodeType,
         cost: u64, storage: &crate::storage::Storage,
-    ) -> (Vec<(String, String)>, u64, u64) {
+    ) -> (Vec<(String, String)>, u64, u64, u64) {
         let nt = match node_type { qnet_state::NodeType::Light => "light", _ => "super" };
         // Attestor set = the consensus committee for the current tip (genesis era ⇒ the genesis set,
         // the only members then). need = quorum_size(committee) — exactly what the verifier requires,
         // so a gathered set actually passes whether the network is at genesis or scaled past 120.
         let tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        // M-5: pin the attestation to epoch(arm_tip); every attestor signs THIS epoch and the registrant
+        // binds it, so the apply-time verifier resolves the SAME committee (no arm/apply straddle).
+        let attest_epoch = tip.saturating_sub(1) / 90 + 1;
         let committee: Vec<String> = match Self::committee_for_height(storage, tip) {
             Some(c) => c,
             None => crate::genesis_constants::GENESIS_NODE_IPS.iter()
@@ -23270,14 +23468,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         };
         let need = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
         let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30)).build() { Ok(c) => c, Err(_) => return (Vec::new(), cost, amount) };
+            .timeout(std::time::Duration::from_secs(30)).build() { Ok(c) => c, Err(_) => return (Vec::new(), cost, amount, attest_epoch) };
         // Carry the cost+amount as advisory hints; each attestor RECOMPUTES the cost from its own Solana
         // read and reads the ACTUAL on-Solana burned amount, signing ONLY its own (cost, amount) pair
         // (returned below), so a forged hint cannot lower the binding cost nor the embedded amount.
+        // attest_epoch is authoritative: each attestor signs it (bound in the message) and self-checks
+        // membership in that epoch's committee.
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "node_attestBurn",
             "params": { "burn_tx": burn_tx, "solana_wallet": solana_wallet,
-                        "qnet_wallet": qnet_wallet, "amount": amount, "node_type": nt, "cost": cost }
+                        "qnet_wallet": qnet_wallet, "amount": amount, "node_type": nt, "cost": cost,
+                        "attest_epoch": attest_epoch }
         });
         // Group sigs by the (cost, amount) PAIR each attestor signed; the embedded registration cost AND
         // amount are exactly what the quorum shares, so keep only the pair-bucket that first reaches
@@ -23305,13 +23506,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let bucket = by_pair.entry((signed_cost, signed_amount)).or_default();
             bucket.push((gid.to_string(), sig.to_string()));
             if bucket.len() >= need {
-                return (bucket.clone(), signed_cost, signed_amount);
+                return (bucket.clone(), signed_cost, signed_amount, attest_epoch);
             }
         }
         // No (cost, amount) bucket reached quorum — return the largest bucket + its pair so the caller can
         // log got/need and retry (e.g. a 10% boundary split, or attestors disagreeing on the amount).
         by_pair.into_iter().max_by_key(|(_, v)| v.len())
-            .map(|((c, a), v)| (v, c, a)).unwrap_or_else(|| (Vec::new(), cost, amount))
+            .map(|((c, a), v)| (v, c, a, attest_epoch)).unwrap_or_else(|| (Vec::new(), cost, amount, attest_epoch))
     }
 
     /// PRODUCTION v2.19.25: Validate and add transaction received from P2P network
@@ -24020,7 +24221,26 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         state.get_balance_with_proof(address)
             .ok_or_else(|| QNetError::StateError(format!("Account not found: {}", address)))
     }
-    
+
+    /// V2: two-level trustless proof that `holder`'s balance in QRC-20 `contract` is committed in state_root.
+    pub async fn get_token_balance_with_proof(&self, contract: &str, holder: &str) -> Result<qnet_state::TokenBalanceProof, QNetError> {
+        // Level-1 under a SHORT read guard: only O(1) metadata + the O(log N) account-leaf proof + an O(1)
+        // accounts handle — the full contract_storage is NEVER cloned under the lock. Level-2 re-reads
+        // storage OFF the consensus lock (via the accounts handle) so a whale-token clone+build never stalls
+        // apply, and builds from a PRIVATE tree so it can never poison the shared apply-path storage cache.
+        let (partial, accounts, store, need_disk) = {
+            let state = self.state.read().await;
+            state.token_proof_level1(contract)
+        }.ok_or_else(|| QNetError::StateError(format!("Token contract not provable: {}", contract)))?;
+        let contract = contract.to_string();
+        let holder = holder.to_string();
+        tokio::task::spawn_blocking(move || {
+            StateManager::token_proof_level2(partial, &contract, &holder, accounts, store, need_disk)
+        }).await
+            .map_err(|e| QNetError::StateError(format!("proof build join: {}", e)))?
+            .ok_or_else(|| QNetError::StateError("Token balance not provable".to_string()))
+    }
+
     pub async fn get_stats(&self) -> Result<serde_json::Value, QNetError> {
         let height = self.get_height().await;
         let peer_count = self.get_peer_count().await?;
@@ -24684,9 +24904,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 }
             }
         }
-        let verified = qc.verify(&committee, |voter, body, sig| match std::str::from_utf8(sig) {
-            Ok(s) => p2p.verify_consensus_signature(voter, &format!("QNET_BFT2_VOTE:{}", hex::encode(body)), s),
-            Err(_) => false,
+        // C-2: qc.sigs are pk-stripped (compact). Resolve each signer's pk from on-chain committee state
+        // (deterministic + process-uniform: vrf_pk row, else the binary-pinned genesis anchor — NEVER the
+        // RAM registry, which is idle-evicted/TOFV ⇒ a fork source in a consensus verifier). Pre-resolved
+        // into a Sync map because the per-sig check runs inside QuorumCertificate::verify's rayon par_iter.
+        let pk_map: std::collections::HashMap<String, Vec<u8>> = qc.signers.iter().filter_map(|id| {
+            match storage.load_vrf_public_key(id) {
+                Ok(Some(p)) => Some((id.clone(), p)),
+                _ => crate::genesis_constants::get_genesis_anchor_pk(id).map(|p| (id.clone(), p)),
+            }
+        }).collect();
+        let verified = qc.verify(&committee, |voter, body, sig| {
+            let pk = match pk_map.get(voter) { Some(p) => p, None => return false };
+            match std::str::from_utf8(sig) {
+                Ok(s) => qnet_consensus::consensus_crypto::verify_consensus_signature_compact(
+                    voter, &format!("QNET_BFT2_VOTE:{}", hex::encode(body)), s, pk),
+                Err(_) => false,
+            }
         }).is_ok();
         if !verified {
             return Err(format!("v2_qc_invalid mb={} signers={} committee={}", index, qc.signers.len(), committee.len()));
@@ -25785,10 +26019,25 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         // is the committee-certified agreed_amount (== what the counted 2f+1 signed), so an
                         // honest over-burn (declared < actual) still verifies. For the exact-burn case
                         // (declared == actual) agreed_amount == b_amt ⇒ identical registration as before.
-                        let (attestors, agreed_cost, agreed_amount) = Self::collect_burn_attestations(
+                        let (attestors, agreed_cost, agreed_amount, agreed_epoch) = Self::collect_burn_attestations(
                             &b_tx, &solana_wallet, &wallet_address, b_amt, qnt, cost_hint, &self.storage).await;
-                        let need = qnet_consensus::checkpoint_bft::quorum_size(
-                            crate::genesis_constants::genesis_node_count());
+                        // Arm gate = quorum of the committee OF agreed_epoch — the SAME committee the
+                        // attestors signed for and the on-chain verifier re-resolves (M-5), so the local
+                        // `need` EXACTLY matches the verifier's threshold (no arm/apply straddle). Genesis
+                        // era ⇒ the genesis set; post-genesis None ⇒ this node can't read that epoch's N-2
+                        // committee ⇒ abort/retry (never arm bytes the verifier rejects forever).
+                        let arm_genesis_era = agreed_epoch <= 2;
+                        let arm_rep_h = agreed_epoch.saturating_sub(1) * 90 + 1;
+                        let arm_committee_len = match Self::committee_for_height(&self.storage, arm_rep_h) {
+                            Some(c) => c.len(),
+                            None if arm_genesis_era => crate::genesis_constants::genesis_node_count(),
+                            None => {
+                                eprintln!("[WARN][REG] burn_attest_committee_unavailable epoch={} — can't read N-2 committee; retrying arm after resync", agreed_epoch);
+                                return Err(QNetError::NetworkError(format!(
+                                    "burn_attest_committee_unavailable epoch={}", agreed_epoch)));
+                            }
+                        };
+                        let need = qnet_consensus::checkpoint_bft::quorum_size(arm_committee_len);
                         if attestors.len() < need {
                             // Sub-quorum ⇒ ABORT the arm (return Err) so the single-owner onboarding driver
                             // re-collects fresh attestations against the current committee next tick. Arming a
@@ -25800,9 +26049,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 "burn_attest_sub_quorum got={} need={}", attestors.len(), need)));
                         }
                         if let qnet_state::TransactionType::NodeRegistration {
-                            burn_tx: bt, burn_amount: ba, burn_cost: bc, burn_attestors: at, ..
+                            burn_tx: bt, burn_amount: ba, burn_cost: bc, burn_attestors: at, attest_epoch: ae, ..
                         } = &mut registration_tx.tx_type {
-                            *bt = b_tx; *ba = agreed_amount; *bc = agreed_cost; *at = attestors;
+                            *bt = b_tx; *ba = agreed_amount; *bc = agreed_cost; *at = attestors; *ae = agreed_epoch;
                         }
                     }
                 }
@@ -27599,52 +27848,32 @@ mod tests {
         }
     }
 
-    // Restart escalation-lock fix: a node must NOT escalate timeout_round while behind the head or
-    // during the post-boot mesh-formation window. This is what stopped rolling upgrades from stalling.
+    // Failover vote key = pure fn of the voter's OWN verified tip (window = (tip+1)/90); spread
+    // tips converge via f+1 committee-signed window amplification (tested in unified_p2p), never
+    // via a peer-height sample. The order statistic survives only as a SYNC-HINT oracle.
     #[test]
-    fn timeout_escalation_gate() {
-        let boot = 1_000u64;
-        let after = boot + super::TIMEOUT_ESCALATION_BOOT_FLOOR_SECS;   // boot floor elapsed
-        let during = after - 1;                                        // still in boot floor
-        let np = super::TIMEOUT_ESCALATION_MIN_PEERS;                   // meshed peer count
-        use super::timeout_escalation_allowed as ok;
-        // ok(our_h, corroborated_h, best_raw_h, peer_count, wall_now, boot_wall)
+    fn failover_key_is_own_tip_windowed() {
+        // Converged tips (chain stopped ⇒ gossip equalizes within one delay) ⇒ identical window key.
+        let tip = 4080u64;
+        for _node in 0..5 { assert_eq!((tip + 1) / 90, 45, "converged tips ⇒ one (window) key"); }
+        // Deep-inside-window spread (incident 4065..4079) ⇒ STILL one key: same window.
+        for local_tip in [4065u64, 4069, 4072, 4075, 4079] {
+            assert_eq!((local_tip + 1) / 90, 45, "same window despite spread tips");
+        }
+        // Boundary straddle (4049 vs 4050) ⇒ adjacent windows; convergence is f+1 amplification
+        // (min-target) + TC-floor monotonicity — NOT any shared height sample.
+        assert_eq!((4049u64 + 1) / 90, 45);
+        assert_eq!((4050u64 + 1) / 90, 45);
+        assert_eq!((4139u64 + 1) / 90, 46, "next window starts at target 4140");
 
-        // BEHIND the head ⇒ never escalate (must sync), even meshed and long after boot.
-        assert!(!ok(97_650, 97_739, 97_739, np, after + 5_000, boot), "behind node must not escalate");
-
-        // Heard the live net but no f+1 corroboration (thin/stale) ⇒ never escalate — the scale gate.
-        assert!(!ok(50, 0, 97_739, np, after, boot), "no quorum-attested tip on a live net must not escalate");
-        assert!(!ok(97_739, 97_739, 97_739, np - 1, after, boot), "too few peers ⇒ no quorum, no escalate");
-
-        // Still in the boot floor ⇒ don't escalate yet.
-        assert!(!ok(97_739, 97_739, 97_739, np, during, boot), "boot floor blocks first ticks");
-
-        // Meshed + at head + past boot floor ⇒ legitimate failover escalation allowed.
-        assert!(ok(97_739, 97_739, 97_739, np, after, boot), "meshed + at head ⇒ escalate ok");
-        assert!(ok(97_739, 97_740, 97_740, np, after, boot), "1 behind (block in flight) counts as at-head");
-        assert!(ok(97_739, 97_739, 97_739, np + 50, after, boot), "more peers still ok");
-
-        // Dead-producer liveness (F1): survivors at the (f+1)-corroborated tip STILL escalate even though
-        // a lone peer's RAW height is higher — the at-head reference is corroborated_h, not best_raw, so
-        // the un-appliable in-flight block never reads as "network ahead".
-        assert!(ok(97_739, 97_739, 100_000, np, after + 200, boot), "phantom-high raw ⇒ fast failover preserved");
-
-        // >1 behind the corroborated tip is NOT at-head ⇒ genuine catch-up, must sync.
-        assert!(!ok(97_738, 97_740, 97_740, np, after, boot), ">1 behind must sync, not escalate");
-
-        // GENESIS bootstrap (our_h==0 AND best_raw==0 ⇒ whole visible net at h0): failover-eligible so a
-        // dead first-block producer can be routed around; still gated by peers + boot floor.
-        assert!(ok(0, 0, 0, np, after, boot), "genesis bootstrap ⇒ first-block failover allowed");
-        assert!(!ok(0, 0, 0, np - 1, after, boot), "genesis but too few peers ⇒ no escalate");
-        assert!(!ok(0, 0, 0, np, during, boot), "genesis but in boot floor ⇒ no escalate");
-
-        // RE-OPEN GUARDS — the genesis branch must NOT let a behind node escalate:
-        // (a) restarted node with intact storage, transient corroborated==0 AND best_raw==0 at boot, but
-        //     our_h>0 ⇒ NOT genesis ⇒ stays gated (this is exactly the restart escalation-lock bug).
-        assert!(!ok(97_740, 0, 0, np, after + 5_000, boot), "restarted high-our_h with raw=0 must stay gated");
-        // (b) fresh joiner to a live net: our_h==0 but best_raw>0 (heard the tip) ⇒ NOT genesis ⇒ sync.
-        assert!(!ok(0, 97_800, 97_800, np, after, boot), "fresh joiner to live net must sync, not escalate");
+        // Hint oracle (clamp_overclaim / sync targeting ONLY): lone-liar and thin-sample safety.
+        use crate::unified_p2p::frontier_order_statistic as fos;
+        let sample = vec![4053u64, 4051, 4049, 4049, 4049, 4049];
+        assert_eq!(fos(sample.clone()), 4051, "(f+1)-th highest hint");
+        let mut rot = sample.clone(); rot.rotate_left(3);
+        assert_eq!(fos(rot), 4051, "order-independent");
+        assert_eq!(fos(vec![]), 0, "no corroborators ⇒ no hint");
+        assert_eq!(fos(vec![9_000_000u64, 4050]), 0, "thin sample ⇒ no hint (no lone-liar steer)");
     }
 
     // lhb_ liveness index == body scan, byte-identical (Phase-2A eligibility feeds epoch_commitment;
@@ -28235,17 +28464,50 @@ mod tests {
         c.extend_from_slice(pk);
         format!("dilithium_sig_{}_{}", genesis_id, general_purpose::STANDARD.encode(&c))
     }
-    // Default: cost == amount (the at-cost case). Use burn_reg_tx_cost to set an explicit cost.
+
+    // C-2 QC-sig compaction KAT: a full-format vote sig strips to a smaller compact sig that verifies
+    // against the committee-resolved pk (the exact node QC-verify path), and every tamper rejects. This
+    // is the headless proof the strip↔compact-verify round-trip is byte-correct (the live mobile client
+    // is pk-agnostic + already verifies against the committee pk; still cross-check byte-exact when live).
+    #[test]
+    fn c2_qc_sig_compaction_roundtrip() {
+        use qnet_consensus::consensus_crypto::{strip_embedded_pk, verify_consensus_signature_compact};
+        let (pk, sk) = burn_gen_genesis("genesis_node_001");
+        let msg = "QNET_BFT2_VOTE:deadbeefcafe";
+        let full = burn_sign("genesis_node_001", &pk, &sk, msg);
+        let compact = strip_embedded_pk(&full).expect("full-format sig must strip");
+        assert!(compact.len() < full.len(), "compact sig is smaller (embedded pk dropped)");
+        assert!(verify_consensus_signature_compact("genesis_node_001", msg, &compact, &pk),
+            "compact verify with the correct committee pk + message must pass");
+        // Every tamper rejects: wrong message, wrong pk, wrong claimed id.
+        assert!(!verify_consensus_signature_compact("genesis_node_001", "QNET_BFT2_VOTE:00", &compact, &pk));
+        let (other_pk, _) = burn_gen_genesis("genesis_node_002");
+        assert!(!verify_consensus_signature_compact("genesis_node_001", msg, &compact, &other_pk));
+        assert!(!verify_consensus_signature_compact("genesis_node_002", msg, &compact, &pk), "id in string must match");
+        // Idempotent: an already-compact sig is not re-strippable (no double-strip forming bad qc.sigs).
+        assert!(strip_embedded_pk(&compact).is_none(), "compact sig must not re-strip");
+        // A non-dilithium_sig_ envelope (e.g. a Byzantine pq_bin: vote) is not strippable ⇒ the driver
+        // drops it so it can never lock an unverifiable leaf into the QC (finality-stall guard).
+        assert!(strip_embedded_pk("pq_bin:AAAA").is_none(), "non-dilithium_sig_ envelope must not strip");
+        // The compact verifier rejects a FULL-format sig (exact [sig_len][SignedMessage] length is enforced).
+        assert!(!verify_consensus_signature_compact("genesis_node_001", msg, &full, &pk),
+            "compact verifier must reject a full (pk-trailer) sig");
+    }
+    // Default: cost == amount (at-cost), attest_epoch=1 (genesis committee at the GATE=0 height). Use
+    // burn_reg_tx_cost for an explicit cost, burn_reg_tx_epoch for a non-genesis attest_epoch.
     fn burn_reg_tx(reg_proof: &str, burn_tx: &str, amount: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
-        burn_reg_tx_full("super_test", reg_proof, burn_tx, amount, amount, attestors)
+        burn_reg_tx_full("super_test", reg_proof, burn_tx, amount, amount, attestors, 1)
+    }
+    fn burn_reg_tx_epoch(reg_proof: &str, burn_tx: &str, amount: u64, attestors: Vec<(String, String)>, attest_epoch: u64) -> qnet_state::Transaction {
+        burn_reg_tx_full("super_test", reg_proof, burn_tx, amount, amount, attestors, attest_epoch)
     }
     fn burn_reg_tx_cost(reg_proof: &str, burn_tx: &str, amount: u64, cost: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
-        burn_reg_tx_full("super_test", reg_proof, burn_tx, amount, cost, attestors)
+        burn_reg_tx_full("super_test", reg_proof, burn_tx, amount, cost, attestors, 1)
     }
     fn burn_reg_tx_id(node_id: &str, reg_proof: &str, burn_tx: &str, amount: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
-        burn_reg_tx_full(node_id, reg_proof, burn_tx, amount, amount, attestors)
+        burn_reg_tx_full(node_id, reg_proof, burn_tx, amount, amount, attestors, 1)
     }
-    fn burn_reg_tx_full(node_id: &str, reg_proof: &str, burn_tx: &str, amount: u64, cost: u64, attestors: Vec<(String, String)>) -> qnet_state::Transaction {
+    fn burn_reg_tx_full(node_id: &str, reg_proof: &str, burn_tx: &str, amount: u64, cost: u64, attestors: Vec<(String, String)>, attest_epoch: u64) -> qnet_state::Transaction {
         let mut tx = qnet_state::Transaction {
             hash: String::new(), from: "walletA".to_string(), to: None, amount: 0, nonce: 0,
             gas_price: 0, gas_limit: 0, timestamp: 1000, signature: None, public_key: None,
@@ -28259,6 +28521,7 @@ mod tests {
                 burn_amount: amount,
                 burn_cost: cost,
                 burn_attestors: attestors,
+                attest_epoch,
             },
             data: None, dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
         };
@@ -28285,7 +28548,7 @@ mod tests {
         let burn_tx = "solBurnSig123";
         let amount = 1500u64;
         let cost = 1500u64; // default helper sets cost==amount; the signed message must carry it
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super, cost);
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super, cost, 1);
         let a1 = ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg));
         let a2 = ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg));
         let a3 = ("genesis_node_003".to_string(), burn_sign("genesis_node_003", &pk3, &sk3, &msg));
@@ -28337,7 +28600,7 @@ mod tests {
         // message with burn_amount >= cost ⇒ ACCEPT. The committee attested 1350, the joiner paid 1350.
         let burn_tx7 = "solBurnSig7";
         let cost7 = 1350u64;
-        let msg7 = qnet_state::Transaction::burn_attestation_message(burn_tx7, "walletA", cost7, &qnet_state::NodeType::Super, cost7);
+        let msg7 = qnet_state::Transaction::burn_attestation_message(burn_tx7, "walletA", cost7, &qnet_state::NodeType::Super, cost7, 1);
         let q7: Vec<(String, String)> = vec![
             ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg7)),
             ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg7)),
@@ -28353,7 +28616,7 @@ mod tests {
         let burn_tx8 = "solBurnSig8";
         let cost8 = 1500u64;
         let under = 300u64;
-        let msg8 = qnet_state::Transaction::burn_attestation_message(burn_tx8, "walletA", under, &qnet_state::NodeType::Super, cost8);
+        let msg8 = qnet_state::Transaction::burn_attestation_message(burn_tx8, "walletA", under, &qnet_state::NodeType::Super, cost8, 1);
         let q8: Vec<(String, String)> = vec![
             ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg8)),
             ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg8)),
@@ -28362,6 +28625,22 @@ mod tests {
         ];
         let tx8 = burn_reg_tx_cost("burn", burn_tx8, under, cost8, q8);
         assert!(BlockchainNode::verify_burn_attestation_quorum(&tx8, GATE, &storage).await.is_err(), "under-cost burn must reject (amount < attested cost)");
+
+        // (9) M-5 transition (no downgrade-strand): a genesis-era attestation (attest_epoch=2) whose reg
+        // lands in EARLY post-genesis (apply height 210 ⇒ epoch 3) MUST still ACCEPT — the committee is
+        // genesis-derived there, the ≤2-epoch recency window covers it, and there is no downgrade guard to
+        // permanently reject a legit genesis-era-armed registration (would strand the on-Solana burn).
+        let burn_tx9 = "solBurnSig9";
+        let msg9 = qnet_state::Transaction::burn_attestation_message(burn_tx9, "walletA", amount, &qnet_state::NodeType::Super, amount, 2);
+        let q9: Vec<(String, String)> = vec![
+            ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg9)),
+            ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg9)),
+            ("genesis_node_003".to_string(), burn_sign("genesis_node_003", &pk3, &sk3, &msg9)),
+            ("genesis_node_004".to_string(), burn_sign("genesis_node_004", &pk4, &sk4, &msg9)),
+        ];
+        let tx9 = burn_reg_tx_epoch("burn", burn_tx9, amount, q9, 2);
+        assert!(BlockchainNode::verify_burn_attestation_quorum(&tx9, 210, &storage).await.is_ok(),
+            "genesis-era attestation landing in early post-genesis must accept (no downgrade-strand)");
     }
 
     // Fork-fix coverage: at a POST-genesis height with no locally-readable N-2 macroblock, verify
@@ -28383,16 +28662,16 @@ mod tests {
         storage.save_vrf_public_key("genesis_node_004", &hex::encode(&pk4)).unwrap();
         let burn_tx = "solBurnSigPG";
         let amount = 1500u64;
-        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super, amount);
+        let msg = qnet_state::Transaction::burn_attestation_message(burn_tx, "walletA", amount, &qnet_state::NodeType::Super, amount, 4);
         let attest = vec![
             ("genesis_node_001".to_string(), burn_sign("genesis_node_001", &pk1, &sk1, &msg)),
             ("genesis_node_002".to_string(), burn_sign("genesis_node_002", &pk2, &sk2, &msg)),
             ("genesis_node_003".to_string(), burn_sign("genesis_node_003", &pk3, &sk3, &msg)),
             ("genesis_node_004".to_string(), burn_sign("genesis_node_004", &pk4, &sk4, &msg)),
         ];
-        let tx = burn_reg_tx("burn", burn_tx, amount, attest);
-        // height 300 ⇒ epoch 4 ⇒ N-2 = macroblock idx 2, ABSENT in this fresh storage ⇒ committee None,
-        // post-genesis ⇒ MUST reject (not genesis-fallback-accept).
+        let tx = burn_reg_tx_epoch("burn", burn_tx, amount, attest, 4);
+        // height 300 ⇒ epoch 4; attest_epoch=4 ⇒ N-2 = macroblock idx 2, ABSENT in this fresh storage ⇒
+        // committee None, post-genesis ⇒ MUST reject (not genesis-fallback-accept).
         assert!(BlockchainNode::verify_burn_attestation_quorum(&tx, 300, &storage).await.is_err(),
             "post-genesis without N-2 committee must REJECT, not fall back to the genesis set");
     }

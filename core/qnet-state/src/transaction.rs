@@ -14,6 +14,16 @@ use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU8, Ordering};
 use once_cell::sync::Lazy;
 
+/// QRC-20 wallet→token ownership transition emitted by apply, drained by the persist layer into the
+/// wallet_token reverse index (NON-consensus, never in state_root). Set = a holder's balance went
+/// 0→nonzero for a contract; Clear = nonzero→0. Keyed on the HOLDER in `balance:{holder}`, not the
+/// tx sender (transferFrom credits `to` and drains `from`, neither of which is the spender).
+#[derive(Debug, Clone)]
+pub enum OwnsDelta {
+    Set { wallet: String, contract: String },
+    Clear { wallet: String, contract: String },
+}
+
 /// v3.35: Conditional logging -- only log in DEBUG/INFO mode, not in production hot path
 /// Controlled by LOG_LEVEL env var (default: "info")
 /// 0=none, 1=error, 2=warn, 3=info, 4=debug
@@ -386,7 +396,7 @@ pub enum TransactionType {
         /// Phase-1 proof-of-burn carrier. The external Solana 1DEV burn is non-deterministic (live
         /// RPC) and cannot be re-checked in apply, so the burn fact is brought ON-CHAIN as a committee
         /// quorum: `burn_attestors` carries ≥2f+1 distinct committee Dilithium signatures over
-        /// `burn_attestation_message(burn_tx, wallet_address, burn_amount, node_type, burn_cost)`,
+        /// `burn_attestation_message(burn_tx, wallet_address, burn_amount, node_type, burn_cost, attest_epoch)`,
         /// re-verified from these bytes at block validation (deterministic, snapshot-independent).
         /// Empty for genesis identities (registration_proof=="genesis") and when the gate is inactive.
         #[serde(default)]
@@ -400,6 +410,12 @@ pub enum TransactionType {
         /// (committee_id, dilithium_sig) attestation quorum. Verified, never trusted blindly.
         #[serde(default)]
         burn_attestors: Vec<(String, String)>,
+        /// Epoch whose consensus committee produced `burn_attestors` (== epoch(arm_tip) at collection).
+        /// Bound into the signed message so the apply-time verifier resolves the SAME committee the
+        /// attestors used — closes the arm-tip/apply-height straddle (M-5). Verifier bounds it recent
+        /// and forbids a genesis-committee downgrade for a post-genesis registration.
+        #[serde(default)]
+        attest_epoch: u64,
     },
 
     /// Create new account
@@ -1026,6 +1042,11 @@ impl Transaction {
                 // the lazy path regardless of the caller-supplied tx.to.
                 let derived = derive_contract_address(&self.from, self.nonce);
                 if !addresses.contains(&derived) { addresses.push(derived); }
+                // A QRC-20 deploy with initial_supply>0 charges the deployer a storage-rent deposit INTO
+                // the escrow. It MUST be in the lazy working set (same as ContractCall) — else merge-back
+                // clobbers the real escrow with a fresh balance-0 one, burning every accrued deposit.
+                let escrow = STORAGE_RENT_ESCROW_ADDR.to_string();
+                if !addresses.contains(&escrow) { addresses.push(escrow); }
             }
             _ => {} // Other types only touch tx.from / tx.to
         }
@@ -1087,14 +1108,16 @@ impl Transaction {
     /// identical bytes and every validator recomputes the identical message at block validation —
     /// no float / locale / map-iteration input. Binds the burn tx, beneficiary wallet, amount, node
     /// type AND the required Phase-1 cost, so a quorum signature is valid for exactly one
-    /// (burn, wallet, amount, type, cost) tuple. The `cost` lives INSIDE the 2f+1-signed message so
-    /// every validator agrees on it by signature-verification, never by re-reading Solana.
-    pub fn burn_attestation_message(burn_tx: &str, wallet: &str, amount: u64, node_type: &NodeType, cost: u64) -> String {
+    /// (burn, wallet, amount, type, cost, attest_epoch) tuple. The `cost` lives INSIDE the 2f+1-signed
+    /// message so every validator agrees on it by signature-verification, never by re-reading Solana.
+    /// `attest_epoch` = the epoch whose committee attested (M-5): bound in so the apply-time verifier
+    /// resolves the SAME committee the attestors used, closing the arm-tip/apply-height straddle.
+    pub fn burn_attestation_message(burn_tx: &str, wallet: &str, amount: u64, node_type: &NodeType, cost: u64, attest_epoch: u64) -> String {
         let nt: u8 = match node_type {
             NodeType::Super => 0,
             NodeType::Light => 1,
         };
-        format!("burn_attest:{}:{}:{}:{}:{}", burn_tx, wallet, amount, nt, cost)
+        format!("burn_attest:{}:{}:{}:{}:{}:{}", burn_tx, wallet, amount, nt, cost, attest_epoch)
     }
 
     /// Deterministic Phase-1 super/light activation cost in whole 1DEV, computed with INTEGER math so
@@ -1923,11 +1946,21 @@ impl Transaction {
     /// (block height 0). The WASM VM's get_block_height reads the threaded height, so
     /// the consensus block-apply path calls `apply_to_state_at` with the real height.
     pub fn apply_to_state(&self, accounts: &mut HashMap<String, Account>) -> Result<(), StateError> {
-        self.apply_to_state_at(accounts, 0)
+        let mut owns = Vec::new();
+        self.apply_to_state_at_indexed(accounts, 0, &mut owns)
     }
 
-    /// Apply transaction to state at a known block height (threaded to the WASM host).
+    /// Apply at a known block height (threaded to the WASM host). Discards owns-index deltas; the
+    /// consensus persist path calls `apply_to_state_at_indexed` to capture them for the reverse index.
     pub fn apply_to_state_at(&self, accounts: &mut HashMap<String, Account>, block_height: u64) -> Result<(), StateError> {
+        let mut owns = Vec::new();
+        self.apply_to_state_at_indexed(accounts, block_height, &mut owns)
+    }
+
+    /// Apply at a known height, collecting QRC-20 owns-index deltas (Set/Clear on 0↔nonzero balance
+    /// transitions) so the persist layer maintains the wallet→token reverse index in the SAME batch.
+    /// owns is NON-consensus (never in state_root) — a stale/wrong index self-heals via boot backfill.
+    pub fn apply_to_state_at_indexed(&self, accounts: &mut HashMap<String, Account>, block_height: u64, owns: &mut Vec<OwnsDelta>) -> Result<(), StateError> {
         // SECURITY: Out-of-gas check — reject TX if compute_gas_used() > gas_limit
         // System TXs (gas_limit=0, gas_used=0) are exempt
         if self.gas_limit > 0 {
@@ -2287,7 +2320,11 @@ impl Transaction {
                         let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         let symbol = parsed.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
                         let decimals = parsed.get("decimals").and_then(|v| v.as_u64()).unwrap_or(9);
-                        let initial_supply = parsed.get("initial_supply").and_then(|v| v.as_u64()).unwrap_or(0);
+                        // Accept number OR numeric string (a large supply as a JSON number loses precision
+                        // past 2^53 on JS clients; the string form is exact). Absent/malformed ⇒ 0.
+                        let initial_supply = parsed.get("initial_supply")
+                            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
+                            .unwrap_or(0);
                         // Supply is IMMUTABLE by default: mint/burn stay disabled unless the deployer
                         // explicitly opts in. Absent flag ⇒ false, so an unset field can never enable them.
                         let mintable = parsed.get("mintable").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -2306,6 +2343,10 @@ impl Transaction {
                         // adjust it, each 1:1 with the balance delta via checked arithmetic. Conservative
                         // ops (transfer/transferFrom/approve) must NEVER write it.
                         contract.contract_storage.insert("total_supply".to_string(), initial_supply.to_string());
+                        // Lifetime emission accounting: total_minted seeds at the initial supply, total_burned
+                        // at 0; mint/burn advance them 1:1 ⇒ invariant total_supply == total_minted − total_burned.
+                        contract.contract_storage.insert("total_minted".to_string(), initial_supply.to_string());
+                        contract.contract_storage.insert("total_burned".to_string(), "0".to_string());
                         // Creator receives initial supply — ON-CHAIN balance. Materialize (and charge
                         // the refundable deposit for) the balance entry ONLY when non-zero: a zero entry
                         // is pointless, and an unbacked entry whose later removal refunds would drain the
@@ -2316,6 +2357,7 @@ impl Transaction {
                                 format!("balance:{}", self.from), initial_supply.to_string()
                             );
                             deployer_deposit_entries = 1;
+                            owns.push(OwnsDelta::Set { wallet: self.from.clone(), contract: contract_address.clone() });
                         }
                         
                         if is_info_log() {
@@ -2448,9 +2490,7 @@ impl Transaction {
                 }
 
                 // v3.40: Execute QRC-20 operations ON-CHAIN (deterministic on all nodes)
-                let is_qrc20 = accounts.get(&contract_addr)
-                    .and_then(|c| c.contract_storage.get("type"))
-                    .map(|t| t == "qrc20").unwrap_or(false);
+                let is_qrc20 = accounts.get(&contract_addr).map(|c| c.is_qrc20()).unwrap_or(false);
                 // QRC-721 (NFT) dispatch — parallel to qrc20, keyed on the same contract_storage["type"].
                 let is_qrc721 = accounts.get(&contract_addr)
                     .and_then(|c| c.contract_storage.get("type"))
@@ -2511,6 +2551,7 @@ impl Transaction {
                                     // New recipient entry ⇒ charge refundable deposit before writing it.
                                     if to_is_new {
                                         charge_storage_deposit(accounts, &sender_addr, 1)?;
+                                        owns.push(OwnsDelta::Set { wallet: to.to_string(), contract: contract_addr.clone() });
                                     }
 
                                     // Debit from_key first.
@@ -2528,6 +2569,7 @@ impl Transaction {
                                     if from_key != to_key && new_from_bal == 0 {
                                         accounts.get_mut(&contract_addr).unwrap().contract_storage.remove(&from_key);
                                         refund_storage_deposit(accounts, &sender_addr, 1)?;
+                                        owns.push(OwnsDelta::Clear { wallet: sender_addr.clone(), contract: contract_addr.clone() });
                                     }
 
                                     if is_info_log() {
@@ -2620,6 +2662,7 @@ impl Transaction {
                                     };
                                     if to_is_new {
                                         charge_storage_deposit(accounts, &sender_addr, 1)?;
+                                        owns.push(OwnsDelta::Set { wallet: to.to_string(), contract: contract_addr.clone() });
                                     }
 
                                     // ALIASING-SAFE DEBIT-THEN-CREDIT-WITH-REREAD: debit from_key, then re-read
@@ -2636,6 +2679,7 @@ impl Transaction {
                                     if from_key != to_key && new_from_bal == 0 {
                                         accounts.get_mut(&contract_addr).unwrap().contract_storage.remove(&from_key);
                                         refund_storage_deposit(accounts, &sender_addr, 1)?;
+                                        owns.push(OwnsDelta::Clear { wallet: from.to_string(), contract: contract_addr.clone() });
                                     }
                                     // Allowance decrement (checked); allowance keys are never deposit-refunded
                                     // here — only balance entries participate in the zero→remove refund path.
@@ -2692,6 +2736,7 @@ impl Transaction {
                                     };
                                     if to_is_new {
                                         charge_storage_deposit(accounts, &sender_addr, 1)?;
+                                        owns.push(OwnsDelta::Set { wallet: to.to_string(), contract: contract_addr.clone() });
                                     }
 
                                     // Aliasing-safe: re-read to_key from the live map, credit (checked), write.
@@ -2710,6 +2755,13 @@ impl Transaction {
                                         .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] supply_overflow".into()))?;
                                     accounts.get_mut(&contract_addr).unwrap()
                                         .contract_storage.insert("total_supply".to_string(), new_supply.to_string());
+                                    // Lifetime minted counter, 1:1 with the supply delta (checked).
+                                    let minted = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, "total_minted")?;
+                                    let new_minted = minted.checked_add(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] minted_overflow".into()))?;
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert("total_minted".to_string(), new_minted.to_string());
 
                                     if is_info_log() {
                                         println!("[INFO][QRC20] mint to={} amount={} supply={} contract={}",
@@ -2751,6 +2803,7 @@ impl Transaction {
                                     if new_from_bal == 0 {
                                         accounts.get_mut(&contract_addr).unwrap().contract_storage.remove(&from_key);
                                         refund_storage_deposit(accounts, &sender_addr, 1)?;
+                                        owns.push(OwnsDelta::Clear { wallet: sender_addr.clone(), contract: contract_addr.clone() });
                                     }
 
                                     // total_supply 1:1 with the balance delta (checked). balance <= supply
@@ -2761,6 +2814,13 @@ impl Transaction {
                                         .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] supply_underflow".into()))?;
                                     accounts.get_mut(&contract_addr).unwrap()
                                         .contract_storage.insert("total_supply".to_string(), new_supply.to_string());
+                                    // Lifetime burned counter, 1:1 with the supply delta (checked).
+                                    let burned = read_balance(
+                                        &accounts.get(&contract_addr).unwrap().contract_storage, "total_burned")?;
+                                    let new_burned = burned.checked_add(amount)
+                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] burned_overflow".into()))?;
+                                    accounts.get_mut(&contract_addr).unwrap()
+                                        .contract_storage.insert("total_burned".to_string(), new_burned.to_string());
 
                                     if is_info_log() {
                                         println!("[INFO][QRC20] burn from={} amount={} supply={} contract={}",
@@ -3986,16 +4046,17 @@ mod tests_v34_heartbeat {
     // is byte-identical network-wide. Drift here would split the signatures ⇒ no quorum forms.
     #[test]
     fn burn_attestation_message_is_canonical_and_type_distinct() {
-        let m = Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1500);
-        assert_eq!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1500), "deterministic");
-        assert_eq!(m, "burn_attest:solSig:walletA:1500:0:1500", "fixed format, Super=0, cost suffix");
-        // Every bound field (incl. node_type and cost) changes the signed message.
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Light, 1500));
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1501, &NodeType::Super, 1500));
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletB", 1500, &NodeType::Super, 1500));
-        assert_ne!(m, Transaction::burn_attestation_message("solSig2", "walletA", 1500, &NodeType::Super, 1500));
-        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1350), "cost is bound");
-        assert_eq!(Transaction::burn_attestation_message("x", "y", 0, &NodeType::Light, 300), "burn_attest:x:y:0:1:300", "Light=1");
+        let m = Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1500, 5);
+        assert_eq!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1500, 5), "deterministic");
+        assert_eq!(m, "burn_attest:solSig:walletA:1500:0:1500:5", "fixed format, Super=0, cost+epoch suffix");
+        // Every bound field (incl. node_type, cost AND attest_epoch) changes the signed message.
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Light, 1500, 5));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1501, &NodeType::Super, 1500, 5));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletB", 1500, &NodeType::Super, 1500, 5));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig2", "walletA", 1500, &NodeType::Super, 1500, 5));
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1350, 5), "cost is bound");
+        assert_ne!(m, Transaction::burn_attestation_message("solSig", "walletA", 1500, &NodeType::Super, 1500, 6), "attest_epoch is bound");
+        assert_eq!(Transaction::burn_attestation_message("x", "y", 0, &NodeType::Light, 300, 3), "burn_attest:x:y:0:1:300:3", "Light=1");
     }
 
     // Phase-1 cost formula: integer-deterministic, matching max(1500 - 150*floor(burn_pct/10), 300).
@@ -4456,6 +4517,15 @@ mod tests_qrc20_self_transfer {
             "deployer debited deploy fee + one storage deposit");
     }
 
+    // ROOT GUARD: a ContractDeploy touches the escrow (deposit move), so it MUST be in the lazy
+    // working set — else merge-back clobbers the real escrow, burning every other contract's deposits.
+    #[test]
+    fn contract_deploy_affected_set_includes_escrow() {
+        let affected = qrc20_deploy("alice", 1000).get_all_affected_addresses();
+        assert!(affected.iter().any(|a| a == STORAGE_RENT_ESCROW_ADDR),
+            "deploy must preload the escrow so lazy merge-back cannot clobber accrued deposits");
+    }
+
     // A zero-supply deploy creates NO balance entry and therefore charges NO deposit.
     #[test]
     fn qrc20_deploy_zero_supply_no_entry_no_charge() {
@@ -4467,6 +4537,56 @@ mod tests_qrc20_self_transfer {
             .contains_key(&format!("balance:{}", deployer)), "no balance entry for zero supply");
         assert!(accounts.get(STORAGE_RENT_ESCROW_ADDR).map(|a| a.balance).unwrap_or(0) == 0,
             "zero-supply deploy charges no deposit");
+    }
+
+    // Owns-index deltas track live holdings: Set on a 0→nonzero balance (deploy seed, new recipient),
+    // Clear on a nonzero→0 drain; a partial transfer to an existing holder emits neither.
+    #[test]
+    fn qrc20_owns_deltas_track_live_holdings() {
+        let (alice, bob) = ("alice", "bob");
+        let mut accounts = seed_deployer(alice);
+        let contract = derive_contract_address(alice, 1);
+        let mut owns: Vec<OwnsDelta> = Vec::new();
+
+        // Deploy seeds the creator with full supply → Set{alice}.
+        qrc20_deploy(alice, 1000).apply_to_state_at_indexed(&mut accounts, 0, &mut owns).unwrap();
+        match owns.last().expect("deploy emits an owns-delta") {
+            OwnsDelta::Set { wallet, contract: c } => {
+                assert_eq!(wallet.as_str(), alice);
+                assert_eq!(c, &contract);
+            }
+            _ => panic!("deploy should Set the deployer"),
+        }
+
+        // Deploy consumed nonce 1; subsequent transfers use 2, 3 (else the idempotent-apply nonce gate
+        // treats them as replays and no-ops). Recompute the hash after stamping the nonce.
+        let mut mkxfer = |nonce: u64, amt: &str| {
+            let mut t = qrc20_call(alice, &contract, "transfer", &format!("[\"{}\",\"{}\"]", bob, amt));
+            t.nonce = nonce;
+            t.hash = t.calculate_hash();
+            t
+        };
+
+        // Transfer 400 alice→bob: bob is a NEW holder → exactly one Set{bob}; alice keeps 600 (no Clear).
+        owns.clear();
+        mkxfer(2, "400").apply_to_state_at_indexed(&mut accounts, 0, &mut owns).unwrap();
+        assert_eq!(owns.len(), 1, "new-recipient transfer emits one delta");
+        match &owns[0] {
+            OwnsDelta::Set { wallet, .. } => assert_eq!(wallet.as_str(), bob),
+            _ => panic!("new recipient should Set"),
+        }
+
+        // Transfer remaining 600 alice→bob: drains alice → exactly one Clear{alice}; bob already holds (no Set).
+        owns.clear();
+        mkxfer(3, "600").apply_to_state_at_indexed(&mut accounts, 0, &mut owns).unwrap();
+        assert_eq!(owns.len(), 1, "drain emits one delta");
+        match &owns[0] {
+            OwnsDelta::Clear { wallet, .. } => assert_eq!(wallet.as_str(), alice),
+            _ => panic!("drained sender should Clear"),
+        }
+
+        assert_eq!(bal(&accounts, &contract, alice), 0, "alice fully drained");
+        assert_eq!(bal(&accounts, &contract, bob), 1000, "bob holds all supply");
     }
 
     // End-to-end conservation: deploy (1 deposit) → creator drains ALL to a NEW holder → creator entry
@@ -4848,23 +4968,25 @@ mod tests_qrc20_self_transfer {
 mod tests_wasm_e2e {
     use super::*;
 
+    // Deploy validator requires an EXPLICIT memory maximum (bounded deterministic memory) —
+    // fixtures declare (memory 1 4) like any deployable contract.
     // Contract that writes storage key "k" = "v".
     const WRITE_KV: &str = r#"(module
         (import "env" "storage_write" (func $sw (param i32 i32 i32 i32)))
-        (memory (export "memory") 1)
+        (memory (export "memory") 1 4)
         (data (i32.const 0) "kv")
         (func (export "run") (call $sw (i32.const 0)(i32.const 1)(i32.const 1)(i32.const 1))))"#;
     // B writes "bk"="bv".
     const B_WRITES: &str = r#"(module
         (import "env" "storage_write" (func $sw (param i32 i32 i32 i32)))
-        (memory (export "memory") 1)
+        (memory (export "memory") 1 4)
         (data (i32.const 0) "bkbv")
         (func (export "run") (call $sw (i32.const 0)(i32.const 2)(i32.const 2)(i32.const 2))))"#;
     // A calls "B" then writes "ak"="av".
     const A_CALLS_B: &str = r#"(module
         (import "env" "call_contract" (func $call (param i32 i32 i32 i32 i32 i32 i64 i32 i32)(result i32)))
         (import "env" "storage_write" (func $sw (param i32 i32 i32 i32)))
-        (memory (export "memory") 1)
+        (memory (export "memory") 1 4)
         (data (i32.const 0) "Brunakav")
         (func (export "run")(local $n i32)
             (local.set $n (call $call

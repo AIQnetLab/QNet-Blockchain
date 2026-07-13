@@ -3473,11 +3473,14 @@ export class WalletManager {
     const balanceNanoStr = balMatch ? balMatch[1] : String(data.balance || 0);
     const nonceMatch = /"nonce"\s*:\s*"?(\d+)"?/.exec(res.data);
     const nonceStr = nonceMatch ? nonceMatch[1] : String(data.nonce || 0);
+    // pending_rewards is in the account leaf, so the proof needs it (0 for a fresh wallet).
+    const pendMatch = /"pending_rewards"\s*:\s*"?(\d+)"?/.exec(res.data);
+    const pendingStr = pendMatch ? pendMatch[1] : '0';
     const balanceQNC = Number(balanceNanoStr) / 1e9;
     // QC-anchored proof verification (MITM-proof); advisory flag surfaced to the caller.
     let verified = false;
     if (verify && data.merkle_proof && data.merkle_proof.length > 0) {
-      const proofValid = await this.verifyMerkleProof(address, balanceNanoStr, nonceStr, data.merkle_proof, data.state_root);
+      const proofValid = await this.verifyMerkleProof(address, balanceNanoStr, nonceStr, data.merkle_proof, data.state_root, pendingStr);
       if (proofValid) {
         verified = await verifyMacroblockStateRoot(data.state_root, data.block_height, () => this.getRankedNodes(1)[0]);
       }
@@ -3485,6 +3488,41 @@ export class WalletManager {
     return {
       ok: true, balance: balanceQNC, balanceNano: balanceNanoStr, nonce: nonceStr,
       verified, blockHeight: data.block_height, stateRoot: data.state_root, proof: data.merkle_proof,
+    };
+  }
+
+  // V2: TRUSTLESS QRC-20 balance — exactly the getQNCBalanceWithProof trust model, one level deeper.
+  //   GET /api/v1/token/{contract}/{holder}/balance/proof -> two-level TokenBalanceProof.
+  // verifyTokenBalanceProof re-derives the chain balance -> storage_root -> contract account leaf ->
+  // state_root; then verifyMacroblockStateRoot independently anchors state_root to the committee QC
+  // (MITM-proof). `verified` is true only if BOTH hold. Balance is exact u64-string (BigInt-safe).
+  async getTokenBalanceWithProof(contract, holder, decimals = null, verify = true) {
+    if (!contract || !holder) return { ok: false, balance: null, verified: false, error: 'bad args' };
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/token/${contract}/${holder}/balance/proof`, { timeoutMs: 5000, hedgeMs: 800, raw: true });
+    } catch (e) {
+      return { ok: false, balance: null, verified: false, error: e.message };
+    }
+    if (!res.ok || !res.data) return { ok: false, balance: null, verified: false, error: `HTTP ${res.status}` };
+    let data;
+    try { data = JSON.parse(res.data); } catch (_) { return { ok: false, balance: null, verified: false, error: 'bad json' }; }
+    // token_balance is a u64 base-unit string — re-extract from raw text so it stays exact past 2^53.
+    const balMatch = /"token_balance"\s*:\s*"?(\d+)"?/.exec(res.data);
+    const baseUnitsStr = balMatch ? balMatch[1] : String(data.token_balance || '0');
+    let verified = false;
+    if (verify && Array.isArray(data.storage_proof) && Array.isArray(data.account_proof)) {
+      // SECURITY: bind to the REQUESTED (contract, holder) — else a valid proof for a DIFFERENT
+      // token/holder verifies internally and falsely earns the checkmark.
+      const proofValid = await this.verifyTokenBalanceProof(data, contract, holder);
+      if (proofValid) {
+        verified = await verifyMacroblockStateRoot(data.state_root, data.block_height, () => this.getRankedNodes(1)[0]);
+      }
+    }
+    const human = decimals != null ? this._formatBaseUnits(baseUnitsStr, decimals) : baseUnitsStr;
+    return {
+      ok: true, balance: human, balanceBase: baseUnitsStr, verified,
+      blockHeight: data.block_height, stateRoot: data.state_root,
     };
   }
 
@@ -3626,63 +3664,142 @@ export class WalletManager {
    * CRITICAL: Must match Rust implementation exactly!
    * Rust uses raw bytes, not hex strings for hashing
    */
-  async verifyMerkleProof(address, balance, nonce, proof, expectedRoot) {
+  /**
+   * Shared SMT sibling-fold used by BOTH the account balance proof and the two-level token proof —
+   * ONE primitive so a fix to the walk can never drift between the two proof types. Folds `leafHashHex`
+   * up `proof` ([{sibling, is_right}, ...]) using `keyHashHex` bits for the expected direction at each
+   * level; returns true iff the fold reproduces `root`. MUST stay byte-exact to the Rust
+   * verify_proof / verify_raw_proof (SHA3-256 over sibling||current ordered by is_right).
+   */
+  _smtFold(leafHashHex, keyHashHex, proof, root, sha3_256) {
+    if (!Array.isArray(proof)) return false;
+    let current = leafHashHex;
+    for (let i = 0; i < proof.length; i++) {
+      const isRight = proof[i].is_right;
+      const byteIdx = Math.floor(i / 8);
+      const bitIdx = 7 - (i % 8);
+      const kByte = byteIdx < 32 ? parseInt(keyHashHex.substring(byteIdx * 2, byteIdx * 2 + 2), 16) : 0;
+      const expectedBit = ((kByte >> bitIdx) & 1) === 1;
+      if (isRight !== expectedBit) return false;
+      const sib = this.hexToBytes(proof[i].sibling);
+      const cur = this.hexToBytes(current);
+      const combined = isRight ? this.concatBytes(sib, cur) : this.concatBytes(cur, sib);
+      current = sha3_256(combined);
+    }
+    return current === root;
+  }
+
+  async verifyMerkleProof(address, balance, nonce, proof, expectedRoot, pending = 0) {
     try {
       // Import js-sha3 for SHA3-256 (same as Rust implementation)
       const { sha3_256 } = await import('js-sha3');
-      
+
       // Hash address (same as Rust: b"QNET_ADDR:" + address.as_bytes())
       const addrHashHex = sha3_256(this.concatBytes(
         Buffer.from('QNET_ADDR:', 'utf8'),
         Buffer.from(address, 'utf8')
       ));
-      
-      // Hash account data (same as Rust: b"QNET_ACCOUNT:" + balance(8) + nonce(8) + pending_rewards(8) + address)
-      // CRITICAL: Use raw bytes, not hex strings!
+
+      // Account leaf — MUST match Rust hash_account (QNET_ACCOUNT_V2) EXACTLY, else the leaf
+      // never matches the QC-committed root and the proof always fails. A plain wallet has
+      // is_contract=false, no code/storage, and (server proof leaf) heartbeat/last_claimed=0;
+      // pending_rewards is threaded from the account. Field order + widths are byte-exact.
       const accountDataBytes = this.concatBytes(
-        Buffer.from('QNET_ACCOUNT:', 'utf8'),
-        this.uint64ToBytes(balance),           // 8 bytes little-endian
-        this.uint64ToBytes(nonce),             // 8 bytes little-endian
-        this.uint64ToBytes(0),                 // pending_rewards = 0 for basic proof
-        Buffer.from(address, 'utf8')           // address string bytes
+        Buffer.from('QNET_ACCOUNT_V2:', 'utf8'),
+        this.uint64ToBytes(balance),           // balance u64 LE
+        this.uint64ToBytes(nonce),             // nonce u64 LE
+        Buffer.from(address, 'utf8'),          // address string bytes
+        Buffer.from([0]),                      // is_contract = false
+        this.uint64ToBytes(pending),           // pending_rewards u64 LE
+        Buffer.from('HB:', 'utf8'),
+        this.uint64ToBytes(0),                 // heartbeat_epoch u64 LE
+        Buffer.from([0, 0]),                   // heartbeat_slots u16 LE
+        this.uint64ToBytes(0),                 // heartbeat_final_epoch u64 LE
+        Buffer.from([0]),                      // heartbeat_final_count u8
+        Buffer.from('LCE:', 'utf8'),
+        this.uint64ToBytes(0)                  // last_claimed_epoch u64 LE
       );
-      let currentHash = sha3_256(accountDataBytes);
-      
-      // Walk up the Merkle tree
-      for (let i = 0; i < proof.length; i++) {
-        const sibling = proof[i].sibling;
-        const isRight = proof[i].is_right;
-        
-        // Check bit matches direction
-        const byteIdx = Math.floor(i / 8);
-        const bitIdx = 7 - (i % 8);
-        const addrByte = byteIdx < 32 ? 
-          parseInt(addrHashHex.substring(byteIdx * 2, byteIdx * 2 + 2), 16) : 0;
-        const expectedBit = ((addrByte >> bitIdx) & 1) === 1;
-        
-        if (isRight !== expectedBit) {
-          return false; // Proof direction mismatch
-        }
-        
-        // Combine hashes (convert hex to bytes first!)
-        const siblingBytes = this.hexToBytes(sibling);
-        const currentBytes = this.hexToBytes(currentHash);
-        
-        let combinedBytes;
-        if (isRight) {
-          combinedBytes = this.concatBytes(siblingBytes, currentBytes);
-        } else {
-          combinedBytes = this.concatBytes(currentBytes, siblingBytes);
-        }
-        
-        // Hash the combination
-        currentHash = sha3_256(combinedBytes);
-      }
-      
-      // Compare with expected root
-      return currentHash === expectedRoot;
+      const leafHash = sha3_256(accountDataBytes);
+      // Fold the account leaf up to the expected root via the shared SMT primitive.
+      return this._smtFold(leafHash, addrHashHex, proof, expectedRoot, sha3_256);
     } catch (error) {
       console.warn('[MERKLE] Proof verification failed:', error.message);
+      return false;
+    }
+  }
+
+  /**
+   * V2: verify a two-level trustless QRC-20 balance proof against a QC-committed state_root.
+   * Level-2 proves balance:{holder} in storage_root; Level-1 proves the contract account leaf
+   * (which commits storage_root) in state_root. Byte-exact to Rust hash_account (SROOT schema) +
+   * StorageMerkleTree. Returns true only if BOTH levels verify (and, when supplied, the proof's
+   * state_root equals the independently QC-verified expectedStateRoot).
+   */
+  async verifyTokenBalanceProof(proofData, expectedContract, expectedHolder, expectedStateRoot) {
+    try {
+      const { sha3_256 } = await import('js-sha3');
+      const {
+        contract_address, holder, token_balance, storage_root,
+        storage_proof, account_proof,
+        account_balance, account_nonce, account_pending_rewards,
+        contract_code_hash, heartbeat_epoch, heartbeat_slots,
+        heartbeat_final_epoch, heartbeat_final_count, last_claimed_epoch,
+        state_root,
+      } = proofData;
+
+      // Identity binding: the folds below verify against the identifiers IN the proof, so reject unless
+      // they match what we requested (else a valid proof for another token/holder passes).
+      if (expectedContract != null && contract_address !== expectedContract) return false;
+      if (expectedHolder != null && holder !== expectedHolder) return false;
+
+      // The proof's own state_root MUST equal the root we independently trust (QC-verified).
+      if (expectedStateRoot && state_root !== expectedStateRoot) return false;
+
+      // Both levels are canonical 256-deep SMT proofs; fold each with the ONE shared primitive.
+      if (!Array.isArray(storage_proof) || storage_proof.length !== 256) return false;
+      if (!Array.isArray(account_proof) || account_proof.length !== 256) return false;
+
+      // ── Level-2: balance:{holder} ∈ storage_root ──
+      const storageKey = 'balance:' + holder;
+      const storageKeyHashHex = sha3_256(this.concatBytes(
+        Buffer.from('QNET_STORAGE_KEY:', 'utf8'), Buffer.from(storageKey, 'utf8')));
+      // QRC-20 removes drained keys, so token_balance "0" ⇒ ABSENT ⇒ empty-leaf default (32 zero bytes).
+      const storageLeafHex = String(token_balance) === '0'
+        ? '00'.repeat(32)
+        : sha3_256(this.concatBytes(Buffer.from('QNET_STORAGE_VAL:', 'utf8'), Buffer.from(String(token_balance), 'utf8')));
+      if (!this._smtFold(storageLeafHex, storageKeyHashHex, storage_proof, storage_root, sha3_256)) return false;
+
+      // ── Level-1: contract account leaf (committing storage_root) ∈ state_root ──
+      const contractAddrHashHex = sha3_256(this.concatBytes(
+        Buffer.from('QNET_ADDR:', 'utf8'), Buffer.from(contract_address, 'utf8')));
+      const parts = [
+        Buffer.from('QNET_ACCOUNT_V2:', 'utf8'),
+        this.uint64ToBytes(account_balance),   // u64 LE (BigInt-safe)
+        this.uint64ToBytes(account_nonce),
+        Buffer.from(contract_address, 'utf8'),
+        Buffer.from([1]),                       // is_contract = true
+      ];
+      if (contract_code_hash) {
+        parts.push(Buffer.from('CODE:', 'utf8'));
+        parts.push(Buffer.from(String(contract_code_hash), 'utf8'));
+      }
+      parts.push(Buffer.from('SROOT:', 'utf8'));
+      parts.push(this.hexToBytes(storage_root)); // 32 RAW bytes (not hex text)
+      parts.push(this.uint64ToBytes(account_pending_rewards));
+      parts.push(Buffer.from('HB:', 'utf8'));
+      parts.push(this.uint64ToBytes(heartbeat_epoch || 0));
+      const slots = heartbeat_slots || 0;
+      parts.push(Buffer.from([slots & 0xff, (slots >> 8) & 0xff])); // u16 LE
+      parts.push(this.uint64ToBytes(heartbeat_final_epoch || 0));
+      parts.push(Buffer.from([(heartbeat_final_count || 0) & 0xff]));
+      parts.push(Buffer.from('LCE:', 'utf8'));
+      parts.push(this.uint64ToBytes(last_claimed_epoch || 0));
+      const contractLeafHex = sha3_256(this.concatBytes(...parts));
+      if (!this._smtFold(contractLeafHex, contractAddrHashHex, account_proof, state_root, sha3_256)) return false;
+
+      return true;
+    } catch (error) {
+      console.warn('[MERKLE] Token proof verification failed:', error.message);
       return false;
     }
   }

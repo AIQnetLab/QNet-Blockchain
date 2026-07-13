@@ -218,7 +218,27 @@ impl ConsensusDriver {
                 self.proposals.insert((cp.index, cp.hash()), cp.clone());
                 self.eng.on_proposal(cp, &ph)
             }
-            ConsensusMsg::Vote(v) => self.eng.on_vote(v),
+            ConsensusMsg::Vote(v) => {
+                // C-2: strip the embedded pk from the vote sig BEFORE it enters the QC — on_vote copies
+                // v.signature VERBATIM into qc.sigs, so compacting here shrinks the sealed QC ~½ (≤1000
+                // sigs × a redundant 1952-byte pk). Ingest (verify_msg) already verified the FULL sig AND
+                // enforces the dilithium_sig_ envelope for votes on EVERY path that reaches handle() (live +
+                // drain_pending), so a Byzantine non-dilithium_sig_ vote (e.g. pq_bin:) never arrives here —
+                // its compacted leaf would otherwise be unverifiable by the compact QC verifier (finality
+                // stall). The QC verifier re-derives the pk from committee state. Pass a non-strippable sig
+                // through unchanged (test-injected mock votes bypass ingest; production never hits this).
+                // Pure transform ⇒ every node forms byte-identical qc.sigs.
+                match std::str::from_utf8(&v.signature).ok()
+                    .and_then(qnet_consensus::consensus_crypto::strip_embedded_pk)
+                {
+                    Some(compact) => {
+                        let mut cv = v.clone();
+                        cv.signature = compact.into_bytes();
+                        self.eng.on_vote(&cv)
+                    }
+                    None => self.eng.on_vote(v),
+                }
+            }
             ConsensusMsg::Qc(qc) => self.eng.adopt_qc(qc),
             ConsensusMsg::Timeout(tm) => self.eng.on_timeout_msg(tm),
             ConsensusMsg::Tc(tc) => self.eng.on_timeout_cert(tc),

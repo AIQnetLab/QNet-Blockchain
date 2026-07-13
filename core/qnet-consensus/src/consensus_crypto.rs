@@ -1963,6 +1963,64 @@ pub async fn verify_consensus_signature_bound(
     }
 }
 
+/// C-2: transform a FULL consensus signature string into its COMPACT form by DROPPING the embedded pk
+/// trailer. The QC stores ≤1000 per-vote sigs; each carries a redundant 1952-byte ML-DSA pk that the
+/// verifier re-derives from on-chain committee state anyway, so stripping it ~halves the QC bytes on the
+/// wire. Pure + deterministic (base64 STANDARD, drop exactly [pk_len(4)][pk(1952)]) so every node produces
+/// byte-identical qc.sigs ⇒ identical sig_merkle_root. Input MUST already be full-format + ingest-verified;
+/// returns None on anything that isn't a full-format sig (incl. an already-compact one) so the caller keeps
+/// the original — idempotent, never double-strips.
+pub fn strip_embedded_pk(signature: &str) -> Option<String> {
+    use pqcrypto_mldsa::mldsa65 as dilithium3;
+    let prefix = "dilithium_sig_";
+    if !signature.starts_with(prefix) { return None; }
+    let part = &signature[prefix.len()..];
+    let sep = part.rfind('_')?;
+    let id = &part[..sep];
+    let bytes = general_purpose::STANDARD.decode(&part[sep + 1..]).ok()?;
+    if bytes.len() < 8 { return None; }
+    let signed_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    if signed_len <= 3309 || 4 + signed_len >= bytes.len() { return None; }
+    let pk_len_start = 4 + signed_len;
+    if pk_len_start + 4 > bytes.len() { return None; }
+    let pk_len = u32::from_le_bytes([
+        bytes[pk_len_start], bytes[pk_len_start + 1], bytes[pk_len_start + 2], bytes[pk_len_start + 3],
+    ]) as usize;
+    // Exact full-format shape (else leave untouched): [sig_len][SignedMessage][pk_len(4)][pk(1952)].
+    if pk_len != dilithium3::public_key_bytes() || pk_len_start + 4 + pk_len != bytes.len() { return None; }
+    // Keep [sig_len(4)][SignedMessage]; drop [pk_len(4)][pk].
+    let b64 = general_purpose::STANDARD.encode(&bytes[..pk_len_start]);
+    Some(format!("{}{}_{}", prefix, id, b64))
+}
+
+/// C-2: verify a COMPACT consensus signature (pk trailer stripped by `strip_embedded_pk`) against an
+/// EXPLICIT expected pk resolved from on-chain committee state (storage.load_vrf_public_key + genesis
+/// anchor — deterministic + process-uniform, NEVER the RAM registry). Wire: dilithium_sig_{id}_b64([
+/// sig_len(4)][SignedMessage]). Identity binding = expected_pk; the id in the string must still match.
+/// Sync (no registry/DB) so it runs inside QuorumCertificate::verify's rayon par_iter.
+pub fn verify_consensus_signature_compact(
+    node_id: &str, message: &str, signature: &str, expected_pk: &[u8],
+) -> bool {
+    use pqcrypto_mldsa::mldsa65 as dilithium3;
+    if expected_pk.len() != dilithium3::public_key_bytes() { return false; }
+    if !signature.starts_with("dilithium_sig_") { return false; }
+    let part = &signature["dilithium_sig_".len()..];
+    let sep = match part.rfind('_') { Some(p) => p, None => return false };
+    if &part[..sep] != node_id { return false; } // sig carries its claimed id; must match
+    let bytes = match general_purpose::STANDARD.decode(&part[sep + 1..]) { Ok(b) => b, Err(_) => return false };
+    if bytes.len() < 4 { return false; }
+    let signed_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    // Compact: the decoded bytes are EXACTLY [sig_len(4)][SignedMessage] — no pk trailer.
+    if signed_len <= 3309 || 4 + signed_len != bytes.len() { return false; }
+    let signed_message_bytes = &bytes[4..4 + signed_len];
+    let public_key = match dilithium3::PublicKey::from_bytes(expected_pk) { Ok(p) => p, Err(_) => return false };
+    let signed_message = match dilithium3::SignedMessage::from_bytes(signed_message_bytes) { Ok(s) => s, Err(_) => return false };
+    match dilithium3::open(&signed_message, &public_key) {
+        Ok(recovered) => ct_eq(recovered.as_slice(), message.as_bytes()),
+        Err(_) => false,
+    }
+}
+
 /// Constant-time byte slice comparison -- prevents timing side-channel attacks.
 /// Returns true only if slices are equal in length and content.
 /// FIX L-C2ct: Also constant-time for length to prevent length-based timing leaks.

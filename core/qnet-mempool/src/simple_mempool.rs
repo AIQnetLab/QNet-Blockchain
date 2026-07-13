@@ -972,6 +972,7 @@ impl SimpleMempool {
         for hash in hashes {
             self.included_tx_hashes.insert(hash.clone(), std::time::Instant::now());
         }
+        self.enforce_included_cap();
 
         // Step 1: Remove from transactions map (fast O(1) per hash)
         let mut removed_count = 0;
@@ -1009,6 +1010,17 @@ impl SimpleMempool {
     pub fn record_included_txs(&self, hashes: &[String]) {
         for hash in hashes {
             self.included_tx_hashes.insert(hash.clone(), std::time::Instant::now());
+        }
+        self.enforce_included_cap();
+    }
+
+    /// Hard-count backstop enforced AT INSERTION (not just the 300s periodic prune): a distinct-hash
+    /// flood otherwise grows the set to inclusion-rate×cadence between ticks (multi-GB). O(n) evict runs
+    /// only when the ceiling is crossed, so the peak is bounded to ~the cap, not the cap×cadence.
+    fn enforce_included_cap(&self) {
+        const MAX_INCLUDED_TX_HASHES: usize = 2_000_000;
+        if self.included_tx_hashes.len() > MAX_INCLUDED_TX_HASHES {
+            self.cleanup_included_tx_hashes();
         }
     }
 

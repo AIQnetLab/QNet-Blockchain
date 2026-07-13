@@ -86,6 +86,7 @@ impl StateDB {
                     heartbeat_final_epoch: 0,
                     heartbeat_final_count: 0,
                     last_claimed_epoch: 0,
+                    storage_root: [0u8; 32], // inert: legacy is_contract=false apply path
                 }
             });
 
@@ -153,6 +154,7 @@ impl StateDB {
                     heartbeat_final_epoch: 0,
                     heartbeat_final_count: 0,
                     last_claimed_epoch: 0,
+                    storage_root: [0u8; 32], // inert: legacy is_contract=false apply path
                 }
             });
 

@@ -1253,7 +1253,20 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_account_balance_with_proof);
-    
+
+    // V2: GET /api/v1/token/{contract}/{holder}/balance/proof — two-level trustless QRC-20 balance proof
+    let token_balance_proof = api_v1
+        .and(warp::path("token"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::param::<String>())
+        .and(warp::path("balance"))
+        .and(warp::path("proof"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_token_balance_with_proof);
+
     // v3.32: Validator set with Merkle proof for trustless light clients
     let validators_proof = api_v1
         .and(warp::path("validators"))
@@ -2371,6 +2384,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let account_routes = account_info
         .or(account_balance)
         .or(account_balance_proof)  // v3.11: Balance with Merkle proof
+        .or(token_balance_proof)  // V2: trustless QRC-20 token balance proof
         .or(validators_proof)       // v3.32: Validator set with Merkle proof
         .or(account_transactions)
         .or(batch_transfer);
@@ -2713,12 +2727,16 @@ async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>
         "light" => qnet_state::NodeType::Light,
         _ => qnet_state::NodeType::Super,
     };
+    // M-5: the epoch the registrant will bind — this attestor signs it into the message + self-checks
+    // membership in THAT epoch's committee (not its own tip), so the apply-time verifier agrees.
+    let attest_epoch = params.get("attest_epoch").and_then(|v| v.as_u64()).unwrap_or(0);
     if burn_tx.is_empty() || solana_wallet.is_empty() || qnet_wallet.is_empty() {
         return Err(RpcError { code: -32602, message: "burn_tx, solana_wallet, qnet_wallet required".to_string() });
     }
-    // Cheap genesis gate first — only genesis nodes attest (avoids a wasted Solana lookup on others).
-    if !blockchain.is_genesis_attestor() {
-        return Err(RpcError { code: -32601, message: "not a genesis attestor".to_string() });
+    // Cheap committee gate first (avoids a wasted Solana lookup on non-members); sign_burn_attestation
+    // re-checks membership + epoch recency authoritatively.
+    if attest_epoch == 0 || !blockchain.is_committee_attestor_for_epoch(attest_epoch) {
+        return Err(RpcError { code: -32601, message: "not an attestor for attest_epoch".to_string() });
     }
     // Recompute the Phase-1 cost from THIS attestor's own Solana supply read (NOT the caller's hint) so
     // a forged hint can't lower the binding cost. Then require the ACTUAL on-Solana burn to cover it.
@@ -2739,9 +2757,9 @@ async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>
     // return BOTH the signed cost AND the signed amount so the collector agrees on the on-chain truth and
     // the registrant embeds the committee-certified amount (closes the over-burn quorum footgun: the
     // embedded burn_amount must equal the amount the counted 2f+1 attestors actually signed).
-    match blockchain.sign_burn_attestation(&burn_tx, &qnet_wallet, actual_burned, node_type, cost) {
+    match blockchain.sign_burn_attestation(&burn_tx, &qnet_wallet, actual_burned, node_type, cost, attest_epoch) {
         Some((genesis_id, sig)) => Ok(serde_json::json!({ "genesis_id": genesis_id, "sig": sig, "cost": cost, "amount": actual_burned })),
-        None => Err(RpcError { code: -32000, message: "attestation refused (dedup / not genesis)".to_string() }),
+        None => Err(RpcError { code: -32000, message: "attestation refused (dedup / not committee / stale epoch)".to_string() }),
     }
 }
 
@@ -3663,6 +3681,62 @@ async fn handle_account_balance_with_proof(
                 "state_root": "",
                 "block_height": 0,
                 "error": "account not found",
+                "proof_valid": false
+            })))
+        }
+    }
+}
+
+/// V2: GET /api/v1/token/{contract}/{holder}/balance/proof
+/// Two-level trustless proof that `holder`'s QRC-20 balance is committed in state_root. Emits EVERY
+/// field the contract account leaf and the storage leaf depend on, so a light client can reconstruct
+/// both levels (account leaf → state_root, then balance:{holder} leaf → storage_root) with no trust.
+async fn handle_token_balance_with_proof(
+    contract: String,
+    holder: String,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(rate_limit_response);
+    }
+    if contract.len() > 64 || holder.len() > 64 {
+        return Ok(warp::reply::json(&json!({ "error": "Invalid parameter", "proof_valid": false })));
+    }
+    let hexvec = |v: &Vec<([u8; 32], bool)>| -> Vec<serde_json::Value> {
+        v.iter().map(|(h, r)| json!({ "sibling": hex::encode(h), "is_right": r })).collect()
+    };
+    match blockchain.get_token_balance_with_proof(&contract, &holder).await {
+        Ok(p) => Ok(warp::reply::json(&json!({
+            "contract_address": p.contract_address,
+            "holder": p.holder,
+            // Level-2 (balance:{holder} -> storage_root)
+            "token_balance": p.token_balance,     // raw stored decimal string
+            "storage_proof": hexvec(&p.storage_proof),
+            "storage_root": hex::encode(p.storage_root),
+            // Level-1 (contract account leaf -> state_root): ALL leaf-determining fields
+            "account_balance": p.account_balance.to_string(),
+            "account_nonce": p.account_nonce,
+            "account_pending_rewards": p.account_pending_rewards.to_string(),
+            "contract_code_hash": p.contract_code_hash,
+            "heartbeat_epoch": p.heartbeat_epoch,
+            "heartbeat_slots": p.heartbeat_slots,
+            "heartbeat_final_epoch": p.heartbeat_final_epoch,
+            "heartbeat_final_count": p.heartbeat_final_count,
+            "last_claimed_epoch": p.last_claimed_epoch,
+            "account_proof": hexvec(&p.account_proof),
+            // Anchors
+            "state_root": hex::encode(p.state_root),
+            "block_height": p.block_height,
+            "proof_valid": true
+        }))),
+        Err(e) => {
+            println!("[WARN][RPC] api_error endpoint=token_balance_proof contract={} holder={} err={}", contract, holder, e);
+            Ok(warp::reply::json(&json!({
+                "contract_address": contract,
+                "holder": holder,
+                "token_balance": "0",
+                "error": "token balance not provable",
                 "proof_valid": false
             })))
         }
@@ -12962,12 +13036,29 @@ async fn handle_node_registration_client_submit(
         // The client-declared burn_amount is now only a hint; the embedded burn_amount is the
         // committee-certified agreed_amount (== what the counted 2f+1 signed), so an honest over-burn
         // still verifies. Exact-burn (declared == actual) ⇒ agreed_amount == burn_amount (unchanged).
-        let (attestors, agreed_cost, agreed_amount) = crate::node::BlockchainNode::collect_burn_attestations(
+        let storage_ref = crate::node::get_storage();
+        let (attestors, agreed_cost, agreed_amount, agreed_epoch) = crate::node::BlockchainNode::collect_burn_attestations(
             burn_tx, solana_wallet, &req.wallet_address, burn_amount,
-            qnet_state::NodeType::Light, cost_hint, &**crate::node::get_storage(),
+            qnet_state::NodeType::Light, cost_hint, &**storage_ref,
         ).await;
-        let need = qnet_consensus::checkpoint_bft::quorum_size(
-            crate::genesis_constants::genesis_node_count());
+        // Quorum of the committee OF agreed_epoch — the SAME committee the attestors signed for and the
+        // on-chain verifier re-resolves (M-5), so `need` EXACTLY matches the verifier's threshold. Genesis
+        // era ⇒ the genesis set; post-genesis None ⇒ this node can't read that epoch's N-2 committee ⇒
+        // return retry-later rather than arm a registration the verifier rejects forever.
+        let arm_genesis_era = agreed_epoch <= 2;
+        let arm_rep_h = agreed_epoch.saturating_sub(1) * 90 + 1;
+        let arm_committee_len = match crate::node::BlockchainNode::committee_for_height(&**storage_ref, arm_rep_h) {
+            Some(c) => c.len(),
+            None if arm_genesis_era => crate::genesis_constants::genesis_node_count(),
+            None => {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "burn-attestation committee unavailable (node syncing); retry shortly",
+                    "epoch": agreed_epoch
+                })));
+            }
+        };
+        let need = qnet_consensus::checkpoint_bft::quorum_size(arm_committee_len);
         if attestors.len() < need {
             return Ok(warp::reply::json(&json!({
                 "success": false,
@@ -12979,12 +13070,13 @@ async fn handle_node_registration_client_submit(
             })));
         }
         if let qnet_state::TransactionType::NodeRegistration {
-            burn_tx: bt, burn_amount: ba, burn_cost: bc, burn_attestors: at, ..
+            burn_tx: bt, burn_amount: ba, burn_cost: bc, burn_attestors: at, attest_epoch: ae, ..
         } = &mut reg_tx.tx_type {
             *bt = burn_tx.to_string();
             *ba = agreed_amount;
             *bc = agreed_cost;
             *at = attestors;
+            *ae = agreed_epoch;
         }
     }
 
@@ -13798,13 +13890,14 @@ async fn handle_contract_call(
                     "qrc20" => {
                         match request.method.as_str() {
                             "balanceOf" | "balance_of" => {
+                                // u128 STRING (QRC-20 storage is u128; u64 dropped whales, raw number rounds >2^53).
                                 let holder = arg_str(0).unwrap_or_else(|| request.from.clone());
-                                let bal: u64 = cs.get(&format!("balance:{}", holder)).and_then(|s| s.parse().ok()).unwrap_or(0);
-                                json!(bal)
+                                let bal: u128 = cs.get(&format!("balance:{}", holder)).and_then(|s| s.parse().ok()).unwrap_or(0);
+                                json!(bal.to_string())
                             }
                             "totalSupply" | "total_supply" => {
-                                let supply: u64 = cs.get("total_supply").and_then(|s| s.parse().ok()).unwrap_or(0);
-                                json!(supply)
+                                let supply: u128 = cs.get("total_supply").and_then(|s| s.parse().ok()).unwrap_or(0);
+                                json!(supply.to_string())
                             }
                             "name" => json!(cs.get("name").cloned().unwrap_or_default()),
                             "symbol" => json!(cs.get("symbol").cloned().unwrap_or_default()),
@@ -13815,8 +13908,9 @@ async fn handle_contract_call(
                             "allowance" => {
                                 let owner = arg_str(0).unwrap_or_default();
                                 let spender = arg_str(1).unwrap_or_default();
-                                let val: u64 = cs.get(&format!("allowance:{}:{}", owner, spender)).and_then(|s| s.parse().ok()).unwrap_or(0);
-                                json!(val)
+                                // u128 base units as a STRING (same reason as balanceOf/totalSupply).
+                                let val: u128 = cs.get(&format!("allowance:{}:{}", owner, spender)).and_then(|s| s.parse().ok()).unwrap_or(0);
+                                json!(val.to_string())
                             }
                             _ => json!(null)
                         }
@@ -14962,7 +15056,8 @@ async fn handle_token_deploy(
             "name": request.name,
             "symbol": request.symbol,
             "decimals": request.decimals,
-            "initial_supply": request.initial_supply,
+            // STRING (exact past 2^53); apply + explorer both accept number-or-string.
+            "initial_supply": request.initial_supply.to_string(),
             "code_hash": code_hash
         })).unwrap_or_default()),
         dilithium_signature: Some(request.dilithium_signature.clone()),
@@ -15027,10 +15122,14 @@ async fn handle_token_info(
                         "name": storage.get("name").cloned().unwrap_or_default(),
                         "symbol": storage.get("symbol").cloned().unwrap_or_default(),
                         "decimals": storage.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9),
-                        // u64 base units as a STRING: a JSON number is an f64 and loses precision above
+                        // u128 base units as a STRING: a JSON number is an f64 and loses precision above
                         // 2^53, so a large-supply token would round in any JS client. Parse validates it
-                        // as u64, .to_string() re-emits it exactly. Clients scale by `decimals`.
-                        "total_supply": storage.get("total_supply").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0).to_string(),
+                        // as u128 (the QRC-20 storage width; total_supply == total_minted − total_burned,
+                        // both u128), .to_string() re-emits it exactly. Clients scale by `decimals`.
+                        "total_supply": storage.get("total_supply").and_then(|s| s.parse::<u128>().ok()).unwrap_or(0).to_string(),
+                        // Lifetime emission (string, u128-safe): total_supply == total_minted − total_burned.
+                        "total_minted": storage.get("total_minted").and_then(|s| s.parse::<u128>().ok()).unwrap_or(0).to_string(),
+                        "total_burned": storage.get("total_burned").and_then(|s| s.parse::<u128>().ok()).unwrap_or(0).to_string(),
                         "deployer": storage.get("deployer").cloned().unwrap_or_default(),
                         "deployed_at": storage.get("deployed_at").cloned().unwrap_or_default()
                     },
@@ -15075,14 +15174,15 @@ async fn handle_token_balance(
         Ok(Some(account)) if account.is_contract => {
             let storage = &account.contract_storage;
             let balance_key = format!("balance:{}", holder_address);
-            let balance: u64 = storage.get(&balance_key)
+            let balance: u128 = storage.get(&balance_key)
                 .and_then(|s| s.parse().ok()).unwrap_or(0);
-            
+
             Ok(warp::reply::json(&json!({
                 "success": true,
                 "contract_address": contract_address,
                 "holder_address": holder_address,
-                // u64 base units as a STRING (exact past 2^53 — a JSON number would round). Client scales by decimals.
+                // u128 base units as a STRING (exact — a JSON number would round; QRC-20 stores u128).
+                // Client scales by decimals.
                 "balance": balance.to_string(),
                 "token_name": storage.get("name").cloned().unwrap_or_default(),
                 "token_symbol": storage.get("symbol").cloned().unwrap_or_default(),
@@ -15107,40 +15207,74 @@ async fn handle_token_balance(
     }
 }
 
-/// Handle query for all tokens owned by an address
-/// v3.40: Reads FROM BLOCKCHAIN STATE (StateManager).
-/// Scans all contract accounts for balance:{address} entries.
+/// Handle query for all QRC-20 tokens held by an address.
+/// Fast path: the wallet_token reverse index (O(held) prefix seek), each hit balance-rechecked
+/// against live state so a stale index entry can never surface a phantom or wrong-balance token.
+/// Fallback (until the boot backfill marks the index authoritative): the full O(N) contract scan,
+/// so a pre-index or not-yet-backfilled DB never regresses the returned list.
 async fn handle_tokens_for_address(
     address: String,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    let state_manager = blockchain.get_state_manager();
-    let state = state_manager.read().await;
-    
     let balance_key = format!("balance:{}", address);
     let mut tokens: Vec<serde_json::Value> = Vec::new();
-    
-    // Scan contract accounts in blockchain state for this holder's balance
-    for (addr, account) in state.get_all_accounts() {
-        if !account.is_contract { continue; }
-        let cs = &account.contract_storage;
-        if cs.get("type").map(|t| t == "qrc20").unwrap_or(false) {
-            if let Some(bal_str) = cs.get(&balance_key) {
-                let balance: u64 = bal_str.parse().unwrap_or(0);
-                if balance > 0 {
-                    tokens.push(json!({
-                        "contract_address": addr,
-                        // u64 base units as a STRING (exact past 2^53). Client scales by decimals.
-                        "balance": balance.to_string(),
-                        "name": cs.get("name").cloned().unwrap_or_default(),
-                        "symbol": cs.get("symbol").cloned().unwrap_or_default(),
-                        "decimals": cs.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9)
-                    }));
+
+    // ONE token-row projection for both the index and scan branches, so the response shape can never
+    // depend on which path served it. u128 base units as a STRING (exact past 2^53); client scales by
+    // decimals. Also the ONE type==qrc20 gate — a generic WASM contract writing a `balance:{wallet}`
+    // key must never surface as a phantom token.
+    let token_row = |contract: &str, cs: &std::collections::HashMap<String, String>| -> Option<serde_json::Value> {
+        if cs.get("type").map(|t| t != "qrc20").unwrap_or(true) { return None; }
+        // u128 (QRC-20 storage width) so a whale above u64::MAX is not dropped from the list.
+        let balance: u128 = cs.get(&balance_key).and_then(|s| s.parse().ok()).unwrap_or(0);
+        if balance == 0 { return None; }
+        Some(json!({
+            "contract_address": contract,
+            "balance": balance.to_string(),
+            "name": cs.get("name").cloned().unwrap_or_default(),
+            "symbol": cs.get("symbol").cloned().unwrap_or_default(),
+            "decimals": cs.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9)
+        }))
+    };
+
+    // Use the reverse index (O(held) prefix seek) ONLY while it is authoritative. Until the boot
+    // backfill sets OWNS_INDEX_READY, a partial index is NOT trusted (a not-yet-indexed holding would
+    // under-report) — take the authoritative O(N) scan instead. Each index hit is still balance-rechecked
+    // against live state, so a stale entry can never surface a phantom or wrong-balance token.
+    if crate::storage::OWNS_INDEX_READY.load(std::sync::atomic::Ordering::Relaxed) {
+        // A storage-read error is NOT an authoritative "no tokens" — only a successful seek is. On Err,
+        // fall through to the O(N) scan below instead of returning an empty index result.
+        match blockchain.get_storage().get_tokens_for_wallet(&address) {
+            Ok(indexed) => {
+                for contract in &indexed {
+                    if let Ok(Some(account)) = blockchain.get_account(contract).await {
+                        if !account.is_contract { continue; }
+                        if let Some(row) = token_row(contract, &account.contract_storage) { tokens.push(row); }
+                    }
                 }
+                let count = tokens.len();
+                return Ok(warp::reply::json(&json!({
+                    "success": true,
+                    "address": address,
+                    "tokens": tokens,
+                    "token_count": count,
+                    "source": "reverse_index"
+                })));
+            }
+            Err(e) => {
+                if is_warn() { println!("[WARN][RPC] tokens_index_read_failed addr={} err={:?} action=scan", address, e); }
             }
         }
     }
-    
+
+    // Fallback: authoritative full scan of contract accounts for this holder's balance.
+    let state_manager = blockchain.get_state_manager();
+    let state = state_manager.read().await;
+    for (addr, account) in state.get_all_accounts() {
+        if !account.is_contract { continue; }
+        if let Some(row) = token_row(&addr, &account.contract_storage) { tokens.push(row); }
+    }
+
     let count = tokens.len();
     Ok(warp::reply::json(&json!({
         "success": true,

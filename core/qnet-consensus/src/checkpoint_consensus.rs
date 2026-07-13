@@ -144,7 +144,12 @@ impl CheckpointConsensus {
             let entry = self.timeouts.entry(tm.index).or_default();
             entry.insert(tm.voter.clone(), tm.clone());
             let c = entry.len();
-            let snap = if c >= q { Some(entry.values().cloned().collect::<Vec<_>>()) } else { None };
+            // Form the TC EXACTLY once — on the quorum-CROSSING insert (c == q), never on every subsequent
+            // timeout. At committee 1000 a view change gathers up to ~1000 timeouts; forming/relaying a
+            // fresh multi-MB TC on each (the old c >= q) is an O(committee) re-verify + egress storm on
+            // every node during the very view change that must restore finality. c == q yields the MINIMAL
+            // valid TC (exactly quorum) once; later duplicates add nothing (quorum met; high_qc is ours).
+            let snap = if c == q { Some(entry.values().cloned().collect::<Vec<_>>()) } else { None };
             (c, snap)
         };
         let mut out = Vec::new();

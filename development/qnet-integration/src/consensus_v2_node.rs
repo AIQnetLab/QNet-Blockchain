@@ -50,8 +50,13 @@ pub fn verify_msg(p2p: &SimplifiedP2P, committee: &[String], msg: &ConsensusMsg)
     let in_committee = |id: &str| committee.is_empty() || committee.iter().any(|c| c == id);
     match msg {
         ConsensusMsg::Proposal(cp) => sig_ok(p2p, &cp.proposer, &sign_str("CKPT", &cp.hash()), &cp.proposer_sig),
+        // C-2: a vote is folded into the QC and later re-checked by the compact QC verifier against the
+        // signer's on-chain vrf_pk. Gate it here with the IDENTICAL check (strip → verify_compact vs
+        // vrf_pk) so any admitted vote is guaranteed compact-verifiable network-wide — NOT the RAM-registry
+        // sig_ok, whose TOFV/idle-eviction lets an off-chain-key vote pass ingest yet fail the QC verifier
+        // ⇒ an unverifiable leaf locks the QC ⇒ finality stall.
         ConsensusMsg::Vote(v) => in_committee(&v.voter)
-            && sig_ok(p2p, &v.voter, &sign_str("VOTE", &v.checkpoint_hash), &v.signature),
+            && vote_sig_compact_ok(&v.voter, &v.checkpoint_hash, &v.signature),
         ConsensusMsg::Timeout(tm) => in_committee(&tm.voter)
             && sig_ok(p2p, &tm.voter, &sign_str("TMO", &timeout_bytes(tm.index, tm.high_qc_index)), &tm.signature),
         ConsensusMsg::Qc(qc) => verify_qc(p2p, committee, qc),
@@ -74,8 +79,46 @@ fn sig_ok(p2p: &SimplifiedP2P, signer: &str, msg: &str, sig: &[u8]) -> bool {
     }
 }
 
-fn verify_qc(p2p: &SimplifiedP2P, committee: &[String], qc: &QuorumCertificate) -> bool {
-    qc.verify(committee, |voter, body, sig| sig_ok(p2p, voter, &sign_str("VOTE", body), sig)).is_ok()
+/// C-2: verify a VOTE signature EXACTLY as the compact QC verifier will — strip the embedded pk and open
+/// against the signer's ON-CHAIN vrf_pk (load_vrf_public_key, else the binary-pinned genesis anchor; NEVER
+/// the RAM registry). The registry is TOFV-capable + idle-evicted, so gating a vote with the registry
+/// (sig_ok) would let a signer pass ingest under an OFF-CHAIN key yet fail the vrf_pk QC verifier at scale —
+/// an unverifiable leaf locks the QC ⇒ finality stall. Same key + math as verify_qc/verify_v2_macroblock ⇒
+/// any gated vote is guaranteed compact-verifiable network-wide. Sync + deterministic; pk/storage absent ⇒
+/// reject. Honest votes carry embedded==vrf_pk ⇒ pass (no liveness cost).
+fn vote_sig_compact_ok(voter: &str, checkpoint_hash: &[u8], sig: &[u8]) -> bool {
+    let storage = match crate::node::try_get_storage() { Some(s) => s, None => return false };
+    let pk = match storage.load_vrf_public_key(voter) {
+        Ok(Some(p)) => p,
+        _ => match crate::genesis_constants::get_genesis_anchor_pk(voter) { Some(p) => p, None => return false },
+    };
+    let sig_str = match std::str::from_utf8(sig) { Ok(s) => s, Err(_) => return false };
+    let compact = match qnet_consensus::consensus_crypto::strip_embedded_pk(sig_str) { Some(c) => c, None => return false };
+    qnet_consensus::consensus_crypto::verify_consensus_signature_compact(
+        voter, &sign_str("VOTE", checkpoint_hash), &compact, &pk)
+}
+
+fn verify_qc(_p2p: &SimplifiedP2P, committee: &[String], qc: &QuorumCertificate) -> bool {
+    // C-2: qc.sigs are pk-stripped — resolve each signer's pk from on-chain committee state (deterministic
+    // + process-uniform: vrf_pk row, else the binary-pinned genesis anchor; NEVER the RAM registry) and
+    // verify compact. Pre-resolve a Sync map (the per-sig check runs in QuorumCertificate::verify's rayon
+    // par_iter). Storage not yet initialized ⇒ reject (cannot authenticate). MUST stay byte-identical to
+    // the apply-time verifier (verify_v2_macroblock) or live-gossip and stored QC verify would diverge.
+    let storage = match crate::node::try_get_storage() { Some(s) => s, None => return false };
+    let pk_map: std::collections::HashMap<String, Vec<u8>> = qc.signers.iter().filter_map(|id| {
+        match storage.load_vrf_public_key(id) {
+            Ok(Some(p)) => Some((id.clone(), p)),
+            _ => crate::genesis_constants::get_genesis_anchor_pk(id).map(|p| (id.clone(), p)),
+        }
+    }).collect();
+    qc.verify(committee, |voter, body, sig| {
+        let pk = match pk_map.get(voter) { Some(p) => p, None => return false };
+        match std::str::from_utf8(sig) {
+            Ok(s) => qnet_consensus::consensus_crypto::verify_consensus_signature_compact(
+                voter, &sign_str("VOTE", body), s, pk),
+            Err(_) => false,
+        }
+    }).is_ok()
 }
 
 /// Checkpoint index a wire message pertains to — used to gate handling until this

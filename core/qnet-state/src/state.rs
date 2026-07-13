@@ -50,6 +50,13 @@ static CREDITED_FEES_BLOCKS: Lazy<ParkingRwLock<HashSet<u64>>> = Lazy::new(|| {
     ParkingRwLock::new(HashSet::new())
 });
 
+/// V2: storage_root of a contract with an empty contract_storage — the root of an empty
+/// StorageMerkleTree (a fixed constant). Account constructors seed this; a real deployed contract
+/// always carries metadata keys, so a contract leaf is never hashed with this in practice — it is a
+/// backstop that keeps a default-constructed account consistent with a rebuild-derived empty tree.
+pub static EMPTY_STORAGE_ROOT: Lazy<[u8; 32]> =
+    Lazy::new(|| StateMerkleTree::compute_storage_root(&HashMap::new()));
+
 /// v3.26: Check and mark block as fee-credited atomically
 /// Returns true if fee should be credited (first time), false if already done
 /// v3.39: Auto-cleanup blocks older than 1000 heights to prevent memory leak
@@ -398,6 +405,27 @@ impl StateMerkleTree {
         self.dirty_paths.insert(addr_hash); // v32.14: incremental path tracking
     }
 
+    /// V2: insert a RAW leaf (key hashed via hash_storage_key, value taken verbatim), no root recompute.
+    /// Builds a per-contract StorageMerkleTree over contract_storage entries; its root is storage_root.
+    /// Bypasses hash_account (that is for account leaves; this leaf commits one storage key→value).
+    pub fn insert_raw_lazy(&mut self, key_preimage: &str, leaf_value: [u8; HASH_SIZE]) {
+        let leaf_key = Self::hash_storage_key(key_preimage);
+        self.leaf_put(leaf_key, leaf_value);
+        self.dirty = true;
+        self.pending_updates += 1;
+        self.dirty_paths.insert(leaf_key);
+    }
+
+    /// V2 (incremental): remove a RAW leaf (drained storage key) WITHOUT root recomputation — the
+    /// delete-side of insert_raw_lazy, so an incremental sweep can drop a drained `balance:{holder}`.
+    pub fn delete_raw_lazy(&mut self, key_preimage: &str) {
+        let leaf_key = Self::hash_storage_key(key_preimage);
+        self.leaf_del(leaf_key);
+        self.dirty = true;
+        self.pending_updates += 1;
+        self.dirty_paths.insert(leaf_key);
+    }
+
     /// v3.22: Batch insert multiple accounts WITHOUT root recomputation
     /// Use for Genesis block or large batch operations
     /// O(m) where m = number of updates, no tree traversal
@@ -591,7 +619,32 @@ impl StateMerkleTree {
 
         proof
     }
-    
+
+    /// V2: proof for a RAW storage leaf (level-2 of a TokenBalanceProof). Same sibling walk as
+    /// generate_proof but keyed by hash_storage_key(key_preimage) instead of hash_address.
+    pub fn generate_raw_proof(&mut self, key_preimage: &str) -> Vec<([u8; HASH_SIZE], bool)> {
+        let leaf_hash = Self::hash_storage_key(key_preimage);
+        let mut proof = Vec::with_capacity(TREE_DEPTH);
+        let mut key = leaf_hash;
+        for depth in 0..TREE_DEPTH {
+            let mut sibling_key = key;
+            Self::flip_bit(&mut sibling_key, depth);
+            let sibling_hash = if depth == 0 {
+                self.leaf_get(&sibling_key).unwrap_or(self.default_hashes[0])
+            } else {
+                self.node_get(depth as u32, &sibling_key).unwrap_or(self.default_hashes[depth])
+            };
+            let is_right = Self::get_bit(&leaf_hash, depth);
+            proof.push((sibling_hash, is_right));
+            let byte_idx = depth / 8;
+            let bit_idx = 7 - (depth % 8);
+            if byte_idx < HASH_SIZE {
+                key[byte_idx] &= !(1 << bit_idx);
+            }
+        }
+        proof
+    }
+
     /// Verify proof
     pub fn verify_proof(
         address: &str,
@@ -629,9 +682,43 @@ impl StateMerkleTree {
         
         current == *root
     }
-    
+
+    /// V2: verify a RAW storage-leaf proof (level-2 of a TokenBalanceProof). Seeds current = leaf_value
+    /// (NOT hash_account) and keys the walk by hash_storage_key(key_preimage). Proves value ∈ storage_root.
+    pub fn verify_raw_proof(
+        key_preimage: &str,
+        leaf_value: [u8; HASH_SIZE],
+        proof: &[([u8; HASH_SIZE], bool)],
+        root: &[u8; HASH_SIZE],
+    ) -> bool {
+        if proof.len() != TREE_DEPTH {
+            return false;
+        }
+        let leaf_hash = Self::hash_storage_key(key_preimage);
+        let mut current = leaf_value;
+        let mut buffer = [0u8; HASH_SIZE * 2];
+        for (depth, (sibling, is_right)) in proof.iter().enumerate() {
+            let expected_bit = Self::get_bit(&leaf_hash, depth);
+            if *is_right != expected_bit {
+                return false;
+            }
+            if *is_right {
+                buffer[..HASH_SIZE].copy_from_slice(sibling);
+                buffer[HASH_SIZE..].copy_from_slice(&current);
+            } else {
+                buffer[..HASH_SIZE].copy_from_slice(&current);
+                buffer[HASH_SIZE..].copy_from_slice(sibling);
+            }
+            let mut hasher = Sha3_256::new();
+            hasher.update(&buffer);
+            let result = hasher.finalize();
+            current.copy_from_slice(&result);
+        }
+        current == *root
+    }
+
     // Internal helpers
-    
+
     fn hash_address(address: &str) -> [u8; HASH_SIZE] {
         let mut hasher = Sha3_256::new();
         hasher.update(b"QNET_ADDR:");
@@ -640,6 +727,58 @@ impl StateMerkleTree {
         let mut arr = [0u8; HASH_SIZE];
         arr.copy_from_slice(&result);
         arr
+    }
+
+    /// V2: SMT leaf-position hash for a contract_storage KEY (domain-separated from account addresses).
+    fn hash_storage_key(key: &str) -> [u8; HASH_SIZE] {
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"QNET_STORAGE_KEY:");
+        hasher.update(key.as_bytes());
+        let mut arr = [0u8; HASH_SIZE];
+        arr.copy_from_slice(&hasher.finalize());
+        arr
+    }
+
+    /// V2: SMT leaf VALUE for a contract_storage value — hash of the RAW stored string (balances are
+    /// decimal strings), so a client reproduces it from the same string with no width/padding ambiguity.
+    fn storage_leaf_value(value: &str) -> [u8; HASH_SIZE] {
+        let mut hasher = Sha3_256::new();
+        hasher.update(b"QNET_STORAGE_VAL:");
+        hasher.update(value.as_bytes());
+        let mut arr = [0u8; HASH_SIZE];
+        arr.copy_from_slice(&hasher.finalize());
+        arr
+    }
+
+    /// V2: deterministic root of the per-contract StorageMerkleTree over the ENTIRE contract_storage
+    /// map (one leaf per key). PURE function of the map — order-independent (SMT keyed by hash) — so it
+    /// CANNOT drift from the account's true storage. This is what Account.storage_root commits to, and
+    /// it is rebuilt on demand (O(entries)) to serve a TokenBalanceProof.
+    pub fn compute_storage_root(storage: &HashMap<String, String>) -> [u8; HASH_SIZE] {
+        // Single source of truth for the tree shape — build_storage_tree; taking .root() cannot diverge
+        // from the tree the proof path serves.
+        let mut tree = Self::build_storage_tree(storage);
+        tree.root()
+    }
+
+    /// V2: build the per-contract StorageMerkleTree in-memory (for proof generation AND compute_storage_root).
+    /// The ONE place the storage-tree leaf shape (hash_storage_key + storage_leaf_value) is defined.
+    pub fn build_storage_tree(storage: &HashMap<String, String>) -> StateMerkleTree {
+        let mut tree = StateMerkleTree::new();
+        for (k, v) in storage {
+            tree.insert_raw_lazy(k, Self::storage_leaf_value(v));
+        }
+        tree.finalize();
+        tree
+    }
+
+    /// V2 SNAPSHOT BINDING: true iff `account`'s committed storage_root actually hashes its
+    /// contract_storage (trivially true for non-contracts). The ONE predicate the snapshot/cold-join
+    /// ingest chokepoints (state.rs restore_accounts_streamed + integration recompute_account_merkle_root_cf)
+    /// use to reject a forged snapshot — extracted so the leaf-schema check cannot drift between them.
+    pub fn contract_storage_root_matches(account: &Account) -> bool {
+        !account.is_contract
+            || Self::compute_storage_root(&account.contract_storage) == account.storage_root
     }
     
     fn hash_account(account: &Account) -> [u8; HASH_SIZE] {
@@ -655,15 +794,16 @@ impl StateMerkleTree {
             hasher.update(b"CODE:");
             hasher.update(code_hash.as_bytes());
         }
-        if !account.contract_storage.is_empty() {
-            hasher.update(b"STORAGE:");
-            // Keys MUST be sorted — HashMap iteration is non-deterministic
-            let mut sorted_keys: Vec<&String> = account.contract_storage.keys().collect();
-            sorted_keys.sort();
-            for key in sorted_keys {
-                hasher.update(key.as_bytes());
-                hasher.update(account.contract_storage[key].as_bytes());
-            }
+        // V2: contract state committed via the per-contract storage merkle root — each stored value
+        // (token balances, total_supply, allowances) is individually provable, and this leaf no longer
+        // folds the whole map O(H). storage_root is kept == root(StorageMerkleTree(contract_storage)) by
+        // a pure post-apply recompute, so it cannot drift. UNCONDITIONAL for contracts (fixed schema,
+        // same rule as pending/HB/LCE): an emptiness- or flag-conditional inclusion would fork running
+        // vs rebuilt nodes. Non-contract accounts skip it (their storage is always empty) → the native
+        // leaf is byte-identical to the pre-V2 schema, so native BalanceProofs keep verifying.
+        if account.is_contract {
+            hasher.update(b"SROOT:");
+            hasher.update(&account.storage_root);
         }
         // v32.15: pending_rewards ALWAYS in leaf hash — fixed schema for chain
         // lifetime. A runtime flag here made hash_account non-deterministic:
@@ -926,6 +1066,34 @@ pub struct BalanceProof {
     pub block_height: u64,
 }
 
+/// V2: two-level proof that a holder's QRC-20 balance is committed in state_root.
+///  Level 1 — the contract ACCOUNT leaf (carrying storage_root) is proven in state_root.
+///  Level 2 — the `balance:{holder}` leaf is proven in that storage_root (the contract's storage tree).
+/// Carries EVERY field hash_account reads for a contract leaf so a light client can reconstruct both.
+#[derive(Debug, Clone)]
+pub struct TokenBalanceProof {
+    // Level-1: contract account leaf → state_root
+    pub contract_address: String,
+    pub account_balance: u64,
+    pub account_nonce: u64,
+    pub account_pending_rewards: u64,
+    pub contract_code_hash: Option<String>,
+    pub storage_root: [u8; HASH_SIZE],
+    pub heartbeat_epoch: u64,
+    pub heartbeat_slots: u16,
+    pub heartbeat_final_epoch: u64,
+    pub heartbeat_final_count: u8,
+    pub last_claimed_epoch: u64,
+    pub account_proof: Vec<([u8; HASH_SIZE], bool)>,
+    // Level-2: balance:{holder} leaf → storage_root
+    pub holder: String,
+    pub token_balance: String, // raw stored decimal string (what storage_leaf_value hashes)
+    pub storage_proof: Vec<([u8; HASH_SIZE], bool)>,
+    // Anchors
+    pub state_root: [u8; HASH_SIZE],
+    pub block_height: u64,
+}
+
 /// Chain state information
 #[derive(Debug, Clone)]
 pub struct ChainState {
@@ -973,6 +1141,9 @@ pub struct BlockSnapshot {
     created_keys: HashSet<String>,
     /// Block height for logging
     height: u64,
+    /// QRC-20 wallet↔token ownership transitions applied this block (NON-consensus reverse-index
+    /// deltas). Drained by the persist layer; never restored on rollback (the block is discarded).
+    owns: Vec<crate::transaction::OwnsDelta>,
 }
 
 impl BlockSnapshot {
@@ -982,6 +1153,7 @@ impl BlockSnapshot {
             pre_images: HashMap::new(),
             created_keys: HashSet::new(),
             height,
+            owns: Vec::new(),
         }
     }
 
@@ -1016,6 +1188,17 @@ impl BlockSnapshot {
 
     pub fn height(&self) -> u64 {
         self.height
+    }
+
+    /// Mutable owns-delta sink — the apply path passes this to `apply_transaction_lazy_at_indexed`
+    /// so QRC-20 0↔nonzero transitions are journaled alongside the account pre-images.
+    pub fn owns_mut(&mut self) -> &mut Vec<crate::transaction::OwnsDelta> {
+        &mut self.owns
+    }
+
+    /// Owns-index deltas collected this block (drained by the persist layer).
+    pub fn owns(&self) -> &[crate::transaction::OwnsDelta] {
+        &self.owns
     }
 
     /// Number of accounts journaled (pre-images + created)
@@ -1143,6 +1326,13 @@ pub struct StateManager {
     disk_load_hits: Arc<std::sync::atomic::AtomicU64>,
     disk_load_misses: Arc<std::sync::atomic::AtomicU64>,
     evictions_total: Arc<std::sync::atomic::AtomicU64>,
+    /// V2 (incremental): in-memory per-contract StorageMerkleTree cache, keyed by contract address.
+    /// NON-persisted (no RocksDB namespace → no wipe-bound fork edge): each tree is a pure cache
+    /// rebuilt from the authoritative Account.contract_storage on first touch after boot, and dropped
+    /// on rollback/restore. The post-apply sweep updates ONLY the keys that changed (diff of pre vs post)
+    /// → O(changed·depth) instead of an O(H) full rebuild, while storage_root stays provably equal to
+    /// StateMerkleTree::compute_storage_root(contract_storage) (from-truth determinism test).
+    token_trees: Arc<parking_lot::RwLock<HashMap<String, StateMerkleTree>>>,
 }
 
 impl StateManager {
@@ -1172,6 +1362,7 @@ impl StateManager {
             // compatible with the pre-2A behaviour. Bumping this via
             // `set_num_shards` activates the multi-shard routing surface.
             num_shards: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            token_trees: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -1395,6 +1586,10 @@ impl StateManager {
             for (addr, _) in &victims {
                 self.accounts.remove(addr);
                 self.last_access.remove(addr);
+                // V2: drop any per-contract storage-tree cache for an evicted address too, so the cache
+                // never outlives its account (it rebuilds from the disk-warmed contract_storage on next
+                // touch — the pipeline warms before apply). Bounds token_trees memory under eviction.
+                self.token_trees.write().remove(addr);
                 evicted = evicted.saturating_add(1);
             }
             if evicted > 0 {
@@ -1617,7 +1812,23 @@ impl StateManager {
     
     /// Update account
     /// v3.22: Uses lazy Merkle update - call finalize_merkle() after batch updates
+    /// V2 FOOTGUN GUARD: this bypasses the post-apply storage-root sweep AND the per-contract token-tree
+    /// cache, so using it for a CONTRACT account would (a) commit an unswept storage_root and (b) leave
+    /// the cached tree stale → the next incremental diff forks. It is apply-funnel-external (no prod
+    /// callers today); never route a contract account through it without resync_contract_storage_roots.
     pub fn update_account(&self, address: String, account: Account) {
+        // A contract leaf committed here without the sweep would carry a stale storage_root and desync
+        // token_trees → fork. Route contracts through the sweep so the leaf is always correct.
+        if account.is_contract {
+            let mut one = HashMap::new();
+            one.insert(address.clone(), account);
+            self.resync_contract_storage_roots(&mut one);
+            let swept = one.remove(&address).expect("account retained by sweep");
+            let mut tree = self.merkle_tree.write();
+            tree.insert_lazy(&address, &swept);
+            self.accounts.insert(address, swept);
+            return;
+        }
         // v3.22: Lazy merkle update
         {
             let mut tree = self.merkle_tree.write();
@@ -1626,10 +1837,22 @@ impl StateManager {
         // Update accounts map
         self.accounts.insert(address, account);
     }
-    
+
     /// v3.22: Update account with immediate Merkle finalization
     /// Use for single updates outside block processing
     pub fn update_account_finalize(&self, address: String, account: Account) {
+        // V2 RELEASE-ACTIVE GUARD — see update_account. A contract account is swept (storage_root +
+        // token_trees) before the merkle insert so a release build can never commit a stale leaf.
+        if account.is_contract {
+            let mut one = HashMap::new();
+            one.insert(address.clone(), account);
+            self.resync_contract_storage_roots(&mut one);
+            let swept = one.remove(&address).expect("account retained by sweep");
+            let mut tree = self.merkle_tree.write();
+            tree.insert(&address, &swept);
+            self.accounts.insert(address, swept);
+            return;
+        }
         {
             let mut tree = self.merkle_tree.write();
             tree.insert(&address, &account);
@@ -1668,7 +1891,170 @@ impl StateManager {
             block_height: chain_state.height,
         })
     }
-    
+
+    /// V2: build a two-level proof that `holder`'s balance in QRC-20 contract `contract` is committed in
+    /// state_root. Level-2 rebuilds the contract's storage tree on demand (O(entries), off-consensus) and
+    /// proves the balance:{holder} leaf in it; Level-1 proves the contract account leaf (with storage_root)
+    /// in the account tree. Fail-closed if the rebuilt storage root disagrees with the committed one.
+    pub fn get_token_balance_with_proof(&self, contract: &str, holder: &str) -> Option<TokenBalanceProof> {
+        let account = self.read_account(contract)?;
+        if !account.is_contract { return None; }
+        let balance_key = format!("balance:{}", holder);
+        let token_balance = account.contract_storage.get(&balance_key).cloned()
+            .unwrap_or_else(|| "0".to_string());
+
+        // Level-2 storage proof: reuse the incremental per-contract tree (O(log N)) instead of rebuilding
+        // the whole SMT per request (O(entries) CPU on producing nodes). Cold cache builds once and
+        // repopulates only when the fresh root == committed storage_root (keeps the cache invariant).
+        // Runs under the caller's outer state READ lock (excludes apply), so the snapshot is consistent.
+        let (storage_root, storage_proof) = {
+            let mut trees = self.token_trees.write();
+            // root() takes &mut (finalizes lazily) so it can't sit in a match guard — probe get_mut first.
+            let reused = if let Some(t) = trees.get_mut(contract) {
+                if t.root() == account.storage_root { Some((t.root(), t.generate_raw_proof(&balance_key))) } else { None }
+            } else { None };
+            match reused {
+                Some(v) => v,
+                None => {
+                    let mut fresh = StateMerkleTree::build_storage_tree(&account.contract_storage);
+                    let r = fresh.root();
+                    let p = fresh.generate_raw_proof(&balance_key);
+                    if r == account.storage_root { trees.insert(contract.to_string(), fresh); }
+                    (r, p)
+                }
+            }
+        };
+        if storage_root != account.storage_root { return None; }
+
+        // Level-1: prove the contract account leaf in the account tree.
+        let mut tree = self.merkle_tree.write();
+        let chain_state = self.chain_state.read();
+        let account_proof = tree.generate_proof(contract);
+        let state_root = tree.root();
+
+        Some(TokenBalanceProof {
+            contract_address: contract.to_string(),
+            account_balance: account.balance,
+            account_nonce: account.nonce,
+            account_pending_rewards: account.pending_rewards,
+            contract_code_hash: account.contract_code_hash.clone(),
+            storage_root: account.storage_root,
+            heartbeat_epoch: account.heartbeat_epoch,
+            heartbeat_slots: account.heartbeat_slots,
+            heartbeat_final_epoch: account.heartbeat_final_epoch,
+            heartbeat_final_count: account.heartbeat_final_count,
+            last_claimed_epoch: account.last_claimed_epoch,
+            account_proof,
+            holder: holder.to_string(),
+            token_balance,
+            storage_proof,
+            state_root,
+            block_height: chain_state.height,
+        })
+    }
+
+    /// Level-1 half of a token-balance proof — captures the O(log N) account-leaf proof + state_root under
+    /// the caller's guard (they exist in the merkle tree even for an evicted contract), plus O(1) handles to
+    /// `accounts` and the `disk_store`. The FULL contract_storage is NEVER cloned under the lock: Level-2
+    /// re-reads it OFF the consensus lock via the accounts handle (or, for an LRU-evicted idle contract,
+    /// a single point read from disk_store), so a whale token's O(holders) clone+build can never stall block
+    /// apply. The shared per-contract `token_trees` cache is deliberately NOT handed out — it is the apply-
+    /// path's trusted last-committed mirror (resync applies incremental diffs onto it), so an off-lock write
+    /// from a concurrent proof would poison that diff → divergent storage_root → fork; Level-2 uses a private
+    /// throwaway tree instead. `need_disk=true` means the contract was not resident: Level-1 could not copy
+    /// its metadata under the lock (that would re-introduce the O(holders) stall), so Level-2 fills it from
+    /// the off-lock disk snapshot; the account_proof(H) remains the consistency anchor (a light client
+    /// rejects any metadata that doesn't hash to the committed leaf), so the evicted path is fail-closed.
+    pub fn token_proof_level1(&self, contract: &str)
+        -> Option<(TokenBalanceProof, Arc<DashMap<String, Account>>, Option<Arc<dyn AccountStore>>, bool)> {
+        // Copy the scalar metadata (O(1)) and DROP the account Ref before taking merkle_tree — never hold
+        // an accounts shard lock across the tree lock (matches the apply-path lock order). A non-resident
+        // (evicted) contract defers metadata capture to Level-2's off-lock disk read (need_disk=true).
+        let (need_disk, addr, balance, nonce, pending, code_hash, sroot, hb_e, hb_s, hb_fe, hb_fc, lce) =
+            match self.accounts.get(contract) {
+                Some(acc) => {
+                    if !acc.is_contract { return None; }
+                    (false, acc.address.clone(), acc.balance, acc.nonce, acc.pending_rewards,
+                     acc.contract_code_hash.clone(), acc.storage_root, acc.heartbeat_epoch, acc.heartbeat_slots,
+                     acc.heartbeat_final_epoch, acc.heartbeat_final_count, acc.last_claimed_epoch)
+                }
+                None => (true, contract.to_string(), 0u64, 0u64, 0u64, None, [0u8; 32], 0u64, 0u16, 0u64, 0u8, 0u64),
+            };
+        let (account_proof, state_root) = {
+            let mut tree = self.merkle_tree.write();
+            (tree.generate_proof(contract), tree.root())
+        };
+        let height = self.chain_state.read().height;
+        let store = self.disk_store.read().clone(); // O(1) Arc clone — used only on the evicted (need_disk) path
+        let partial = TokenBalanceProof {
+            contract_address: addr, account_balance: balance, account_nonce: nonce,
+            account_pending_rewards: pending, contract_code_hash: code_hash, storage_root: sroot,
+            heartbeat_epoch: hb_e, heartbeat_slots: hb_s, heartbeat_final_epoch: hb_fe,
+            heartbeat_final_count: hb_fc, last_claimed_epoch: lce, account_proof,
+            holder: String::new(), token_balance: String::new(), storage_proof: Vec::new(),
+            state_root, block_height: height,
+        };
+        Some((partial, self.accounts.clone(), store, need_disk))
+    }
+
+    /// Level-2 half — OFF the consensus lock: re-read the contract from the accounts handle (a single
+    /// O(holders) clone that never touches the outer state lock), build the storage half of the proof from
+    /// a PRIVATE throwaway tree, and fill it in. The account metadata comes from Level-1's committed snapshot
+    /// (bound by account_proof); the off-lock storage is used ONLY to build the local tree, fail-closed
+    /// unless its root == that snapshot's storage_root (apply moved the contract in the L1→L2 gap ⇒ client
+    /// retries). storage_root unchanged ⇒ every storage entry incl. balance:{holder} is unchanged, so the
+    /// served token_balance is consistent with the account_proof at Level-1's height.
+    ///
+    /// The tree is LOCAL and discarded — it is NEVER inserted into the shared `token_trees` cache. That
+    /// cache is the apply-path's trusted last-committed mirror (resync_contract_storage_roots applies only
+    /// the PRE→POST key diff onto it, with no root re-check); an off-lock insert here could overwrite a
+    /// freshly-resynced tree with a stale one (clone-at-Rn races an apply Rn→Rn+1), after which the next
+    /// apply's incremental diff yields the wrong storage_root and this node forks off. The O(holders) clone
+    /// dominates the cost regardless, so skipping the cache-reuse costs only a constant, never a stall.
+    ///
+    /// `need_disk`: the contract was LRU-evicted (idle) at Level-1, so resolve it from `store` (one off-lock
+    /// point read) and fill the metadata Level-1 left as a sentinel. A non-resident contract has not been
+    /// mutated-in-memory since its persist, so disk == the committed state the account_proof(H) binds; the
+    /// only race (a concurrent re-warm+persist in the L1→L2 gap) is caught by the light client — the served
+    /// metadata won't hash to the committed leaf → verify fails → retry, never a wrong proof.
+    pub fn token_proof_level2(
+        mut partial: TokenBalanceProof, contract: &str, holder: &str,
+        accounts: Arc<DashMap<String, Account>>,
+        store: Option<Arc<dyn AccountStore>>, need_disk: bool,
+    ) -> Option<TokenBalanceProof> {
+        let account = if need_disk {
+            // Evicted idle contract: single off-lock point read; fill the metadata L1 could not copy.
+            let acc = store?.load_account(contract)?;
+            if !acc.is_contract { return None; }
+            partial.contract_address = acc.address.clone();
+            partial.account_balance = acc.balance;
+            partial.account_nonce = acc.nonce;
+            partial.account_pending_rewards = acc.pending_rewards;
+            partial.contract_code_hash = acc.contract_code_hash.clone();
+            partial.storage_root = acc.storage_root;
+            partial.heartbeat_epoch = acc.heartbeat_epoch;
+            partial.heartbeat_slots = acc.heartbeat_slots;
+            partial.heartbeat_final_epoch = acc.heartbeat_final_epoch;
+            partial.heartbeat_final_count = acc.heartbeat_final_count;
+            partial.last_claimed_epoch = acc.last_claimed_epoch;
+            acc
+        } else {
+            let acc = accounts.get(contract)?.clone(); // O(holders) clone, OFF the outer state lock
+            if acc.storage_root != partial.storage_root { return None; } // moved in the L1→L2 gap ⇒ retry
+            acc
+        };
+        let balance_key = format!("balance:{}", holder);
+        let token_balance = account.contract_storage.get(&balance_key).cloned()
+            .unwrap_or_else(|| "0".to_string());
+        // Private throwaway tree, built OFF all locks — never the shared consensus token_trees cache.
+        let mut fresh = StateMerkleTree::build_storage_tree(&account.contract_storage);
+        if fresh.root() != account.storage_root { return None; } // built root must match committed snapshot
+        partial.holder = holder.to_string();
+        partial.token_balance = token_balance;
+        partial.storage_proof = fresh.generate_raw_proof(&balance_key);
+        Some(partial)
+    }
+
     /// Verify a balance proof (static method for Light clients)
     /// FIX R23-C2: Uses pending_rewards from proof (not hardcoded 0) so verification
     /// works correctly after v7.0 fork when PENDING_REWARDS_IN_MERKLE is active.
@@ -1691,8 +2077,10 @@ impl StateManager {
             heartbeat_final_epoch: 0,
             heartbeat_final_count: 0,
             last_claimed_epoch: 0,
+            // Inert for this native (is_contract=false) reconstruction — the SROOT branch never reads it.
+            storage_root: [0u8; 32],
         };
-        
+
         StateMerkleTree::verify_proof(
             &proof.address,
             &account,
@@ -1700,7 +2088,48 @@ impl StateManager {
             &proof.state_root
         )
     }
-    
+
+    /// V2: verify a two-level TokenBalanceProof. Level-2 proves balance:{holder} ∈ storage_root; Level-1
+    /// reconstructs the contract account leaf (is_contract=true + storage_root) and proves it ∈ state_root.
+    /// Both must pass, binding token_balance → storage_root → contract account leaf → state_root.
+    pub fn verify_token_balance_proof(proof: &TokenBalanceProof) -> bool {
+        // Level-2: balance:{holder} ∈ storage_root.
+        let balance_key = format!("balance:{}", proof.holder);
+        // QRC-20 REMOVES drained keys (never stores "0"), so token_balance=="0" means the leaf is ABSENT
+        // — its on-chain value is the empty-leaf default (all-zero at depth 0). This makes a proof-of-
+        // absence (balance 0) verify too; a present balance hashes to a SHA3 leaf that is never all-zero.
+        let leaf_value = if proof.token_balance == "0" {
+            [0u8; HASH_SIZE]
+        } else {
+            StateMerkleTree::storage_leaf_value(&proof.token_balance)
+        };
+        if !StateMerkleTree::verify_raw_proof(&balance_key, leaf_value, &proof.storage_proof, &proof.storage_root) {
+            return false;
+        }
+        // Level-1: the contract account leaf (committing storage_root) ∈ state_root.
+        let account = Account {
+            address: proof.contract_address.clone(),
+            balance: proof.account_balance,
+            nonce: proof.account_nonce,
+            pending_rewards: proof.account_pending_rewards,
+            is_node: false,
+            node_type: None,
+            reputation: 0.70,
+            created_at: 0,
+            updated_at: 0,
+            is_contract: true,
+            contract_code_hash: proof.contract_code_hash.clone(),
+            contract_storage: std::collections::HashMap::new(), // not hashed under the SROOT schema
+            heartbeat_epoch: proof.heartbeat_epoch,
+            heartbeat_slots: proof.heartbeat_slots,
+            heartbeat_final_epoch: proof.heartbeat_final_epoch,
+            heartbeat_final_count: proof.heartbeat_final_count,
+            last_claimed_epoch: proof.last_claimed_epoch,
+            storage_root: proof.storage_root,
+        };
+        StateMerkleTree::verify_proof(&proof.contract_address, &account, &proof.account_proof, &proof.state_root)
+    }
+
     /// Get current Merkle state root (finalized)
     pub fn get_merkle_state_root(&self) -> [u8; HASH_SIZE] {
         let mut tree = self.merkle_tree.write();
@@ -1823,10 +2252,13 @@ impl StateManager {
         
         // Apply transaction
         tx.apply_to_state(&mut accounts_map)?;
-        
+
         // PROTOCOL: Mark commitment as applied after successful apply_to_state
         self.mark_commitment_from_tx(tx);
-        
+
+        // V2: keep each touched contract's storage_root == its storage tree before hashing (drift-proof).
+        self.resync_contract_storage_roots(&mut accounts_map);
+
         // v3.11: Write back changes AND update Merkle tree
         {
             let mut tree = self.merkle_tree.write();
@@ -1855,6 +2287,58 @@ impl StateManager {
     /// `apply_transaction_lazy_at` with the real height so the WASM host's
     /// `get_block_height()` is correct; every other caller (mempool pre-check, tests)
     /// is height-independent and stays on this wrapper.
+    /// V2: post-apply sweep — resync every touched contract's storage_root to
+    /// root(StorageMerkleTree(contract_storage)). The ONE sweep both apply funnels call (extracted from a
+    /// copy-paste), so a future perf change can't skew the SROOT leaf on one path and fork the other.
+    // SERIALIZATION INVARIANT: correctness relies on the caller holding the outer `state.write()` lock so
+    // applies are serialized — `pre` is read from self.accounts (still PRE) and the write-back happens
+    // after this returns. Applying contract txs concurrently (e.g. a future parallel/sharded executor
+    // mutating state) would race PRE vs the already-advanced tree → wrong diff. Keep applies serialized.
+    fn resync_contract_storage_roots(&self, accounts: &mut HashMap<String, Account>) {
+        let mut trees = self.token_trees.write();
+        for (addr, account) in accounts.iter_mut() {
+            if !account.is_contract { continue; }
+            match trees.get_mut(addr) {
+                Some(tree) => {
+                    match self.accounts.get(addr) {
+                        Some(pre_acct) => {
+                            // The cached tree reflects the LAST-committed storage = this tx's PRE (self.accounts
+                            // is still PRE at sweep time; write-back happens after). Diff PRE vs POST and apply
+                            // ONLY the changed keys → O(changed·depth). tree.finalize() incremental (recompute_levels).
+                            let pre = &pre_acct.contract_storage;
+                            let post = &account.contract_storage;
+                            for k in pre.keys() {
+                                if !post.contains_key(k) { tree.delete_raw_lazy(k); }
+                            }
+                            for (k, v) in post.iter() {
+                                if pre.get(k).map(|pv| pv != v).unwrap_or(true) {
+                                    tree.insert_raw_lazy(k, StateMerkleTree::storage_leaf_value(v));
+                                }
+                            }
+                            account.storage_root = tree.finalize();
+                        }
+                        None => {
+                            // PRE not resident in self.accounts (only via the funnel-external update_account
+                            // path): diffing against an empty PRE would overlay POST onto a stale tree. Rebuild
+                            // from POST (== compute_storage_root), like the None branch.
+                            let mut fresh = StateMerkleTree::build_storage_tree(&account.contract_storage);
+                            account.storage_root = fresh.root();
+                            *tree = fresh;
+                        }
+                    }
+                }
+                None => {
+                    // First touch (freshly deployed, or first write after boot/rollback): build from POST
+                    // once (O(H)); the resulting root == compute_storage_root(POST), and the populated
+                    // intermediate_nodes make every subsequent finalize incremental.
+                    let mut tree = StateMerkleTree::build_storage_tree(&account.contract_storage);
+                    account.storage_root = tree.root();
+                    trees.insert(addr.clone(), tree);
+                }
+            }
+        }
+    }
+
     pub fn apply_transaction_lazy(&self, tx: &Transaction) -> StateResult<()> {
         self.apply_transaction_lazy_at(tx, 0)
     }
@@ -1862,6 +2346,13 @@ impl StateManager {
     /// Lazy apply at a known block height, threaded into `apply_to_state_at` so the
     /// WASM host sees the height of the block that contains this TX.
     pub fn apply_transaction_lazy_at(&self, tx: &Transaction, block_height: u64) -> StateResult<()> {
+        let mut owns = Vec::new();
+        self.apply_transaction_lazy_at_indexed(tx, block_height, &mut owns)
+    }
+
+    /// Lazy apply that also collects QRC-20 owns-index deltas (wallet↔token 0↔nonzero transitions)
+    /// into `owns` so the persist layer maintains the reverse index. owns is NON-consensus.
+    pub fn apply_transaction_lazy_at_indexed(&self, tx: &Transaction, block_height: u64, owns: &mut Vec<crate::transaction::OwnsDelta>) -> StateResult<()> {
         // PROTOCOL: Check for duplicate commitment TXs before applying
         // Deterministic: same check on all nodes → same accept/reject decisions
         self.check_duplicate_commitment(tx)?;
@@ -1879,11 +2370,17 @@ impl StateManager {
         }
 
         // Apply transaction
-        tx.apply_to_state_at(&mut accounts_map, block_height)?;
+        tx.apply_to_state_at_indexed(&mut accounts_map, block_height, owns)?;
 
         // PROTOCOL: Mark commitment as applied after successful apply_to_state
         self.mark_commitment_from_tx(tx);
-        
+
+        // V2: recompute storage_root for every contract this tx touched, BEFORE the account is hashed
+        // into the merkle tree, so the leaf's SROOT commitment == root(StorageMerkleTree(contract_storage)).
+        // Pure function of the (now-mutated) map → drift-proof; this single funnel covers transfer/mint/
+        // burn/approve/deploy AND cross-contract/WASM writes (all touched contracts are in accounts_map).
+        self.resync_contract_storage_roots(&mut accounts_map);
+
         // v3.22: Lazy Merkle update - no root recomputation!
         {
             let mut tree = self.merkle_tree.write();
@@ -2042,6 +2539,10 @@ impl StateManager {
         }
 
         tree.finalize();
+        // V2: the in-mem per-contract storage-tree cache may have been advanced by the rolled-back block;
+        // drop it so each contract's tree rebuilds from its RESTORED contract_storage on next touch (the
+        // cache is non-consensus — storage_root is re-derived from truth, never trusted from the cache).
+        self.token_trees.write().clear();
 
         println!("[INFO][STATE] block_rollback h={} restored={} removed={} merkle=O(k) k={}",
                  snapshot.height(), k_restored, k_removed, k_removed + k_restored);
@@ -2060,6 +2561,7 @@ impl StateManager {
         let mut tree = self.merkle_tree.write();
         *tree = StateMerkleTree::new();
         *self.state_root.write() = [0u8; 32];
+        self.token_trees.write().clear(); // V2: drop the per-contract storage-tree cache on full reset
     }
     
     /// v3.38: Get number of accounts in state
@@ -2208,6 +2710,7 @@ impl StateManager {
     pub fn restore_accounts_streamed<I>(&self, accounts: I) -> StateResult<[u8; 32]>
     where I: IntoIterator<Item = (String, Account)> {
         self.accounts.clear();
+        self.token_trees.write().clear(); // V2: drop the per-contract storage-tree cache — rebuilds lazily from the restored contract_storage
 
         // Fork flag (PENDING_REWARDS_IN_MERKLE) is left for block replay to activate on a v2-emission
         // block; hashing already always includes those fields, so it does not affect the root here.
@@ -2216,6 +2719,14 @@ impl StateManager {
 
         let mut count: usize = 0;
         for (address, account) in accounts {
+            // V2 SNAPSHOT BINDING (mirrors storage.rs recompute_account_merkle_root_cf): the SROOT contract
+            // leaf commits only storage_root, so a restored contract_storage that does NOT hash to it would
+            // rebuild a valid-looking root yet serve forged balances / fork on the next write. Reject the
+            // mismatch here so the rehydrate fail-closed path rejects a tampered snapshot. O(entries).
+            if !StateMerkleTree::contract_storage_root_matches(&account) {
+                return Err(StateError::InvalidTransaction(format!(
+                    "[REJECT][SNAPSHOT] storage_root_mismatch addr={}", address)));
+            }
             tree.insert_lazy(&address, &account);
             self.accounts.insert(address, account); // move, no clone
             count += 1;
@@ -2412,6 +2923,334 @@ mod merkle_equiv_tests {
         a.recompute_root();
         let b = StateMerkleTree::new();
         assert_eq!(a.root, b.root, "empty-tree root must be the canonical default-hash root");
+    }
+
+    // V2: storage_root is a pure, order-independent function of contract_storage, and a raw storage
+    // proof (level-2 of a TokenBalanceProof) round-trips against it; tampering the value or key fails.
+    #[test]
+    fn storage_root_order_independent_and_provable() {
+        use std::collections::HashMap;
+        let mut a = HashMap::new();
+        a.insert("balance:alice".to_string(), "1000".to_string());
+        a.insert("balance:bob".to_string(), "250".to_string());
+        a.insert("total_supply".to_string(), "1250".to_string());
+        a.insert("symbol".to_string(), "TKN".to_string());
+        let mut b = HashMap::new(); // same entries, different construction order
+        b.insert("symbol".to_string(), "TKN".to_string());
+        b.insert("total_supply".to_string(), "1250".to_string());
+        b.insert("balance:bob".to_string(), "250".to_string());
+        b.insert("balance:alice".to_string(), "1000".to_string());
+        let ra = StateMerkleTree::compute_storage_root(&a);
+        assert_eq!(ra, StateMerkleTree::compute_storage_root(&b), "storage_root must be order-independent");
+
+        let mut tree = StateMerkleTree::build_storage_tree(&a);
+        let root = tree.finalize();
+        assert_eq!(root, ra, "built tree root must equal compute_storage_root");
+        let proof = tree.generate_raw_proof("balance:alice");
+        let leaf = StateMerkleTree::storage_leaf_value("1000");
+        assert!(StateMerkleTree::verify_raw_proof("balance:alice", leaf, &proof, &root), "valid proof verifies");
+        let wrong_val = StateMerkleTree::storage_leaf_value("9999");
+        assert!(!StateMerkleTree::verify_raw_proof("balance:alice", wrong_val, &proof, &root), "wrong value rejected");
+        assert!(!StateMerkleTree::verify_raw_proof("balance:bob", leaf, &proof, &root), "wrong key rejected");
+    }
+
+    // V2 CLIENT-PARITY: the storage leaf/key hashes the Rust node produces must byte-match what the
+    // mobile JS verifier recomputes via js-sha3 (SHA3-256). Pinned vectors — the JS constants
+    // sha3_256("QNET_STORAGE_VAL:1000") and sha3_256("QNET_STORAGE_KEY:balance:alice") must equal these.
+    #[test]
+    fn v2_storage_hash_vectors_pinned_for_client_parity() {
+        assert_eq!(hex::encode(StateMerkleTree::storage_leaf_value("1000")),
+            "c19bc1743d19707e654bf7e0061b3b7c05347d8d047a2562bba6ec792444507e",
+            "storage_leaf_value(\"1000\") must match js-sha3 sha3_256(\"QNET_STORAGE_VAL:1000\")");
+        // This key-hash preimage drives the mobile verifier's bit-direction walk — a Rust↔js-sha3
+        // divergence here silently breaks trustless token proofs, so it is ASSERTED, not printed.
+        assert_eq!(hex::encode(StateMerkleTree::hash_storage_key("balance:alice")),
+            "0207400c7af5da59b11169673e342fbb971469d6d268d32152cf2c746f5c4e07",
+            "hash_storage_key(\"balance:alice\") must match js-sha3 sha3_256(\"QNET_STORAGE_KEY:balance:alice\")");
+    }
+
+    // V2: empty contract_storage yields the canonical EMPTY_STORAGE_ROOT; a drained key returns to it.
+    #[test]
+    fn empty_storage_root_matches_constant() {
+        use std::collections::HashMap;
+        let empty: HashMap<String, String> = HashMap::new();
+        assert_eq!(StateMerkleTree::compute_storage_root(&empty), *EMPTY_STORAGE_ROOT);
+        let mut m = HashMap::new();
+        m.insert("balance:alice".to_string(), "5".to_string());
+        let with_key = StateMerkleTree::compute_storage_root(&m);
+        m.remove("balance:alice");
+        assert_eq!(StateMerkleTree::compute_storage_root(&m), *EMPTY_STORAGE_ROOT, "drained key → empty root");
+        assert_ne!(with_key, *EMPTY_STORAGE_ROOT);
+    }
+
+    // V2 CUTOVER: a QRC-20 deploy applied through the consensus funnel (StateManager) leaves the
+    // contract's storage_root == compute_storage_root(contract_storage) — the post-apply sweep hit
+    // every write — and a full rebuild from the swept accounts reproduces the identical merkle root,
+    // i.e. the incremental (live) leaf and a from-scratch rebuild agree on the SROOT contract leaf.
+    #[test]
+    fn v2_contract_storage_root_swept_and_rebuild_stable() {
+        use crate::{Transaction, TransactionType};
+        let deployer = "deployer_eon_test";
+        let mut d = Account::new(deployer.to_string());
+        d.balance = 1_000_000_000;
+        let sm = StateManager::new();
+        sm.restore_accounts(vec![(deployer.to_string(), d)]).unwrap();
+
+        let mut tx = Transaction {
+            hash: String::new(), from: deployer.to_string(), to: None, amount: 0, nonce: 1,
+            timestamp: 0, gas_price: 1, gas_limit: 1_000_000,
+            data: Some("{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":1000}".to_string()),
+            signature: None, public_key: None, tx_type: TransactionType::ContractDeploy,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        sm.apply_transaction_lazy_at(&tx, 1).unwrap();
+        let live_root = sm.finalize_merkle();
+
+        let all = sm.get_all_accounts();
+        let cacct = all.iter().map(|(_, a)| a).find(|a| a.is_contract).expect("contract account created");
+        assert_eq!(cacct.storage_root, StateMerkleTree::compute_storage_root(&cacct.contract_storage),
+            "sweep must leave storage_root == root(StorageMerkleTree(contract_storage))");
+        assert_ne!(cacct.storage_root, *EMPTY_STORAGE_ROOT, "a deployed contract has metadata → non-empty root");
+
+        let sm2 = StateManager::new();
+        sm2.restore_accounts(all.clone()).unwrap();
+        assert_eq!(sm2.finalize_merkle(), live_root, "full rebuild must equal the incremental root");
+    }
+
+    // V2 PROOF: a two-level TokenBalanceProof for a holder verifies against state_root; a proof-of-absence
+    // (balance 0) also verifies; tampering the balance, holder, or a level fails.
+    #[test]
+    fn v2_token_balance_proof_round_trip() {
+        use crate::{Transaction, TransactionType};
+        let deployer = "deployer_eon_tok";
+        let mut d = Account::new(deployer.to_string());
+        d.balance = 1_000_000_000;
+        let sm = StateManager::new();
+        sm.restore_accounts(vec![(deployer.to_string(), d)]).unwrap();
+        let mut tx = Transaction {
+            hash: String::new(), from: deployer.to_string(), to: None, amount: 0, nonce: 1,
+            timestamp: 0, gas_price: 1, gas_limit: 1_000_000,
+            data: Some("{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":1000}".to_string()),
+            signature: None, public_key: None, tx_type: TransactionType::ContractDeploy,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        sm.apply_transaction_lazy_at(&tx, 1).unwrap();
+        sm.finalize_merkle();
+        let contract = sm.get_all_accounts().into_iter().find(|(_, a)| a.is_contract).unwrap().0;
+
+        // Holder (deployer) proof verifies; balance is the seeded supply.
+        let p = sm.get_token_balance_with_proof(&contract, deployer).expect("holder proof");
+        assert_eq!(p.token_balance, "1000");
+        assert!(StateManager::verify_token_balance_proof(&p), "holder proof must verify");
+
+        // Tampering the balance breaks Level-2.
+        let mut bad = p.clone();
+        bad.token_balance = "9999".to_string();
+        assert!(!StateManager::verify_token_balance_proof(&bad), "tampered balance must fail");
+        // Wrong holder in the reconstructed key breaks Level-2.
+        let mut bad2 = p.clone();
+        bad2.holder = "someone_else".to_string();
+        assert!(!StateManager::verify_token_balance_proof(&bad2), "wrong holder must fail");
+
+        // Proof-of-absence: a non-holder has balance "0" and still verifies (empty-leaf proof).
+        let pa = sm.get_token_balance_with_proof(&contract, "nonholder_eon").expect("absence proof");
+        assert_eq!(pa.token_balance, "0");
+        assert!(StateManager::verify_token_balance_proof(&pa), "absence proof must verify");
+    }
+
+    // V2 SNAPSHOT BINDING: a restored contract account whose contract_storage does NOT hash to its
+    // committed storage_root is REJECTED. Closes the forged-snapshot vector (edit balances, leave
+    // storage_root stale → the SROOT leaf still matches state_root but balances are forged / fork on write).
+    #[test]
+    fn v2_tampered_contract_storage_snapshot_rejected() {
+        use crate::{Transaction, TransactionType};
+        let deployer = "deployer_eon_bind";
+        let mut d = Account::new(deployer.to_string());
+        d.balance = 1_000_000_000;
+        let sm = StateManager::new();
+        sm.restore_accounts(vec![(deployer.to_string(), d)]).unwrap();
+        let mut tx = Transaction {
+            hash: String::new(), from: deployer.to_string(), to: None, amount: 0, nonce: 1,
+            timestamp: 0, gas_price: 1, gas_limit: 1_000_000,
+            data: Some("{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":1000}".to_string()),
+            signature: None, public_key: None, tx_type: TransactionType::ContractDeploy,
+            dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+        };
+        tx.hash = tx.calculate_hash();
+        sm.apply_transaction_lazy_at(&tx, 1).unwrap();
+        let mut all = sm.get_all_accounts();
+
+        // Honest restore of the swept accounts passes.
+        assert!(StateManager::new().restore_accounts(all.clone()).is_ok(), "honest restore must pass");
+
+        // Attack: inject a forged balance into the contract storage but leave storage_root stale.
+        for (_, a) in all.iter_mut() {
+            if a.is_contract {
+                a.contract_storage.insert("balance:attacker".to_string(), "999999".to_string());
+            }
+        }
+        assert!(StateManager::new().restore_accounts(all).is_err(),
+            "restore must reject contract_storage that does not hash to its committed storage_root");
+    }
+
+    // V2 INCREMENTAL fork-safety: the diff-maintained per-contract storage tree must produce a
+    // storage_root byte-equal to the from-truth compute_storage_root(contract_storage) after EVERY op
+    // type (deploy → None-branch build; transfer/mint/burn → Some-branch diff), and a full rebuild from
+    // the final accounts must reproduce the identical state_root. This is the guarantee that the
+    // incremental sweep never diverges from truth (a divergence would fork).
+    #[test]
+    fn v2_incremental_storage_root_equals_from_truth() {
+        use crate::{Transaction, TransactionType};
+        let deployer = "dep_inc";
+        let mut d = Account::new(deployer.to_string());
+        d.balance = 10_000_000_000;
+        let mut dv = Account::new("dave".to_string());
+        dv.balance = 10_000_000_000; // dave holds native QNC so he can pay gas to drain his own tokens
+        let sm = StateManager::new();
+        sm.restore_accounts(vec![(deployer.to_string(), d), ("dave".to_string(), dv)]).unwrap();
+
+        let mk = |from: &str, nonce: u64, tt: TransactionType, to: Option<String>, data: String| {
+            let mut tx = Transaction {
+                hash: String::new(), from: from.to_string(), to, amount: 0, nonce,
+                timestamp: 0, gas_price: 1, gas_limit: 1_000_000, data: Some(data),
+                signature: None, public_key: None, tx_type: tt,
+                dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+            };
+            tx.hash = tx.calculate_hash();
+            tx
+        };
+
+        sm.apply_transaction_lazy_at(&mk(deployer, 1, TransactionType::ContractDeploy, None,
+            "{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":1000000,\"mintable\":true,\"burnable\":true}".to_string()), 1).unwrap();
+        let c = sm.get_all_accounts().into_iter().find(|(_, a)| a.is_contract).unwrap().0;
+        // storage_root after deploy (None-branch build) == from truth.
+        let a0 = sm.get_account(&c).unwrap();
+        assert_eq!(a0.storage_root, StateMerkleTree::compute_storage_root(&a0.contract_storage));
+
+        let ops: Vec<(u64, String)> = vec![
+            (2, "{\"method\":\"transfer\",\"args\":[\"alice\",\"400\"]}".to_string()),
+            (3, "{\"method\":\"transfer\",\"args\":[\"bob\",\"250\"]}".to_string()),
+            (4, "{\"method\":\"mint\",\"args\":[\"carol\",\"5000\"]}".to_string()),
+            (5, "{\"method\":\"transfer\",\"args\":[\"alice\",\"600\"]}".to_string()),
+            (6, "{\"method\":\"burn\",\"args\":[\"100\"]}".to_string()),
+            (7, "{\"method\":\"transfer\",\"args\":[\"dave\",\"500\"]}".to_string()), // seed dave so he can drain
+        ];
+        for (nonce, data) in ops {
+            sm.apply_transaction_lazy_at(&mk(deployer, nonce, TransactionType::ContractCall, Some(c.clone()), data), 1).unwrap();
+            let acct = sm.get_account(&c).unwrap();
+            assert_eq!(acct.storage_root, StateMerkleTree::compute_storage_root(&acct.contract_storage),
+                "Some-branch diff must keep storage_root == compute_storage_root after op nonce={}", nonce);
+        }
+
+        // DELETE path: dave drains his ENTIRE 500 → balance:dave is REMOVED (delete_raw_lazy + subtree
+        // collapse). This exercises the incremental delete the other ops never hit; must stay == truth.
+        sm.apply_transaction_lazy_at(&mk("dave", 1, TransactionType::ContractCall, Some(c.clone()),
+            "{\"method\":\"transfer\",\"args\":[\"eve\",\"500\"]}".to_string()), 1).unwrap();
+        let ad = sm.get_account(&c).unwrap();
+        assert!(!ad.contract_storage.contains_key("balance:dave"), "drained holder key must be removed");
+        assert_eq!(ad.storage_root, StateMerkleTree::compute_storage_root(&ad.contract_storage),
+            "delete path (drain-to-zero) must keep storage_root == compute_storage_root");
+
+        // Full rebuild from the final swept accounts reproduces the identical state_root.
+        let all = sm.get_all_accounts();
+        let live_root = sm.finalize_merkle();
+        let sm2 = StateManager::new();
+        sm2.restore_accounts(all).unwrap();
+        assert_eq!(sm2.finalize_merkle(), live_root, "full rebuild == incremental (diff-maintained) root");
+
+        // Post-restore (token_trees cleared) a further apply on sm2 rebuilds the tree from POST (None
+        // branch) then diffs — proving the boot/rollback rebuild path stays == truth. Deployer nonce is 7.
+        sm2.apply_transaction_lazy_at(&mk(deployer, 8, TransactionType::ContractCall, Some(c.clone()),
+            "{\"method\":\"transfer\",\"args\":[\"frank\",\"111\"]}".to_string()), 1).unwrap();
+        let a2 = sm2.get_account(&c).unwrap();
+        assert_eq!(a2.storage_root, StateMerkleTree::compute_storage_root(&a2.contract_storage),
+            "post-restore rebuild + diff must stay == compute_storage_root");
+    }
+
+    // HARDENING [A]: update_account / update_account_finalize must NEVER commit a contract's incoming
+    // (possibly stale) storage_root verbatim — they route through resync_contract_storage_roots so the
+    // SROOT leaf == truth. This is the release-active closure of the only surviving fork-critical class
+    // (a debug_assert alone is stripped in release). We POISON the incoming storage_root and prove both
+    // methods correct it AND commit the identical merkle leaf a from-truth restore would.
+    #[test]
+    fn v2_update_account_reroutes_contract_through_sweep() {
+        let mut c = Account::new("tok".to_string());
+        c.is_contract = true;
+        c.contract_storage.insert("type".to_string(), "qrc20".to_string());
+        c.contract_storage.insert("balance:alice".to_string(), "100".to_string());
+        c.contract_storage.insert("balance:bob".to_string(), "250".to_string());
+        let truth = StateMerkleTree::compute_storage_root(&c.contract_storage);
+        c.storage_root = [0xAB; 32]; // poison: wrong root
+        assert_ne!(c.storage_root, truth);
+
+        // Lazy update must sweep the storage_root to truth.
+        let sm = StateManager::new();
+        sm.update_account("tok".to_string(), c.clone());
+        assert_eq!(sm.get_account("tok").unwrap().storage_root, truth,
+            "update_account must sweep a contract's storage_root to truth, not commit the poisoned value");
+
+        // Immediate-finalize variant must do the same AND commit the same leaf as a from-truth restore.
+        let sm2 = StateManager::new();
+        sm2.update_account_finalize("tok".to_string(), c.clone());
+        assert_eq!(sm2.get_account("tok").unwrap().storage_root, truth);
+
+        let mut c_ok = c.clone();
+        c_ok.storage_root = truth;
+        let sm3 = StateManager::new();
+        sm3.restore_accounts(vec![("tok".to_string(), c_ok)]).unwrap();
+        assert_eq!(sm2.finalize_merkle(), sm3.finalize_merkle(),
+            "update_account_finalize on a poisoned contract commits the same state_root as a from-truth restore");
+    }
+
+    // HARDENING [B]: get_token_balance_with_proof may POPULATE token_trees from a read path when the
+    // cache is cold. A subsequent apply's sweep (Some-branch diff vs self.accounts) must still compute
+    // the correct storage_root against that read-populated tree — i.e. the read-path populate is
+    // cache-coherent and cannot fork a later block.
+    #[test]
+    fn v2_proof_read_path_populate_is_cache_coherent() {
+        use crate::{Transaction, TransactionType};
+        let deployer = "dep_pc";
+        let mut d = Account::new(deployer.to_string());
+        d.balance = 10_000_000_000;
+        let sm = StateManager::new();
+        sm.restore_accounts(vec![(deployer.to_string(), d)]).unwrap();
+        let mk = |from: &str, nonce: u64, tt: TransactionType, to: Option<String>, data: String| {
+            let mut tx = Transaction {
+                hash: String::new(), from: from.to_string(), to, amount: 0, nonce,
+                timestamp: 0, gas_price: 1, gas_limit: 1_000_000, data: Some(data),
+                signature: None, public_key: None, tx_type: tt,
+                dilithium_signature: None, dilithium_public_key: None, chain_id: 0,
+            };
+            tx.hash = tx.calculate_hash();
+            tx
+        };
+        sm.apply_transaction_lazy_at(&mk(deployer, 1, TransactionType::ContractDeploy, None,
+            "{\"qrc20\":true,\"name\":\"T\",\"symbol\":\"T\",\"decimals\":9,\"initial_supply\":1000000,\"mintable\":true,\"burnable\":true}".to_string()), 1).unwrap();
+        let c = sm.get_all_accounts().into_iter().find(|(_, a)| a.is_contract).unwrap().0;
+        sm.apply_transaction_lazy_at(&mk(deployer, 2, TransactionType::ContractCall, Some(c.clone()),
+            "{\"method\":\"transfer\",\"args\":[\"alice\",\"400\"]}".to_string()), 1).unwrap();
+
+        // Finalize the account tree first — proofs are served on finalized state (after a block's
+        // finalize_merkle), exactly as the RPC path does; the pre-existing get_balance_with_proof shares
+        // this invariant. Then force the proof to REBUILD + POPULATE from the read path (cold cache).
+        sm.finalize_merkle();
+        sm.token_trees.write().clear();
+        let proof = sm.get_token_balance_with_proof(&c, "alice").expect("alice proof");
+        assert!(StateManager::verify_token_balance_proof(&proof),
+            "proof served from a freshly-populated read-path cache must verify");
+
+        // The NEXT apply sweeps Some-branch against the read-populated tree; must still == truth (no fork).
+        sm.apply_transaction_lazy_at(&mk(deployer, 3, TransactionType::ContractCall, Some(c.clone()),
+            "{\"method\":\"transfer\",\"args\":[\"bob\",\"200\"]}".to_string()), 1).unwrap();
+        let acct = sm.get_account(&c).unwrap();
+        assert_eq!(acct.storage_root, StateMerkleTree::compute_storage_root(&acct.contract_storage),
+            "sweep after a read-path cache populate must equal compute_storage_root (cache coherent)");
+        sm.finalize_merkle();
+        let proof2 = sm.get_token_balance_with_proof(&c, "bob").expect("bob proof");
+        assert!(StateManager::verify_token_balance_proof(&proof2),
+            "proof after a further apply (Some-branch reuse) must verify");
     }
 
     // Streaming restore (accounts fed one-at-a-time from an iterator, in ANY order) must produce a

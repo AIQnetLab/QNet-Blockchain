@@ -2,13 +2,7 @@
 // Tests all critical components for production readiness
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use qnet_integration::{
-    vrf::QNetVrf,
-    vrf_hybrid::select_producer_with_vrf_no_fallback,
-    storage::PersistentStorage,
-};
-use pqcrypto_mldsa::mldsa65 as dilithium3;
-use pqcrypto_traits::sign::{PublicKey as PkTrait, SecretKey as SkTrait};
+use qnet_integration::storage::PersistentStorage;
 use sha3::{Sha3_512, Sha3_256, Digest};
 use std::time::Duration;
 
@@ -45,79 +39,8 @@ fn benchmark_poh_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-// Benchmark VRF operations
-fn benchmark_vrf_operations(c: &mut Criterion) {
-    let mut group = c.benchmark_group("vrf_performance");
-    
-    // Dilithium3 keypair, generated once for the init/evaluate/verify benches.
-    let (pk, sk) = dilithium3::keypair();
-    let pk_b = PkTrait::as_bytes(&pk).to_vec();
-    let sk_b = SkTrait::as_bytes(&sk).to_vec();
-
-    // VRF initialization (construct + load keys)
-    group.bench_function("vrf_init", |b| {
-        b.iter(|| {
-            let mut vrf = QNetVrf::new("test_node_001".to_string());
-            vrf.initialize_from_keys(&pk_b, &sk_b).unwrap();
-            black_box(vrf)
-        });
-    });
-
-    // VRF evaluation
-    let mut vrf = QNetVrf::new("test_node_001".to_string());
-    vrf.initialize_from_keys(&pk_b, &sk_b).unwrap();
-    let input = b"test_input_for_vrf_evaluation";
-
-    group.bench_function("vrf_evaluate", |b| {
-        b.iter(|| {
-            let output = vrf.evaluate(input).unwrap();
-            black_box(output)
-        });
-    });
-
-    // VRF verification
-    let output = vrf.evaluate(input).unwrap();
-
-    group.bench_function("vrf_verify", |b| {
-        b.iter(|| {
-            let verified = QNetVrf::verify_static(&pk_b, input, &output).unwrap();
-            black_box(verified)
-        });
-    });
-    
-    group.finish();
-}
-
-// Benchmark producer selection with different network sizes
-fn benchmark_producer_selection(c: &mut Criterion) {
-    let mut group = c.benchmark_group("producer_selection");
-    
-    // Test with different numbers of candidates (simulating network growth)
-    for num_candidates in [5, 100, 1000, 10000].iter() {
-        let candidates: Vec<(String, f64)> = (0..*num_candidates)
-            .map(|i| (format!("node_{:06}", i), 0.70 + (i as f64) * 0.001))
-            .collect();
-        
-        group.bench_with_input(
-            BenchmarkId::new("select_with_vrf", num_candidates),
-            &candidates,
-            |b, candidates| {
-                b.to_async(tokio::runtime::Runtime::new().unwrap()).iter(|| async {
-                    let entropy = [0x42u8; 32];
-                    let result = select_producer_with_vrf_no_fallback(
-                        1,
-                        candidates,
-                        "test_node",
-                        &entropy
-                    ).await.unwrap();
-                    black_box(result)
-                });
-            },
-        );
-    }
-    
-    group.finish();
-}
+// VRF init/evaluate/verify + producer-selection benches REMOVED with the deleted vrf/vrf_hybrid
+// modules (pure-Dilithium cutover); crypto benches live in benches/benchmark.rs.
 
 // Benchmark consensus operations
 fn benchmark_consensus(c: &mut Criterion) {
@@ -259,8 +182,6 @@ fn benchmark_crypto(c: &mut Criterion) {
 criterion_group!(
     benches,
     benchmark_poh_throughput,
-    benchmark_vrf_operations,
-    benchmark_producer_selection,
     benchmark_consensus,
     benchmark_storage,
     benchmark_scalability,

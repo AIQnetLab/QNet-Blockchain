@@ -1158,11 +1158,23 @@ static INVALID_CERT_TRACKER: Lazy<Arc<DashMap<String, (std::sync::atomic::Atomic
 // When 2/3+ votes collected, TimeoutCertificate is generated
 // ═══════════════════════════════════════════════════════════════════════════════════════
 
-/// Collected timeout votes per (macroblock_index, round)
-/// v4.2: keyed by macroblock index (height/90) so nodes at different microblock
-/// heights within the same macroblock still form quorum.
-/// Key: (macroblock_index, timeout_round), Value: HashMap<voter_id, (signature, last_block_hash)>
-static TIMEOUT_VOTES: Lazy<Arc<DashMap<(u64, u64), HashMap<String, (Vec<u8>, [u8; 32])>>>> = 
+/// One stored timeout vote: the voter's signature over its OWN canonical payload (see
+/// `timeout_vote_message`). Votes with divergent finality/tip aggregate into one TC because each
+/// entry is verified against its own fields — the aggregation key is only (window, round, anchor).
+#[derive(Clone)]
+pub struct StoredTimeoutVote {
+    pub signature: Vec<u8>,
+    pub anchor: [u8; 32],
+    pub high_qc_idx: u64,
+    pub high_qc_hash: [u8; 32],
+    pub tip_height: u64,
+    pub tip_hash: [u8; 32],
+    /// Local wall (secs) of last accepted update — rate-bounds update-not-slash re-gossip.
+    pub updated_at: u64,
+}
+
+/// Collected timeout votes per (window = target_height/90, round).
+static TIMEOUT_VOTES: Lazy<Arc<DashMap<(u64, u64), HashMap<String, StoredTimeoutVote>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 /// Generated timeout certificates (cached for block validation)
@@ -1174,6 +1186,168 @@ static TIMEOUT_CERTIFICATES: Lazy<Arc<DashMap<(u64, u64), TimeoutCertificate>>> 
 /// Updated on every certificate insert — avoids linear scan of TIMEOUT_CERTIFICATES.
 static HIGHEST_CERTIFIED_ROUND: Lazy<Arc<DashMap<u64, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Window-monotonic floor: highest window with a locally-VERIFIED TC. A voter never emits below it
+/// — once a window certified, resuming a lower key would let ≤f cross-window Byzantine votes push
+/// two adjacent windows to quorum simultaneously (double-TC at a boundary straddle).
+static HIGHEST_OBSERVED_TC_WINDOW: AtomicU64 = AtomicU64::new(0);
+
+/// Window-keyed failover committee cache (committee_for_height(w*90), anchor = macroblock w-2).
+static FAILOVER_COMMITTEE_CACHE: Lazy<Arc<DashMap<u64, Arc<std::collections::HashSet<String>>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Cooldown per macroblock index for the missing-anchor pull (secs).
+static ANCHOR_PULL_LAST: Lazy<Arc<DashMap<u64, u64>>> = Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Cooldown per window for the SyncInfo-driven TC pull (secs).
+static TC_PULL_LAST: Lazy<Arc<DashMap<u64, u64>>> = Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Global token bucket (wall_second, pulls_this_second) for SyncInfo-driven TC pulls — bounds the
+/// pull fan-out regardless of how many distinct cert_mb an unauthenticated peer cycles.
+static TC_CLAIM_PULL_BUDGET: Lazy<Arc<parking_lot::Mutex<(u64, u32)>>> =
+    Lazy::new(|| Arc::new(parking_lot::Mutex::new((0, 0))));
+
+/// Same, for anchor-macroblock pulls (request_window_anchor) — an attacker-chosen height in a
+/// TC/vote reaches this sink pre-auth, so the fan-out is globally capped, not just per-window.
+static ANCHOR_PULL_BUDGET: Lazy<Arc<parking_lot::Mutex<(u64, u32)>>> =
+    Lazy::new(|| Arc::new(parking_lot::Mutex::new((0, 0))));
+
+/// Canonical signed payload of a failover vote — domain-tagged + versioned; the ONE builder shared
+/// by signer and verifier. anchor = hash(macroblock w-2) (zeros for w<3): fork-binds the vote to
+/// QC-sealed state every honest voter shares; high_qc/tip are the voter's own (sync hints +
+/// accountability), NOT quorum-checked fields.
+pub fn timeout_vote_message(
+    w: u64, round: u64, anchor: &[u8; 32],
+    high_qc_idx: u64, high_qc_hash: &[u8; 32],
+    tip_height: u64, tip_hash: &[u8; 32],
+) -> String {
+    format!("QNET_TIMEOUT_V2:{}:{}:{}:{}:{}:{}:{}",
+            w, round, hex::encode(anchor),
+            high_qc_idx, hex::encode(high_qc_hash),
+            tip_height, hex::encode(tip_hash))
+}
+
+/// Deterministic failover committee for vote window `w`: committee_for_height(w*90) (epoch w,
+/// anchor macroblock w-2 — ALWAYS sealed for any producible window: the seal throttle caps tips at
+/// (last_sealed+2)*90). w<3 = genesis era: the committee IS the 5 genesis ids — never signature-only
+/// (a self-announced key must not count toward failover quorum). None = anchor absent locally
+/// (post-genesis) → caller pulls it and defers; the sender retransmits until the TC forms.
+pub fn failover_committee_for_window(w: u64) -> Option<Arc<std::collections::HashSet<String>>> {
+    if let Some(c) = FAILOVER_COMMITTEE_CACHE.get(&w) { return Some(c.value().clone()); }
+    if w < 3 {
+        let set: std::collections::HashSet<String> = crate::genesis_constants::GENESIS_CONSENSUS_PKS
+            .iter().map(|(id, _)| id.to_string()).collect();
+        let arc = Arc::new(set);
+        FAILOVER_COMMITTEE_CACHE.insert(w, arc.clone());
+        return Some(arc);
+    }
+    let storage = crate::node::try_get_storage()?;
+    let ids = crate::node::BlockchainNode::committee_for_height(&storage, w.saturating_mul(90))?;
+    let arc = Arc::new(ids.into_iter().collect::<std::collections::HashSet<String>>());
+    FAILOVER_COMMITTEE_CACHE.insert(w, arc.clone());
+    FAILOVER_COMMITTEE_CACHE.retain(|k, _| k.saturating_add(8) >= w);
+    Some(arc)
+}
+
+/// Deterministic sealed anchor for window `w`: hash(macroblock w-2), zeros for w<3 (genesis
+/// convention). None = anchor macroblock absent locally (refuse-and-fetch).
+pub fn sealed_anchor_for_window(w: u64) -> Option<[u8; 32]> {
+    if w < 3 { return Some([0u8; 32]); }
+    let storage = crate::node::try_get_storage()?;
+    let raw = storage.get_macroblock_by_height(w - 2).ok().flatten()?;
+    let plain = crate::node::BlockchainNode::macroblock_plaintext(raw)?;
+    let mb = bincode::deserialize::<qnet_state::MacroBlock>(&plain).ok()?;
+    Some(mb.hash())
+}
+
+/// Amplification sanity ceiling, in windows: max(local seal, QC-verified frontier) + the SAME
+/// unsealed allowance the production throttle enforces — a window above it is not producible
+/// anywhere, so f+1 votes for it are fabricated. u64::MAX pre-first-seal (mirrors the throttle's
+/// skip-at-zero: heights ≤180 are unbounded until macroblock 1 seals).
+pub fn certified_view_bound_windows() -> u64 {
+    let sealed_w = crate::node::try_get_storage().map(|s| s.last_sealed_mb_index()).unwrap_or(0);
+    let qc_w = crate::node::qc_verified_frontier_cached() / 90;
+    let base = sealed_w.max(qc_w);
+    if base == 0 { return u64::MAX; }
+    base + crate::node::MAX_UNSEALED_WINDOWS
+}
+
+/// Lowest window ABOVE `above_w` supported by ≥ f+1 DISTINCT committee voters (any round) —
+/// min-target amplification: f+1 guarantees ≥1 honest witness whose verified chain reached that
+/// window, and MIN (not max) is the provably-convergent choice when two windows transiently carry
+/// support. Votes are committee-filtered at insert, so counting distinct voters is sound.
+pub fn lowest_window_with_support(above_w: u64) -> Option<u64> {
+    let mut by_w: std::collections::BTreeMap<u64, std::collections::HashSet<String>> =
+        std::collections::BTreeMap::new();
+    for e in TIMEOUT_VOTES.iter() {
+        let (w, _r) = *e.key();
+        if w > above_w {
+            by_w.entry(w).or_default().extend(e.value().keys().cloned());
+        }
+    }
+    for (w, voters) in by_w {
+        if let Some(c) = failover_committee_for_window(w) {
+            let f = c.len().saturating_sub(1) / 3;
+            if voters.len() >= f + 1 { return Some(w); }
+        }
+    }
+    None
+}
+
+/// Current failover VIEW floor: no honest node emits, forms, accepts, or tallies a vote/TC for a
+/// window below it (anti-double-TC — once a window certified, an earlier window is a left view).
+pub fn observed_tc_window_floor() -> u64 {
+    HIGHEST_OBSERVED_TC_WINDOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Raise the view floor to a newly-verified TC window and evict now-below-floor banked votes so
+/// stale keys cannot later be topped-up to quorum (the banked-vote double-TC vector). Idempotent.
+fn raise_tc_window_floor(w: u64) {
+    let prev = HIGHEST_OBSERVED_TC_WINDOW.fetch_max(w, std::sync::atomic::Ordering::Relaxed);
+    if w > prev {
+        TIMEOUT_VOTES.retain(|(h, _), _| *h >= w);
+    }
+}
+
+/// Lower the view floor after a finality-subordinate fork rollback moved this node's verified tip
+/// below it. The higher-window TCs referenced blocks the rollback orphaned, so the node must be
+/// able to fail over at its new (lower) tip. Safe vs double-TC: a rollback needs real blocks + the
+/// deterministic fork choice (never ≤f-forgeable), so an adversary cannot drive an honest floor down.
+/// MUST also drop the orphaned above-tip certs — else the 2s TC flush persists them and boot rehydrate
+/// re-raises the floor, permanently deafening the node to failover at its rolled-back tip.
+pub(crate) fn lower_tc_window_floor(w: u64) {
+    HIGHEST_OBSERVED_TC_WINDOW.fetch_min(w, std::sync::atomic::Ordering::Relaxed);
+    TIMEOUT_CERTIFICATES.retain(|(h, _), _| *h <= w);
+    HIGHEST_CERTIFIED_ROUND.retain(|h, _| *h <= w);
+    TIMEOUT_VOTES.retain(|(h, _), _| *h <= w);
+}
+
+/// This node's highest-TC hint (window, round) for outbound SyncInfo claims.
+pub fn current_tc_hint() -> (u64, u64) {
+    let w = observed_tc_window_floor();
+    (w, highest_certified_round_for(w))
+}
+
+#[cfg(test)]
+pub(crate) fn test_insert_timeout_vote(w: u64, round: u64, voter: &str) {
+    TIMEOUT_VOTES.entry((w, round)).or_insert_with(HashMap::new).insert(
+        voter.to_string(),
+        StoredTimeoutVote {
+            signature: Vec::new(), anchor: [0u8; 32],
+            high_qc_idx: 0, high_qc_hash: [0u8; 32],
+            tip_height: 0, tip_hash: [0u8; 32], updated_at: 0,
+        },
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn test_clear_timeout_state() {
+    TIMEOUT_VOTES.clear();
+    TIMEOUT_CERTIFICATES.clear();
+    HIGHEST_CERTIFIED_ROUND.clear();
+    HIGHEST_OBSERVED_TC_WINDOW.store(0, std::sync::atomic::Ordering::Relaxed);
+    FAILOVER_COMMITTEE_CACHE.clear();
+}
 
 /// Track which macroblock indices we've already voted for timeout (prevent double-voting)
 /// Key: macroblock_index, Value: timeout_round we voted for
@@ -1298,6 +1472,17 @@ pub fn failover_round_authorized(mb_index: u64, block_round: u64) -> bool {
     if block_round == 0 { return true; } // happy path: no failover, no certificate required
     let baseline = get_baseline_round(mb_index);
     highest_certified_round_for(mb_index) >= block_round.saturating_add(baseline)
+}
+
+/// (f+1)-th highest of a fresh-height multiset (≥1 honest ≥ it). SYNC-HINT REGISTER ONLY — feeds
+/// the height oracle (clamp_overclaim / sync targeting), NEVER any consensus derivation: the
+/// failover vote key is a pure function of the voter's own verified chain + committee-signed
+/// evidence. Floor of 4 fresh corroborators so a lone liar can't steer the hint; below ⇒ 0.
+pub fn frontier_order_statistic(mut hs: Vec<u64>) -> u64 {
+    if hs.len() < 4 { return 0; }
+    let f = hs.len().saturating_sub(1) / 3;
+    hs.sort_unstable_by(|a, b| b.cmp(a)); // descending
+    hs[f]
 }
 
 
@@ -5830,11 +6015,14 @@ impl SimplifiedP2P {
                         *LATEST_SIGNED_HEAD.write() = Some((node_id.clone(), ts, current_height, sig_hex.clone(), pk_hex.clone()));
                     }
 
+                    let (hint_mb, hint_round) = current_tc_hint();
                     for (peer_addr, peer_id, _peer_type) in &connected_peers {
                         let ping_msg = NetworkMessage::HealthPing {
                             from: node_id.clone(),
                             timestamp: ts,
                             height: current_height,
+                            cert_mb: hint_mb,
+                            cert_round: hint_round,
                             signature: sig_hex.clone(),
                             public_key: pk_hex.clone(),
                         };
@@ -10744,6 +10932,7 @@ impl SimplifiedP2P {
                                         .as_ref().map(|a| a.clone());
                                     if let Some(transport_arc) = transport_arc_opt {
                                         let transport = transport_arc.read().await;
+                                        let (hint_mb, hint_round) = current_tc_hint();
                                         let ping = NetworkMessage::HealthPing {
                                             from: GLOBAL_NODE_ID.read().clone(),
                                             timestamp: std::time::SystemTime::now()
@@ -10751,6 +10940,8 @@ impl SimplifiedP2P {
                                                 .unwrap_or_default()
                                                 .as_secs(),
                                             height: LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed),
+                                            cert_mb: hint_mb,
+                                            cert_round: hint_round,
                                             signature: String::new(),
                                             public_key: String::new(),
                                         };
@@ -11658,6 +11849,14 @@ pub enum NetworkMessage {
         timestamp: u64,
         #[serde(default)]
         height: u64,
+        /// UNSIGNED SyncInfo claim: sender's highest-TC window + round. Ambient TC-repair channel
+        /// outside stall periods (the one-shot TC broadcast can be missed). Receiver: monotonic
+        /// compare → cooldown-gated pull of the self-authenticating TC — claims never mutate state,
+        /// so signing them would add nothing.
+        #[serde(default)]
+        cert_mb: u64,
+        #[serde(default)]
+        cert_round: u64,
         /// Dilithium3 detached signature (hex-encoded), empty = unsigned (backward compat)
         #[serde(default)]
         signature: String,
@@ -11851,24 +12050,31 @@ pub enum NetworkMessage {
         signature: String,  // v2.48: Dilithium signature for Byzantine safety
     },
     
-    /// BFT Timeout Vote - deterministic failover without system time dependency
-    /// v4.0: Replaces NTP-based timeout with Byzantine consensus voting
-    /// When 2/3+ validators vote for timeout at (height, round), producer changes
+    /// BFT Timeout Vote v2 — certificate-anchored failover. Signed payload = timeout_vote_message
+    /// (domain "QNET_TIMEOUT_V2"): (window, round, sealed anchor) + the voter's OWN high_qc/tip.
+    /// cert_mb/cert_round are UNSIGNED SyncInfo claims (sender's highest certified round) — a behind
+    /// receiver pulls the TC before tallying; claims never mutate state directly.
     TimeoutVote {
-        height: u64,              // Block height awaiting production
-        timeout_round: u64,       // Failover round (1, 2, 3...)
-        voter_id: String,         // Node voting for timeout
-        last_block_hash: Vec<u8>, // Hash of last known block (proves sync state) - 32 bytes
-        signature: Vec<u8>,       // Dilithium signature over vote data
+        height: u64,              // vote window (target_height / 90)
+        timeout_round: u64,       // failover round within the window
+        voter_id: String,
+        anchor: Vec<u8>,          // 32B hash(macroblock window-2), zeros for window<3
+        high_qc_idx: u64,         // voter's last sealed macroblock index
+        high_qc_hash: Vec<u8>,    // 32B its hash (zeros if none)
+        tip_height: u64,          // voter's verified tip (sync hint)
+        tip_hash: Vec<u8>,        // 32B its hash (fetch-by-hash hint)
+        signature: Vec<u8>,       // Dilithium over timeout_vote_message(...)
+        cert_mb: u64,             // SyncInfo claim: window of sender's highest TC (0 = none)
+        cert_round: u64,          // SyncInfo claim: its round
     },
-    
-    /// BFT Timeout Certificate - broadcast when 2/3+ votes collected
-    /// v4.0: Enables new/reconnecting nodes to sync timeout state
+
+    /// BFT Timeout Certificate — per-voter payloads (each signature verifies over ITS OWN fields),
+    /// so mixed-finality votes aggregate into one TC that verifies on every node.
     TimeoutCertificateBroadcast {
         height: u64,
         timeout_round: u64,
-        last_block_hash: Vec<u8>,
-        votes: Vec<(String, Vec<u8>)>, // (voter_id, signature) pairs
+        anchor: Vec<u8>,          // 32B deterministic sealed anchor (verifier re-derives + compares)
+        votes: Vec<SignedTimeoutVote>,
     },
 
     // `TimeoutAggregateCertificate` (cross-round pacemaker cert) REMOVED: it
@@ -11884,9 +12090,9 @@ pub enum NetworkMessage {
         requester_id: String,
     },
 
-    /// Response with timeout certificates
+    /// Response with timeout certificates (full per-voter-payload proofs).
     TimeoutCertificatesResponse {
-        certificates: Vec<(u64, u64, Vec<u8>, Vec<(String, Vec<u8>)>)>, // (height, round, hash, votes)
+        certificates: Vec<TimeoutProof>,
         sender_id: String,
     },
 
@@ -12301,24 +12507,28 @@ pub struct ActiveNodeInfo {
 }
 
 
-/// BFT Timeout Proof - collection of 2/3+ signed votes
-/// ARCHITECTURE: No separate "certificate" - the votes themselves ARE the proof
-/// Each vote is signed with Dilithium, so 2/3+ votes = cryptographic proof
-/// This is simpler than a separate certificate and equally secure
+/// BFT Timeout Proof — n-f signed votes over one (window, round, anchor); the votes ARE the proof.
+/// anchor is the deterministic sealed anchor for the window (re-derived by every verifier), NOT any
+/// voter's local tip — so validity is independent of the voters' finality skew.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TimeoutProof {
-    pub height: u64,              // Block height for which timeout occurred
-    pub timeout_round: u64,       // Which failover round (1 = first backup, 2 = second, etc.)
-    pub last_block_hash: [u8; 32], // Hash of previous block (all voters must agree)
-    pub votes: Vec<SignedTimeoutVote>, // 2/3+ signed votes = proof
+    pub height: u64,              // vote window (target_height / 90)
+    pub timeout_round: u64,
+    pub anchor: [u8; 32],         // hash(macroblock window-2), zeros for window<3
+    pub votes: Vec<SignedTimeoutVote>,
 }
 
-/// Individual signed timeout vote
-/// SECURITY: Each vote is independently verifiable via Dilithium signature
+/// One vote inside a TC: signature over timeout_vote_message(window, round, anchor, OWN fields).
+/// high_qc/tip are per-voter hints + accountability — verified in the signature, never quorum-read
+/// as a max-of-claims (the certified-prefix floor is what the LOCAL verifier has verified).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SignedTimeoutVote {
-    pub voter_id: String,         // Node ID of voter
-    pub signature: Vec<u8>,       // Dilithium signature over "TIMEOUT:{height}:{round}:{hash}"
+    pub voter_id: String,
+    pub signature: Vec<u8>,
+    pub high_qc_idx: u64,
+    pub high_qc_hash: [u8; 32],
+    pub tip_height: u64,
+    pub tip_hash: [u8; 32],
 }
 
 // Legacy alias for compatibility
@@ -12669,7 +12879,9 @@ impl SimplifiedP2P {
                 self.add_peer_to_region(requesting_node);
             }
             
-            NetworkMessage::HealthPing { from, timestamp, height, signature, public_key } => {
+            NetworkMessage::HealthPing { from, timestamp, height, cert_mb, cert_round, signature, public_key } => {
+                // SyncInfo FIRST (pull-only, cooldown-gated — cannot poison state or the dedup floor).
+                self.process_tc_claim(cert_mb, cert_round);
                 // Dedup BEFORE verify+rate-limit. The serve-envelope co-sends the cached head on every
                 // block-serve (hundreds/min during catch-up), but the origin re-signs only once per emit
                 // tick — between ticks every co-send repeats one (ts,height). Skip repeats here: O(1), no
@@ -12715,8 +12927,10 @@ impl SimplifiedP2P {
                     // (no relay when already near the head) while a lagging node still learns the real tip
                     // and re-arms within one gap. fetch_max above stays unconditional (oracle never lags).
                     if height > prev_max.saturating_add(HEAD_REPLY_MIN_GAP) {
+                        let (hint_mb, hint_round) = current_tc_hint();
                         self.relay_signed_head(NetworkMessage::HealthPing {
                             from: from.clone(), timestamp, height,
+                            cert_mb: hint_mb, cert_round: hint_round,
                             signature: signature.clone(), public_key: public_key.clone(),
                         }, &from, from_peer, 6);
                     }
@@ -12897,13 +13111,14 @@ impl SimplifiedP2P {
                     );
                 }
 
-                // 2f+1 supermajority threshold check using the canonical
-                // active validator count from the consensus PK registry.
-                let total_validators = {
-                    let n = qnet_consensus::consensus_crypto::consensus_pk_registry_len();
-                    if n >= 3 { n } else { 5 }
-                };
-                let two_f_plus_1 = qnet_consensus::checkpoint_bft::quorum_size(total_validators).max(3); // v34: n−f (was ceil(2n/3))
+                // Threshold keyed on the WINDOW COMMITTEE (≤ cap), not the unbounded PK registry: at
+                // scale registry_len is ~100k so quorum_size would need ~66k distinct rejections that
+                // gossip never accumulates → the heuristic goes silently dead. The failover committee is
+                // the same ≤cap set the vote gates use; genesis era → the small genesis fallback.
+                let committee_n = failover_committee_for_window(height / 90)
+                    .map(|c| c.len())
+                    .unwrap_or(crate::genesis_constants::GENESIS_CONSENSUS_PKS.len());
+                let two_f_plus_1 = qnet_consensus::checkpoint_bft::quorum_size(committee_n).max(3);
 
                 if count_after >= two_f_plus_1 {
                     // 2f+1 observers reject this source at `height` → deprioritise it in
@@ -13320,7 +13535,8 @@ impl SimplifiedP2P {
                 }
             }
 
-            NetworkMessage::TimeoutVote { height, timeout_round, voter_id, last_block_hash, signature } => {
+            NetworkMessage::TimeoutVote { height, timeout_round, voter_id, anchor, high_qc_idx,
+                                          high_qc_hash, tip_height, tip_hash, signature, cert_mb, cert_round } => {
                 self.update_peer_last_seen(&voter_id);
 
                 // v17.1: IP-anchor gate intentionally NOT applied here.
@@ -13332,14 +13548,30 @@ impl SimplifiedP2P {
                 // `handle_timeout_vote`; that path is the canonical,
                 // gossip-safe security gate.
 
-                // v9.5/v9.8: Early height filter — discard obviously stale/future votes before signature check.
-                // saturating_add prevents overflow from malicious u64::MAX height values.
-                // FIX: `height` is macroblock INDEX (microblock_height / 90), so compare against
-                // local macroblock index, NOT raw microblock height. The old code compared
-                // index (~623) vs height (~56100) — always true — dropping ALL timeout votes.
+                // SyncInfo FIRST — before any filter/tally, so a behind node is never deafened by
+                // its own filter to the certificate that would advance it (pull-only, verified).
+                self.process_tc_claim(cert_mb, cert_round);
+
+                // Dispatch tiers. Floor: windows deep below local tip are stale → drop. Ceiling:
+                // certified_view_bound (same constant as the production throttle — a window above
+                // it is not producible anywhere) → relay WITHOUT counting (rate-capped) so deep
+                // laggards keep gossip density for the live key, but fabricated far-future keys
+                // never consume tally memory.
                 let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                 let local_mb_index = local_h / 90;
-                if (local_mb_index > 20 && height.saturating_add(20) < local_mb_index) || height > local_mb_index.saturating_add(50) {
+                if local_mb_index > 20 && height.saturating_add(20) < local_mb_index {
+                    return; // stale window
+                }
+                // Ceiling: a window above certified_view_bound is not producible anywhere → no real
+                // TC can exist for it. DROP (do NOT relay): the vote is unverified here, so relaying
+                // it would rebroadcast an unauthenticated far-future packet with no TTL/dedup (self-
+                // sustaining flood). The SyncInfo cert-hint above already advanced a genuine laggard;
+                // real recovery is the cooldown-gated pull, not gossip of junk keys.
+                let bound_w = certified_view_bound_windows();
+                if bound_w != u64::MAX && height > bound_w.saturating_add(1) {
+                    if crate::node::is_debug() {
+                        println!("[DBG][TIMEOUT] vote_oob mb={} bound={} action=drop", height, bound_w);
+                    }
                     return;
                 }
 
@@ -13363,17 +13595,28 @@ impl SimplifiedP2P {
                 }
 
                 // Process timeout vote and check if certificate is ready.
-                // Signature verification + round-uniqueness + equivocation
+                // Signature verification + committee gate + anchor check + equivocation
                 // slashing are all enforced inside handle_timeout_vote.
-                self.handle_timeout_vote(height, timeout_round, voter_id, last_block_hash, signature);
+                self.handle_timeout_vote(height, timeout_round, voter_id, anchor, high_qc_idx,
+                                         high_qc_hash, tip_height, tip_hash, signature);
             }
-            
+
             // BFT Timeout Proof received from network
-            NetworkMessage::TimeoutCertificateBroadcast { height, timeout_round, last_block_hash, votes } => {
+            NetworkMessage::TimeoutCertificateBroadcast { height, timeout_round, anchor, votes } => {
+                // Window sanity BEFORE the handler (which reaches request_window_anchor pre-auth): a real
+                // TC only exists for a producible window. Drop stale (deep-below-tip) and fabricated
+                // (above the producible bound) heights so an attacker-chosen height can't drive anchor-pull
+                // amplification on the finality lane. Mirrors the TimeoutVote dispatch bound.
+                let local_mb_index = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 90;
+                let bound_w = certified_view_bound_windows();
+                if (local_mb_index > 20 && height.saturating_add(20) < local_mb_index)
+                    || (bound_w != u64::MAX && height > bound_w.saturating_add(1)) {
+                    return;
+                }
                 if crate::node::is_info() {
                     println!("[INFO][TIMEOUT] proof_recv h={} round={} votes={}", height, timeout_round, votes.len());
                 }
-                self.handle_timeout_proof_broadcast(height, timeout_round, last_block_hash, votes);
+                self.handle_timeout_proof_broadcast(height, timeout_round, anchor, votes);
             }
 
             // Request for timeout proofs (sync)
@@ -17408,12 +17651,23 @@ impl SimplifiedP2P {
     
     /// Byzantine-safe head ceiling: the (f+1)-th highest fresh last_block_height over CURRENTLY-connected
     /// in-set peers (round committee ∪ genesis). >=f+1 members attesting a height ⇒ >=1 honest ⇒ a real
-    /// lower bound on the true tip, so stragglers in the set cannot demote a tip the honest majority
-    /// attests (a median would). 0 if <f+1 fresh corroborators ⇒ the clamp trusts raw (bootstrap/isolated).
+    /// lower bound on the true tip, so stragglers cannot demote a tip the honest majority attests (a median
+    /// would). 0 if <f+1 fresh corroborators ⇒ the clamp trusts raw (bootstrap/isolated). Self EXCLUDED
+    /// (peer-only). SYNC-HINT oracle ONLY (clamp_overclaim) — never a consensus/failover input.
     pub fn corroborated_head_ceiling(&self) -> u64 {
+        frontier_order_statistic(self.fresh_in_set_peer_heights())
+    }
+
+    // failover_frontier_ceiling REMOVED: the failover vote key is a pure function of the voter's
+    // OWN verified chain + f+1 committee-signed window amplification — peer-claimed heights are
+    // sync hints only and must never derive a consensus key (eclipse/staleness split honest votes).
+
+    /// Fresh (attested within TTL) last_block_height of currently-connected in-set peers (committee ∪
+    /// genesis). Shared builder for the head oracle and the failover frontier.
+    fn fresh_in_set_peer_heights(&self) -> Vec<u64> {
         let cc = CURRENT_COMMITTEE.read().clone();
         let now = self.current_timestamp();
-        let mut hs: Vec<u64> = self.connected_peers_lockfree.iter()
+        self.connected_peers_lockfree.iter()
             .filter(|e| {
                 let p = e.value();
                 let in_set = cc.members.contains(&p.id) || cc.genesis_ids.contains(&p.id)
@@ -17422,11 +17676,7 @@ impl SimplifiedP2P {
                     && now.saturating_sub(p.last_height_attested_at) < PEER_HEIGHT_ATTEST_TTL_SECS
             })
             .map(|e| e.value().last_block_height)
-            .collect();
-        let f = hs.len().saturating_sub(1) / 3;
-        if hs.len() < f + 1 { return 0; }
-        hs.sort_unstable_by(|a, b| b.cmp(a)); // descending
-        hs[f] // (f+1)-th highest = Byzantine-safe lower bound on the true tip
+            .collect()
     }
 
     /// Anti-forgery CEILING for the height oracle (single source for get_best/get_max_peer_height): a
@@ -21264,7 +21514,8 @@ impl SimplifiedP2P {
     pub fn cosend_signed_head(&self, addr: &str) {
         let head = LATEST_SIGNED_HEAD.read().clone();
         if let Some((from, timestamp, height, signature, public_key)) = head {
-            self.send_network_message(addr, NetworkMessage::HealthPing { from, timestamp, height, signature, public_key });
+            let (cert_mb, cert_round) = current_tc_hint();
+            self.send_network_message(addr, NetworkMessage::HealthPing { from, timestamp, height, cert_mb, cert_round, signature, public_key });
         }
     }
 
@@ -21384,29 +21635,75 @@ impl SimplifiedP2P {
     // This replaces NTP-based delay calculation with Byzantine agreement
     // ═══════════════════════════════════════════════════════════════════════════════════════
     
-    /// Handle incoming timeout vote from peer
-    /// SECURITY: Verifies Dilithium signature before accepting vote
+    /// Handle incoming timeout vote (v2). Verifies the voter's signature over ITS OWN payload,
+    /// gates on the WINDOW-KEYED committee (identical on every verifier — the quorum denominator
+    /// can never split by local height), checks the deterministic anchor, and tallies.
     fn handle_timeout_vote(&self, height: u64, timeout_round: u64, voter_id: String,
-                           last_block_hash: Vec<u8>, signature: Vec<u8>) {
-        // v9.5: Height filter is applied at dispatch level (NetworkMessage::TimeoutVote handler)
-        // before this function is called — no duplicate check needed here.
-
-        // Validate vote data
-        if last_block_hash.len() != 32 {
+                           anchor: Vec<u8>, high_qc_idx: u64, high_qc_hash: Vec<u8>,
+                           tip_height: u64, tip_hash: Vec<u8>, signature: Vec<u8>) {
+        if anchor.len() != 32 || high_qc_hash.len() != 32 || tip_hash.len() != 32 {
             if crate::node::is_warn() {
-                println!("[WARN][TIMEOUT] vote_invalid_hash h={} voter={} hash_len={}", 
-                         height, voter_id, last_block_hash.len());
+                println!("[WARN][TIMEOUT] vote_invalid_fields h={} voter={}", height, voter_id);
             }
             return;
         }
-        
-        // Convert to fixed array
-        let mut hash_arr = [0u8; 32];
-        hash_arr.copy_from_slice(&last_block_hash);
-        
-        // SECURITY: Verify Dilithium signature
-        // Vote message format: "TIMEOUT:{height}:{round}:{hash_hex}"
-        let vote_msg = format!("TIMEOUT:{}:{}:{}", height, timeout_round, hex::encode(&hash_arr));
+        // View floor: a window below the highest certified one is a left view — never tally it
+        // (banked below-floor votes cannot be topped-up to a second TC on an adjacent window).
+        if height < observed_tc_window_floor() {
+            if crate::node::is_debug() {
+                println!("[DBG][TIMEOUT] vote_below_floor h={} floor={} action=drop", height, observed_tc_window_floor());
+            }
+            return;
+        }
+        // Round bound: a legit failover round never exceeds certified+MAX_FAILOVER_ROUND — caps the
+        // (window,round) key space so ≤f Byzantine cannot mint unbounded distinct keys.
+        if timeout_round > highest_certified_round_for(height).saturating_add(crate::node::MAX_FAILOVER_ROUND) {
+            if crate::node::is_debug() {
+                println!("[DBG][TIMEOUT] vote_round_oob h={} round={} action=drop", height, timeout_round);
+            }
+            return;
+        }
+        // CHEAP checks before the ~5ms Dilithium verify (DoS: any registered non-committee super
+        // could otherwise force a verify per junk vote). Window committee is cached; anchor absent →
+        // pull + defer (sender retransmits until TC). None-committee ⇒ same anchor-absent path.
+        let committee = match failover_committee_for_window(height) {
+            Some(c) => c,
+            None => {
+                self.request_window_anchor(height);
+                if crate::node::is_warn() {
+                    println!("[WARN][TIMEOUT] vote_deferred h={} round={} reason=anchor_absent action=pull", height, timeout_round);
+                }
+                return;
+            }
+        };
+        if !committee.contains(&voter_id) {
+            if crate::node::is_warn() {
+                println!("[WARN][TIMEOUT] vote_noncommittee h={} round={} voter={} committee={} action=drop",
+                         height, timeout_round, voter_id, committee.len());
+            }
+            return;
+        }
+
+        let mut anchor_arr = [0u8; 32]; anchor_arr.copy_from_slice(&anchor);
+        let mut qc_hash_arr = [0u8; 32]; qc_hash_arr.copy_from_slice(&high_qc_hash);
+        let mut tip_hash_arr = [0u8; 32]; tip_hash_arr.copy_from_slice(&tip_hash);
+
+        // Deterministic anchor must match our sealed state (cheap, pre-sig): a vote minted on a fork
+        // (different sealed w-2) is rejected by every honest node.
+        match sealed_anchor_for_window(height) {
+            Some(local_anchor) if local_anchor != anchor_arr => {
+                if crate::node::is_warn() {
+                    println!("[WARN][TIMEOUT] vote_anchor_mismatch h={} voter={} action=drop", height, voter_id);
+                }
+                return;
+            }
+            None => { self.request_window_anchor(height); return; }
+            _ => {}
+        }
+
+        // Signature LAST (the ~5ms cost) — only after the cheap floor/round/committee/anchor gates.
+        let vote_msg = timeout_vote_message(height, timeout_round, &anchor_arr,
+                                            high_qc_idx, &qc_hash_arr, tip_height, &tip_hash_arr);
         if !self.verify_timeout_vote_signature(&voter_id, &vote_msg, &signature) {
             if crate::node::is_warn() {
                 println!("[WARN][TIMEOUT] vote_sig_invalid h={} voter={}", height, voter_id);
@@ -21414,59 +21711,47 @@ impl SimplifiedP2P {
             return;
         }
 
-        // v27 HOLE5: count vote only if voter ∈ deterministic committee
-        // (same set as the BFT threshold). Valid sig ≠ consensus participant;
-        // non-committee votes desync view-change → fork (h=53731). Receiver-
-        // enforced (sender self-gating untrustworthy). None = fallback.
-        if let Some(committee) = self.deterministic_eligible_ids() {
-            if !committee.contains(&voter_id) {
-                if crate::node::is_warn() {
-                    println!("[WARN][TIMEOUT] vote_noncommittee h={} round={} voter={} committee={} action=drop",
-                             height, timeout_round, voter_id, committee.len());
-                }
-                return;
-            }
-        }
-
-        // Check if we already have proof for this (height, round)
         if TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round)) {
             if crate::node::is_debug() {
                 println!("[DBG][TIMEOUT] proof_exists h={} round={} ignoring_vote", height, timeout_round);
             }
             return;
         }
-        
-        // Get total validator count for Byzantine threshold calculation
-        let total_validators = self.get_active_validator_count();
-        // v34: canonical n−f quorum — the SAME fn the macroblock Checkpoint-BFT uses
-        // (checkpoint_bft::quorum_size). The old ceil(2n/3) was a STRICTLY SMALLER (unsafe)
-        // quorum whenever n ≡ 0 (mod 3) — 4-of-6 vs the safe 5-of-6 — so the two consensus
-        // layers disagreed on the failover threshold and a round certified at the weaker bar
-        // could split honest nodes once the committee grows past 5. At n=5 both give 4 (no-op).
-        let byzantine_threshold = qnet_consensus::checkpoint_bft::quorum_size(total_validators);
-        
-        // Add vote to collection
+
+        // n−f quorum over the WINDOW committee (same quorum fn as Checkpoint-BFT).
+        let byzantine_threshold = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let stored = StoredTimeoutVote {
+            signature: signature.clone(), anchor: anchor_arr,
+            high_qc_idx, high_qc_hash: qc_hash_arr,
+            tip_height, tip_hash: tip_hash_arr, updated_at: now_secs,
+        };
+        // Tally. Equivocation is ANCHOR-ONLY (a field an honest voter can never legitimately
+        // change); a same-key re-vote with advanced tip/high_qc is an UPDATE (replace, rate-
+        // bounded) — never slashed, so honest supersession/progress mid-stall is safe.
         let votes_count = {
             let mut entry = TIMEOUT_VOTES.entry((height, timeout_round)).or_insert_with(HashMap::new);
-            
-            // Check for conflicting vote (different hash from same voter)
-            if let Some((_, existing_hash)) = entry.get(&voter_id) {
-                if *existing_hash != hash_arr {
+            if let Some(existing) = entry.get(&voter_id) {
+                if existing.anchor != anchor_arr {
                     if crate::node::is_warn() {
                         println!("[WARN][TIMEOUT] vote_equivocation h={} voter={}", height, voter_id);
                     }
-                    // SLASHABLE: Equivocation detected - voter sent different hashes
                     self.report_timeout_equivocation(&voter_id, height, timeout_round);
                     return;
                 }
-                // Duplicate vote with same hash - ignore silently
-                return;
+                let progressed = tip_height > existing.tip_height || high_qc_idx > existing.high_qc_idx;
+                let rate_ok = now_secs > existing.updated_at;
+                if !(progressed && rate_ok) { return; } // duplicate / non-progress / too-fast update
+                entry.insert(voter_id.clone(), stored);
+                entry.len()
+            } else {
+                entry.insert(voter_id.clone(), stored);
+                entry.len()
             }
-            
-            entry.insert(voter_id.clone(), (signature.clone(), hash_arr));
-            entry.len()
         };
-        
+
         if crate::node::is_info() {
             println!("[INFO][TIMEOUT] vote_collected h={} round={} voter={} count={}/{}",
                      height, timeout_round, voter_id, votes_count, byzantine_threshold);
@@ -21478,9 +21763,9 @@ impl SimplifiedP2P {
         // different leaders for one height → dual production, forensic h=154). Liveness:
         // heartbeat-synchronized timeouts + per-round grace backoff, all strictly 2f+1.
 
-        // Signed 2f+1 same-round → TimeoutCertificate (strongest advancement).
+        // Signed n−f same-round → TimeoutCertificate (strongest advancement).
         if votes_count >= byzantine_threshold {
-            self.generate_and_broadcast_timeout_proof(height, timeout_round, hash_arr);
+            self.generate_and_broadcast_timeout_proof(height, timeout_round, anchor_arr);
         }
 
         // Vote gossip for fast round-convergence under partial reach. Without
@@ -21493,7 +21778,7 @@ impl SimplifiedP2P {
         // the dedup early-return terminates the wave (no loop). ~200× less
         // bandwidth than full re-broadcast at 1000-validator scale.
         if voter_id != self.node_id {
-            let total_for_gossip = total_validators;
+            let total_for_gossip = committee.len();
             if total_for_gossip > 1 {
                 let gossip_fanout = if total_for_gossip > 100 { 5 } else { 3 };
                 let self_id = self.node_id.clone();
@@ -21518,8 +21803,14 @@ impl SimplifiedP2P {
                         height,
                         timeout_round,
                         voter_id: voter_id.clone(),
-                        last_block_hash: hash_arr.to_vec(),
+                        anchor: anchor_arr.to_vec(),
+                        high_qc_idx,
+                        high_qc_hash: qc_hash_arr.to_vec(),
+                        tip_height,
+                        tip_hash: tip_hash_arr.to_vec(),
                         signature: signature.clone(),
+                        cert_mb: height,
+                        cert_round: self.get_highest_certified_round(height),
                     };
                     let quic_transport = self.quic_transport.clone();
                     let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
@@ -21592,10 +21883,11 @@ impl SimplifiedP2P {
         );
     }
     
-    /// Generate and broadcast TimeoutProof when 2/3+ votes collected
-    /// ARCHITECTURE: Proof = collection of signed votes, no separate signature needed
-    fn generate_and_broadcast_timeout_proof(&self, height: u64, timeout_round: u64, last_block_hash: [u8; 32]) {
-        // Get all votes for this (height, round)
+    /// Generate and broadcast TimeoutProof when n−f votes collected.
+    /// Proof = the signed per-voter payloads themselves; no separate signature.
+    fn generate_and_broadcast_timeout_proof(&self, height: u64, timeout_round: u64, anchor: [u8; 32]) {
+        // Never form a TC for a left view (a window below the floor) — the anti-double-TC barrier.
+        if height < observed_tc_window_floor() { return; }
         let votes = match TIMEOUT_VOTES.get(&(height, timeout_round)) {
             Some(v) => v.clone(),
             None => {
@@ -21605,38 +21897,33 @@ impl SimplifiedP2P {
                 return;
             }
         };
-        
-        // Build signed vote list
+
         let signed_votes: Vec<SignedTimeoutVote> = votes.iter()
-            .map(|(voter_id, (sig, _))| SignedTimeoutVote {
+            .map(|(voter_id, v)| SignedTimeoutVote {
                 voter_id: voter_id.clone(),
-                signature: sig.clone(),
+                signature: v.signature.clone(),
+                high_qc_idx: v.high_qc_idx,
+                high_qc_hash: v.high_qc_hash,
+                tip_height: v.tip_height,
+                tip_hash: v.tip_hash,
             })
             .collect();
-        
-        let proof = TimeoutProof {
-            height,
-            timeout_round,
-            last_block_hash,
-            votes: signed_votes.clone(),
-        };
-        
-        // Store proof locally
+
+        let proof = TimeoutProof { height, timeout_round, anchor, votes: signed_votes.clone() };
         TIMEOUT_CERTIFICATES.insert((height, timeout_round), proof);
 
-        // O(1) tracker update
+        // O(1) tracker update + raise the view floor (prunes now-below-floor banked votes).
         HIGHEST_CERTIFIED_ROUND.entry(height)
             .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
             .or_insert(timeout_round);
+        raise_tc_window_floor(height);
 
         if crate::node::is_info() {
-            println!("[INFO][TIMEOUT] proof_generated h={} round={} votes={}",
-                     height, timeout_round, votes.len());
+            println!("[INFO][TC] certified mb={} round={} voters={}", height, timeout_round, votes.len());
         }
-        
-        // CRITICAL: Broadcast proof to all nodes (for sync/new nodes)
-        self.broadcast_timeout_proof(height, timeout_round, last_block_hash, signed_votes);
 
+        // Broadcast proof to all nodes (for sync/new nodes)
+        self.broadcast_timeout_proof(height, timeout_round, anchor, signed_votes);
     }
 
     /// Parallel best-effort fan-out of a consensus message to all validator peers
@@ -21788,12 +22075,12 @@ impl SimplifiedP2P {
     /// Broadcast timeout proof to all connected nodes
     /// ARCHITECTURE: Same as broadcast_certificate_announce_tracked - parallel with retries
     fn broadcast_timeout_proof(&self, height: u64, timeout_round: u64,
-                               last_block_hash: [u8; 32], votes: Vec<SignedTimeoutVote>) {
+                               anchor: [u8; 32], votes: Vec<SignedTimeoutVote>) {
         let msg = NetworkMessage::TimeoutCertificateBroadcast {
             height,
             timeout_round,
-            last_block_hash: last_block_hash.to_vec(),
-            votes: votes.iter().map(|v| (v.voter_id.clone(), v.signature.clone())).collect(),
+            anchor: anchor.to_vec(),
+            votes,
         };
         
         // Get runtime handle
@@ -22122,9 +22409,10 @@ impl SimplifiedP2P {
         OWN_CLAIM_BROADCAST.retain(|round, _| *round >= min_round);
     }
 
-    pub fn broadcast_timeout_vote(&self, height: u64, timeout_round: u64, 
-                                   last_block_hash: [u8; 32], signature: Vec<u8>) {
-        // Retransmit until certified: suppress only once the 2f+1 TC for this (height,round) is
+    pub fn broadcast_timeout_vote(&self, height: u64, timeout_round: u64,
+                                   anchor: [u8; 32], high_qc_idx: u64, high_qc_hash: [u8; 32],
+                                   tip_height: u64, tip_hash: [u8; 32], signature: Vec<u8>) {
+        // Retransmit until certified: suppress only once the n−f TC for this (height,round) is
         // held. The view-timeout redrive re-invokes this each tick, so a vote lost to packet loss /
         // peer churn is re-broadcast until the TC forms. A single-shot send is not liveness-safe —
         // one lost failover vote wedged finality on onboarding (no node received it, TC never formed).
@@ -22141,17 +22429,24 @@ impl SimplifiedP2P {
         self.handle_timeout_vote(
             height, timeout_round,
             self.node_id.clone(),
-            last_block_hash.to_vec(),
+            anchor.to_vec(), high_qc_idx, high_qc_hash.to_vec(),
+            tip_height, tip_hash.to_vec(),
             signature.clone(),
         );
-        
-        // Broadcast to all validators
+
+        // Broadcast to all validators (cert_* = SyncInfo claims for behind receivers).
         let msg = NetworkMessage::TimeoutVote {
             height,
             timeout_round,
             voter_id: self.node_id.clone(),
-            last_block_hash: last_block_hash.to_vec(),
+            anchor: anchor.to_vec(),
+            high_qc_idx,
+            high_qc_hash: high_qc_hash.to_vec(),
+            tip_height,
+            tip_hash: tip_hash.to_vec(),
             signature,
+            cert_mb: height,
+            cert_round: self.get_highest_certified_round(height),
         };
         
         if crate::node::is_info() {
@@ -22306,9 +22601,14 @@ pub fn rehydrate_timeout_certificates(bytes: &[u8]) -> usize {
     if bytes.is_empty() { return 0; }
     match bincode::deserialize::<Vec<((u64, u64), TimeoutCertificate)>>(bytes) {
         Ok(entries) => {
-            let count = entries.len();
+            let mut count = 0usize;
             for (k, v) in entries {
-                TIMEOUT_CERTIFICATES.insert(k, v);
+                // Structural consistency: key must match the proof's own fields, votes non-empty.
+                if v.height == k.0 && v.timeout_round == k.1 && !v.votes.is_empty() {
+                    raise_tc_window_floor(k.0);
+                    TIMEOUT_CERTIFICATES.insert(k, v);
+                    count += 1;
+                }
             }
             count
         }
@@ -22316,13 +22616,19 @@ pub fn rehydrate_timeout_certificates(bytes: &[u8]) -> usize {
     }
 }
 
+/// Rehydrate the certified-round tracker — a pair is installed ONLY when the co-persisted TC blob
+/// (rehydrated first) actually holds that (mb, round) proof. Raw pairs from disk are otherwise a
+/// forgeable production input.
 pub fn rehydrate_highest_certified_rounds(bytes: &[u8]) -> usize {
     if bytes.is_empty() { return 0; }
     match bincode::deserialize::<Vec<(u64, u64)>>(bytes) {
         Ok(entries) => {
-            let count = entries.len();
+            let mut count = 0usize;
             for (k, v) in entries {
-                HIGHEST_CERTIFIED_ROUND.insert(k, v);
+                if TIMEOUT_CERTIFICATES.contains_key(&(k, v)) {
+                    HIGHEST_CERTIFIED_ROUND.insert(k, v);
+                    count += 1;
+                }
             }
             count
         }
@@ -22352,53 +22658,87 @@ impl SimplifiedP2P {
     /// they reach quorum — so a replayed single vote or a non-committee key can never inflate
     /// the count and illegitimately advance the leader-selection round.
     fn verify_timeout_certificate(
-        &self, height: u64, timeout_round: u64, hash_arr: [u8; 32],
-        votes: &[(String, Vec<u8>)],
+        &self, height: u64, timeout_round: u64, anchor: [u8; 32],
+        votes: &[SignedTimeoutVote],
     ) -> Option<Vec<SignedTimeoutVote>> {
-        let quorum = qnet_consensus::checkpoint_bft::quorum_size(self.get_active_validator_count());
-        let committee = self.deterministic_eligible_ids(); // None at genesis → signature-only
-        // Dedup BEFORE verify; drop non-committee voters (None = genesis fallback, no filter).
-        let mut by_voter: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
-        for (voter, sig) in votes {
-            if committee.as_ref().map_or(true, |c| c.contains(voter)) {
-                by_voter.insert(voter.clone(), sig.clone());
+        // Window-keyed committee + quorum (identical on every verifier). Anchor absent locally →
+        // pull + defer (sender/requester paths retransmit); NEVER signature-only post-genesis.
+        let committee = match failover_committee_for_window(height) {
+            Some(c) => c,
+            None => {
+                self.request_window_anchor(height);
+                if crate::node::is_warn() {
+                    println!("[WARN][TC] anchor_absent mb={} action=defer_fetch", height);
+                }
+                return None;
+            }
+        };
+        // The anchor is DETERMINISTIC per window — re-derive locally and compare; a TC minted on a
+        // fork with a different sealed w-2 fails here on every honest node.
+        match sealed_anchor_for_window(height) {
+            Some(local_anchor) if local_anchor == anchor => {}
+            Some(_) => {
+                if crate::node::is_warn() {
+                    println!("[WARN][TC] anchor_mismatch mb={} round={} action=reject", height, timeout_round);
+                }
+                return None;
+            }
+            None => { self.request_window_anchor(height); return None; }
+        }
+        let quorum = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+        // Dedup by voter BEFORE verify; drop non-committee voters.
+        let mut by_voter: std::collections::HashMap<String, SignedTimeoutVote> = std::collections::HashMap::new();
+        for v in votes {
+            if committee.contains(&v.voter_id) {
+                by_voter.insert(v.voter_id.clone(), v.clone());
             }
         }
         if by_voter.len() < quorum { return None; }
-        let vote_msg = format!("TIMEOUT:{}:{}:{}", height, timeout_round, hex::encode(&hash_arr));
-        let candidates: Vec<(String, Vec<u8>)> = by_voter.into_iter().collect();
+        let candidates: Vec<SignedTimeoutVote> = by_voter.into_values().collect();
         use rayon::prelude::*;
+        // Per-voter payload reconstruction: each signature verifies over the voter's OWN fields —
+        // mixed-finality votes certify together (the aggregation key is only (window, round, anchor)).
         let verified: Vec<SignedTimeoutVote> = candidates
-            .par_iter()
-            .filter_map(|(voter, sig)| {
-                if self.verify_timeout_vote_signature(voter, &vote_msg, sig) {
-                    Some(SignedTimeoutVote { voter_id: voter.clone(), signature: sig.clone() })
-                } else { None }
+            .into_par_iter()
+            .filter(|v| {
+                let msg = timeout_vote_message(height, timeout_round, &anchor,
+                                               v.high_qc_idx, &v.high_qc_hash,
+                                               v.tip_height, &v.tip_hash);
+                self.verify_timeout_vote_signature(&v.voter_id, &msg, &v.signature)
             })
             .collect();
         if verified.len() < quorum { None } else { Some(verified) }
     }
 
     fn handle_timeout_proof_broadcast(&self, height: u64, timeout_round: u64,
-                                       last_block_hash: Vec<u8>, votes: Vec<(String, Vec<u8>)>) {
+                                       anchor: Vec<u8>, votes: Vec<SignedTimeoutVote>) {
         // Skip if we already have this proof
         if TIMEOUT_CERTIFICATES.contains_key(&(height, timeout_round)) {
             return;
         }
-        
-        if last_block_hash.len() != 32 {
-            if crate::node::is_warn() {
-                println!("[WARN][TIMEOUT] proof_invalid_hash h={} round={}", height, timeout_round);
+        // Never ACCEPT a TC for a left view — a node past window W ignores a certificate for an
+        // earlier window (it cannot drive a reorg here); a genuinely-lagging node has a low floor
+        // and still accepts it to advance.
+        if height < observed_tc_window_floor() {
+            if crate::node::is_debug() {
+                println!("[DBG][TIMEOUT] tc_below_floor h={} floor={} action=drop", height, observed_tc_window_floor());
             }
             return;
         }
-        
-        let mut hash_arr = [0u8; 32];
-        hash_arr.copy_from_slice(&last_block_hash);
-        
-        // Distinct committee signers ≥ quorum (dedup + committee filter inside) — a replayed
-        // single vote or a non-committee key cannot advance the round.
-        let verified_votes = match self.verify_timeout_certificate(height, timeout_round, hash_arr, &votes) {
+
+        if anchor.len() != 32 {
+            if crate::node::is_warn() {
+                println!("[WARN][TIMEOUT] proof_invalid_anchor h={} round={}", height, timeout_round);
+            }
+            return;
+        }
+
+        let mut anchor_arr = [0u8; 32];
+        anchor_arr.copy_from_slice(&anchor);
+
+        // Distinct committee signers ≥ quorum (dedup + committee filter + anchor re-derivation
+        // inside) — a replayed vote, non-committee key, or forked anchor cannot advance the round.
+        let verified_votes = match self.verify_timeout_certificate(height, timeout_round, anchor_arr, &votes) {
             Some(v) => v,
             None => {
                 if crate::node::is_warn() {
@@ -22411,17 +22751,95 @@ impl SimplifiedP2P {
         let signers = verified_votes.len();
 
         TIMEOUT_CERTIFICATES.insert((height, timeout_round), TimeoutProof {
-            height, timeout_round, last_block_hash: hash_arr, votes: verified_votes,
+            height, timeout_round, anchor: anchor_arr, votes: verified_votes,
         });
 
-        // O(1) tracker update — round advances only on a quorum of DISTINCT committee signers.
+        // Tracker + view floor (prunes below-floor banked votes) — round advances only on a quorum.
         HIGHEST_CERTIFIED_ROUND.entry(height)
             .and_modify(|cur| { if timeout_round > *cur { *cur = timeout_round; } })
             .or_insert(timeout_round);
+        raise_tc_window_floor(height);
 
         if crate::node::is_info() {
-            println!("[INFO][TIMEOUT] proof_accepted h={} round={} signers={}", height, timeout_round, signers);
+            println!("[INFO][TC] certified mb={} round={} voters={} source=broadcast", height, timeout_round, signers);
         }
+    }
+
+    /// Cooldown-gated control-lane pull of the sealed anchor macroblock (w-2) for vote window `w`.
+    /// The artifact provably exists network-wide for any producible window (seal-throttle bound),
+    /// so this costs at most one control-lane RTT before the deferred vote/TC can be processed.
+    pub(crate) fn request_window_anchor(&self, w: u64) {
+        if w < 3 { return; }
+        let idx = w - 2;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        // GLOBAL token bucket first: caps anchor-pull fan-out across ALL windows so an attacker cycling
+        // distinct heights (bypassing the per-idx cooldown) cannot amplify a tiny inbound TC/vote into
+        // O(peers) reflected control-lane traffic. Shared sink for every caller (vote/TC-broadcast/response).
+        const ANCHOR_PULLS_PER_SEC: u32 = 4;
+        {
+            let mut b = ANCHOR_PULL_BUDGET.lock();
+            if b.0 != now { *b = (now, 0); }
+            if b.1 >= ANCHOR_PULLS_PER_SEC { return; }
+            b.1 += 1;
+        }
+        let last = ANCHOR_PULL_LAST.get(&idx).map(|v| *v).unwrap_or(0);
+        if now.saturating_sub(last) < 5 { return; }
+        ANCHOR_PULL_LAST.insert(idx, now);
+        ANCHOR_PULL_LAST.retain(|_, t| now.saturating_sub(*t) < 300);
+        let msg = NetworkMessage::RequestMacroblockAnchor { index: idx, requester_id: self.node_id.clone() };
+        let peers: Vec<String> = self.get_all_validator_addresses().into_iter().take(3).collect();
+        if peers.is_empty() { return; }
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if !quic_enabled { return; }
+                let transport = match quic_transport { Some(t) => t, None => return };
+                for peer in peers {
+                    let quic_addr_str = format!("{}:10876", peer.split(':').next().unwrap_or(&peer));
+                    if let Ok(quic_addr) = quic_addr_str.parse::<std::net::SocketAddr>() {
+                        let t = transport.read().await;
+                        let _ = t.send_message(quic_addr, &msg).await;
+                    }
+                }
+            });
+        }
+    }
+
+    /// SyncInfo claim intake — processed BEFORE any dispatch filter/tally so a behind node is never
+    /// deafened by its own filter to the certificate that would advance it. Claims (UNSIGNED, may
+    /// precede auth) trigger only a rate-capped PULL of the real TC; state mutates solely through
+    /// the verified TC writers. Attacker-hardened: a claim for a window beyond the producible
+    /// frontier is fabricated (no TC can exist there) → ignored; a GLOBAL token bucket (not per-
+    /// cert_mb) bounds the pull fan-out so cycling cert_mb cannot amplify.
+    pub(crate) fn process_tc_claim(&self, cert_mb: u64, cert_round: u64) {
+        if cert_mb == 0 && cert_round == 0 { return; }
+        // Sanity bound: a real TC only exists for a producible window (≤ local tip + throttle slack);
+        // a far-future cert_mb is fabricated and un-pullable.
+        let local_w = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 90;
+        if cert_mb > local_w.saturating_add(crate::node::MAX_UNSEALED_WINDOWS + 1) { return; }
+        if cert_round <= self.get_highest_certified_round(cert_mb) { return; }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        // GLOBAL token bucket: ≤ TC_CLAIM_PULLS_PER_SEC SyncInfo-driven pulls/sec regardless of how
+        // many distinct cert_mb an attacker cycles (the per-cert_mb cooldown alone was bypassable).
+        const TC_CLAIM_PULLS_PER_SEC: u32 = 4;
+        {
+            let mut b = TC_CLAIM_PULL_BUDGET.lock();
+            if b.0 != now { *b = (now, 0); }
+            if b.1 >= TC_CLAIM_PULLS_PER_SEC { return; }
+            b.1 += 1;
+        }
+        let last = TC_PULL_LAST.get(&cert_mb).map(|v| *v).unwrap_or(0);
+        if now.saturating_sub(last) < 5 { return; }
+        TC_PULL_LAST.insert(cert_mb, now);
+        // Occasional prune (not every call) — the O(n) scan must not run per message.
+        if now % 30 == 0 { TC_PULL_LAST.retain(|_, t| now.saturating_sub(*t) < 300); }
+        if crate::node::is_info() {
+            println!("[INFO][TIMEOUT] tc_claim_pull mb={} claimed_round={}", cert_mb, cert_round);
+        }
+        self.request_timeout_proofs(cert_mb, cert_mb);
     }
 
     /// #80: adopt a 2f+1 TimeoutProof attached to a round>0 microblock. Verifies + stores it via the
@@ -22439,10 +22857,8 @@ impl SimplifiedP2P {
         // dedup/verify loop (verify_timeout_certificate would reject it anyway on the quorum check).
         const MAX_TC_VOTES: usize = 2048;
         if proof.votes.len() > MAX_TC_VOTES { return; }
-        let votes: Vec<(String, Vec<u8>)> = proof.votes.into_iter()
-            .map(|v| (v.voter_id, v.signature)).collect();
         self.handle_timeout_proof_broadcast(proof.height, proof.timeout_round,
-                                            proof.last_block_hash.to_vec(), votes);
+                                            proof.anchor.to_vec(), proof.votes);
     }
 
     /// Handle request for timeout proofs (for syncing nodes)
@@ -22452,13 +22868,9 @@ impl SimplifiedP2P {
 
         // Collect all proofs in range
         for entry in TIMEOUT_CERTIFICATES.iter() {
-            let (h, r) = entry.key();
+            let (h, _r) = entry.key();
             if *h >= from_height && *h <= to_height {
-                let proof = entry.value();
-                let votes: Vec<(String, Vec<u8>)> = proof.votes.iter()
-                    .map(|v| (v.voter_id.clone(), v.signature.clone()))
-                    .collect();
-                certificates.push((*h, *r, proof.last_block_hash.to_vec(), votes));
+                certificates.push(entry.value().clone());
             }
         }
 
@@ -22496,9 +22908,10 @@ impl SimplifiedP2P {
     }
     
     /// Handle response with timeout proofs
-    fn handle_timeout_proof_response(&self, certificates: Vec<(u64, u64, Vec<u8>, Vec<(String, Vec<u8>)>)>) {
-        for (height, round, hash, votes) in certificates {
-            self.handle_timeout_proof_broadcast(height, round, hash, votes);
+    fn handle_timeout_proof_response(&self, certificates: Vec<TimeoutProof>) {
+        for proof in certificates {
+            self.handle_timeout_proof_broadcast(proof.height, proof.timeout_round,
+                                                proof.anchor.to_vec(), proof.votes);
         }
     }
     
@@ -22687,11 +23100,10 @@ impl SimplifiedP2P {
         total
     }
 
-    /// v27 HOLE5: deterministic N-2 eligible-producer node_id set for the
-    /// current height — single source of truth shared with the BFT-threshold
-    /// denominator and every quorum-vote gate (numerator==denominator set).
-    /// `None` = non-deterministic fallback (genesis pre-180 / snapshot absent) → signature-only
-    /// doctrine. Returns the ≤100 VRF committee (epoch-cached; computing it is O(E log E)).
+    /// Deterministic N-2 VRF committee (≤1000, THRESHOLD==SIZE) keyed on the LOCAL height's epoch.
+    /// NON-FAILOVER consumers only: the failover vote/TC path uses the window-keyed
+    /// `failover_committee_for_window` (verifier-local height must never pick the quorum set there).
+    /// `None` = genesis pre-180 / snapshot absent.
     fn deterministic_eligible_ids(&self) -> Option<std::collections::HashSet<String>> {
         let local_h = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
         if local_h <= 180 {
@@ -22733,16 +23145,11 @@ impl SimplifiedP2P {
                         if let Ok(producers) =
                             bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snap)
                         {
-                            // v34: the failover / timeout consensus set is the VRF COMMITTEE (≤100),
-                            // NOT the full eligible set (≤1000). Derived by the SAME canonical fn the
-                            // macroblock sealer calls (checkpoint_bft::sample_committee) with the SAME
-                            // inputs — sorted-by-id eligible from THIS macroblock, window = current
-                            // epoch, this macroblock's beacon as seed — so every node gets a byte-
-                            // identical committee (no fork). At ≤120 nodes committee == eligible ⇒
-                            // behaviour-identical to today; this only bites at scale, moving failover
-                            // from a 667-of-1000 quorum to 67-of-100 (bounded gossip, churn-robust).
-                            // Microblock PRODUCTION still rotates over the full eligible set — only the
-                            // failover VOTING set narrows to the committee.
+                            // VRF committee (hard cap 1000, THRESHOLD==SIZE) via the SAME canonical
+                            // fn the macroblock sealer calls (checkpoint_bft::sample_committee) with
+                            // the SAME inputs — sorted-by-id eligible from THIS macroblock, window =
+                            // current epoch, its beacon as seed — byte-identical on every node.
+                            // Below the cap committee == full eligible set.
                             let mut ids: Vec<String> = producers
                                 .into_iter()
                                 .map(|p| p.node_id)
@@ -24614,6 +25021,74 @@ impl SimplifiedP2P {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ONE test fn: these invariants share module statics — parallel test threads must not interleave.
+    #[test]
+    fn failover_view_sync_invariants() {
+        test_clear_timeout_state();
+
+        // ── Canonical vote payload: versioned domain tag; every field changes the signed bytes.
+        let a = [1u8; 32]; let qh = [2u8; 32]; let th = [3u8; 32];
+        let m = timeout_vote_message(7, 3, &a, 5, &qh, 640, &th);
+        assert!(m.starts_with("QNET_TIMEOUT_V2:7:3:"), "domain-tagged + versioned");
+        assert_ne!(m, timeout_vote_message(7, 3, &[9u8; 32], 5, &qh, 640, &th), "anchor binds");
+        assert_ne!(m, timeout_vote_message(7, 3, &a, 5, &qh, 641, &th), "tip binds");
+        assert_ne!(m, timeout_vote_message(8, 3, &a, 5, &qh, 640, &th), "window binds");
+
+        // ── Genesis-era committee (w<3): the fixed genesis set, n=5 ⇒ f=1, quorum=4 — never
+        // signature-only. Anchor = zeros.
+        let c0 = failover_committee_for_window(0).expect("genesis committee");
+        assert_eq!(c0.len(), crate::genesis_constants::GENESIS_CONSENSUS_PKS.len());
+        assert_eq!(qnet_consensus::checkpoint_bft::quorum_size(c0.len()), 4, "n=5 ⇒ quorum 4");
+        assert_eq!(sealed_anchor_for_window(2), Some([0u8; 32]), "w<3 ⇒ zero anchor");
+
+        // ── f+1 window amplification, MIN-target. Genesis f=1 ⇒ need 2 distinct voters.
+        test_insert_timeout_vote(2, 1, "voter_a");
+        test_insert_timeout_vote(2, 1, "voter_b");          // w=2 supported (2 distinct)
+        test_insert_timeout_vote(1, 1, "voter_c");          // w=1 NOT supported (1 distinct)
+        assert_eq!(lowest_window_with_support(0), Some(2), "f+1 support fires; single vote does not");
+        // Same voter across two rounds of one window counts ONCE (distinct-voter rule).
+        test_insert_timeout_vote(1, 2, "voter_c");
+        assert_eq!(lowest_window_with_support(0), Some(2), "same voter twice ≠ two voters");
+        // A second distinct voter on w=1 flips the min-target to the LOWER supported window.
+        test_insert_timeout_vote(1, 1, "voter_d");
+        assert_eq!(lowest_window_with_support(0), Some(1), "MIN of supported windows wins");
+        assert_eq!(lowest_window_with_support(1), Some(2), "strictly-above filter");
+        assert_eq!(lowest_window_with_support(2), None, "nothing above");
+
+        // ── Rehydration hardening + window-monotonic TC floor. A certified-round pair installs
+        // ONLY when backed by a co-persisted structurally-consistent TC; the floor advances.
+        test_clear_timeout_state();
+        let vote = SignedTimeoutVote {
+            voter_id: "voter_a".into(), signature: vec![1],
+            high_qc_idx: 0, high_qc_hash: [0u8; 32], tip_height: 629, tip_hash: [0u8; 32],
+        };
+        let good = TimeoutProof { height: 7, timeout_round: 3, anchor: [0u8; 32], votes: vec![vote.clone()] };
+        let mismatched = TimeoutProof { height: 6, timeout_round: 1, anchor: [0u8; 32], votes: vec![vote] };
+        let blob = bincode::serialize(&vec![((7u64, 3u64), good), ((8u64, 1u64), mismatched)]).unwrap();
+        assert_eq!(rehydrate_timeout_certificates(&blob), 1, "key/field-mismatched TC rejected");
+        assert_eq!(observed_tc_window_floor(), 7, "floor = highest verified TC window");
+        let pairs = bincode::serialize(&vec![(7u64, 3u64), (9u64, 5u64)]).unwrap();
+        assert_eq!(rehydrate_highest_certified_rounds(&pairs), 1, "unbacked pair NOT installed");
+        assert_eq!(highest_certified_round_for(7), 3);
+        assert_eq!(highest_certified_round_for(9), 0, "raw disk pair is not a production input");
+
+        // ── View floor raise prunes banked below-floor votes (banked-vote double-TC vector) and is
+        // monotone; rollback lowers it so a rolled-back tip can fail over again.
+        test_clear_timeout_state();
+        test_insert_timeout_vote(4, 1, "voter_a"); // banked at window 4
+        test_insert_timeout_vote(6, 1, "voter_b"); // at window 6
+        raise_tc_window_floor(5);
+        assert_eq!(observed_tc_window_floor(), 5, "floor raised");
+        assert!(!TIMEOUT_VOTES.contains_key(&(4, 1)), "below-floor banked vote pruned");
+        assert!(TIMEOUT_VOTES.contains_key(&(6, 1)), "at-or-above-floor vote retained");
+        raise_tc_window_floor(3);
+        assert_eq!(observed_tc_window_floor(), 5, "raise is monotone (no regress)");
+        lower_tc_window_floor(2); // fork rollback moved the tip into window 2
+        assert_eq!(observed_tc_window_floor(), 2, "rollback lowers the floor → re-vote enabled");
+
+        test_clear_timeout_state();
+    }
 
     /// The live-conn signed-head reply fires ONLY for a genuine follower (behind by >= HEAD_REPLY_MIN_GAP),
     /// so an at-tip / within-gap peer triggers no chatter while a real follower always gets the tip feed.

@@ -912,6 +912,8 @@ const WalletScreen = () => {
   // { contract, name, symbol, decimals, balance (human string) }. Keyed/deduped by contract.
   const [qrcTokens, setQrcTokens] = useState([]); // held + custom, merged for the Assets list
   const [customTokens, setCustomTokens] = useState([]); // user-added (persisted), balances filled in on load
+  const [hiddenTokens, setHiddenTokens] = useState(new Set()); // user-hidden token contracts (spam control)
+  const [showHidden, setShowHidden] = useState(false); // reveal hidden tokens so they can be unhidden
   // Add-Custom-Token modal
   const [showAddTokenModal, setShowAddTokenModal] = useState(false);
   const [addTokenAddress, setAddTokenAddress] = useState('');
@@ -3380,12 +3382,48 @@ const WalletScreen = () => {
         });
       }));
 
-      setQrcTokens(Array.from(byContract.values()));
+      const list = Array.from(byContract.values());
+      setQrcTokens(list);
+
+      // Trustless upgrade: verify each held token's balance via its two-level proof against the
+      // committee-QC-anchored state_root (same trust model as the native balance). Non-blocking — the
+      // list shows node-trusted balances immediately, each row flips to `verified` + its proof-exact
+      // balance as the proof lands. A node that lies about a token balance is caught here.
+      list.forEach(async (tk) => {
+        if (!tk.contract) return;
+        try {
+          const r = await walletManager.getTokenBalanceWithProof(tk.contract, qnetAddress, tk.decimals);
+          if (r && r.ok && r.verified) {
+            setQrcTokens((prev) => prev.map((t) => (t.contract === tk.contract
+              ? { ...t, balance: r.balance, verified: true } : t)));
+          }
+        } catch (_) { /* keep the node-trusted balance */ }
+      });
     } catch (e) {
       // Non-fatal: keep the last-known token list rather than flashing empty.
       // console.warn('[QRC20] token list load failed:', e.message);
     }
   };
+
+  // Per-token hide list (spam control): an array of contract addresses persisted in AsyncStorage
+  // 'qnet_hidden_tokens'. The Assets list filters these out; showHidden reveals them to unhide.
+  const persistHiddenTokens = async (set) => {
+    try { await AsyncStorage.setItem('qnet_hidden_tokens', JSON.stringify(Array.from(set))); } catch (_) {}
+  };
+  const hideToken = (contract) => {
+    setHiddenTokens((prev) => { const next = new Set(prev); next.add(contract); persistHiddenTokens(next); return next; });
+  };
+  const unhideToken = (contract) => {
+    setHiddenTokens((prev) => { const next = new Set(prev); next.delete(contract); persistHiddenTokens(next); return next; });
+  };
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem('qnet_hidden_tokens');
+        if (raw) { const arr = JSON.parse(raw); if (Array.isArray(arr)) setHiddenTokens(new Set(arr)); }
+      } catch (_) {}
+    })();
+  }, []);
 
   const loadBalance = async (publicKey) => {
     try {
@@ -4987,16 +5025,30 @@ const WalletScreen = () => {
 
                 {/* QRC-20 tokens: on-chain holdings + persisted custom tokens (deduped by contract).
                     Each row opens the Send screen carrying its contract address + decimals. */}
-                {qrcTokens.map((tk) => (
+                {qrcTokens.filter((tk) => showHidden || !hiddenTokens.has(tk.contract)).map((tk) => {
+                  const isHidden = hiddenTokens.has(tk.contract);
+                  return (
                   <TouchableOpacity
                     key={tk.contract}
-                    style={styles.tokenItemClickable}
+                    style={[styles.tokenItemClickable, isHidden && { opacity: 0.45 }]}
                     onPress={() => openSendModal(
                       tk.symbol || tk.name || 'Token',
                       parseFloat(tk.balance) || 0,
                       'qnet',
                       { contract: tk.contract, decimals: tk.decimals }
                     )}
+                    onLongPress={() => {
+                      const label = tk.symbol || tk.name || 'Token';
+                      Alert.alert(
+                        isHidden ? 'Show token' : 'Hide token', label,
+                        [
+                          { text: 'Cancel', style: 'cancel' },
+                          isHidden
+                            ? { text: 'Show', onPress: () => unhideToken(tk.contract) }
+                            : { text: 'Hide', style: 'destructive', onPress: () => hideToken(tk.contract) },
+                        ]
+                      );
+                    }}
                     activeOpacity={0.6}
                   >
                     <View style={styles.tokenInfo}>
@@ -5013,10 +5065,26 @@ const WalletScreen = () => {
                       </View>
                     </View>
                     <View style={styles.tokenBalance}>
-                      <Text style={styles.tokenAmount}>{tk.balance}</Text>
+                      <Text style={styles.tokenAmount}>
+                        {tk.balance}{tk.verified ? ' ✓' : ''}
+                      </Text>
                     </View>
                   </TouchableOpacity>
-                ))}
+                  );
+                })}
+
+                {/* Long-press a token to hide/show it; toggle the hidden set in/out of view. */}
+                {hiddenTokens.size > 0 && (
+                  <TouchableOpacity
+                    style={styles.addTokenButton}
+                    onPress={() => setShowHidden((v) => !v)}
+                    activeOpacity={0.6}
+                  >
+                    <Text style={styles.addTokenButtonText}>
+                      {showHidden ? 'Done managing' : `Show ${hiddenTokens.size} hidden token${hiddenTokens.size > 1 ? 's' : ''}`}
+                    </Text>
+                  </TouchableOpacity>
+                )}
 
                 {/* Add-Custom-Token button */}
                 <TouchableOpacity

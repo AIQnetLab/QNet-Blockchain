@@ -37,6 +37,11 @@ static ROLLBACK_TARGET_HEIGHT: AtomicU64 = AtomicU64::new(0);
 /// churn). Mirrors ROLLBACK_IN_PROGRESS; cleared via RAII on every rehydrate exit.
 pub static SNAPSHOT_REHYDRATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+/// Set true once `backfill_owns_indices` has fully rebuilt the wallet_token index from the accounts
+/// CF, making it authoritative: from then on an EMPTY per-wallet result means "holds no tokens" and
+/// the reader skips the O(N) scan fallback. Until then a wallet with no index hits still falls back.
+pub static OWNS_INDEX_READY: AtomicBool = AtomicBool::new(false);
+
 /// Timestamp when rollback started (for timeout protection)
 static ROLLBACK_START_TIME: AtomicU64 = AtomicU64::new(0);
 
@@ -883,6 +888,10 @@ impl PersistentStorage {
                 // fresh genesis DB carries them even when the feature stays disabled.
                 ColumnFamilyDescriptor::new("merkle_leaves", create_cf_opts()),
                 ColumnFamilyDescriptor::new("merkle_nodes", create_cf_opts()),
+                // Wallet→token reverse index (NON-consensus): key `owns_{wallet}_{contract}` marks a
+                // live QRC-20 holding, maintained at apply from 0↔nonzero balance transitions. Turns the
+                // per-wallet token list from an O(N)-accounts scan into an O(held) prefix seek at scale.
+                ColumnFamilyDescriptor::new("wallet_token", create_cf_opts()),
             ]
         }
 
@@ -897,7 +906,7 @@ impl PersistentStorage {
             "snapshots", "tx_index", "tx_by_address", "attestations", "heartbeats", "poh_state",
             "contract_storage", "fcm_tokens", "mempool", "cross_shard_pending", "cross_shard_receipts",
             "accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage",
-            "merkle_leaves", "merkle_nodes",
+            "merkle_leaves", "merkle_nodes", "wallet_token",
         ];
         let open_descriptors = || -> Vec<ColumnFamilyDescriptor> {
             let mut cfs = build_column_families();
@@ -1618,6 +1627,159 @@ impl PersistentStorage {
         }
         self.db.write(batch)?;
         Ok(accounts.len())
+    }
+
+    // ── Wallet→token reverse index (wallet_token CF, NON-consensus) ──
+    // Key `owns|{wallet}|{contract}` (the `|` separator never occurs in an address, so a shorter
+    // wallet can't prefix-alias a longer one). Value is a single marker byte. Maintained at apply
+    // from QRC-20 0↔nonzero transitions; a stale/missing entry self-heals via backfill_owns_indices.
+    fn owns_key(wallet: &str, contract: &str) -> Vec<u8> {
+        format!("owns|{}|{}", wallet, contract).into_bytes()
+    }
+    fn owns_prefix(wallet: &str) -> Vec<u8> {
+        format!("owns|{}|", wallet).into_bytes()
+    }
+
+    /// A holder is indexable only if its address cannot alias another wallet's key prefix — i.e. it
+    /// contains no `|` separator. `to`/holder is attacker-controlled (never format-validated at the
+    /// QRC-20 credit arms), so this makes the owns key collision-free BY CONSTRUCTION rather than by
+    /// the (false) assumption that `|` never appears in an address. Belt to the reader's live-balance
+    /// recheck; a junk holder is simply never indexed under a real wallet's prefix.
+    #[inline]
+    pub(crate) fn owns_indexable(holder: &str) -> bool { !holder.contains('|') }
+
+    /// The wallet_token keys for every LIVE (nonzero-balance) indexable holder of `contract` in
+    /// `storage`. Single source of truth for "which holders does this contract's storage imply",
+    /// shared by the boot/snapshot backfill and the reorg resync so the two index populations can
+    /// never diverge on the type gate, the zero-detection, or the holder filter. Empty for non-QRC-20.
+    pub(crate) fn owns_keys_for_contract(contract: &str, storage: &std::collections::HashMap<String, String>) -> Vec<Vec<u8>> {
+        if storage.get("type").map(|t| t != "qrc20").unwrap_or(true) { return Vec::new(); }
+        let mut out = Vec::new();
+        for (skey, sval) in storage {
+            if let Some(holder) = skey.strip_prefix("balance:") {
+                if sval.trim() != "0" && !sval.trim().is_empty() && Self::owns_indexable(holder) {
+                    out.push(Self::owns_key(holder, contract));
+                }
+            }
+        }
+        out
+    }
+
+    /// Write pre-derived owns keys in bounded chunks (one WriteBatch per 10k puts) so a full-index
+    /// rebuild never materialises one giant batch. Returns keys written.
+    pub(crate) fn write_owns_keys_batched(&self, keys: &[Vec<u8>]) -> IntegrationResult<usize> {
+        if keys.is_empty() { return Ok(0); }
+        let cf = self.db.cf_handle("wallet_token")
+            .ok_or_else(|| IntegrationError::StorageError("wallet_token column family not found".to_string()))?;
+        for chunk in keys.chunks(10_000) {
+            let mut batch = WriteBatch::default();
+            for key in chunk { batch.put_cf(&cf, key, &[1u8]); }
+            self.db.write(batch)?;
+        }
+        Ok(keys.len())
+    }
+
+    /// Apply this block's Set/Clear owns-deltas AND advance the durable owns-watermark in ONE atomic
+    /// cross-CF batch. The watermark = highest height whose owns-deltas are durable; boot compares it to
+    /// the tip to skip the full rebuild when the index is already current (deltas empty → watermark-only).
+    pub fn persist_owns_deltas(&self, deltas: &[qnet_state::OwnsDelta], height: u64) -> IntegrationResult<()> {
+        let cf = self.db.cf_handle("wallet_token")
+            .ok_or_else(|| IntegrationError::StorageError("wallet_token column family not found".to_string()))?;
+        let meta = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        let mut batch = WriteBatch::default();
+        for d in deltas {
+            match d {
+                // Skip a holder whose address could alias another wallet's key prefix (contains `|`).
+                // Same collision-safe filter as the backfill/resync helper — an unvalidated `to` can
+                // never plant a junk key under a real wallet's prefix. Clear of such a key is a no-op.
+                qnet_state::OwnsDelta::Set { wallet, contract } => {
+                    if Self::owns_indexable(wallet) {
+                        batch.put_cf(&cf, Self::owns_key(wallet, contract), &[1u8]);
+                    }
+                }
+                qnet_state::OwnsDelta::Clear { wallet, contract } => {
+                    if Self::owns_indexable(wallet) {
+                        batch.delete_cf(&cf, Self::owns_key(wallet, contract));
+                    }
+                }
+            }
+        }
+        batch.put_cf(&meta, b"meta_owns_watermark", &height.to_le_bytes());
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Contracts for which `wallet` holds a live (nonzero) QRC-20 balance. O(held) prefix seek.
+    pub fn get_tokens_for_wallet(&self, wallet: &str) -> IntegrationResult<Vec<String>> {
+        let cf = self.db.cf_handle("wallet_token")
+            .ok_or_else(|| IntegrationError::StorageError("wallet_token column family not found".to_string()))?;
+        let prefix = Self::owns_prefix(wallet);
+        let mut out = Vec::new();
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward));
+        for item in iter {
+            let (key, _) = item.map_err(|e| IntegrationError::StorageError(e.to_string()))?;
+            if !key.starts_with(&prefix) { break; }
+            if let Ok(contract) = std::str::from_utf8(&key[prefix.len()..]) {
+                out.push(contract.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// One-time reconciliation: rebuild the wallet_token index from the authoritative accounts CF
+    /// (every contract's `balance:{holder}` entry with a nonzero value). Idempotent; run at boot and
+    /// after a snapshot apply so the O(1) reader is complete even for pre-index or externally-written
+    /// (e.g. WASM) balances. O(contract storage entries) — bounded by live holders, run off the hot path.
+    pub fn backfill_owns_indices(&self) -> IntegrationResult<usize> {
+        let accounts_cf = self.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let wt_cf = self.db.cf_handle("wallet_token")
+            .ok_or_else(|| IntegrationError::StorageError("wallet_token column family not found".to_string()))?;
+        let mut batch = WriteBatch::default();
+        let mut in_batch = 0usize;
+        let mut written = 0usize;
+        let iter = self.db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, val) = item.map_err(|e| IntegrationError::StorageError(e.to_string()))?;
+            let contract = match std::str::from_utf8(&key) { Ok(s) => s.to_string(), Err(_) => continue };
+            let account: qnet_state::Account = match bincode::deserialize(&val) { Ok(a) => a, Err(_) => continue };
+            if account.contract_storage.is_empty() { continue; }
+            // Single source of truth for the type gate + live-holder + collision-safe filter (shared with
+            // resync_owns_for_contract), so a WASM contract's `balance:{}` key is never a phantom token
+            // and the boot/reorg index populations cannot drift apart.
+            for key in Self::owns_keys_for_contract(&contract, &account.contract_storage) {
+                batch.put_cf(&wt_cf, key, &[1u8]);
+                in_batch += 1;
+                written += 1;
+                // Bounded chunks: a millions-of-holders rebuild never holds one giant batch in RAM.
+                if in_batch >= 10_000 {
+                    self.db.write(std::mem::take(&mut batch))?;
+                    in_batch = 0;
+                }
+            }
+        }
+        if in_batch > 0 { self.db.write(batch)?; }
+        // Index is now complete → readers may treat an empty per-wallet result as authoritative.
+        OWNS_INDEX_READY.store(true, Ordering::Relaxed);
+        Ok(written)
+    }
+
+    /// Re-derive the wallet_token entries for ONE contract from an authoritative `contract_storage`
+    /// (the reorg-restored pre-image). Used on rollback: the owns-delta persist is a non-consensus
+    /// background write that is NOT rolled back, so a `Clear` flushed for a balance the reorg then
+    /// restores would leave the pair missing → the reader under-reports it. Re-adding every present
+    /// holder heals that; stale entries left behind are balance-rechecked away by the reader. Bounded
+    /// by this contract's holders. No-op for non-QRC-20 (same type gate as emission/backfill/reader).
+    pub fn resync_owns_for_contract(&self, contract: &str, contract_storage: &std::collections::HashMap<String, String>) -> IntegrationResult<()> {
+        let keys = Self::owns_keys_for_contract(contract, contract_storage);
+        if keys.is_empty() { return Ok(()); }
+        let cf = self.db.cf_handle("wallet_token")
+            .ok_or_else(|| IntegrationError::StorageError("wallet_token column family not found".to_string()))?;
+        let mut batch = WriteBatch::default();
+        for key in keys { batch.put_cf(&cf, key, &[1u8]); }
+        self.db.write(batch)?;
+        Ok(())
     }
 
     // GALC held-capsule persistence (metadata CF). Tiny self-authenticating object; re-verified against
@@ -3458,6 +3620,28 @@ impl Storage {
         self.persistent
             .persist_accounts_batch(modified_accounts, deleted_addresses)
             .await
+    }
+
+    /// Wallet→token reverse-index maintenance (NON-consensus). One atomic batch: this block's owns-deltas
+    /// + the durable watermark at `height`; see `PersistentStorage::persist_owns_deltas`.
+    pub fn persist_owns_deltas(&self, deltas: &[qnet_state::OwnsDelta], height: u64) -> IntegrationResult<()> {
+        self.persistent.persist_owns_deltas(deltas, height)
+    }
+
+    /// Contracts a wallet holds a live QRC-20 balance in (O(held) prefix seek).
+    pub fn get_tokens_for_wallet(&self, wallet: &str) -> IntegrationResult<Vec<String>> {
+        self.persistent.get_tokens_for_wallet(wallet)
+    }
+
+    /// One-time reconciliation of the wallet_token index from the accounts CF (boot / post-snapshot).
+    pub fn backfill_owns_indices(&self) -> IntegrationResult<usize> {
+        self.persistent.backfill_owns_indices()
+    }
+
+    /// Heal the wallet_token index for one contract from a reorg-restored `contract_storage`
+    /// (rollback path); see `PersistentStorage::resync_owns_for_contract`.
+    pub fn resync_owns_for_contract(&self, contract: &str, contract_storage: &std::collections::HashMap<String, String>) -> IntegrationResult<()> {
+        self.persistent.resync_owns_for_contract(contract, contract_storage)
     }
 
     /// Load a single account from the persistent `accounts` CF. Used by
@@ -7309,6 +7493,86 @@ impl Storage {
         Ok(())
     }
 
+    /// wallet_token index is built AND clean (skip boot backfill, trust empty results): build marker
+    /// present AND dirty-sentinel absent. The sentinel — not marker-absence — is the "must rebuild"
+    /// authority: marking dirty WRITES a key, so a failed op leaves it dirty (safe over-rebuild).
+    pub fn owns_index_built(&self) -> bool {
+        match self.persistent.db.cf_handle("metadata") {
+            Some(cf) => {
+                let built = self.persistent.db.get_cf(&cf, b"meta_owns_index_v1").map(|o| o.is_some()).unwrap_or(false);
+                let dirty = self.persistent.db.get_cf(&cf, b"meta_owns_dirty").map(|o| o.is_some()).unwrap_or(true);
+                built && !dirty
+            }
+            None => false,
+        }
+    }
+
+    /// Mark built+clean after a full backfill at `height`: set marker, stamp the watermark to `height`
+    /// (index now current up to there), THEN clear the dirty-sentinel (a crash between leaves it dirty →
+    /// next boot rebuilds).
+    pub fn set_owns_index_built(&self, height: u64) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.persistent.db.put_cf(&cf, b"meta_owns_index_v1", b"1")?;
+        self.persistent.db.put_cf(&cf, b"meta_owns_watermark", &height.to_le_bytes())?;
+        self.persistent.db.delete_cf(&cf, b"meta_owns_dirty")?;
+        Ok(())
+    }
+
+    /// Durable owns-watermark: highest height whose owns-deltas are known persisted (0 if never set).
+    /// Boot rebuilds the index only when this lags the tip (unclean shutdown lost the last deltas).
+    pub fn owns_watermark(&self) -> u64 {
+        self.persistent.db.cf_handle("metadata")
+            .and_then(|cf| self.persistent.db.get_cf(&cf, b"meta_owns_watermark").ok().flatten())
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Advance the owns-watermark alone (empty-delta block: index already consistent at `height`).
+    pub fn set_owns_watermark(&self, height: u64) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.persistent.db.put_cf(&cf, b"meta_owns_watermark", &height.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Owns keys implied by one contract's storage — pure derivation for callers that hold the
+    /// in-memory state (boot rebuild extracts keys under the read guard, no map clones).
+    pub fn owns_index_keys(contract: &str, contract_storage: &std::collections::HashMap<String, String>) -> Vec<Vec<u8>> {
+        PersistentStorage::owns_keys_for_contract(contract, contract_storage)
+    }
+
+    /// Rebuild wallet_token from pre-derived owns keys: one range-delete tombstone (every key sits
+    /// under the `owns|` prefix), chunked re-index, mark built+clean+READY with the watermark stamped
+    /// to `at_height`. NON-consensus. Returns keys written.
+    pub fn rebuild_owns_from_keys(&self, keys: &[Vec<u8>], at_height: u64) -> IntegrationResult<usize> {
+        if let Some(cf) = self.persistent.db.cf_handle("wallet_token") {
+            let mut batch = WriteBatch::default();
+            batch.delete_range_cf(&cf, b"owns|".as_ref(), b"owns}".as_ref());
+            self.persistent.db.write(batch)?;
+        }
+        let n = self.persistent.write_owns_keys_batched(keys)?;
+        self.set_owns_index_built(at_height)?;
+        OWNS_INDEX_READY.store(true, Ordering::Relaxed);
+        Ok(n)
+    }
+
+    /// Flag wallet_token possibly-incomplete (dropped delta write, promote/reorg rebuild, or unclean-
+    /// shutdown replay which re-applies blocks without owns deltas): write a durable dirty-sentinel (the
+    /// crash-safe rebuild trigger) and drop READY so the live reader falls back to scan until the next
+    /// boot rebuilds. NON-consensus.
+    pub fn mark_owns_index_dirty(&self) {
+        OWNS_INDEX_READY.store(false, Ordering::Relaxed);
+        if let Some(cf) = self.persistent.db.cf_handle("metadata") {
+            // If the sentinel write fails, zero the watermark instead: a watermark regression (< tip) is
+            // an equally-durable boot-rebuild trigger, so a failed dirty-mark is never silently lost.
+            if self.persistent.db.put_cf(&cf, b"meta_owns_dirty", b"1").is_err() {
+                let _ = self.persistent.db.put_cf(&cf, b"meta_owns_watermark", &0u64.to_le_bytes());
+            }
+        }
+    }
+
     /// True iff this node's NodeRegistration is chain-confirmed (reg_height stamped at
     /// block-apply / genesis boot) in the local node_registry. The on-chain binding is the
     /// source of truth — a locally-persisted activation code does NOT prove the registration
@@ -9908,6 +10172,16 @@ impl Storage {
                 .map_err(|e| IntegrationError::StorageError(format!("merkle_addr_utf8_err: {}", e)))?;
             let account: qnet_state::Account = bincode::deserialize(&v)
                 .map_err(|e| IntegrationError::SerializationError(format!("merkle_account_decode_err: {}", e)))?;
+            // V2 SNAPSHOT BINDING: under the SROOT schema the contract account leaf commits only
+            // storage_root, NOT the raw contract_storage map (the old full-map fold is gone). So a
+            // restored/untrusted contract_storage that does NOT hash to the committed storage_root would
+            // still reproduce state_root and pass the Pattern-C bind — yet serve forged balances and fork
+            // on the next write. Re-derive and reject the mismatch here (O(entries)) to restore the
+            // transitive binding the fold gave for free, so a tampered snapshot fails the bind check.
+            if !qnet_state::StateMerkleTree::contract_storage_root_matches(&account) {
+                return Err(IntegrationError::StorageError(format!(
+                    "[REJECT][SNAPSHOT] storage_root_mismatch addr={} cf={}", addr, cf_name)));
+            }
             tree.insert_lazy(&addr, &account);
         }
         Ok(tree.finalize())
@@ -10548,6 +10822,15 @@ impl Storage {
         self.backfill_roster_indices()?;
         self.rebuild_committed_burn_wallet(height)?;
         self.rebuild_registry_lthash(height)?;
+        // Wallet→token reverse index (NON-consensus): rebuild from the freshly promoted accounts so a
+        // cold-joined node serves per-wallet token lists in O(held). Best-effort — a failure must never
+        // wedge the consensus-critical promote. Mark dirty FIRST (drops OWNS_INDEX_READY + clears the
+        // build marker) so that if the rebuild Errs — or we crash mid-rebuild — the emptied CF is NEVER
+        // left authoritative: the reader falls back to the O(N) scan and the NEXT boot re-runs the
+        // backfill. backfill_owns_indices re-asserts READY on success; the marker is set ONLY then.
+        self.mark_owns_index_dirty();
+        let _ = self.clear_cf("wallet_token");
+        if self.backfill_owns_indices().is_ok() { let _ = self.set_owns_index_built(height); }
         // Commit height + finality/WS floors + durable anchor (adopt_snapshot_finality persists it).
         self.set_chain_height(height)?;
         crate::node::adopt_snapshot_finality(height, anchor_hash);

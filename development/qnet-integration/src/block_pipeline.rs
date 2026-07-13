@@ -2664,6 +2664,8 @@ impl BlockPipeline {
             // op will be the stuck point.
             metrics.mark_apply_op(height, PIPELINE_OP_APPLY_STATE_LOCK);
             let lock_start = std::time::Instant::now();
+            // Owns-index deltas for this block, captured under the lock and persisted OFF-lock below.
+            let mut owns_to_persist: Vec<qnet_state::OwnsDelta> = Vec::new();
             let apply_ok = {
                 let state_guard = ctx.state.write().await;
                 let lock_elapsed = lock_start.elapsed();
@@ -3070,6 +3072,8 @@ impl BlockPipeline {
                             let mut modified: Vec<(String, qnet_state::Account)> =
                                 Vec::with_capacity(snapshot.accounts().len() + snapshot.created_keys().len());
                             let mut deleted: Vec<String> = Vec::new();
+                            // QRC-20 wallet→token owns-index deltas this block (NON-consensus reverse index).
+                            let owns_deltas: Vec<qnet_state::OwnsDelta> = snapshot.owns().to_vec();
 
                             // Modified addresses: pre-image existed; check if
                             // the post-image still exists (it might have been
@@ -3096,9 +3100,13 @@ impl BlockPipeline {
                                 }
                             }
 
+                            // Owns-index (NON-consensus): capture under the lock, persist OFF-lock below.
+                            // A large airdrop block's batch must not serialise apply behind the state lock.
+                            owns_to_persist = owns_deltas;
                             if !modified.is_empty() || !deleted.is_empty() {
                                 // ───────────────────────────────────────────────
-                                // Persist in the BACKGROUND so we never await on
+                                // Accounts CF (best-effort mirror, can be large):
+                                // persist in the BACKGROUND so we never await on
                                 // RocksDB while still holding `state_guard`.
                                 // Holding the state write lock across an async
                                 // I/O would serialise the entire apply pipeline
@@ -3166,6 +3174,32 @@ impl BlockPipeline {
                 crate::unified_p2p::clear_block_pending_sync(height);
                 metrics.mark_apply_idle();
                 continue;
+            }
+
+            // Owns-index (NON-consensus): persist this block's deltas + advance the durable watermark to
+            // `height`, OFF-lock, in strict block order (the pipeline processes one height per iteration and
+            // awaits here). A non-empty (airdrop) batch goes to the blocking pool so it never stalls the
+            // async worker; an empty block only advances the watermark (tiny put, inline). The watermark
+            // lets boot skip the O(contracts) rebuild when the index is already current. On failure mark
+            // dirty → reader falls back to a live scan.
+            if owns_to_persist.is_empty() {
+                if let Err(e) = ctx.storage.set_owns_watermark(height) {
+                    if is_warn() { println!("[WARN][PIPELINE] owns_watermark_failed h={} err={:?}", height, e); }
+                }
+            } else {
+                let storage = ctx.storage.clone();
+                let n = owns_to_persist.len();
+                match tokio::task::spawn_blocking(move || storage.persist_owns_deltas(&owns_to_persist, height)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        ctx.storage.mark_owns_index_dirty();
+                        if is_warn() { println!("[WARN][PIPELINE] persist_owns_failed h={} n={} err={:?} action=index_dirty", height, n, e); }
+                    }
+                    Err(join) => {
+                        ctx.storage.mark_owns_index_dirty();
+                        if is_warn() { println!("[WARN][PIPELINE] persist_owns_join_failed h={} n={} err={:?} action=index_dirty", height, n, join); }
+                    }
+                }
             }
 
             // ── Post-save updates (no state lock held) ──

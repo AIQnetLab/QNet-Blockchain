@@ -29,9 +29,9 @@ import {
   WS_CHECKPOINT,
 } from '../config/genesisConsensus';
 
-// ── consensus constants (mirror checkpoint_bft.rs) ──────────────────────────
-const COMMITTEE_THRESHOLD = 120; // ≤120 eligible ⇒ whole set is the committee
-const COMMITTEE_SIZE = 100;      // VRF subsample size when > threshold
+// ── consensus constants (mirror checkpoint_bft.rs — MUST stay in lockstep with the node) ──
+const COMMITTEE_THRESHOLD = 1000; // ≤1000 eligible ⇒ whole set is the committee
+const COMMITTEE_SIZE = 1000;      // VRF subsample size when > threshold
 const MACROBLOCK_INTERVAL = 90;  // microblocks per macroblock / epoch
 const DILITHIUM_SIG_LEN = 3309;  // detached ML-DSA-65 signature bytes
 const LANES = 1024;              // LtHash lanes (u16)
@@ -101,9 +101,11 @@ export function checkpointHash(cp) {
 }
 
 // ── 3. Parse the ATTACHED dilithium sig string → detached sig hex ───────────
-// String: "dilithium_sig_<node_id>_<base64>". base64 decodes to
-//   [u32LE signed_msg_len][signed_msg][u32LE pk_len][pk]; signed_msg = [detached_sig(3309)][msg].
-// We need only the detached sig; the embedded pk is IGNORED (we use the TRUSTED pk).
+// String: "dilithium_sig_<node_id>_<base64>". base64 decodes to [u32LE signed_msg_len][signed_msg]
+//   where signed_msg = [detached_sig(3309)][msg]. We need only the detached sig and ALWAYS verify against
+//   the TRUSTED committee pk. QC sigs are pk-compacted node-side (C-2) so there is NO trailing pk; a live
+//   identity ping may still carry [u32LE pk_len][pk] which we simply ignore. Never assert a pk trailer's
+//   presence — that would false-reject compact QC sigs.
 export function parseDilithiumSig(sigStr) {
   if (typeof sigStr !== 'string' || !sigStr.startsWith('dilithium_sig_')) return null;
   const pos = sigStr.lastIndexOf('_'); // base64 alphabet has no '_' → last '_' is the separator

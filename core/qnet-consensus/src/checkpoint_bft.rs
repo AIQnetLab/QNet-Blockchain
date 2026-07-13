@@ -33,10 +33,12 @@ pub fn leader_index(index: u64, parent_checkpoint_hash: &Hash, committee_len: us
     (u64::from_le_bytes(x) % committee_len as u64) as usize
 }
 
-/// Canonical committee parameters: when the eligible set exceeds `COMMITTEE_THRESHOLD`,
-/// consensus runs over a VRF-sampled committee of `COMMITTEE_SIZE`. Single source of truth.
-pub const COMMITTEE_THRESHOLD: usize = 120;
-pub const COMMITTEE_SIZE: usize = 100;
+/// Canonical committee parameters: the round committee is the VRF-capped eligible set (≤ this size =
+/// the round cap MAX_VALIDATORS). Both macro-finality and micro-failover vote over the SAME set. Size
+/// sets safety — equivocation needs ≥f+1≈C/3 sampled Byzantine, bounded P ≤ exp(−C·D(1/3‖β)); at β=0.20
+/// a 1e-9 bound needs C≈426, so C=1000 ⇒ ≈7e-22/epoch. THRESHOLD==SIZE ⇒ subsample only above the cap.
+pub const COMMITTEE_THRESHOLD: usize = 1000;
+pub const COMMITTEE_SIZE: usize = 1000;
 
 /// Macroblock / epoch cadence: one macroblock (epoch transition, emission, committee
 /// rotation, N-2 snapshot) every MACROBLOCK_INTERVAL microblocks. A true network constant.
@@ -622,7 +624,7 @@ mod tests {
         assert_eq!(sample_committee(&small, 7, &seed, COMMITTEE_THRESHOLD, COMMITTEE_SIZE), small);
 
         // > threshold → subsample to exactly COMMITTEE_SIZE, deterministic, a subset, order-preserving.
-        let big: Vec<NodeId> = (0..300).map(|i| format!("n{:03}", i)).collect();
+        let big: Vec<NodeId> = (0..1500).map(|i| format!("n{:04}", i)).collect();
         let c1 = sample_committee(&big, 7, &seed, COMMITTEE_THRESHOLD, COMMITTEE_SIZE);
         assert_eq!(c1, sample_committee(&big, 7, &seed, COMMITTEE_THRESHOLD, COMMITTEE_SIZE), "deterministic");
         assert_eq!(c1.len(), COMMITTEE_SIZE);

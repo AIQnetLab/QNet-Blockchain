@@ -131,6 +131,17 @@ pub struct Account {
     /// success. Part of the leaf hash (consensus-bound — see hash_account).
     #[serde(default)]
     pub last_claimed_epoch: u64,
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // V2: PER-CONTRACT STORAGE MERKLE ROOT
+    // ═══════════════════════════════════════════════════════════════════════════
+    /// Root of this contract's StorageMerkleTree over the ENTIRE contract_storage map (one leaf per
+    /// key). For contract accounts it is committed into the account leaf (hash_account SROOT branch),
+    /// giving each stored value — token balances, total_supply, allowances — an individual merkle proof.
+    /// For non-contract accounts it is inert (never hashed). Kept in lockstep with contract_storage by a
+    /// pure post-apply recompute, so it can never drift. Appended LAST to keep bincode positional layout.
+    #[serde(default)]
+    pub storage_root: [u8; 32],
 }
 
 /// Account state (alias for compatibility)
@@ -188,6 +199,7 @@ impl Default for AccountState {
             heartbeat_final_epoch: 0,
             heartbeat_final_count: 0,
             last_claimed_epoch: 0,
+            storage_root: *crate::state::EMPTY_STORAGE_ROOT,
         }
     }
 }
@@ -240,6 +252,14 @@ impl AccountState {
 }
 
 impl Account {
+    /// True iff this account is a QRC-20 token contract (contract_storage["type"] == "qrc20").
+    /// The ONE named predicate for the token-type gate — apply-path dispatch, the owns index, and the
+    /// RPC token readers all mean the same thing by "is a QRC-20", so it lives in one place.
+    #[inline]
+    pub fn is_qrc20(&self) -> bool {
+        self.contract_storage.get("type").map(|t| t == "qrc20").unwrap_or(false)
+    }
+
     /// Create new account
     pub fn new(address: Address) -> Self {
         Self {
@@ -261,6 +281,7 @@ impl Account {
             heartbeat_final_epoch: 0,
             heartbeat_final_count: 0,
             last_claimed_epoch: 0,
+            storage_root: *crate::state::EMPTY_STORAGE_ROOT,
         }
     }
 
@@ -285,6 +306,7 @@ impl Account {
             heartbeat_final_epoch: 0,
             heartbeat_final_count: 0,
             last_claimed_epoch: 0,
+            storage_root: *crate::state::EMPTY_STORAGE_ROOT,
         }
     }
 

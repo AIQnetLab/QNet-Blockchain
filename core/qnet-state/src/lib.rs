@@ -23,11 +23,11 @@ mod python_bindings;
 
 pub use account::{Account, AccountState, NodeType};
 pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock, StoredMicroBlock, PoHState, storage_version, EligibleProducer, RewardHeartbeat, HeartbeatSummary, ExcludedProducerEntry};
-pub use transaction::{Transaction, TransactionReceipt, TransactionType, EquivocationHeader, gas_limits, PingSampleData, HeartbeatSampleData, ShardHeartbeatSummary, GAS_METERING_ACTIVATION_HEIGHT, MAX_CONTRACT_STORAGE_ENTRIES, DynamicGasPricing, init_dynamic_gas_pricing, update_dynamic_gas_pricing, get_dynamic_gas_pricing};
+pub use transaction::{Transaction, TransactionReceipt, TransactionType, EquivocationHeader, gas_limits, PingSampleData, HeartbeatSampleData, ShardHeartbeatSummary, GAS_METERING_ACTIVATION_HEIGHT, MAX_CONTRACT_STORAGE_ENTRIES, DynamicGasPricing, init_dynamic_gas_pricing, update_dynamic_gas_pricing, get_dynamic_gas_pricing, OwnsDelta};
 pub use state_db::StateDB;
 pub use state_manager::StateManager;
 pub use errors::{StateError, StateResult};
-pub use state::{StateManager as State, MAX_QNC_SUPPLY, MAX_QNC_SUPPLY_NANO, StateMerkleTree, BalanceProof};
+pub use state::{StateManager as State, MAX_QNC_SUPPLY, MAX_QNC_SUPPLY_NANO, StateMerkleTree, BalanceProof, TokenBalanceProof};
 // v3.26: Atomic fee crediting protection
 pub use state::{should_credit_fees, clear_credited_fees_cache, credited_fees_count};
 // v3.39: Block-level snapshot for state_root mismatch recovery

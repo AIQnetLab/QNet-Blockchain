@@ -144,6 +144,10 @@ fn max_size_for_message_type(msg_type: u8) -> usize {
     match msg_type {
         // Block data: full 10 MB (macroblocks can be large)
         1 => MAX_MESSAGE_SIZE,         // Block
+        // Checkpoint-BFT (proposal/QC/TC) + macroblock-sync frames: a 1000-committee QC carries
+        // quorum_size(1000) ML-DSA sigs (no PQ aggregation) ≈ several MB, and each macroblock embeds
+        // its QC — the 2 MB catch-all silently dropped them → finality stall at scale. Full 10 MB.
+        10 => MAX_MESSAGE_SIZE,        // ConsensusV2 / MacroblocksBatch
         8 => 512 * 1024 + 256,        // ShredProtocolChunk: 512 KB data + header
         // Consensus messages: 64 KB max (signatures + metadata only)
         5 => 64 * 1024,               // ConsensusCommit
@@ -1700,7 +1704,8 @@ impl QuicTransport {
         let (h_from, h_ts, h_height, h_sig, h_pk) = match head { Some(h) => h, None => return };
         if h_height < peer_height.saturating_add(crate::unified_p2p::HEAD_REPLY_MIN_GAP) { return; }
         // Re-emit OUR signed head over THIS live conn (same framing as try_broadcast_once, no dial).
-        let reply = crate::unified_p2p::NetworkMessage::HealthPing { from: h_from, timestamp: h_ts, height: h_height, signature: h_sig, public_key: h_pk };
+        let (hint_mb, hint_round) = crate::unified_p2p::current_tc_hint();
+        let reply = crate::unified_p2p::NetworkMessage::HealthPing { from: h_from, timestamp: h_ts, height: h_height, cert_mb: hint_mb, cert_round: hint_round, signature: h_sig, public_key: h_pk };
         if let Ok(wire) = Self::serialize_message(&reply) {
             // Bounded like try_broadcast_once so a stalled stream never pins this per-stream task's permit.
             let _ = tokio::time::timeout(Duration::from_secs(MESSAGE_TIMEOUT_SECS), async {
@@ -2552,6 +2557,16 @@ impl QuicTransport {
             NetworkMessage::ShredProtocolChunk { .. } => 8,
             #[allow(deprecated)]
             NetworkMessage::ReputationSyncDeprecated { .. } => 9,
+            // Large consensus frames: a 1000-committee QC (no PQ sig aggregation) + macroblocks that
+            // embed it exceed the 2 MB catch-all → dedicated type with the full 10 MB cap. A same-round
+            // 2f+1 TimeoutCertificate carries the SAME committee sig-set (~667-1000 ML-DSA sigs ≈ 2-3.4 MB),
+            // so its gossip + pull-response frames need the 10 MB cap too — otherwise the receiver drops
+            // them at scale and the failover-cert fallback silently degrades (the primary in-band round>0
+            // block path is type-1/10 MB and unaffected, but the redundant TC-sync path must not break).
+            NetworkMessage::ConsensusV2 { .. } => 10,
+            NetworkMessage::MacroblocksBatch { .. } => 10,
+            NetworkMessage::TimeoutCertificateBroadcast { .. } => 10,
+            NetworkMessage::TimeoutCertificatesResponse { .. } => 10,
             _ => 0,
         }
     }
