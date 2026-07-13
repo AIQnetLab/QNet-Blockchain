@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getTransactionsByAddress } from '../../../../../lib/db';
 import { formatTokenAmount } from '@/lib/token-format';
+import { formatAmount } from '@/lib/tx-mapping';
 
 // ============================================================================
 // QRC-20 token detail: node /api/v1/token/{contract} + recent transfers
@@ -28,6 +29,8 @@ interface TokenInfo {
   decimals: number;
   total_supply: string;   // formatted by the token's own decimals
   total_supply_raw: string;
+  total_minted: string;   // lifetime minted, formatted
+  total_burned: string;   // lifetime burned, formatted
   deployer: string;
   deployed_at: string;
 }
@@ -42,6 +45,7 @@ interface TokenTransfer {
   block: number;
   timestamp: number;
   status: string;
+  fee: string;         // network fee (gas_price * gas_limit), formatted "N QNC"
 }
 
 // Decode a QRC-20 ContractCall `data` JSON ({ "method", "args": [...] }).
@@ -95,6 +99,7 @@ export async function GET(
         const t = body.token as {
           contract_address?: string; name?: string; symbol?: string;
           decimals?: number; total_supply?: number | string; deployer?: string; deployed_at?: string;
+          total_minted?: number | string; total_burned?: number | string;
         };
         const decimals = typeof t.decimals === 'number' ? t.decimals : 9;
         // total_supply is a u64 base-unit amount. The node now emits it as a JSON
@@ -107,6 +112,10 @@ export async function GET(
         } else if (typeof t.total_supply === 'number' && Number.isFinite(t.total_supply)) {
           totalSupplyRaw = Math.trunc(t.total_supply).toString();
         }
+        // Lifetime emission counters (base-unit digit strings, u128-safe); same parse as supply.
+        const rawStr = (v: number | string | undefined): string =>
+          typeof v === 'string' ? (v.trim() || '0')
+          : (typeof v === 'number' && Number.isFinite(v)) ? Math.trunc(v).toString() : '0';
         info = {
           contract_address: t.contract_address || contract,
           name: t.name || '',
@@ -114,6 +123,8 @@ export async function GET(
           decimals,
           total_supply: formatTokenAmount(totalSupplyRaw, decimals),
           total_supply_raw: totalSupplyRaw,
+          total_minted: formatTokenAmount(rawStr(t.total_minted), decimals),
+          total_burned: formatTokenAmount(rawStr(t.total_burned), decimals),
           deployer: t.deployer || '',
           deployed_at: t.deployed_at || '',
         };
@@ -146,6 +157,13 @@ export async function GET(
         }
         let ts = Number(tx.timestamp) || 0;
         if (ts > 0 && ts < 1e12) ts = ts * 1000;
+        // Network fee is on the ContractCall tx itself (gas_price * gas_limit), same
+        // convention as the tx-detail route; format in QNC via the shared helper.
+        const gp = Number((tx as { gas_price?: number }).gas_price) || 0;
+        const gl = Number((tx as { gas_limit?: number }).gas_limit) || 0;
+        // BigInt product so gas_price*gas_limit stays exact past 2^53 (parity with the amount/balance
+        // paths, which are kept as exact strings). gp/gl each fit in a JS number; only the product can overflow.
+        const feeUnits = BigInt(Math.trunc(gp)) * BigInt(Math.trunc(gl));
         return {
           hash: tx.hash,
           from: tx.from_address,
@@ -156,6 +174,7 @@ export async function GET(
           block: tx.block,
           timestamp: ts > 946684800000 ? ts : 0,
           status: tx.status || 'confirmed',
+          fee: feeUnits > 0n ? formatAmount(feeUnits.toString()) : '0 QNC',
         };
       })
       .filter((t): t is TokenTransfer => t !== null);

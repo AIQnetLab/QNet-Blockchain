@@ -277,9 +277,21 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
     setPage(1);
   };
 
-  const handleSearch = () => {
+  const handleSearch = async () => {
     if (!searchQuery.trim()) return;
     const q = searchQuery.trim();
+    // Unified resolver: one box → tx | block | address | token (folds token lookup
+    // into search, so no separate Tokens nav is needed to reach a token page).
+    try {
+      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+      const data = await res.json();
+      if (data?.success && typeof data.href === 'string') {
+        window.location.href = data.href;
+        return;
+      }
+    } catch {
+      // resolver unavailable → client heuristic below (token lookup degrades to tx)
+    }
     if (q.length === 64 && /^[0-9A-Fa-f]+$/.test(q)) {
       window.location.href = `/explorer/tx/${q}`;
     } else if (q.length >= 38 && q.includes('eon')) {
@@ -303,7 +315,7 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
       <div className="explorer-search">
         <input
           type="text"
-          placeholder="Search by TX hash, block number, or EON address..."
+          placeholder="Search by token, TX hash, block, or address..."
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && handleSearch()}

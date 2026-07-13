@@ -575,6 +575,43 @@ export async function getContractDeploys(limit: number = 1000): Promise<Contract
   return result.rows;
 }
 
+// Point-lookup of ONE contract's deploy row by its address (tx to_address). O(1) via index — used by
+// the holders route to seed initial_supply/decimals without depending on the newest-N deploy window
+// (a token whose deploy fell outside getContractDeploys(limit) would otherwise seed an empty balance
+// map and compute a wrong holder table). Returns null if this address has no ContractDeploy.
+export async function getContractDeployByAddress(contract: string): Promise<ContractDeployRow | null> {
+  validateAddress(contract);
+  const result = await query<ContractDeployRow>(
+    `SELECT hash, from_address, to_address, block, timestamp, data
+     FROM transactions
+     WHERE tx_type = 'ContractDeploy' AND to_address = $1
+     ORDER BY block ASC, timestamp ASC
+     LIMIT 1`,
+    [contract]
+  );
+  return result.rows[0] || null;
+}
+
+// DB-side candidate search for a QRC-20 by symbol/name text, so search does not depend on loading the
+// newest-N deploys into JS (an older token would be unfindable by symbol/name). The `data` TEXT column
+// holds the deploy JSON; ILIKE filters to qrc20 deploys mentioning the needle (wildcards escaped so the
+// needle is literal), bounded — the caller parses+confirms the symbol/name match exactly.
+export async function searchQrc20DeploysByText(needle: string, limit: number = 25): Promise<ContractDeployRow[]> {
+  const clean = needle.trim();
+  if (!clean) return [];
+  if (!Number.isInteger(limit) || limit < 1 || limit > 200) limit = 25;
+  const esc = clean.replace(/[\\%_]/g, (c) => '\\' + c);
+  const result = await query<ContractDeployRow>(
+    `SELECT hash, from_address, to_address, block, timestamp, data
+     FROM transactions
+     WHERE tx_type = 'ContractDeploy' AND data ILIKE '%qrc20%' AND data ILIKE $1 ESCAPE '\\'
+     ORDER BY block DESC, timestamp DESC
+     LIMIT $2`,
+    [`%${esc}%`, limit]
+  );
+  return result.rows;
+}
+
 export async function closePool(): Promise<void> {
   if (pool) {
     await pool.end();

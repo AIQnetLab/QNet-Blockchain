@@ -14,6 +14,14 @@ interface TokenTransfer {
   block: number;
   timestamp: number;
   status: string;
+  fee: string;
+}
+
+interface TokenHolder {
+  address: string;
+  balance: string;
+  balance_raw: string;
+  percent: string;
 }
 
 interface TokenData {
@@ -23,6 +31,8 @@ interface TokenData {
   decimals: number;
   total_supply: string;
   total_supply_raw: string;
+  total_minted: string;
+  total_burned: string;
   deployer: string;
   deployed_at: string;
   transfers: TokenTransfer[];
@@ -93,6 +103,9 @@ export default function TokenPage() {
   const [data, setData] = useState<TokenData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hasFetched, setHasFetched] = useState(false);
+  const [holders, setHolders] = useState<TokenHolder[]>([]);
+  const [holderCount, setHolderCount] = useState<number | null>(null);
+  const [holdersTruncated, setHoldersTruncated] = useState(false);
 
   const fetchToken = useCallback(async () => {
     if (!contract) return;
@@ -123,6 +136,22 @@ export default function TokenPage() {
     const interval = setInterval(fetchToken, 5000);
     return () => clearInterval(interval);
   }, [contract, fetchToken]);
+
+  // Holders (off-chain, from the PG tx index). Fetched once — a heavier replay than transfers.
+  useEffect(() => {
+    if (!contract) return;
+    (async () => {
+      try {
+        const res = await fetch(`/api/token/${contract}/holders?limit=100`);
+        const result = await res.json();
+        if (result.success && result.data) {
+          setHolders(result.data.holders || []);
+          setHolderCount(typeof result.data.holder_count === 'number' ? result.data.holder_count : null);
+          setHoldersTruncated(result.data.truncated === true);
+        }
+      } catch { /* keep last-known */ }
+    })();
+  }, [contract]);
 
   if (hasFetched && (error || !data)) {
     return (
@@ -174,9 +203,21 @@ export default function TokenPage() {
             <span className="detail-value">{data.decimals}</span>
           </div>
           <div className="detail-row">
-            <span className="detail-label">Total Supply</span>
+            <span className="detail-label">Circulating Supply</span>
             <span className="detail-value">
               {data.total_supply}{data.symbol ? ` ${data.symbol}` : ''}
+            </span>
+          </div>
+          <div className="detail-row">
+            <span className="detail-label">Total Issued</span>
+            <span className="detail-value">
+              {data.total_minted}{data.symbol ? ` ${data.symbol}` : ''}
+            </span>
+          </div>
+          <div className="detail-row">
+            <span className="detail-label">Total Burned</span>
+            <span className="detail-value">
+              {data.total_burned}{data.symbol ? ` ${data.symbol}` : ''}
             </span>
           </div>
           <div className="detail-row">
@@ -186,6 +227,42 @@ export default function TokenPage() {
             </span>
           </div>
         </div>
+      </div>
+
+      {/* Holders (off-chain, from the PG tx index) */}
+      <div className="block-card">
+        <h2 className="card-title">Holders{holderCount !== null ? ` (${holderCount})` : ''}</h2>
+        {holdersTruncated && (
+          <div className="detail-row">
+            <span className="detail-value" style={{ opacity: 0.7, fontSize: '0.85em' }}>
+              Derived from the most recent transfers only — balances may be approximate for very high-activity tokens.
+            </span>
+          </div>
+        )}
+        {holders.length === 0 ? (
+          <div className="detail-row">
+            <span className="detail-value">No holders indexed yet.</span>
+          </div>
+        ) : (
+          <table className="block-table">
+            <thead>
+              <tr>
+                <th>Address</th>
+                <th>Balance</th>
+                <th>%</th>
+              </tr>
+            </thead>
+            <tbody>
+              {holders.map((h, idx) => (
+                <tr key={h.address || idx}>
+                  <td><AddrLink addr={h.address} /></td>
+                  <td>{h.balance}{data.symbol ? ` ${data.symbol}` : ''}</td>
+                  <td>{h.percent}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
 
       {/* Recent transfers */}
@@ -204,6 +281,7 @@ export default function TokenPage() {
                 <th>From</th>
                 <th>To</th>
                 <th>Amount</th>
+                <th>Fee</th>
                 <th>Block</th>
                 <th>Time</th>
               </tr>
@@ -222,6 +300,7 @@ export default function TokenPage() {
                   <td><AddrLink addr={t.from} /></td>
                   <td>{t.to ? <AddrLink addr={t.to} /> : <span className="address-link">—</span>}</td>
                   <td>{t.amount}{data.symbol ? ` ${data.symbol}` : ''}</td>
+                  <td>{t.fee}</td>
                   <td>
                     <Link href={`/explorer/block/${t.block}`} className="address-link">
                       {t.block}
