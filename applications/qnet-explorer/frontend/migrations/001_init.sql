@@ -70,6 +70,38 @@ CREATE INDEX IF NOT EXISTS idx_transactions_tx_type ON transactions(tx_type);
 CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
 -- Active-node stats: per-epoch windowed scan over a single tx_type (Heartbeat / LightNodeEligibilityBitmap).
 CREATE INDEX IF NOT EXISTS idx_transactions_tx_type_block ON transactions(tx_type, block);
+-- NOTE (search-suggest scale): the free-text token search issues a leading-wildcard `data ILIKE '%needle%'`
+-- (lib/db.ts) that no b-tree serves; it stays bounded by the tx_type='ContractDeploy' btree pre-filter +
+-- a min-length(2) guard + LIMIT. A pg_trgm GIN index (`CREATE EXTENSION pg_trgm; CREATE INDEX ... USING gin
+-- (data gin_trgm_ops) WHERE tx_type='ContractDeploy'`) makes it index-served at large token counts — but the
+-- migration runner splits on ';' and cannot run a DO/EXTENSION block, so this is a manual DBA step, not an
+-- auto-migration. Left out of the migration to avoid breaking `npm run db:migrate`.
+
+-- Token transfers table (decoded, effect-sourced index from the node token-transfers endpoint)
+-- One row per transfer log (tx_hash + log_index). amount is u64 base units (exact numeric, never float).
+CREATE TABLE IF NOT EXISTS token_transfers (
+    tx_hash TEXT NOT NULL,
+    log_index INTEGER NOT NULL,
+    contract TEXT NOT NULL,
+    from_address TEXT NOT NULL DEFAULT '',
+    to_address TEXT NOT NULL DEFAULT '',
+    amount NUMERIC(80,0) NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL,
+    std TEXT NOT NULL,
+    token_id TEXT NOT NULL DEFAULT '',
+    block BIGINT NOT NULL,
+    timestamp BIGINT NOT NULL,
+    PRIMARY KEY (tx_hash, log_index)
+);
+
+-- Indexes for token_transfers (address history, per-token history, block ordering). The address/contract
+-- indexes carry (block DESC, log_index DESC) so an address/token page is an index-ordered scan bounded
+-- near the LIMIT (no full-set fetch + sort) even for a hot exchange address with millions of rows. The
+-- leftmost prefix (from_address / to_address / contract) still serves plain equality lookups.
+CREATE INDEX IF NOT EXISTS idx_token_transfers_from_block ON token_transfers(from_address, block DESC, log_index DESC);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_to_block ON token_transfers(to_address, block DESC, log_index DESC);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_contract_block ON token_transfers(contract, block DESC, log_index DESC);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_block ON token_transfers(block DESC);
 
 -- Sync state table
 CREATE TABLE IF NOT EXISTS sync_state (

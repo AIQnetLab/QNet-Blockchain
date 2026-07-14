@@ -187,6 +187,12 @@ pub const STORAGE_DEPOSIT_PER_ENTRY_NANO_QNC: u64 = 10_000_000;
 /// so no user can own it or derive its key — verified against is_valid_sender_format at test time.
 pub const STORAGE_RENT_ESCROW_ADDR: &str = "system_storage_rent_escrow";
 
+/// Canonical burn address — a well-known, provably-unspendable EON (nothing-up-my-sleeve all-zeros
+/// body + valid checksum). No pubkey's SHA512 can yield an all-zeros body, so no key ever maps here.
+/// Transferring a token here is a REAL burn: QRC-20/721 destroy supply/ownership on-chain (below);
+/// native QNC accumulates here unspendably and is excluded from circulating supply (off-consensus).
+pub const CANONICAL_BURN_ADDR: &str = "0000000000000000000eon00000000000000036877022";
+
 /// Gas price in nanoQNC (QNet native units)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GasPrice(pub u64);
@@ -847,6 +853,88 @@ fn nft_move_token(
     let had_approval = accounts.get(contract_addr).unwrap()
         .contract_storage.contains_key(approved_key);
     if had_approval {
+        accounts.get_mut(contract_addr).unwrap().contract_storage.remove(approved_key);
+        refund_storage_deposit(accounts, payer, 1)?;
+    }
+    Ok(())
+}
+
+/// QRC-20 transfer-to-CANONICAL_BURN_ADDR: a REAL burn (works for ANY token, even non-burnable). Debits
+/// `holder`, reduces total_supply, bumps total_burned (1:1, checked), NEVER credits the burn address, and
+/// emits a "burn" event (empty `to`). Returns whether the holder entry drained to 0 (caller records the
+/// OwnsDelta). `payer` receives the drained-entry deposit refund (the tx sender).
+fn qrc20_burn_to_sink(
+    accounts: &mut HashMap<String, Account>,
+    contract_addr: &str,
+    holder: &str,
+    payer: &str,
+    amount: u128,
+    tx_hash: &str,
+) -> Result<bool, StateError> {
+    let from_key = format!("balance:{}", holder);
+    let from_bal = read_balance(&accounts.get(contract_addr).unwrap().contract_storage, &from_key)?;
+    if from_bal < amount {
+        return Err(StateError::InvalidTransaction(format!(
+            "[REJECT][QRC20] insufficient_balance have={} need={}", from_bal, amount)));
+    }
+    let new_from_bal = from_bal.checked_sub(amount)
+        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] balance_overflow".into()))?;
+    accounts.get_mut(contract_addr).unwrap()
+        .contract_storage.insert(from_key.clone(), new_from_bal.to_string());
+    let drained = new_from_bal == 0;
+    if drained {
+        accounts.get_mut(contract_addr).unwrap().contract_storage.remove(&from_key);
+        refund_storage_deposit(accounts, payer, 1)?;
+    }
+    // total_supply -= amt, total_burned += amt (checked; mirrors the `burn` method arm).
+    let supply = read_balance(&accounts.get(contract_addr).unwrap().contract_storage, "total_supply")?;
+    let new_supply = supply.checked_sub(amount)
+        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] supply_underflow".into()))?;
+    accounts.get_mut(contract_addr).unwrap()
+        .contract_storage.insert("total_supply".to_string(), new_supply.to_string());
+    let burned = read_balance(&accounts.get(contract_addr).unwrap().contract_storage, "total_burned")?;
+    let new_burned = burned.checked_add(amount)
+        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] burned_overflow".into()))?;
+    accounts.get_mut(contract_addr).unwrap()
+        .contract_storage.insert("total_burned".to_string(), new_burned.to_string());
+    if is_info_log() {
+        println!("[INFO][QRC20] burn from={} amount={} supply={} contract={}",
+            &holder[..holder.len().min(16)], amount, new_supply,
+            &contract_addr[..contract_addr.len().min(16)]);
+    }
+    crate::wasm_exec::push_wasm_log(tx_hash, contract_addr,
+        crate::wasm_exec::encode_transfer_log("qrc20", "burn", holder, "", amount, ""));
+    Ok(drained)
+}
+
+/// QRC-721 transfer-to-CANONICAL_BURN_ADDR: a REAL burn — the token ceases to exist. Removes owner:{id}
+/// (refund its always-charged mint deposit), decrements bal:{from} (remove+refund on 0), clears any
+/// approval (+refund), and NEVER creates bal:{burn}. Caller emits the "burn" event. Precondition (caller):
+/// `from` owns the token and the caller is authorized — identical to nft_move_token.
+fn nft_burn_token(
+    accounts: &mut HashMap<String, Account>,
+    contract_addr: &str,
+    payer: &str,
+    from: &str,
+    owner_key: &str,
+    approved_key: &str,
+) -> Result<(), StateError> {
+    let from_bal_key = format!("bal:{}", from);
+    // Remove the ownership pointer (token destroyed) + refund the deposit charged for it at mint.
+    accounts.get_mut(contract_addr).unwrap().contract_storage.remove(owner_key);
+    refund_storage_deposit(accounts, payer, 1)?;
+    // Decrement the holder's count (checked); remove+refund the entry when it reaches 0.
+    let from_bal = read_balance(&accounts.get(contract_addr).unwrap().contract_storage, &from_bal_key)?;
+    let new_from_bal = from_bal.checked_sub(1)
+        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][NFT] balance_underflow".into()))?;
+    accounts.get_mut(contract_addr).unwrap()
+        .contract_storage.insert(from_bal_key.clone(), new_from_bal.to_string());
+    if new_from_bal == 0 {
+        accounts.get_mut(contract_addr).unwrap().contract_storage.remove(&from_bal_key);
+        refund_storage_deposit(accounts, payer, 1)?;
+    }
+    // Clear any approval (+refund if it existed).
+    if accounts.get(contract_addr).unwrap().contract_storage.contains_key(approved_key) {
         accounts.get_mut(contract_addr).unwrap().contract_storage.remove(approved_key);
         refund_storage_deposit(accounts, payer, 1)?;
     }
@@ -2335,6 +2423,36 @@ impl Transaction {
                         contract.contract_storage.insert("name".to_string(), name.to_string());
                         contract.contract_storage.insert("symbol".to_string(), symbol.to_string());
                         contract.contract_storage.insert("decimals".to_string(), decimals.to_string());
+                        // Optional token logo — an emoji or an https URL stored in on-chain token metadata,
+                        // which clients render as the token icon (generated avatar fallback when unset).
+                        // Sanitized so a deploy cannot smuggle a javascript:/data:/http: scheme NOR an
+                        // attribute-breakout (quotes/angle-brackets/space/backtick/control chars) into an
+                        // explorer/wallet <img> render, and capped so it cannot bloat the consensus
+                        // storage_root. Pure string ops ⇒ every node derives the byte-identical value.
+                        let logo_raw = parsed.get("logo").and_then(|v| v.as_str()).unwrap_or("").trim();
+                        let logo: String = {
+                            let capped: String = logo_raw.chars().take(256).collect();
+                            let lower = capped.to_ascii_lowercase();
+                            // Any char that could break out of an HTML attribute / inject markup.
+                            let html_unsafe = capped.chars().any(|c|
+                                matches!(c, '"' | '\'' | '<' | '>' | '`' | ' ') || c.is_control());
+                            if capped.is_empty() {
+                                String::new()
+                            } else if lower.contains("://") || lower.contains("javascript:") || lower.contains("data:") {
+                                // Has a scheme ⇒ accept ONLY a clean https:// URL (reject http/data/javascript/
+                                // etc., and any URL carrying HTML/attribute-breaking characters).
+                                if lower.starts_with("https://") && !html_unsafe { capped } else { String::new() }
+                            } else if html_unsafe {
+                                // No scheme but carries markup-unsafe chars ⇒ drop (never store a render hazard).
+                                String::new()
+                            } else {
+                                // No scheme ⇒ a short label/emoji; kept as-is and rendered as text, never as a URL.
+                                capped
+                            }
+                        };
+                        if !logo.is_empty() {
+                            contract.contract_storage.insert("logo".to_string(), logo);
+                        }
                         // Opt-in supply-mutation flags — canonical "true"/"false" strings; the mint/burn
                         // arms gate on an exact "true" match, so any other value keeps them disabled.
                         contract.contract_storage.insert("mintable".to_string(), mintable.to_string());
@@ -2507,7 +2625,7 @@ impl Transaction {
                             let args = parsed.get("args");
                             
                             match method {
-                                "transfer" => {
+                                "transfer" => 'qrc20_transfer: {
                                     // QRC-20 transfer: move tokens from sender to recipient
                                     let to = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
                                         .ok_or_else(|| StateError::InvalidTransaction(
@@ -2517,6 +2635,14 @@ impl Transaction {
 
                                     if amount == 0 {
                                         return Err(StateError::InvalidTransaction("[REJECT][QRC20] zero_amount_transfer".into()));
+                                    }
+
+                                    // Transfer to the canonical burn address → REAL burn (any token, even
+                                    // non-burnable): destroy supply, never credit the sink. See qrc20_burn_to_sink.
+                                    if to == CANONICAL_BURN_ADDR {
+                                        let drained = qrc20_burn_to_sink(accounts, &contract_addr, &sender_addr, &sender_addr, amount as u128, &self.hash)?;
+                                        if drained { owns.push(OwnsDelta::Clear { wallet: sender_addr.clone(), contract: contract_addr.clone() }); }
+                                        break 'qrc20_transfer;
                                     }
 
                                     let from_key = format!("balance:{}", sender_addr);
@@ -2578,6 +2704,10 @@ impl Transaction {
                                             &to[..to.len().min(16)], amount,
                                             &contract_addr[..contract_addr.len().min(16)]);
                                     }
+                                    // Success-gated transfer event (effect, not calldata intent) → getLogs +
+                                    // logs_root + the token-transfer index. Only reached on the Ok path.
+                                    crate::wasm_exec::push_wasm_log(&self.hash, &contract_addr,
+                                        crate::wasm_exec::encode_transfer_log("qrc20", "transfer", &sender_addr, to, amount, ""));
                                 }
                                 "approve" => {
                                     // QRC-20 approve: set allowance for spender
@@ -2611,7 +2741,7 @@ impl Transaction {
                                             &spender[..spender.len().min(16)], amount);
                                     }
                                 }
-                                "transferFrom" | "transfer_from" => {
+                                "transferFrom" | "transfer_from" => 'qrc20_transfer_from: {
                                     // QRC-20 transferFrom: spend from approved allowance
                                     let from = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
                                         .ok_or_else(|| StateError::InvalidTransaction(
@@ -2626,6 +2756,25 @@ impl Transaction {
                                     }
 
                                     let amount = amount as u128;
+
+                                    // Transfer-from to the burn address → REAL burn: consume allowance exactly
+                                    // like a normal transferFrom, then destroy `from`'s tokens (no sink credit).
+                                    if to == CANONICAL_BURN_ADDR {
+                                        let allowance_key = format!("allowance:{}:{}", from, sender_addr);
+                                        let allowance = read_balance(&accounts.get(&contract_addr).unwrap().contract_storage, &allowance_key)?;
+                                        if allowance < amount {
+                                            return Err(StateError::InvalidTransaction(format!(
+                                                "[REJECT][QRC20] insufficient_allowance have={} need={}", allowance, amount)));
+                                        }
+                                        let new_allowance = allowance.checked_sub(amount)
+                                            .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] balance_overflow".into()))?;
+                                        accounts.get_mut(&contract_addr).unwrap()
+                                            .contract_storage.insert(allowance_key, new_allowance.to_string());
+                                        let drained = qrc20_burn_to_sink(accounts, &contract_addr, from, &sender_addr, amount, &self.hash)?;
+                                        if drained { owns.push(OwnsDelta::Clear { wallet: from.to_string(), contract: contract_addr.clone() }); }
+                                        break 'qrc20_transfer_from;
+                                    }
+
                                     let allowance_key = format!("allowance:{}:{}", from, sender_addr);
                                     let from_key = format!("balance:{}", from);
                                     let to_key = format!("balance:{}", to);
@@ -2692,6 +2841,9 @@ impl Transaction {
                                             &to[..to.len().min(16)], amount,
                                             &sender_addr[..sender_addr.len().min(16)]);
                                     }
+                                    // Transfer effect keyed on the token holder (from), not the spender.
+                                    crate::wasm_exec::push_wasm_log(&self.hash, &contract_addr,
+                                        crate::wasm_exec::encode_transfer_log("qrc20", "transfer", from, to, amount, ""));
                                 }
                                 "mint" => {
                                     // QRC-20 mint: owner-only supply increase, ONLY on an opt-in mintable token.
@@ -2715,6 +2867,11 @@ impl Transaction {
                                     let to = args.and_then(|a| a.get(0)).and_then(|v| v.as_str())
                                         .ok_or_else(|| StateError::InvalidTransaction(
                                             "[REJECT][QRC20] mint_missing_to_arg".to_string()))?;
+                                    // Mint-to-burn is nonsensical: it would strand credit at the sink without
+                                    // counting as burned. Reject (only transfer paths burn).
+                                    if to == CANONICAL_BURN_ADDR {
+                                        return Err(StateError::InvalidTransaction("[REJECT][QRC20] mint_to_burn_address".into()));
+                                    }
                                     let amount = parse_amount(args.and_then(|a| a.get(1)))?;
                                     if amount == 0 {
                                         return Err(StateError::InvalidTransaction("[REJECT][QRC20] zero_amount_mint".into()));
@@ -2768,6 +2925,9 @@ impl Transaction {
                                             &to[..to.len().min(16)], amount, new_supply,
                                             &contract_addr[..contract_addr.len().min(16)]);
                                     }
+                                    // Mint = Transfer(∅ → to): empty `from` marks a supply increase.
+                                    crate::wasm_exec::push_wasm_log(&self.hash, &contract_addr,
+                                        crate::wasm_exec::encode_transfer_log("qrc20", "mint", "", to, amount, ""));
                                 }
                                 "burn" => {
                                     // QRC-20 burn: holder destroys their OWN tokens (no owner check), ONLY on
@@ -2783,50 +2943,11 @@ impl Transaction {
                                     if amount == 0 {
                                         return Err(StateError::InvalidTransaction("[REJECT][QRC20] zero_amount_burn".into()));
                                     }
-
-                                    let from_key = format!("balance:{}", sender_addr);
-                                    let amount = amount as u128;
-
-                                    // Debit the sender's own balance (checked). Reject if it cannot cover.
-                                    let from_bal = read_balance(
-                                        &accounts.get(&contract_addr).unwrap().contract_storage, &from_key)?;
-                                    if from_bal < amount {
-                                        return Err(StateError::InvalidTransaction(format!(
-                                            "[REJECT][QRC20] insufficient_balance have={} need={}", from_bal, amount)));
-                                    }
-                                    let new_from_bal = from_bal.checked_sub(amount)
-                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] balance_overflow".into()))?;
-                                    accounts.get_mut(&contract_addr).unwrap()
-                                        .contract_storage.insert(from_key.clone(), new_from_bal.to_string());
-                                    // Drained-to-zero entry: remove the key (no "0" residue) + refund deposit,
-                                    // mirroring transfer's drained-entry path.
-                                    if new_from_bal == 0 {
-                                        accounts.get_mut(&contract_addr).unwrap().contract_storage.remove(&from_key);
-                                        refund_storage_deposit(accounts, &sender_addr, 1)?;
-                                        owns.push(OwnsDelta::Clear { wallet: sender_addr.clone(), contract: contract_addr.clone() });
-                                    }
-
-                                    // total_supply 1:1 with the balance delta (checked). balance <= supply
-                                    // always holds, so this cannot underflow — checked as defense-in-depth.
-                                    let supply = read_balance(
-                                        &accounts.get(&contract_addr).unwrap().contract_storage, "total_supply")?;
-                                    let new_supply = supply.checked_sub(amount)
-                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] supply_underflow".into()))?;
-                                    accounts.get_mut(&contract_addr).unwrap()
-                                        .contract_storage.insert("total_supply".to_string(), new_supply.to_string());
-                                    // Lifetime burned counter, 1:1 with the supply delta (checked).
-                                    let burned = read_balance(
-                                        &accounts.get(&contract_addr).unwrap().contract_storage, "total_burned")?;
-                                    let new_burned = burned.checked_add(amount)
-                                        .ok_or_else(|| StateError::InvalidTransaction("[REJECT][QRC20] burned_overflow".into()))?;
-                                    accounts.get_mut(&contract_addr).unwrap()
-                                        .contract_storage.insert("total_burned".to_string(), new_burned.to_string());
-
-                                    if is_info_log() {
-                                        println!("[INFO][QRC20] burn from={} amount={} supply={} contract={}",
-                                            &sender_addr[..sender_addr.len().min(16)], amount, new_supply,
-                                            &contract_addr[..contract_addr.len().min(16)]);
-                                    }
+                                    // Same real-burn as transfer-to-CANONICAL_BURN_ADDR — one shared helper, so
+                                    // the supply invariant lives in exactly one place. The `burnable` gate above
+                                    // is the only difference between the two entry points.
+                                    let drained = qrc20_burn_to_sink(accounts, &contract_addr, &sender_addr, &sender_addr, amount as u128, &self.hash)?;
+                                    if drained { owns.push(OwnsDelta::Clear { wallet: sender_addr.clone(), contract: contract_addr.clone() }); }
                                 }
                                 _ => {
                                     // Unknown method: fail-loud so a typo/unsupported call cannot silently
@@ -2877,6 +2998,10 @@ impl Transaction {
                                     }
 
                                     let to = addr_at(0)?;
+                                    // Mint-to-burn would strand an NFT at the sink un-burned. Reject.
+                                    if to == CANONICAL_BURN_ADDR {
+                                        return Err(StateError::InvalidTransaction("[REJECT][NFT] mint_to_burn_address".into()));
+                                    }
                                     let token_id = token_id_at(1)?;
                                     let owner_key = format!("owner:{}", token_id);
                                     let bal_key = format!("bal:{}", to);
@@ -2924,6 +3049,8 @@ impl Transaction {
                                             &to[..to.len().min(16)], token_id,
                                             &contract_addr[..contract_addr.len().min(16)]);
                                     }
+                                    crate::wasm_exec::push_wasm_log(&self.hash, &contract_addr,
+                                        crate::wasm_exec::encode_transfer_log("qrc721", "mint", "", &to, 1, &token_id));
                                 }
                                 "transfer" => {
                                     // Caller must own the token. Absent owner ⇒ not_owner (fail-loud).
@@ -2939,9 +3066,14 @@ impl Transaction {
                                             "[REJECT][NFT] not_owner token_id={}", token_id)));
                                     }
 
-                                    nft_move_token(
-                                        accounts, &contract_addr, &sender_addr, &sender_addr, &to,
-                                        &owner_key, &approved_key)?;
+                                    // Transfer to the burn address → REAL burn (token destroyed); else a move.
+                                    if to == CANONICAL_BURN_ADDR {
+                                        nft_burn_token(accounts, &contract_addr, &sender_addr, &sender_addr, &owner_key, &approved_key)?;
+                                    } else {
+                                        nft_move_token(
+                                            accounts, &contract_addr, &sender_addr, &sender_addr, &to,
+                                            &owner_key, &approved_key)?;
+                                    }
 
                                     if is_info_log() {
                                         println!("[INFO][NFT] transfer {} -> {} token_id={} contract={}",
@@ -2949,6 +3081,12 @@ impl Transaction {
                                             &to[..to.len().min(16)], token_id,
                                             &contract_addr[..contract_addr.len().min(16)]);
                                     }
+                                    crate::wasm_exec::push_wasm_log(&self.hash, &contract_addr,
+                                        if to == CANONICAL_BURN_ADDR {
+                                            crate::wasm_exec::encode_transfer_log("qrc721", "burn", &sender_addr, "", 1, &token_id)
+                                        } else {
+                                            crate::wasm_exec::encode_transfer_log("qrc721", "transfer", &sender_addr, &to, 1, &token_id)
+                                        });
                                 }
                                 "approve" => {
                                     // Caller must own the token to approve a spender for it.
@@ -3010,9 +3148,14 @@ impl Transaction {
                                             "[REJECT][NFT] transfer_from_not_approved token_id={}", token_id)));
                                     }
 
-                                    nft_move_token(
-                                        accounts, &contract_addr, &sender_addr, &from, &to,
-                                        &owner_key, &approved_key)?;
+                                    // Transfer-from to the burn address → REAL burn (token destroyed); else a move.
+                                    if to == CANONICAL_BURN_ADDR {
+                                        nft_burn_token(accounts, &contract_addr, &sender_addr, &from, &owner_key, &approved_key)?;
+                                    } else {
+                                        nft_move_token(
+                                            accounts, &contract_addr, &sender_addr, &from, &to,
+                                            &owner_key, &approved_key)?;
+                                    }
 
                                     if is_info_log() {
                                         println!("[INFO][NFT] transferFrom {} -> {} token_id={} spender={}",
@@ -3020,6 +3163,12 @@ impl Transaction {
                                             &to[..to.len().min(16)], token_id,
                                             &sender_addr[..sender_addr.len().min(16)]);
                                     }
+                                    crate::wasm_exec::push_wasm_log(&self.hash, &contract_addr,
+                                        if to == CANONICAL_BURN_ADDR {
+                                            crate::wasm_exec::encode_transfer_log("qrc721", "burn", &from, "", 1, &token_id)
+                                        } else {
+                                            crate::wasm_exec::encode_transfer_log("qrc721", "transfer", &from, &to, 1, &token_id)
+                                        });
                                 }
                                 _ => {
                                     // Unknown method: fail-loud, mirroring qrc20.
@@ -4905,6 +5054,96 @@ mod tests_qrc20_self_transfer {
         assert_eq!(nft_count(&accounts, contract, bob), 1, "recipient count is 1");
         assert!(!accounts.get(contract).unwrap().contract_storage.contains_key("approved:tok1"),
             "approval cleared on transfer");
+    }
+
+    // ---- Canonical burn address ----
+
+    #[test]
+    fn canonical_burn_addr_is_valid_eon() {
+        assert!(is_valid_eon_address(CANONICAL_BURN_ADDR),
+            "burn address must be a valid checksummed EON so transfers to it are never rejected");
+        assert_eq!(CANONICAL_BURN_ADDR.len(), 45);
+    }
+
+    // QRC-20 transfer to the burn address is a REAL burn even for a NON-burnable token (no "burnable"
+    // flag): reduces total_supply, bumps total_burned, never credits the sink.
+    #[test]
+    fn qrc20_transfer_to_burn_reduces_supply() {
+        let (alice, contract) = ("alice", "tokenX");
+        let mut accounts = seed(alice, contract, 1000);
+        {
+            let cs = &mut accounts.get_mut(contract).unwrap().contract_storage;
+            cs.insert("total_supply".into(), "1000".into());
+            cs.insert("total_burned".into(), "0".into());
+        }
+        let tx = qrc20_call(alice, contract, "transfer", &format!("[\"{}\",300]", CANONICAL_BURN_ADDR));
+        tx.apply_to_state(&mut accounts).expect("transfer-to-burn applies");
+        assert_eq!(bal(&accounts, contract, alice), 700, "holder debited by burn");
+        assert_eq!(bal(&accounts, contract, CANONICAL_BURN_ADDR), 0, "sink never credited");
+        let cs = &accounts.get(contract).unwrap().contract_storage;
+        assert_eq!(cs.get("total_supply").map(|s| s.as_str()), Some("700"), "supply reduced");
+        assert_eq!(cs.get("total_burned").map(|s| s.as_str()), Some("300"), "burned increased");
+        assert!(!cs.contains_key(&format!("balance:{}", CANONICAL_BURN_ADDR)), "no sink balance entry");
+    }
+
+    // QRC-20 transferFrom to burn consumes allowance AND reduces supply.
+    #[test]
+    fn qrc20_transferfrom_to_burn_consumes_allowance_and_burns() {
+        let (owner, spender, contract) = ("alice", "bob", "tokenX");
+        let mut accounts = seed(owner, contract, 1000);
+        fund(&mut accounts, spender);
+        {
+            let cs = &mut accounts.get_mut(contract).unwrap().contract_storage;
+            cs.insert("total_supply".into(), "1000".into());
+            cs.insert("total_burned".into(), "0".into());
+            cs.insert(format!("allowance:{}:{}", owner, spender), "500".into());
+        }
+        let tx = qrc20_call(spender, contract, "transferFrom", &format!("[\"{}\",\"{}\",300]", owner, CANONICAL_BURN_ADDR));
+        tx.apply_to_state(&mut accounts).expect("transferFrom-to-burn applies");
+        assert_eq!(bal(&accounts, contract, owner), 700, "owner debited");
+        let cs = &accounts.get(contract).unwrap().contract_storage;
+        assert_eq!(cs.get("total_supply").map(|s| s.as_str()), Some("700"), "supply reduced");
+        assert_eq!(cs.get("total_burned").map(|s| s.as_str()), Some("300"), "burned increased");
+        assert_eq!(cs.get(&format!("allowance:{}:{}", owner, spender)).map(|s| s.as_str()), Some("200"), "allowance consumed");
+        assert!(!cs.contains_key(&format!("balance:{}", CANONICAL_BURN_ADDR)), "no sink balance entry");
+    }
+
+    // Mint-to-burn is rejected (would strand credit at the sink un-burned) — both standards.
+    #[test]
+    fn mint_to_burn_address_rejected() {
+        let (alice, contract) = ("alice", "tokenX");
+        let mut accounts = seed(alice, contract, 1000);
+        {
+            let cs = &mut accounts.get_mut(contract).unwrap().contract_storage;
+            cs.insert("mintable".into(), "true".into());
+            cs.insert("deployer".into(), alice.into());
+            cs.insert("total_supply".into(), "1000".into());
+        }
+        let tx = qrc20_call(alice, contract, "mint", &format!("[\"{}\",100]", CANONICAL_BURN_ADDR));
+        let err = tx.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("mint_to_burn_address"), "qrc20 mint-to-burn must reject, got {:?}", err);
+
+        let (owner, nft) = ("bob", "nftY");
+        let mut accounts = seed_nft(owner, nft);
+        let m = qrc20_call(owner, nft, "mint", &format!("[\"{}\",\"tok1\"]", CANONICAL_BURN_ADDR));
+        let err = m.apply_to_state(&mut accounts).unwrap_err();
+        assert!(format!("{:?}", err).contains("mint_to_burn_address"), "nft mint-to-burn must reject, got {:?}", err);
+        assert!(owner_of(&accounts, nft, "tok1").is_none(), "no token minted on reject");
+    }
+
+    // QRC-721 transfer to burn destroys the token (owner:{id} removed) — it can no longer move.
+    #[test]
+    fn nft_transfer_to_burn_destroys_token() {
+        let (owner, contract) = ("alice", "nftX");
+        let mut accounts = seed_nft(owner, contract);
+        let m = qrc20_call(owner, contract, "mint", &format!("[\"{}\",\"tok1\"]", owner));
+        m.apply_to_state(&mut accounts).expect("mint applies");
+        let mut tr = qrc20_call(owner, contract, "transfer", &format!("[\"{}\",\"tok1\"]", CANONICAL_BURN_ADDR));
+        tr.nonce = 2; tr.hash = tr.calculate_hash();
+        tr.apply_to_state(&mut accounts).expect("transfer-to-burn applies");
+        assert!(owner_of(&accounts, contract, "tok1").is_none(), "token destroyed (owner removed)");
+        assert_eq!(nft_count(&accounts, contract, owner), 0, "holder count drops to 0");
+        assert_eq!(nft_count(&accounts, contract, CANONICAL_BURN_ADDR), 0, "sink never holds the token");
     }
 
     #[test]

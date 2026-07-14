@@ -48,16 +48,14 @@ pub const REGISTRY_ROOT_GATE_HEIGHT: u64 = 0;
 /// bitmap/reward_root. On a fresh genesis all nodes agree from h=0, so no staging window is needed.
 pub const LIGHT_REG_EPOCH_ROSTER_GATE_HEIGHT: u64 = 0;
 
-/// Activation height for the consensus WASM-event `logs_root` rule (`logs_root_required`): at/after
-/// this height a checkpoint's `logs_root` (merkle root over the window's committed WASM event logs,
-/// recomputed identically on every node from the deterministic per-block log receipts) MUST match
-/// the validator's independent recompute in content_ok, giving trustless light-client event proofs.
-/// u64::MAX = DORMANT: the OFF-consensus RPC log store (`getLogs`) is already live, but committing
-/// logs into the QC hash is deferred until a live multi-node equivalence run confirms a byte-identical
-/// window logs_root on every node — the same bar state_root/reward_root cleared. Until then every node
-/// computes [0;32] and content_ok's `cp.logs_root == c.logs_root` is trivially satisfied ([0;32]==[0;32]),
-/// so a fresh genesis is unaffected. TO ACTIVATE: set to a coordinated future height AFTER that run.
-pub const LOGS_ROOT_GATE_HEIGHT: u64 = u64::MAX;
+/// Activation for the consensus `logs_root` rule (`logs_root_required`): at/after this height a
+/// checkpoint's logs_root (merkle root over the window's committed event logs — native QRC-20/721
+/// transfer events AND WASM emit_log, recomputed identically from the deterministic per-block
+/// receipts) MUST match the validator's recompute in content_ok, giving trustless light-client
+/// transfer proofs. 0 = ACTIVE FROM GENESIS: correct for a fresh-genesis relaunch (identical binaries +
+/// deterministic encoding ⇒ byte-identical root on every node from h=0; a mismatch fails content_ok
+/// loudly, never silent). Raise to a coordinated future height ONLY to activate on a LIVE chain.
+pub const LOGS_ROOT_GATE_HEIGHT: u64 = 0;
 
 /// (feature id, activation height). Heights are hardcoded in the binary, so every node agrees
 /// without on-chain governance. Genesis-active rules need no entry (the default is active);

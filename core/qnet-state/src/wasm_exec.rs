@@ -130,6 +130,16 @@ pub fn drain_wasm_logs() -> Vec<(String, String, Vec<u8>)> {
 pub fn clear_wasm_logs() {
     WASM_LOG_SINK.with(|s| s.borrow_mut().clear());
 }
+/// Current buffered-log count — capture BEFORE a tx applies so a REJECTED tx's partial emissions can be
+/// dropped (truncate_wasm_logs), keeping the block's committed logs == successful-tx logs only. This makes
+/// the "logs of a failed tx are never committed" invariant hold by construction, not by convention.
+pub fn wasm_log_len() -> usize {
+    WASM_LOG_SINK.with(|s| s.borrow().len())
+}
+/// Truncate the sink back to `len` — drop a rejected tx's partial log emissions.
+pub fn truncate_wasm_logs(len: usize) {
+    WASM_LOG_SINK.with(|s| { let mut b = s.borrow_mut(); if len < b.len() { b.truncate(len); } });
+}
 
 // Fuel the LAST-applied WASM ContractCall burned, published by the apply arm and read ONCE by the
 // apply caller immediately after each tx (same thread, before the next tx / any await) to price the
@@ -150,16 +160,55 @@ pub fn take_last_tx_wasm_fuel() -> u64 {
     LAST_TX_WASM_FUEL.with(|c| c.replace(0))
 }
 
-/// Canonical merkle leaf for one persisted log entry: `sha3(contract_hex || 0x00 || data)`.
-/// Deterministic + collision-resistant across (contract, data) pairs — used both for the RPC
-/// receipt view and (gated) the consensus logs_root over a window's ordered log list.
-pub fn log_leaf(contract_hex: &str, data: &[u8]) -> Vec<u8> {
+/// Canonical merkle leaf for one persisted log entry, KEYED by its receipt coordinates:
+/// `sha3(tx_hash || u32le(log_index) || contract_hex || 0x00 || data)`. Binding (tx_hash, log_index)
+/// makes a light-client inclusion proof commit to the EXACT receipt — a node cannot replay one entry's
+/// proof under a different tx_hash. Used by BOTH the consensus logs_root and the P4 /logs/proof endpoint.
+pub fn log_leaf(tx_hash: &str, log_index: u32, contract_hex: &str, data: &[u8]) -> Vec<u8> {
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();
+    h.update(tx_hash.as_bytes());
+    h.update(log_index.to_le_bytes());
     h.update(contract_hex.as_bytes());
     h.update([0u8]);
     h.update(data);
     h.finalize().to_vec()
+}
+
+/// Decoded structured token-transfer log (`t:"xfer"` payload emitted by the native QRC-20/721 arms).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenTransferEvent {
+    pub std: String,      // "qrc20" | "qrc721"
+    pub kind: String,     // "transfer" | "mint" | "burn"
+    pub from: String,     // "" for mint
+    pub to: String,       // "" for burn
+    pub amount: String,   // decimal u128 (qrc20); "1" per NFT move
+    pub token_id: String, // "" for qrc20
+}
+
+/// Canonical transfer-event payload. serde_json (preserve_order OFF) sorts keys → byte-identical on
+/// every node, so it folds one deterministic logs_root leaf. `t:"xfer"` tags it for the transfer
+/// indexer; the emitting contract in the leaf binds token identity (a non-token contract's forged
+/// copy is rejected at index time by the emitter-type gate).
+pub fn encode_transfer_log(std_tag: &str, kind: &str, from: &str, to: &str, amount: u128, token_id: &str) -> Vec<u8> {
+    serde_json::json!({
+        "t": "xfer", "std": std_tag, "kind": kind,
+        "from": from, "to": to, "amt": amount.to_string(), "tid": token_id,
+    }).to_string().into_bytes()
+}
+
+/// Decode a persisted log payload iff it is a QNet structured transfer event. Arbitrary WASM
+/// `emit_log` bytes return None. Callers MUST additionally gate on the emitting contract being a
+/// token contract — this only validates the payload shape.
+pub fn decode_transfer_log(data: &[u8]) -> Option<TokenTransferEvent> {
+    let v: serde_json::Value = serde_json::from_slice(data).ok()?;
+    if v.get("t").and_then(|x| x.as_str()) != Some("xfer") { return None; }
+    let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let std = g("std");
+    if std != "qrc20" && std != "qrc721" { return None; }
+    let amount = g("amt");
+    if amount.is_empty() || !amount.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    Some(TokenTransferEvent { std, kind: g("kind"), from: g("from"), to: g("to"), amount, token_id: g("tid") })
 }
 
 /// Owned snapshot resolver for one call tree: contract address bytes → (code, storage).
@@ -270,22 +319,46 @@ mod tests {
     }
 
     #[test]
+    fn transfer_log_encode_is_deterministic_and_roundtrips() {
+        // Encoding is a network-wide commitment once logs_root activates: sorted-key JSON must be
+        // byte-identical across nodes. Freeze it here — a key-order or field change forks at activation.
+        let a = encode_transfer_log("qrc20", "transfer", "eon_a", "eon_b", 12345, "");
+        assert_eq!(a, encode_transfer_log("qrc20", "transfer", "eon_a", "eon_b", 12345, ""));
+        assert_eq!(String::from_utf8(a.clone()).unwrap(),
+            r#"{"amt":"12345","from":"eon_a","kind":"transfer","std":"qrc20","t":"xfer","tid":"","to":"eon_b"}"#);
+        let ev = decode_transfer_log(&a).expect("roundtrip");
+        assert_eq!(ev.std, "qrc20");
+        assert_eq!(ev.from, "eon_a");
+        assert_eq!(ev.to, "eon_b");
+        assert_eq!(ev.amount, "12345");
+        // Mint (empty from) / burn (empty to) / NFT (token_id) shapes.
+        assert_eq!(decode_transfer_log(&encode_transfer_log("qrc20", "mint", "", "eon_b", 7, "")).unwrap().from, "");
+        assert_eq!(decode_transfer_log(&encode_transfer_log("qrc721", "transfer", "eon_a", "eon_b", 1, "id9")).unwrap().token_id, "id9");
+        // Arbitrary / non-transfer WASM emit_log bytes are rejected (no `t:"xfer"`, or bad amount).
+        assert!(decode_transfer_log(b"hello").is_none());
+        assert!(decode_transfer_log(br#"{"t":"other"}"#).is_none());
+        assert!(decode_transfer_log(br#"{"t":"xfer","std":"qrc20","amt":"x"}"#).is_none());
+        assert!(decode_transfer_log(br#"{"t":"xfer","std":"evil","amt":"1"}"#).is_none());
+    }
+
+    #[test]
     fn log_leaf_is_deterministic_domain_separated_and_stable() {
         // log_leaf is the consensus leaf hashed into the (gated) window logs_root. Its exact byte
-        // format — sha3_256(contract_hex ++ 0x00 ++ data) — is a network-wide commitment once the
-        // gate activates, so this test freezes it: an accidental change to the domain separator or
-        // hash would fork every node at activation and must break here first.
+        // format — sha3_256(tx_hash ++ u32le(log_index) ++ contract_hex ++ 0x00 ++ data) — is a
+        // network-wide commitment once the gate activates, so this test freezes it: an accidental change
+        // to the key, separator, or hash would fork every node at activation and must break here first.
         // 1) Deterministic + fixed 32-byte width.
-        assert_eq!(log_leaf("ab", b"cd"), log_leaf("ab", b"cd"), "pure function of its inputs");
-        assert_eq!(log_leaf("ab", b"cd").len(), 32, "sha3_256 → 32-byte leaf");
-        // 2) The 0x00 separator makes the (contract, data) split unambiguous: without it,
-        //    ("ab","cd") and ("abcd","") would both hash the byte string "abcd" and collide.
-        assert_ne!(log_leaf("ab", b"cd"), log_leaf("abcd", b""), "separator prevents split-collision");
-        assert_ne!(log_leaf("ab", b"cd"), log_leaf("a", b"bcd"), "separator prevents split-collision");
+        assert_eq!(log_leaf("t", 0, "ab", b"cd"), log_leaf("t", 0, "ab", b"cd"), "pure function of its inputs");
+        assert_eq!(log_leaf("t", 0, "ab", b"cd").len(), 32, "sha3_256 → 32-byte leaf");
+        // 2) The 0x00 separator makes the (contract, data) split unambiguous; tx_hash + log_index bind
+        //    the receipt so one entry's proof can never be replayed under a different tx or index.
+        assert_ne!(log_leaf("t", 0, "ab", b"cd"), log_leaf("t", 0, "abcd", b""), "separator prevents split-collision");
+        assert_ne!(log_leaf("t", 0, "ab", b"cd"), log_leaf("t", 1, "ab", b"cd"), "log_index bound into the leaf");
+        assert_ne!(log_leaf("a", 0, "ab", b"cd"), log_leaf("b", 0, "ab", b"cd"), "tx_hash bound into the leaf");
         // 3) Golden vector — locks the concrete encoding, not just its structural properties.
         assert_eq!(
-            hex::encode(log_leaf("00", &[0x11u8, 0x22])),
-            "c5cf8e215d3a5db4a8db9bccf2181c629728957456a67220a74fe3e19a8cf813",
+            hex::encode(log_leaf("t0", 0, "00", &[0x11u8, 0x22])),
+            "69ed30220ad86e1b7c07aebbcf8bd5f0515cfd0891b4778ec8683486290e5745",
         );
     }
 

@@ -3522,6 +3522,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "qnet-loadtest"
+version = "0.1.0"
+dependencies = [
+ "base64 0.21.7",
+ "clap",
+ "fips204",
+ "hex",
+ "pqcrypto-mldsa",
+ "pqcrypto-traits",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3",
+ "tokio",
+]
+
+[[package]]
 name = "qnet-mempool"
 version = "0.1.0"
 dependencies = [

@@ -1905,6 +1905,17 @@ curl http://localhost:8003/api/v1/transactions/{hash}
 - `GET /api/v1/token/{address}` - Get token info (name, symbol, decimals, supply)
 - `GET /api/v1/token/{address}/balance/{holder}` - Get token balance for holder
 
+**Token Transfers (decoded, effect-sourced events):**
+- `GET /api/v1/account/{address}/token-transfers?limit=&before=` - QRC-20/721 transfers for an address (cursor-paged)
+- `GET /api/v1/token/{contract}/transfers?limit=&before=` - Transfers for one token (cursor-paged)
+- `GET /api/v1/token-transfers?from=&to=&limit=&after=` - Height-range feed for indexers (`truncated` + `next_cursor`)
+- `GET /api/v1/logs/proof?tx_hash=&log_index=` - Light-client merkle inclusion proof against the QC-certified `logs_root`
+
+**Canonical Burn Address:**
+- `0000000000000000000eon00000000000000036877022` - well-known, provably unspendable (all-zeros body, no key can derive it)
+- Sending ANY QRC-20 (even non-burnable) or QRC-721 here is a REAL on-chain burn: supply reduced / token destroyed, `burn` event emitted
+- Sending native QNC here removes it from circulation permanently; `GET /api/v1/public/stats` reports `burn_address` + `qnc_burned` (circulating = total_supply − qnc_burned)
+
 **Blockchain Data:**
 - `GET /api/v1/block/latest` - Get latest block
 - `GET /api/v1/block/{height}` - Get block by height

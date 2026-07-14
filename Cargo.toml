@@ -7,6 +7,7 @@ members = [
     "core/qnet-sharding",
     "core/qnet-vm",
     "development/qnet-integration",
+    "development/qnet-loadtest",
     "audit"
 ]
 resolver = "2"

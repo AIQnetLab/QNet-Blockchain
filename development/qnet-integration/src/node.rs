@@ -3450,23 +3450,41 @@ impl BlockchainNode {
         [0u8; 32]
     }
 
-    /// Checkpoint.logs_root for a window — RESERVED, gated by `logs_root_required` (dormant ⇒ the
-    /// caller passes [0;32]). Deterministic: reads the OFF-consensus per-block WASM log receipts for
-    /// every height in [start,end] in height order (and emit order within each block — both agreed by
-    /// every node since block apply is sequential), hashes each into a canonical leaf, and merkle-roots
-    /// them. The leaves derive ONLY from committed contract execution (identical on every node), so the
-    /// root is byte-identical across nodes — the property a 2f+1 QC over logs_root relies on. The exact
-    /// window bounds are finalised WITH the live equivalence run when the gate is activated.
-    fn compute_window_logs_root(storage: &crate::storage::Storage, start_height: u64, end_height: u64) -> [u8; 32] {
-        let mut leaves: Vec<Vec<u8>> = Vec::new();
+
+    /// Level-1 sub-root for ONE block's committed logs — merkle over its ordered leaves (log_leaf per
+    /// (tx_hash, in-block index, contract, data)); `[0;32]` for a log-less block. Deterministic on every
+    /// node (same committed logs, same emit order). Stored at apply, folded into the window root at seal.
+    pub fn block_logs_root_of(block_logs: &[(String, String, Vec<u8>)]) -> [u8; 32] {
+        let leaves: Vec<Vec<u8>> = block_logs.iter().enumerate()
+            .map(|(i, (tx, c, d))| qnet_state::wasm_exec::log_leaf(tx, i as u32, c, d)).collect();
+        qnet_consensus::checkpoint_bft::logs_merkle_root(&leaves)
+    }
+
+    /// Per-block sub-roots across a window in height order — from the stored sub-root, else recomputed
+    /// from the block's logs (robust across snapshot/upgrade), else `[0;32]` for a log-less block.
+    pub fn collect_window_block_roots(storage: &crate::storage::Storage, start_height: u64, end_height: u64) -> Vec<[u8; 32]> {
+        let mut roots = Vec::new();
         let mut h = start_height;
         while h <= end_height {
-            for (_tx_hash, contract, data) in storage.get_block_logs(h) {
-                leaves.push(qnet_state::wasm_exec::log_leaf(&contract, &data));
-            }
+            let root = match storage.get_block_logs_root(h) {
+                Some(r) => r,
+                None => {
+                    let logs = storage.get_block_logs(h);
+                    if logs.is_empty() { [0u8; 32] } else { Self::block_logs_root_of(&logs) }
+                }
+            };
+            roots.push(root);
             h = h.saturating_add(1);
         }
-        qnet_consensus::checkpoint_bft::logs_merkle_root(&leaves)
+        roots
+    }
+
+    /// Checkpoint.logs_root for a window — ACTIVE from genesis (`logs_root_required` gate=0). SHARDED:
+    /// a merkle over the per-block sub-roots (`logs_window_root`), so the seal folds ~90 small roots and a
+    /// light-client proof touches ONE block, never the whole window. Byte-identical on every node (the
+    /// property a 2f+1 QC relies on). Window = [(K-1)*90+1, K*90] is FROZEN; a fresh-genesis-only commitment.
+    fn compute_window_logs_root(storage: &crate::storage::Storage, start_height: u64, end_height: u64) -> [u8; 32] {
+        qnet_consensus::checkpoint_bft::logs_window_root(&Self::collect_window_block_roots(storage, start_height, end_height))
     }
 
     // Single apply_block_to_state() for ALL paths (startup replay, recovery
@@ -3604,6 +3622,9 @@ impl BlockchainNode {
             // Capture QRC-20 owns-index deltas into the block journal when journaling is on (the
             // consensus persist path), so the wallet→token reverse index is written in the same batch.
             let owns_mark = block_snapshot.as_deref().map(|s| s.owns().len());
+            // Capture the log-sink length too, so a rejected tx's partial log emissions are dropped
+            // (mirrors the producer-inline per-tx clear) — logs_root then commits successful-tx logs only.
+            let log_mark = qnet_state::wasm_exec::wasm_log_len();
             let apply_result = match block_snapshot {
                 Some(ref mut snap) => state_guard.apply_transaction_lazy_at_indexed(tx, h, snap.owns_mut()),
                 None => state_guard.apply_transaction_lazy_at(tx, h),
@@ -3612,11 +3633,13 @@ impl BlockchainNode {
             // the next tx — WASM or not) so the metered fee matches the producer-inline path exactly.
             let tx_wasm_fuel = qnet_state::wasm_exec::take_last_tx_wasm_fuel();
             if let Err(e) = apply_result {
-                // Rejected tx: drop any owns-deltas it partially emitted (its state mutations were
-                // discarded too), keeping the reverse index aligned with committed balances.
+                // Rejected tx: drop any owns-deltas AND any partial WASM logs it emitted (its state
+                // mutations were discarded too), keeping the reverse index + logs_root aligned with
+                // committed balances.
                 if let (Some(ref mut snap), Some(mark)) = (block_snapshot.as_mut(), owns_mark) {
                     snap.owns_mut().truncate(mark);
                 }
+                qnet_state::wasm_exec::truncate_wasm_logs(log_mark);
                 if is_debug() {
                     println!("[DBG][STATE] tx_skip h={} err={}", h, e);
                 }
@@ -3690,13 +3713,25 @@ impl BlockchainNode {
             }
         }
 
-        // OFF-CONSENSUS: persist this block's captured WASM event logs for RPC getLogs. Drained in
-        // tx-apply order (the Phase-2 loop is sequential). Non-fatal — the receipt store never
-        // blocks or fails block apply — and never hashed, so it cannot affect state_root.
+        // Persist this block's captured WASM event logs (RPC getLogs), drained in tx-apply order. These
+        // leaves ALSO feed the gate-0 `logs_root` consensus commitment, so a persist failure diverges
+        // this node's window logs_root → it stalls out of that window's 2f+1 (fail-safe, not a fork).
+        // Block apply is never blocked; surface the error instead of dropping it silently.
         {
             let block_logs = qnet_state::wasm_exec::drain_wasm_logs();
+            // Reorg-consistency: a re-applied block at h fully replaces h's logs + token index. No-op on a fresh height.
+            storage.reset_block_token_data(h);
             if !block_logs.is_empty() {
-                let _ = storage.save_block_logs(h, &block_logs);
+                if let Err(e) = storage.save_block_logs(h, &block_logs) {
+                    if crate::node::is_warn() {
+                        println!("[WARN][LOGS] block_logs_persist_failed h={} err={} (logs_root will diverge → stall out of 2f+1 until resync)", h, e);
+                    }
+                }
+                // P1: index this block's success-gated token transfers (from + to + contract).
+                Self::index_block_token_transfers(storage, &state_guard.accounts, h, microblock.timestamp, &block_logs);
+                // Sharded logs: store this block's level-1 sub-root so the macroblock seal folds ~90 sub-
+                // roots (not the whole window) and /logs/proof reads one block. Deterministic from block_logs.
+                let _ = storage.save_block_logs_root(h, &Self::block_logs_root_of(&block_logs));
             }
         }
 
@@ -5349,6 +5384,37 @@ impl BlockchainNode {
                 if let Ok(bm) = zstd::decode_all(&bitmap_compressed[..]) {
                     let _ = storage.save_light_bitmap(h / 14400, gidx, &bm);
                 }
+            }
+        }
+    }
+
+    /// P1: index a block's success-gated token-transfer events (effect, not calldata). Keeps only
+    /// `t:xfer` logs whose EMITTING contract is a token (qrc20/qrc721) — a WASM contract emitting
+    /// look-alike bytes is rejected (anti-forgery). log_index = position in the block's emit-ordered
+    /// log stream. Off-consensus local index; identical logic on the validator + producer paths.
+    fn index_block_token_transfers(
+        storage: &crate::storage::Storage,
+        accounts: &std::sync::Arc<dashmap::DashMap<String, qnet_state::Account>>,
+        height: u64, timestamp: u64,
+        logs: &[(String, String, Vec<u8>)],
+    ) {
+        let mut rows = Vec::new();
+        for (log_index, (tx_hash, contract, data)) in logs.iter().enumerate() {
+            if let Some(ev) = qnet_state::wasm_exec::decode_transfer_log(data) {
+                let is_token = accounts.get(contract).map(|a|
+                    a.is_qrc20() || a.contract_storage.get("type").map(|t| t == "qrc721").unwrap_or(false)
+                ).unwrap_or(false);
+                if !is_token { continue; }
+                rows.push(crate::storage::TokenTransferRow {
+                    contract: contract.clone(), from: ev.from, to: ev.to, amount: ev.amount,
+                    kind: ev.kind, std: ev.std, token_id: ev.token_id,
+                    tx_hash: tx_hash.clone(), log_index: log_index as u32, height, timestamp,
+                });
+            }
+        }
+        if !rows.is_empty() {
+            if let Err(e) = storage.index_token_transfers(&rows) {
+                if is_warn() { println!("[WARN][STORAGE] token_xfer_index_failed h={} err={}", height, e); }
             }
         }
     }
@@ -16643,8 +16709,18 @@ impl BlockchainNode {
                         // Persist this producer's OWN block WASM logs (validators persist theirs via
                         // apply_block_to_state's drain) — closes the producer-side getLogs hole and makes
                         // the producer's window logs_root match peers at activation. Plain Vec ⇒ await-safe.
+                        // Reorg-consistency (mirror validator): re-applied block fully replaces h data.
+                        storage.reset_block_token_data(next_block_height);
                         if !block_logs.is_empty() {
-                            let _ = storage.save_block_logs(next_block_height, &block_logs);
+                            if let Err(e) = storage.save_block_logs(next_block_height, &block_logs) {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][LOGS] block_logs_persist_failed h={} err={} (logs_root will diverge → stall out of 2f+1 until resync)", next_block_height, e);
+                                }
+                            }
+                            // P1: index this block's success-gated token transfers (identical to validator path).
+                            Self::index_block_token_transfers(&*storage, &state_guard.accounts, next_block_height, microblock.timestamp, &block_logs);
+                            // Sharded logs: store this block's level-1 sub-root (identical to validator path).
+                            let _ = storage.save_block_logs_root(next_block_height, &Self::block_logs_root_of(&block_logs));
                         }
 
                         // Owns-index (NON-consensus): persisted AFTER the block is durably saved (see the
@@ -20952,8 +21028,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             Some(t) => t,
                                             None => return,
                                         };
-                                        // RESERVED consensus WASM-event logs_root — gated OFF (`logs_root_required`
-                                        // dormant) ⇒ [0;32] today; recomputed identically on every node once activated.
+                                        // Consensus event logs_root — ACTIVE from genesis (`logs_root_required` gate=0).
+                                        // Merkle root over this window's committed event logs (native QRC-20/721 transfers +
+                                        // WASM emit_log), folded into Checkpoint.hash + QC-certified 2f+1. CONSENSUS-CRITICAL:
+                                        // block_logs must be byte-identical across the validator + producer drain paths, else
+                                        // this root diverges and the macroblock QC never reaches 2f+1.
                                         let logs_root = if qnet_state::feature_gates::is_active("logs_root_required", end_height) {
                                             Self::compute_window_logs_root(&storage_cons, start_height, end_height)
                                         } else { [0u8; 32] };
@@ -24202,7 +24281,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let state = self.state.read().await;
         Ok(state.get_account(address))
     }
-    
+
+    /// Light token-metadata read (symbol, decimals, logo, is_nft) that does NOT clone the whole contract
+    /// account — used by the token-transfer enrich so a hot token never clones every holder balance.
+    pub async fn get_contract_meta(&self, address: &str) -> Option<(String, u8, String, bool)> {
+        let state = self.state.read().await;
+        state.get_contract_meta(address)
+    }
+
     pub async fn get_balance(&self, address: &str) -> Result<u64, QNetError> {
         let state = self.state.read().await;
         Ok(state.get_balance(address))

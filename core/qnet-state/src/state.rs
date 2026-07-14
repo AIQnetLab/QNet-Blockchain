@@ -1809,6 +1809,31 @@ impl StateManager {
     pub fn get_account(&self, address: &str) -> Option<Account> {
         self.read_account(address)
     }
+
+    /// Read-only token metadata (symbol, decimals, logo, is_nft) for a contract WITHOUT cloning the whole
+    /// Account. `get_account` clones `contract_storage` — every holder balance — just to read 4 small keys;
+    /// on a hot token that is O(holders) per call, so the enrich path must use this instead. In-memory ref
+    /// is read in place (no clone); disk fallback loads only a cold contract. None if absent / not a contract.
+    pub fn get_contract_meta(&self, address: &str) -> Option<(String, u8, String, bool)> {
+        if let Some(acc) = self.accounts.get(address) {
+            if !acc.is_contract { return None; }
+            let cs = &acc.contract_storage;
+            let is_nft = cs.get("type").map(|t| t == "qrc721").unwrap_or(false);
+            let decimals = if is_nft { 0 } else { cs.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9) };
+            return Some((cs.get("symbol").cloned().unwrap_or_default(), decimals, cs.get("logo").cloned().unwrap_or_default(), is_nft));
+        }
+        let store_guard = self.disk_store.read();
+        if let Some(ref store) = *store_guard {
+            if let Some(account) = store.load_account(address) {
+                if !account.is_contract { return None; }
+                let cs = &account.contract_storage;
+                let is_nft = cs.get("type").map(|t| t == "qrc721").unwrap_or(false);
+                let decimals = if is_nft { 0 } else { cs.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9) };
+                return Some((cs.get("symbol").cloned().unwrap_or_default(), decimals, cs.get("logo").cloned().unwrap_or_default(), is_nft));
+            }
+        }
+        None
+    }
     
     /// Update account
     /// v3.22: Uses lazy Merkle update - call finalize_merkle() after batch updates

@@ -46,7 +46,7 @@ impl Default for GenesisConfig {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
-        let accounts = if benchmark_mode {
+        let mut accounts: Vec<(String, u64)> = if benchmark_mode {
             // [WARN] Benchmark mode — reduced to 100 accounts x 10K QNC = 1M total
             println!("[WARN][GENESIS] BENCHMARK_MODE_ACTIVE — NOT FOR PRODUCTION");
             println!("[WARN][GENESIS] benchmark_accounts=100 balance=10K_QNC total=1M_QNC");
@@ -66,6 +66,36 @@ impl Default for GenesisConfig {
             vec![]
         };
             
+        // LOADTEST: deterministic, real-key pre-funded accounts for the external
+        // /transaction load harness (development/qnet-loadtest). Gated by
+        // QNET_LOADTEST_ACCOUNTS=N (+ optional QNET_LOADTEST_BALANCE_QNC, default 1000).
+        // Address derivation is byte-identical to the harness: SHAKE-256 of the domain
+        // seed "QNET_LOADTEST_MLDSA65_v1:{i}" -> fips204 ML-DSA-65 keygen -> EON. The
+        // harness re-derives the same signing keys, so its transfers finalize on-chain.
+        if let Some(n) = std::env::var("QNET_LOADTEST_ACCOUNTS").ok().and_then(|s| s.parse::<u64>().ok()) {
+            // Hard gate: these accounts' signing keys are PUBLIC (derived from a constant domain seed),
+            // so their balances are drainable by anyone. Require a SECOND, independent opt-in so a single
+            // stray/copied QNET_LOADTEST_ACCOUNTS on a value-bearing genesis can never silently prefund a
+            // spendable balance. Missing the explicit allow ⇒ refuse + loud WARN, genesis stays empty.
+            let allowed = std::env::var("QNET_LOADTEST_ALLOW").map(|v| v == "1" || v == "true").unwrap_or(false);
+            if n > 0 && !allowed {
+                println!("[WARN][GENESIS] LOADTEST_PREFUND_REFUSED accounts={} — QNET_LOADTEST_ALLOW not set (public-key accounts are drainable; never prefund a value-bearing genesis)", n);
+            } else if n > 0 {
+                let bal_qnc = std::env::var("QNET_LOADTEST_BALANCE_QNC").ok()
+                    .and_then(|s| s.parse::<u64>().ok()).unwrap_or(1_000);
+                let bal_nano = bal_qnc.saturating_mul(1_000_000_000);
+                println!("[WARN][GENESIS] LOADTEST_MODE — prefunding {} accounts x {} QNC (NOT FOR PRODUCTION)", n, bal_qnc);
+                for i in 0..n {
+                    let xi = crate::crypto::genesis_key::wallet_xi_from_seed_string(
+                        &format!("QNET_LOADTEST_MLDSA65_v1:{}", i));
+                    let (pk, _sk) = crate::crypto::genesis_key::derive_mldsa65_from_xi(&xi);
+                    if let Some(addr) = crate::crypto::solana_derivation::eon_from_qnet_pubkey(&hex::encode(&pk)) {
+                        accounts.push((addr, bal_nano));
+                    }
+                }
+            }
+        }
+
         Self {
             accounts,
             timestamp: genesis_timestamp,
@@ -81,7 +111,8 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
     // CRITICAL FIX v2.74.1: Create "genesis" account FIRST
     // This account is the source for all initial token distributions
     // Without this, Transfer TX fail with "Account not found: genesis"
-    let total_distribution: u64 = config.accounts.iter().map(|(_, amt)| amt).sum();
+    // Saturating so an extreme (NOT-FOR-PRODUCTION) loadtest-prefund total never wraps/panics.
+    let total_distribution: u64 = config.accounts.iter().fold(0u64, |a, (_, amt)| a.saturating_add(*amt));
     // [SECURITY] Genesis transactions use protocol-level authorization (signature="system"/"genesis")
     // These are valid ONLY in block height 0. The genesis block hash serves as the root of trust.
     // Cryptographic signatures are not required because:

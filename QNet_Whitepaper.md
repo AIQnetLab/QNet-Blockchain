@@ -1307,6 +1307,17 @@ pub struct SimpleMempool {
 - **Pool #3**: Activation QNC redistributed to all nodes
 - **Decimals**: 9 (1 QNC = 10^9 nanoQNC)
 
+**Canonical Burn Address (all QNet tokens):**
+
+```
+0000000000000000000eon00000000000000036877022
+```
+
+- **Nothing-up-my-sleeve**: the address body is all zeros with a valid checksum; addresses derive from SHA512(pubkey), so no key can ever map to it — provably unspendable forever
+- **QRC-20**: transferring to it is a REAL burn recognized by the protocol — holder debited, `total_supply` reduced, `total_burned` increased 1:1, a `burn` event emitted. Works for ANY token, including non-burnable ones (the opt-in `burnable` flag only gates the token's own `burn` method)
+- **QRC-721 (NFT)**: transferring to it destroys the token — ownership record removed, storage deposits refunded, a `burn` event emitted
+- **Native QNC**: accumulates unspendably at the address and is excluded from circulating supply (`circulating = total_supply − qnc_burned`, reported by `/api/v1/public/stats`). Burned QNC still counts against the 2^32 emission cap — burning never re-opens emission headroom
+
 ### 7.2 Sharp Drop Halving Innovation
 
 **Revolutionary Emission Schedule:**

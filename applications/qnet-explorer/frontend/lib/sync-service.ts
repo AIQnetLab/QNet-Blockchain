@@ -1,4 +1,5 @@
-import { getDbPool, insertTransactionsBatch, updateSyncState, getSyncState, query, insertBlock } from './db';
+import { getDbPool, insertTransactionsBatch, updateSyncState, getSyncState, query, insertBlock, getBlockByHeight } from './db';
+import type { BlockRow } from './db';
 import { verifyTransactionHash, verifyTransactionIntegrity, logSecurityEvent } from './security';
 import WebSocket from 'ws';
 
@@ -75,6 +76,15 @@ const WS_RECONNECT_DELAY_BASE = 1000; // Initial reconnect delay: 1 second
 const WS_RECONNECT_DELAY_MAX = 60000; // Max reconnect delay: 60 seconds
 const WS_MAX_RECONNECT_ATTEMPTS = 50; // Circuit breaker: stop after 50 failed attempts
 const WS_HEARTBEAT_INTERVAL = 30000; // Ping every 30 seconds to detect dead connections
+
+// ── Reorg / self-heal bounds (F2 bounded rollback, F3 tail re-validation) ──────────────────
+// QNet does bounded, finality-guarded reorgs (small backward height move, or an equal-height
+// re-produce), so a bare `networkHeight < lastHeight` must NOT full-wipe the DB on every 1–2
+// block reorg. Deletes stay bounded by the reorg point — never a full scan (except a real genesis).
+const REORG_LIMIT = 5000;           // max finality-bounded reorg depth; a deeper backward move ⇒ genuine fresh genesis
+const GENESIS_FLOOR = 2;            // new tip at/below this ⇒ genuine fresh genesis (full wipe, not a rollback)
+const REVALIDATE_DEPTH = 64;       // F3: tail blocks hash-checked per pass (bounded, ≤ REORG_LIMIT)
+const REVALIDATE_INTERVAL = 30000; // F3: min ms between tail re-validations (bounded cadence, not per-block)
 
 // ============================================================================
 // WebSocket JSON-RPC for bulk block fetching (NO HTTP overhead!)
@@ -585,6 +595,12 @@ async function processSingleBlock(height: number): Promise<number> {
   // Update sync state
   await updateSyncState(height);
 
+  // Index effect-sourced token transfers for this block (non-fatal). Only blocks
+  // with TXs can carry transfers, so skip empty microblocks.
+  if (txs.length > 0) {
+    await ingestTokenTransfers(height, height);
+  }
+
   return insertedOk ? uniqueTransactions.length : 0;
 }
 
@@ -624,10 +640,10 @@ async function syncBlocksPolling(): Promise<{ added: number; currentHeight: numb
     const syncState = await getSyncState();
     const lastHeight = typeof syncState?.last_height === 'number' ? syncState.last_height : Number(syncState?.last_height) || 0;
 
-    // Check for blockchain reset
+    // Backward height move: bounded reorg → scoped rollback; genuine fresh genesis → full wipe (F2).
     if (currentHeight < lastHeight) {
-      log(`[Sync] Blockchain reset detected! ${currentHeight} < ${lastHeight}`);
-      await updateSyncState(0);
+      log(`[Sync] Backward height detected: ${currentHeight} < ${lastHeight}`);
+      await reconcileBackwardHeight(currentHeight, lastHeight, `polling network=${currentHeight} < local=${lastHeight}`);
       return { added: 0, currentHeight };
     }
 
@@ -641,6 +657,9 @@ async function syncBlocksPolling(): Promise<{ added: number; currentHeight: numb
       await new Promise(resolve => setTimeout(resolve, 100));
     }
 
+    // F3: bounded tail re-validation catches equal-height / shallow reorgs (throttled internally).
+    await maybeRevalidateChainTail();
+
     return { added: totalAdded, currentHeight };
   } catch (err) {
     error('[Sync] Polling error:', err);
@@ -653,6 +672,160 @@ async function syncBlocksPolling(): Promise<{ added: number; currentHeight: numb
 // After catching up → NewBlock WS handles live sync at 1 block/sec
 // ============================================================================
 let isBackfillRunning = false;
+
+// Self-heal: the node reports a chain SHORTER than what we've recorded, which means
+// it was wiped / rolled back to a fresh genesis. Drop every indexed row and reset
+// sync_state so normal forward sync repopulates from genesis. updateSyncState() only
+// ever RAISES last_height (GREATEST), so reset it directly here.
+async function resetChainForFreshGenesis(reason: string): Promise<void> {
+  warn(`[Sync] Fresh genesis / rollback detected — wiping stale chain data: ${reason}`);
+  const db = getDbPool();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('TRUNCATE token_transfers, transactions, blocks');
+    await client.query('UPDATE sync_state SET last_height = -1, last_sync_at = CURRENT_TIMESTAMP WHERE id = 1');
+    await client.query('COMMIT');
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    warn('[Sync] chain reset failed:', err);
+  } finally {
+    client.release();
+  }
+}
+
+// F2: bounded reorg self-heal. Drop ONLY the rows strictly ABOVE the new canonical tip and lower
+// sync_state to it, so forward sync re-ingests height+1.. . Deletes are bounded by the reorg point
+// (indexed on block/height) — never a full-table scan. updateSyncState() is monotonic (GREATEST),
+// so last_height is set directly here. Mirrors resetChainForFreshGenesis but scoped, not a wipe.
+async function rollbackChainAbove(height: number, reason: string): Promise<void> {
+  warn(`[Sync] Bounded reorg rollback above height ${height}: ${reason}`);
+  const db = getDbPool();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM token_transfers WHERE block > $1', [height]);
+    await client.query('DELETE FROM transactions WHERE block > $1', [height]);
+    await client.query('DELETE FROM blocks WHERE height > $1', [height]);
+    await client.query('UPDATE sync_state SET last_height = $1, last_sync_at = CURRENT_TIMESTAMP WHERE id = 1', [height]);
+    await client.query('COMMIT');
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    warn('[Sync] bounded rollback failed:', err);
+  } finally {
+    client.release();
+  }
+}
+
+// F2: a backward tip move (observed height < recorded height). Decide between a BOUNDED reorg
+// rollback (keep newHeight, drop above it) and a genuine FRESH-GENESIS full wipe. Returns the
+// height sync_state now sits at: newHeight for a rollback, -1 for a full wipe.
+async function reconcileBackwardHeight(newHeight: number, lastHeight: number, reason: string): Promise<number> {
+  const drop = lastHeight - newHeight;
+  // Genuine fresh genesis: chain reset to (near) zero, or a drop too deep to be a finality-bounded reorg.
+  if (newHeight <= GENESIS_FLOOR || drop > REORG_LIMIT) {
+    // CORROBORATE before the destructive TRUNCATE: a super-node that was merely wiped+re-syncing (the
+    // standard testnet relaunch op) transiently reports a LOW /height while its early blocks are IDENTICAL
+    // to ours. Compare an early ANCHOR block; wipe ONLY on a positive divergence (a genuinely new chain).
+    // A match (node re-syncing the same chain) or an unfetchable anchor (node briefly down) keeps the DB
+    // intact and retries next tick — never nuke good indexed data on a transient backward height.
+    const anchorH = Math.max(1, Math.min(newHeight > 0 ? newHeight : 1, GENESIS_FLOOR + 1));
+    const stored = await getBlockByHeight(anchorH).catch(() => null);
+    const fetched = await fetchBlock(anchorH).catch(() => null);
+    if (!(stored && fetched && blockIdentityDiverged(stored, fetched.block))) {
+      warn(`[Sync] backward height (${reason}, drop=${drop}) but anchor block ${anchorH} does not positively diverge — treating as node re-sync, NOT wiping`);
+      return lastHeight;
+    }
+    await resetChainForFreshGenesis(`${reason} (drop=${drop}, anchor ${anchorH} diverged)`);
+    return -1;
+  }
+  // Bounded, finality-guarded reorg: scoped rollback, DB stays populated.
+  await rollbackChainAbove(newHeight, `${reason} (drop=${drop})`);
+  return newHeight;
+}
+
+// F3: classify our stored block at a height against the node's freshly-fetched block. The node's
+// MicroBlock JSON carries NO stable `hash`, so identity = (merkle_root, previous_hash). The tip (~99%
+// of blocks) is an empty WS-fast-path block stored with NULL roots, so a plain merkle compare is blind
+// to it — we therefore also treat "we stored it empty but the node's block now carries txs" as a
+// positive divergence (the exact equal-height tip-swap that would orphan token_transfers).
+function nodeHasTransactions(nodeBlock: BlockData): boolean {
+  return Array.isArray(nodeBlock.transactions) && nodeBlock.transactions.length > 0;
+}
+// CONFIDENT consistency: merkle present on BOTH sides and equal, with no contradicting previous_hash.
+// Only a positive match anchors the fork point — an ambiguous (both-empty) height never does.
+function blockIdentityMatches(stored: BlockRow, nodeBlock: BlockData): boolean {
+  const nodeMerkle = bytesToHex(nodeBlock.merkle_root);
+  const nodePrev = bytesToHex(nodeBlock.previous_hash);
+  if (!stored.merkle_root || !nodeMerkle || stored.merkle_root !== nodeMerkle) return false;
+  if (stored.previous_hash && nodePrev && stored.previous_hash !== nodePrev) return false;
+  return true;
+}
+// POSITIVE divergence: a concrete merkle/previous_hash mismatch, OR our empty (null-roots, tx_count 0)
+// block whose node counterpart now carries txs. Ambiguous (both empty) ⇒ false (never nukes good rows).
+function blockIdentityDiverged(stored: BlockRow, nodeBlock: BlockData): boolean {
+  const nodeMerkle = bytesToHex(nodeBlock.merkle_root);
+  const nodePrev = bytesToHex(nodeBlock.previous_hash);
+  if (stored.merkle_root && nodeMerkle && stored.merkle_root !== nodeMerkle) return true;
+  if (stored.previous_hash && nodePrev && stored.previous_hash !== nodePrev) return true;
+  if (!stored.merkle_root && (stored.tx_count || 0) === 0 && nodeHasTransactions(nodeBlock)) return true;
+  return false;
+}
+
+// F3 throttle state: bound the cadence so re-validation runs O(reorg-depth) per window, never per block.
+let lastRevalidateAt = 0;
+let isRevalidating = false;
+
+// F3: bounded tail re-validation for EQUAL-height / shallow reorgs. QNet can re-produce a block at an
+// equal height (tip height unchanged) — forward-only sync ingests each height once, so a swapped block
+// H and its orphaned token_transfers would never be re-fetched (F2 only fires on a backward move).
+// Walk back from the tip (bounded by REVALIDATE_DEPTH): descend PAST ambiguous (both-empty) heights,
+// stop at the first CONFIDENT match (the fork), and roll back above it ONLY if a concrete divergence
+// was actually seen — so a healthy all-empty tail is left untouched while a tx-adding tip-swap (empty→
+// non-empty) is caught. Forward sync then re-ingests H.. (replaceTokenTransfers' DELETE-by-range).
+// O(reorg-depth), never O(chain).
+async function revalidateChainTail(): Promise<void> {
+  const syncState = await getSyncState();
+  const tip = typeof syncState?.last_height === 'number' ? syncState.last_height : Number(syncState?.last_height) || -1;
+  if (tip <= GENESIS_FLOOR) return;
+  const floor = Math.max(GENESIS_FLOOR + 1, tip - REVALIDATE_DEPTH + 1);
+  let fork = -1;               // highest height we can POSITIVELY confirm consistent with the node
+  let sawDivergence = false;
+  for (let h = tip; h >= floor; h--) {
+    const stored = await getBlockByHeight(h);
+    if (!stored) continue;                 // never indexed — nothing to compare
+    const fetched = await fetchBlock(h);
+    if (!fetched) return;                  // transient node error — abort, keep existing rows
+    if (blockIdentityMatches(stored, fetched.block)) { fork = h; break; } // consistent from here down
+    if (blockIdentityDiverged(stored, fetched.block)) sawDivergence = true;
+    // else ambiguous (both empty) — cannot confirm; keep descending past it
+  }
+  // Roll back ONLY when a concrete divergence was seen: above the confirmed fork, or the bounded window
+  // floor if none was found (deeper fork — the next throttled pass walks further). Never on ambiguity.
+  if (sawDivergence) {
+    const above = fork >= 0 ? fork : floor - 1;
+    await rollbackChainAbove(above, fork >= 0
+      ? `tail re-validation: fork above ${fork}`
+      : `tail re-validation: divergence throughout [${floor}, ${tip}]`);
+  }
+}
+
+// F3: throttled entry point. Reachable from poll/catchup AND the live WS path so an equal-height
+// reorg at the tip is caught even when the height never changes; the throttle keeps it off the
+// per-block hot path.
+async function maybeRevalidateChainTail(): Promise<void> {
+  const now = Date.now();
+  if (isRevalidating || now - lastRevalidateAt < REVALIDATE_INTERVAL) return;
+  lastRevalidateAt = now;
+  isRevalidating = true;
+  try {
+    await revalidateChainTail();
+  } catch (err) {
+    warn('[Sync] tail re-validation error:', err);
+  } finally {
+    isRevalidating = false;
+  }
+}
 
 async function runCatchupSync(): Promise<void> {
   try {
@@ -668,12 +841,20 @@ async function runCatchupSync(): Promise<void> {
     if (!networkHeight || networkHeight < 0) return;
     
     const syncState = await getSyncState();
-    const lastHeight = typeof syncState?.last_height === 'number' 
-      ? syncState.last_height 
+    let lastHeight = typeof syncState?.last_height === 'number'
+      ? syncState.last_height
       : Number(syncState?.last_height) || -1;
-    
+
+    // Backward height move (F2): bounded reorg → scoped rollback (keeps DB populated); genuine
+    // fresh genesis → full wipe. reconcile returns the reconciled tip (newHeight, or -1 on wipe).
+    if (networkHeight < lastHeight) {
+      lastHeight = await reconcileBackwardHeight(networkHeight, lastHeight, `catchup network=${networkHeight} < local=${lastHeight}`);
+    }
+
     const gap = networkHeight - lastHeight - 1;
     if (gap <= 0) {
+      // Height already caught up — still re-validate the tail for an equal-height reorg (F3).
+      await maybeRevalidateChainTail();
       console.log('[Sync] Catchup: already synced');
       return;
     }
@@ -908,6 +1089,128 @@ async function fetchBlocksBatch(heights: number[]): Promise<{ height: number; bl
   return blocks;
 }
 
+// ============================================================================
+// TOKEN TRANSFERS: effect-sourced index from the node token-transfers endpoint
+// ============================================================================
+const TOKEN_TRANSFER_RANGE_CAP = 10000; // node caps the height range per request
+const TOKEN_TRANSFER_ROW_LIMIT = 5000;  // node's range reader hard-stops at this many rows
+
+// One decoded transfer row as returned by the node. `amount` is a u64 base-unit
+// DECIMAL STRING — kept as a string end-to-end (never Number()).
+interface NodeTokenTransfer {
+  contract?: string;
+  from?: string;
+  to?: string;
+  amount?: string | number;
+  kind?: string;
+  std?: string;
+  token_id?: string;
+  tx_hash?: string;
+  log_index?: number;
+  height?: number;
+  timestamp?: number;
+}
+
+// Replace the token_transfers rows for a height range in ONE transaction: first
+// DELETE the range, then insert. This mirrors the node's clear-and-reindex on reorg,
+// so re-ingesting a height fully replaces its rows (an orphaned transfer that is no
+// longer re-included is correctly removed). ON CONFLICT DO NOTHING keeps the insert
+// idempotent for the boundary rows a paginated re-fetch may return twice. Never throws.
+async function replaceTokenTransfers(fromBlock: number, toBlock: number, list: NodeTokenTransfer[]): Promise<void> {
+  const db = getDbPool();
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM token_transfers WHERE block >= $1 AND block <= $2', [fromBlock, toBlock]);
+    for (const t of list) {
+      const txHash = typeof t.tx_hash === 'string' ? t.tx_hash : '';
+      const logIndex = Number(t.log_index);
+      const contract = typeof t.contract === 'string' ? t.contract : '';
+      if (!txHash || !Number.isInteger(logIndex) || !contract) continue;
+      // Keep amount as an exact base-unit digit string; reject anything non-numeric.
+      const amountStr = typeof t.amount === 'string'
+        ? t.amount.trim()
+        : (typeof t.amount === 'number' && Number.isFinite(t.amount) ? Math.trunc(t.amount).toString() : '0');
+      const amount = /^\d+$/.test(amountStr) ? amountStr : '0';
+      await client.query(
+        `INSERT INTO token_transfers (
+           tx_hash, log_index, contract, from_address, to_address,
+           amount, kind, std, token_id, block, timestamp
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+        [
+          txHash,
+          logIndex,
+          contract,
+          typeof t.from === 'string' ? t.from : '',
+          typeof t.to === 'string' ? t.to : '',
+          amount,
+          typeof t.kind === 'string' ? t.kind : '',
+          typeof t.std === 'string' ? t.std : '',
+          typeof t.token_id === 'string' ? t.token_id : '',
+          Number.isInteger(t.height) ? t.height : 0,
+          Number.isInteger(t.timestamp) ? t.timestamp : 0,
+        ]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    warn('[Sync] token-transfers replace failed:', err);
+  } finally {
+    client.release();
+  }
+}
+
+// Drain ALL transfer rows for a single node-range window [start, end], paging past the node's
+// TOKEN_TRANSFER_ROW_LIMIT hard cap via the endpoint's within-height cursor: when the node sets
+// `truncated`, it returns `next_cursor` ({height}_{log_index} of the last row served) which we pass
+// back as `after`, so even a single block holding > ROW_LIMIT events pages fully — no tail dropped.
+// MAX_PAGES bounds a misbehaving node. Returns null on a hard fetch error so the caller can skip the
+// reorg-delete and keep existing rows; [] means the window is genuinely empty.
+async function fetchTokenTransfersWindow(start: number, end: number): Promise<NodeTokenTransfer[] | null> {
+  const rows: NodeTokenTransfer[] = [];
+  const MAX_PAGES = 4096;
+  let after: string | null = null;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    let body: { transfers?: unknown; truncated?: boolean; next_cursor?: unknown } | null;
+    try {
+      const url = `${NODE_RPC_URL}/api/v1/token-transfers?from=${start}&to=${end}&limit=${TOKEN_TRANSFER_ROW_LIMIT}`
+        + (after ? `&after=${after}` : '');
+      const res = await fetch(url, { cache: 'no-store', headers: getApiHeaders(), signal: AbortSignal.timeout(15000) });
+      if (!res.ok) {
+        warn(`[Sync] token-transfers ${start}-${end}: HTTP ${res.status}`);
+        return null;
+      }
+      body = await res.json().catch(() => null);
+    } catch (err) {
+      warn(`[Sync] token-transfers ${start}-${end} failed:`, err);
+      return null;
+    }
+    const list: unknown = body?.transfers;
+    rows.push(...(Array.isArray(list) ? (list as NodeTokenTransfer[]) : []));
+    // More rows remain past this page ⇒ continue from the node's within-height cursor.
+    if (!body?.truncated || typeof body?.next_cursor !== 'string' || !body.next_cursor) break;
+    after = body.next_cursor;
+    if (page === MAX_PAGES - 1) warn(`[Sync] token-transfers ${start}-${end}: hit ${MAX_PAGES}-page cap`);
+  }
+  return rows;
+}
+
+// Fetch + index token transfers for a saved height range. Chunks to respect the
+// node's max height range, paginates WITHIN each chunk (row cap), and replaces each
+// chunk's rows transactionally (reorg reconciliation). Non-fatal: a failed fetch
+// skips that chunk (keeps existing rows); block sync continues regardless.
+async function ingestTokenTransfers(fromHeight: number, toHeight: number): Promise<void> {
+  if (!Number.isInteger(fromHeight) || !Number.isInteger(toHeight) || fromHeight < 0 || toHeight < fromHeight) return;
+  for (let start = fromHeight; start <= toHeight; start += TOKEN_TRANSFER_RANGE_CAP) {
+    const end = Math.min(start + TOKEN_TRANSFER_RANGE_CAP - 1, toHeight);
+    const rows = await fetchTokenTransfersWindow(start, end);
+    if (rows === null) continue; // transient fetch failure — leave the range untouched
+    await replaceTokenTransfers(start, end, rows);
+  }
+}
+
 // FAST BATCH: Save multiple blocks to DB in one batch
 async function saveBlocksBatch(blocks: { height: number; block: BlockData }[]): Promise<number> {
   let totalTx = 0;
@@ -1015,6 +1318,19 @@ async function saveBlocksBatch(blocks: { height: number; block: BlockData }[]): 
         // Log batch errors for debugging
         console.error(`[Sync] TX batch insert error:`, err);
       }
+    }
+  }
+
+  // Index effect-sourced token transfers across the saved height range (non-fatal).
+  if (blocks.length > 0) {
+    let minH = Infinity;
+    let maxH = -Infinity;
+    for (const { height } of blocks) {
+      if (height < minH) minH = height;
+      if (height > maxH) maxH = height;
+    }
+    if (Number.isFinite(minH) && Number.isFinite(maxH)) {
+      await ingestTokenTransfers(minH, maxH);
     }
   }
 
@@ -1311,6 +1627,21 @@ async function handleNewBlockEvent(event: WsNewBlockEvent): Promise<void> {
     ? syncState.last_height
     : Number(syncState?.last_height) || -1;
 
+  // Backward height move: a single WS event below our tip may be a STALE/out-of-order delivery (handlers
+  // are unserialized) rather than a real reorg — so corroborate against the node's authoritative /height
+  // before any destructive rollback. Only reconcile when the node ITSELF reports a lower tip; roll back to
+  // that node tip (not the possibly-stale event height). Forward sync then re-ingests.
+  if (height < lastHeight) {
+    let nodeTip = -1;
+    try {
+      const hr = await fetch(`${NODE_RPC_URL}/api/v1/height`, { cache: 'no-store', headers: getApiHeaders(), signal: AbortSignal.timeout(8000) });
+      if (hr.ok) { const hj = await hr.json().catch(() => null); const h = Number(hj?.height); if (Number.isFinite(h)) nodeTip = h; }
+    } catch { /* transient — treat as uncorroborated below */ }
+    if (nodeTip < 0 || nodeTip >= lastHeight) return; // node still at/above our tip ⇒ stale event, ignore
+    await reconcileBackwardHeight(nodeTip, lastHeight, `WS block=${height} < local=${lastHeight}, node_tip=${nodeTip}`);
+    return;
+  }
+
   const gap = height - lastHeight - 1;
   if (gap > 0) {
     // Jump sync state to just before this block so WS can continue
@@ -1321,6 +1652,10 @@ async function handleNewBlockEvent(event: WsNewBlockEvent): Promise<void> {
       runBackfillScan(lastHeight + 1, height - 1).catch(() => {});
     }
   }
+
+  // F3: throttled tail re-validation on the live path — catches an equal-height reorg at the tip
+  // (height unchanged) during steady-state WS. Fire-and-forget; the throttle keeps it off the hot path.
+  void maybeRevalidateChainTail();
 
   // FAST PATH: empty blocks (99%+) — save metadata from WS event, NO HTTP!
   if (txCount === 0) {

@@ -3,12 +3,15 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
+import TokenIcon from '@/components/TokenIcon';
 
 interface TokenTransfer {
   hash: string;
   from: string;
   to: string;
-  amount: string;
+  std: string;        // qrc20 | qrc721
+  token_id: string;   // NFT id (qrc721); '' for qrc20
+  amount: string;     // qrc20: decimal amount; qrc721: "#<token_id>"
   amountRaw: string;
   method: string;
   block: number;
@@ -28,6 +31,7 @@ interface TokenData {
   contract_address: string;
   name: string;
   symbol: string;
+  logo?: string;
   decimals: number;
   total_supply: string;
   total_supply_raw: string;
@@ -173,8 +177,9 @@ export default function TokenPage() {
           <span className="block-label">TOKEN</span>
           {data.symbol ? <span className="type-badge type-transfer">{data.symbol}</span> : null}
         </div>
-        <div className="block-hash-display">
-          <h1>{data.name || data.symbol || contract}</h1>
+        <div className="block-hash-display" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <TokenIcon logo={data.logo} symbol={data.symbol} address={contract} size={40} />
+          <h1 style={{ margin: 0 }}>{data.name || data.symbol || contract}</h1>
           <CopyBtn text={contract} />
         </div>
       </div>
@@ -288,7 +293,7 @@ export default function TokenPage() {
             </thead>
             <tbody>
               {data.transfers.map((t, idx) => (
-                <tr key={t.hash || idx}>
+                <tr key={`${t.hash}-${idx}`}>
                   <td>
                     <Link href={`/explorer/tx/${t.hash}`} className="address-link">
                       {truncate(t.hash, 6, 4)}
@@ -298,8 +303,13 @@ export default function TokenPage() {
                     <span className={`type-badge type-${t.method.toLowerCase()}`}>{t.method}</span>
                   </td>
                   <td><AddrLink addr={t.from} /></td>
-                  <td>{t.to ? <AddrLink addr={t.to} /> : <span className="address-link">—</span>}</td>
-                  <td>{t.amount}{data.symbol ? ` ${data.symbol}` : ''}</td>
+                  <td>{t.to ? <AddrLink addr={t.to} /> : <span className="address-link">🔥 Burn</span>}</td>
+                  <td>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <TokenIcon logo={data.logo} symbol={data.symbol} address={contract} size={16} />
+                      <span>{t.amount}{data.symbol ? ` ${data.symbol}` : ''}</span>
+                    </span>
+                  </td>
                   <td>{t.fee}</td>
                   <td>
                     <Link href={`/explorer/block/${t.block}`} className="address-link">

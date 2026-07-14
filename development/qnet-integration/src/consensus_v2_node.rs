@@ -328,7 +328,7 @@ pub enum V2Event {
         banned: Vec<String>,           // QC-bound cumulative ban set (binds stored banned_validators)
         reward_root: Hash,             // per-epoch reward merkle root ([0;32] off emission boundary)
         registry_root: Hash,           // deterministic Super/genesis registry digest (snapshot-forge defence)
-        logs_root: Hash,               // RESERVED WASM-event logs root (gated `logs_root_required`; [0;32] until active)
+        logs_root: Hash,               // consensus event logs root (native QRC-20/721 + WASM), ACTIVE from genesis (gate=0)
         total_supply: u64,             // QC-bound total minted supply (cold-joiner reads this, not balance sum)
     },
     // A macroblock whose checkpoint QC the apply path already verified against the correct epoch
@@ -351,7 +351,7 @@ struct WindowContent {
     banned: Vec<String>,   // QC-bound cumulative ban set (folded into epoch_commitment)
     reward_root: Hash,     // per-epoch reward merkle root, QC-certified via Checkpoint.reward_root
     registry_root: Hash,   // Super/genesis registry digest, QC-certified via Checkpoint.registry_root
-    logs_root: Hash,       // RESERVED WASM-event logs root (gated; [0;32] until logs_root_required active)
+    logs_root: Hash,       // consensus event logs root (native QRC-20/721 + WASM), ACTIVE from genesis (gate=0)
     total_supply: u64,     // total minted supply, QC-certified via Checkpoint.total_supply
 }
 

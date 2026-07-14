@@ -9,6 +9,30 @@ QNet supports a complete ecosystem of smart contracts and decentralized applicat
 - **Post-Quantum Security** - Protection against quantum computer attacks
 - **Low Fees** - Accessibility for mass adoption
 
+## 🪙 Native Token Standards (QRC-20 / QRC-721)
+
+QNet ships two CONTAINED token standards executed natively by the state machine (no WASM required):
+
+**QRC-20 (fungible):** deploy carries `name`, `symbol`, `decimals`, `initial_supply`, optional `logo` (emoji or clean https URL, sanitized on-chain), and opt-in `mintable` / `burnable` flags (immutable defaults: false). Methods: `transfer`, `approve`, `transferFrom`, plus `mint` (owner-only, if mintable) and `burn` (holder, if burnable). Invariant: `total_supply == total_minted − total_burned`, enforced with checked arithmetic.
+
+**QRC-721 (NFT):** deploy flagged `"qrc721": true`. Methods: `mint` (deployer-only, string `token_id`), `transfer`, `approve`, `transferFrom`. Ownership lives in per-token `owner:{token_id}` records.
+
+**Transfer events:** every successful transfer/mint/burn emits a canonical event folded into the QC-certified `logs_root`, so wallets verify history trustlessly via `GET /api/v1/logs/proof`.
+
+### 🔥 Canonical Burn Address
+
+```
+0000000000000000000eon00000000000000036877022
+```
+
+A well-known, provably unspendable address (all-zeros body + valid checksum; no key can derive it). The protocol RECOGNIZES transfers to it as a real burn:
+
+- **QRC-20** → supply reduced + `total_burned` increased, even for non-burnable tokens; the sink is never credited
+- **QRC-721** → the token is destroyed (ownership record removed, deposits refunded)
+- **Native QNC** → permanently removed from circulation (`circulating = total_supply − qnc_burned` via `/api/v1/public/stats`)
+
+`transferFrom` to the burn address consumes allowance exactly like a normal transfer.
+
 ## 📝 Writing Smart Contracts
 
 ### Supported Languages

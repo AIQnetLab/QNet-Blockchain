@@ -799,10 +799,65 @@ const TabBox = React.memo(
     prev.deps.every((v, i) => Object.is(v, next.deps[i]))
 );
 
+// Format a u64 base-unit token amount by its decimals using string math (exact past 2^53 — a
+// 0-decimal high-supply token can reach ~1.8e19, well beyond a JS float's safe integer range).
+function fmtTokenBaseUnits(base, decimals) {
+  const s = String(base == null ? '0' : base).replace(/[^0-9]/g, '') || '0';
+  const d = Number(decimals) || 0;
+  // Thousands-group an all-digit string directly (never via Number()) so no low-order digit is lost.
+  const group = (digits) => digits.replace(/^0+(?=\d)/, '').replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  if (d <= 0) return group(s);
+  const padded = s.padStart(d + 1, '0');
+  const intPart = padded.slice(0, padded.length - d);
+  const frac = padded.slice(padded.length - d).replace(/0+$/, '');
+  const intFmt = group(intPart);
+  return frac ? `${intFmt}.${frac}` : intFmt;
+}
+
+// 16px coin/token mark next to a history row's amount. Native QNC → the cyan "Q" brand; a QRC-20
+// transfer → an emoji logo or a deterministic coloured-letter avatar (colour from the contract
+// address) — the same icon model as the Assets list. Privacy: a node-supplied https logo is NEVER
+// loaded as <Image> from the wallet (it would leak the device IP/timing to an attacker-controlled
+// host); only inert emoji logos render as-is, everything else falls back to the letter avatar.
+function TxCoinMark({ token }) {
+  if (!token) {
+    return (
+      <View style={{ width: 16, height: 16, borderRadius: 8, backgroundColor: '#00e5f0', alignItems: 'center', justifyContent: 'center', marginRight: 5 }}>
+        <Text style={{ color: '#04141a', fontSize: 10, fontWeight: '800' }}>Q</Text>
+      </View>
+    );
+  }
+  const logo = typeof token.logo === 'string' ? token.logo.trim() : '';
+  const isEmoji = logo.length > 0 && logo.length <= 8 && !logo.startsWith('http');
+  let h = 0;
+  const seed = String(token.contract || token.symbol || '?');
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  const bg = isEmoji ? '#0b1a22' : `hsl(${h % 360}, 60%, 42%)`;
+  return (
+    <View style={{ width: 16, height: 16, borderRadius: 8, backgroundColor: bg, alignItems: 'center', justifyContent: 'center', marginRight: 5 }}>
+      <Text style={{ color: '#fff', fontSize: 9, fontWeight: '700' }}>
+        {isEmoji ? logo : String(token.symbol || 'T').slice(0, 1).toUpperCase()}
+      </Text>
+    </View>
+  );
+}
+
 // Memoized transaction-history row — skips re-render on unrelated parent setState (balance/height ticks).
+// Canonical burn address (matches core CANONICAL_BURN_ADDR) — a transfer here is a 🔥 burn.
+const CANONICAL_BURN_ADDR = '0000000000000000000eon00000000000000036877022';
+
 const TxRow = React.memo(function TxRow({ tx, onCopy }) {
   const isSend = tx.type === 'send';
+  // Burn: a success-gated token burn event (kind), or a native/token transfer to the burn address.
+  const isBurn = tx.tokenKind === 'burn' || (typeof tx.to === 'string' && tx.to === CANONICAL_BURN_ADDR);
   const counter = isSend ? tx.to : tx.from;
+  const isToken = !!tx.tokenContract;
+  const isNft = tx.tokenStd === 'qrc721';
+  const amountLabel = isToken
+    ? (isNft
+        ? `${isSend ? '-' : '+'}${tx.tokenSymbol ? `${tx.tokenSymbol} ` : ''}#${tx.tokenId || '?'}`
+        : `${isSend ? '-' : '+'}${tx.tokenAmountDisplay || '0'}${tx.tokenSymbol ? ` ${tx.tokenSymbol}` : ''}`)
+    : `${tx.amount === 0 ? '0' : `${isSend ? '-' : '+'}${tx.amount.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: Math.abs(tx.amount) >= 1 ? 4 : 8 })}`} QNC`;
   const dateLabel = tx.status === 'pending'
     ? '⏳ Pending...'
     : (!tx.timestamp || tx.timestamp === 0 || tx.timestamp < 1000000)
@@ -820,17 +875,27 @@ const TxRow = React.memo(function TxRow({ tx, onCopy }) {
       <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
           <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: isSend ? '#ff444420' : '#00ff8820', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
-            <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 18 }}>{isSend ? '↑' : '↓'}</Text>
+            <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 18 }}>{isBurn ? '🔥' : (isSend ? '↑' : '↓')}</Text>
           </View>
           <View>
-            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>{isSend ? 'Sent' : 'Received'}</Text>
+            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>{isBurn ? '🔥 Burn' : (isSend ? 'Sent' : 'Received')}</Text>
             <Text style={{ color: '#666', fontSize: 12 }}>{dateLabel}</Text>
           </View>
         </View>
         <View style={{ alignItems: 'flex-end', flexShrink: 1, marginLeft: 8 }}>
-          <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 16, fontWeight: '600' }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
-            {tx.amount === 0 ? '0' : `${isSend ? '-' : '+'}${tx.amount.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: Math.abs(tx.amount) >= 1 ? 4 : 8 })}`} QNC
-          </Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            {/* QNC brand mark for native rows; the token's own icon for a QRC-20 transfer. */}
+            <TxCoinMark token={isToken ? { contract: tx.tokenContract, symbol: tx.tokenSymbol, logo: tx.tokenLogo } : null} />
+            <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 16, fontWeight: '600' }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
+              {amountLabel}
+            </Text>
+            {/* Trust badge: a ✓ marks a token transfer proven against a committee-QC-anchored logs_root
+                (verifyTokenTransferInclusion → 'verified') AND whose decimals/symbol are from the wallet's
+                own added-token registry — so ✓ never backs a node-scaled magnitude for an un-added token. */}
+            {isToken && tx.verified === true && tx.tokenMetaTrusted && (
+              <Text style={{ color: '#00e5f0', fontSize: 12, fontWeight: '800', marginLeft: 4 }} accessibilityLabel="QC-verified">✓</Text>
+            )}
+          </View>
           {tx.fee > 0 && <Text style={{ color: '#666', fontSize: 11 }}>Fee: {tx.fee.toFixed(5)} QNC</Text>}
         </View>
       </View>
@@ -2002,6 +2067,7 @@ const WalletScreen = () => {
         name: info.name,
         symbol: info.symbol,
         decimals: info.decimals,
+        logo: info.logo || '',
       };
       // Persist (dedupe by contract_address).
       let persisted = [];
@@ -2025,7 +2091,7 @@ const WalletScreen = () => {
       }
       setQrcTokens((prev) => {
         const next = prev.filter((t) => t.contract !== contract);
-        next.push({ contract, name: info.name, symbol: info.symbol, decimals: info.decimals, balance: balanceStr });
+        next.push({ contract, name: info.name, symbol: info.symbol, decimals: info.decimals, balance: balanceStr, logo: info.logo || '' });
         return next;
       });
       closeAddTokenModal();
@@ -2307,6 +2373,16 @@ const WalletScreen = () => {
           symbol: sendingToken.symbol,
           confirming: true,
         });
+        // Show the transfer in history immediately as a pending TOKEN row (icon + amount + symbol).
+        if (txHash) {
+          addPendingTxToHistory(txHash, sendAddress, amount, 0, {
+            contract: sendingToken.contract,
+            symbol: sendingToken.symbol,
+            logo: sendingToken.logo,
+            decimals,
+            rawBaseUnits: amountBaseUnits,
+          });
+        }
         // Optimistic balance update using the TOKEN's decimals (string math): subtract the sent
         // base units from the current base units, then merge back into the Assets list row.
         setQrcTokens((prev) => prev.map((t) => {
@@ -3379,6 +3455,7 @@ const WalletScreen = () => {
           symbol: c.symbol || '',
           decimals: dec,
           balance: bal.balance != null ? bal.balance : '0',
+          logo: c.logo || '',
         });
       }));
 
@@ -3638,44 +3715,135 @@ const WalletScreen = () => {
   // NOW: Merge — keep pending TXs that aren't yet in blockchain response
   const loadTxHistory = async () => {
     if (!wallet?.qnetAddress) return;
-    
+
     try {
+      const myAddress = wallet.qnetAddress.toLowerCase();
+
+      // Fetch the native tx list (carries native QNC transfers) and the node-decoded token-transfer
+      // events in parallel. Token transfers are no longer derived from client-side calldata parsing.
       const apiUrl = walletManager.getRandomBootstrapNode();
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), 5000);
-      const response = await fetch(
+      const nativePromise = fetch(
         `${apiUrl}/api/v1/account/${wallet.qnetAddress}/transactions?limit=50`,
         { method: 'GET', headers: { 'Content-Type': 'application/json' }, signal: controller.signal }
       ).finally(() => clearTimeout(t));
-      
+      const tokenEventsPromise = walletManager.getAccountTokenTransfers(wallet.qnetAddress, 50);
+
+      // Token rows first: node-decoded QRC-20/721 events, metadata embedded per row (no metadata fetch).
+      // u64 amounts stay STRINGS. Direction: 'receive' iff the tokens land on me and I'm not the sender.
+      // tokenLogIndex disambiguates multiple transfer logs sharing one tx_hash (unique React key + no
+      // row collapse in the FlatList).
+      const tokenEvents = await tokenEventsPromise;
+      // Trusted per-contract display metadata: the QC-committed logs_root leaf binds base-units+parties
+      // but NOT decimals/symbol, so a serving node's per-row decimals could otherwise inflate the shown
+      // magnitude under the ✓ badge. Prefer the wallet's OWN added-token metadata (reviewed at add-time,
+      // node-independent) keyed by contract; fall back to the node's per-row value only for tokens the
+      // user hasn't added (where no magnitude is implied trustworthy anyway). Base units stay verbatim —
+      // they are the value actually proven against the committed leaf.
+      const trustedTokenMeta = new Map(
+        (customTokens || []).map(ct => [String(ct.contract || '').toLowerCase(),
+          { decimals: Number(ct.decimals) || 0, symbol: ct.symbol }])
+      );
+      const tokenTxs = (tokenEvents || [])
+        // A malicious/buggy node may return rows unrelated to me — only display transfers I'm party to.
+        .filter(ev => {
+          const f = String(ev.from || '').toLowerCase(), t = String(ev.to || '').toLowerCase();
+          return f === myAddress || t === myAddress;
+        })
+        .map(ev => {
+          const tm = trustedTokenMeta.get(String(ev.contract || '').toLowerCase());
+          const dec = tm ? tm.decimals : (Number(ev.decimals) || 0);
+          const sym = tm ? tm.symbol : ev.symbol;
+          return {
+        hash: ev.tx_hash,
+        tokenLogIndex: ev.log_index,
+        from: ev.from,
+        to: ev.to,
+        amount: 0,
+        status: 'pending', // promoted to 'confirmed' below only after a QC-anchored inclusion proof
+        verified: false,
+        timestamp: (ev.timestamp || 0) * 1000,
+        type: (String(ev.to || '').toLowerCase() === myAddress && String(ev.from || '').toLowerCase() !== myAddress) ? 'receive' : 'send',
+        fee: 0,
+        tokenContract: ev.contract,
+        tokenSymbol: sym,
+        tokenLogo: ev.logo,
+        tokenStd: ev.std,
+        tokenId: ev.token_id,
+        // True only when decimals/symbol came from the wallet's OWN added-token registry (node-independent).
+        // The ✓ trust badge requires this so it never sits next to a node-scaled magnitude for a token the
+        // user never added (a dust-airdrop-as-"1,000,000 USDC" phishing row): base units are proven, but the
+        // human magnitude is only trustworthy for added tokens.
+        tokenMetaTrusted: !!tm,
+        // Raw fields (verbatim from the node) needed to recompute the logs_root leaf for the P4 binding.
+        tokenKind: ev.kind,
+        tokenRawAmount: String(ev.amount == null ? '' : ev.amount),
+        tokenAmountDisplay: fmtTokenBaseUnits(String(ev.amount || '0'), dec),
+          };
+        });
+      const tokenHashes = new Set(tokenTxs.map(t => t.hash));
+
+      // Native rows: keep every native type; drop only a ContractCall a token event already represents
+      // (avoids a duplicate "0 QNC" row). A non-transfer contract call (approve / WASM) stays visible.
+      let nativeTxs = [];
+      const response = await nativePromise;
       if (response.ok) {
         const data = await response.json();
         const transactions = data.transactions || data || [];
-        
-        const myAddress = wallet.qnetAddress.toLowerCase();
-        const formattedTxs = transactions.map(tx => ({
-          hash: tx.hash || tx.tx_hash,
-          from: tx.from || tx.sender,
-          to: tx.to || tx.recipient,
-          amount: (tx.amount || 0) / 1e9,
-          status: 'confirmed',
-          // v3.33: Convert Unix timestamp (seconds) to milliseconds for Date()
-          timestamp: (tx.timestamp || 0) * 1000,
-          type: (tx.from || tx.sender || '').toLowerCase() === myAddress ? 'send' : 'receive',
-          fee: (tx.fee || tx.gas_used || 0) / 1e9
+        nativeTxs = transactions
+          .filter(tx => !(String(tx.tx_type) === 'ContractCall' && tokenHashes.has(tx.hash || tx.tx_hash)))
+          .map(tx => ({
+            hash: tx.hash || tx.tx_hash,
+            from: tx.from || tx.sender,
+            to: tx.to || tx.recipient,
+            amount: (tx.amount || 0) / 1e9,
+            status: 'confirmed',
+            // v3.33: Convert Unix timestamp (seconds) to milliseconds for Date()
+            timestamp: (tx.timestamp || 0) * 1000,
+            type: (tx.from || tx.sender || '').toLowerCase() === myAddress ? 'send' : 'receive',
+            fee: (tx.fee || tx.gas_used || 0) / 1e9,
+          }));
+      }
+
+      // Merge + sort newest-first so native + token rows interleave chronologically (a native Transfer
+      // and a token event never share a hash, so no further dedup is needed).
+      const formattedTxs = [...nativeTxs, ...tokenTxs]
+        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+      // MERGE with pending TXs instead of replacing, but ONLY pending sent from THIS wallet —
+      // a pending TX from a previously opened wallet must never survive a wallet switch.
+      setTxHistory(prev => {
+        const confirmedHashes = new Set(formattedTxs.map(t => t.hash));
+        const stillPending = prev.filter(t =>
+          t.status === 'pending' &&
+          (t.from || '').toLowerCase() === myAddress &&
+          !confirmedHashes.has(t.hash)
+        );
+        return [...stillPending, ...formattedTxs];
+      });
+
+      // P4: verify each token transfer's inclusion against a committee-QC-anchored logs_root. 'verified'
+      // → confirmed + trust badge; 'consistent' → confirmed but unverified (real on-chain row below the
+      // trust floor, so it stops showing ⏳ forever); 'rejected'/'pending' → stay pending (never confirmed).
+      if (tokenTxs.length) {
+        const statuses = new Map();
+        await Promise.all(tokenTxs.map(async t => {
+          // Bind the proof to THIS row's own fields (contract/from/to/amount/kind/std/token_id).
+          const row = {
+            tx_hash: t.hash, log_index: t.tokenLogIndex, contract: t.tokenContract,
+            from: t.from, to: t.to, amount: t.tokenRawAmount, kind: t.tokenKind,
+            std: t.tokenStd, token_id: t.tokenId,
+          };
+          const s = await walletManager.verifyTokenTransferInclusion(row);
+          if (s === 'verified' || s === 'consistent') statuses.set(t.hash + ':' + t.tokenLogIndex, s);
         }));
-        
-        // MERGE with pending TXs instead of replacing, but ONLY pending sent from THIS wallet —
-        // a pending TX from a previously opened wallet must never survive a wallet switch.
-        setTxHistory(prev => {
-          const confirmedHashes = new Set(formattedTxs.map(t => t.hash));
-          const stillPending = prev.filter(t =>
-            t.status === 'pending' &&
-            (t.from || '').toLowerCase() === myAddress &&
-            !confirmedHashes.has(t.hash)
-          );
-          return [...stillPending, ...formattedTxs];
-        });
+        if (statuses.size) {
+          setTxHistory(prev => prev.map(t => {
+            const s = t.tokenContract ? statuses.get(t.hash + ':' + t.tokenLogIndex) : undefined;
+            return s ? { ...t, status: 'confirmed', verified: s === 'verified' } : t;
+          }));
+        }
       }
     } catch (e) {
       // API error - keep existing history
@@ -3683,18 +3851,27 @@ const WalletScreen = () => {
   };
 
   // v3.30: Add pending TX to history
-  const addPendingTxToHistory = (txHash, to, amount, fee) => {
+  // `token` (optional) = { contract, symbol, logo, decimals, rawBaseUnits } marks this pending row as a
+  // QRC-20 transfer so it renders with the token's icon + amount + symbol (parity with the confirmed
+  // row), instead of a native "QNC" row. On confirm, loadTxHistory replaces it with the enriched row.
+  const addPendingTxToHistory = (txHash, to, amount, fee, token) => {
     const pendingTx = {
       hash: txHash,
       from: wallet?.qnetAddress || '',
       to: to,
-      amount: amount,
+      amount: token && token.contract ? 0 : amount,
       status: 'pending',
       timestamp: Date.now(),
       type: 'send',
       fee: fee
     };
-    
+    if (token && token.contract) {
+      pendingTx.tokenContract = token.contract;
+      pendingTx.tokenSymbol = token.symbol || '';
+      pendingTx.tokenLogo = token.logo || '';
+      pendingTx.tokenAmountDisplay = fmtTokenBaseUnits(token.rawBaseUnits, token.decimals);
+    }
+
     setTxHistory(prev => [pendingTx, ...prev.filter(t => t.hash !== txHash)]);
   };
 
@@ -5052,11 +5229,25 @@ const WalletScreen = () => {
                     activeOpacity={0.6}
                   >
                     <View style={styles.tokenInfo}>
-                      <View style={styles.tokenIcon}>
-                        <Text style={styles.tokenIconText}>
-                          {(tk.symbol || tk.name || 'T').slice(0, 1).toUpperCase()}
-                        </Text>
-                      </View>
+                      {(() => {
+                        // Token icon: an inert emoji logo, else a deterministic coloured-circle letter
+                        // avatar (colour from the contract address). Privacy: a node-supplied https logo
+                        // is never loaded as <Image> here — it would leak the device IP/timing to an
+                        // attacker-controlled host — so a URL logo falls through to the letter avatar.
+                        const logo = typeof tk.logo === 'string' ? tk.logo.trim() : '';
+                        const isEmoji = logo.length > 0 && logo.length <= 8 && !logo.startsWith('http');
+                        let h = 0;
+                        const seed = String(tk.contract || tk.symbol || '?');
+                        for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+                        const bg = isEmoji ? '#0b1a22' : `hsl(${h % 360}, 60%, 42%)`;
+                        return (
+                          <View style={[styles.tokenIcon, { backgroundColor: bg, borderRadius: 20 }]}>
+                            <Text style={[styles.tokenIconText, { color: '#ffffff' }]}>
+                              {isEmoji ? logo : (tk.symbol || tk.name || 'T').slice(0, 1).toUpperCase()}
+                            </Text>
+                          </View>
+                        );
+                      })()}
                       <View style={styles.tokenDetails}>
                         <Text style={styles.tokenName}>{tk.symbol || tk.name || 'Token'}</Text>
                         {!!tk.name && tk.name !== tk.symbol && (
@@ -5915,7 +6106,7 @@ const WalletScreen = () => {
               Platform.OS === 'ios' && { paddingBottom: 50 }
             ]}
             data={txHistory}
-            keyExtractor={(tx, index) => tx.hash || String(index)}
+            keyExtractor={(tx, index) => tx.tokenContract ? `${tx.hash}-${tx.tokenLogIndex ?? index}` : (tx.hash || String(index))}
             renderItem={({ item }) => <TxRow tx={item} onCopy={handleCopyTxHash} />}
             ListHeaderComponent={<Text style={[styles.sectionTitle, { marginBottom: 16 }]}>Transaction History</Text>}
             ListEmptyComponent={

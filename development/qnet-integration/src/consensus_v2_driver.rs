@@ -156,12 +156,10 @@ impl ConsensusDriver {
         let cp = Checkpoint {
             index: round, parent_qc: self.eng.high_qc.clone(), window_head_height: head_height,
             window_mb_hashes: mb_hashes, state_root, beacon, epoch_commitment: epoch_c, reward_root, registry_root,
-            // Consensus WASM-event logs root, threaded from the caller. Gated `logs_root_required`
-            // (dormant) ⇒ the caller passes [0;32] today, so this is deterministically [0;32] on every
-            // node and content_ok's `cp.logs_root == c.logs_root` is trivially satisfied. Once the gate
-            // activates the caller passes compute_window_logs_root(window) and content_ok enforces the
-            // merkle equivalence — giving trustless light-client EVENT proofs. Kept in Checkpoint::hash
-            // from genesis so the wire format is unchanged at activation.
+            // Consensus event logs root (native QRC-20/721 transfers + WASM emit_log), threaded from the
+            // caller = compute_window_logs_root(window). ACTIVE from genesis (`logs_root_required` gate=0):
+            // content_ok enforces `cp.logs_root == c.logs_root`, giving trustless light-client event proofs.
+            // In Checkpoint::hash from genesis, so block_logs byte-identity across drain paths is consensus-critical.
             logs_root,
             total_supply, timestamp: head_ts,
             proposer: self.node_id.clone(), proposer_sig: Vec::new(),

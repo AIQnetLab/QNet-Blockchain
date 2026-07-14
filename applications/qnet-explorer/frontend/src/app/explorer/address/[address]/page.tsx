@@ -4,6 +4,7 @@ import React, { useState, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { getCache, setCache, isCacheStale } from '@/lib/explorer-cache';
+import TokenIcon from '@/components/TokenIcon';
 
 interface AddressData {
   address: string;
@@ -35,6 +36,21 @@ interface AddressData {
     timestamp: number;
     block: number;
     status: 'confirmed' | 'pending';
+  }>;
+  tokenTransfers: Array<{
+    hash: string;
+    from: string;
+    to: string;
+    kind: string;
+    direction: 'in' | 'out';
+    symbol: string;
+    contract: string;
+    logo: string;
+    std: string;        // qrc20 | qrc721
+    token_id: string;   // NFT id (qrc721); '' for qrc20
+    amount: string;     // qrc20: decimal amount; qrc721: "#<token_id>"
+    block: number;
+    timestamp: number;
   }>;
 }
 
@@ -477,16 +493,16 @@ export default function AddressPage() {
             
             {totalPages > 1 && (
               <div className="pagination">
-                <button 
-                  onClick={() => setTxPage(p => Math.max(1, p - 1))} 
+                <button
+                  onClick={() => setTxPage(p => Math.max(1, p - 1))}
                   disabled={txPage === 1}
                   className="page-btn"
                 >
                   ← Prev
                 </button>
                 <span className="page-info">Page {txPage} of {totalPages}</span>
-                <button 
-                  onClick={() => setTxPage(p => Math.min(totalPages, p + 1))} 
+                <button
+                  onClick={() => setTxPage(p => Math.min(totalPages, p + 1))}
                   disabled={txPage === totalPages}
                   className="page-btn"
                 >
@@ -497,6 +513,71 @@ export default function AddressPage() {
           </div>
         );
       })()}
+
+      {/* Token Transfers — decoded QRC transfer logs (effect-sourced), separate from native TXs */}
+      {(data.tokenTransfers?.length ?? 0) > 0 && (
+        <div className="block-card">
+          <h2 className="card-title">Token Transfers ({data.tokenTransfers.length})</h2>
+          <table className="block-table">
+            <thead>
+              <tr>
+                <th>Hash</th>
+                <th>Token</th>
+                <th>Amount</th>
+                <th>Counterparty</th>
+                <th>Block</th>
+                <th>Time</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.tokenTransfers.map((t, idx) => {
+                const isOut = t.direction === 'out';
+                const isNft = t.std === 'qrc721';
+                // Counterparty = the other side of the transfer (or a mint/burn label).
+                const counter = isOut ? t.to : t.from;
+                const counterValid = counter && counter.length > 10 && counter.includes('eon');
+                return (
+                  <tr key={`${t.hash}-${idx}`}>
+                    <td>
+                      <Link href={`/explorer/tx/${t.hash}`} className="address-link">
+                        {truncate(t.hash, 6, 4)}
+                      </Link>
+                    </td>
+                    <td>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        <TokenIcon logo={t.logo} symbol={t.symbol} address={t.contract} size={16} />
+                        <Link href={`/explorer/token/${t.contract}`} className="address-link">
+                          {t.symbol || truncate(t.contract, 6, 4)}
+                        </Link>
+                      </span>
+                    </td>
+                    <td className={isOut ? 'amount-out' : 'amount-in'}>
+                      {/* NFTs show "#<token_id>" (no +/− quantity sign); fungibles keep the signed amount. */}
+                      {isNft ? '' : (isOut ? '−' : '+')}{t.amount}{t.symbol ? ` ${t.symbol}` : ''}
+                    </td>
+                    <td>
+                      <span className={isOut ? 'tx-out' : 'tx-in'}>{isOut ? '→ ' : '← '}</span>
+                      {counterValid ? (
+                        <Link href={`/explorer/address/${counter}`} className="address-link">
+                          {truncate(counter, 6, 4)}
+                        </Link>
+                      ) : (
+                        <span className="address-link">{t.kind === 'mint' ? 'Mint' : t.kind === 'burn' ? '🔥 Burn' : (counter || 'N/A')}</span>
+                      )}
+                    </td>
+                    <td>
+                      <Link href={`/explorer/block/${t.block}`} className="address-link">
+                        {t.block}
+                      </Link>
+                    </td>
+                    <td>{formatTimeAgo(t.timestamp)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,3 +1,5 @@
+// NOTE: standalone manual/CLI migration helper — NOT the runtime migration path.
+// At server startup migrations run via src/instrumentation.ts register().
 import * as fs from 'fs';
 import * as path from 'path';
 import { getDbPool } from '../lib/db';

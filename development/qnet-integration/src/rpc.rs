@@ -144,6 +144,12 @@ static REWARD_SUMMARY_CACHE: Lazy<DashMap<String, (serde_json::Value, std::time:
 
 const REWARD_SUMMARY_CACHE_TTL_SECS: u64 = 60;
 
+// Per-contract token metadata (symbol/decimals/logo) is IMMUTABLE after deploy (no setter method), so
+// cache it: enrich_token_transfers must not re-clone a full contract account (every holder balance) for
+// the same token on every request. Bounded (anti-OOM); positive entries only.
+static TOKEN_META_CACHE: Lazy<DashMap<String, (String, u8, String)>> = Lazy::new(|| DashMap::new());
+const TOKEN_META_CACHE_MAX: usize = 100_000;
+
 #[derive(Default, Clone)]
 struct RewardPoolsCache {
     pool2_fees: u64,
@@ -1286,7 +1292,53 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_account_transactions);
-    
+
+    // Decoded token-transfer feeds (effect-sourced, success-gated) — P2.
+    // GET /api/v1/account/{address}/token-transfers?limit=&before=
+    let account_token_transfers = api_v1
+        .and(warp::path("account"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("token-transfers"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<TokenTransfersQuery>())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_account_token_transfers);
+
+    // GET /api/v1/token/{contract}/transfers?limit=&before=
+    let token_transfers_feed = api_v1
+        .and(warp::path("token"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("transfers"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<TokenTransfersQuery>())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_token_transfers);
+
+    // GET /api/v1/token-transfers?from=&to=&limit= — height-range decoded transfers (explorer ingest).
+    let token_transfers_range = api_v1
+        .and(warp::path("token-transfers"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<TokenTransfersRangeQuery>())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_token_transfers_range);
+
+    // GET /api/v1/logs/proof?tx_hash=&log_index= — P4 light-client transfer inclusion proof.
+    let log_proof = api_v1
+        .and(warp::path("logs"))
+        .and(warp::path("proof"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<LogProofQuery>())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_log_proof);
+
     // Extended transaction history with pagination and filters
     // GET /api/v1/transactions/history?address=XXX&page=1&per_page=20&type=transfer
     let transaction_history = api_v1
@@ -2334,7 +2386,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::get())
         .and(warp::addr::remote())
         .and_then(handle_benchmark_presets);
-    
+
     // Combine benchmark routes
     let benchmark_routes = benchmark_start
         .or(benchmark_status)
@@ -2387,6 +2439,10 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(token_balance_proof)  // V2: trustless QRC-20 token balance proof
         .or(validators_proof)       // v3.32: Validator set with Merkle proof
         .or(account_transactions)
+        .or(account_token_transfers)
+        .or(token_transfers_feed)
+        .or(token_transfers_range)
+        .or(log_proof)
         .or(batch_transfer);
         
     let transaction_routes = transaction_submit
@@ -3921,7 +3977,10 @@ async fn handle_account_transactions(
                     "timestamp": tx.timestamp,
                     "gas_price": tx.gas_price,
                     "gas_limit": tx.gas_limit,
-                    "tx_type": format!("{:?}", tx.tx_type)
+                    "tx_type": format!("{:?}", tx.tx_type),
+                    // ContractCall payload {"method","args"} so clients render a QRC-20 transfer with the
+                    // real recipient + token amount/symbol/icon instead of a native "0 QNC" row.
+                    "data": tx.data
                 })
             }).collect();
             
@@ -3949,6 +4008,202 @@ async fn handle_account_transactions(
             Ok(warp::reply::json(&error_response))
         }
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TokenTransfersQuery {
+    limit: Option<usize>,
+    before: Option<String>,
+}
+
+/// Resolve per-contract metadata (symbol/decimals/logo) ONCE and denormalize it onto each row, so a
+/// client renders the icon + human amount with no extra per-token fetch. Bounded by the page size.
+async fn enrich_token_transfers(blockchain: &Arc<BlockchainNode>, rows: Vec<crate::storage::TokenTransferRow>) -> Vec<serde_json::Value> {
+    // Resolve each unique contract's metadata ONCE per request into a local map: global immutable cache
+    // first, else a LIGHT metadata read (get_contract_meta — no whole-account/O(holders) clone), caching
+    // it globally only while under the cap. Using the local map for rendering means EVERY row gets the
+    // CORRECT decimals/symbol (incl. NFT decimals=0) even for contracts beyond the global cache cap — a
+    // miss no longer silently defaults to decimals=9.
+    let mut resolved: std::collections::HashMap<String, (String, u8, String)> = std::collections::HashMap::new();
+    for r in &rows {
+        if resolved.contains_key(&r.contract) { continue; }
+        if let Some(e) = TOKEN_META_CACHE.get(&r.contract) { resolved.insert(r.contract.clone(), e.value().clone()); continue; }
+        if let Some((symbol, decimals, logo, _is_nft)) = blockchain.get_contract_meta(&r.contract).await {
+            let m = (symbol, decimals, logo);
+            if TOKEN_META_CACHE.len() < TOKEN_META_CACHE_MAX { TOKEN_META_CACHE.insert(r.contract.clone(), m.clone()); }
+            resolved.insert(r.contract.clone(), m);
+        }
+    }
+    rows.into_iter().map(|r| {
+        let (symbol, decimals, logo) = resolved.get(&r.contract).cloned().unwrap_or((String::new(), 9, String::new()));
+        json!({
+            "contract": r.contract, "from": r.from, "to": r.to, "amount": r.amount,
+            "kind": r.kind, "std": r.std, "token_id": r.token_id, "tx_hash": r.tx_hash,
+            "log_index": r.log_index, "height": r.height, "timestamp": r.timestamp,
+            "cursor": format!("{:016x}_{:08x}", r.height, r.log_index),
+            "symbol": symbol, "decimals": decimals, "logo": logo,
+        })
+    }).collect()
+}
+
+/// GET /api/v1/account/{address}/token-transfers?limit=&before= — decoded, success-gated token
+/// transfers where the address is sender OR recipient (newest first). `before` = last row's cursor.
+async fn handle_account_token_transfers(
+    address: String,
+    q: TokenTransfersQuery,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(r) = check_api_rate_limit(remote_addr, "read_only") { return Ok(r); }
+    if address.len() > 128 {
+        return Ok(warp::reply::json(&json!({"error": "Invalid address"})));
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let before = q.before.as_deref().filter(|s| s.len() <= 40 && s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_'));
+    let storage = blockchain.get_storage();
+    let rows = storage.get_token_transfers_by_address(&address, limit, before);
+    let transfers = enrich_token_transfers(&blockchain, rows).await;
+    // Retention honesty (mirror getLogs): transfers below the prune floor are physically gone on this
+    // node, so an empty/short result there is NOT "no more history". A client below it must archive-fetch.
+    Ok(warp::reply::json(&json!({ "address": address, "count": transfers.len(), "transfers": transfers, "oldest_available": storage.log_prune_floor() })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LogProofQuery {
+    tx_hash: String,
+    log_index: Option<usize>,
+}
+
+/// GET /api/v1/logs/proof?tx_hash=&log_index= — P4 light-client transfer-inclusion proof. Returns the
+/// merkle sibling path from the event leaf to the window's logs_root; the client recomputes the root
+/// and checks it equals the QC-anchored `Checkpoint.logs_root` it independently verified for [start,end].
+async fn handle_log_proof(
+    q: LogProofQuery,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(r) = check_api_rate_limit(remote_addr, "read_only") { return Ok(r); }
+    if q.tx_hash.len() != 64 || !q.tx_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(warp::reply::json(&json!({"error": "Invalid tx_hash"})));
+    }
+    let target_li = q.log_index.unwrap_or(0);
+    let storage = blockchain.get_storage();
+    let h = match storage.get_transaction_block_height(&q.tx_hash).await {
+        Ok(h) if h > 0 => h,
+        _ => return Ok(warp::reply::json(&json!({"error": "Transaction not found"}))),
+    };
+    // Macroblock window [start,end] (90 microblocks) whose Checkpoint.logs_root commits this height —
+    // same window keying as the consensus signal (K=90). Leaves via the SHARED builder (no drift).
+    let end = ((h - 1) / 90 + 1) * 90;
+    let start = end.saturating_sub(89).max(1);
+    // Only prove FINALIZED windows: every block in [start,end] must be applied, else the leaf set is
+    // partial and the proof can never match the eventual QC-committed Checkpoint.logs_root.
+    if end > blockchain.get_height().await {
+        return Ok(warp::reply::json(&json!({"error": "window_not_finalized", "window_end": end})));
+    }
+    // Lower bound: blocklogs below the prune floor are physically gone (get_block_logs → empty), so a
+    // straddling window rebuilds a truncated-suffix leaf set whose root is NOT the QC-committed
+    // logs_root. Reject like getLogs rather than emit an authoritative-looking non-consensus root.
+    // floor is window-aligned (14_400 = 160*90) ⇒ it sits at a window END, so only the [floor-89,floor]
+    // window has partial leaves; start < floor gates exactly that window and every fully-pruned older one.
+    let log_floor = storage.log_prune_floor();
+    if start < log_floor {
+        return Ok(warp::reply::json(&json!({"error": "window_pruned", "window_start": start, "window_end": end, "oldest_available": log_floor})));
+    }
+    // SHARDED 2-level proof — the SCALE fix: rebuild ONLY block h's leaves for level-1 (leaf → this
+    // block's sub-root), then fold the window's per-block sub-roots for level-2 (sub-root → the committed
+    // logs_root). Both are O(one block) + O(~90 sub-roots), so a proof NEVER rebuilds the whole window —
+    // no per-request OOM even at high token TPS, and no serve ceiling below the consensus maximum.
+    let block_h_logs = storage.get_block_logs(h);
+    let belongs = block_h_logs.get(target_li).map(|(lt, _, _)| lt == &q.tx_hash).unwrap_or(false);
+    if !belongs {
+        return Ok(warp::reply::json(&json!({"error": "Log not found in window", "window_start": start, "window_end": end})));
+    }
+    let block_leaves: Vec<Vec<u8>> = block_h_logs.iter().enumerate()
+        .map(|(i, (tx, contract, data))| qnet_state::wasm_exec::log_leaf(tx, i as u32, contract, data)).collect();
+    let raw = block_leaves[target_li].clone();
+    // Level 1: leaf → block sub-root (rebuilds only this block).
+    let (l1_pairs, block_root) = qnet_consensus::checkpoint_bft::logs_merkle_proof_with_root(&block_leaves, target_li);
+    // Level 2: block sub-root → window logs_root (over the ~90 stored per-block sub-roots — same builder
+    // the seal uses, so byte-identical to the QC-committed Checkpoint.logs_root).
+    let block_roots = crate::node::BlockchainNode::collect_window_block_roots(&storage, start, end);
+    let block_index = (h - start) as usize;
+    let (l2_pairs, window_root) = qnet_consensus::checkpoint_bft::logs_window_proof_with_root(&block_roots, block_index);
+    let l1: Vec<serde_json::Value> = l1_pairs.iter().map(|(hsh, right)| json!({ "hash": hex::encode(hsh), "right": right })).collect();
+    let l2: Vec<serde_json::Value> = l2_pairs.iter().map(|(hsh, right)| json!({ "hash": hex::encode(hsh), "right": right })).collect();
+    Ok(warp::reply::json(&json!({
+        "tx_hash": q.tx_hash, "log_index": target_li,
+        "window_start": start, "window_end": end, "block_index": block_index,
+        "leaf": hex::encode(&raw),
+        "proof": l1,                            // level 1: leaf → block_root
+        "block_root": hex::encode(block_root),
+        "window_proof": l2,                     // level 2: block_root → logs_root
+        "logs_root": hex::encode(window_root),
+    })))
+}
+
+/// GET /api/v1/token/{contract}/transfers?limit=&before= — decoded transfers for one token (newest first).
+async fn handle_token_transfers(
+    contract: String,
+    q: TokenTransfersQuery,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(r) = check_api_rate_limit(remote_addr, "read_only") { return Ok(r); }
+    if contract.len() > 128 {
+        return Ok(warp::reply::json(&json!({"error": "Invalid contract"})));
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let before = q.before.as_deref().filter(|s| s.len() <= 40 && s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_'));
+    let storage = blockchain.get_storage();
+    let rows = storage.get_token_transfers_by_contract(&contract, limit, before);
+    let transfers = enrich_token_transfers(&blockchain, rows).await;
+    // Retention honesty (mirror getLogs): history below the prune floor is physically gone on this node.
+    Ok(warp::reply::json(&json!({ "contract": contract, "count": transfers.len(), "transfers": transfers, "oldest_available": storage.log_prune_floor() })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TokenTransfersRangeQuery {
+    from: u64,
+    to: u64,
+    limit: Option<usize>,
+    after: Option<String>,
+}
+
+/// GET /api/v1/token-transfers?from=&to=&limit=&after= — decoded, type-gated token transfers in a
+/// height range (block order). For explorer ingestion; raw rows (the explorer joins its own metadata).
+/// `after` = the `{height:016x}_{log_index:08x}` cursor of the last row already ingested; the response
+/// carries `truncated` + `next_cursor` so a height with more than `limit` events pages fully (no drop).
+async fn handle_token_transfers_range(
+    q: TokenTransfersRangeQuery,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    if let Err(r) = check_api_rate_limit(remote_addr, "read_only") { return Ok(r); }
+    let from = q.from;
+    let to = q.to.max(from);
+    if to.saturating_sub(from) > 10_000 {
+        return Ok(warp::reply::json(&json!({"error": "Range too large (max 10000 blocks)"})));
+    }
+    let limit = q.limit.unwrap_or(2000).clamp(1, 5000);
+    let after = q.after.as_deref().filter(|s| s.len() <= 40 && s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_'));
+    let storage = blockchain.get_storage();
+    let (rows, truncated) = storage.get_token_transfers_in_range(from, to, limit, after);
+    let next_cursor = if truncated {
+        rows.last().map(|r| format!("{:016x}_{:08x}", r.height, r.log_index))
+    } else { None };
+    let transfers: Vec<serde_json::Value> = rows.iter().map(|r| json!({
+        "contract": r.contract, "from": r.from, "to": r.to, "amount": r.amount,
+        "kind": r.kind, "std": r.std, "token_id": r.token_id, "tx_hash": r.tx_hash,
+        "log_index": r.log_index, "height": r.height, "timestamp": r.timestamp,
+    })).collect();
+    // Retention honesty (mirror getLogs): a range dipping below the prune floor is incomplete on this node.
+    let floor = storage.log_prune_floor();
+    Ok(warp::reply::json(&json!({
+        "from": from, "to": to, "count": transfers.len(), "transfers": transfers,
+        "truncated": truncated, "next_cursor": next_cursor,
+        "oldest_available": floor, "pruned_below": if from < floor { Some(floor) } else { None },
+    })))
 }
 
 /// Extended transaction history handler with pagination, filtering, and sorting
@@ -12580,7 +12835,12 @@ async fn handle_public_stats(
     // Determine current phase
     let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
     let phase = if burn_percentage >= 90.0 { 2 } else { 1 };
-    
+
+    // Native QNC removed from circulation via the canonical burn sink (an unspendable EON address):
+    // clients compute circulating = total_supply − qnc_burned. Read-only; the sink can never be spent.
+    let qnc_burned = blockchain.get_account(qnet_state::transaction::CANONICAL_BURN_ADDR).await
+        .ok().flatten().map(|a| a.balance).unwrap_or(0);
+
     let stats = json!({
         "active_nodes": total_nodes,
         "light_nodes": light_nodes,
@@ -12589,6 +12849,8 @@ async fn handle_public_stats(
         "height": height,
         "phase": phase,
         "burn_percentage": burn_percentage,
+        "burn_address": qnet_state::transaction::CANONICAL_BURN_ADDR,
+        "qnc_burned": qnc_burned,
         "cached_at": chrono::Utc::now().to_rfc3339(),
         "cache_ttl_seconds": CACHE_TTL_SECS
     });
@@ -14943,6 +15205,11 @@ struct TokenDeployRequest {
     decimals: u8,
     /// Initial supply
     initial_supply: u64,
+    /// Optional token logo — an emoji or https URL (sanitized + capped at apply; not part of
+    /// code_hash, so it never affects the deploy address or the signed canonical message). Empty
+    /// ⇒ clients render a generated avatar.
+    #[serde(default)]
+    logo: String,
     /// Replay-protection nonce (client-provided; the caller signs it into the canonical
     /// "contract_deploy:{from}:{code_hash}:{nonce}" message the value-TX gate verifies).
     nonce: u64,
@@ -15056,6 +15323,8 @@ async fn handle_token_deploy(
             "name": request.name,
             "symbol": request.symbol,
             "decimals": request.decimals,
+            // Optional on-chain logo (emoji / https URL) — sanitized at apply; "" ⇒ generated avatar.
+            "logo": request.logo,
             // STRING (exact past 2^53); apply + explorer both accept number-or-string.
             "initial_supply": request.initial_supply.to_string(),
             "code_hash": code_hash
@@ -15122,6 +15391,9 @@ async fn handle_token_info(
                         "name": storage.get("name").cloned().unwrap_or_default(),
                         "symbol": storage.get("symbol").cloned().unwrap_or_default(),
                         "decimals": storage.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9),
+                        // Optional on-chain token logo (emoji or https URL); "" when the deployer set none
+                        // — clients fall back to a generated avatar. Sanitized at deploy (https-only scheme).
+                        "logo": storage.get("logo").cloned().unwrap_or_default(),
                         // u128 base units as a STRING: a JSON number is an f64 and loses precision above
                         // 2^53, so a large-supply token would round in any JS client. Parse validates it
                         // as u128 (the QRC-20 storage width; total_supply == total_minted − total_burned,

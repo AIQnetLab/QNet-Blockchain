@@ -79,7 +79,8 @@ export function quorumSize(n) {
 //   ++ window_mb_hashes[](32 each) ++ state_root(32) ++ beacon(32) ++ epoch_commitment(32)
 //   ++ reward_root(32) ++ registry_root(32) ++ logs_root(32) ++ total_supply(u64LE)
 //   ++ timestamp(u64LE) ++ proposer.utf8 → 32B hash.
-// logs_root is [0;32] while the contract VM is gated OFF (no window emits WASM logs).
+// logs_root is CONSENSUS-ACTIVE from genesis (gate=0): the window's committed event logs (native
+// QRC-20/721 transfers + WASM emit_log) merkle-rooted; [0;32] only for a window with no logs.
 export function checkpointHash(cp) {
   const parts = [utf8('qnet-checkpoint-v2'), u64le(cp.index)];
   if (cp.parent_qc) {
@@ -101,6 +102,66 @@ export function checkpointHash(cp) {
 }
 
 // ── 3. Parse the ATTACHED dilithium sig string → detached sig hex ───────────
+/**
+ * P4: verify a token-transfer inclusion proof against a QC-anchored Checkpoint.logs_root.
+ * `proof` = [{hash:<hex>, right:<bool>}] from GET /api/v1/logs/proof — byte-mirror of
+ * checkpoint_bft::verify_logs_merkle_proof (sha3 "log-leaf"/"log-node"). The caller MUST first confirm
+ * `rootHex` == the logs_root of a checkpoint it QC-verified for [window_start, window_end].
+ */
+export function verifyLogInclusion(leafHex, proof, rootHex) {
+  const bytes = (h) => Buffer.from(String(h || ''), 'hex');
+  let cur = sha3_256.create().update(Buffer.from('log-leaf')).update(bytes(leafHex)).hex();
+  for (const step of (proof || [])) {
+    const h = sha3_256.create().update(Buffer.from('log-node'));
+    if (step && step.right) { h.update(bytes(cur)).update(bytes(step.hash)); }
+    else { h.update(bytes(step && step.hash)).update(bytes(cur)); }
+    cur = h.hex();
+  }
+  return cur === String(rootHex || '').toLowerCase();
+}
+
+/**
+ * P4 LEVEL 2 (sharded logs): verify a block sub-root's inclusion in the window logs_root. Byte-mirror of
+ * checkpoint_bft::verify_logs_window_proof (sha3 "logw-leaf"/"logw-node", domain-separated from level 1).
+ * Pair with verifyLogInclusion (level 1: leaf→block_root) to prove one transfer against a QC-anchored
+ * Checkpoint.logs_root — each level touches ONE block, never the whole window.
+ */
+export function verifyLogWindowInclusion(subRootHex, windowProof, windowRootHex) {
+  const bytes = (h) => Buffer.from(String(h || ''), 'hex');
+  let cur = sha3_256.create().update(Buffer.from('logw-leaf')).update(bytes(subRootHex)).hex();
+  for (const step of (windowProof || [])) {
+    const h = sha3_256.create().update(Buffer.from('logw-node'));
+    if (step && step.right) { h.update(bytes(cur)).update(bytes(step.hash)); }
+    else { h.update(bytes(step && step.hash)).update(bytes(cur)); }
+    cur = h.hex();
+  }
+  return cur === String(windowRootHex || '').toLowerCase();
+}
+
+/**
+ * P4 leaf-binding: recompute the canonical logs_root leaf for a decoded transfer row — a byte-exact
+ * port of node wasm_exec::{encode_transfer_log, log_leaf}. The event JSON is serde_json with SORTED
+ * keys (amt,from,kind,std,t,tid,to) and no spaces; leaf = sha3_256(utf8(tx_hash) || u32le(log_index) ||
+ * utf8(contract) || 0x00 || utf8(json)), lowercase hex. Binding tx_hash+log_index means the proof commits
+ * to the EXACT receipt, so a node can neither ride another transfer's proof NOR replay one real transfer
+ * under duplicate/forged tx_hashes. Returns null on a bad row.
+ */
+export function transferLogLeaf(row) {
+  if (!row || typeof row !== 'object') return null;
+  const s = (v) => JSON.stringify(v == null ? '' : String(v)); // matches serde_json string escaping (ASCII)
+  const json = '{"amt":' + s(row.amount) + ',"from":' + s(row.from) + ',"kind":' + s(row.kind) +
+    ',"std":' + s(row.std) + ',"t":"xfer","tid":' + s(row.token_id) + ',"to":' + s(row.to) + '}';
+  const li = Buffer.alloc(4);
+  li.writeUInt32LE((Number(row.log_index) || 0) >>> 0, 0);
+  return sha3_256.create()
+    .update(Buffer.from(String(row.tx_hash == null ? '' : row.tx_hash), 'utf8'))
+    .update(li)
+    .update(Buffer.from(String(row.contract == null ? '' : row.contract), 'utf8'))
+    .update(Buffer.from([0]))
+    .update(Buffer.from(json, 'utf8'))
+    .hex();
+}
+
 // String: "dilithium_sig_<node_id>_<base64>". base64 decodes to [u32LE signed_msg_len][signed_msg]
 //   where signed_msg = [detached_sig(3309)][msg]. We need only the detached sig and ALWAYS verify against
 //   the TRUSTED committee pk. QC sigs are pk-compacted node-side (C-2) so there is NO trailing pk; a live
@@ -352,7 +413,7 @@ async function verifyOne(j, proof, registryFetch) {
     console.warn('[ERR][LIGHT] epoch_commitment_mismatch j=' + j);
     return null;
   }
-  const entry = { stateRoot: cp.state_root, checkpointHash: cpHash, eligibleIds: decodeEligibleNodeIds(eligibleBytes), beacon: cp.beacon };
+  const entry = { stateRoot: cp.state_root, logsRoot: cp.logs_root, checkpointHash: cpHash, eligibleIds: decodeEligibleNodeIds(eligibleBytes), beacon: cp.beacon };
   _verifiedCache.set(j, entry);
   console.log('[INFO][LIGHT] macroblock_verified j=' + j + ' committee=' + committee.length);
   return entry;
@@ -427,6 +488,37 @@ export async function verifyMacroblockStateRoot(stateRoot, blockHeight, getRando
     return true;
   } catch (e) {
     console.warn('[ERR][LIGHT] verify_threw err=' + (e && e.message));
+    return false;
+  }
+}
+
+/**
+ * P4: verify that `logsRoot` is the QC-certified Checkpoint.logs_root of the macroblock covering
+ * `windowEnd` (a multiple of 90). Mirrors verifyMacroblockStateRoot; pair with verifyLogInclusion to
+ * prove a token transfer against a committee-QC-anchored root.
+ * Three outcomes so the caller can separate a proven forgery from an honest can't-prove-now:
+ * @returns {Promise<true|'mismatch'|false>} true = QC-certified match; 'mismatch' = the committee-QC
+ *   root for this window DIFFERS from the node-claimed root (a proven forgery → caller must reject);
+ *   false = unprovable now (below trust floor / macroblock unreachable / threw → caller keeps pending).
+ */
+export async function verifyMacroblockLogsRoot(logsRoot, windowEnd, getRandomBootstrapNode) {
+  if (!logsRoot || typeof logsRoot !== 'string') return false;
+  if (typeof getRandomBootstrapNode !== 'function') return false;
+  const idx = Math.floor((windowEnd || 0) / MACROBLOCK_INTERVAL);
+  const floor = Math.max(1, WS_CHECKPOINT.index || 0);
+  if (idx < floor) return false; // below the finalized/trust floor — unprovable, not a forgery
+  try {
+    const verified = await verifyMacroblockAt(idx, getRandomBootstrapNode);
+    if (!verified) return false; // couldn't fetch/QC-verify the macroblock — unprovable, not a forgery
+    if (verified.logsRoot !== logsRoot) {
+      // QC-certified root ≠ node-claimed root: the node's (leaf,proof,root) triple is self-consistent
+      // but the root itself is not what the committee signed → the transfer is forged/fork-served.
+      console.warn('[ERR][LIGHT] logs_root_mismatch idx=' + idx);
+      return 'mismatch';
+    }
+    return true;
+  } catch (e) {
+    console.warn('[ERR][LIGHT] verify_logs_threw err=' + (e && e.message));
     return false;
   }
 }

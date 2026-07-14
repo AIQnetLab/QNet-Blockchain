@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getTransactionsByAddress } from '../../../../../lib/db';
+import { getTransactionsByAddress, getAddressTokenTransfers, getContractDeployByAddress } from '../../../../../lib/db';
 import { mapTxType, formatAmount } from '@/lib/tx-mapping';
 import { formatTokenAmount } from '@/lib/token-format';
+import { sanitizeLogo } from '@/lib/sanitize-logo';
 
 // ============================================================================
 // PRODUCTION v3.0: PostgreSQL-based address data
@@ -42,6 +43,47 @@ export interface AddressData {
     block: number;
     status: 'confirmed' | 'pending';
   }>;
+  // Decoded QRC token transfers touching this address (effect-sourced, not calldata).
+  tokenTransfers: Array<{
+    hash: string;
+    from: string;
+    to: string;
+    kind: string;              // transfer | mint | burn
+    direction: 'in' | 'out';   // relative to this address
+    symbol: string;
+    contract: string;
+    logo: string;
+    std: string;               // qrc20 | qrc721
+    token_id: string;          // NFT id (qrc721); '' for qrc20
+    amount: string;            // qrc20: scaled by decimals; qrc721: "#<token_id>"
+    block: number;
+    timestamp: number;
+  }>;
+}
+
+// QRC-20 metadata parsed from a contract's ContractDeploy `data` JSON
+// ({symbol,decimals,logo,qrc20}). Used to render token transfers without a node round-trip.
+interface DeployMeta {
+  symbol: string;
+  decimals: number;
+  logo: string;
+}
+
+function parseDeployMeta(dataStr: string | null): DeployMeta {
+  let symbol = '';
+  let decimals = 9; // node default
+  let logo = '';
+  if (dataStr) {
+    try {
+      const d = JSON.parse(dataStr) as { symbol?: unknown; decimals?: unknown; logo?: unknown };
+      if (typeof d.symbol === 'string') symbol = d.symbol;
+      if (typeof d.decimals === 'number' && Number.isInteger(d.decimals) && d.decimals >= 0 && d.decimals <= 30) {
+        decimals = d.decimals;
+      }
+      logo = sanitizeLogo(d.logo);
+    } catch { /* keep defaults */ }
+  }
+  return { symbol, decimals, logo };
 }
 
 // Mapped QRC-20 token holding for the address page. Balance is scaled by the
@@ -107,6 +149,7 @@ function createSystemAddressData(address: string): AddressData {
     isSystem: true,
     tokens: [],
     transactions: [],
+    tokenTransfers: [],
   };
 }
 
@@ -145,17 +188,51 @@ export async function GET(
   if (API_KEY) nodeHeaders['X-API-Key'] = API_KEY;
 
   try {
-    // Parallel: node balance + node QRC-20 token holdings + PostgreSQL TX history
-    const [accountResponse, tokens, txResult] = await Promise.all([
+    // Parallel: node balance + node QRC-20 token holdings + PostgreSQL TX history + token transfers
+    const [accountResponse, tokens, txResult, tokenTransferRows] = await Promise.all([
       fetch(`${NODE_API}/api/v1/account/${address}`, {
         headers: nodeHeaders,
         signal: AbortSignal.timeout(10000),
       }).then(r => r.ok ? r.json() : null).catch(() => null),
       fetchAddressTokens(address, NODE_API, nodeHeaders),
       getTransactionsByAddress(address, 1, 100),
+      getAddressTokenTransfers(address, 50),
     ]);
-    
+
     const { transactions, total } = txResult;
+
+    // Resolve each unique contract's QRC-20 metadata once (symbol/decimals/logo) from its ContractDeploy.
+    const uniqueContracts = Array.from(new Set(tokenTransferRows.map(t => t.contract)));
+    const metaEntries = await Promise.all(uniqueContracts.map(async (c): Promise<[string, DeployMeta]> => {
+      const dep = await getContractDeployByAddress(c).catch(() => null);
+      return [c, parseDeployMeta(dep?.data ?? null)];
+    }));
+    const metaByContract = new Map<string, DeployMeta>(metaEntries);
+
+    // Map transfers to response rows (direction relative to this address). NFTs
+    // (qrc721) render as "#<token_id>" and are NOT scaled by decimals; qrc20 amounts
+    // stay scaled by the token's own decimals (exact string math).
+    const tokenTransfers = tokenTransferRows.map(t => {
+      const meta = metaByContract.get(t.contract) ?? { symbol: '', decimals: 9, logo: '' };
+      let ts = Number(t.timestamp) || 0;
+      if (ts > 0 && ts < 1e12) ts = ts * 1000;
+      const isNft = t.std === 'qrc721';
+      return {
+        hash: t.tx_hash,
+        from: t.from_address,
+        to: t.to_address,
+        kind: t.kind,
+        direction: (t.to_address === address ? 'in' : 'out') as 'in' | 'out',
+        symbol: meta.symbol,
+        contract: t.contract,
+        logo: meta.logo,
+        std: t.std,
+        token_id: t.token_id,
+        amount: isNft ? `#${t.token_id}` : formatTokenAmount(t.amount, meta.decimals),
+        block: t.block,
+        timestamp: ts > 946684800000 ? ts : 0,
+      };
+    });
     
     // Balance from node (nanoQNC) — authoritative source
     let balance = 0;
@@ -220,6 +297,7 @@ export async function GET(
         lastActive: lastActive,
         tokens,
         transactions: txData,
+        tokenTransfers,
       },
     });
   } catch (err) {
@@ -237,6 +315,7 @@ export async function GET(
         lastActive: 0,
         tokens,
         transactions: [],
+        tokenTransfers: [],
       },
     }, { status: 500 });
   }

@@ -1023,6 +1023,8 @@ impl PersistentStorage {
                     let to_key = format!("addr_{}_{:016x}_{}", to, timestamp, tx.hash);
                     batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), tx.hash.as_bytes());
                 }
+                // QRC-20/721 counterparties are indexed from the success-gated transfer EVENTS
+                // (index_block_token_transfers), not from calldata intent — see the token_transfers index.
             }
 
             // Update chain height
@@ -3207,7 +3209,184 @@ impl PersistentStorage {
         
         Ok(transactions)
     }
-    
+
+    /// Index a block's success-gated token-transfer events (P1). Canonical row stored once under
+    /// `xfer_{height}_{log_index}`; from/to/contract pointer keys give O(hits) reverse prefix seeks.
+    /// Reuses the tx_by_address CF (prefix-isolated), off-consensus. Idempotent per (height,log_index):
+    /// a reorg re-apply overwrites the same keys.
+    pub fn index_token_transfers(&self, rows: &[TokenTransferRow]) -> IntegrationResult<()> {
+        if rows.is_empty() { return Ok(()); }
+        let cf = self.db.cf_handle("tx_by_address")
+            .ok_or_else(|| IntegrationError::StorageError("tx_by_address column family not found".to_string()))?;
+        let mut batch = WriteBatch::default();
+        for r in rows {
+            let canon = format!("xfer_{:016x}_{:08x}", r.height, r.log_index);
+            let val = serde_json::to_vec(r)
+                .map_err(|e| IntegrationError::StorageError(format!("xfer serialize: {}", e)))?;
+            batch.put_cf(&cf, canon.as_bytes(), &val);
+            if !r.from.is_empty() {
+                batch.put_cf(&cf, format!("xfeadr_{}_{:016x}_{:08x}", xfer_seg(&r.from), r.height, r.log_index).as_bytes(), canon.as_bytes());
+            }
+            if !r.to.is_empty() {
+                batch.put_cf(&cf, format!("xfeadr_{}_{:016x}_{:08x}", xfer_seg(&r.to), r.height, r.log_index).as_bytes(), canon.as_bytes());
+            }
+            batch.put_cf(&cf, format!("xfectr_{}_{:016x}_{:08x}", xfer_seg(&r.contract), r.height, r.log_index).as_bytes(), canon.as_bytes());
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Reverse (newest-first) prefix read of decoded transfer rows. `before` = the
+    /// `{height:016x}_{log_index:08x}` cursor of the last row already seen (None ⇒ newest). Bounded by
+    /// `limit` — a fixed O(limit) seek regardless of an address's lifetime volume.
+    fn read_token_transfers(&self, prefix: &str, limit: usize, before: Option<&str>) -> Vec<TokenTransferRow> {
+        let cf = match self.db.cf_handle("tx_by_address") { Some(c) => c, None => return Vec::new() };
+        let seek = match before {
+            Some(c) => format!("{}{}", prefix, c),
+            None => format!("{}~", prefix),
+        };
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::From(seek.as_bytes(), rocksdb::Direction::Reverse));
+        let mut out = Vec::new();
+        for item in iter {
+            let (key, value) = match item { Ok(kv) => kv, Err(_) => break };
+            let ks = match std::str::from_utf8(&key) { Ok(s) => s, Err(_) => break };
+            if !ks.starts_with(prefix) { break; }
+            // reverse-From starts AT an existing key — skip the cursor row itself.
+            if let Some(c) = before { if &ks[prefix.len()..] == c { continue; } }
+            if let Ok(Some(v)) = self.db.get_cf(&cf, &value) {
+                if let Ok(row) = serde_json::from_slice::<TokenTransferRow>(&v) { out.push(row); }
+            }
+            if out.len() >= limit { break; }
+        }
+        out
+    }
+
+    /// Decoded token transfers where `address` is the sender OR recipient (newest first).
+    pub fn get_token_transfers_by_address(&self, address: &str, limit: usize, before: Option<&str>) -> Vec<TokenTransferRow> {
+        self.read_token_transfers(&format!("xfeadr_{}_", xfer_seg(address)), limit, before)
+    }
+    /// Decoded token transfers for one contract (newest first).
+    pub fn get_token_transfers_by_contract(&self, contract: &str, limit: usize, before: Option<&str>) -> Vec<TokenTransferRow> {
+        self.read_token_transfers(&format!("xfectr_{}_", xfer_seg(contract)), limit, before)
+    }
+
+    /// Decoded token transfers in the height range [from,to] (block order) — for explorer ingestion.
+    /// Forward-scans only the canonical `xfer_` rows (pointer prefixes xfeadr_/xfectr_ sort before it).
+    /// `after` = the `{height:016x}_{log_index:08x}` cursor of the last row already returned (None ⇒
+    /// start of range); the scan resumes strictly AFTER it, so a single height holding more than `limit`
+    /// events pages cleanly instead of silently dropping the tail. Returns (rows, truncated); truncated
+    /// ⇒ another in-range row exists past this page (caller re-requests with `after` = last row's cursor).
+    pub fn get_token_transfers_in_range(&self, from: u64, to: u64, limit: usize, after: Option<&str>) -> (Vec<TokenTransferRow>, bool) {
+        let cf = match self.db.cf_handle("tx_by_address") { Some(c) => c, None => return (Vec::new(), false) };
+        // Seek at max(from, cursor): keys are zero-padded hex so lexical order == height order. Clamping
+        // to `from` stops a client-supplied cursor below `from` from forcing an unbounded pre-`from` scan.
+        let from_start = format!("xfer_{:016x}_", from);
+        let start = match after {
+            Some(c) => { let ac = format!("xfer_{}", c); if ac > from_start { ac } else { from_start } }
+            None => from_start,
+        };
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::From(start.as_bytes(), rocksdb::Direction::Forward));
+        let mut out = Vec::new();
+        let mut truncated = false;
+        for item in iter {
+            let (key, value) = match item { Ok(kv) => kv, Err(_) => break };
+            let ks = match std::str::from_utf8(&key) { Ok(s) => s, Err(_) => break };
+            if !ks.starts_with("xfer_") { break; }
+            let row = match serde_json::from_slice::<TokenTransferRow>(&value) { Ok(r) => r, Err(_) => continue };
+            if row.height > to { break; }
+            if row.height < from { continue; }
+            if let Some(c) = after { if &ks["xfer_".len()..] == c { continue; } } // skip the cursor row itself
+            if out.len() >= limit { truncated = true; break; } // an in-range row remains past the page
+            out.push(row);
+        }
+        (out, truncated)
+    }
+
+    /// Stage (into `batch`) deletes for every token-transfer index row (canonical + from/to/contract
+    /// pointers) at one height. Caller commits — so the guard delete rides the SAME atomic batch.
+    fn stage_clear_token_transfers_at_height(&self, height: u64, batch: &mut WriteBatch) {
+        let cf = match self.db.cf_handle("tx_by_address") { Some(c) => c, None => return };
+        let prefix = format!("xfer_{:016x}_", height);
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
+        for item in iter {
+            let (key, value) = match item { Ok(kv) => kv, Err(_) => break };
+            if !std::str::from_utf8(&key).map(|s| s.starts_with(&prefix)).unwrap_or(false) { break; }
+            if let Ok(r) = serde_json::from_slice::<TokenTransferRow>(&value) {
+                let suffix = format!("{:016x}_{:08x}", r.height, r.log_index);
+                if !r.from.is_empty() { batch.delete_cf(&cf, format!("xfeadr_{}_{}", xfer_seg(&r.from), suffix).as_bytes()); }
+                if !r.to.is_empty() { batch.delete_cf(&cf, format!("xfeadr_{}_{}", xfer_seg(&r.to), suffix).as_bytes()); }
+                batch.delete_cf(&cf, format!("xfectr_{}_{}", xfer_seg(&r.contract), suffix).as_bytes());
+            }
+            batch.delete_cf(&cf, &key);
+        }
+    }
+
+    /// Reorg-consistency: if height `h` was applied before (blocklogs_h present), wipe its block_logs +
+    /// token index so a re-applied replacement block fully overwrites BOTH — critical because gate-0
+    /// logs_root is consensus-committed and pointer rows are address-keyed (never height-overwritten).
+    /// The index clear AND the guard delete ride ONE atomic WriteBatch (RocksDB batches span CFs), so no
+    /// crash window can disarm the guard while stale pointer rows survive. Fresh forward height = cheap miss.
+    pub fn reset_block_token_data(&self, height: u64) {
+        let key = format!("blocklogs_{:010}", height);
+        let root_key = format!("blocklogsroot_{:010}", height);
+        // Fire if EITHER the logs blob OR the sub-root is present. A partial persist (one written, the
+        // other's save failed) must still be fully cleared before a re-applied block — else a stale
+        // sub-root survives a log-reducing reorg and the seal folds a WRONG window root vs peers.
+        let present = matches!(self.db.get(key.as_bytes()), Ok(Some(_)))
+            || matches!(self.db.get(root_key.as_bytes()), Ok(Some(_)));
+        if present {
+            let mut batch = WriteBatch::default();
+            self.stage_clear_token_transfers_at_height(height, &mut batch);
+            batch.delete(key.as_bytes()); // default-CF guard key, atomic with the index deletes above
+            batch.delete(root_key.as_bytes()); // drop the stale sub-root too
+            if let Err(e) = self.db.write(batch) {
+                if crate::node::is_warn() {
+                    println!("[WARN][LOGS] reset_block_token_data h={} err={} (reorg re-index may leave stale pointers until next reset)", height, e);
+                }
+            }
+        }
+    }
+
+    /// Retention: delete token-transfer index rows below `prune_before` (mirrors the tx_by_address /
+    /// blocklogs prune). Canonical rows are height-prefixed so the scan is bounded to the aged range;
+    /// capped per call so a backlog drains across cycles. Returns rows removed.
+    pub fn prune_token_transfers_below(&self, prune_before: u64) -> usize {
+        let cf = match self.db.cf_handle("tx_by_address") { Some(c) => c, None => return 0 };
+        let end = format!("xfer_{:016x}_", prune_before);
+        // Resume from the last-pruned height (watermark) rather than genesis, so a cycle doesn't re-skip
+        // rows it already deleted (RocksDB tombstones linger until compaction). Everything below the
+        // watermark is finalized+pruned, so no live row is skipped.
+        let wm = self.db.get(b"token_prune_wm").ok().flatten()
+            .and_then(|v| std::str::from_utf8(&v).ok().and_then(|s| s.parse::<u64>().ok())).unwrap_or(0);
+        let start = format!("xfer_{:016x}_", wm);
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::From(start.as_bytes(), rocksdb::Direction::Forward));
+        let mut batch = WriteBatch::default();
+        let mut n = 0usize;
+        let mut last_h = wm;
+        for item in iter {
+            let (key, value) = match item { Ok(kv) => kv, Err(_) => break };
+            let ks = match std::str::from_utf8(&key) { Ok(s) => s, Err(_) => break };
+            if !ks.starts_with("xfer_") || ks.as_bytes() >= end.as_bytes() { break; }
+            if let Ok(r) = serde_json::from_slice::<TokenTransferRow>(&value) {
+                last_h = r.height;
+                let suffix = format!("{:016x}_{:08x}", r.height, r.log_index);
+                if !r.from.is_empty() { batch.delete_cf(&cf, format!("xfeadr_{}_{}", xfer_seg(&r.from), suffix).as_bytes()); }
+                if !r.to.is_empty() { batch.delete_cf(&cf, format!("xfeadr_{}_{}", xfer_seg(&r.to), suffix).as_bytes()); }
+                batch.delete_cf(&cf, format!("xfectr_{}_{}", xfer_seg(&r.contract), suffix).as_bytes());
+            }
+            batch.delete_cf(&cf, &key);
+            n += 1;
+            if n >= 50_000 { break; }
+        }
+        if n > 0 {
+            // Fully drained the range ⇒ advance to prune_before; capped mid-range ⇒ resume at last height.
+            let new_wm = if n >= 50_000 { last_h } else { prune_before };
+            batch.put(b"token_prune_wm", new_wm.to_string().as_bytes());
+            let _ = self.db.write(batch);
+        }
+        n
+    }
+
     /// Count transactions for an address
     pub async fn count_transactions_by_address(&self, address: &str) -> IntegrationResult<usize> {
         let tx_by_addr_cf = self.db.cf_handle("tx_by_address")
@@ -3340,6 +3519,30 @@ pub enum CompressionLevel {
     Heavy,     // Zstd level 15
     /// Extreme compression for ancient data (> 365 days)
     Extreme,   // Zstd level 22
+}
+
+/// Hex-encode an address/contract segment of a token-index pointer key. Hex has no `_`, so an
+/// attacker-chosen recipient string can never be a `_`-boundary prefix of a distinct address in the
+/// reverse-prefix scan (prevents injecting a phantom row into a victim's token history).
+#[inline]
+fn xfer_seg(a: &str) -> String { hex::encode(a.as_bytes()) }
+
+/// One success-gated token-transfer event (P1 off-consensus index). `from`==""⇒mint, `to`==""⇒burn;
+/// `amount` is a decimal u128 string (qrc20) / "1" per NFT move. Not consensus state — mirrors the
+/// tx_by_address index and is rebuilt from block_logs on a fresh-genesis relaunch.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TokenTransferRow {
+    pub contract: String,
+    pub from: String,
+    pub to: String,
+    pub amount: String,
+    pub kind: String,
+    pub std: String,
+    pub token_id: String,
+    pub tx_hash: String,
+    pub log_index: u32,
+    pub height: u64,
+    pub timestamp: u64,
 }
 
 // NOTE: Delta Encoding was evaluated but removed in v2.19.10
@@ -4325,6 +4528,9 @@ impl Storage {
             let to_addr = tx.to.as_ref().map(|s| s.as_str()).unwrap_or(&tx.from);
             let to_key = format!("addr_{}_{:016x}_{}", to_addr, timestamp, tx_hash_str);
             batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), tx_hash_str.as_bytes());
+
+            // QRC-20/721 counterparties are indexed from the success-gated transfer EVENTS
+            // (index_block_token_transfers), not from calldata intent — see the token_transfers index.
         }
         
         // Log pattern compression results (every 100 blocks)
@@ -4926,6 +5132,26 @@ impl Storage {
     /// Count transactions for an address
     pub async fn count_transactions_by_address(&self, address: &str) -> IntegrationResult<usize> {
         self.persistent.count_transactions_by_address(address).await
+    }
+
+    /// P1 token-transfer index (forwarders to PersistentStorage).
+    pub fn index_token_transfers(&self, rows: &[TokenTransferRow]) -> IntegrationResult<()> {
+        self.persistent.index_token_transfers(rows)
+    }
+    pub fn get_token_transfers_by_address(&self, address: &str, limit: usize, before: Option<&str>) -> Vec<TokenTransferRow> {
+        self.persistent.get_token_transfers_by_address(address, limit, before)
+    }
+    pub fn get_token_transfers_by_contract(&self, contract: &str, limit: usize, before: Option<&str>) -> Vec<TokenTransferRow> {
+        self.persistent.get_token_transfers_by_contract(contract, limit, before)
+    }
+    pub fn get_token_transfers_in_range(&self, from: u64, to: u64, limit: usize, after: Option<&str>) -> (Vec<TokenTransferRow>, bool) {
+        self.persistent.get_token_transfers_in_range(from, to, limit, after)
+    }
+    pub fn reset_block_token_data(&self, height: u64) {
+        self.persistent.reset_block_token_data(height)
+    }
+    pub fn prune_token_transfers_below(&self, prune_before: u64) -> usize {
+        self.persistent.prune_token_transfers_below(prune_before)
     }
     
     /// Get recent transactions globally (paginated, newest first)
@@ -9772,6 +9998,7 @@ impl Storage {
             // bounded recent range (<< retention_blocks), so aged-out blocklogs are unreachable and
             // safe to drop. Default CF (save_raw); zero-padded key ⇒ lexicographically contiguous.
             batch.delete(format!("blocklogs_{:010}", h).as_bytes());
+            batch.delete(format!("blocklogsroot_{:010}", h).as_bytes()); // co-prune the per-block sub-root
         }
         batch.put_cf(&metadata_cf, WATERMARK_KEY, &prune_before.to_le_bytes());
         self.persistent.db.write(batch)?;
@@ -9787,8 +10014,11 @@ impl Storage {
             Some(format!("blocklogs_{:010}", from).as_bytes()),
             Some(format!("blocklogs_{:010}", prune_before).as_bytes()),
         );
+        // Co-prune the token-transfer index below the same floor (bounded per run; drains a backlog
+        // over cycles). Mirrors the tx_by_address retention so this index cannot grow unbounded.
+        let pruned_xfers = self.prune_token_transfers_below(prune_before);
         if crate::node::is_info() {
-            println!("[INFO][STORAGE] body_prune_compacted from={} to={}", from, prune_before);
+            println!("[INFO][STORAGE] body_prune_compacted from={} to={} xfer_index_pruned={}", from, prune_before, pruned_xfers);
         }
 
         Ok(prune_before - from)
@@ -11542,9 +11772,10 @@ impl Storage {
         self.persistent.save_raw(&key, value.as_bytes())
     }
 
-    /// OFF-CONSENSUS receipt store: persist a block's captured WASM event logs for RPC `getLogs`.
+    /// Receipt store: persist a block's captured WASM event logs for RPC `getLogs`.
     /// Keyed by height; value = bincode of `Vec<(tx_hash, contract_hex, data)>` in emit order.
-    /// NEVER hashed / never part of state_root — a pure side-index. No-op on an empty list.
+    /// Not part of state_root, but the leaves feed the gate-0 `logs_root` consensus commitment
+    /// (block_logs_root_of → collect_window_block_roots), so a persist/decode failure diverges this node's window logs_root.
     pub fn save_block_logs(&self, height: u64, logs: &[(String, String, Vec<u8>)]) -> IntegrationResult<()> {
         if logs.is_empty() { return Ok(()); }
         let key = format!("blocklogs_{:010}", height);
@@ -11553,12 +11784,37 @@ impl Storage {
         self.persistent.save_raw(&key, &bytes)
     }
 
-    /// Read one block's captured WASM logs (emit order), or empty if none/undecodable.
+    /// Read one block's captured WASM logs (emit order), or empty if none. A decode failure is fail-safe
+    /// (empty) but warns — it desyncs this node's consensus-committed logs_root.
     pub fn get_block_logs(&self, height: u64) -> Vec<(String, String, Vec<u8>)> {
         let key = format!("blocklogs_{:010}", height);
         match self.persistent.load_raw(&key) {
-            Ok(Some(bytes)) => bincode::deserialize(&bytes).unwrap_or_default(),
+            Ok(Some(bytes)) => match bincode::deserialize(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][LOGS] block_logs_decode_failed h={} err={} (logs_root may diverge)", height, e);
+                    }
+                    Vec::new()
+                }
+            },
             _ => Vec::new(),
+        }
+    }
+
+    /// Per-block logs SUB-ROOT (level 1 of the sharded logs commitment = `logs_merkle_root` over the
+    /// block's log leaves). Written at apply so the macroblock seal folds ~90 sub-roots via
+    /// `logs_window_root` (never a re-hash of the whole window), and a light-client `/logs/proof` reads
+    /// ONE block's leaves + the sub-roots — both O(one block), not O(window). Absent ⇒ log-less block ([0;32]).
+    pub fn save_block_logs_root(&self, height: u64, root: &[u8; 32]) -> IntegrationResult<()> {
+        let key = format!("blocklogsroot_{:010}", height);
+        self.persistent.save_raw(&key, root)
+    }
+    pub fn get_block_logs_root(&self, height: u64) -> Option<[u8; 32]> {
+        let key = format!("blocklogsroot_{:010}", height);
+        match self.persistent.load_raw(&key) {
+            Ok(Some(bytes)) if bytes.len() == 32 => { let mut r = [0u8; 32]; r.copy_from_slice(&bytes); Some(r) }
+            _ => None,
         }
     }
 

@@ -5,6 +5,32 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] "Token Transfers & Canonical Burn"
+
+### 🪙 Token-Transfer System (top-L1)
+- Success-gated QRC-20/721 transfer events folded into the 2f+1 QC-certified `logs_root` (active from genesis)
+- `token_transfers` node index (reorg-consistent, cursor-paged) + decoded RPC endpoints (`/account/{a}/token-transfers`, `/token/{c}/transfers`, `/token-transfers` range feed with `after`/`truncated`/`next_cursor`)
+- `/logs/proof`: light-client merkle inclusion proofs; mobile wallet verifies each history row trustlessly (leaf recomputed from the row's own fields and bound to the QC-anchored root)
+- Explorer: token transfers tab/pages, search suggest, TokenIcon, bounded reorg rollback + null-merkle tail revalidation, composite SQL indexes for hot addresses
+
+### 🔥 Canonical Burn Address
+- `0000000000000000000eon00000000000000036877022` — provably unspendable (all-zeros body, valid checksum)
+- QRC-20 transfer/transferFrom to it = real burn (supply reduced, works for non-burnable tokens, allowance consumed); QRC-721 = token destroyed with exact deposit refunds; native QNC = removed from circulation (`/public/stats` reports `burn_address` + `qnc_burned`)
+- 🔥 Burn labels in explorer and mobile wallet
+
+### 🛡️ Hardening
+- On-chain + explorer logo sanitizer (scheme + HTML-metacharacter guard, shared rule)
+- Atomic cross-CF reorg reset for block logs + token index (single WriteBatch)
+- Loadtest genesis prefund double-gated (`QNET_LOADTEST_ACCOUNTS` + `QNET_LOADTEST_ALLOW`)
+- External load-test harness `qnet-loadtest` (real `/transaction` path, included vs finalized TPS, finality latency, proof sampling)
+
+### 🔎 Pre-relaunch audit fixes
+- `/logs/proof`: reject a window straddling the log prune floor (`window_pruned`) instead of returning a truncated non-consensus `logs_root` — mirrors `getLogs` retention honesty
+- Mobile light-client: a QC-anchored `logs_root` **mismatch** (proven forgery) is now `rejected` (never confirmed), distinct from an honest below-floor "unprovable"; QC-verified rows render a ✓ trust badge
+- Mobile wallet: node-supplied token logo URLs are no longer loaded as `<Image>` (device-IP/timing-leak) — inert emoji or deterministic letter avatar only
+- Validator log-drain mirrors the producer's per-tx clear so `logs_root` commits successful-tx logs only; token-index prune resumes from a watermark (no tombstone re-scan)
+- Removed dead client-side seed-generator scaffold (derived keys from public data)
+
 ## [2.57.0] - December 28, 2025 "Stage Pipeline"
 
 ### ⚡ Full Runtime Isolation

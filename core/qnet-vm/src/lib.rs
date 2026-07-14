@@ -473,8 +473,16 @@ const MAX_WRITES_PER_FRAME: usize = 50_000;
 /// near-free. Without this, host-side log bytes escape wasm fuel metering entirely and a
 /// cheap ContractCall could persist unbounded data into the block-logs store.
 const MAX_LOG_DATA_BYTES: usize = 16_384;
-const LOG_FUEL_BASE: u64 = 375;
+// Raised from 375: at 375 a max-gas tx could emit thousands of events, and 90 such blocks build a
+// multi-million-leaf window merkle that every super-node reconstructs synchronously at the macroblock
+// seal (and the /logs/proof RPC rebuilds per request) — a paid emit_log-spam DoS. A higher base fuel
+// tightens the gas→event ratio; combined with MAX_LOGS_PER_TX it hard-bounds the window leaf count.
+const LOG_FUEL_BASE: u64 = 1_500;
 const LOG_FUEL_PER_BYTE: u64 = 8;
+// Hard deterministic cap on events emitted by ONE tx (whole call tree). Beyond it emit_log traps, the tx
+// reverts via the normal trapped-exec path (no partial logs committed), identical on producer + every
+// validator. Bounds the per-block and per-window logs_root merkle so log spam cannot inflate the seal.
+const MAX_LOGS_PER_TX: usize = 512;
 
 /// call_contract error codes (returned as negative i32 to the calling contract).
 pub const CALL_ERR_NOT_CONTRACT: i32 = -1; // target has no code / is not a contract
@@ -513,6 +521,9 @@ struct CallState {
     loaded: BTreeSet<Vec<u8>>,
     /// Contracts currently executing (reentrancy + depth bound).
     stack: Vec<Vec<u8>>,
+    /// Tree-wide emit_log counter for the MAX_LOGS_PER_TX cap — shared across every frame so child
+    /// emits (which bubble into the parent via logs.extend, bypassing the emit_log binding) still count.
+    logs_emitted: usize,
 }
 
 impl CallState {
@@ -654,6 +665,17 @@ fn bind_frame_host(linker: &mut wasmi::Linker<FrameHost>) -> Result<(), wasmi::E
 
     linker.func_wrap("env", "emit_log",
         |mut caller: wasmi::Caller<'_, FrameHost>, dp: i32, dl: i32| -> Result<(), wasmi::Error> {
+            // Deterministic per-TX event cap over the WHOLE call tree. The counter lives on the shared
+            // CallState (one Rc across every frame), so child-frame emits — which bubble up via logs.extend
+            // and never re-enter this binding — are still counted. Trapping reverts the tx (the trapped
+            // path drops all frame logs), hard-bounding the window logs_root merkle regardless of
+            // cross-contract fan-out. Per-frame `logs.len()` was NOT enough (each frame reset to 0).
+            {
+                let st = caller.data().state.clone();
+                let mut s = st.borrow_mut();
+                if s.logs_emitted >= MAX_LOGS_PER_TX { return Err(trap("emit_log TooManyLogs")); }
+                s.logs_emitted += 1;
+            }
             let mem = host_memory(&caller)?;
             let data = mem_read(&caller, &mem, dp, dl)?;
             charge_log_fuel(&mut caller, data.len())?;
@@ -779,7 +801,7 @@ pub fn execute_call_tree(
     let code = match resolver.code(entry_addr) { Some(c) => c, None => return empty(true, 0) };
     let state = Rc::new(RefCell::new(CallState {
         resolver, engine, base: BTreeMap::new(), delta: BTreeMap::new(),
-        loaded: BTreeSet::new(), stack: vec![entry_addr.to_vec()],
+        loaded: BTreeSet::new(), stack: vec![entry_addr.to_vec()], logs_emitted: 0,
     }));
     let res = run_frame(state.clone(), &code, entry_name, entry_addr.to_vec(),
                         caller.to_vec(), value, block_height, args, fuel);
@@ -1087,6 +1109,40 @@ mod p5_cross_contract_tests {
             (b"B".as_slice(), b"Blog".as_slice()),
             (b"A".as_slice(), b"Alog2".as_slice()),
         ]);
+    }
+
+    #[test]
+    fn tree_wide_log_cap_bounds_cross_contract_fanout() {
+        // A emits 300 events AND calls B which emits 300 (600 > MAX_LOGS_PER_TX). A PER-FRAME cap would
+        // let both frames through (600 committed leaves); the tree-wide counter on the shared CallState
+        // traps once the 512th event fires anywhere in the tree, so the tx commits at most the cap — the
+        // DoS bound that keeps the window logs_root merkle bounded regardless of cross-contract fan-out.
+        // Locks against a regression back to per-frame `logs.len()`.
+        const EMIT_300: &str = r#"(module
+            (import "env" "emit_log" (func $log (param i32 i32)))
+            (memory (export "memory") 1)
+            (func (export "run") (local $i i32)
+                (loop $l
+                    (call $log (i32.const 0)(i32.const 1))
+                    (local.set $i (i32.add (local.get $i)(i32.const 1)))
+                    (br_if $l (i32.lt_u (local.get $i)(i32.const 300))))))"#;
+        const A_EMIT_AND_CALL_B: &str = r#"(module
+            (import "env" "emit_log" (func $log (param i32 i32)))
+            (import "env" "call_contract" (func $call (param i32 i32 i32 i32 i32 i32 i64 i32 i32)(result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "Brun")
+            (func (export "run") (local $i i32)
+                (drop (call $call (i32.const 0)(i32.const 1) (i32.const 1)(i32.const 3)
+                                  (i32.const 0)(i32.const 0) (i64.const 0) (i32.const 128)(i32.const 0)))
+                (loop $l
+                    (call $log (i32.const 0)(i32.const 1))
+                    (local.set $i (i32.add (local.get $i)(i32.const 1)))
+                    (br_if $l (i32.lt_u (local.get $i)(i32.const 300))))))"#;
+        let r = MapResolver::new().with(b"A", A_EMIT_AND_CALL_B).with(b"B", EMIT_300);
+        // Ample fuel so the CAP, not fuel exhaustion, is what bounds the log count.
+        let o = execute_call_tree(Rc::new(r), b"A", "run", b"tester", 0, 42, Vec::new(), 50_000_000);
+        assert!(o.logs.len() <= MAX_LOGS_PER_TX,
+            "tree-wide cap must bound total committed logs across frames (got {})", o.logs.len());
     }
 
     // Callee that writes then reverts (its write + log must be dropped).

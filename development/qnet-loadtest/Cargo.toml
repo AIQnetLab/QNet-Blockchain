@@ -1,0 +1,27 @@
+[package]
+name = "qnet-loadtest"
+version = "0.1.0"
+edition = "2021"
+description = "QNet external load-test harness: real /transaction confirmed-TPS + finality-latency measurement"
+license = "MIT"
+
+[[bin]]
+name = "qnet-loadtest"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.195", features = ["derive"] }
+serde_json = "1.0.111"
+sha2 = "0.10.8"
+sha3 = "0.10.8"
+hex = "0.4.3"
+base64 = "0.21"
+clap = { version = "4.4.0", features = ["derive"] }
+rand = "0.8.5"
+# Deterministic ML-DSA-65 keygen (matches node crypto/genesis_key.rs) + signing
+# on the same pqcrypto-mldsa backend the node verifies with (KAT byte-compatible).
+fips204 = "0.4.6"
+pqcrypto-mldsa = "0.1"
+pqcrypto-traits = "0.3"

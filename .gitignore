@@ -687,3 +687,9 @@ dev-scratch/
 # Build artifacts (never track)
 *.rlib
 *.tsbuildinfo
+
+# Explorer app TypeScript source libs are real code, not Python build artifacts (override the generic `lib/` ignore above)
+!applications/qnet-explorer/frontend/lib/
+!applications/qnet-explorer/frontend/lib/**
+!applications/qnet-explorer/frontend/src/lib/
+!applications/qnet-explorer/frontend/src/lib/**

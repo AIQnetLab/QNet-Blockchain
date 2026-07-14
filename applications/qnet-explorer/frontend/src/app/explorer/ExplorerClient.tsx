@@ -3,6 +3,7 @@
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Link from 'next/link';
 import { batchCache, getListCache, setListCache, noteChainHeight } from '@/lib/explorer-cache';
+import TokenIcon from '@/components/TokenIcon';
 
 // ============================================================================
 // v4.0: SSR-powered Explorer Client
@@ -20,6 +21,10 @@ interface ActivityItem {
   block: number;
   time: string;
   timestamp: number;
+  // Set on QRC-20 token-interaction rows so the row shows the token's icon (SSR-resolved).
+  tokenContract?: string;
+  tokenSymbol?: string;
+  tokenLogo?: string;
 }
 
 export interface ExplorerClientProps {
@@ -83,7 +88,14 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
           <span className="addr">{item.to || 'N/A'}</span>
         )}
       </td>
-      <td className="col-amount">{item.amount}</td>
+      <td className="col-amount">
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          {item.tokenContract
+            ? <TokenIcon logo={item.tokenLogo} symbol={item.tokenSymbol} address={item.tokenContract} size={16} />
+            : item.type === 'Transfer' && <TokenIcon native size={16} />}
+          <span>{item.amount}</span>
+        </span>
+      </td>
       <td className="col-block">
         <Link href={`/explorer/block/${item.block}`}>{item.block}</Link>
       </td>
@@ -106,6 +118,13 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
   const [loading, setLoading] = useState(false); // SSR data ready — no loading spinner
   const [hasFetched, setHasFetched] = useState(initialData.length > 0);
   const [searchQuery, setSearchQuery] = useState('');
+  // Live search dropdown (top-L1 unified search): debounced suggestions as you type.
+  const [suggestions, setSuggestions] = useState<{ type: string; label: string; sublabel?: string; href: string; symbol?: string; address?: string; logo?: string }[]>([]);
+  const [showSuggest, setShowSuggest] = useState(false);
+  const [activeSuggest, setActiveSuggest] = useState(-1);
+  const [suggestLoading, setSuggestLoading] = useState(false);
+  const suggestTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const suggestAbort = useRef<AbortController | null>(null);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(Math.ceil(initialTotal / ITEMS_PER_PAGE) || 1);
   const [totalCount, setTotalCount] = useState(initialTotal);
@@ -277,30 +296,48 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
     setPage(1);
   };
 
-  const handleSearch = async () => {
-    if (!searchQuery.trim()) return;
+  const goToResult = (href: string) => { window.location.href = href; };
+
+  // Debounced live suggestions: fetch /api/search/suggest as the user types; abort
+  // stale requests so a fast typist never lands on an out-of-order response.
+  useEffect(() => {
     const q = searchQuery.trim();
-    // Unified resolver: one box → tx | block | address | token (folds token lookup
-    // into search, so no separate Tokens nav is needed to reach a token page).
-    try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
-      const data = await res.json();
-      if (data?.success && typeof data.href === 'string') {
-        window.location.href = data.href;
-        return;
+    if (suggestTimer.current) clearTimeout(suggestTimer.current);
+    if (!q) { setSuggestions([]); setShowSuggest(false); setSuggestLoading(false); return; }
+    setSuggestLoading(true);
+    suggestTimer.current = setTimeout(async () => {
+      suggestAbort.current?.abort();
+      const ac = new AbortController();
+      suggestAbort.current = ac;
+      try {
+        const res = await fetch(`/api/search/suggest?q=${encodeURIComponent(q)}`, { signal: ac.signal });
+        const data = await res.json();
+        if (!ac.signal.aborted) {
+          setSuggestions(Array.isArray(data?.results) ? data.results : []);
+          setShowSuggest(true);
+          setActiveSuggest(-1);
+        }
+      } catch {
+        if (!ac.signal.aborted) { setSuggestions([]); setShowSuggest(true); }
+      } finally {
+        if (!ac.signal.aborted) setSuggestLoading(false);
       }
-    } catch {
-      // resolver unavailable → client heuristic below (token lookup degrades to tx)
-    }
-    if (q.length === 64 && /^[0-9A-Fa-f]+$/.test(q)) {
-      window.location.href = `/explorer/tx/${q}`;
-    } else if (q.length >= 38 && q.includes('eon')) {
-      window.location.href = `/explorer/address/${q}`;
-    } else if (/^\d+$/.test(q)) {
-      window.location.href = `/explorer/block/${q}`;
-    } else {
-      window.location.href = `/explorer/tx/${q}`;
-    }
+    }, 250);
+    return () => { if (suggestTimer.current) clearTimeout(suggestTimer.current); };
+  }, [searchQuery]);
+
+  // Enter / search-button: go to the highlighted (or first) suggestion. With no
+  // suggestion yet, resolve ONLY unambiguous shapes directly — free text with no
+  // token match stays on the "Nothing found" dropdown instead of a broken /tx/{q}.
+  const handleSearch = () => {
+    const pick = activeSuggest >= 0 ? suggestions[activeSuggest] : suggestions[0];
+    if (pick) { goToResult(pick.href); return; }
+    const q = searchQuery.trim();
+    if (!q) return;
+    if (/^\d+$/.test(q)) goToResult(`/explorer/block/${q}`);
+    else if (q.length === 64 && /^[0-9A-Fa-f]+$/.test(q)) goToResult(`/explorer/tx/${q}`);
+    else if (q.length >= 38 && q.toLowerCase().includes('eon')) goToResult(`/explorer/address/${q}`);
+    // else: free text, no token match → keep the dropdown ("Nothing found").
   };
 
   // ========== RENDER ==========
@@ -312,13 +349,22 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
         <p suppressHydrationWarning>All transactions from Genesis to Now • Block Height: {currentHeight || '...'}</p>
       </div>
 
-      <div className="explorer-search">
+      <div className="explorer-search" style={{ position: 'relative' }}>
         <input
           type="text"
           placeholder="Search by token, TX hash, block, or address..."
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+          onFocus={() => { if (searchQuery.trim() && suggestions.length) setShowSuggest(true); }}
+          onBlur={() => setTimeout(() => setShowSuggest(false), 150)}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowDown') { e.preventDefault(); setShowSuggest(true); setActiveSuggest((i) => Math.min(i + 1, suggestions.length - 1)); }
+            else if (e.key === 'ArrowUp') { e.preventDefault(); setActiveSuggest((i) => Math.max(i - 1, 0)); }
+            else if (e.key === 'Enter') { handleSearch(); }
+            else if (e.key === 'Escape') { setShowSuggest(false); }
+          }}
+          autoComplete="off"
+          spellCheck={false}
         />
         <button className="search-btn" type="button" onClick={handleSearch}>
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -326,6 +372,47 @@ export default function ExplorerClient({ initialData, initialHeight, initialTota
             <path d="M16.5 16.5L21 21" stroke="#00e5f0" strokeWidth="2" strokeLinecap="round"/>
           </svg>
         </button>
+        {showSuggest && searchQuery.trim() && (
+          <div style={{
+            position: 'absolute', top: 'calc(100% + 6px)', left: 0, right: 0, zIndex: 50,
+            background: 'rgba(8, 20, 28, 0.98)', border: '1px solid rgba(0, 229, 240, 0.35)',
+            borderRadius: 10, boxShadow: '0 12px 32px rgba(0,0,0,0.55)',
+            overflow: 'hidden', maxHeight: 360, overflowY: 'auto', textAlign: 'left',
+          }}>
+            {suggestLoading && suggestions.length === 0 && (
+              <div style={{ padding: '12px 16px', color: '#7fa8b0', fontSize: 14 }}>Searching…</div>
+            )}
+            {!suggestLoading && suggestions.length === 0 && (
+              <div style={{ padding: '12px 16px', color: '#7fa8b0', fontSize: 14 }}>Nothing found</div>
+            )}
+            {suggestions.map((s, i) => (
+              <div
+                key={`${s.type}-${s.href}-${i}`}
+                onMouseDown={(e) => { e.preventDefault(); goToResult(s.href); }}
+                onMouseEnter={() => setActiveSuggest(i)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', cursor: 'pointer',
+                  background: i === activeSuggest ? 'rgba(0, 229, 240, 0.12)' : 'transparent',
+                  borderTop: i === 0 ? 'none' : '1px solid rgba(255,255,255,0.05)',
+                }}
+              >
+                {s.type === 'token' ? (
+                  <TokenIcon logo={s.logo} symbol={s.symbol} address={s.address} size={24} />
+                ) : (
+                  <span style={{
+                    fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.5px', fontWeight: 700,
+                    padding: '2px 7px', borderRadius: 5, color: '#04141a', flexShrink: 0,
+                    background: s.type === 'tx' ? '#8b9dff' : s.type === 'block' ? '#7CFFB2' : '#ffd166',
+                  }}>{s.type}</span>
+                )}
+                <span style={{ color: '#e6f7fa', fontWeight: 600, fontSize: 14 }}>{s.label}</span>
+                {s.sublabel && (
+                  <span style={{ color: '#7fa8b0', fontSize: 12, marginLeft: 'auto', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '55%' }}>{s.sublabel}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="explorer-activity">

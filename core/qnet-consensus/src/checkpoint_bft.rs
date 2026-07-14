@@ -243,16 +243,12 @@ pub struct Checkpoint {
     /// node_registry — the source of cbw and attestor VRF keys — against this committed root,
     /// closing the forgeable-snapshot Sybil/fork vector.
     pub registry_root: Hash,
-    /// RESERVED QC-signed merkle root over the WASM event logs in this checkpoint's window.
-    /// Deterministically [0;32] on every node TODAY: although the contract VM is ENABLED and
-    /// contracts do emit logs (qnet_vm::emit_log), those logs are consumed off-consensus at
-    /// apply and are NOT yet threaded into the window seal — so this stays uncommitted. It is
-    /// reserved in the QC-signed hash from genesis so activation is a value change, never a
-    /// consensus wire-format migration. Activation (producer feeds `logs_merkle_root(window_logs)`,
-    /// 2f+1 certify it exactly like reward_root, giving trustless light-client event proofs)
-    /// requires the window logs to be recomputed BYTE-IDENTICALLY on the verifier side
-    /// (content_ok's WindowContent) so a producer/verifier mismatch can never reach 2f+1, plus
-    /// a live multi-node equivalence run — the same bar state_root/reward_root cleared.
+    /// QC-signed merkle root over this window's committed event logs — native QRC-20/721 transfers +
+    /// WASM emit_log. ACTIVE from genesis (`logs_root_required` gate=0): the producer feeds
+    /// logs_merkle_root(window logs), content_ok's WindowContent recomputes it BYTE-IDENTICALLY, and
+    /// 2f+1 certify it exactly like reward_root — giving trustless light-client event proofs. CONSENSUS-
+    /// CRITICAL: block_logs must be byte-identical across the validator + producer drain paths, else
+    /// this root diverges and the macroblock QC never reaches 2f+1. [0;32] only for a log-less window.
     pub logs_root: Hash,
     /// QC-signed total minted supply as of window_head_height. The apply-accumulated
     /// emission total (genesis=0, monotonic +emit_rewards). QC-signed ⇒ 2f+1 certify it ⇒
@@ -294,10 +290,10 @@ impl Checkpoint {
     }
 }
 
-/// Merkle root over an ordered WASM-log list, domain-separated from `sig_merkle_root`.
-/// `[0;32]` for an empty window — the invariant while the contract VM is gated OFF, so
-/// every node produces the same root deterministically. The QC binds it into
-/// `Checkpoint.logs_root`; a light client verifies one log against the root + a sample.
+/// Merkle root over an ordered event-log list (native QRC-20/721 transfers + WASM emit_log),
+/// domain-separated from `sig_merkle_root`. `[0;32]` only for a log-less window; deterministic on
+/// every node. The QC binds it into `Checkpoint.logs_root`; a light client verifies one log via
+/// logs_merkle_proof against the root.
 pub fn logs_merkle_root(logs: &[Vec<u8>]) -> Hash {
     if logs.is_empty() { return [0u8; 32]; }
     let mut layer: Vec<Hash> = logs.iter().map(|l| {
@@ -315,6 +311,135 @@ pub fn logs_merkle_root(logs: &[Vec<u8>]) -> Hash {
         layer = next;
     }
     layer[0]
+}
+
+/// Merkle inclusion proof for leaf `index` in the ordered log list — mirrors `logs_merkle_root`'s tree
+/// (leaf = sha3("log-leaf"||l), node = sha3("log-node"||L||R), odd tail duplicated). Returns the sibling
+/// hash + side (`true` = sibling on the RIGHT) at each level, leaf→root. Empty if `index` out of range.
+pub fn logs_merkle_proof(logs: &[Vec<u8>], index: usize) -> Vec<(Hash, bool)> {
+    logs_merkle_proof_with_root(logs, index).0
+}
+
+/// Single tree build returning both the proof and the root — the proof RPC needs both without
+/// rebuilding the tree twice. Byte-identical proof to `logs_merkle_proof` (empty if out of range).
+pub fn logs_merkle_proof_with_root(logs: &[Vec<u8>], index: usize) -> (Vec<(Hash, bool)>, Hash) {
+    if logs.is_empty() { return (Vec::new(), [0u8; 32]); }
+    let mut layer: Vec<Hash> = logs.iter().map(|l| {
+        let mut h = Sha3_256::new(); h.update(b"log-leaf"); h.update(l); h.finalize().into()
+    }).collect();
+    let want_proof = index < logs.len();
+    let mut idx = index;
+    let mut proof = Vec::new();
+    while layer.len() > 1 {
+        if want_proof {
+            let sib = if idx % 2 == 0 {
+                (if idx + 1 < layer.len() { layer[idx + 1] } else { layer[idx] }, true) // right sibling (or self on odd tail)
+            } else {
+                (layer[idx - 1], false) // left sibling
+            };
+            proof.push(sib);
+        }
+        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+        for pair in layer.chunks(2) {
+            let mut h = Sha3_256::new();
+            h.update(b"log-node");
+            h.update(pair[0]);
+            h.update(if pair.len() == 2 { pair[1] } else { pair[0] });
+            next.push(h.finalize().into());
+        }
+        layer = next;
+        idx /= 2;
+    }
+    (proof, layer[0])
+}
+
+/// Verify a logs inclusion proof: recompute the root from the RAW leaf + sibling path, compare to `root`.
+/// A light client uses this to prove one transfer against a QC-anchored `Checkpoint.logs_root`.
+pub fn verify_logs_merkle_proof(raw_leaf: &[u8], proof: &[(Hash, bool)], root: &Hash) -> bool {
+    let mut cur: Hash = { let mut h = Sha3_256::new(); h.update(b"log-leaf"); h.update(raw_leaf); h.finalize().into() };
+    for (sib, sib_is_right) in proof {
+        let mut h = Sha3_256::new();
+        h.update(b"log-node");
+        if *sib_is_right { h.update(cur); h.update(sib); } else { h.update(sib); h.update(cur); }
+        cur = h.finalize().into();
+    }
+    &cur == root
+}
+
+// ── Sharded (per-block) logs commitment ─────────────────────────────────────────────────────────────
+// LEVEL 2. `Checkpoint.logs_root` is a Merkle root over the ORDERED per-block sub-roots of a macroblock
+// window — each sub-root = `logs_merkle_root(block_logs)` (level 1; `[0;32]` for a log-less block). This
+// is what makes proofs SCALE: sub-roots are computed once as each block applies and stored, so the seal
+// is a tiny root over ~90 sub-roots (not a re-hash of the whole window), and a light-client proof =
+// level-1 (leaf→block_root) + level-2 (block_root→window_root), each touching ONE block — serving and
+// verifying are O(one block), never O(window). Domain `logw-*` is separate from the leaf level `log-*`
+// so a block sub-root can never be reinterpreted as a leaf.
+
+/// Merkle root over the ordered per-block sub-roots → the window's committed `logs_root`. `[0;32]` only
+/// for an empty block set. Deterministic on every node (same sub-roots, same order).
+pub fn logs_window_root(block_roots: &[Hash]) -> Hash {
+    if block_roots.is_empty() { return [0u8; 32]; }
+    let mut layer: Vec<Hash> = block_roots.iter().map(|r| {
+        let mut h = Sha3_256::new(); h.update(b"logw-leaf"); h.update(r); h.finalize().into()
+    }).collect();
+    while layer.len() > 1 {
+        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+        for pair in layer.chunks(2) {
+            let mut h = Sha3_256::new();
+            h.update(b"logw-node");
+            h.update(pair[0]);
+            h.update(if pair.len() == 2 { pair[1] } else { pair[0] });
+            next.push(h.finalize().into());
+        }
+        layer = next;
+    }
+    layer[0]
+}
+
+/// Level-2 inclusion proof: sibling path from block `index`'s sub-root up to `logs_window_root`. Returns
+/// (path, window_root); mirrors `logs_merkle_proof_with_root` with the `logw-*` domain.
+pub fn logs_window_proof_with_root(block_roots: &[Hash], index: usize) -> (Vec<(Hash, bool)>, Hash) {
+    if block_roots.is_empty() { return (Vec::new(), [0u8; 32]); }
+    let mut layer: Vec<Hash> = block_roots.iter().map(|r| {
+        let mut h = Sha3_256::new(); h.update(b"logw-leaf"); h.update(r); h.finalize().into()
+    }).collect();
+    let want_proof = index < block_roots.len();
+    let mut idx = index;
+    let mut proof = Vec::new();
+    while layer.len() > 1 {
+        if want_proof {
+            let sib = if idx % 2 == 0 {
+                (if idx + 1 < layer.len() { layer[idx + 1] } else { layer[idx] }, true) // right sibling (or self on odd tail)
+            } else {
+                (layer[idx - 1], false) // left sibling
+            };
+            proof.push(sib);
+        }
+        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+        for pair in layer.chunks(2) {
+            let mut h = Sha3_256::new();
+            h.update(b"logw-node");
+            h.update(pair[0]);
+            h.update(if pair.len() == 2 { pair[1] } else { pair[0] });
+            next.push(h.finalize().into());
+        }
+        layer = next;
+        idx /= 2;
+    }
+    (proof, layer[0])
+}
+
+/// Verify a level-2 proof: fold block `sub_root` up the sibling path, compare to `window_root`. Pair with
+/// `verify_logs_merkle_proof` (level 1) to prove one log against a QC-anchored `Checkpoint.logs_root`.
+pub fn verify_logs_window_proof(sub_root: &Hash, proof: &[(Hash, bool)], window_root: &Hash) -> bool {
+    let mut cur: Hash = { let mut h = Sha3_256::new(); h.update(b"logw-leaf"); h.update(sub_root); h.finalize().into() };
+    for (sib, sib_is_right) in proof {
+        let mut h = Sha3_256::new();
+        h.update(b"logw-node");
+        if *sib_is_right { h.update(cur); h.update(sib); } else { h.update(sib); h.update(cur); }
+        cur = h.finalize().into();
+    }
+    &cur == window_root
 }
 
 /// Merkle root over an ordered signature list (light clients verify root + sample).
@@ -497,7 +622,7 @@ mod tests {
         assert_ne!(a.hash(), b.hash());
         // logs_root MUST be bound too: at VM activation the QC certifies the window's WASM-log
         // root, so a checkpoint differing only in logs_root must hash differently (else a
-        // proposer-chosen log root would ride uncertified). [0;32] while gated OFF.
+        // proposer-chosen log root would ride uncertified). Active from genesis (gate=0).
         let mut la = c.clone();
         la.logs_root = h(0);
         let mut lb = la.clone();
@@ -516,6 +641,53 @@ mod tests {
         assert_ne!(logs_merkle_root(&logs), sig_merkle_root(&logs));
         let reordered = vec![b"bb".to_vec(), b"a".to_vec(), b"ccc".to_vec()];
         assert_ne!(logs_merkle_root(&logs), logs_merkle_root(&reordered));
+    }
+
+    #[test]
+    fn logs_merkle_proof_verifies_for_every_index_and_size() {
+        // Every leaf's proof must recompute the exact logs_merkle_root — across sizes that hit the
+        // odd-tail duplicate path (1,2,3,5,8). A tampered leaf/root must fail.
+        for n in [1usize, 2, 3, 5, 8] {
+            let logs: Vec<Vec<u8>> = (0..n).map(|i| format!("leaf-{}", i).into_bytes()).collect();
+            let root = logs_merkle_root(&logs);
+            for i in 0..n {
+                let proof = logs_merkle_proof(&logs, i);
+                assert!(verify_logs_merkle_proof(&logs[i], &proof, &root), "size={} idx={}", n, i);
+                assert!(!verify_logs_merkle_proof(b"forged", &proof, &root), "forged leaf must fail size={} idx={}", n, i);
+            }
+        }
+        assert!(logs_merkle_proof(&[b"x".to_vec()], 5).is_empty()); // out-of-range
+    }
+
+    #[test]
+    fn sharded_logs_two_level_proof_round_trips() {
+        // 5 blocks, varying leaf counts incl. empty (→ [0;32] sub-root). Prove one leaf via level-1
+        // (leaf→block_root) THEN level-2 (block_root→window_root); confirm it folds to logs_window_root.
+        // A forged leaf breaks L1; a tampered sub-root breaks L2. This is the SCALE property: each proof
+        // rebuilds only ONE block (level 1) + folds ~90 sub-roots (level 2), never the whole window.
+        let blocks: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"a0".to_vec(), b"a1".to_vec(), b"a2".to_vec()],
+            vec![],
+            vec![b"c0".to_vec()],
+            vec![b"d0".to_vec(), b"d1".to_vec()],
+            vec![],
+        ];
+        let sub_roots: Vec<Hash> = blocks.iter().map(|b| logs_merkle_root(b)).collect();
+        let window_root = logs_window_root(&sub_roots);
+        assert_eq!(window_root, logs_window_root(&sub_roots), "window root must be deterministic");
+        assert_ne!(window_root, [0u8; 32], "non-empty block set ⇒ non-zero window root");
+        for (bi, block) in blocks.iter().enumerate() {
+            let (l2, wr) = logs_window_proof_with_root(&sub_roots, bi);
+            assert_eq!(wr, window_root, "level-2 build must match window root, block {}", bi);
+            assert!(verify_logs_window_proof(&sub_roots[bi], &l2, &window_root), "L2 verify block {}", bi);
+            assert!(!verify_logs_window_proof(&[9u8; 32], &l2, &window_root), "tampered sub-root must fail, block {}", bi);
+            for li in 0..block.len() {
+                let (l1, block_root) = logs_merkle_proof_with_root(block, li);
+                assert_eq!(block_root, sub_roots[bi], "level-1 root == stored sub-root");
+                assert!(verify_logs_merkle_proof(&block[li], &l1, &block_root), "L1 verify b{} l{}", bi, li);
+                assert!(!verify_logs_merkle_proof(b"forged", &l1, &block_root), "forged leaf must fail b{} l{}", bi, li);
+            }
+        }
     }
 
     #[test]

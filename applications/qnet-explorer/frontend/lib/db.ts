@@ -612,6 +612,61 @@ export async function searchQrc20DeploysByText(needle: string, limit: number = 2
   return result.rows;
 }
 
+// ============================================================================
+// TOKEN TRANSFERS (decoded, effect-sourced index — populated by sync-service)
+// ============================================================================
+
+// One decoded transfer log. `amount` is a u64 base-unit value; PostgreSQL returns
+// NUMERIC as a string, so it stays exact past 2^53 — scale it with the token's
+// decimals via formatTokenAmount, never Number(). from==''⇒mint, to==''⇒burn.
+export interface TokenTransferRow {
+  tx_hash: string;
+  log_index: number;
+  contract: string;
+  from_address: string;
+  to_address: string;
+  amount: string;
+  kind: string;
+  std: string;
+  token_id: string;
+  block: number;
+  timestamp: number;
+}
+
+// All transfers touching an address (as sender or recipient), newest first. A UNION of two single-column
+// branches — not `from = $1 OR to = $1` — so each side is an index-ordered, LIMIT-bounded scan on its
+// (address, block DESC, log_index DESC) composite index (an OR across two columns cannot use either index
+// for ordering and forces a full BitmapOr fetch + sort). UNION dedupes a self-transfer (from == to == $1).
+export async function getAddressTokenTransfers(address: string, limit: number = 50): Promise<TokenTransferRow[]> {
+  validateAddress(address);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) limit = 50;
+  const result = await query<TokenTransferRow>(
+    `SELECT * FROM (
+       (SELECT * FROM token_transfers WHERE from_address = $1 ORDER BY block DESC, log_index DESC LIMIT $2)
+       UNION
+       (SELECT * FROM token_transfers WHERE to_address = $1 ORDER BY block DESC, log_index DESC LIMIT $2)
+     ) u
+     ORDER BY block DESC, log_index DESC
+     LIMIT $2`,
+    [address, limit]
+  );
+  return result.rows;
+}
+
+// All transfers of one token contract, newest first.
+export async function getContractTokenTransfers(contract: string, limit: number = 50): Promise<TokenTransferRow[]> {
+  validateAddress(contract);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) limit = 50;
+  const result = await query<TokenTransferRow>(
+    `SELECT * FROM token_transfers
+     WHERE contract = $1
+     ORDER BY block DESC, log_index DESC
+     LIMIT $2`,
+    [contract, limit]
+  );
+  return result.rows;
+}
+
 export async function closePool(): Promise<void> {
   if (pool) {
     await pool.end();

@@ -1,15 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getTransactionsByAddress } from '../../../../../lib/db';
+import { getContractTokenTransfers } from '../../../../../lib/db';
 import { formatTokenAmount } from '@/lib/token-format';
-import { formatAmount } from '@/lib/tx-mapping';
+import { sanitizeLogo } from '@/lib/sanitize-logo';
 
 // ============================================================================
 // QRC-20 token detail: node /api/v1/token/{contract} + recent transfers
 // ============================================================================
 // Reuses the same NODE_API env + header pattern as the address route (single
 // source of truth for on-chain token metadata). Recent transfers come from the
-// explorer's PostgreSQL index (getTransactionsByAddress on the contract address
-// returns every ContractCall whose `to` is this contract).
+// explorer's effect-sourced token_transfers index (real transfer logs, not
+// decoded calldata intent).
 
 const NODE_API = process.env.QNET_API_URL || 'https://162.244.25.114:8001';
 const API_KEY = process.env.QNET_API_KEY || '';
@@ -27,6 +27,7 @@ interface TokenInfo {
   name: string;
   symbol: string;
   decimals: number;
+  logo: string;           // on-chain logo (emoji / https URL); '' ⇒ client renders a generated avatar
   total_supply: string;   // formatted by the token's own decimals
   total_supply_raw: string;
   total_minted: string;   // lifetime minted, formatted
@@ -37,43 +38,17 @@ interface TokenInfo {
 
 interface TokenTransfer {
   hash: string;
-  from: string;
-  to: string;          // transfer recipient (decoded from tx data), NOT the contract
-  amount: string;      // formatted by the token's own decimals
-  amountRaw: string;
-  method: string;      // transfer | transferFrom | mint | burn | approve | ...
+  from: string;        // '' ⇒ mint
+  to: string;          // '' ⇒ burn
+  std: string;         // qrc20 | qrc721
+  token_id: string;    // NFT id (qrc721); '' for qrc20
+  amount: string;      // qrc20: formatted by decimals; qrc721: "#<token_id>"
+  amountRaw: string;   // u64 base-unit digit string (exact)
+  method: string;      // transfer | mint | burn
   block: number;
   timestamp: number;
   status: string;
-  fee: string;         // network fee (gas_price * gas_limit), formatted "N QNC"
-}
-
-// Decode a QRC-20 ContractCall `data` JSON ({ "method", "args": [...] }).
-// Returns the human recipient + raw base-unit amount for value-moving methods.
-// Non-value methods (approve, etc.) still surface method + best-effort fields.
-function decodeTransfer(dataStr: string | null): { method: string; to: string; amountRaw: string } | null {
-  if (!dataStr) return null;
-  let parsed: unknown;
-  try { parsed = JSON.parse(dataStr); } catch { return null; }
-  if (typeof parsed !== 'object' || parsed === null) return null;
-  const obj = parsed as { method?: unknown; args?: unknown };
-  const method = typeof obj.method === 'string' ? obj.method : '';
-  const args = Array.isArray(obj.args) ? obj.args : [];
-
-  const str = (v: unknown): string => (typeof v === 'string' ? v : v == null ? '' : String(v));
-
-  switch (method) {
-    case 'transfer':          // args: [to, amount]
-      return { method, to: str(args[0]), amountRaw: str(args[1]) };
-    case 'transferFrom':      // args: [from, to, amount]
-      return { method, to: str(args[1]), amountRaw: str(args[2]) };
-    case 'mint':              // args: [to, amount]
-      return { method, to: str(args[0]), amountRaw: str(args[1]) };
-    case 'burn':              // args: [amount]
-      return { method, to: '', amountRaw: str(args[0]) };
-    default:
-      return { method, to: '', amountRaw: '' };
-  }
+  fee: string;         // effect rows carry no per-transfer gas
 }
 
 export async function GET(
@@ -97,7 +72,7 @@ export async function GET(
       const body = await res.json().catch(() => null);
       if (body?.success && body.token) {
         const t = body.token as {
-          contract_address?: string; name?: string; symbol?: string;
+          contract_address?: string; name?: string; symbol?: string; logo?: string;
           decimals?: number; total_supply?: number | string; deployer?: string; deployed_at?: string;
           total_minted?: number | string; total_burned?: number | string;
         };
@@ -120,6 +95,7 @@ export async function GET(
           contract_address: t.contract_address || contract,
           name: t.name || '',
           symbol: t.symbol || '',
+          logo: sanitizeLogo(t.logo),
           decimals,
           total_supply: formatTokenAmount(totalSupplyRaw, decimals),
           total_supply_raw: totalSupplyRaw,
@@ -141,43 +117,32 @@ export async function GET(
     );
   }
 
-  // Recent transfers: every ContractCall targeting this contract (to_address =
-  // contract). getTransactionsByAddress matches from OR to; for a contract the
-  // matches are its calls. Decode each with the token's own decimals.
+  // Recent transfers: real transfer logs from the effect-sourced token_transfers
+  // index (success-gated). Amount is a u64 base-unit string, scaled by the token's
+  // own decimals via the exact string helper.
   let transfers: TokenTransfer[] = [];
   try {
-    const { transactions } = await getTransactionsByAddress(contract, 1, 50);
-    transfers = transactions
-      .map((tx): TokenTransfer | null => {
-        const decoded = decodeTransfer(tx.data);
-        if (!decoded) return null;
-        // Only surface QRC-20 value/ownership methods; skip unrelated calls.
-        if (!['transfer', 'transferFrom', 'mint', 'burn', 'approve'].includes(decoded.method)) {
-          return null;
-        }
-        let ts = Number(tx.timestamp) || 0;
-        if (ts > 0 && ts < 1e12) ts = ts * 1000;
-        // Network fee is on the ContractCall tx itself (gas_price * gas_limit), same
-        // convention as the tx-detail route; format in QNC via the shared helper.
-        const gp = Number((tx as { gas_price?: number }).gas_price) || 0;
-        const gl = Number((tx as { gas_limit?: number }).gas_limit) || 0;
-        // BigInt product so gas_price*gas_limit stays exact past 2^53 (parity with the amount/balance
-        // paths, which are kept as exact strings). gp/gl each fit in a JS number; only the product can overflow.
-        const feeUnits = BigInt(Math.trunc(gp)) * BigInt(Math.trunc(gl));
-        return {
-          hash: tx.hash,
-          from: tx.from_address,
-          to: decoded.to,
-          amount: formatTokenAmount(decoded.amountRaw, info!.decimals),
-          amountRaw: decoded.amountRaw,
-          method: decoded.method,
-          block: tx.block,
-          timestamp: ts > 946684800000 ? ts : 0,
-          status: tx.status || 'confirmed',
-          fee: feeUnits > 0n ? formatAmount(feeUnits.toString()) : '0 QNC',
-        };
-      })
-      .filter((t): t is TokenTransfer => t !== null);
+    const rows = await getContractTokenTransfers(contract, 50);
+    transfers = rows.map((r): TokenTransfer => {
+      let ts = Number(r.timestamp) || 0;
+      if (ts > 0 && ts < 1e12) ts = ts * 1000;
+      const isNft = r.std === 'qrc721';
+      return {
+        hash: r.tx_hash,
+        from: r.from_address,
+        to: r.to_address,
+        std: r.std,
+        token_id: r.token_id,
+        // NFTs (qrc721) render as "#<token_id>", never scaled by decimals.
+        amount: isNft ? `#${r.token_id}` : formatTokenAmount(r.amount, info!.decimals),
+        amountRaw: r.amount,
+        method: r.kind,
+        block: r.block,
+        timestamp: ts > 946684800000 ? ts : 0,
+        status: 'confirmed',
+        fee: '',
+      };
+    });
   } catch {
     // DB unavailable — return metadata with an empty transfer list rather than failing.
     transfers = [];

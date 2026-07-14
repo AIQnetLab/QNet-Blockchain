@@ -12,7 +12,7 @@ import * as Keychain from 'react-native-keychain';
 import { GENESIS_NODES, NODE_DISCOVERY, getRandomGenesisNode, getSolanaRpcUrl, rotateSolanaRpc } from '../config/nodes';
 // Post-quantum BFT light-client: trustless committee-QC state-root verification
 // (replaces the MITM-bypassable 2/3 peer-poll). MITM-proof at any network size.
-import { verifyMacroblockStateRoot } from '../crypto/QcLightClient';
+import { verifyMacroblockStateRoot, verifyLogInclusion, verifyLogWindowInclusion, verifyMacroblockLogsRoot, transferLogLeaf } from '../crypto/QcLightClient';
 
 export class WalletManager {
   constructor() {
@@ -3587,6 +3587,7 @@ export class WalletManager {
         name: t.name || t.symbol || 'Token',
         symbol: t.symbol || '',
         decimals,
+        logo: typeof t.logo === 'string' ? t.logo : '',
         balance: this._formatBaseUnits(balanceStr, decimals),
       };
     }).filter((t) => t.contract);
@@ -3613,10 +3614,65 @@ export class WalletManager {
       contract: contractAddress,
       name: d.name || d.symbol || 'Token',
       symbol: d.symbol || '',
+      // Defensive across a flat or {token:{...}}-nested body; '' ⇒ client renders a generated avatar.
+      logo: String((d.logo != null ? d.logo : (d.token && d.token.logo)) || ''),
       decimals: Number(d.decimals) || 0,
       totalSupply: d.total_supply != null ? String(d.total_supply) : null,
       deployer: d.deployer || null,
     };
+  }
+
+  // Decoded QRC-20/721 token-transfer events for an account (effect-sourced, success-gated).
+  //   GET /api/v1/account/{addr}/token-transfers?limit=N
+  // Each row embeds its token metadata (symbol/decimals/logo) — no extra fetch. `amount` is a u64
+  // base-unit DECIMAL STRING (quoted in JSON, so JSON.parse keeps it exact). Returns the transfers
+  // array, or [] on any error/miss. Never throws.
+  async getAccountTokenTransfers(address, limit = 50) {
+    if (!address || typeof address !== 'string') return [];
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/account/${address}/token-transfers?limit=${limit}`, { timeoutMs: 5000, hedgeMs: 800 });
+    } catch (e) {
+      console.warn('[QRC20] token transfers fetch failed:', e.message);
+      return [];
+    }
+    if (!res.ok || !res.data || typeof res.data !== 'object') return [];
+    return Array.isArray(res.data.transfers) ? res.data.transfers : [];
+  }
+
+  // P4 trustless check for ONE token transfer: fetch its /logs/proof, BIND the proven leaf to this
+  // row's own fields, verify the merkle inclusion, then anchor the window logs_root to a committee-QC-
+  // certified Checkpoint.logs_root. `row` = the decoded transfer row (contract/from/to/amount/kind/std/
+  // token_id/tx_hash/log_index). True ONLY on a full cryptographic proof of THIS row; false for
+  // pending-finality / unreachable / forged (caller keeps those unverified, never dropping a legit row).
+  // Returns: 'verified' (leaf-bound + merkle + committee-QC anchored), 'consistent' (leaf folds to the
+  // node-claimed root but the window is below the trust floor / not QC-anchorable now — real but unproven),
+  // 'rejected' (leaf ≠ this row's fields, or the proof doesn't fold → forged), or 'pending' (transient
+  // fetch/finality miss → retry). Caller shows only 'verified' with the trust badge.
+  async verifyTokenTransferInclusion(row) {
+    if (!row || typeof row !== 'object' || !row.tx_hash || typeof row.tx_hash !== 'string') return 'rejected';
+    let res;
+    try {
+      res = await this._hedged(`/api/v1/logs/proof?tx_hash=${row.tx_hash}&log_index=${row.log_index || 0}`, { timeoutMs: 5000, hedgeMs: 800 });
+    } catch (_) { return 'pending'; }
+    const d = res && res.data;
+    if (!res || !res.ok || !d || d.error || !d.leaf || !Array.isArray(d.proof) ||
+        !d.block_root || !Array.isArray(d.window_proof) || !d.logs_root) return 'pending';
+    // BIND: the proven leaf MUST equal the leaf recomputed from THIS row's own fields — else a node
+    // replayed a real transfer's proof under a forged row. This check is what makes P4 reject forgeries.
+    const expected = transferLogLeaf(row);
+    if (!expected || expected !== String(d.leaf).toLowerCase()) return 'rejected';
+    // SHARDED 2-level proof: level 1 folds the leaf → this block's sub-root; level 2 folds that sub-root →
+    // the window logs_root. BOTH must hold — the node cannot substitute a block sub-root it did not commit.
+    if (!verifyLogInclusion(d.leaf, d.proof, d.block_root)) return 'rejected';
+    if (!verifyLogWindowInclusion(d.block_root, d.window_proof, d.logs_root)) return 'rejected';
+    // Leaf folds to the node-CLAIMED root (self-consistent, a malicious node can fabricate this), so
+    // QC-anchor the root to the committee signature for real trust. 'mismatch' = the committee-signed
+    // root differs from the node's claim → a proven forgery, must be rejected (never confirmed).
+    const anchored = await verifyMacroblockLogsRoot(d.logs_root, d.window_end, () => this.getRandomBootstrapNode());
+    if (anchored === true) return 'verified';
+    if (anchored === 'mismatch') return 'rejected';
+    return 'consistent'; // below trust floor / macroblock unreachable — real but unprovable now
   }
 
   // Raw + scaled QRC-20 balance for a single holder of a single contract.
