@@ -10476,20 +10476,30 @@ impl Storage {
         let mut best_height = 0u64;
         let mut peer_heights: Vec<(String, u64)> = Vec::new();
 
-        // A1: settle the GALC pin BEFORE the ceiling is read. The pin is read here, but the capsule arrives
-        // + Dilithium-verifies asynchronously, so a cold join (pin==0) must request + bounded-wait for it
-        // first — else it clamps to the genesis h=90 anchor and replays the whole chain. Fail-open: on
-        // timeout (e.g. fresh genesis <h3600 with no capsule yet) proceed with pin==0 → ws_floor ceiling.
-        // Skip the wait on a young network: the first capsule only mints at mb == GALC_MINT_INTERVAL
-        // (h3600), so below that NO capsule can exist and the wait is pure dead-time. Tip proxy =
-        // the observed network height (max peer head); fail-open path (ws_floor / early-anchor) is
-        // unchanged. Once tip>=h3600 this behaves exactly as before.
-        let tip_mb = p2p.get_cached_network_height().unwrap_or(0) / 90;
-        if crate::galc::effective_pin_checkpoint().0 == 0 && tip_mb >= crate::galc::GALC_MINT_INTERVAL {
-            const GALC_PIN_WAIT_ATTEMPTS: u32 = 20;       // ≤ ~10s
+        // A1: settle the genesis-rooted GALC pin BEFORE reading the ceiling — the capsule arrives +
+        // Dilithium-verifies asynchronously, so a fresh cold join (pin==0) must acquire it first, else the
+        // ceiling collapses to the h=90 anchor and the node replays the whole chain. Re-sample the
+        // (f+1-corroborated) network tip EACH pass: at t=0 the height cache can read 0 (peers up, head not
+        // yet reported) so a one-shot gate would skip the wait. should_have_capsule = fresh joiner (own
+        // frontier mb==0) AND network past the first-capsule height (mb >= GALC_MINT_INTERVAL) ⇒ a capsule
+        // provably exists and any peer can serve it. Young chain or an already-advanced node keeps the
+        // fail-open path below (ws_floor / early anchor) unchanged.
+        static COLDJOIN_ANCHOR_PENDING_ROUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        const COLDJOIN_ANCHOR_PENDING_MAX: u64 = 10; // ~2 min of retries, then fail-open (eclipse liveness floor)
+        let own_frontier_mb = self.get_chain_height().unwrap_or(0) / 90;
+        if own_frontier_mb == 0 {                         // only a fresh joiner (no own lineage) waits for the pin
+            const GALC_PIN_WAIT_ATTEMPTS: u32 = 20;       // ≤ ~10s per cold-join call
             const GALC_PIN_WAIT_INTERVAL_MS: u64 = 500;
+            let mut should_have_capsule = false;          // set true ONLY on a (f+1)-corroborated mature tip
             for i in 0..GALC_PIN_WAIT_ATTEMPTS {
                 if crate::galc::effective_pin_checkpoint().0 > 0 { break; }
+                // (f+1)-corroborated tip only: corroborated_head_ceiling() is the (f+1)-th highest fresh
+                // in-set peer height, or 0 when < f+1 corroborators — a lone lying peer cannot raise it, so
+                // it can't falsely trip the capsule-wait into AnchorPending. 0 = uncorroborated → keep polling.
+                let tip_mb = p2p.corroborated_head_ceiling() / 90;
+                if tip_mb >= crate::galc::GALC_MINT_INTERVAL { should_have_capsule = true; }
+                else if tip_mb > 0 { break; }              // CORROBORATED young chain (< first capsule) → fail-open to h=90
+                // tip_mb == 0: no f+1 corroboration yet → keep polling (never latch from an unproven tip)
                 if i % 4 == 0 {                            // re-request every ~2s (a reply may be lost)
                     let _ = p2p.broadcast_quic(&crate::unified_p2p::NetworkMessage::RequestGenesisCheckpoint {
                         requester_id: "snapshot_ceiling".to_string(),
@@ -10497,8 +10507,24 @@ impl Storage {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(GALC_PIN_WAIT_INTERVAL_MS)).await;
             }
-        } else if crate::galc::effective_pin_checkpoint().0 == 0 && crate::node::is_debug() {
-            println!("[DBG][SYNC] galc_pin_wait_skipped tip_mb={} first_capsule_mb={}", tip_mb, crate::galc::GALC_MINT_INTERVAL);
+            // AnchorPending only when the network PROVABLY has a capsule (mature tip observed) but it hasn't
+            // arrived: return retryable so the caller bails to the desync tick rather than collapsing to h=90.
+            // Bounded escape after COLDJOIN_ANCHOR_PENDING_MAX rounds → fail-open to block-replay (eclipse floor).
+            // The counter is process-global (shared across cold-join drivers); in a true eclipse every driver
+            // takes the increment (none the reset), so it climbs monotonically to MAX — no livelock.
+            if should_have_capsule && crate::galc::effective_pin_checkpoint().0 == 0 {
+                let rounds = COLDJOIN_ANCHOR_PENDING_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if rounds <= COLDJOIN_ANCHOR_PENDING_MAX {
+                    if crate::node::is_info() {
+                        println!("[INFO][SYNC] coldjoin_anchor_pending round={}/{} — retry next tick", rounds, COLDJOIN_ANCHOR_PENDING_MAX);
+                    }
+                    return Err(IntegrationError::AnchorPending);
+                }
+                if crate::node::is_warn() {
+                    println!("[WARN][SYNC] coldjoin_anchor_pending_exhausted rounds={} — fail-open to block-replay (degraded/eclipse)", rounds);
+                }
+            }
+            COLDJOIN_ANCHOR_PENDING_ROUNDS.store(0, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Exogenously-verifiable anchor ceiling — genesis-rooted, no peer-tip trust. A cold joiner verifies a
@@ -11562,8 +11588,11 @@ impl Storage {
                 Ok(())
             },
             Err(e) => {
-                println!("[WARN][STORAGE] snapshot_sync_failed err={:?} fallback=full_sync", e);
-                // Fall back to normal sync
+                // AnchorPending is retryable (caller bails to the desync tick until the GALC pin arrives) —
+                // not a failure, so don't emit the fallback warning for it.
+                if !matches!(e, IntegrationError::AnchorPending) && crate::node::is_warn() {
+                    println!("[WARN][STORAGE] snapshot_sync_failed err={:?} fallback=full_sync", e);
+                }
                 Err(e)
             }
         }

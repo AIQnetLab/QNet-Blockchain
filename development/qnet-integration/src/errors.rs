@@ -40,7 +40,13 @@ pub enum IntegrationError {
     
     #[error("Network error: {0}")]
     NetworkError(String),
-    
+
+    // Cold-join: genesis-rooted GALC pin not yet adopted while the network is past the first-capsule
+    // height. Retryable — the caller bails to the desync tick (pin arrives via peer co-send) instead of
+    // collapsing the verifiable ceiling to the h=90 anchor and replaying the whole chain.
+    #[error("Cold-join anchor pending")]
+    AnchorPending,
+
     #[error("Security error: {0}")]
     SecurityError(String),
     

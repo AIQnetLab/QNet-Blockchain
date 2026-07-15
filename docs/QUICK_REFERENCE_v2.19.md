@@ -72,7 +72,7 @@ Block 270+: PFP Level 4 (critical)
 ## 🔐 Security
 
 ### Cryptography Stack (NIST Post-Quantum, v2.19.22)
-- **Signatures**: pure ML-DSA-65 / CRYSTALS-Dilithium3 (NIST FIPS 204) — TXs, consensus, identity, gossip
+- **Signatures**: pure ML-DSA-65 (NIST FIPS 204) — TXs, consensus, identity, gossip
 - **Transport KEX**: X25519Kyber768Draft00 hybrid (ML-KEM-768, FIPS 203) in QUIC TLS 1.3
 - **Hashing**: SHA3-256 (quantum-resistant)
 - **Consensus**: Byzantine (2/3+ honest nodes)
@@ -81,7 +81,7 @@ Block 270+: PFP Level 4 (critical)
 ### ML-DSA-65 Signature (Per Message)
 ```
 1. Build canonical message (payload || hash || timestamp)
-2. Sign with the persistent ML-DSA-65 (Dilithium3) key
+2. Sign with the persistent ML-DSA-65 key
 3. Verify against the signer's on-chain registry public key
 ```
 **Why?** End-to-end post-quantum security (no classical Ed25519 dependency)
@@ -93,7 +93,7 @@ Microblock arrives
 P2P Layer (node.rs)
     ├─► Structure check (signature + signer cert present?)
     ├─► Certificate lookup
-    ├─► ML-DSA-65 (Dilithium3) verify vs signer's registry key ✅
+    ├─► ML-DSA-65 verify vs signer's registry key ✅
     └─► Signer ↔ registry-key binding check ✅
     ↓
 Consensus Layer (consensus_crypto.rs)
@@ -281,7 +281,7 @@ is_consensus_qualified() {
 | **Max Lifetime** | 60s | 60 microblocks maximum |
 | **Rate Limiting** | 10/min | Per-user anti-spam protection |
 | **Block Allocation** | 0-20% | Dynamic, 80-100% for public TXs |
-| **Signature** | Dilithium3 | Post-quantum verification |
+| **Signature** | ML-DSA-65 | Post-quantum verification |
 
 ### Priority Mempool (Public TXs)
 
@@ -470,7 +470,7 @@ const REPAIR_BATCH_DELAY_MS: u64 = 5;                // Pacing between batches
 2. **Defense in Depth**: Two-layer verification (P2P + Consensus)
 3. **Byzantine Safety**: All PFP levels maintain 2/3+ requirement (except Level 4 emergency)
 4. **Scalability**: Max 1000 validators regardless of total nodes
-5. **NIST Compliant**: pure ML-DSA-65 (Dilithium3) signatures + ML-KEM-768 TLS key exchange
+5. **NIST Compliant**: pure ML-DSA-65 signatures + ML-KEM-768 TLS key exchange
 6. **Memory Protected**: Bounded block buffering (~10 MB max)
 7. **Tracked Delivery**: Byzantine 2/3+ threshold for critical certificates
 

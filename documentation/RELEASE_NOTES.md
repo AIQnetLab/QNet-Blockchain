@@ -240,7 +240,7 @@ ROUND 2 → Leader C (30s timeout) → SUCCESS!
 
 ### Cryptographic Signatures
 
-MacroBlock commits/reveals use hybrid Dilithium3 + Ed25519 ephemeral keys:
+MacroBlock commits/reveals use hybrid ML-DSA-65 + Ed25519 ephemeral keys:
 - **Full signature** (~5KB) for MacroBlocks (includes certificate)
 - **Compact signature** (~2.6KB) for microblocks
 

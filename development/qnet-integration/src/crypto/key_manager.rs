@@ -782,6 +782,9 @@ mod tests {
     /// Test key directory creation with fallback paths
     #[test]
     fn test_ensure_writable_directory() {
+        // Resolves a key dir → sets the process-global CACHED_KEY_DIR OnceLock. Hold the identity lock so
+        // it can't race the singleton tests, whose cache-keyed keypair resolution depends on it.
+        let _identity_guard = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("Failed to create temp dir");
         let key_dir = temp.path().join("keys");
         
@@ -795,6 +798,9 @@ mod tests {
     /// Test key manager creation
     #[test]
     fn test_key_manager_creation() {
+        // new() → ensure_writable_directory sets the process-global CACHED_KEY_DIR. Hold the identity lock
+        // so this can't cross-poison the singleton tests running in the same process.
+        let _identity_guard = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempdir().expect("Failed to create temp dir");
         let key_dir = temp.path().join("keys");
         

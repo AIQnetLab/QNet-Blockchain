@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     total_gas_used BIGINT DEFAULT 0,
     poh_hash TEXT,
     poh_count BIGINT DEFAULT 0,
-    signature_type TEXT DEFAULT 'Dilithium3',
+    signature_type TEXT DEFAULT 'ML-DSA-65',
     signature TEXT,
     cert_serial TEXT,
     qrb_output TEXT,

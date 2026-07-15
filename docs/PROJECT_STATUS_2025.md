@@ -50,7 +50,7 @@
 ### ✅ **Post-Quantum Cryptography Integration - PRODUCTION READY**
 
 **Core Implementation:**
-- ✅ **CRYSTALS-Dilithium** transaction signature verification
+- ✅ **ML-DSA-65** transaction signature verification
 - ✅ **Hybrid cryptographic architecture** with Ed25519 fallback
 - ✅ **PQ-EVM extensions** with custom opcodes (0xF0-0xFF range)
 - ✅ **Gas optimization** for post-quantum operations
@@ -180,7 +180,7 @@
 > **v3.18 Change**: Pool 2 removed - transaction fees now go directly to block producer.
 
 **Security & Validation:**
-- ✅ **Post-quantum cryptography** with CRYSTALS-Dilithium
+- ✅ **Post-quantum cryptography** with ML-DSA-65
 - ✅ **Burn security** system prevents double-activation
 - ✅ **Rate limiting** in DHT to prevent spam attacks
 - ✅ **Real signature verification** for all transactions
@@ -267,7 +267,7 @@
 - ✅ **Cross-platform** iOS/Android support
 - ✅ **Firebase SDK** integrated (iOS + Android)
 - ✅ **FCM push notifications** for ping challenges
-- ✅ **Dilithium3 (ML-DSA-65) signature** for ping responses
+- ✅ **ML-DSA-65 signature** for ping responses
 - 🔄 **App store** preparation underway
 
 ### **Web Application**
@@ -287,7 +287,7 @@
 - ✅ **No inline handlers** for CSP compliance
 
 ### **Network Security**
-- ✅ **Dilithium3 (ML-DSA-65)** cryptographic signatures
+- ✅ **ML-DSA-65** cryptographic signatures
 - ✅ **TLS encryption** for all communications
 - ✅ **Anti-spam** mechanisms implemented
 - ✅ **Rate limiting** across all endpoints

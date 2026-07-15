@@ -519,6 +519,14 @@ impl SyncManager {
                     }
                 }
                 Err(e) => {
+                    // AnchorPending: genesis-rooted GALC pin not yet adopted while the network provably has
+                    // one. Bail to the desync tick (gated !active), which re-drives cold-join once the
+                    // co-sent capsule arrives — never fall to O(height) block-replay from the h=90 anchor.
+                    if matches!(e, crate::errors::IntegrationError::AnchorPending) {
+                        if is_info() { println!("[INFO][SYNC] coldjoin_await_anchor — bail to tick"); }
+                        self.active.store(false, Ordering::SeqCst);
+                        return;
+                    }
                     if is_info() {
                         println!("[INFO][SYNC] snapshot_unavailable reason={:?} fallback=block_sync", e);
                     }

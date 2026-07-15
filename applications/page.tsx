@@ -94,7 +94,7 @@ export default function Page() {
                 <div className="stat-card">
                   <div className="stat-number">Post-Quantum</div>
                   <div className="stat-label">Security</div>
-                  <div className="stat-trend">ML-KEM-768 + Dilithium3</div>
+                  <div className="stat-trend">ML-KEM-768 + ML-DSA-65</div>
                 </div>
                 <div className="stat-card">
                   <div className="stat-number">Mobile-First</div>

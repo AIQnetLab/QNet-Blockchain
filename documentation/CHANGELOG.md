@@ -646,7 +646,7 @@ async fn create_eligible_producers_snapshot(
 ### Cryptographic Signatures
 
 MacroBlock commits/reveals use hybrid cryptography:
-- **Dilithium3** (NIST PQC) - post-quantum signature
+- **ML-DSA-65** (NIST PQC) - post-quantum signature
 - **Ed25519 ephemeral keys** - forward secrecy, generated per message
 - **Full signature** (~5KB bincode) for MacroBlocks - includes certificate for immediate verification
 - **Compact signature** (~2.6KB bincode) for microblocks - certificate cached
@@ -803,14 +803,14 @@ Introduces RANDAO-style accumulated randomness with quantum-resistant VRF, provi
 | **VRF in Microblocks** | Each producer generates Hybrid VRF output | block.rs, node.rs |
 | **RANDAO Accumulator** | XOR all VRF outputs in MacroBlock | node.rs |
 | **RPC API** | `qrb_getRandomness`, `qrb_getLatestRandomness`, `qrb_getRandomnessWithSeed` | rpc.rs |
-| **Quantum Safety** | Dilithium3 VRF signatures (NIST FIPS 204) | vrf_hybrid.rs |
+| **Quantum Safety** | ML-DSA-65 VRF signatures (NIST FIPS 204) | vrf_hybrid.rs |
 
 ### 🔐 Security Properties
 
 | Property | Value |
 |----------|-------|
 | Unpredictability | ✅ Nobody knows beacon until MacroBlock finalization |
-| Quantum Resistance | ✅ Dilithium3 + SHA3-512 |
+| Quantum Resistance | ✅ ML-DSA-65 + SHA3-512 |
 | Manipulation Resistance | ✅ Requires >50% producers to manipulate |
 | Verification | ✅ Any node can verify VRF proofs |
 
@@ -819,7 +819,7 @@ Introduces RANDAO-style accumulated randomness with quantum-resistant VRF, provi
 | Feature | Ethereum 2.0 | Solana | Chainlink VRF | QNet QRB |
 |---------|--------------|--------|---------------|----------|
 | Native | ✅ Yes | ❌ No | ❌ No (oracle) | ✅ Yes |
-| Quantum Safe | ❌ No | ❌ No | ❌ No | ✅ **Dilithium3** |
+| Quantum Safe | ❌ No | ❌ No | ❌ No | ✅ **ML-DSA-65** |
 | Cost | Gas fees | Minimal | High (oracle) | **Free** |
 
 ### 🔧 API Example
@@ -990,12 +990,12 @@ Emergency Failover:        Same MacroBlock snapshot (deterministic)
 
 ### 🔐 MAJOR - Optional Quantum Signatures for Transactions
 
-**New Feature**: Users can now optionally add Dilithium3 signatures to transactions for post-quantum security.
+**New Feature**: Users can now optionally add ML-DSA-65 signatures to transactions for post-quantum security.
 
 | TX Type | Signatures | Gas Multiplier | Security |
 |---------|------------|----------------|----------|
 | Standard | Ed25519 only | 1.0x | Classical |
-| Quantum | Ed25519 + Dilithium3 | **1.5x** | Post-Quantum |
+| Quantum | Ed25519 + ML-DSA-65 | **1.5x** | Post-Quantum |
 
 ### ✅ Changes
 
@@ -1691,7 +1691,7 @@ keys/
 - **FIXED** `verify_dilithium_signature()` - uses `dilithium3::open()` for real verification
 - **FIXED** `create_consensus_signature()` - uses `sign_full()` returning complete SignedMessage
 - **ADDED** `sign_full()` method returning [signature(2420)] + [message] format
-- **STANDARDIZED** Algorithm string: "CRYSTALS-Dilithium3" everywhere
+- **STANDARDIZED** Scheme: ML-DSA-65 (FIPS 204) everywhere; on-wire `algorithm` identifier string remains the literal "CRYSTALS-Dilithium3"
 - **REMOVED** SHA3-256 fallback - operations skip if Dilithium unavailable
 - **REMOVED** `create_quantum_signature()` - dead code using incorrect sign()
 - **REMOVED** Genesis node bypass in signature verification
@@ -2645,7 +2645,7 @@ keys/
 - **Blockchain Peer Registry**: Immutable peer records in distributed ledger
 - **Bootstrap Trust Mechanism**: Genesis nodes instant connectivity
 - **Emergency Bootstrap Fallback**: Cold-start cryptographic validation
-- **CRYSTALS-Dilithium Integration**: Post-quantum peer verification
+- **ML-DSA-65 Integration**: Post-quantum peer verification
 - **Certificate-Based Genesis Discovery**: Blockchain activation registry integration
 
 ### Changed
@@ -2665,7 +2665,7 @@ keys/
 - **Post-Quantum Compliance**: 100% quantum-resistant P2P protocols implemented
 - **Real-Time Peer Announcements**: Instant topology updates via NetworkMessage::PeerDiscovery
 - **Bidirectional Peer Registration**: Automatic mutual peer discovery via RPC endpoints
-- **Quantum-Resistant Validation**: CRYSTALS-Dilithium signatures for all peer connections
+- **Quantum-Resistant Validation**: ML-DSA-65 signatures for all peer connections
 - **Byzantine Safety**: Strict 4-node minimum requirement prevents single points of failure
 - **Emergency Bootstrap**: Cryptographic validation for network cold-start scenarios
 
@@ -2681,7 +2681,7 @@ keys/
 
 ### Added
 - Initial release of QNet blockchain platform
-- Post-quantum cryptography support (Dilithium3, Kyber1024)
+- Post-quantum cryptography support (ML-DSA-65, Kyber1024)
 - Rust optimization modules for 100x performance improvement
 - Go network layer for high-performance P2P communication
 - WebAssembly VM for smart contract execution

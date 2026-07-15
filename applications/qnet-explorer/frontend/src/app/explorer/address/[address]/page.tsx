@@ -12,6 +12,7 @@ interface AddressData {
   txCount: number;
   firstSeen: number;
   lastActive: number;
+  historyUnavailable?: boolean;   // balance is authoritative; TX history read failed (DB down/resync)
   nodeInfo?: {
     nodeId: string;
     nodeType: 'SUPER' | 'LIGHT';  // v3.18: FULL removed
@@ -436,6 +437,11 @@ export default function AddressPage() {
         return (
           <div className="block-card">
             <h2 className="card-title">Transactions ({data.transactions.length})</h2>
+            {data.historyUnavailable && (
+              <p style={{ color: '#e0a63a', margin: '0 0 12px' }}>
+                Transaction history is temporarily unavailable — balance above is current.
+              </p>
+            )}
             <table className="block-table">
               <thead>
                 <tr>

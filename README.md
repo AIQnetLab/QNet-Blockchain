@@ -100,7 +100,7 @@ macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`
 
 **⚡ Stage Pipeline (Full Runtime Isolation):**
 - **BROADCAST_RUNTIME**: Dedicated threads for Shred protocol
-- **SIGVERIFY_RUNTIME**: Isolated ML-DSA-65 (Dilithium3) signature verification
+- **SIGVERIFY_RUNTIME**: Isolated ML-DSA-65 signature verification
 - **BANKING_RUNTIME**: Transaction intake and mempool ops
 - **REPLAY_RUNTIME**: State machine execution
 - **Adaptive Threading**: 2 cores→4t, 4 cores→5t, 8 cores→10t, 16 cores→20t
@@ -114,7 +114,7 @@ macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`
 - **Round Update at Save Only**: Prevents premature round advancement causing desync
 - **Reveal Loss Prevention**: Participant nodes don't reset consensus engine mid-round
 - **Dynamic Height Threshold**: 5/10/20 blocks based on network size (scalable resync)
-- **Signed Consensus Votes**: pure Dilithium3 signatures over Checkpoint-BFT v2 votes (there are no "reveals")
+- **Signed Consensus Votes**: pure ML-DSA-65 signatures over Checkpoint-BFT v2 votes (there are no "reveals")
 
 ### 🛡️ **Previous Updates (v2.44.0 - December 24, 2025)**
 
@@ -171,7 +171,7 @@ macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`
 - **No Fallback Policy**: Desynchronized nodes excluded from production
 
 **🔐 NIST/Cisco Compliant Post-Quantum Cryptography:**
-- **Pure ML-DSA-65 Signatures**: EVERY QNet signature — transactions, consensus votes, node identity, P2P gossip — is pure CRYSTALS-Dilithium3 (ML-DSA-65, FIPS 204). No classical signature is involved in any on-chain path.
+- **Pure ML-DSA-65 Signatures**: EVERY QNet signature — transactions, consensus votes, node identity, P2P gossip — is pure ML-DSA-65 (FIPS 204). No classical signature is involved in any on-chain path.
 - **Quantum Protection**: No Ed25519 fallback on any QNet signing path — post-quantum by default, so nothing breaks if classical curves fall.
 - **Transport Confidentiality**: QUIC/TLS 1.3 uses the X25519Kyber768 hybrid KEX (ML-KEM-768, FIPS 203) for key exchange only — the sole "hybrid" primitive in the stack, and a key-exchange step, not a signature.
 - **Ed25519 Scope**: Ed25519 appears ONLY off-chain, on the Solana side, as the credential for the Phase 1 1DEV proof-of-burn — never for QNet transaction, consensus, or identity signing.
@@ -203,7 +203,7 @@ macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`
 - **MAX_VALIDATORS_PER_EPOCH = 1000**: Scalable deterministic sampling
 
 ### 🛡️ **Previous Update (v2.25.2 - December 9, 2025)**
-- **Batch Signature Verification**: 3x faster ML-DSA-65 (Dilithium3) verification via batched signature checks
+- **Batch Signature Verification**: 3x faster ML-DSA-65 verification via batched signature checks
 - **Batch Mempool Operations**: 1 lock per 1000 TX instead of per-TX (1000x reduction)
 - **TX Accumulator**: Batch 1000 TX for verification, 100ms timeout
 - **Skip Self-Broadcast**: Producer doesn't broadcast TX to itself
@@ -218,7 +218,7 @@ macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`
 - **Cascade Prevention**: Prevents false accusations from network desync
 
 ### 🛡️ **Previous Updates (v2.23 - December 6, 2025)**
-- **Heartbeat with quantum signatures**: Full quantum protection (pure ML-DSA-65 (Dilithium3) per heartbeat)
+- **Heartbeat with quantum signatures**: Full quantum protection (pure ML-DSA-65 per heartbeat)
 - **RAW bytes signatures**: 88% size reduction (~2.6KB vs 22KB)
 - **Shred Protocol ALWAYS**: Block propagation uses Shred Protocol for ALL network sizes
 - **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing (K=3)
@@ -242,17 +242,17 @@ macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`
 - **Balance Restoration**: Balances restored from snapshots or block replay during synchronization
 
 ### 🛡️ **SECURITY UPDATES (v2.19.11 - November 26, 2025)**
-- **REAL Dilithium3 Signatures**: Full NIST FIPS 204 cryptographic verification with `dilithium3::open()`
+- **REAL ML-DSA-65 Signatures**: Full NIST FIPS 204 cryptographic verification with `dilithium3::open()`
 - **Secure Key Storage**: Random encryption keys (NOT derived from public node_id) with SHA3-256 integrity
 - **No Fallback Signatures**: Removed SHA3-256 fallback - operations skip if Dilithium unavailable
-- **Standardized Algorithm**: All signatures use "CRYSTALS-Dilithium3" identifier
+- **Standardized Algorithm**: ML-DSA-65 (NIST FIPS 204); the on-wire `PqSignature.algorithm` identifier string is the literal "CRYSTALS-Dilithium3"
 - **WebSocket Rate Limiting**: DDoS protection for real-time connections
 
 ### 🛡️ **Previous Updates (v2.19.6 - November 26, 2025)**
 - **WebSocket Real-time Events**: Live updates for blocks, balances, contracts, and transactions
-- **Smart Contract REST API**: Deploy, call, query WASM contracts with ML-DSA-65 (Dilithium3) signatures
+- **Smart Contract REST API**: Deploy, call, query WASM contracts with ML-DSA-65 signatures
 - **Smart Polling for Light Nodes**: Battery-efficient polling (~94% fewer wake-ups)
-- **Mandatory Transaction Signatures**: All transfers require pure ML-DSA-65 (Dilithium3) verification — post-quantum by default, no classical (Ed25519) signature accepted on any QNet transaction path
+- **Mandatory Transaction Signatures**: All transfers require pure ML-DSA-65 verification — post-quantum by default, no classical (Ed25519) signature accepted on any QNet transaction path
 - **Enhanced Rate Limiting**: IP-based DDoS protection for all API endpoints
 
 ### 🛡️ **Previous Updates (v2.19.3 - November 23, 2025)**
@@ -265,7 +265,7 @@ macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`
   - Multi-producer submission: 3 producers for redundancy
   - Auto-fallback: Public mempool if bundle submission fails
   - Atomic inclusion: All bundle TXs included together or rejected
-  - Post-quantum signatures: Dilithium3 verification for all bundles
+  - Post-quantum signatures: ML-DSA-65 verification for all bundles
   - Real-time tests: 11/11 passed (validated in production environment)
 - **Priority Mempool**: Gas-price-based transaction ordering (NEW!)
   - BTreeMap priority queue: highest gas price processed first
@@ -337,7 +337,7 @@ macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`
   - Partial determinism by design (±1-5% acceptable)
   - Byzantine consensus ensures security
 - **Compact ML-DSA-65 signatures v2.23**: Optimized microblock signatures (~2.6KB RAW bytes)
-  - Pure CRYSTALS-Dilithium3 (ML-DSA-65) cryptography
+  - Pure ML-DSA-65 cryptography
   - RAW bytes format via `serde_bytes` (88% reduction from 22KB)
   - Defense-in-depth: real Dilithium verification at P2P + Consensus layers
   - NIST/Cisco post-quantum compliance
@@ -388,7 +388,7 @@ macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`
 - **Chain Reorganization (Chain Reorg)**: Byzantine-safe fork resolution with 2/3 majority consensus
 - **Advanced Block Synchronization**: Out-of-order block buffering with active missing block requests
 - **DDoS-Protected P2P**: Rate limiting and concurrent request management for network stability
-- **Quantum-Resistant Genesis**: CRYSTALS-Dilithium3 Genesis block with encapsulated keys
+- **Quantum-Resistant Genesis**: ML-DSA-65 Genesis block with encapsulated keys
 - **Parallel Block Processing**: High-performance consecutive block processing (up to 10 blocks)
 - **Reputation-Based Chain Weight**: Byzantine weight calculation using validator reputation scores
 
@@ -418,12 +418,12 @@ macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`
   - 100 ticks per second (10ms intervals) for smooth entropy generation
   - 5,000 hashes per tick (optimized for 1-second microblocks)
   - Sequential ordering via SHA3-512 every 4th hash (limits parallelization, not formal VDF)
-  - Integrated into Dilithium3-VRF Secret Leader Election for consensus
+  - Integrated into ML-DSA-65-VRF Secret Leader Election for consensus
   - Checkpoint persistence with zstd compression (every 1M hashes)
   - Clock drift: 5-7% (excellent for production)
   - 72 bytes overhead per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
   - Hardware: Intel Xeon E5-2680v4 @ 2.4GHz
-- **Dilithium3-VRF Secret Leader Election**: Post-quantum VRF (NIST FIPS 204, ML-DSA-65) with macroblock N-2 entropy, unpredictable and verifiable leader selection for Byzantine-safe consensus
+- **ML-DSA-65-VRF Secret Leader Election**: Post-quantum VRF (NIST FIPS 204) with macroblock N-2 entropy, unpredictable and verifiable leader selection for Byzantine-safe consensus
 - **Hybrid Parallel Executor Execution**: 5-stage pipeline with 10,000 parallel transactions
 - **Adaptive BFT Adaptive Timeouts**: Dynamic 7s base to 20s max (1.5x multiplier) based on network conditions
 - **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache
@@ -476,8 +476,8 @@ macroblock handshake has been removed. Full design: `docs/ARCHITECTURE_v2.19.md`
 
 **QNet production testnet is ready for deployment with advanced consensus and synchronization.**
 
-- ✅ **Post-Quantum Cryptography**: Pure ML-DSA-65 / CRYSTALS-Dilithium3 signatures (nodes)
-- ✅ **Client Cryptography**: Pure ML-DSA-65 (Dilithium3) signatures for mobile/browser
+- ✅ **Post-Quantum Cryptography**: Pure ML-DSA-65 signatures (nodes)
+- ✅ **Client Cryptography**: Pure ML-DSA-65 signatures for mobile/browser
 - ✅ **Entropy-Based Consensus**: True decentralization with unpredictable producer rotation
 - ✅ **Reputation System**: Economic incentives for network participation
 - ✅ **State Snapshots**: Full & incremental snapshots with LZ4 compression
@@ -500,7 +500,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 ### 🎯 Key Features
 
-- **🔐 Post-Quantum Security**: Pure ML-DSA-65 (Dilithium3) signatures everywhere (nodes + clients) | X25519Kyber768 hybrid KEX for TLS transport
+- **🔐 Post-Quantum Security**: Pure ML-DSA-65 signatures everywhere (nodes + clients) | X25519Kyber768 hybrid KEX for TLS transport
 - **⚡ Ultra-High Performance**: 424,411 TPS with zero-downtime consensus
 - **🎲 True Decentralization**: Deterministic producer selection (finality window + SHA3) with Byzantine fairness and quantum resistance
 - **💰 Reputation Economics**: Rewards for block production (+1 micro, +10/+5 macro)
@@ -543,13 +543,13 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 **Hardware & Benchmarks:**
 - **Test Environment**: Intel Xeon E5-2680v4 @ 2.4GHz (14 cores, 28 threads), 32GB DDR4-2400
 - **VTS Performance**: 500K hashes/sec (hybrid SHA3-512/Blake3, sequential ordering chain)
-- **Signature Verification**: Dilithium3 ~2ms, Ed25519 ~20μs per signature
+- **Signature Verification**: ML-DSA-65 ~2ms, Ed25519 ~20μs per signature
 - **Network**: WAN-optimized with adaptive timeouts (7s-20s)
 
 **Cryptographic Approach:**
-- ✅ **Consensus Layer**: Real CRYSTALS-Dilithium3 / ML-DSA-65 (pqcrypto-dilithium 0.5) - fully post-quantum
-- ✅ **Node Signatures**: Pure ML-DSA-65 (Dilithium3) for consensus, node identity and P2P gossip (Ed25519 removed)
-- ✅ **Client Transactions**: Pure ML-DSA-65 (Dilithium3) required — post-quantum by default, no classical fallback
+- ✅ **Consensus Layer**: Real ML-DSA-65 (pqcrypto-dilithium 0.5) - fully post-quantum
+- ✅ **Node Signatures**: Pure ML-DSA-65 for consensus, node identity and P2P gossip (Ed25519 removed)
+- ✅ **Client Transactions**: Pure ML-DSA-65 required — post-quantum by default, no classical fallback
 - ✅ **Transport Key Exchange**: QUIC/TLS 1.3 X25519Kyber768 hybrid KEX (ML-KEM-768, FIPS 203) — the ONLY remaining "hybrid" in the stack
 - 🔐 **Addresses**: A QNet address is the hash of the Dilithium public key; keys derive from a BIP39 seed
 
@@ -632,7 +632,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │                    QNet Blockchain                         │
 ├─────────────────────────────────────────────────────────────┤
 │  Post-Quantum Crypto Layer                                 │
-│  ├── ML-DSA-65 / CRYSTALS-Dilithium3 (FIPS 204 Signatures) │
+│  ├── ML-DSA-65 (FIPS 204 Signatures)                       │
 │  ├── Pure ML-DSA-65 for consensus, identity & P2P gossip   │
 │  ├── X25519Kyber768 KEX (ML-KEM-768, FIPS 203) for TLS     │
 │  └── SHA3-256 (NIST FIPS 202 Hashing)                     │
@@ -640,11 +640,11 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  Consensus Layer with Deterministic Selection              │
 │  ├── Microblock Production (1s intervals)                  │
 │  │   ├── Deterministic VRF selection (finality entropy)    │
-│  │   ├── Pure ML-DSA-65 (Dilithium3) signatures            │
+│  │   ├── Pure ML-DSA-65 signatures                         │
 │  │   ├── 30-block rotation with SHA3-512 entropy           │
 │  │   ├── Race-free at boundaries (no delays)               │
 │  │   ├── Producer rewards: +1 reputation per block         │
-│  │   └── Super nodes only (reputation >= 70)         │
+│  │   └── Super nodes only (reputation >= 70)               │
 │  ├── Macroblock Consensus — Checkpoint-BFT v2 (per 90 mb)  │
 │  │   ├── VRF committee (<=100 of up to 1000 eligible)      │
 │  │   ├── One 2f+1 QC per window seals the macroblock       │
@@ -658,7 +658,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │      ├── IPFS integration for P2P snapshot distribution    │
 │      └── Deadlock prevention with guard pattern            │
 ├─────────────────────────────────────────────────────────────┤
-│  Performance Optimization Layer                   │
+│  Performance Optimization Layer                            │
 │  ├── Shred Protocol Block Propagation                             │
 │  │   ├── 1KB chunks with Reed-Solomon erasure coding       │
 │  │   ├── Adaptive fanout (4-32) based on network size & latency │
@@ -722,7 +722,7 @@ QNet implements advanced chain reorganization and synchronization mechanisms for
 - **Automatic Retry**: Re-queues buffered blocks when dependencies arrive
 - **Memory Management**: Automatic cleanup of blocks older than 60 seconds
 - **Genesis Coordination**: Only node_001 creates Genesis block in bootstrap mode
-- **Quantum-Resistant Genesis**: CRYSTALS-Dilithium signature ensures identical Genesis across all nodes
+- **Quantum-Resistant Genesis**: ML-DSA-65 signature ensures identical Genesis across all nodes
 
 ### **Verifiable Time Sequence (VTS) Integration**
 - **Cryptographic Clock**: 500K hashes/sec SHA3-512 + Blake3 hybrid (25%/75%)
@@ -876,10 +876,10 @@ Fair penalties - equal for ALL nodes (including Genesis):
 | **Network Flooding** | >100 msgs/sec from single node | -10.0 points |
 | **Invalid Consensus** | Malformed checkpoint/QC vote | -5.0 points |
 
-### **Dilithium3-VRF Secret Leader Election (v4.0)**
+### **ML-DSA-65-VRF Secret Leader Election (v4.0)**
 ```rust
 // Post-quantum VRF leader election — unpredictable, verifiable, bias-resistant
-// NIST FIPS 204 (ML-DSA-65) Dilithium3 detached signature as VRF proof
+// NIST FIPS 204 (ML-DSA-65) detached signature as VRF proof
 
 // Step 1: Compute deterministic slot seed (same on all nodes)
 let slot_seed = SHA3_256(macroblock_N2_hash || leadership_round);
@@ -897,7 +897,7 @@ let winner = verified_claims.min_by(|a, b| a.vrf_output.cmp(&b.vrf_output));
 
 // ✅ UNPREDICTABLE: VRF output = f(secret_key, slot_seed) — unknowable without sk
 // ✅ VERIFIABLE: Any node can verify(pk, slot_seed, proof) → output
-// ✅ BIAS-RESISTANT: Dilithium3 signing is deterministic (no nonce manipulation)
+// ✅ BIAS-RESISTANT: ML-DSA-65 signing is deterministic (no nonce manipulation)
 // ✅ POST-QUANTUM: NIST FIPS 204 Level 3 (128-bit PQ security)
 ```
 
@@ -1137,7 +1137,7 @@ docker run -d --name my-qnet-node --restart=always \
 > **⚠️ Mnemonic Seed Phrase**: Both 12-word (128-bit) and 24-word (256-bit) BIP39 mnemonics are supported.
 > The seed phrase **MUST match** the wallet used in the mobile app to burn 1DEV tokens and obtain the activation code.
 > The server derives the Solana address from this mnemonic and verifies it against the XOR-encrypted address in the activation code.
-> Dilithium3 keypair is generated on first launch, encrypted with **AES-256-GCM**, and stored in the Docker volume with `chmod 600`.
+> ML-DSA-65 keypair is generated on first launch, encrypted with **AES-256-GCM**, and stored in the Docker volume with `chmod 600`.
 >
 > **🔥 QNET_BURN_TX_HASH**: Solana transaction signature from the 1DEV burn. Obtained in the mobile app along with the activation code.
 >
@@ -1151,8 +1151,8 @@ docker run -d --name my-qnet-node --restart=always \
 |------|---------|--------|------------|
 | Mnemonic seed | Environment variable (RAM only) | Text, 12 or 24 BIP39 words | Process memory isolation |
 | Wallet address | In-memory + blockchain | 41-char EON format | Public data |
-| Dilithium3 PK | Docker volume (`/app/data/keys/`) | 1952 bytes | AES-256-GCM encrypted, chmod 600 |
-| Dilithium3 SK | Docker volume (`/app/data/keys/`) | 4000 bytes | AES-256-GCM encrypted, chmod 600 |
+| ML-DSA-65 PK | Docker volume (`/app/data/keys/`) | 1952 bytes | AES-256-GCM encrypted, chmod 600 |
+| ML-DSA-65 SK | Docker volume (`/app/data/keys/`) | 4000 bytes | AES-256-GCM encrypted, chmod 600 |
 | VRF public keys | RocksDB (`/app/data/blockchain/`) | Hex-encoded | Persistent, public data |
 
 #### 🚚 Node Migration to Another Server
@@ -1181,7 +1181,7 @@ docker run -d --name my-qnet-node --restart=always \
   qnet-production
 ```
 
-> **⚠️ CRITICAL**: The Dilithium3 keypair is generated randomly (not from seed).
+> **⚠️ CRITICAL**: The ML-DSA-65 keypair is generated randomly (not from seed).
 > If you lose the key files, the network will not recognize your node even with the correct mnemonic.
 > The mnemonic only derives the wallet address — the cryptographic keys are separate.
 > Always backup your Docker volume (`/app/data/keys/`) when migrating!
@@ -1468,7 +1468,7 @@ docker run -d --name qnet-super --restart=always \
 #### How It Works
 - **1 Wallet = 1 Active Node**: Only one node per type per wallet can be active
 - **Seamless Migration**: Activate on new server → old node automatically shuts down
-- **Quantum-Secure**: All replacement signals use CRYSTALS-Dilithium signatures
+- **Quantum-Secure**: All replacement signals use ML-DSA-65 signatures
 - **Blockchain Authority**: Blockchain records are the source of truth
 
 #### Migration Scenarios
@@ -1768,7 +1768,7 @@ blockchain.submit_activation_record(activation_record).await;
 ### 🔐 **Cryptographic Security:**
 
 #### **✅ Tamper-Proof Code Generation:**
-- **CRYSTALS-Dilithium signatures** - quantum-resistant  
+- **ML-DSA-65 signatures** - quantum-resistant  
 - **BLAKE3 + SHA3-512 hashing** - deterministic from burn data
 - **Consensus verification** - multiple nodes must agree
 - **Blockchain immutability** - codes recorded on-chain
@@ -2070,7 +2070,7 @@ docker run ... -e QNET_MAX_THREADS=8 ...
 - **K-bucket Management**: Max 20 peers per bucket with reputation-based replacement
 
 #### Core Features:
-- **Post-quantum cryptography**: CRYSTALS-Dilithium peer verification
+- **Post-quantum cryptography**: ML-DSA-65 peer verification
 - **Adaptive peer limits**: 8-500 connections per region based on network size
 - **Real-time topology**: 1-second rebalancing intervals
 - **Blockchain peer registry**: Immutable peer records in distributed ledger
@@ -2265,7 +2265,7 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 
 ### 🛡️ Security Features
 
-- **Post-quantum crypto**: Always enabled (CRYSTALS-Dilithium, AES-256-GCM)
+- **Post-quantum crypto**: Always enabled (ML-DSA-65, AES-256-GCM)
 - **AES-256-GCM Database Encryption**: Activation codes encrypted, key never stored
 - **Database Theft Protection**: Cannot decrypt without activation code
 - **Critical Attack Protection**: Instant 1-year ban for database/chain attacks
@@ -2315,7 +2315,7 @@ User Transaction Flow:
 | **Rate Limiting** | 10 bundles/min per user | Anti-spam protection |
 | **Block Allocation** | 0-20% dynamic | 80-100% guaranteed for public TXs |
 | **Multi-Producer Submission** | 3 producers | Redundancy and load distribution |
-| **Signature Verification** | Dilithium3 | Post-quantum security |
+| **Signature Verification** | ML-DSA-65 | Post-quantum security |
 
 **Why QNet Still Has Natural MEV Resistance:**
 
@@ -2337,7 +2337,7 @@ QNet's **reputation-based consensus** + **Private Bundles** provides dual-layer 
 2. **Atomic Inclusion**: All bundle TXs included together or rejected entirely
 3. **Auto-Fallback**: Failed bundles automatically fall back to public mempool
 4. **Priority Mempool**: Public TXs prioritized by gas price (anti-spam)
-5. **Post-Quantum Signatures**: All bundles verified with Dilithium3
+5. **Post-Quantum Signatures**: All bundles verified with ML-DSA-65
 6. **Real-Time Tested**: 11/11 tests passed in production environment
 
 **API Endpoints:**
@@ -2466,7 +2466,7 @@ Prevents repeat attacks: attackers can't instantly rejoin after penalty
 **November 15, 2025 - "Deterministic Producer Selection & Macroblock Consensus Listener"**
 
 This release introduces critical improvements for quantum-resistant consensus:
-- **Deterministic Producer Selection** with pure ML-DSA-65 (Dilithium3) and finality window entropy
+- **Deterministic Producer Selection** with pure ML-DSA-65 and finality window entropy
 - **Race-Free Rotation**: No delays at block boundaries (31, 61, 91)
 - **Active Macroblock Consensus**: All Super nodes run 1-second polling listener
 - **Deterministic Validator Selection**: 1000 validators per macroblock round

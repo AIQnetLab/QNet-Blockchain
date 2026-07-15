@@ -317,8 +317,9 @@ function transformTransaction(
     return null;
   }
 
-  // Skip genesis benchmark transactions (initial 1000 account creation)
-  if (blockHeight === 0 && from === 'genesis' && to && to.startsWith('EON1be')) {
+  // Hide the genesis prefund/benchmark distribution (genesis -> user address at block 0),
+  // any address format. Real genesis rows use a genesis-wallet 'from' or a 'system' recipient.
+  if (blockHeight === 0 && from === 'genesis' && to && !to.startsWith('system')) {
     return null;
   }
 
@@ -525,7 +526,7 @@ async function processSingleBlock(height: number): Promise<number> {
       total_gas_used: totalGasUsed,
       poh_hash: bytesToHex(block.poh_hash) || null,
       poh_count: (block.poh_count as number) || 0,
-      signature_type: (block.signature_type as string) || 'Dilithium3',
+      signature_type: (block.signature_type as string) || 'ML-DSA-65',
       signature: (block.signature as string) || null,
       cert_serial: (block.cert_serial as string) || null,
       qrb_output: bytesToHex(block.qrb_output) || null,
@@ -1255,7 +1256,7 @@ async function saveBlocksBatch(blocks: { height: number; block: BlockData }[]): 
         total_gas_used: totalGasUsed,
         poh_hash: bytesToHex(block.poh_hash) || null,
         poh_count: (block.poh_count as number) || 0,
-        signature_type: (block.signature_type as string) || 'Dilithium3',
+        signature_type: (block.signature_type as string) || 'ML-DSA-65',
         signature: (block.signature as string) || null,
         cert_serial: (block.cert_serial as string) || null,
         qrb_output: bytesToHex(block.qrb_output) || null,
@@ -1676,7 +1677,7 @@ async function handleNewBlockEvent(event: WsNewBlockEvent): Promise<void> {
         total_gas_used: 0,
         poh_hash: null,
         poh_count: 0,
-        signature_type: 'Dilithium3',
+        signature_type: 'ML-DSA-65',
         signature: null,
         cert_serial: null,
         qrb_output: null,

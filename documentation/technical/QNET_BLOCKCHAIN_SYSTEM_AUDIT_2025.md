@@ -53,7 +53,7 @@ Consensus Security Test Results:
 ✅ Double-Spend Protection: 100% attack prevention
 ✅ Fork Resolution: Longest chain rule with reputation scoring
 ✅ Replay Attack Protection: Nonce-based transaction ordering
-✅ Signature Verification: Hybrid Dilithium3 + Ed25519 (NIST/Cisco encapsulated keys)
+✅ Signature Verification: Hybrid ML-DSA-65 + Ed25519 (NIST/Cisco encapsulated keys)
 ✅ Merkle Proof Integrity: SHA-3 quantum-resistant hashing
 ✅ Commit-Reveal Security: Prevents coordination attacks
 ```
@@ -155,9 +155,9 @@ Blockchain Performance Test Results (June 12, 2025):
 ```python
 Post-Quantum Crypto Test Results (June 12, 2025):
 ✅ AES-256-GCM Key Storage: Production ready + ML-KEM-768 key exchange active
-✅ Dilithium3 + Ed25519 Hybrid: Production ready
-✅ Dilithium3 Key Generation: 2.98ms (target: <50ms)
-✅ Hybrid Signing: 0.23ms (Dilithium3 + ephemeral Ed25519)
+✅ ML-DSA-65 + Ed25519 Hybrid: Production ready
+✅ ML-DSA-65 Key Generation: 2.98ms (target: <50ms)
+✅ Hybrid Signing: 0.23ms (ML-DSA-65 + ephemeral Ed25519)
 ✅ Hybrid Verification: Full verification per NIST/Cisco (no caching)
 ✅ Key Manager: SHA3-512 with Dilithium-seeded entropy (512-bit security)
 ✅ Hash Functions: SHA3-256/SHA3-512 (quantum-resistant)
@@ -169,7 +169,7 @@ Post-Quantum Crypto Test Results (June 12, 2025):
 #### **Quantum Threat Protection**
 ```bash
 Quantum Attack Resistance Validation:
-✅ Shor's Algorithm Defense: Dilithium3 immune to factoring + ML-KEM-768 secures key exchange
+✅ Shor's Algorithm Defense: ML-DSA-65 immune to factoring + ML-KEM-768 secures key exchange
 ✅ Grover's Algorithm Mitigation: 512-bit keys → 256-bit quantum security
 ✅ Quantum Replay Protection: Ephemeral keys with 60s expiration
 ✅ NIST/Cisco Compliance: Encapsulated keys per official recommendations
@@ -182,7 +182,7 @@ Quantum Attack Resistance Validation:
 
 #### **Post-Quantum Audit Score: 100/100**
 - **Strengths:** Full NIST/Cisco compliance, encapsulated keys, 512-bit security
-- **Implementation:** Real Dilithium3 for consensus, hybrid for key manager
+- **Implementation:** Real ML-DSA-65 for consensus, hybrid for key manager
 - **Security:** No caching vulnerabilities, forward secrecy, Byzantine-safe
 - **Production Ready:** ✅ YES - Exceeds NIST requirements
 

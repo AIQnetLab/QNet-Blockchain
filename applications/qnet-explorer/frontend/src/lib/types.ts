@@ -69,7 +69,7 @@ export interface Block {
   // State
   state_root?: string;
   
-  // Cryptographic signature (Dilithium3)
+  // Cryptographic signature (ML-DSA-65 / FIPS 204)
   signature_type: string;
   signature?: string;
   cert_serial?: string;

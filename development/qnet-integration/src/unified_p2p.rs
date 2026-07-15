@@ -14139,8 +14139,27 @@ impl SimplifiedP2P {
             }
 
             NetworkMessage::RequestGenesisCheckpoint { requester_id } => {
-                // GALC: serve the latest held capsule to a cold joiner (control-lane, tiny).
-                if let Some(cap) = crate::galc::held() {
+                // GALC: serve the latest held capsule to a cold joiner. The capsule is ~30 KB (genesis
+                // quorum sigs), so cap this serve per QUIC-anchored IP — a cold joiner needs it only a few
+                // times; the bound stops a synced peer from looping it to force uncapped serialize+egress.
+                let ip_over = {
+                    let ip = from_peer.split(':').next().unwrap_or(from_peer);
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs()).unwrap_or(0);
+                    let mut b = self.rate_limiter.entry(format!("galc_capsule_ip_{}", ip)).or_insert_with(|| RateLimit {
+                        requests: Vec::new(), max_requests: 60, window_seconds: 60, blocked_until: 0,
+                    });
+                    if b.blocked_until > now { true }
+                    else {
+                        let w = b.window_seconds;
+                        b.requests.retain(|&t| t > now.saturating_sub(w));
+                        if b.requests.len() >= b.max_requests { b.blocked_until = now + 30; true }
+                        else { b.requests.push(now); false }
+                    }
+                };
+                if ip_over {
+                    if crate::node::is_warn() { println!("[WARN][GALC] serve_capsule_rate_exceeded from={}", requester_id); }
+                } else if let Some(cap) = crate::galc::held() {
                     if let Ok(data) = bincode::serialize(&cap) {
                         if crate::node::is_info() {
                             println!("[INFO][GALC] serve_capsule mb={} to={}", cap.mb_index, requester_id);
@@ -21534,6 +21553,18 @@ impl SimplifiedP2P {
         if let Some((from, timestamp, height, signature, public_key)) = head {
             let (cert_mb, cert_round) = current_tc_hint();
             self.send_network_message(addr, NetworkMessage::HealthPing { from, timestamp, height, cert_mb, cert_round, signature, public_key });
+        }
+    }
+
+    /// Co-send the latest held GALC capsule (self-authenticating, tiny) to a served peer alongside the
+    /// signed head — a cold joiner adopts the genesis-rooted anchor from its first serving peer and
+    /// snapshot-jumps near-tip instead of replaying from h=90. Propagates via the serve tree
+    /// (genesis → early supers → later joiners): O(1) per joiner, no fan-in to genesis.
+    pub fn cosend_galc_capsule(&self, addr: &str) {
+        if let Some(cap) = crate::galc::held() {
+            if let Ok(data) = bincode::serialize(&cap) {
+                self.send_network_message(addr, NetworkMessage::GenesisCheckpoint { data });
+            }
         }
     }
 

@@ -32,11 +32,11 @@ QNet v3.18 implements a **direct fee crediting model** where transaction fees go
 Block_Fees = Sum of (effective_gas_price × gas_limit) for all transactions
 
 Where:
-- effective_gas_price = gas_price × 1.5 for ML-DSA-65 (Dilithium3, quantum) signatures
+- effective_gas_price = gas_price × 1.5 for ML-DSA-65 (quantum) signatures
 - effective_gas_price = gas_price for any non-quantum-signed (legacy/unsigned) transaction
 ```
 
-> Note: QNet transactions are signed with pure ML-DSA-65 (Dilithium3); the base
+> Note: QNet transactions are signed with pure ML-DSA-65; the base
 > (non-multiplied) tier is a fallback for legacy/unsigned transactions, not a
 > classical-signature path.
 

@@ -10,7 +10,7 @@
  * Output: dist/lib/noble-pq-ml-dsa.js (~17 KB minified)
  *   Sets window.QNetDilithiumLib = { QNetDilithium: { keygen, sign, verify, ... } }
  *
- * Algorithm: ML-DSA-65 (NIST FIPS 204 / Dilithium3)
+ * Algorithm: ML-DSA-65 (NIST FIPS 204)
  *   PK=1952 SK=4032 SIG=3309 (CTILDEBYTES=48)
  *   Byte-compatible with Android/iOS PQClean and Rust pqcrypto_mldsa.
  */

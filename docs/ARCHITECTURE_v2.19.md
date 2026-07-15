@@ -71,7 +71,7 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 - **Compact ML-DSA-65 Signatures v2.23**: 88% bandwidth reduction (~2.6KB RAW bytes)
 - **Progressive Finalization Protocol**: Self-healing consensus recovery
 - **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
-- **NIST Post-Quantum Compliant**: pure ML-DSA-65 (Dilithium3) signatures + ML-KEM-768 TLS key exchange
+- **NIST Post-Quantum Compliant**: pure ML-DSA-65 signatures + ML-KEM-768 TLS key exchange
 - **Batch Dilithium Verification v2.25.2**: 3x faster signature verification
 
 ### v2.57.0: Stage Pipeline (Adaptive Threading)
@@ -84,7 +84,7 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 │  (Heartbeat,    │ (adaptive)      │ (adaptive)      │ (adaptive)        │
 │   P2P, API)     │                 │                 │                   │
 │                 │ ML-DSA-65 verify│ Shred protocol  │ TX validation     │
-│                 │ (Dilithium3)    │ Block propagate │ State updates     │
+│                 │ (ML-DSA-65)    │ Block propagate │ State updates     │
 └─────────────────┴─────────────────┴─────────────────┴───────────────────┘
 ```
 
@@ -121,7 +121,7 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 
 ### Problem Solved
 
-Previous gossip-based producer selection caused **network forks** when different nodes had different views of active peers. Now replaced by **Dilithium3-VRF Secret Leader Election** (NIST FIPS 204).
+Previous gossip-based producer selection caused **network forks** when different nodes had different views of active peers. Now replaced by **ML-DSA-65-VRF Secret Leader Election** (NIST FIPS 204).
 
 ### Solution: MacroBlock Snapshots
 
@@ -156,7 +156,7 @@ pub struct EligibleProducer {
 │  └── Source: MacroBlock N-2.eligible_producers (blockchain)            │
 │  └── WHY N-2? N-1 may not be finalized yet! N-2 has 90+ blocks buffer │
 │                                                                         │
-│  PRODUCER SELECTION (Dilithium3-VRF Secret Leader Election v4.0):     │
+│  PRODUCER SELECTION (ML-DSA-65-VRF Secret Leader Election v4.0):     │
 │  └── calculate_qualified_candidates() → read snapshot from blockchain  │
 │  └── VRF evaluate(sk, slot_seed) → lowest output wins                 │
 │  └── All nodes use SAME snapshot + verify VRF proofs → DETERMINISM!   │
@@ -358,7 +358,7 @@ Deadlock Scenario (pre-v2.61):
 │  │   └── No commit/reveal phases — single round, one 2f+1 QC                  │
 │  ├── Each committee node reproduces window content locally                              │
 │  │   └── 90 mb hashes + head state_root + VRF beacon + epoch                   │
-│  │   └── content_ok fail-stop: sign ONLY if local content matches│
+│  │   └── content_ok fail-stop: sign ONLY if local content matches         │
 │  └── Checkpoint = hash(content); 2f+1 sigs = Quorum Cert (QC)                             │
 │      └── Leader assembles the MacroBlock once the QC is formed             │
 │                                                                             │
@@ -433,7 +433,7 @@ MacroBlock consensus uses the same pure post-quantum signature scheme as microbl
 
 | Component | Algorithm | Purpose |
 |-----------|-----------|---------|
-| **ML-DSA-65 (Dilithium3)** | CRYSTALS-Dilithium (NIST FIPS 204) | Pure post-quantum signature |
+| **ML-DSA-65** | ML-DSA-65 (NIST FIPS 204) | Pure post-quantum signature |
 | **Signature Size** | ~5KB (Full) for MacroBlocks | Includes certificate |
 
 ```rust
@@ -497,7 +497,7 @@ Even with epoch-based validator sets, three sources of non-determinism caused fo
 | Fallback | ❌ None | ❌ None | **❌ None** ✅ |
 | Lagging nodes | Must sync | Must sync | **Must sync** ✅ |
 | Determinism | 100% | 100% | **100%** ✅ |
-| Quantum Safe | ❌ No | ❌ No | **✅ Dilithium3 VRF** |
+| Quantum Safe | ❌ No | ❌ No | **✅ ML-DSA-65 VRF** |
 
 ### Fork Risk
 
@@ -581,7 +581,7 @@ QNet v3.0 introduces a native **Quantum Randomness Beacon** - a RANDAO-style acc
 │                                                                             │
 │  EPOCH (90 microblocks) - Each producer contributes:                        │
 │                                                                             │
-│  Block 1:  Producer A → VRF_output_A (Dilithium3 signature)                │
+│  Block 1:  Producer A → VRF_output_A (ML-DSA-65 signature)                │
 │  Block 2:  Producer B → VRF_output_B                                        │
 │  ...                                                                        │
 │  Block 90: Producer E → VRF_output_E                                        │
@@ -609,7 +609,7 @@ vrf_input = SHA3-256(
 // Output (quantum-resistant):
 vrf_output = DilithiumVRF.evaluate(vrf_input)
 // → 32 bytes random output
-// → Proof: ML-DSA-65 (Dilithium3) signature
+// → Proof: ML-DSA-65 signature
 ```
 
 ### Beacon Accumulation (per MacroBlock)
@@ -648,7 +648,7 @@ pub vrf_contributions_count: Option<u64>,
 | Property | Value | Notes |
 |----------|-------|-------|
 | Unpredictability | ✅ 100% | No one knows beacon until finalization |
-| Quantum Resistance | ✅ Yes | Dilithium3 VRF (NIST FIPS 204) |
+| Quantum Resistance | ✅ Yes | ML-DSA-65 VRF (NIST FIPS 204) |
 | Manipulation Resistance | ✅ Yes | Requires controlling >50% of producers |
 | Last Revealer Attack | ⚠️ Mitigated | Withholding = lost rewards + slashing |
 | Verification | ✅ On-chain | Any node can verify VRF proofs |
@@ -658,7 +658,7 @@ pub vrf_contributions_count: Option<u64>,
 | Feature | Ethereum 2.0 | Solana | Chainlink VRF | QNet QRB |
 |---------|--------------|--------|---------------|----------|
 | Native | ✅ Yes | ❌ No | ❌ No (oracle) | ✅ Yes |
-| Quantum Safe | ❌ No | ❌ No | ❌ No | ✅ **Dilithium3** |
+| Quantum Safe | ❌ No | ❌ No | ❌ No | ✅ **ML-DSA-65** |
 | Verifiable | ✅ Yes | ⚠️ Limited | ✅ Yes | ✅ Yes |
 | True Random | ✅ Yes | ⚠️ VRF only | ✅ Yes | ✅ Yes |
 | Cost | Gas fees | Minimal | High (oracle) | **Free** |
@@ -667,10 +667,10 @@ pub vrf_contributions_count: Option<u64>,
 
 ## Signature System
 
-### Pure ML-DSA-65 (Dilithium3) Signatures (v2.23 - RAW bytes)
+### Pure ML-DSA-65 Signatures (v2.23 - RAW bytes)
 
 > **CURRENT DESIGN**: QNet transactions, consensus, node identity, and P2P gossip are
-> signed with **pure ML-DSA-65 (Dilithium3, NIST FIPS 204)**. The former hybrid
+> signed with **pure ML-DSA-65 (NIST FIPS 204)**. The former hybrid
 > Ed25519+Dilithium scheme has been **fully removed** — there is no ephemeral Ed25519
 > layer on the signing path. (The only remaining "hybrid" in the stack is the
 > X25519Kyber768 TLS 1.3 key exchange for transport, which is KEY EXCHANGE, not signing.)
@@ -681,7 +681,7 @@ pub vrf_contributions_count: Option<u64>,
 > This reduces compact signature size from ~22KB to **~2.6KB** (88% reduction).
 
 **Critical Security**: Every message is signed directly with the node's persistent
-ML-DSA-65 (Dilithium3) key; a QNet address is a hash of that Dilithium public key.
+ML-DSA-65 key; a QNet address is a hash of that Dilithium public key.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -689,11 +689,11 @@ ML-DSA-65 (Dilithium3) key; a QNet address is a hash of that Dilithium public ke
 ├─────────────────────────────────────────────────────────────────────┤
 │ For EACH message:                                                   │
 │   1. Build canonical message bytes (payload || hash || timestamp)  │
-│   2. Sign with the persistent ML-DSA-65 (Dilithium3) key           │
+│   2. Sign with the persistent ML-DSA-65 key                        │
 │   3. Attach signature (RAW bytes) referencing the signer's cert    │
 ├─────────────────────────────────────────────────────────────────────┤
 │ Quantum Attack Protection:                                          │
-│   - Pure post-quantum: Dilithium3 resists Shor's algorithm         │
+│   - Pure post-quantum: ML-DSA-65 resists Shor's algorithm         │
 │   - No classical Ed25519 dependency anywhere on the signing path   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -707,7 +707,7 @@ CompactHybridSignature {
     node_id: String,                     // "genesis_node_001"
     cert_serial: String,                 // "cert_2024_11_16_12345"
     ephemeral_public_key: [u8; 32],      // RAW bytes (NEW Ed25519 key)
-    message_signature: Vec<u8>,          // RAW bytes (Dilithium3 signature, variable length ~3309B)
+    message_signature: Vec<u8>,          // RAW bytes (ML-DSA-65 signature, variable length ~3309B)
     dilithium_key_signature: Vec<u8>,    // RAW bytes (~2500 bytes, NOT base64!)
     signed_at: u64,                      // Unix timestamp
 }
@@ -727,13 +727,13 @@ CompactHybridSignature {
    ├─► Structural validation (signature + signer cert present?)
    ├─► Certificate lookup (cache or request)
    ├─► Reconstruct canonical message = payload || hash || timestamp
-   ├─► ML-DSA-65 (Dilithium3) verify against signer's registry key ✅
+   ├─► ML-DSA-65 verify against signer's registry key ✅
    └─► Result: Accept (pass) or Reject (fail)
    ↓
 3. Consensus Layer (consensus_crypto.rs::verify_compact_signature)
    ├─► Parse RAW bytes
    ├─► Reconstruct canonical message
-   ├─► Real Dilithium3 verification via dilithium3::open()
+   ├─► Real ML-DSA-65 verification via dilithium3::open()
    ├─► Byzantine consensus (2/3+ honest nodes)
    └─► Only verified blocks participate
 ```
@@ -743,7 +743,7 @@ CompactHybridSignature {
 > The struct below retains legacy `ephemeral_public_key` / `message_signature` (Ed25519)
 > fields from the superseded hybrid format; the live signing path uses pure ML-DSA-65.
 
-**Format**: `hybrid:<json>` with RAW bytes (legacy tag retained; payload is Dilithium3-signed)
+**Format**: `hybrid:<json>` with RAW bytes (legacy tag retained; payload is ML-DSA-65-signed)
 
 ```rust
 HybridSignature {
@@ -770,8 +770,8 @@ HybridCertificate {
 
 **Size**: ~5KB RAW bytes (was 12KB - 58% reduction)  
 **Use Case**: Macroblocks (no certificate lookup delay)  
-**Verification**: Immediate (certificate embedded) + real Dilithium3  
-**Signing**: Pure ML-DSA-65 (Dilithium3), same as compact signatures
+**Verification**: Immediate (certificate embedded) + real ML-DSA-65  
+**Signing**: Pure ML-DSA-65, same as compact signatures
 
 ### Certificate Management
 
@@ -893,10 +893,10 @@ let tx = bincode::deserialize::<Transaction>(&tx_bytes)
 
 ### Quantum-Resistant Transactions (v2.26)
 
-All QNet transactions are signed with **pure ML-DSA-65 (Dilithium3)** — a QNet address is
+All QNet transactions are signed with **pure ML-DSA-65** — a QNet address is
 a hash of the Dilithium public key, and keys derive from a BIP39 seed via the QNet
 derivation path. The optional `dilithium_signature` / `dilithium_public_key` fields below
-are legacy from the earlier opt-in model; the base signing path is Dilithium3 by default:
+are legacy from the earlier opt-in model; the base signing path is ML-DSA-65 by default:
 
 ```rust
 pub struct Transaction {
@@ -924,8 +924,8 @@ impl Transaction {
 
 | Type | Signature | Size | Gas Cost | Security |
 |------|-----------|------|----------|----------|
-| **Standard TX** | ML-DSA-65 (Dilithium3) | ~2.5KB | Base | Post-quantum |
-| **Quantum TX** | ML-DSA-65 (Dilithium3) | ~2.5KB | +50% premium (legacy tier) | Post-quantum |
+| **Standard TX** | ML-DSA-65 | ~2.5KB | Base | Post-quantum |
+| **Quantum TX** | ML-DSA-65 | ~2.5KB | +50% premium (legacy tier) | Post-quantum |
 
 **API Usage**:
 ```json
@@ -1232,7 +1232,7 @@ Block 150: PFP Level 2
 - **Storage**: Minimal (recent state only)
 - **Bandwidth**: Low (receive blocks, no validation)
 - **Target Users**: Mobile wallets, IoT devices
-- **Cryptography**: pure ML-DSA-65 (Dilithium3) for QNet transactions/identity (Ed25519 only as a Solana-side credential for the 1DEV burn)
+- **Cryptography**: pure ML-DSA-65 for QNet transactions/identity (Ed25519 only as a Solana-side credential for the 1DEV burn)
 - **Reputation**: Fixed at 70 (immutable, not affected by network events)
 - **Rewards**: Eligible for Pool 1 base emission (equal share with all nodes)
 
@@ -1247,7 +1247,7 @@ match self.node_type {
 
 **Transaction Signing (Light Nodes / Clients):**
 ```javascript
-// Mobile/Browser clients sign QNet transfers with pure ML-DSA-65 (Dilithium3).
+// Mobile/Browser clients sign QNet transfers with pure ML-DSA-65.
 // The wallet address is SHA512(Dilithium public key); keys derive from a BIP39 seed.
 // Format: "transfer:from:to:amount:gas_price:gas_limit"
 const message = `transfer:${from}:${to}:${amount}:1:10000`;
@@ -1259,7 +1259,7 @@ const signature = await signWithDilithium(message, dilSkHex, dilPkHex);
 // (Ed25519 is used ONLY as a Solana-side credential for the 1DEV burn, not for QNet TXs)
 ```
 
-**Performance (ML-DSA-65 / Dilithium3):**
+**Performance (ML-DSA-65):**
 - Sign: ~100–200μs
 - Verify: ~50–100μs
 - Size: ~5.2 KB (signature + public key)
@@ -1463,7 +1463,7 @@ NetworkMessage::ReputationSync {
 **v2.19.19 Optimizations**:
 - **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing
 - **Shred Protocol ALWAYS**: Block propagation uses Shred Protocol for ALL network sizes
-- **Heartbeat with ML-DSA-65 signatures (v2.23)**: Full quantum protection (pure Dilithium3)
+- **Heartbeat with ML-DSA-65 signatures (v2.23)**: Full quantum protection (pure ML-DSA-65)
 - **Exponential backoff failover**: 3s → 6s → 12s → 24s → 30s max
 
 **Why Gossip O(log n) vs Broadcast O(n)**:
@@ -1669,8 +1669,8 @@ POST /api/v1/rewards/claim
 {
     "node_id": "light_abc123",
     "wallet_address": "QNet...",
-    "signature": "dilithium3_signature",
-    "public_key": "dilithium3_pubkey"
+    "signature": "mldsa65_signature",
+    "public_key": "mldsa65_pubkey"
 }
 ```
 
@@ -1714,7 +1714,7 @@ struct LightNodeAttestation {
     pinger_node_id: String,
     slot: u64,
     timestamp: u64,
-    light_node_signature: Vec<u8>,    // ML-DSA-65 / Dilithium3 (Light node)
+    light_node_signature: Vec<u8>,    // ML-DSA-65 (Light node)
     pinger_dilithium_signature: String, // Dilithium (Pinger)
 }
 ```
@@ -2032,7 +2032,7 @@ pub struct TxBundle {
     min_timestamp: u64,             // Earliest inclusion time
     max_timestamp: u64,             // Latest inclusion time (max 60s)
     reverting_tx_hashes: Vec<String>,  // TXs that must NOT be included
-    signature: Vec<u8>,             // Dilithium3 signature
+    signature: Vec<u8>,             // ML-DSA-65 signature
     submitter_pubkey: Vec<u8>,      // Submitter identity
     total_gas_price: u64,           // Bundle priority
 }
@@ -2048,7 +2048,7 @@ pub struct TxBundle {
 | Max Lifetime | 60 seconds | Time window check | Prevent stale bundles (60 microblocks) |
 | Rate Limiting | 10 bundles/min | Per-user counter | Anti-spam protection |
 | Block Allocation | 0-20% dynamic | Calculated per block | 80-100% guaranteed for public TXs |
-| Signature | Dilithium3 | Post-quantum verification | Byzantine-safe authentication |
+| Signature | ML-DSA-65 | Post-quantum verification | Byzantine-safe authentication |
 
 **Dynamic Allocation Algorithm**:
 
@@ -2131,7 +2131,7 @@ DELETE /api/v1/bundle/{bundle_id}
 ### Security Properties
 
 **Byzantine Safety**:
-- ✅ **Post-Quantum Signatures**: All bundles verified with Dilithium3
+- ✅ **Post-Quantum Signatures**: All bundles verified with ML-DSA-65
 - ✅ **Reputation Gate**: Only 80%+ reputation nodes can submit
 - ✅ **Multi-Producer Submission**: 3 producers for redundancy
 - ✅ **Atomic Inclusion**: All bundle TXs verified before inclusion
@@ -2182,7 +2182,7 @@ DELETE /api/v1/bundle/{bundle_id}
 ├─────────────────────────────────────────────────────────┤
 │  1. Structural validation                               │
 │  2. Certificate lookup (cache or request from network)  │
-│  3. ML-DSA-65 (Dilithium3) signature verification ✅    │
+│  3. ML-DSA-65 signature verification ✅                  │
 │  4. Signer ↔ registry-key binding check ✅              │
 │  5. Chain continuity checks                             │
 │  6. Verifiable Time Sequence verification                       │
@@ -2210,7 +2210,7 @@ Per **NIST FIPS 204** (ML-DSA):
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │ EVERY MESSAGE uses:                                                 │
-│   1. The signer's persistent ML-DSA-65 (Dilithium3) key            │
+│   1. The signer's persistent ML-DSA-65 key                         │
 │   2. Dilithium signs: payload || message_hash || timestamp         │
 │   3. Verify against the signer's on-chain registry public key      │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -2222,8 +2222,8 @@ Per **NIST FIPS 204** (ML-DSA):
 ```
 
 #### Post-Quantum Cryptography (v4.0)
-- **Algorithm**: CRYSTALS-Dilithium3 (NIST FIPS 204 / ML-DSA-65)
-- **Security Level**: Dilithium3 (Level 3, 128-bit post-quantum)
+- **Algorithm**: ML-DSA-65 (NIST FIPS 204)
+- **Security Level**: ML-DSA-65 (Level 3, 128-bit post-quantum)
 - **Key Size**: 1952 bytes (public), 4000 bytes (private)
 - **Signature Size**: 3293 bytes (detached)
 - **Security**: Resistant to Shor's algorithm (quantum attacks)
@@ -2247,7 +2247,7 @@ Per **NIST FIPS 204** (ML-DSA):
 #### Key Management & Storage
 - **Mnemonic Seed**: 12 or 24 BIP39 words, passed via `QNET_WALLET_SEED` / `QNET_GENESIS_SEED` env var
 - **Wallet Address**: Deterministically derived from seed via `SHA3-256("QNet_Wallet_v1" + seed)`
-- **Dilithium3 Keypair**: Generated randomly on first launch, encrypted with **AES-256-GCM**, stored in Docker volume
+- **ML-DSA-65 Keypair**: Generated randomly on first launch, encrypted with **AES-256-GCM**, stored in Docker volume
 - **Key File Permissions**: `chmod 600` (owner read/write only) on Unix systems
 - **VRF Public Keys**: Persisted in RocksDB, restored on node restart
 - **Migration**: Key files **must be copied** when moving node to another server (seed alone is insufficient)
@@ -2327,7 +2327,7 @@ if cert.issued_at > current_time + MAX_CLOCK_SKEW {
 
 #### Layer 5: Cryptographic Verification
 ```rust
-// Asynchronous Dilithium3 verification
+// Asynchronous ML-DSA-65 verification
 tokio::spawn(async move {
     let is_valid = pqcrypto_dilithium::dilithium3::open(signed_msg, &pk);
     
@@ -2624,7 +2624,7 @@ Docker:
     -v $(pwd)/super_node_data:/app/data \
     qnet-production
 
-Node Migration (MUST copy Dilithium3 keys — seed alone is not enough):
+Node Migration (MUST copy ML-DSA-65 keys — seed alone is not enough):
   # Backup keys from old server
   docker cp my-qnet-node:/app/data/keys ./keys_backup
   # Restore keys on new server before starting
@@ -2661,7 +2661,7 @@ QNet v2.23 implements a production-ready, post-quantum secure blockchain with:
 ✅ **Defense-in-depth**: Real Dilithium verification at P2P + Consensus layers  
 ✅ **Progressive Finalization**: Self-healing consensus  
 ✅ **Zero downtime**: Microblocks never stop  
-✅ **NIST compliant**: CRYSTALS-Dilithium post-quantum cryptography  
+✅ **NIST compliant**: ML-DSA-65 post-quantum cryptography  
 ✅ **Scalable**: Millions of nodes, max 1000 validators  
 ✅ **Byzantine safe**: 2/3+ honest nodes at all times  
 ✅ **Memory protected**: Bounded block buffering with automatic cleanup  
@@ -2733,7 +2733,7 @@ QNet v2.23 implements a production-ready, post-quantum secure blockchain with:
 **Mobile Integration:**
 - Firebase SDK integration (iOS + Android)
 - FCM message handling for ping challenges
-- Ping response with Dilithium3 (ML-DSA-65) signature
+- Ping response with ML-DSA-65 signature
 - Token refresh and registration
 
 ---

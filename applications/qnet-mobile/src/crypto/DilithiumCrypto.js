@@ -1,15 +1,15 @@
 /**
- * QNet Dilithium3 (ML-DSA-65) Crypto Module for React Native
+ * QNet ML-DSA-65 (FIPS 204) Crypto Module for React Native
  *
- * Provides post-quantum CRYSTALS-Dilithium3 signatures via native module.
+ * Provides post-quantum ML-DSA-65 (FIPS 204) signatures via native module.
  * NIST FIPS 204 compliant. Supported on Android (NDK/JNI) and iOS (ObjC bridge).
  *
  * Architecture:
  *   - Keypair deterministically derived from activation code
  *   - Signs light node registration and ping messages
  *   - Signature format matches backend's verify_dilithium_signature()
- *   - Ed25519 (nacl) used for wallet TX, Dilithium3 for node identity
- *   - HYBRID: both Ed25519 + Dilithium3 signatures sent for double security
+ *   - ML-DSA-65 (FIPS 204) for wallet TX and node identity (post-quantum)
+ *   - Pure post-quantum: no Ed25519 hybrid
  *
  * Backend format expected:
  *   "dilithium_sig_{pseudonym}_{base64([sig_len_LE][signed_msg][pk_len_LE][pk])}"

@@ -39,7 +39,7 @@ const WalletSection = React.memo(function WalletSection() {
         <div className="tool-card-large">
           <h4>Hybrid Post-Quantum Security</h4>
           <p>
-            Dilithium3 + Ed25519 dual-signature system. CRYSTALS-Kyber ML-KEM-768 key exchange (active via QUIC TLS 1.3). 
+            ML-DSA-65 (NIST FIPS 204) quantum-signature system. CRYSTALS-Kyber ML-KEM-768 key exchange (active via QUIC TLS 1.3). 
             Hardware-backed storage with biometric authentication. Future-proof against quantum computers.
           </p>
         </div>

@@ -180,7 +180,7 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
             </div>
             <h3>Post-Quantum Cryptography</h3>
             <p>
-              CRYSTALS-Dilithium3 (NIST FIPS 204) + Ed25519 hybrid signatures. 31/31 crypto tests passed (100% perfect). 
+              ML-DSA-65 (NIST FIPS 204) quantum signatures. 31/31 crypto tests passed (100% perfect). 
               NIST-approved algorithms protecting against quantum computing threats.
             </p>
           </div>

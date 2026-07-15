@@ -24536,6 +24536,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Co-send signed head even on an empty serve so a behind follower's SIGNED_HEAD_MAX
                     // still refreshes — breaks the request-vs-behind loop.
                     p2p.cosend_signed_head(&addr);
+                    // Co-send the genesis-rooted anchor ONLY to a far-behind (cold-join range) requester, so a
+                    // cold joiner jumps near-tip instead of replaying from h=90 — and 100k routine near-tip serves
+                    // don't each carry the capsule. A requester within one snapshot interval already has the pin.
+                    if crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire)
+                        .saturating_sub(from_height) > crate::galc::GALC_MINT_INTERVAL * 90 {
+                        p2p.cosend_galc_capsule(&addr);
+                    }
                     if is_info() { println!("[INFO][SYNC] empty_batch_sent to={} addr={}", requester_id, addr); }
                 } else {
                     if is_warn() { println!("[WARN][SYNC] empty_batch_no_addr id={} from={}", requester_id, from_peer_addr); }
@@ -24694,6 +24701,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // cold node the HealthPing emit fan-out misses) learns the real network tip and advances
             // its SIGNED_HEAD_MAX, instead of stalling at its own frontier.
             p2p.cosend_signed_head(&addr);
+            // Co-send the genesis-rooted anchor ONLY to a far-behind (cold-join range) requester — see empty-batch site.
+            if crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire)
+                .saturating_sub(from_height) > crate::galc::GALC_MINT_INTERVAL * 90 {
+                p2p.cosend_galc_capsule(&addr);
+            }
 
             if is_info() {
                 println!("[INFO][SYNC] sent blocks={} (shred={} batch={}) to={}",

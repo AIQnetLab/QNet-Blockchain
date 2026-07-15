@@ -5,7 +5,7 @@
 > live system: (1) there is NO "Post-Quantum EVM" (`pq_evm` was deleted); smart
 > contracts run on a deterministic WASM VM (`wasmi`, fuel = gas) with on-chain
 > QRC-20 and QRC-721 standards and cross-contract calls (EIP-2930-style access list).
-> (2) Signatures are pure ML-DSA-65 (Dilithium3), NOT "Hybrid Dilithium2 + Ed25519" —
+> (2) Signatures are pure ML-DSA-65, NOT "Hybrid Dilithium2 + Ed25519" —
 > the Ed25519 removal is complete; the only remaining hybrid is the X25519Kyber768
 > (ML-KEM-768) TLS 1.3 transport key exchange. (3) Sharding is deferred and OFF
 > (single-shard); "cross-shard" claims are not live. (4) Solana burn is proof-of-burn,

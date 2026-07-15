@@ -31,7 +31,7 @@ ranks anyone — so a gradient would feed nothing.
 | Threat | Defense |
 |--------|---------|
 | Sybil / many identities | Proof-of-burn cost per node + 2f+1 committee burn-attestation binding each registration to a real on-chain burn |
-| Double-sign / equivocation | Cryptographic proof (Dilithium3) → permanent ban; ban-set anchored per-macroblock in `consensus_data.banned_validators`, re-verified each epoch (O(window), pruning-safe) |
+| Double-sign / equivocation | Cryptographic proof (ML-DSA-65) → permanent ban; ban-set anchored per-macroblock in `consensus_data.banned_validators`, re-verified each epoch (O(window), pruning-safe) |
 | Invalid block | Rejected at validation (sig/hash) before apply; if it reached a QC, requires proof = permanent-ban class |
 | Censorship by a producer | Uniform-VRF rotation (30 blocks/producer) + 2f+1 timeout-round failover; next producer from the same eligible pool |
 | Slot timeout / silent producer | Failover skips it, **no penalty** — missed-block attribution is deterministically unsound post-failover |
@@ -69,7 +69,7 @@ deterministic per-window ping (shard-assigned, 1 ping per 4h).
 
 | Offense | Result | Evidence |
 |---------|--------|----------|
-| Double-sign (2 valid sigs, same height) | Permanent ban (rep 0) | `EquivocationProof` TX, re-verified (Dilithium3) |
+| Double-sign (2 valid sigs, same height) | Permanent ban (rep 0) | `EquivocationProof` TX, re-verified (ML-DSA-65) |
 | Same-round checkpoint double-vote | Permanent ban | `VoteEquivocationProof` TX, re-verified |
 | Invalid block | Rejected before apply | Block validation (sig/hash) |
 

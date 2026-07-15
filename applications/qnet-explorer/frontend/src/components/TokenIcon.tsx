@@ -37,15 +37,29 @@ export default function TokenIcon({ logo, symbol, address, size = 28, native = f
   const letter = (String(symbol || '?').trim().charAt(0) || '?').toUpperCase();
   const px = `${size}px`;
 
-  // Native QNC: fixed brand mark (cyan disc, "Q") — consistent everywhere the coin appears.
+  // Native QNC: the real brand logo (local /public asset), consistent with the mobile wallet.
+  // If the asset ever 404s (e.g. not deployed), fall back to a brand disc — never a broken image.
   if (native) {
+    if (imgFailed) {
+      return (
+        <span aria-hidden style={{
+          width: px, height: px, borderRadius: '50%', flexShrink: 0,
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          background: 'linear-gradient(135deg,#00e5f0,#0a8fa0)', color: '#04141a',
+          fontSize: Math.round(size * 0.5), fontWeight: 800, lineHeight: 1, userSelect: 'none',
+        }}>Q</span>
+      );
+    }
     return (
-      <span aria-hidden style={{
-        width: px, height: px, borderRadius: '50%', flexShrink: 0,
-        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-        background: 'linear-gradient(135deg,#00e5f0,#0a8fa0)', color: '#04141a',
-        fontSize: Math.round(size * 0.5), fontWeight: 800, lineHeight: 1, userSelect: 'none',
-      }}>Q</span>
+      // eslint-disable-next-line @next/next/no-img-element
+      <img
+        src="/qnc-logo.png"
+        alt="QNC"
+        width={size}
+        height={size}
+        onError={() => setImgFailed(true)}
+        style={{ width: px, height: px, borderRadius: '50%', objectFit: 'contain', flexShrink: 0, background: '#04141a' }}
+      />
     );
   }
 

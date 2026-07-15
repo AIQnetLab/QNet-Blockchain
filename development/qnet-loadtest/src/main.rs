@@ -58,6 +58,11 @@ struct Args {
     /// Finality tracker poll interval (ms).
     #[arg(long, default_value_t = 400)]
     poll_ms: u64,
+    /// Committee (validator) size this network launched with, used as the 2f+1 finality
+    /// threshold ONLY when the node's macroblock-proof response doesn't enumerate the committee.
+    /// 0 (default) = no assumption: finality is counted only when the node itself reports it.
+    #[arg(long, default_value_t = 0)]
+    committee: u64,
     /// JSON report output path.
     #[arg(long, default_value = "loadtest_report.json")]
     out: String,
@@ -140,6 +145,7 @@ async fn main() {
         let free_tx = free_tx.clone();
         let poll = Duration::from_millis(args.poll_ms);
         let sample_cap = args.proof_sample as usize;
+        let committee_fallback = args.committee as usize;
         tokio::spawn(async move {
             let c = &clients[0];
             let mut next_h = c.get_height().await.unwrap_or(0) + 1;
@@ -176,7 +182,7 @@ async fn main() {
                 }
                 // Hard-finality advance: walk finalized macroblocks forward.
                 loop {
-                    match c.macroblock_hard_final(last_final_macro + 1).await {
+                    match c.macroblock_hard_final(last_final_macro + 1, committee_fallback).await {
                         Ok(true) => last_final_macro += 1,
                         _ => break,
                     }

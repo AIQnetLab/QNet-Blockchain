@@ -2136,8 +2136,10 @@ export class WalletManager {
   // Re-derive the QNet address to the canonical pure-Dilithium identity.
   async migrateQNetAddress(wallet) {
     try {
-      // Already on the pure-Dilithium identity — nothing to do.
-      if (wallet.qnetKeypair && wallet.qnetKeypair.path === 'QNET_WALLET_MLDSA65_v1') {
+      // Already on the current FIPS-204 identity — nothing to do. (A wallet from the old
+      // round-3 build carries the previous 'QNET_WALLET_MLDSA65_v1' marker, so it does NOT
+      // match here and falls through to be re-derived below.)
+      if (wallet.qnetKeypair && wallet.qnetKeypair.path === 'QNET_WALLET_MLDSA65_fips204') {
         return wallet;
       }
 
@@ -2202,7 +2204,10 @@ export class WalletManager {
       // (Array.from(...)) keep working; the bytes are now the ML-DSA-65 wallet key, not Ed25519.
       return {
         address,
-        keypair: { publicKey: pkBytes, privateKey: skBytes, path: 'QNET_WALLET_MLDSA65_v1' },
+        // path marker bumped to '_fips204' so a wallet created by the OLD round-3 native
+        // build (same seed prefix, same '_v1' marker, but a different key) is NOT mistaken
+        // for already-migrated — migrateQNetAddress re-derives it to this FIPS-204 identity.
+        keypair: { publicKey: pkBytes, privateKey: skBytes, path: 'QNET_WALLET_MLDSA65_fips204' },
       };
     } catch (error) {
       throw new Error('Failed to generate QNet address (pure Dilithium): ' + ((error && error.message) || error));
@@ -3347,6 +3352,9 @@ export class WalletManager {
 
       if (wallet.qnetAddress) {
         await AsyncStorage.setItem('qnet_address', wallet.qnetAddress);
+        // Stamp the crypto scheme so getCurrentWallet (no-password path) never trusts an
+        // address cached by the old round-3 build; a missing/old stamp = re-derive on unlock.
+        await AsyncStorage.setItem('qnet_address_scheme', 'fips204');
       }
 
       // Remove mnemonic from returned object — caller uses getEncryptedMnemonic() explicitly
@@ -5997,7 +6005,7 @@ export class WalletManager {
       // Create challenge from timestamp (for signature)
       const challenge = `ping:${nodeId}:${Date.now()}`;
 
-      // Build HYBRID signature: Ed25519 + Dilithium3
+      // Build ML-DSA-65 signature (pure post-quantum, no Ed25519)
       let formattedSignature;
 
       if (!isDilithiumAvailable()) {
@@ -6624,32 +6632,18 @@ export class WalletManager {
       // Return a minimal wallet structure with what we know
       const solanaAddress = await AsyncStorage.getItem('qnet_wallet_address');
       if (solanaAddress) {
-        // Check for stored QNet address first
+        // Trust the cached QNet address ONLY if a prior unlock stamped it under the current
+        // FIPS-204 scheme. A cache from the old round-3 build (still a valid 45-char eon with a
+        // valid checksum) would otherwise be returned verbatim and diverge from the node. We
+        // cannot re-derive here (no password) — leave it null so the UI waits for the next
+        // unlock, which re-derives via generateQNetAddress and stamps the scheme. Never fall
+        // back to the Solana-bridge address (non-Dilithium — it can never match the node).
         let qnetAddress = await AsyncStorage.getItem('qnet_address');
-        
-        // v4.1: Force regen if missing or not 45-char format (old 41-char addresses)
-        let needsRegen = !qnetAddress || qnetAddress.length !== 45;
-        if (!needsRegen && qnetAddress) {
-          // Verify SHA3-256 checksum integrity
-          try {
-            const { sha3_256 } = require('js-sha3');
-            const addrBody = qnetAddress.substring(0, 37);
-            const storedChecksum = qnetAddress.substring(37, 45);
-            const correctChecksum = sha3_256(addrBody).substring(0, 8).toLowerCase();
-            if (storedChecksum !== correctChecksum) {
-              console.log('[WARN][WALLET] checksum_mismatch regen=true');
-              needsRegen = true;
-            }
-          } catch (e) { needsRegen = true; }
+        const scheme = await AsyncStorage.getItem('qnet_address_scheme');
+        if (scheme !== 'fips204' || !qnetAddress || qnetAddress.length !== 45) {
+          qnetAddress = null;
         }
-        if (needsRegen) {
-          qnetAddress = this.generateQNetAddressFromSolana(solanaAddress);
-          // Store the new address for future use
-          if (qnetAddress) {
-            await AsyncStorage.setItem('qnet_address', qnetAddress);
-          }
-        }
-        
+
         return {
           address: solanaAddress,
           solanaAddress: solanaAddress,

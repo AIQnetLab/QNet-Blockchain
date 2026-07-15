@@ -19,7 +19,7 @@ QNet implements a **WebAssembly-based smart contract architecture**:
 
 **Key Features**:
 - ✅ **Mobile Optimization**: <2MB memory footprint, <0.01% battery usage
-- ✅ **Post-Quantum Security**: ML-DSA-65 (Dilithium3) signatures + hybrid X25519Kyber768 (ML-KEM-768) transport key exchange
+- ✅ **Post-Quantum Security**: ML-DSA-65 signatures + hybrid X25519Kyber768 (ML-KEM-768) transport key exchange
 - ✅ **High Performance**: 50,000+ TPS per node
 - ✅ **Microblock Integration**: Sub-second block time; Checkpoint-BFT v2 macroblock finality (~60s)
 
@@ -91,7 +91,7 @@ curl -X POST http://localhost:9876/api/v1/contract/deploy \
 ## 🛡️ Security Architecture
 
 ### **Quantum Protection**:
-- **ML-DSA-65 (Dilithium3)**: Digital signatures — transactions, consensus, node identity, and P2P gossip are all signed with pure ML-DSA-65
+- **ML-DSA-65**: Digital signatures — transactions, consensus, node identity, and P2P gossip are all signed with pure ML-DSA-65
 - **Hybrid X25519Kyber768 (ML-KEM-768)**: Transport key exchange over QUIC + TLS 1.3
 - **SHA3-256**: Quantum-resistant hashing
 
@@ -166,5 +166,5 @@ qnet call-contract <CONTRACT_ADDRESS> --data 0x... --gas-limit 100000
 - ✅ **QRC-721 NFTs**: Fully on-chain (deploy, mint, transfer, approve, transferFrom)
 - ✅ **Cross-contract calls**: EIP-2930-style access list
 - ✅ **Mobile optimization**: <0.01% battery usage achieved
-- ✅ **Quantum security**: Pure ML-DSA-65 (Dilithium3) signatures + hybrid X25519Kyber768 (ML-KEM-768) transport KEX
+- ✅ **Quantum security**: Pure ML-DSA-65 signatures + hybrid X25519Kyber768 (ML-KEM-768) transport KEX
 - ✅ **Developer tools**: SDK available 

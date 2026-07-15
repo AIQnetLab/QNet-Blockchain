@@ -24,7 +24,7 @@ This guide explains how QNet integrates with 1DEV token burn on Solana for node 
 ┌─────────────────┐                                              │
 │  Light Node:    │  POST /api/v1/light-node/register            │
 │  Register via   │─────────────────────────────────────────────▶│
-│  mobile API     │  (Ed25519 sig + Dilithium3 sig)              │
+│  mobile API     │  (Ed25519 sig + ML-DSA-65 sig)              │
 └─────────────────┘                                              │
                                                                  │
 ┌─────────────────┐                                              │
@@ -126,7 +126,7 @@ docker run -d --name qnet-super --restart=always \
 
 ### Light Node Registration (Mobile API)
 ```javascript
-// Mobile app sends registration with Ed25519 + Dilithium3 signatures
+// Mobile app sends registration with Ed25519 + ML-DSA-65 signatures
 const response = await fetch("http://genesis-node:8001/api/v1/light-node/register", {
     method: "POST",
     body: JSON.stringify({

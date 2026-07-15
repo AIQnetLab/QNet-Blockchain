@@ -328,7 +328,7 @@ The network can handle up to 10M+ nodes with the implemented quantum-resistant o
 4. **Sampled consensus** - Keeps consensus fast ✅ IMPLEMENTED
 5. **Hierarchical structure** - Reduces connection overhead ✅ IMPLEMENTED
 6. **NEW: Adaptive peer limits** - Scales from 8 to 500 peers per region ✅ IMPLEMENTED
-7. **NEW: Quantum-resistant peer verification** - CRYSTALS-Dilithium validation ✅ IMPLEMENTED
+7. **NEW: Quantum-resistant peer verification** - ML-DSA-65 validation ✅ IMPLEMENTED
 8. **NEW: Real-time topology updates** - 1-second rebalancing intervals ✅ IMPLEMENTED
 9. **NEW: Blockchain peer registry** - Immutable peer records ✅ IMPLEMENTED
 

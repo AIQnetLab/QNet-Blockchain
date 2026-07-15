@@ -149,7 +149,7 @@ curl http://localhost:8545/api/v1/metrics
 - **Sub-second finality** for small transactions
 - **Adaptive batch processing** up to 50k transactions
 - **Regional P2P clustering** for optimal routing
-- **Post-quantum cryptography** (Dilithium3 + Ed25519 hybrid)
+- **Post-quantum cryptography** (ML-DSA-65 + Ed25519 hybrid)
 
 ### Node Types & Capabilities
 
@@ -175,7 +175,7 @@ curl http://localhost:8545/api/v1/metrics
 ### Post-Quantum Algorithms
 ```rust
 // Signature scheme
-Dilithium3 (NIST standard)
+ML-DSA-65 (NIST standard)
 
 // Key storage encryption  
 AES-256-GCM (NIST FIPS 197)

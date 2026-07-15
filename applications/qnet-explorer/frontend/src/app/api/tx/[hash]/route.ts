@@ -257,12 +257,12 @@ export async function GET(
       const isQuantumSigned = dbTx.is_quantum_signed;
       
       // Signature types (Ed25519 removed from consensus; user/consensus TXs are pure ML-DSA-65):
-      // 1. System TX  2. Dilithium3 (quantum-signed)  3. Unsigned (legacy / no PQ sig)
+      // 1. System TX  2. ML-DSA-65 (quantum-signed)  3. Unsigned (legacy / no PQ sig)
       let signatureType: string;
       if (isSystemTx) {
         signatureType = 'System TX';
       } else if (isQuantumSigned) {
-        signatureType = 'Dilithium3';
+        signatureType = 'ML-DSA-65';
       } else {
         signatureType = 'Unsigned';
       }
@@ -401,7 +401,7 @@ export async function GET(
     if (isSystemTx) {
       signatureType = 'System TX';
     } else if (isQuantumSigned) {
-      signatureType = 'Dilithium3';
+      signatureType = 'ML-DSA-65';
     } else {
       signatureType = 'Unsigned';
     }

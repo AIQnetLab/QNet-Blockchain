@@ -69,7 +69,7 @@ impl NodeClient {
 
     /// True iff macroblock `index` is hard-finalized: its 2f+1 checkpoint QC is
     /// present and `qc.signers >= floor(2*committee/3)+1`.
-    pub async fn macroblock_hard_final(&self, index: u64) -> Result<bool, String> {
+    pub async fn macroblock_hard_final(&self, index: u64, fallback_committee: usize) -> Result<bool, String> {
         let url = format!("{}/api/v1/macroblock/{}/proof", self.base, index);
         let v: Value = self.http.get(&url).send().await.map_err(|e| e.to_string())?
             .json().await.map_err(|e| e.to_string())?;
@@ -77,7 +77,10 @@ impl NodeClient {
             return Ok(false); // not yet finalized / no QC yet
         }
         let signers = v.pointer("/qc/signers").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0);
-        let committee = v.get("committee").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0);
+        // Prefer the committee the node reports; if it doesn't enumerate it (empty array),
+        // fall back to the operator-supplied --committee size. 0 = no assumption → not counted.
+        let reported = v.get("committee").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0);
+        let committee = if reported > 0 { reported } else { fallback_committee };
         if committee == 0 { return Ok(false); }
         Ok(signers >= (2 * committee) / 3 + 1)
     }

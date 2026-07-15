@@ -16,7 +16,7 @@
    - 100x performance improvement achieved
 
 2. **Post-Quantum Ready**
-   - Dilithium3 signatures
+   - ML-DSA-65 signatures
    - ML-KEM-768 (Kyber) key exchange via QUIC TLS 1.3
    - Future-proof security
 

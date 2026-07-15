@@ -300,23 +300,40 @@ export async function GET(
         tokenTransfers,
       },
     });
-  } catch (err) {
-    // DB read (TX history) failed. The node may still be reachable, so make a
-    // best-effort token fetch instead of hardcoding an empty list.
-    const tokens = await fetchAddressTokens(address, NODE_API, nodeHeaders);
+  } catch {
+    // PostgreSQL TX-history read failed (DB down / mid-resync). Degrade gracefully:
+    // the node is authoritative for balance, so still serve balance + token holdings
+    // and flag history as temporarily unavailable — the address page renders with real
+    // data instead of hard-failing. A transient DB blip must not blank the whole page.
+    const [accountResponse, tokens] = await Promise.all([
+      fetch(`${NODE_API}/api/v1/account/${address}`, {
+        headers: nodeHeaders,
+        signal: AbortSignal.timeout(10000),
+      }).then(r => r.ok ? r.json() : null).catch(() => null),
+      fetchAddressTokens(address, NODE_API, nodeHeaders),
+    ]);
+    if (!accountResponse) {
+      // Node also unreachable (DB down + node blip): balance is genuinely unknown. Don't fabricate a
+      // 0 balance as authoritative under a "balance is current" banner — fail honestly instead.
+      return NextResponse.json({ success: false, error: 'Address data temporarily unavailable' }, { status: 503 });
+    }
+    let balance = 0;
+    if (typeof accountResponse.balance === 'number') balance = accountResponse.balance;
+    else if (accountResponse.balance) balance = Number(accountResponse.balance) || 0;
     return NextResponse.json({
-      success: false,
-      error: 'Failed to load address data',
+      success: true,
+      source: 'node',
       data: {
         address,
-        balance: '0',
+        balance: formatAmount(balance),
         txCount: 0,
         firstSeen: 0,
         lastActive: 0,
+        historyUnavailable: true,   // TX history could not be read; balance is still authoritative
         tokens,
         transactions: [],
         tokenTransfers: [],
       },
-    }, { status: 500 });
+    });
   }
 }

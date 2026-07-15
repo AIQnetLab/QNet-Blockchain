@@ -20,7 +20,6 @@ import {
   FlatList,
   KeyboardAvoidingView,
   BackHandler,
-  Switch,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -820,12 +819,24 @@ function fmtTokenBaseUnits(base, decimals) {
 // address) — the same icon model as the Assets list. Privacy: a node-supplied https logo is NEVER
 // loaded as <Image> from the wallet (it would leak the device IP/timing to an attacker-controlled
 // host); only inert emoji logos render as-is, everything else falls back to the letter avatar.
+// Compact pill toggle: track hugs the knob (28px pill, 22px knob) — same on both platforms.
+const PillToggle = React.memo(function PillToggle({ value, onValueChange }) {
+  return (
+    <TouchableOpacity activeOpacity={0.8} onPress={() => onValueChange(!value)}
+      style={{ width: 46, height: 28, borderRadius: 14, padding: 3, justifyContent: 'center',
+               backgroundColor: value ? '#00d4ff' : '#33475b' }}>
+      <View style={{ width: 22, height: 22, borderRadius: 11, backgroundColor: '#ffffff',
+                     alignSelf: value ? 'flex-end' : 'flex-start' }} />
+    </TouchableOpacity>
+  );
+});
+
 function TxCoinMark({ token }) {
   if (!token) {
+    // Native QNC → the app's own brand icon.
     return (
-      <View style={{ width: 16, height: 16, borderRadius: 8, backgroundColor: '#00e5f0', alignItems: 'center', justifyContent: 'center', marginRight: 5 }}>
-        <Text style={{ color: '#04141a', fontSize: 10, fontWeight: '800' }}>Q</Text>
-      </View>
+      <Image source={require('../../assets/qnet_logo.png')}
+        style={{ width: 16, height: 16, borderRadius: 8, marginRight: 5 }} resizeMode="contain" />
     );
   }
   const logo = typeof token.logo === 'string' ? token.logo.trim() : '';
@@ -2026,9 +2037,9 @@ const WalletScreen = () => {
   // Validate a pasted contract address, resolve its token metadata via getTokenInfo, persist it to
   // AsyncStorage 'qnet_custom_tokens' (deduped by contract_address), merge it into the Assets list,
   // and fetch its balance for the current wallet.
-  const handleAddCustomToken = async () => {
+  const handleAddCustomToken = async (contractArg) => {
     if (addingToken) return;
-    const contract = (addTokenAddress || '').trim();
+    const contract = ((typeof contractArg === 'string' ? contractArg : '') || addTokenAddress || '').trim();
     if (!contract) { setAddTokenError('Enter a contract address'); return; }
     // QNet contract addresses are 64-char hex (derive_contract_address → SHA3-256 hex).
     if (!/^[0-9a-fA-F]{64}$/.test(contract)) {
@@ -2077,6 +2088,7 @@ const WalletScreen = () => {
         next.push({ contract, name: info.name, symbol: info.symbol, decimals: info.decimals, balance: balanceStr, logo: info.logo || '' });
         return next;
       });
+      setTokenMgrQuery('');   // clear search so the just-added token shows in the tracked list
       closeAddTokenModal();
     } catch (e) {
       setAddTokenError(e.message || 'Failed to add token');
@@ -3507,12 +3519,18 @@ const WalletScreen = () => {
       balance: (Number(tokenBalances.qnc) || 0).toFixed(5),
     };
     const all = [qnc, ...qrcTokens];
-    const q = tokenMgrQuery.trim().toLowerCase();
-    if (!q) return all;
-    return all.filter((tk) =>
+    const raw = tokenMgrQuery.trim();
+    if (!raw) return all;
+    const q = raw.toLowerCase();
+    const matches = all.filter((tk) =>
       (tk.symbol || '').toLowerCase().includes(q)
       || (tk.name || '').toLowerCase().includes(q)
       || (tk.contract || '').toLowerCase().includes(q));
+    // Paste a 64-hex contract to track a token not in the list yet — its row toggle adds it.
+    if (!matches.length && /^[0-9a-fA-F]{64}$/.test(raw) && !all.some((tk) => tk.contract === q)) {
+      return [{ contract: q, symbol: '', name: '', decimals: 5, logo: '', balance: '0', _addable: true }];
+    }
+    return matches;
   }, [qrcTokens, tokenMgrQuery, tokenBalances]);
 
   // Load the persisted hidden-token set and the hide-balances preference on mount.
@@ -6903,12 +6921,7 @@ const WalletScreen = () => {
             <View style={styles.menuDivider} />
             <View style={styles.menuItem}>
               <Text style={styles.menuItemText}>Hide balances</Text>
-              <Switch
-                value={balancesHidden}
-                onValueChange={toggleBalancesHidden}
-                trackColor={{ false: '#33475b', true: 'rgba(0, 212, 255, 0.45)' }}
-                thumbColor={balancesHidden ? '#00d4ff' : '#8aa0b3'}
-              />
+              <PillToggle value={balancesHidden} onValueChange={toggleBalancesHidden} />
             </View>
             <View style={styles.menuDivider} />
             <TouchableOpacity
@@ -6929,22 +6942,22 @@ const WalletScreen = () => {
           <View style={[styles.modalBox, styles.mgrBox]}>
             <View style={styles.mgrHeader}>
               <Text style={styles.modalTitle}>Manage tokens</Text>
-              <TouchableOpacity onPress={() => setShowTokenManager(false)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+              <TouchableOpacity onPress={() => { setShowTokenManager(false); setAddTokenError(''); }} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
                 <Text style={styles.mgrClose}>✕</Text>
               </TouchableOpacity>
             </View>
             <TextInput
               style={styles.mgrSearch}
-              placeholder="Search tokens"
+              placeholder="Search or paste token address"
               placeholderTextColor="#888"
               value={tokenMgrQuery}
-              onChangeText={setTokenMgrQuery}
+              onChangeText={(t) => { setTokenMgrQuery(t); if (addTokenError) setAddTokenError(''); }}
               autoCapitalize="none"
               autoCorrect={false}
             />
-            <TouchableOpacity style={styles.mgrAddBtn} onPress={() => { setShowTokenManager(false); openAddTokenModal(); }} activeOpacity={0.7}>
-              <Text style={styles.mgrAddText}>+ Add token by address</Text>
-            </TouchableOpacity>
+            {/* Toggle-add feedback (the add-token modal is not used from here). */}
+            {addingToken && <Text style={styles.mgrHint}>Adding token…</Text>}
+            {!!addTokenError && <Text style={styles.mgrError}>{addTokenError}</Text>}
             <FlatList
               data={tokenMgrResults}
               keyExtractor={(tk) => tk.contract}
@@ -6952,29 +6965,34 @@ const WalletScreen = () => {
               style={styles.mgrList}
               ListEmptyComponent={<Text style={styles.mgrEmpty}>No tokens. Tokens you receive appear here automatically; add one by address to watch it.</Text>}
               renderItem={({ item: tk }) => {
-                const visible = !hiddenTokens.has(tk.contract);
-                // Same inert letter/emoji avatar as the Assets list (never load a node-supplied URL logo).
+                const isQnc = tk.contract === 'native:qnc';
+                const addable = !!tk._addable;
+                const visible = !addable && !hiddenTokens.has(tk.contract);
+                // Inert letter/emoji avatar (never load a node-supplied URL logo); QNC = app icon.
                 const logo = typeof tk.logo === 'string' ? tk.logo.trim() : '';
                 const isEmoji = logo.length > 0 && logo.length <= 8 && !logo.startsWith('http');
                 let h = 0; const seed = String(tk.contract || tk.symbol || '?');
                 for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
                 const bg = isEmoji ? '#0b1a22' : `hsl(${h % 360}, 60%, 42%)`;
+                const title = addable ? `${tk.contract.slice(0, 10)}…${tk.contract.slice(-6)}` : (tk.symbol || tk.name || 'Token');
                 return (
                   <View style={styles.mgrRow}>
-                    <View style={[styles.tokenIcon, { backgroundColor: bg, borderRadius: 18, width: 36, height: 36, marginRight: 10 }]}>
-                      <Text style={[styles.tokenIconText, { color: '#ffffff', fontSize: 15 }]}>
-                        {isEmoji ? logo : (tk.symbol || tk.name || 'T').slice(0, 1).toUpperCase()}
-                      </Text>
+                    <View style={[styles.tokenIcon, { backgroundColor: isQnc ? 'transparent' : bg, borderRadius: 18, width: 36, height: 36, marginRight: 10 }]}>
+                      {isQnc ? (
+                        <Image source={require('../../assets/qnet_logo.png')} style={{ width: 36, height: 36 }} resizeMode="contain" />
+                      ) : (
+                        <Text style={[styles.tokenIconText, { color: '#ffffff', fontSize: 15 }]}>
+                          {isEmoji ? logo : (tk.symbol || tk.name || 'T').slice(0, 1).toUpperCase()}
+                        </Text>
+                      )}
                     </View>
                     <View style={styles.mgrRowInfo}>
-                      <Text style={styles.mgrRowSym} numberOfLines={1}>{tk.symbol || tk.name || 'Token'}</Text>
-                      <Text style={styles.mgrRowBal} numberOfLines={1}>{maskAmt(tk.balance)}</Text>
+                      <Text style={styles.mgrRowSym} numberOfLines={1}>{title}</Text>
+                      <Text style={styles.mgrRowBal} numberOfLines={1}>{addable ? 'Not tracked — toggle to add' : maskAmt(tk.balance)}</Text>
                     </View>
-                    <Switch
-                      value={visible}
-                      onValueChange={(v) => setTokenVisible(tk.contract, v)}
-                      trackColor={{ false: '#33475b', true: 'rgba(0, 212, 255, 0.45)' }}
-                      thumbColor={visible ? '#00d4ff' : '#8aa0b3'}
+                    <PillToggle
+                      value={addable ? false : visible}
+                      onValueChange={(v) => addable ? (v && handleAddCustomToken(tk.contract)) : setTokenVisible(tk.contract, v)}
                     />
                   </View>
                 );
@@ -8277,6 +8295,18 @@ const styles = StyleSheet.create({
     paddingVertical: 30,
     paddingHorizontal: 10,
     lineHeight: 19,
+  },
+  mgrHint: {
+    color: '#8aa0b3',
+    fontSize: 12,
+    paddingHorizontal: 4,
+    marginBottom: 8,
+  },
+  mgrError: {
+    color: '#ff5555',
+    fontSize: 12,
+    paddingHorizontal: 4,
+    marginBottom: 8,
   },
   // Send Modal Styles
   sendBalanceInfo: {

@@ -51,12 +51,12 @@ QNet uses a two-phase activation system transitioning from 1DEV burn on Solana t
 
 ### **Cryptography Stack**
 - **Activation Code Encryption**: XOR with SHA3-256 derived key from `burn_tx_hash:node_type:burn_amount`
-- **Node Registration Signatures**: CRYSTALS-Dilithium3 (NIST FIPS 204, ML-DSA-65) — quantum-resistant
+- **Node Registration Signatures**: ML-DSA-65 (NIST FIPS 204) — quantum-resistant
 - **Wallet Ownership Proof (Light Nodes)**: Ed25519 signature from Solana private key
 - **Wallet Ownership Proof (Super Nodes)**: BIP39 mnemonic → SLIP-10 → Solana Ed25519 address derivation, compared with XOR-decrypted prefix
 - **Burn Transaction Verification**: Solana RPC `getTransaction` with `feePayer` (signer) check
 - **Hash Functions**: SHA3-256 (NIST FIPS 202) for all key material derivation
-- **On-Chain Registration**: `NodeRegistration` + `NodeActivation` transaction types with Dilithium3 signatures
+- **On-Chain Registration**: `NodeRegistration` + `NodeActivation` transaction types with ML-DSA-65 signatures
 
 ### **Activation Code Format**
 
@@ -366,7 +366,7 @@ docker run -d --name qnet-super --restart=always \
    a) Scan blockchain for existing NodeRegistration from this wallet
    b) If found → REJECT: "Wallet already has a registered node"
 
-8. Register on-chain via NodeRegistration + NodeActivation TX with Dilithium3 signature
+8. Register on-chain via NodeRegistration + NodeActivation TX with ML-DSA-65 signature
 ```
 
 ### Genesis Node — Docker Deployment (Bootstrap Only)
@@ -415,8 +415,8 @@ docker run -d --name qnet-genesis-001 --restart=always \
      burn_amount: 1500,                     // Must match exactly
      ed25519_signature: "a1b2c3d4...",      // Signed with Solana private key
      signature_timestamp: 1739721600,       // Replay protection
-     quantum_pubkey: "...",                 // Dilithium3 public key
-     quantum_signature: "..."              // Dilithium3 registration signature
+     quantum_pubkey: "...",                 // ML-DSA-65 public key
+     quantum_signature: "..."              // ML-DSA-65 registration signature
    }
 
 8. Server verifies:
@@ -425,7 +425,7 @@ docker run -d --name qnet-genesis-001 --restart=always \
    c) Ed25519 signature valid for burn_wallet public key
    d) burn_amount >= current dynamic price
    e) No existing node for this wallet (RocksDB scan)
-   f) Dilithium3 signature valid
+   f) ML-DSA-65 signature valid
 
 9. Server creates NodeRegistration + NodeActivation on-chain TX
 10. Light node registered, begins receiving rewards
@@ -489,10 +489,10 @@ docker run -d --name qnet-genesis-001 --restart=always \
 ### **Multi-Layer Security (v4.7)**
 
 #### **Quantum Resistance**
-- **Consensus Signatures**: CRYSTALS-Dilithium3 (NIST FIPS 204, ML-DSA-65) — 2420-byte signatures
-- **P2P Message Signatures**: pure ML-DSA-65 (Dilithium3) — the ephemeral Ed25519 leg was removed; the Dilithium key signature is the sole authenticator (certificate binding)
+- **Consensus Signatures**: ML-DSA-65 (NIST FIPS 204) — 3309-byte signatures
+- **P2P Message Signatures**: pure ML-DSA-65 — the ephemeral Ed25519 leg was removed; the Dilithium key signature is the sole authenticator (certificate binding)
 - **Hash Functions**: SHA3-256 (NIST FIPS 202) for all derivations
-- **Key Storage**: AES-256-GCM encrypted Dilithium3 keypairs
+- **Key Storage**: AES-256-GCM encrypted ML-DSA-65 keypairs
 - **P2P Key Exchange**: ML-KEM-768 (Kyber) active in QUIC TLS 1.3 hybrid handshake (X25519Kyber768Draft00, v4.8)
 
 #### **Anti-Fraud Mechanisms**
@@ -591,7 +591,7 @@ User super nodes support **seamless server migration** — same activation code 
 ### **Security & Limitations**
 - **Wallet Binding**: Node activations permanently bound to wallet addresses
 - **No Wallet Transfer**: Prevents activation code trading
-- **Dilithium3 Signatures**: All blockchain transactions use CRYSTALS-Dilithium3
+- **ML-DSA-65 Signatures**: All blockchain transactions use ML-DSA-65
 - **Blockchain Authority**: Blockchain records are source of truth for active nodes
 - **Rate Limiting**: 1 migration per 24 hours prevents abuse
 
@@ -645,10 +645,10 @@ User super nodes support **seamless server migration** — same activation code 
 ## **SECURITY COMPLIANCE**
 
 ### **Quantum Readiness**  
-- CRYSTALS-Dilithium3 (NIST FIPS 204) for all on-chain signatures
+- ML-DSA-65 (NIST FIPS 204) for all on-chain signatures
 - SHA3-256 (NIST FIPS 202) for all hash operations
 - AES-256-GCM (NIST FIPS 197) for key storage encryption
-- Pure ML-DSA-65 (Dilithium3) for P2P message authentication (ephemeral Ed25519 leg removed)
+- Pure ML-DSA-65 for P2P message authentication (ephemeral Ed25519 leg removed)
 - ML-KEM-768 (Kyber) active for P2P key exchange via QUIC TLS 1.3 hybrid handshake (X25519Kyber768Draft00)
 
 ### **Anti-Fraud Measures**
@@ -661,7 +661,7 @@ User super nodes support **seamless server migration** — same activation code 
 ### **Production Security**
 - Stateless activation code verification (no in-memory registries)
 - Solana RPC errors cause registration rejection (no bypass)
-- Dilithium3 signatures on all blockchain transactions
+- ML-DSA-65 signatures on all blockchain transactions
 - Comprehensive audit trails via structured logging
 
 **PRODUCTION-READY WITH v4.7 SECURITY ARCHITECTURE**

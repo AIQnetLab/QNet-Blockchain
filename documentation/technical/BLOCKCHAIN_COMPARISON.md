@@ -20,7 +20,7 @@
 
 1. **Microblocks (production)**:
    - A single VRF-selected leader produces one microblock per second
-   - Dilithium3-signed; the leader rotates every block
+   - ML-DSA-65-signed; the leader rotates every block
 
 2. **Macroblock Checkpoint (finality)**:
    - Every 90 blocks a VRF-sampled committee signs one checkpoint
