@@ -309,4 +309,44 @@ mod kat {
         println!("];");
         println!("---8<--- GENESIS_CONSENSUS_PKS END ---8<---");
     }
+
+    /// Pre-launch identity linkage gate (#[ignore]d, mnemonics from env — no
+    /// secrets in repo). Proves GENESIS_WALLETS[i] and GENESIS_CONSENSUS_PKS[i]
+    /// come from the SAME seed i: derives BOTH the consensus PK (block-signing
+    /// domain) and the wallet eon (reward/claim domain) from each mnemonic and
+    /// asserts each equals its committed constant. A pass means a genesis
+    /// operator importing seed i sees exactly GENESIS_WALLETS[i] in the app and
+    /// the node credits rewards there. MUST be run green before any fresh launch:
+    ///   QNET_GEN_SEED_001..005=".." cargo test -p qnet-integration \
+    ///     verify_genesis_identity_linkage -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn verify_genesis_identity_linkage() {
+        use crate::crypto::vrf::WalletIdentity;
+        use crate::genesis_constants::{GENESIS_CONSENSUS_PKS, GENESIS_WALLETS};
+        for (idx, id) in ["001", "002", "003", "004", "005"].iter().enumerate() {
+            let var = format!("QNET_GEN_SEED_{}", id);
+            let mnemonic = std::env::var(&var)
+                .unwrap_or_else(|_| panic!("missing env {}", var));
+            let mnemonic = mnemonic.trim();
+
+            // Consensus domain (block signing) — the boot-time anchor.
+            let (pk, _sk) = derive_mldsa65_from_mnemonic(mnemonic);
+            let pk_hex = hex::encode(&pk);
+            assert_eq!(
+                pk_hex, GENESIS_CONSENSUS_PKS[idx].1,
+                "consensus PK mismatch for {} (seed != GENESIS_CONSENSUS_PKS[{}])", id, idx
+            );
+
+            // Wallet domain (reward/claim identity) — must match app derivation.
+            let wallet = WalletIdentity::derive_wallet_address(mnemonic);
+            assert_eq!(
+                wallet, GENESIS_WALLETS[idx].1,
+                "wallet eon mismatch for {} (seed != GENESIS_WALLETS[{}])", id, idx
+            );
+            // Both constants proven from the same seed i.
+            println!("[OK] genesis {} linked: wallet={}", id, wallet);
+        }
+        println!("[OK] all 5 genesis seeds: consensus PK + wallet eon both match constants");
+    }
 }

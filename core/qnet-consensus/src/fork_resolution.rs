@@ -198,35 +198,15 @@ impl SecurityValidator {
         }
     }
     
-    /// PRODUCTION: Get validator reputation from integrated reputation system
+    /// Validator reputation prior for the fork-choice heuristic: cached value if
+    /// present, else a uniform neutral prior. No genesis fork-choice preference —
+    /// live consensus reputation is binary {70|0}, and the old bootstrap-0.95 boost
+    /// keyed on a 45-char eon that could never match the 64-hex proposer id, so every
+    /// validator already resolved to 0.75. Kept uniform (behaviour-preserving) rather
+    /// than reviving a genesis weighting.
     fn get_validator_reputation(&self, validator_id: [u8; 32]) -> Option<f64> {
-        // Convert validator ID to string for reputation lookup
         let validator_str = hex::encode(validator_id);
-        
-        // In real implementation, this would query the P2P reputation system
-        // For now, simulate realistic reputation distribution
-        self.reputation_cache.get(&validator_str).copied().or_else(|| {
-            // Bootstrap nodes get high reputation
-            if self.is_bootstrap_validator(&validator_str) {
-                Some(0.95)
-            } else {
-                // New validators get neutral reputation
-                Some(0.75)
-            }
-        })
-    }
-    
-    /// Check if validator is a bootstrap node
-    fn is_bootstrap_validator(&self, validator: &str) -> bool {
-        // Bootstrap validators (format: 19+3+15+8=45 chars)
-        // v4.1: Updated to 45-char format with 8-hex SHA3-256 checksum
-        matches!(validator,
-            "f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab" |
-            "0bac6225a082de1f659eond0c96f1706cf19cc7abf70a" |
-            "d216bb23fbe7f853636eon3f16b378b919227e009fb4f" |
-            "e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc1113" |
-            "02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb74cb"
-        )
+        self.reputation_cache.get(&validator_str).copied().or(Some(0.75))
     }
 }
 

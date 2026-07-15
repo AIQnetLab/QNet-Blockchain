@@ -2133,36 +2133,25 @@ export class WalletManager {
     }
   }
   
-  // Migrate old QNet address to new BIP44-based format
+  // Re-derive the QNet address to the canonical pure-Dilithium identity.
   async migrateQNetAddress(wallet) {
     try {
-      // Skip if wallet already has BIP44 keypair (already migrated or newly imported)
-      if (wallet.qnetKeypair && wallet.qnetKeypair.path) {
+      // Already on the pure-Dilithium identity — nothing to do.
+      if (wallet.qnetKeypair && wallet.qnetKeypair.path === 'QNET_WALLET_MLDSA65_v1') {
         return wallet;
       }
-      
-      // MIGRATE only old wallets without BIP44 keypair
-      if (wallet.mnemonic && !wallet.qnetKeypair) {
+
+      // Any wallet holding a mnemonic (including a stale Ed25519/BIP44 one) re-derives
+      // to the pure-Dilithium address so app and node agree on one identity per seed.
+      if (wallet.mnemonic) {
         const seed = bip39.mnemonicToSeedSync(wallet.mnemonic);
         const result = await this.generateQNetAddress(seed, 0);
-        
-        // Store old address for logging
-        const oldAddress = wallet.qnetAddress;
-        
-        // UPDATE to new BIP44 address (breaking change but necessary)
         wallet.qnetAddress = result.address;
         wallet.qnetKeypair = {
           publicKey: Array.from(result.keypair.publicKey),
           privateKey: Array.from(result.keypair.privateKey),
           path: result.keypair.path
         };
-        
-        //if (oldAddress && oldAddress !== result.address) {
-          //console.log('[MIGRATION] QNet address updated:', oldAddress, '->', result.address);
-       // } else {
-         // console.log('[Migration] Generated BIP44 QNet address:', result.address);
-       // }
-        
         return wallet;
       }
       
@@ -4626,9 +4615,10 @@ export class WalletManager {
   async verifyActivationOnChain(walletAddress) {
     try {
       const apiUrl = this.getRandomBootstrapNode();
+      // Wallet via header, not the URL (privacy).
       const response = await fetch(
-        `${apiUrl}/api/v1/verify-activation?wallet_address=${encodeURIComponent(walletAddress)}`,
-        { method: 'GET', headers: { 'Content-Type': 'application/json' } }
+        `${apiUrl}/api/v1/verify-activation`,
+        { method: 'GET', headers: { 'Content-Type': 'application/json', 'X-QNet-Wallet': walletAddress } }
       );
 
       if (!response.ok) {
@@ -4776,9 +4766,10 @@ export class WalletManager {
       // FIX: backend returns "nodes" array (not "activations")
       const apiUrl = this.getRandomBootstrapNode();
       try {
+        // Wallet via header, not the URL (privacy).
         const response = await fetch(
-          `${apiUrl}/api/v1/activations/by-wallet?wallet_address=${encodeURIComponent(walletAddress)}`,
-          { method: 'GET', timeout: 10000 }
+          `${apiUrl}/api/v1/activations/by-wallet`,
+          { method: 'GET', timeout: 10000, headers: { 'X-QNet-Wallet': walletAddress } }
         );
         
         if (response.ok) {
@@ -5562,8 +5553,9 @@ export class WalletManager {
   async checkOnChainActivation(walletAddress) {
     try {
       const apiUrl = this.getRandomBootstrapNode();
-      const url = `${apiUrl}/api/v1/verify-activation?wallet_address=${encodeURIComponent(walletAddress)}`;
-      const resp = await fetch(url, { method: 'GET', headers: { 'Content-Type': 'application/json' } });
+      // Wallet via header, not the URL (privacy).
+      const url = `${apiUrl}/api/v1/verify-activation`;
+      const resp = await fetch(url, { method: 'GET', headers: { 'Content-Type': 'application/json', 'X-QNet-Wallet': walletAddress } });
       if (!resp.ok) return { verified: false };
       const data = await resp.json();
       return data;

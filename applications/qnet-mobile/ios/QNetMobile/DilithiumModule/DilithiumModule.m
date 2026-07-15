@@ -6,11 +6,11 @@
  * formats are byte-identical so JS code (DilithiumCrypto.js) works unchanged.
  *
  * C sources included in the Xcode build target:
- *   DilithiumModule/dilithium3/*.c
+ *   DilithiumModule/mldsa65/*.c
  *   DilithiumModule/common/fips202.c
  *   DilithiumModule/randombytes_ios.c
  *
- * Key sizes (FIPS 204 / pqclean dilithium3):
+ * Key sizes (ML-DSA-65 / FIPS-204 final):
  *   Public key : 1952 bytes
  *   Secret key : 4032 bytes
  *   Signature  : 3309 bytes
@@ -20,18 +20,18 @@
 #import <React/RCTLog.h>
 #import <Foundation/Foundation.h>
 
-/* PQClean C API */
-#include "dilithium3/api.h"
-#include "dilithium3/sign.h"
+/* PQClean ML-DSA-65 C API (byte-identical to the node's pqcrypto-mldsa) */
+#include "mldsa65/api.h"
+#include "mldsa65/sign.h"
 #include "common/fips202.h"
 #include "randombytes_custom.h"
 
 #include <string.h>
 #include <stdlib.h>
 
-#define DILITHIUM_PK_SIZE  PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES  /* 1952 */
-#define DILITHIUM_SK_SIZE  PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES  /* 4032 */
-#define DILITHIUM_SIG_SIZE PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_BYTES           /* 3309 */
+#define DILITHIUM_PK_SIZE  PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES  /* 1952 */
+#define DILITHIUM_SK_SIZE  PQCLEAN_MLDSA65_CLEAN_CRYPTO_SECRETKEYBYTES  /* 4032 */
+#define DILITHIUM_SIG_SIZE PQCLEAN_MLDSA65_CLEAN_CRYPTO_BYTES           /* 3309 */
 
 /* ---- Hex helpers ---- */
 
@@ -101,7 +101,7 @@ RCT_EXPORT_METHOD(generateKeypairFromSeed:(NSString *)seed
 
     uint8_t pk[DILITHIUM_PK_SIZE];
     uint8_t sk[DILITHIUM_SK_SIZE];
-    int ret = PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_keypair(pk, sk);
+    int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk, sk);
     dilithium_clear_keygen_seed();
 
     if (ret != 0) {
@@ -148,7 +148,7 @@ RCT_EXPORT_METHOD(sign:(NSString *)message
         dilithium_set_keygen_seed(seed32);
 
         uint8_t pk_tmp[DILITHIUM_PK_SIZE];
-        if (PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_keypair(pk_tmp, sk) != 0) {
+        if (PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk_tmp, sk) != 0) {
             dilithium_clear_keygen_seed();
             reject(@"DILITHIUM_SIGN_ERROR", @"Failed to re-derive keypair from seed", nil);
             return;
@@ -171,7 +171,7 @@ RCT_EXPORT_METHOD(sign:(NSString *)message
 
     uint8_t sig[DILITHIUM_SIG_SIZE];
     size_t  sigLen = 0;
-    int ret = PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_signature(
+    int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(
                   sig, &sigLen, msgBytes, msgLen, sk);
 
     /* Zero secret key immediately after use — prevent key material in stack residue */
@@ -248,7 +248,7 @@ RCT_EXPORT_METHOD(verify:(NSString *)message
     const uint8_t *msgBytes = (const uint8_t *)message.UTF8String;
     size_t msgLen = strlen(message.UTF8String);
 
-    int ret = PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_verify(
+    int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_verify(
                   sig, sigLen, msgBytes, msgLen, pk);
     free(sig);
 
@@ -274,15 +274,15 @@ RCT_EXPORT_METHOD(compatibilityTest:(RCTPromiseResolveBlock)resolve
 
     uint8_t pk[DILITHIUM_PK_SIZE];
     uint8_t sk[DILITHIUM_SK_SIZE];
-    PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_keypair(pk, sk);
+    PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk, sk);
     dilithium_clear_keygen_seed();
 
     uint8_t sig[DILITHIUM_SIG_SIZE];
     size_t  sigLen = 0;
-    PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_signature(
+    PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(
         sig, &sigLen, (const uint8_t *)testMsg, msgLen, sk);
 
-    int ok = PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_verify(
+    int ok = PQCLEAN_MLDSA65_CLEAN_crypto_sign_verify(
                  sig, sigLen, (const uint8_t *)testMsg, msgLen, pk);
 
     NSLog(@"=== PQCLEAN COMPAT TEST (iOS) ===");

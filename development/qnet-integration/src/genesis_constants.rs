@@ -12,16 +12,17 @@ pub const GENESIS_BOOTSTRAP_CODES: &[&str] = &[
     "QNET-BOOT-0005-STRAP",
 ];
 
-/// Genesis node wallet addresses (PRODUCTION)
-/// These are the predefined wallet addresses for Genesis nodes
-/// Format: 19 hex + "eon" + 15 hex + 8 hex SHA3-256 checksum = 45 chars
-/// v4.1: Updated to 45-char format with 8-hex (4-byte) SHA3-256 checksum
+/// Genesis node wallet (reward/identity) addresses (PRODUCTION).
+/// Pure-Dilithium: eon = SHA512(WALLET ML-DSA-65 pk) of each genesis mnemonic — byte-identical to
+/// the mobile wallet's generateQNetAddress and to WalletIdentity::derive_wallet_address, so a genesis
+/// operator importing the seed sees THIS address (one seed → one identity, app↔node). Format: 19 hex
+/// + "eon" + 15 hex + 8-hex SHA3-256 checksum = 45 chars. MUST equal derive_wallet_address(seed).
 pub const GENESIS_WALLETS: &[(&str, &str)] = &[
-    ("001", "f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab"), // Genesis Node #1
-    ("002", "0bac6225a082de1f659eond0c96f1706cf19cc7abf70a"), // Genesis Node #2
-    ("003", "d216bb23fbe7f853636eon3f16b378b919227e009fb4f"), // Genesis Node #3
-    ("004", "e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc1113"), // Genesis Node #4
-    ("005", "02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb74cb"), // Genesis Node #5
+    ("001", "4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d"), // Genesis Node #1
+    ("002", "c81f26da185fd05dcaeeona499b3d9e58d7ec75304f1b"), // Genesis Node #2
+    ("003", "006a5c220ca2fa77021eon2b5c6703999066d5411e2ff"), // Genesis Node #3
+    ("004", "a60999a5a40637c1dd6eon975ca9618927edd7c19f38e"), // Genesis Node #4
+    ("005", "9dd783e0c65cf68467ceondfeaed5e1e47f0242f6aed9"), // Genesis Node #5
 ];
 
 /// v27 HOLE1: pinned genesis consensus PKs (ML-DSA-65, hex, 1952B) —

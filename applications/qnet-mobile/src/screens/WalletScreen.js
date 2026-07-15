@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   View,
   Text,
@@ -20,6 +20,7 @@ import {
   FlatList,
   KeyboardAvoidingView,
   BackHandler,
+  Switch,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -846,7 +847,7 @@ function TxCoinMark({ token }) {
 // Canonical burn address (matches core CANONICAL_BURN_ADDR) — a transfer here is a 🔥 burn.
 const CANONICAL_BURN_ADDR = '0000000000000000000eon00000000000000036877022';
 
-const TxRow = React.memo(function TxRow({ tx, onCopy }) {
+const TxRow = React.memo(function TxRow({ tx, onCopy, hideAmounts }) {
   const isSend = tx.type === 'send';
   // Burn: a success-gated token burn event (kind), or a native/token transfer to the burn address.
   const isBurn = tx.tokenKind === 'burn' || (typeof tx.to === 'string' && tx.to === CANONICAL_BURN_ADDR);
@@ -887,16 +888,16 @@ const TxRow = React.memo(function TxRow({ tx, onCopy }) {
             {/* QNC brand mark for native rows; the token's own icon for a QRC-20 transfer. */}
             <TxCoinMark token={isToken ? { contract: tx.tokenContract, symbol: tx.tokenSymbol, logo: tx.tokenLogo } : null} />
             <Text style={{ color: isSend ? '#ff4444' : '#00ff88', fontSize: 16, fontWeight: '600' }} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5}>
-              {amountLabel}
+              {hideAmounts ? '••••' : amountLabel}
             </Text>
             {/* Trust badge: a ✓ marks a token transfer proven against a committee-QC-anchored logs_root
                 (verifyTokenTransferInclusion → 'verified') AND whose decimals/symbol are from the wallet's
                 own added-token registry — so ✓ never backs a node-scaled magnitude for an un-added token. */}
-            {isToken && tx.verified === true && tx.tokenMetaTrusted && (
+            {!hideAmounts && isToken && tx.verified === true && tx.tokenMetaTrusted && (
               <Text style={{ color: '#00e5f0', fontSize: 12, fontWeight: '800', marginLeft: 4 }} accessibilityLabel="QC-verified">✓</Text>
             )}
           </View>
-          {tx.fee > 0 && <Text style={{ color: '#666', fontSize: 11 }}>Fee: {tx.fee.toFixed(5)} QNC</Text>}
+          {tx.fee > 0 && <Text style={{ color: '#666', fontSize: 11 }}>Fee: {hideAmounts ? '••••' : `${tx.fee.toFixed(5)} QNC`}</Text>}
         </View>
       </View>
       <View style={{ borderTopWidth: 1, borderTopColor: '#1a1a2e', paddingTop: 8 }}>
@@ -978,7 +979,10 @@ const WalletScreen = () => {
   const [qrcTokens, setQrcTokens] = useState([]); // held + custom, merged for the Assets list
   const [customTokens, setCustomTokens] = useState([]); // user-added (persisted), balances filled in on load
   const [hiddenTokens, setHiddenTokens] = useState(new Set()); // user-hidden token contracts (spam control)
-  const [showHidden, setShowHidden] = useState(false); // reveal hidden tokens so they can be unhidden
+  const [balancesHidden, setBalancesHidden] = useState(false); // privacy: mask all amounts (persisted)
+  const [showHeaderMenu, setShowHeaderMenu] = useState(false); // header ⋮ dropdown
+  const [showTokenManager, setShowTokenManager] = useState(false); // token visibility/search manager
+  const [tokenMgrQuery, setTokenMgrQuery] = useState(''); // manager search filter
   // Add-Custom-Token modal
   const [showAddTokenModal, setShowAddTokenModal] = useState(false);
   const [addTokenAddress, setAddTokenAddress] = useState('');
@@ -1214,7 +1218,14 @@ const WalletScreen = () => {
       
       // UNIFIED: Load ALL nodes for this wallet (Light + Full + Super + Genesis)
       promises.push(loadAllUserNodes());
-      
+
+      // Light-node status keys on the persisted qnet_light_node_info.nodeId, NOT the activationCode —
+      // so when the code is absent (restored session, or an activation that didn't finish writing it)
+      // load status here, else the gate below never fires and the badge sticks on CHECKING forever.
+      if (activatedNodeType === 'light' && nodePseudonym && !activationCode) {
+        loadLightNodeStatus();
+      }
+
       // Also load specific node data if activated (runs in PARALLEL with loadAllUserNodes)
       if (activatedNodeType && activationCode) {
         if (activatedNodeType === 'light') {
@@ -1240,8 +1251,10 @@ const WalletScreen = () => {
             return;
           }
           
-          if (!saved.burnTxHash) {
-            // No burn evidence — check if this is truly stale from a previous chain
+          if (!saved.burnTxHash && !saved.isGenesis) {
+            // No burn evidence — check if this is truly stale from a previous chain.
+            // isGenesis records never have a burn: the burn checks below would always
+            // come back empty and wipe a legitimately linked genesis node.
             const qnetAddr = wallet.qnetAddress || wallet.address;
             walletManager.verifyActivationOnChain(qnetAddr).then(async (result) => {
               if (!result.verified && !result.networkError) {
@@ -1279,7 +1292,17 @@ const WalletScreen = () => {
       // Ensure nodeInitializing is cleared even if no nodes found
       Promise.all(promises).finally(() => setNodeInitializing(false));
 
-      return () => clearInterval(heightInterval);
+      // Status self-refresh while the tab stays open: a node that comes online
+      // (finished syncing, reconnected) must flip the UI without leaving the tab.
+      const statusInterval = setInterval(() => {
+        if (activatedNodeType === 'light') {
+          loadLightNodeStatus();
+        } else if (activatedNodeType) {
+          loadServerNodeStatus();
+        }
+      }, 30000);
+
+      return () => { clearInterval(heightInterval); clearInterval(statusInterval); };
     }
   }, [activeTab, activatedNodeType, activationCode, wallet]); // load on tab open; NOT nodePseudonym (set here → self-retrigger)
   
@@ -1493,6 +1516,9 @@ const WalletScreen = () => {
               isGenesis: true,
               bootstrapId: bootstrapId,
               timestamp: Date.now(),
+              // Genesis has no burn; truthy marker keeps the no-burn-evidence
+              // cleanup from wiping the auto-linked record.
+              burnTxHash: 'genesis',
               walletAddress: walletAddress
             })).catch(() => {});
             
@@ -1557,13 +1583,14 @@ const WalletScreen = () => {
         
         // AUTO-LINK: Also check if wallet matches Genesis wallet (even if not in API response)
         if (!activatedNodeType && wallet) {
-          // v2.66: Updated to Ed25519-based addresses
+          // Pure-Dilithium genesis wallets: eon = SHA512(WALLET ML-DSA-65 pk),
+          // byte-identical to generateQNetAddress and node GENESIS_WALLETS.
           const GENESIS_WALLETS = {
-            '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab',
-            '002': '0bac6225a082de1f659eond0c96f1706cf19cc7abf70a',
-            '003': 'd216bb23fbe7f853636eon3f16b378b919227e009fb4f',
-            '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc1113',
-            '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb74cb',
+            '001': '4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d',
+            '002': 'c81f26da185fd05dcaeeona499b3d9e58d7ec75304f1b',
+            '003': '006a5c220ca2fa77021eon2b5c6703999066d5411e2ff',
+            '004': 'a60999a5a40637c1dd6eon975ca9618927edd7c19f38e',
+            '005': '9dd783e0c65cf68467ceondfeaed5e1e47f0242f6aed9',
           };
           
           const userQNetAddress = (wallet.qnetAddress || wallet.address || '').toLowerCase();
@@ -1580,24 +1607,14 @@ const WalletScreen = () => {
           for (const [bootstrapId, genesisWallet] of Object.entries(GENESIS_WALLETS)) {
             const normalizedGenesis = genesisWallet.toLowerCase();
             
-            // Check exact match first
-            let isMatch = false;
-            if (userQNetAddress === normalizedGenesis) {
+            // Strict equality only: app and node derive the identical pure-Dilithium
+            // eon from one seed, so a legit operator matches exactly. A prefix/format
+            // fallback could only false-positive (auto-link a non-genesis wallet).
+            const isMatch = userQNetAddress === normalizedGenesis;
+            if (isMatch) {
               console.log(`[Nodes] Exact match with Genesis ${bootstrapId}`);
-              isMatch = true;
-            } else {
-              // Check format match (legacy vs new format)
-              const userPart1 = userQNetAddress.substring(0, 19);
-              const expectedPart1 = normalizedGenesis.substring(0, 19);
-              
-              if (userPart1 === expectedPart1 && userQNetAddress.includes('eon')) {
-                console.log(`[Nodes] Format match with Genesis ${bootstrapId} (first 19 chars match)`);
-                isMatch = true;
-              } else {
-                console.log(`[Nodes] No match with Genesis ${bootstrapId} (user: ${userPart1}, expected: ${expectedPart1})`);
-              }
             }
-            
+
             if (isMatch) {
               // Wallet matches Genesis wallet - check if node is active via API
               const genesisNodeId = `genesis_node_${bootstrapId}`;
@@ -1753,14 +1770,14 @@ const WalletScreen = () => {
         
         // SECURITY: Genesis nodes have PREDEFINED wallets
         // User's wallet MUST match the hardcoded wallet for this Genesis node
-        // PRODUCTION: Genesis wallet addresses (format: 19+3+15+8=45 chars)
-        // v4.1: Updated to 45-char format with 8-hex SHA3-256 checksum
+        // PRODUCTION: pure-Dilithium genesis wallets (19+3+15+8=45 chars).
+        // eon = SHA512(WALLET ML-DSA-65 pk); MUST equal node GENESIS_WALLETS.
         const GENESIS_WALLETS = {
-          '001': 'f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab',
-          '002': '0bac6225a082de1f659eond0c96f1706cf19cc7abf70a',
-          '003': 'd216bb23fbe7f853636eon3f16b378b919227e009fb4f',
-          '004': 'e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc1113',
-          '005': '02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb74cb',
+          '001': '4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d',
+          '002': 'c81f26da185fd05dcaeeona499b3d9e58d7ec75304f1b',
+          '003': '006a5c220ca2fa77021eon2b5c6703999066d5411e2ff',
+          '004': 'a60999a5a40637c1dd6eon975ca9618927edd7c19f38e',
+          '005': '9dd783e0c65cf68467ceondfeaed5e1e47f0242f6aed9',
         };
         
         const expectedWallet = GENESIS_WALLETS[bootstrapId];
@@ -1778,45 +1795,11 @@ const WalletScreen = () => {
         const normalizedUser = userQNetAddress.toLowerCase();
         const normalizedExpected = expectedWallet.toLowerCase();
         
-        // STRICT COMPARISON: Server uses exact match (rpc.rs:5798)
-        // genesis_wallet != claim_request.wallet_address
-        // 
-        // SECURITY CHECK: Verify wallet matches expected Genesis wallet
-        // Genesis wallets in genesis_constants.rs use LEGACY format: {19}eon{19}
-        // Mobile app generates NEW format: {19}eon{15}{4 checksum}
-        // 
-        // IMPORTANT: For Genesis nodes to work, you MUST update genesis_constants.rs
-        // with your actual QNet wallet addresses from the mobile app!
+        // Node credits genesis rewards to GENESIS_WALLETS[id] via exact match,
+        // so the app enforces the same. Node and app now derive the identical
+        // pure-Dilithium eon from one seed, so a legit operator's address equals
+        // the constant exactly; any mismatch is a different wallet — reject.
         if (normalizedUser !== normalizedExpected) {
-          // Check if formats are different but base parts match
-          // Format: 19 hex + "eon" + 15 hex + 8 checksum = 45 chars
-          // Example: f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab
-          const userPart1 = normalizedUser.substring(0, 19);
-          const userEon = normalizedUser.substring(19, 22);
-          const expectedPart1 = normalizedExpected.substring(0, 19);
-          const expectedEon = normalizedExpected.substring(19, 22);
-          
-          const isFormatMismatch = userPart1 === expectedPart1 && 
-                                   userEon === 'eon' && 
-                                   expectedEon === 'eon';
-          
-          console.log('[GENESIS] Wallet comparison:');
-          console.log('  Expected (legacy):', normalizedExpected);
-          console.log('  User has (new):', normalizedUser);
-          console.log('  Part1 match:', userPart1 === expectedPart1);
-          
-          if (isFormatMismatch) {
-            throw new Error(
-              `Address format mismatch detected!\n\n` +
-              `Genesis constants use LEGACY format.\n` +
-              `Your wallet uses NEW format with checksum.\n\n` +
-              `To fix this:\n` +
-              `1. Update genesis_constants.rs with your actual QNet address:\n` +
-              `   "${normalizedUser}"\n\n` +
-              `2. Rebuild and redeploy all Genesis nodes.`
-            );
-          }
-          
           throw new Error(
             `This Genesis code belongs to a different wallet.\n\n` +
             `Expected: ${expectedWallet}\n` +
@@ -2126,6 +2109,8 @@ const WalletScreen = () => {
       if (showLanguagePicker) { setShowLanguagePicker(false); return true; }
       if (showSeedConfirm) { setShowSeedConfirm(false); return true; }
       if (showAddTokenModal) { closeAddTokenModal(); return true; }
+      if (showTokenManager) { setShowTokenManager(false); return true; }
+      if (showHeaderMenu) { setShowHeaderMenu(false); return true; }
       if (showSendScreen) { closeSendScreen(); return true; }
       if (showSettings) { setShowSettings(false); return true; }
       // Pre-wallet onboarding full-screens: back steps in instead of exiting the app,
@@ -2150,6 +2135,7 @@ const WalletScreen = () => {
     showChangePassword, showExportSeed, showExportActivation, showAutoLockPicker,
     showLanguagePicker, showSeedConfirm, showSendScreen, showSettings,
     showCreateOptions, importStep, activeTab, showAddTokenModal,
+    showTokenManager, showHeaderMenu,
   ]);
 
 
@@ -3465,25 +3451,31 @@ const WalletScreen = () => {
       // Trustless upgrade: verify each held token's balance via its two-level proof against the
       // committee-QC-anchored state_root (same trust model as the native balance). Non-blocking — the
       // list shows node-trusted balances immediately, each row flips to `verified` + its proof-exact
-      // balance as the proof lands. A node that lies about a token balance is caught here.
-      list.forEach(async (tk) => {
-        if (!tk.contract) return;
-        try {
-          const r = await walletManager.getTokenBalanceWithProof(tk.contract, qnetAddress, tk.decimals);
-          if (r && r.ok && r.verified) {
-            setQrcTokens((prev) => prev.map((t) => (t.contract === tk.contract
-              ? { ...t, balance: r.balance, verified: true } : t)));
-          }
-        } catch (_) { /* keep the node-trusted balance */ }
-      });
+      // balance as the proof lands. Skip hidden tokens (never shown) and cap concurrency so a
+      // dust-heavy wallet can't open hundreds of simultaneous proof requests.
+      const toProve = list.filter((tk) => tk.contract && !hiddenTokens.has(tk.contract));
+      let proofIdx = 0;
+      const proveWorker = async () => {
+        while (proofIdx < toProve.length) {
+          const tk = toProve[proofIdx++];
+          try {
+            const r = await walletManager.getTokenBalanceWithProof(tk.contract, qnetAddress, tk.decimals);
+            if (r && r.ok && r.verified) {
+              setQrcTokens((prev) => prev.map((t) => (t.contract === tk.contract
+                ? { ...t, balance: r.balance, verified: true } : t)));
+            }
+          } catch (_) { /* keep the node-trusted balance */ }
+        }
+      };
+      for (let w = 0; w < Math.min(5, toProve.length); w++) proveWorker();
     } catch (e) {
       // Non-fatal: keep the last-known token list rather than flashing empty.
       // console.warn('[QRC20] token list load failed:', e.message);
     }
   };
 
-  // Per-token hide list (spam control): an array of contract addresses persisted in AsyncStorage
-  // 'qnet_hidden_tokens'. The Assets list filters these out; showHidden reveals them to unhide.
+  // Per-token hide list (spam control): contract addresses persisted in AsyncStorage 'qnet_hidden_tokens'.
+  // The Assets list filters these out; the token manager toggles them back on.
   const persistHiddenTokens = async (set) => {
     try { await AsyncStorage.setItem('qnet_hidden_tokens', JSON.stringify(Array.from(set))); } catch (_) {}
   };
@@ -3493,11 +3485,46 @@ const WalletScreen = () => {
   const unhideToken = (contract) => {
     setHiddenTokens((prev) => { const next = new Set(prev); next.delete(contract); persistHiddenTokens(next); return next; });
   };
+  // Token manager Switch: on ⇒ visible (unhide), off ⇒ hidden.
+  const setTokenVisible = (contract, visible) => { visible ? unhideToken(contract) : hideToken(contract); };
+
+  // Privacy: mask every displayed amount when balances are hidden (persisted 'qnet_hide_balances').
+  const maskAmt = (s) => (balancesHidden ? '••••' : s);
+  const toggleBalancesHidden = () => {
+    setBalancesHidden((prev) => {
+      const next = !prev;
+      AsyncStorage.setItem('qnet_hide_balances', next ? '1' : '0').catch(() => {});
+      return next;
+    });
+  };
+
+  // Token-manager search results: native QNC first (always listed so it's hideable, even at 0), then
+  // held/custom QRC-20. Normalize the query once and memoize so a keystroke (or unrelated re-render)
+  // doesn't re-scan the list. QNC's synthetic contract 'native:qnc' drives its hidden-set toggle.
+  const tokenMgrResults = useMemo(() => {
+    const qnc = {
+      contract: 'native:qnc', symbol: 'QNC', name: 'QNet', decimals: 5, logo: '',
+      balance: (Number(tokenBalances.qnc) || 0).toFixed(5),
+    };
+    const all = [qnc, ...qrcTokens];
+    const q = tokenMgrQuery.trim().toLowerCase();
+    if (!q) return all;
+    return all.filter((tk) =>
+      (tk.symbol || '').toLowerCase().includes(q)
+      || (tk.name || '').toLowerCase().includes(q)
+      || (tk.contract || '').toLowerCase().includes(q));
+  }, [qrcTokens, tokenMgrQuery, tokenBalances]);
+
+  // Load the persisted hidden-token set and the hide-balances preference on mount.
   useEffect(() => {
     (async () => {
       try {
         const raw = await AsyncStorage.getItem('qnet_hidden_tokens');
         if (raw) { const arr = JSON.parse(raw); if (Array.isArray(arr)) setHiddenTokens(new Set(arr)); }
+      } catch (_) {}
+      try {
+        const hb = await AsyncStorage.getItem('qnet_hide_balances');
+        if (hb === '1') setBalancesHidden(true);
       } catch (_) {}
     })();
   }, []);
@@ -4969,7 +4996,7 @@ const WalletScreen = () => {
 
           // Send Form Screen
           return (
-            <TabBox key="assets-send" deps={[showSendScreen, sendingToken, sendAddress, sendAmount, sendingTransaction]} render={() => (
+            <TabBox key="assets-send" deps={[showSendScreen, sendingToken, sendAddress, sendAmount, sendingTransaction, balancesHidden]} render={() => (
             <KeyboardAvoidingView
               style={{ flex: 1 }}
               behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -4990,7 +5017,7 @@ const WalletScreen = () => {
               {/* Balance Info */}
               <View style={styles.sendBalanceInfo}>
                 <Text style={styles.sendBalanceLabel}>Available Balance</Text>
-                <Text style={styles.sendBalanceAmount}>{sendingToken.balance.toFixed(5)} {sendingToken.symbol}</Text>
+                <Text style={styles.sendBalanceAmount}>{maskAmt(sendingToken.balance.toFixed(5))} {sendingToken.symbol}</Text>
               </View>
               
               {/* Recipient Address */}
@@ -5085,7 +5112,7 @@ const WalletScreen = () => {
 
         // Normal Assets View
         return (
-          <TabBox key="assets-normal" deps={[refreshing, wallet, selectedNetwork, tokenBalances, balance, tokenPrices, copiedAddress, qrcTokens]} render={() => (
+          <TabBox key="assets-normal" deps={[refreshing, wallet, selectedNetwork, tokenBalances, balance, tokenPrices, copiedAddress, qrcTokens, hiddenTokens, balancesHidden]} render={() => (
           <ScrollView
             style={styles.content}
             contentContainerStyle={styles.scrollContentContainer}
@@ -5177,15 +5204,16 @@ const WalletScreen = () => {
             {/* Token List based on selected network */}
             {selectedNetwork === 'qnet' ? (
               <View style={styles.tokenList}>
-                {/* QNC Token - Clickable to open Send screen */}
-                <TouchableOpacity 
+                {/* QNC Token - Clickable to open Send screen. Hidden if toggled off in the token manager. */}
+                {!hiddenTokens.has('native:qnc') && (
+                <TouchableOpacity
                   style={styles.tokenItemClickable}
                   onPress={() => openSendModal('QNC', tokenBalances.qnc, 'qnet')}
                   activeOpacity={0.6}
                 >
                   <View style={styles.tokenInfo}>
                     <View style={styles.tokenIcon}>
-                        <Image 
+                        <Image
                         source={require('../../assets/qnet_logo.png')}
                           style={styles.tokenIconImage}
                           resizeMode="contain"
@@ -5196,18 +5224,17 @@ const WalletScreen = () => {
                     </View>
                   </View>
                   <View style={styles.tokenBalance}>
-                    <Text style={styles.tokenAmount}>{tokenBalances.qnc.toFixed(5)}</Text>
+                    <Text style={styles.tokenAmount}>{maskAmt(tokenBalances.qnc.toFixed(5))}</Text>
                   </View>
                 </TouchableOpacity>
+                )}
 
-                {/* QRC-20 tokens: on-chain holdings + persisted custom tokens (deduped by contract).
-                    Each row opens the Send screen carrying its contract address + decimals. */}
-                {qrcTokens.filter((tk) => showHidden || !hiddenTokens.has(tk.contract)).map((tk) => {
-                  const isHidden = hiddenTokens.has(tk.contract);
+                {/* QRC-20 holdings + custom tokens (deduped, hidden filtered via ⋮ manager); tap=Send, long-press=hide. */}
+                {qrcTokens.filter((tk) => !hiddenTokens.has(tk.contract)).map((tk) => {
                   return (
                   <TouchableOpacity
                     key={tk.contract}
-                    style={[styles.tokenItemClickable, isHidden && { opacity: 0.45 }]}
+                    style={styles.tokenItemClickable}
                     onPress={() => openSendModal(
                       tk.symbol || tk.name || 'Token',
                       parseFloat(tk.balance) || 0,
@@ -5216,15 +5243,10 @@ const WalletScreen = () => {
                     )}
                     onLongPress={() => {
                       const label = tk.symbol || tk.name || 'Token';
-                      Alert.alert(
-                        isHidden ? 'Show token' : 'Hide token', label,
-                        [
-                          { text: 'Cancel', style: 'cancel' },
-                          isHidden
-                            ? { text: 'Show', onPress: () => unhideToken(tk.contract) }
-                            : { text: 'Hide', style: 'destructive', onPress: () => hideToken(tk.contract) },
-                        ]
-                      );
+                      Alert.alert('Hide token', label, [
+                        { text: 'Cancel', style: 'cancel' },
+                        { text: 'Hide', style: 'destructive', onPress: () => hideToken(tk.contract) },
+                      ]);
                     }}
                     activeOpacity={0.6}
                   >
@@ -5257,34 +5279,12 @@ const WalletScreen = () => {
                     </View>
                     <View style={styles.tokenBalance}>
                       <Text style={styles.tokenAmount}>
-                        {tk.balance}{tk.verified ? ' ✓' : ''}
+                        {maskAmt(`${tk.balance}${tk.verified ? ' ✓' : ''}`)}
                       </Text>
                     </View>
                   </TouchableOpacity>
                   );
                 })}
-
-                {/* Long-press a token to hide/show it; toggle the hidden set in/out of view. */}
-                {hiddenTokens.size > 0 && (
-                  <TouchableOpacity
-                    style={styles.addTokenButton}
-                    onPress={() => setShowHidden((v) => !v)}
-                    activeOpacity={0.6}
-                  >
-                    <Text style={styles.addTokenButtonText}>
-                      {showHidden ? 'Done managing' : `Show ${hiddenTokens.size} hidden token${hiddenTokens.size > 1 ? 's' : ''}`}
-                    </Text>
-                  </TouchableOpacity>
-                )}
-
-                {/* Add-Custom-Token button */}
-                <TouchableOpacity
-                  style={styles.addTokenButton}
-                  onPress={openAddTokenModal}
-                  activeOpacity={0.6}
-                >
-                  <Text style={styles.addTokenButtonText}>+ Add token</Text>
-                </TouchableOpacity>
               </View>
             ) : (
               <View style={styles.tokenList}>
@@ -5308,8 +5308,8 @@ const WalletScreen = () => {
                     </View>
                   </View>
                   <View style={styles.tokenBalance}>
-                    <Text style={styles.tokenAmount}>{balance.toFixed(4)}</Text>
-                    <Text style={styles.tokenValue}>${(balance * tokenPrices.sol).toFixed(2)}</Text>
+                    <Text style={styles.tokenAmount}>{maskAmt(balance.toFixed(4))}</Text>
+                    <Text style={styles.tokenValue}>{maskAmt(`$${(balance * tokenPrices.sol).toFixed(2)}`)}</Text>
                   </View>
                 </View>
                 {/* 1DEV Token */}
@@ -5332,8 +5332,8 @@ const WalletScreen = () => {
                     </View>
                   </View>
                   <View style={styles.tokenBalance}>
-                    <Text style={styles.tokenAmount}>{tokenBalances['1dev'].toFixed(4)}</Text>
-                    <Text style={styles.tokenValue}>${(tokenBalances['1dev'] * tokenPrices['1dev']).toFixed(2)}</Text>
+                    <Text style={styles.tokenAmount}>{maskAmt(tokenBalances['1dev'].toFixed(4))}</Text>
+                    <Text style={styles.tokenValue}>{maskAmt(`$${(tokenBalances['1dev'] * tokenPrices['1dev']).toFixed(2)}`)}</Text>
                   </View>
                 </View>
               </View>
@@ -5916,7 +5916,45 @@ const WalletScreen = () => {
                   }
                   
                   setActivatingNode(true);
+                  let bridgeSuperId = null;
                   try {
+                    // Step 0: On-chain wallet-bridge first. Genesis wallets never burn (the
+                    // burn steps below can't find them); a server-activated super is already
+                    // registered on-chain — link its live identity now, recover the code below.
+                    try {
+                      const eonAddr = wallet.qnetAddress || wallet.address;
+                      const gStatus = await checkServerNodeStatus(null, null, eonAddr, 1);
+                      const gid = gStatus?.nodeId || '';
+                      if (gStatus?.success && gid.startsWith('super_node_')) {
+                        bridgeSuperId = gid;
+                        setNodePseudonym(gid);
+                        setServerNodeStatus(gStatus);
+                      }
+                      if (gStatus?.success && gid.startsWith('genesis_node_')) {
+                        const bootstrapId = gid.replace('genesis_node_', '');
+                        const genesisCode = `QNET-BOOT-${bootstrapId}-STRAP`;
+                        setActivatedNodeType('super'); // Genesis nodes are Super nodes
+                        setActivationCode(genesisCode);
+                        setNodePseudonym(gid);
+                        setServerNodeStatus(gStatus);
+                        AsyncStorage.setItem(`node_pseudonym_${genesisCode}`, gid).catch(() => {});
+                        await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                          nodeType: 'super', code: genesisCode, pseudonym: gid,
+                          isGenesis: true, bootstrapId, timestamp: Date.now(),
+                          // No burn exists for genesis; truthy marker keeps the
+                          // no-burn-evidence cleanup from wiping this record.
+                          burnTxHash: 'genesis',
+                          walletAddress: eonAddr
+                        }));
+                        showAlert(
+                          'Genesis Node Linked',
+                          `This wallet backs ${gid}.\n\nActivation code: ${genesisCode}\nThe node is now linked in the Node tab.`,
+                          [{ text: 'OK' }]
+                        );
+                        return;
+                      }
+                    } catch (_) { /* bridge unreachable — fall through to burn paths */ }
+
                     // Step 1: Check local storage first (fastest path)
                     // Don't gate on on-chain verification — user may have a code from burn
                     // but hasn't activated the node on QNet chain yet
@@ -6072,6 +6110,26 @@ const WalletScreen = () => {
                       }
                     }
 
+                    // Step 4a: bridge-resolved super whose code could not be recovered from
+                    // burn history — link it anyway (node_id stands in for the code, same as
+                    // the Node-tab auto-link); the node is registered on-chain, that is the truth.
+                    if (bridgeSuperId) {
+                      setActivatedNodeType('super');
+                      setActivationCode(bridgeSuperId);
+                      AsyncStorage.setItem(`node_pseudonym_${bridgeSuperId}`, bridgeSuperId).catch(() => {});
+                      await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                        nodeType: 'super', code: bridgeSuperId, pseudonym: bridgeSuperId,
+                        timestamp: Date.now(), burnTxHash: 'onchain',
+                        walletAddress: wallet.qnetAddress || wallet.address
+                      }));
+                      showAlert(
+                        'Node Linked',
+                        `This wallet backs ${bridgeSuperId} (registered on-chain).\n\nThe node is now linked in the Node tab.`,
+                        [{ text: 'OK' }]
+                      );
+                      return;
+                    }
+
                     // Step 4: Nothing found
                     showAlert(
                       'No Activation Found',
@@ -6097,7 +6155,7 @@ const WalletScreen = () => {
 
       case 'history':
         return (
-          <TabBox key="history" deps={[txHistory, refreshing]} render={() => (
+          <TabBox key="history" deps={[txHistory, refreshing, balancesHidden]} render={() => (
           <FlatList
             key="history-tab"
             style={styles.content}
@@ -6106,8 +6164,9 @@ const WalletScreen = () => {
               Platform.OS === 'ios' && { paddingBottom: 50 }
             ]}
             data={txHistory}
+            extraData={balancesHidden}
             keyExtractor={(tx, index) => tx.tokenContract ? `${tx.hash}-${tx.tokenLogIndex ?? index}` : (tx.hash || String(index))}
-            renderItem={({ item }) => <TxRow tx={item} onCopy={handleCopyTxHash} />}
+            renderItem={({ item }) => <TxRow tx={item} onCopy={handleCopyTxHash} hideAmounts={balancesHidden} />}
             ListHeaderComponent={<Text style={[styles.sectionTitle, { marginBottom: 16 }]}>Transaction History</Text>}
             ListEmptyComponent={
               <View style={{ alignItems: 'center', paddingVertical: 40 }}>
@@ -6139,7 +6198,7 @@ const WalletScreen = () => {
 
       case 'node':
         return (
-          <TabBox key="node" deps={[refreshing, activatedNodeType, loadingAllNodes, nodeInitializing, allUserNodes, wallet, copiedAddress, nodePseudonym, lightNodeStatus, serverNodeStatus, currentBlockHeight, reactivatingNode, processingValidation]} render={() => (
+          <TabBox key="node" deps={[refreshing, activatedNodeType, loadingAllNodes, nodeInitializing, allUserNodes, wallet, copiedAddress, nodePseudonym, lightNodeStatus, serverNodeStatus, currentBlockHeight, reactivatingNode, processingValidation, balancesHidden]} render={() => (
           <ScrollView
             key="node-tab"
             style={styles.content}
@@ -6427,6 +6486,7 @@ const WalletScreen = () => {
                           color: (serverNodeStatus.pendingRewards || 0) > 0 ? '#34c759' : '#00d4ff'
                         }]}>
                           {(() => {
+                            if (balancesHidden) return '••••';
                             const rewards = (serverNodeStatus.pendingRewards || 0) / 1e9;
                             if (rewards === 0) return '0 QNC';
                             return `${rewards.toFixed(6).replace(/\.?0+$/, '')} QNC`;
@@ -6447,8 +6507,9 @@ const WalletScreen = () => {
                       onPress={handleClaimServerNodeRewards}
                     >
                       <Text style={styles.buttonText}>
-                        {processingValidation ? 'Claiming...' : 
+                        {processingValidation ? 'Claiming...' :
                          (serverNodeStatus.pendingRewards || 0) <= 0 ? 'Claim Rewards' :
+                         balancesHidden ? 'Claim Rewards' :
                          (() => {
                            const rewards = (serverNodeStatus.pendingRewards || 0) / 1e9;
                            return `Claim ${rewards.toFixed(6).replace(/\.?0+$/, '')} QNC`;
@@ -6692,6 +6753,15 @@ const WalletScreen = () => {
     >
       <View style={styles.header}>
         <Text style={styles.title}>QNet Wallet</Text>
+        {/* Overflow menu: token manager / hide balances / wallet settings */}
+        <TouchableOpacity
+          style={styles.headerMenuBtn}
+          onPress={() => setShowHeaderMenu((v) => !v)}
+          hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+          activeOpacity={0.6}
+        >
+          <Text style={styles.headerMenuIcon}>⋮</Text>
+        </TouchableOpacity>
       </View>
 
       {/* Tab Navigation */}
@@ -6751,16 +6821,6 @@ const WalletScreen = () => {
           }}
         >
           <Text style={[styles.tabText, activeTab === 'node' && styles.activeTabText]}>Node</Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity 
-          style={[styles.tab, activeTab === 'settings' && styles.activeTab]}
-          onPress={() => {
-            setActiveTab('settings');
-            setNodeStatus(null); // Reset node selection when leaving activate tab
-          }}
-        >
-          <Text style={[styles.tabText, activeTab === 'settings' && styles.activeTabText]}>⚙️</Text>
         </TouchableOpacity>
       </View>
 
@@ -6823,6 +6883,103 @@ const WalletScreen = () => {
                 <Text style={styles.modalButtonText}>{loading ? t('changing') : t('change')}</Text>
               </TouchableOpacity>
             </View>
+          </View>
+        </View>
+      )}
+
+      {/* Header ⋮ overflow menu */}
+      {showHeaderMenu && (
+        <>
+          <TouchableOpacity style={styles.menuBackdrop} activeOpacity={1} onPress={() => setShowHeaderMenu(false)} />
+          <View style={[styles.menuCard, { top: Platform.OS === 'ios' ? 104 : 62 }]}>
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => { setShowHeaderMenu(false); setTokenMgrQuery(''); setShowTokenManager(true); }}
+              activeOpacity={0.6}
+            >
+              <Text style={styles.menuItemText}>Manage tokens</Text>
+              <Text style={styles.menuItemHint}>›</Text>
+            </TouchableOpacity>
+            <View style={styles.menuDivider} />
+            <View style={styles.menuItem}>
+              <Text style={styles.menuItemText}>Hide balances</Text>
+              <Switch
+                value={balancesHidden}
+                onValueChange={toggleBalancesHidden}
+                trackColor={{ false: '#33475b', true: 'rgba(0, 212, 255, 0.45)' }}
+                thumbColor={balancesHidden ? '#00d4ff' : '#8aa0b3'}
+              />
+            </View>
+            <View style={styles.menuDivider} />
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => { setShowHeaderMenu(false); setActiveTab('settings'); }}
+              activeOpacity={0.6}
+            >
+              <Text style={styles.menuItemText}>Wallet settings</Text>
+              <Text style={styles.menuItemHint}>›</Text>
+            </TouchableOpacity>
+          </View>
+        </>
+      )}
+
+      {/* Token manager: search + per-token visibility + add-by-address; local view only, never touches balances. */}
+      {showTokenManager && (
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalBox, styles.mgrBox]}>
+            <View style={styles.mgrHeader}>
+              <Text style={styles.modalTitle}>Manage tokens</Text>
+              <TouchableOpacity onPress={() => setShowTokenManager(false)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                <Text style={styles.mgrClose}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            <TextInput
+              style={styles.mgrSearch}
+              placeholder="Search tokens"
+              placeholderTextColor="#888"
+              value={tokenMgrQuery}
+              onChangeText={setTokenMgrQuery}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <TouchableOpacity style={styles.mgrAddBtn} onPress={() => { setShowTokenManager(false); openAddTokenModal(); }} activeOpacity={0.7}>
+              <Text style={styles.mgrAddText}>+ Add token by address</Text>
+            </TouchableOpacity>
+            <FlatList
+              data={tokenMgrResults}
+              keyExtractor={(tk) => tk.contract}
+              keyboardShouldPersistTaps="handled"
+              style={styles.mgrList}
+              ListEmptyComponent={<Text style={styles.mgrEmpty}>No tokens. Tokens you receive appear here automatically; add one by address to watch it.</Text>}
+              renderItem={({ item: tk }) => {
+                const visible = !hiddenTokens.has(tk.contract);
+                // Same inert letter/emoji avatar as the Assets list (never load a node-supplied URL logo).
+                const logo = typeof tk.logo === 'string' ? tk.logo.trim() : '';
+                const isEmoji = logo.length > 0 && logo.length <= 8 && !logo.startsWith('http');
+                let h = 0; const seed = String(tk.contract || tk.symbol || '?');
+                for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+                const bg = isEmoji ? '#0b1a22' : `hsl(${h % 360}, 60%, 42%)`;
+                return (
+                  <View style={styles.mgrRow}>
+                    <View style={[styles.tokenIcon, { backgroundColor: bg, borderRadius: 18, width: 36, height: 36, marginRight: 10 }]}>
+                      <Text style={[styles.tokenIconText, { color: '#ffffff', fontSize: 15 }]}>
+                        {isEmoji ? logo : (tk.symbol || tk.name || 'T').slice(0, 1).toUpperCase()}
+                      </Text>
+                    </View>
+                    <View style={styles.mgrRowInfo}>
+                      <Text style={styles.mgrRowSym} numberOfLines={1}>{tk.symbol || tk.name || 'Token'}</Text>
+                      <Text style={styles.mgrRowBal} numberOfLines={1}>{maskAmt(tk.balance)}</Text>
+                    </View>
+                    <Switch
+                      value={visible}
+                      onValueChange={(v) => setTokenVisible(tk.contract, v)}
+                      trackColor={{ false: '#33475b', true: 'rgba(0, 212, 255, 0.45)' }}
+                      thumbColor={visible ? '#00d4ff' : '#8aa0b3'}
+                    />
+                  </View>
+                );
+              }}
+            />
           </View>
         </View>
       )}
@@ -7979,22 +8136,147 @@ const styles = StyleSheet.create({
     fontWeight: '300',
     marginLeft: 8,
   },
-  addTokenButton: {
-    flexDirection: 'row',
+  // Header overflow (⋮) menu
+  headerMenuBtn: {
+    position: 'absolute',
+    right: 14,
+    top: 0,
+    bottom: 0,
     justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: 'transparent',
+    paddingHorizontal: 6,
+  },
+  headerMenuIcon: {
+    color: '#00d4ff',
+    fontSize: 30,
+    fontWeight: '700',
+    lineHeight: 32,
+  },
+  menuBackdrop: {
+    position: 'absolute',
+    top: 0, left: 0, right: 0, bottom: 0,
+    zIndex: 10000,
+  },
+  menuCard: {
+    position: 'absolute',
+    right: 10,
+    minWidth: 210,
+    backgroundColor: '#16213e',
     borderRadius: 12,
-    padding: 14,
-    marginTop: 4,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.3)',
+    paddingVertical: 4,
+    zIndex: 10001,
+    elevation: 30,
+    shadowColor: '#000',
+    shadowOpacity: 0.4,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 6 },
+  },
+  menuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 13,
+    paddingHorizontal: 16,
+  },
+  menuItemText: {
+    color: '#e6f6ff',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  menuItemHint: {
+    color: '#00d4ff',
+    fontSize: 15,
+    fontWeight: '700',
+    marginLeft: 24,
+  },
+  menuDivider: {
+    height: 1,
+    backgroundColor: 'rgba(255, 255, 255, 0.07)',
+    marginHorizontal: 8,
+  },
+  // Token manager modal
+  mgrBox: {
+    width: '92%',
+    maxWidth: 420,
+    height: '78%',
+    maxHeight: '78%',
+  },
+  mgrHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 16,
+    paddingHorizontal: 18,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(0, 212, 255, 0.2)',
+    backgroundColor: 'rgba(0, 212, 255, 0.08)',
+  },
+  mgrClose: {
+    color: '#8aa0b3',
+    fontSize: 20,
+    fontWeight: '700',
+  },
+  mgrSearch: {
+    height: 44,
+    marginHorizontal: 14,
+    marginTop: 14,
+    marginBottom: 8,
+    backgroundColor: 'rgba(22, 33, 62, 0.9)',
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    color: '#ffffff',
+    fontSize: 15,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.35)',
+  },
+  mgrAddBtn: {
+    marginHorizontal: 14,
+    marginBottom: 8,
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
     borderWidth: 1,
     borderColor: 'rgba(0, 212, 255, 0.4)',
     borderStyle: 'dashed',
   },
-  addTokenButtonText: {
+  mgrAddText: {
     color: '#00d4ff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  mgrList: {
+    flex: 1,
+    paddingHorizontal: 14,
+  },
+  mgrRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.05)',
+  },
+  mgrRowInfo: {
+    flex: 1,
+    justifyContent: 'center',
+  },
+  mgrRowSym: {
+    color: '#ffffff',
     fontSize: 15,
     fontWeight: '600',
+  },
+  mgrRowBal: {
+    color: '#8aa0b3',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  mgrEmpty: {
+    color: '#8aa0b3',
+    fontSize: 13,
+    textAlign: 'center',
+    paddingVertical: 30,
+    paddingHorizontal: 10,
+    lineHeight: 19,
   },
   // Send Modal Styles
   sendBalanceInfo: {

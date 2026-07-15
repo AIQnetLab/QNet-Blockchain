@@ -2392,7 +2392,10 @@ pub(crate) fn qc_verified_frontier_height() -> u64 {
     // anchors so verify_v2_macroblock certifies each before storage.
     if hint_mb > local_mb {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        if now.saturating_sub(LAST_FRONTIER_PROBE_SECS.load(Relaxed)) >= 3 {
+        // Adaptive cadence: the seal frontier is what gates production AND apply
+        // (backpressure), so when it lags more than the unsealed bound, probe at 1s.
+        let probe_interval = if hint_mb.saturating_sub(local_mb) > MAX_UNSEALED_WINDOWS { 1 } else { 3 };
+        if now.saturating_sub(LAST_FRONTIER_PROBE_SECS.load(Relaxed)) >= probe_interval {
             LAST_FRONTIER_PROBE_SECS.store(now, Relaxed);
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 let from = local_mb.saturating_add(1).max(1);
@@ -13722,8 +13725,16 @@ impl BlockchainNode {
                         // n−f co-signs advance HIGHEST_CERTIFIED_ROUND[mb_idx] → every node re-elects the same
                         // fallback leader. Exponentially-paced per mb/node; receiver verifies sig + window
                         // committee + anchor + voter-dedup; TC only at n−f (≤f Byzantine cannot rotate).
-                        if local_delay > STALL_GRACE_SECS && production_unlocked && !failover_capped
-                            && meshed_esc && boot_ok_esc && !seal_throttled {
+                        // Leader self-yield fast path: a stored (sig-verified, committee-checked) rotation
+                        // vote from the slot's own expected producer is authoritative about its
+                        // unavailability — co-sign without waiting out the silent-leader grace. Only vote
+                        // TIMING changes; forging a yield still needs the leader's key.
+                        let leader_yielded = get_expected_producer(failover_height)
+                            .map(|(p, _)| !p.is_empty() && p != node_id
+                                && crate::unified_p2p::window_has_vote_from(own_w, &p))
+                            .unwrap_or(false);
+                        if (local_delay > STALL_GRACE_SECS || leader_yielded) && production_unlocked
+                            && !failover_capped && meshed_esc && boot_ok_esc && !seal_throttled {
                             let now_u64 = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -14925,30 +14936,8 @@ impl BlockchainNode {
                     }
                 }
 
-                // Production ceiling: pause (never wedge) if the microblock tip outruns finality or the
-                // last SEALED macroblock. Seal bound K=2 keeps the N-2 producer anchor always sealed
-                // (tip_epoch-2 <= last_sealed). last_sealed = TRUE contiguous seal frontier (not
-                // chain_height/90, which never bound a seal-stalled producer → the ~900-block runaway).
-                // Committed-state-derived ⇒ every node pauses at the same height.
-                {
-                    const MAX_UNFINALIZED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
-                    const MAX_UNSEALED_BLOCKS: u64 = MAX_UNSEALED_WINDOWS * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
-                    let last_finalized = LAST_FINALIZED_CONSENSUS_ROUND.load(Ordering::SeqCst);
-                    let last_sealed = try_get_storage()
-                        .map(|s| s.last_sealed_mb_index().saturating_mul(90))
-                        .unwrap_or(0);
-                    let fin_over = last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS;
-                    let seal_over = last_sealed > 0 && next_block_height > last_sealed + MAX_UNSEALED_BLOCKS;
-                    if fin_over || seal_over {
-                        if is_info() {
-                            println!("[WARN][PROD] production_throttle height={} finalized={} sealed={} awaiting={}",
-                                     next_block_height, last_finalized, last_sealed,
-                                     if seal_over { "macroblock_seal" } else { "bft_finality" });
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                }
+                // Production ceiling moved AFTER leader election (below) so a throttled
+                // elected leader yields its slot explicitly instead of going silent.
 
                 // v19/v23: BFT-certified microblock leader rotation. Leader is a pure
                 // function of on-chain state: select_microblock_producer_with_round(h,
@@ -15001,6 +14990,70 @@ impl BlockchainNode {
                 cache_expected_producer(next_block_height, &current_producer, timeout_round);
 
                 let mut is_my_turn_to_produce = current_producer == node_id;
+
+                // Production ceiling: pause (never wedge) if the tip outruns finality or the
+                // sealed frontier. Base = max(contiguous seal, QC-verified frontier) — the SAME
+                // semantic the failover suppression uses. Committed-state-derived ⇒ every node
+                // pauses at the same height. Placed after election so a throttled elected
+                // leader can yield instead of going silent.
+                {
+                    const MAX_UNFINALIZED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+                    const MAX_UNSEALED_BLOCKS: u64 = MAX_UNSEALED_WINDOWS * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+                    let last_finalized = LAST_FINALIZED_CONSENSUS_ROUND.load(Ordering::SeqCst);
+                    let seal_base = try_get_storage()
+                        .map(|s| s.last_sealed_mb_index().saturating_mul(90))
+                        .unwrap_or(0)
+                        .max(qc_verified_frontier_cached());
+                    let fin_over = last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS;
+                    let seal_over = seal_base > 0 && next_block_height > seal_base + MAX_UNSEALED_BLOCKS;
+                    if fin_over || seal_over {
+                        if is_warn() {
+                            println!("[WARN][PROD] production_throttle height={} finalized={} sealed={} awaiting={}",
+                                     next_block_height, last_finalized, seal_base,
+                                     if seal_over { "macroblock_seal" } else { "bft_finality" });
+                        }
+                        // Slot yield: elected but unable to produce → broadcast the canonical
+                        // rotation vote (same signed TimeoutVote path; TC still needs n−f, only
+                        // vote TIMING changes) so the committee skips this slot in one round
+                        // instead of a silent-grace timeout. Paced via LAST_TIMEOUT_EMIT_PER_MB
+                        // (shared with the failover monitor — no double emit). Misses accrue as
+                        // for silence: receivers record_validator_miss against the expected
+                        // producer regardless of how the rotation started.
+                        // INTENTIONAL asymmetry vs the failover monitor: it emits under BOTH
+                        // fin_over and seal_over, but the monitor co-signs only once !seal_throttled.
+                        // Under a PURE seal-stall every member is equally throttled, so no TC forms
+                        // yet — rotation can't advance the seal frontier anyway; the independent
+                        // macroblock backfill does. This vote is emitted defensively: the moment the
+                        // backfill releases the throttle, the already-broadcast yield gathers its n−f.
+                        if is_my_turn_to_produce
+                            && mb_idx >= crate::unified_p2p::observed_tc_window_floor() {
+                            let now_u64 = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let last = LAST_TIMEOUT_EMIT_PER_MB.get(&mb_idx).map(|v| *v).unwrap_or(0);
+                            if now_u64.saturating_sub(last) >= 5 {
+                                // Stamp pacing only on an actual broadcast: a deferred emit
+                                // (anchor fetch in flight, crypto absent) retries next tick.
+                                if Self::emit_macroblock_view_change_vote(
+                                    mb_idx.saturating_mul(90),
+                                    &node_id,
+                                    &unified_p2p,
+                                    Some(&storage),
+                                ).await {
+                                    LAST_TIMEOUT_EMIT_PER_MB.insert(mb_idx, now_u64);
+                                    if is_info() {
+                                        println!("[INFO][PROD] slot_yield h={} mb={} reason={}",
+                                                 next_block_height, mb_idx,
+                                                 if seal_over { "macroblock_seal" } else { "bft_finality" });
+                                    }
+                                }
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
 
                 // Network producer-heartbeat broadcast. The elected producer
                 // broadcasts a Dilithium3-signed ProducerHeartbeat, turning
@@ -15998,18 +16051,17 @@ impl BlockchainNode {
                             let is_already_on_chain = if let Some((identity, epoch, type_id)) =
                                 tx.commitment_dedup_key()
                             {
-                                let type_str = match type_id {
-                                    1 => "heartbeat",
-                                    2 => "ping",
-                                    3 => "bitmap",
-                                    4 => "registration",
-                                    5 => "reactivation",
-                                    _ => "",
-                                };
-                                if !type_str.is_empty() {
-                                    state_snapshot.is_epoch_committed(type_str, &identity, epoch)
-                                } else {
-                                    false
+                                match type_id {
+                                    // NodeRegistration is one-shot, recorded in the node registry
+                                    // (mark_node_registered), NOT committed_epochs — dedup against the
+                                    // registry, else an already-registered node_id is never dropped and the
+                                    // producer re-selects the same reg every tick (the ~9/s hot loop).
+                                    4 => state_snapshot.is_node_registered(&identity),
+                                    1 => state_snapshot.is_epoch_committed("heartbeat", &identity, epoch),
+                                    2 => state_snapshot.is_epoch_committed("ping", &identity, epoch),
+                                    3 => state_snapshot.is_epoch_committed("bitmap", &identity, epoch),
+                                    5 => state_snapshot.is_epoch_committed("reactivation", &identity, epoch),
+                                    _ => false,
                                 }
                             } else {
                                 false
@@ -16993,112 +17045,44 @@ impl BlockchainNode {
                                     
                                     // REAL PRODUCTION VALIDATION - not a stub!
                                     if let Err(_) = tx.validate() {
-                                        return false;
+                                        return Some(tx.hash.clone());
                                     }
                                     // NodeRegistration has amount=0 by protocol — exempt from amount check.
                                     // NodeReactivation has amount=0 + a single Dilithium3 signature — verify it.
                                     // All other user TX must have non-zero amount and a Dilithium3 (ML-DSA-65) signature.
                                     let is_node_reactivation = matches!(tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. });
                                     if is_client_nodereg {
-                                        // Pure ML-DSA-65 verification for client-signed NodeRegistration.
-                                        // Ed25519 was an illusory leg — quantum-breakable, no identity binding
-                                        // — removed. Identity is bound by the Dilithium checks below: the
-                                        // registered-key match if the VRF key is already on-chain, else the
-                                        // first-reg native_bound (self-signed ML-DSA + eon==wallet_address).
-                                        // Dilithium3: verify against VRF_PK_REGISTRY if key is registered
-                                        // (first registration won't have a registered key yet — skip in that case)
-                                        if let qnet_state::TransactionType::NodeRegistration { node_id, wallet_address, registration_proof, .. } = &tx.tx_type {
-                                            if let Some(registered_pk) = crate::genesis_constants::get_vrf_public_key(node_id) {
-                                                let dil_ok = (|| -> Option<bool> {
-                                                    let dil_sig_str = tx.dilithium_signature.as_ref()?;
-                                                    if dil_sig_str.is_empty() { return None; }
-                                                    let prefix = format!("dilithium_sig_{}_", node_id);
-                                                    let b64_part = dil_sig_str.strip_prefix(&prefix)?;
-                                                    use base64::engine::general_purpose;
-                                                    use base64::Engine;
-                                                    let combined = general_purpose::STANDARD.decode(b64_part).ok()?;
-                                                    if combined.len() < 8 { return None; }
-                                                    let sig_len = u32::from_le_bytes(combined[0..4].try_into().ok()?) as usize;
-                                                    if combined.len() < 4 + sig_len + 4 { return None; }
-                                                    let sm_bytes = &combined[4..4 + sig_len];
-                                                    if registered_pk.len() != 1952 { return None; }
-                                                    use pqcrypto_mldsa::mldsa65 as dilithium3;
-                                                    use pqcrypto_traits::sign::{SignedMessage as SmTrait, PublicKey as PkTrait};
-                                                    let signed_msg = dilithium3::SignedMessage::from_bytes(sm_bytes).ok()?;
-                                                    let pk = dilithium3::PublicKey::from_bytes(&registered_pk).ok()?;
-                                                    let canonical_msg = format!("client_node_reg:{}:{}:{}:{}",
-                                                        node_id, wallet_address, registration_proof, tx.timestamp);
-                                                    let opened_msg = dilithium3::open(&signed_msg, &pk).ok()?;
-                                                    if opened_msg != canonical_msg.as_bytes() { return None; }
-                                                    Some(true)
-                                                })().unwrap_or(false);
-                                                if !dil_ok {
-                                                    println!("[WARN][BLOCK-VALIDATION] NodeRegistration Dilithium3 FAILED from={}", tx.from);
-                                                    return false;
-                                                }
-                                            } else {
-                                                // FIRST registration: no VRF key on-chain yet, so the
-                                                // registered-key Dilithium check above cannot run. Identity
-                                                // is anchored deterministically by the 2f+1 burn-attestation
-                                                // quorum (verify_burn_attestation_quorum, enforced on both the
-                                                // gossip and block-apply paths), which binds burn_tx↔wallet.
-                                                // A dpk→wallet native_bound is intentionally NOT enforced: it
-                                                // is non-deterministic on the receive path (get_vrf_public_key
-                                                // reads gossip-seeded RAM, not committed state → fork risk)
-                                                // AND incompatible with Solana-imported wallets
-                                                // (wallet == eon(solana_address) ≠ eon(dpk)).
+                                        // Single source of truth for signature validity: the SAME deterministic
+                                        // wire-key verifier admission runs (verify_dilithium_tx_signature_async).
+                                        // Opens against tx.dilithium_public_key with a dual-label strip and NO
+                                        // first-reg skip / NO gossip-seeded VRF registry — so a reg that passed
+                                        // admission can never fail here. The prior inline path stripped only the
+                                        // node_id label and read the RAM registry, so a re-included reg flipped
+                                        // PASS→FAIL and wedged the producer. Sig-less imported-wallet first-reg is
+                                        // authorised by the 2f+1 burn quorum at ingest → accept (mirror admission).
+                                        let sig_ok = match tx.dilithium_signature.as_ref() {
+                                            Some(s) if !s.is_empty() => Self::verify_node_lifecycle_dilithium(&tx),
+                                            _ => true,
+                                        };
+                                        if !sig_ok {
+                                            if crate::node::is_warn() {
+                                                println!("[WARN][BLOCK-VALIDATION] NodeRegistration sig invalid from={}", tx.from);
                                             }
-                                            // First registration key gets registered from THIS tx via
-                                            // cache_node_registrations once the block is accepted.
+                                            return Some(tx.hash.clone());
                                         }
                                     } else if is_node_reactivation {
-                                        // Pure ML-DSA-65: NodeReactivation is authenticated solely by the node's
-                                        // registered Dilithium3 identity key (crypto verify against the on-chain
-                                        // VRF key = identity binding). Ed25519 was an illusory leg —
-                                        // quantum-breakable, no identity binding — removed.
-                                        let node_id = &tx.from;
-                                        let canonical_msg = format!("node_reactivation:{}:{}", node_id, tx.timestamp);
-
-                                        // ── Dilithium3 cryptographic verification against registered VRF key ──
-                                        let dilithium_ok = (|| -> Option<bool> {
-                                            let dil_sig_str = tx.dilithium_signature.as_ref()?;
-                                            if dil_sig_str.is_empty() { return None; }
-
-                                            // Parse format: "dilithium_sig_{node_id}_{base64}"
-                                            let prefix = format!("dilithium_sig_{}_", node_id);
-                                            let b64_part = dil_sig_str.strip_prefix(&prefix)?;
-
-                                            use base64::engine::general_purpose;
-                                            use base64::Engine;
-                                            let combined = general_purpose::STANDARD.decode(b64_part).ok()?;
-
-                                            // Layout: [sig_len:4][SignedMessage bytes][pk_len:4][PublicKey bytes]
-                                            if combined.len() < 8 { return None; }
-                                            let sig_len = u32::from_le_bytes(combined[0..4].try_into().ok()?) as usize;
-                                            if combined.len() < 4 + sig_len + 4 { return None; }
-                                            let sm_bytes = &combined[4..4 + sig_len];
-
-                                            // Get REGISTERED Dilithium3 PK from VRF_PK_REGISTRY (identity binding)
-                                            let registered_pk = crate::genesis_constants::get_vrf_public_key(node_id)?;
-                                            if registered_pk.len() != 1952 { return None; }
-
-                                            // Verify: open() checks signature AND extracts original message
-                                            use pqcrypto_mldsa::mldsa65 as dilithium3;
-                                            use pqcrypto_traits::sign::{SignedMessage as SmTrait, PublicKey as PkTrait};
-                                            let signed_msg = dilithium3::SignedMessage::from_bytes(sm_bytes).ok()?;
-                                            let pk = dilithium3::PublicKey::from_bytes(&registered_pk).ok()?;
-                                            let opened_msg = dilithium3::open(&signed_msg, &pk).ok()?;
-
-                                            // Verify extracted message matches expected canonical format
-                                            if opened_msg != canonical_msg.as_bytes() {
-                                                return None;
+                                        // Same single deterministic wire-key verifier as admission AND the
+                                        // receive-side (block_pipeline → verify_node_lifecycle_dilithium). The prior
+                                        // inline path opened vs the gossip-seeded RAM VRF registry, so a producer
+                                        // with a stale/unseeded key could reject its OWN admission-valid,
+                                        // receiver-acceptable reactivation → the same producer wedge as the reg bug.
+                                        // Authority = the node's committed registration (only a registered node
+                                        // reactivates) + per-mb-epoch dedup at apply; the sig is non-repudiation.
+                                        if !Self::verify_node_lifecycle_dilithium(&tx) {
+                                            if crate::node::is_warn() {
+                                                println!("[WARN][BLOCK-VALIDATION] NodeReactivation sig invalid from={}", tx.from);
                                             }
-                                            Some(true)
-                                        })().unwrap_or(false);
-                                        if !dilithium_ok {
-                                            println!("[WARN][BLOCK-VALIDATION] NodeReactivation Dilithium3 FAILED from={} (sig invalid or key not registered)",
-                                                node_id);
-                                            return false;
+                                            return Some(tx.hash.clone());
                                         }
                                     } else if matches!(tx.tx_type,
                                         qnet_state::TransactionType::Transfer { .. } |
@@ -17113,34 +17097,40 @@ impl BlockchainNode {
                                         if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty())
                                             || !Self::verify_user_tx_dilithium(&tx)
                                         {
-                                            return false;
+                                            return Some(tx.hash.clone());
                                         }
                                         if matches!(tx.tx_type, qnet_state::TransactionType::Transfer { .. }) && tx.amount == 0 {
-                                            return false;
+                                            return Some(tx.hash.clone());
                                         }
                                     } else if tx.signature.as_ref().map_or(true, |s| s.is_empty()) || tx.amount == 0 {
-                                        return false;
+                                        return Some(tx.hash.clone());
                                     }
                                 }
-                                true
+                                None
                             }));
                         }
                         
-                        // Wait for all parallel validations
-                        let mut all_valid = true;
+                        // Wait for all parallel validations; collect the hash of any tx that failed so a
+                        // poison tx is evicted (below) rather than left to hot-loop the producer.
+                        let mut poison_tx_hashes: Vec<String> = Vec::new();
                         for future in validation_futures {
-                            if let Ok(result) = future.await {
-                                if !result {
-                                    all_valid = false;
-                                    break;
-                                }
+                            if let Ok(Some(hash)) = future.await {
+                                poison_tx_hashes.push(hash);
                             }
                         }
-                        
+                        let all_valid = poison_tx_hashes.is_empty();
+
                         let validation_time = validation_start.elapsed();
-                        
+
                         if !all_valid {
-                            println!("[ERR][MB] parallel_validation_failed elapsed={}ms", validation_time.as_millis());
+                            // A tx that fails producer validation must never wedge the block: evict it from
+                            // the local mempool so the next tick rebuilds the body without it (eviction is
+                            // per-node, non-consensus). Guarantees no un-appliable tx can hot-loop the producer.
+                            mempool.batch_remove_transactions(&poison_tx_hashes);
+                            if crate::node::is_warn() {
+                                println!("[WARN][MB] producer_poison_tx_evicted count={} elapsed={}ms",
+                                    poison_tx_hashes.len(), validation_time.as_millis());
+                            }
                             // v3.4: CRITICAL - Clear broadcast flag before continue
                             crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
                             continue;
@@ -21258,17 +21248,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     ///
     /// Idempotent: the underlying broadcast path dedupes via
     /// TIMEOUT_VOTED_HEIGHTS, so calling this twice for the same round is safe.
+    /// Returns true only when a vote was actually signed and broadcast — callers pace on that.
     async fn emit_macroblock_view_change_vote(
         round_id: u64,
         node_id: &str,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         storage: Option<&Arc<Storage>>,
-    ) {
-        let Some(p2p) = unified_p2p else { return; };
+    ) -> bool {
+        let Some(p2p) = unified_p2p else { return false; };
         // round_id == 0 is VALID: window 0 (heights 1..89) fails over with the fixed genesis-5
         // committee and a zero anchor — no special genesis mechanics.
         if round_id % 90 != 0 {
-            return;
+            return false;
         }
         let mb_index = round_id / 90;
 
@@ -21279,7 +21270,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 println!("[INFO][TIMEOUT] emit_suppressed mb={} reason=below_tc_floor floor={}",
                          mb_index, crate::unified_p2p::observed_tc_window_floor());
             }
-            return;
+            return false;
         }
 
         // Window-keyed committee (identical on every node). Refuse-and-fetch: without the sealed
@@ -21292,17 +21283,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if is_warn() {
                     println!("[WARN][TIMEOUT] emit_deferred mb={} reason=anchor_absent action=fetch", mb_index);
                 }
-                return;
+                return false;
             }
         };
         // Non-committee members don't vote: receivers drop the vote anyway, and at 100k supers
         // with a 1000-committee the wasted flood would be the dominant stall traffic.
         if !committee.contains(node_id) {
-            return;
+            return false;
         }
         let anchor = match crate::unified_p2p::sealed_anchor_for_window(mb_index) {
             Some(a) => a,
-            None => { p2p.request_window_anchor(mb_index); return; } // committee cached but anchor bytes absent — pull
+            None => { p2p.request_window_anchor(mb_index); return false; } // committee cached but anchor bytes absent — pull
         };
 
         // Base = certified+1 (consensus-visible, identical on every node). f+1 round amplification:
@@ -21337,7 +21328,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if is_warn() {
                     println!("[WARN][MB-VIEW] no_crypto mb={} round={}", mb_index, next_round);
                 }
-                return;
+                return false;
             }
         };
         match crypto.create_consensus_signature(node_id, &vote_msg).await {
@@ -21356,12 +21347,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     tip_hash,
                     sig.signature.as_bytes().to_vec(),
                 );
+                true
             }
             Err(e) => {
                 if is_warn() {
                     println!("[WARN][MB-VIEW] sign_fail mb={} round={} err={}",
                              mb_index, next_round, e);
                 }
+                false
             }
         }
     }

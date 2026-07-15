@@ -37,14 +37,14 @@
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 		AA000001DILITHIUMMOD0001 /* DilithiumModule.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; name = DilithiumModule.m; path = QNetMobile/DilithiumModule/DilithiumModule.m; sourceTree = SOURCE_ROOT; };
 		AA000003DILITHIUMRND0003 /* randombytes_ios.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = randombytes_ios.c; path = QNetMobile/DilithiumModule/randombytes_ios.c; sourceTree = SOURCE_ROOT; };
-		AA000005DILITHIUMNTT0005 /* ntt.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = ntt.c; path = ../../android/app/src/main/cpp/dilithium3/ntt.c; sourceTree = SOURCE_ROOT; };
-		AA000007DILITHIUMPACK007 /* packing.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = packing.c; path = ../../android/app/src/main/cpp/dilithium3/packing.c; sourceTree = SOURCE_ROOT; };
-		AA000009DILITHIUMPOLY009 /* poly.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = poly.c; path = ../../android/app/src/main/cpp/dilithium3/poly.c; sourceTree = SOURCE_ROOT; };
-		AA000011DILITHIUMPLYV011 /* polyvec.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = polyvec.c; path = ../../android/app/src/main/cpp/dilithium3/polyvec.c; sourceTree = SOURCE_ROOT; };
-		AA000013DILITHIUMREDU013 /* reduce.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = reduce.c; path = ../../android/app/src/main/cpp/dilithium3/reduce.c; sourceTree = SOURCE_ROOT; };
-		AA000015DILITHIUMROUN015 /* rounding.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = rounding.c; path = ../../android/app/src/main/cpp/dilithium3/rounding.c; sourceTree = SOURCE_ROOT; };
-		AA000017DILITHIUMSIGN017 /* sign.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = sign.c; path = ../../android/app/src/main/cpp/dilithium3/sign.c; sourceTree = SOURCE_ROOT; };
-		AA000019DILITHIUMSHAK019 /* symmetric-shake.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = symmetric-shake.c; path = ../../android/app/src/main/cpp/dilithium3/symmetric-shake.c; sourceTree = SOURCE_ROOT; };
+		AA000005DILITHIUMNTT0005 /* ntt.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = ntt.c; path = ../../android/app/src/main/cpp/mldsa65/ntt.c; sourceTree = SOURCE_ROOT; };
+		AA000007DILITHIUMPACK007 /* packing.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = packing.c; path = ../../android/app/src/main/cpp/mldsa65/packing.c; sourceTree = SOURCE_ROOT; };
+		AA000009DILITHIUMPOLY009 /* poly.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = poly.c; path = ../../android/app/src/main/cpp/mldsa65/poly.c; sourceTree = SOURCE_ROOT; };
+		AA000011DILITHIUMPLYV011 /* polyvec.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = polyvec.c; path = ../../android/app/src/main/cpp/mldsa65/polyvec.c; sourceTree = SOURCE_ROOT; };
+		AA000013DILITHIUMREDU013 /* reduce.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = reduce.c; path = ../../android/app/src/main/cpp/mldsa65/reduce.c; sourceTree = SOURCE_ROOT; };
+		AA000015DILITHIUMROUN015 /* rounding.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = rounding.c; path = ../../android/app/src/main/cpp/mldsa65/rounding.c; sourceTree = SOURCE_ROOT; };
+		AA000017DILITHIUMSIGN017 /* sign.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = sign.c; path = ../../android/app/src/main/cpp/mldsa65/sign.c; sourceTree = SOURCE_ROOT; };
+		AA000019DILITHIUMSHAK019 /* symmetric-shake.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = symmetric-shake.c; path = ../../android/app/src/main/cpp/mldsa65/symmetric-shake.c; sourceTree = SOURCE_ROOT; };
 		AA000021DILITHIUMFIPS021 /* fips202.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; name = fips202.c; path = ../../android/app/src/main/cpp/common/fips202.c; sourceTree = SOURCE_ROOT; };/* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -316,7 +316,7 @@
 					"$(inherited)",
 					"$(SOURCE_ROOT)/QNetMobile/DilithiumModule",
 					"$(SOURCE_ROOT)/../../android/app/src/main/cpp",
-					"$(SOURCE_ROOT)/../../android/app/src/main/cpp/dilithium3",
+					"$(SOURCE_ROOT)/../../android/app/src/main/cpp/mldsa65",
 					"$(SOURCE_ROOT)/../../android/app/src/main/cpp/common",
 				);
 				INFOPLIST_FILE = QNetMobile/Info.plist;
@@ -351,7 +351,7 @@
 					"$(inherited)",
 					"$(SOURCE_ROOT)/QNetMobile/DilithiumModule",
 					"$(SOURCE_ROOT)/../../android/app/src/main/cpp",
-					"$(SOURCE_ROOT)/../../android/app/src/main/cpp/dilithium3",
+					"$(SOURCE_ROOT)/../../android/app/src/main/cpp/mldsa65",
 					"$(SOURCE_ROOT)/../../android/app/src/main/cpp/common",
 				);
 				INFOPLIST_FILE = QNetMobile/Info.plist;

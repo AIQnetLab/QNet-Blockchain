@@ -1294,6 +1294,17 @@ pub fn lowest_window_with_support(above_w: u64) -> Option<u64> {
     None
 }
 
+/// True if `voter` holds a stored (sig-verified, committee-filtered, deduped) timeout vote for
+/// window `w` at a round ABOVE the highest certified one — a LIVE yield. A consumed vote
+/// (round == certified, retained after its TC formed) must NOT keep the fast path firing
+/// against a leader that already rotated and recovered within the same window. O(windows).
+pub fn window_has_vote_from(w: u64, voter: &str) -> bool {
+    let certified = highest_certified_round_for(w);
+    TIMEOUT_VOTES
+        .iter()
+        .any(|e| e.key().0 == w && e.key().1 > certified && e.value().contains_key(voter))
+}
+
 /// Current failover VIEW floor: no honest node emits, forms, accepts, or tallies a vote/TC for a
 /// window below it (anti-double-TC — once a window certified, an earlier window is a left view).
 pub fn observed_tc_window_floor() -> u64 {
@@ -18825,42 +18836,49 @@ impl SimplifiedP2P {
             // Send request
             self.send_network_message(&peer.addr, request.clone());
             
-            // v3.3: ADAPTIVE TIMEOUT based on ACTUAL batch size from server
-            // Server limits: max 10 macroblocks per response (see handle_macroblock_request)
-            // Macroblocks are ~100-500KB each, but validation requires checking all signatures
+            // The server caps a response at 10 macroblocks per request (handle_macroblock_request),
+            // so a wide window can never be complete in one round. Poll the store (a small batch
+            // lands in 1-2s, not the worst-case timeout) and treat FORWARD PROGRESS — first-missing
+            // advanced past from_index — as success: the caller/probe re-enters from the new hole.
+            // All-or-nothing over a >10-wide range would burn every peer round against the cap.
             let requested_count = to_index - from_index + 1;
-            let actual_batch_size = requested_count.min(10);  // Server sends max 10!
-            let timeout_secs = match actual_batch_size {
-                1 => 6,           // Single macroblock - 6 sec (includes signature validation)
-                2..=5 => 10,      // Small batch - 10 sec
-                6..=10 => 15,     // Max batch - 15 sec (10 macroblocks × 500KB = 5MB + validation)
-                _ => 15,          // Unreachable, but safe fallback
+            let timeout_secs: u64 = match requested_count.min(10) {
+                1 => 6,
+                2..=5 => 10,
+                _ => 15,
             };
-            tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
-            
-            // Check if macroblocks were received
-            let mut all_received = true;
-            for idx in from_index..=to_index {
-                if storage.get_macroblock_by_height(idx).map(|opt| opt.is_some()).unwrap_or(false) {
-                    continue;
-                } else {
-                    all_received = false;
-                break;
+            let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+            let mut first_missing = from_index;
+            loop {
+                while first_missing <= to_index
+                    && storage.get_macroblock_by_height(first_missing)
+                        .map(|opt| opt.is_some()).unwrap_or(false) {
+                    first_missing += 1;
                 }
+                if first_missing > to_index || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(400)).await;
             }
-            
-            if all_received {
+
+            if first_missing > to_index {
                 if crate::node::is_info() {
                     println!("[INFO][MB-SYNC] received idx={}-{} from={}", from_index, to_index, peer.id);
                 }
                 return Ok(());
-            } else {
-                if crate::node::is_warn() {
-                    println!("[WARN][MB-SYNC] no_response idx={}-{} from={} trying_next", from_index, to_index, peer.id);
+            }
+            if first_missing > from_index {
+                if crate::node::is_info() {
+                    println!("[INFO][MB-SYNC] partial idx={}-{} next_missing={} from={}",
+                             from_index, to_index, first_missing, peer.id);
                 }
+                return Ok(());
+            }
+            if crate::node::is_warn() {
+                println!("[WARN][MB-SYNC] no_response idx={}-{} from={} trying_next", from_index, to_index, peer.id);
             }
         }
-        
+
         Err(format!("Macroblock sync failed: all peers did not respond for idx={}-{}", from_index, to_index))
     }
     

@@ -115,9 +115,18 @@ pub fn verify_ed25519_signature(
 // =========================================================================
 
 /// BIP39 mnemonic → 64-byte seed using PBKDF2-HMAC-SHA512.
-/// password = mnemonic, salt = "mnemonic", iterations = 2048, dkLen = 64
+/// password = mnemonic, salt = "mnemonic", iterations = 2048, dkLen = 64.
+/// The mnemonic is NFKD-normalized first per BIP-39, matching the mobile/extension
+/// wallets (bip39.mnemonicToSeedSync) so a non-ASCII mnemonic derives the SAME seed
+/// (hence the SAME identity) on every client. NFKD is a no-op for ASCII mnemonics,
+/// so the English-wordlist genesis seeds — and every pinned constant/KAT — are unchanged.
 fn bip39_mnemonic_to_seed(mnemonic: &str) -> [u8; 64] {
-    let password = mnemonic.as_bytes();
+    use unicode_normalization::UnicodeNormalization;
+    // trim() before NFKD: the genesis constants + linkage gate derive from a trimmed
+    // seed, so an operator seed with a trailing newline (`export X=$(cat seed.txt)` /
+    // docker env-files) still yields the same identity. No-op for clean ASCII seeds.
+    let normalized: String = mnemonic.trim().nfkd().collect();
+    let password = normalized.as_bytes();
     let salt = b"mnemonic"; // BIP39 spec: salt = "mnemonic" + optional passphrase (empty)
     let iterations = 2048;
 

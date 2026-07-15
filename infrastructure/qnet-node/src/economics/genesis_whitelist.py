@@ -60,34 +60,34 @@ class GenesisWhitelist:
     def _create_default_whitelist(self):
         """Create default whitelist for genesis"""
         # Genesis validators - 5 bootstrap nodes (format: 19+3+15+8=45 chars)
-        # v4.1: Updated to 45-char format with 8-hex SHA3-256 checksum
+        # Pure-Dilithium: eon = SHA512(WALLET ML-DSA-65 pk). SOURCE OF TRUTH: genesis_constants.rs.
         genesis_validators = [
             {
-                "address": "f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab",
+                "address": "4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d",
                 "description": "Genesis Bootstrap Node 1 - Primary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "0bac6225a082de1f659eond0c96f1706cf19cc7abf70a",
+                "address": "c81f26da185fd05dcaeeona499b3d9e58d7ec75304f1b",
                 "description": "Genesis Bootstrap Node 2 - Secondary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "d216bb23fbe7f853636eon3f16b378b919227e009fb4f",
+                "address": "006a5c220ca2fa77021eon2b5c6703999066d5411e2ff",
                 "description": "Genesis Bootstrap Node 3 - Tertiary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc1113",
+                "address": "a60999a5a40637c1dd6eon975ca9618927edd7c19f38e",
                 "description": "Genesis Bootstrap Node 4 - Quaternary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb74cb",
+                "address": "9dd783e0c65cf68467ceondfeaed5e1e47f0242f6aed9",
                 "description": "Genesis Bootstrap Node 5 - Quinary",
                 "free_activations": 1,
                 "priority_access": True

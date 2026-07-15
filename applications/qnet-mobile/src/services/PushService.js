@@ -420,6 +420,14 @@ export async function selfAttestIfNeeded(nodeId) {
     const epoch = Math.floor(height / 14400);
     const last = await AsyncStorage.getItem('qnet_last_self_attest_epoch');
     if (last !== null && parseInt(last, 10) === epoch) return false;
+    // Registration gate: don't attest before the node's on-chain key is committed — a ping is only
+    // accepted once load_vrf_public_key(node_id) is present (else rejected no_onchain_key /
+    // ping_dilithium_node_not_found). onChainRegistered mirrors that exact server condition and is
+    // node-independent (a committed key is uniform across storage), unlike RAM-registry presence.
+    // Skip ONLY on a DEFINITIVE on-chain false; proceed when true, when the field is absent (older
+    // node — preserve prior behavior) or on a transient error, so a live node never misses its window.
+    const reg = await checkNodeStatus();
+    if (reg && reg.onChainRegistered === false) return false;
     // Canonical hash of block `anchor` = previous_hash of block anchor+1 (the chain link).
     const anchor = height - 2;
     const br = await fetch(`${apiUrl}/api/v1/microblock/${anchor + 1}`);
@@ -552,6 +560,9 @@ export async function checkNodeStatus() {
         nextPingWindow: result.next_ping_window,
         needsReactivation: result.needs_reactivation,
         currentBlockHeight,
+        // On-chain registration readiness (undefined on older nodes) — authoritative gate for
+        // self-attest: a ping is only accepted once the node's key is committed on-chain.
+        onChainRegistered: result.onchain_registered,
       };
     }
 
@@ -832,6 +843,7 @@ export async function checkServerNodeStatus(activationCode, nodeId = null, walle
   // GENESIS NODE SUPPORT: Convert Genesis activation code to node_id
   // Genesis codes: QNET-BOOT-001-STRAP → genesis_node_001
   let queryParams = '';
+  let walletHeader = null; // wallet sent via X-QNet-Wallet header, never the URL
   const genesisMatch = activationCode?.match(/^QNET-BOOT-00([1-5])-STRAP$/);
 
   if (genesisMatch) {
@@ -847,7 +859,8 @@ export async function checkServerNodeStatus(activationCode, nodeId = null, walle
   } else if (walletAddress) {
     // Wallet-bridge: resolve the node on-chain by wallet (works for server-activated supers and
     // offline/banned nodes — no dependence on the RAM activation registry that misses them).
-    queryParams = `wallet=${encodeURIComponent(walletAddress)}`;
+    // Privacy: the wallet goes in the X-QNet-Wallet header, NOT the URL (see fetch below).
+    walletHeader = walletAddress;
   } else if (activationCode) {
     queryParams = `activation_code=${encodeURIComponent(activationCode)}`;
   } else {
@@ -868,14 +881,17 @@ export async function checkServerNodeStatus(activationCode, nodeId = null, walle
       }
       triedNodes.add(apiUrl);
       
-      const url = `${apiUrl}/api/v1/node/status?${queryParams}`;
+      const url = queryParams
+        ? `${apiUrl}/api/v1/node/status?${queryParams}`
+        : `${apiUrl}/api/v1/node/status`;
       console.log(`[Push] Checking server node status (attempt ${attempt + 1}): ${url}`);
-      
+
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 8000);
-      
-      const response = await fetch(url, { 
+
+      const response = await fetch(url, {
         method: 'GET',
+        headers: walletHeader ? { 'X-QNet-Wallet': walletHeader } : undefined,
         signal: controller.signal
       });
       
@@ -953,10 +969,10 @@ export async function getAllNodesByWallet(walletAddress) {
   try {
     const apiUrl = getRandomBootstrapNode();
     
-    // NEW: Call without node_type to get ALL nodes
+    // NEW: Call without node_type to get ALL nodes. Wallet via header, not the URL (privacy).
     const response = await fetch(
-      `${apiUrl}/api/v1/activations/by-wallet?wallet_address=${encodeURIComponent(walletAddress)}`,
-      { method: 'GET' }
+      `${apiUrl}/api/v1/activations/by-wallet`,
+      { method: 'GET', headers: { 'X-QNet-Wallet': walletAddress } }
     );
 
     if (!response.ok) {

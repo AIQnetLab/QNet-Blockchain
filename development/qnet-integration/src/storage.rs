@@ -7518,6 +7518,27 @@ impl Storage {
         Ok(out)
     }
 
+    /// True if `node_id` has an on-chain Heartbeat in the current or previous 1440-block
+    /// subwindow at `cur_height` — the deterministic liveness answer identical on every node
+    /// (two lhb_ point-reads). The RAM peer view can lag a healthy node after reconnects.
+    pub fn heartbeat_recent_onchain(&self, node_id: &str, cur_height: u64) -> bool {
+        let registry_cf = match self.persistent.db.cf_handle("node_registry") {
+            Some(cf) => cf,
+            None => return false,
+        };
+        let cur = cur_height / 1440;
+        for sw in [cur, cur.saturating_sub(1)] {
+            let key = format!("lhb_{:010}_{}", sw, node_id);
+            if let Ok(Some(v)) = self.persistent.db.get_cf(&registry_cf, key.as_bytes()) {
+                if v.len() >= 8
+                    && u64::from_be_bytes(v[..8].try_into().unwrap_or([0u8; 8])) <= cur_height {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Streaming lrtr_ walk (reg_height < before_height), node_id-ascending — same rows and order as
     /// `light_roster_sorted` but O(1) memory: the reward reader at millions of light nodes must not
     /// collect the roster into a Vec on the emission path.

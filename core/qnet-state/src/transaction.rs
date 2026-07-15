@@ -4250,12 +4250,12 @@ mod tests_v17_swap_sender {
     use crate::account::Account;
 
     // The two genesis wallets below are real production EON addresses used
-    // by `genesis_node_001` and `genesis_node_002`. They satisfy
-    // `is_valid_eon_address` (45 chars, embedded "eon" marker, valid SHA3
-    // checksum). Hard-coding them here keeps the tests independent of
-    // runtime checksum computation while exercising real-shaped data.
-    const ATTACKER: &str = "f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab";
-    const VICTIM:   &str = "0bac6225a082de1f659eond0c96f1706cf19cc7abf70a";
+    // by `genesis_node_001` and `genesis_node_002` (pure-Dilithium form).
+    // They satisfy `is_valid_eon_address` (45 chars, embedded "eon" marker,
+    // valid SHA3 checksum). Hard-coding them here keeps the tests independent
+    // of runtime checksum computation while exercising real-shaped data.
+    const ATTACKER: &str = "4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d";
+    const VICTIM:   &str = "c81f26da185fd05dcaeeona499b3d9e58d7ec75304f1b";
 
     fn make_transfer_tx(tx_from: &str, payload_from: &str, to: &str, amount: u64) -> Transaction {
         // Construct via direct struct init so we can set `payload_from`

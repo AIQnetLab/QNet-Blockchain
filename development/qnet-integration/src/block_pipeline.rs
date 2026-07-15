@@ -483,64 +483,63 @@ pub fn request_missing_parent(parent_h: u64) -> bool {
     }
 }
 
-// v19: range-sync for large gaps. v18 single-flight (1 req/height, 30s
-// TTL) recovers ~1 block/TTL → a 31-block gap ≈ gap×TTL ≈ 15min while the
-// deferred buffer fills. Fix: when the missing parent is >
-// RANGE_SYNC_GAP_THRESHOLD below the child, dispatch ONE sync_blocks(from,
-// to) (canonical: parallel top-rep fan, MAX_BATCH_BLOCKS=500/req; responses
-// re-enter via handle_blocks_batch→ingest) instead of N single-flights.
-// Separate range dedup MISSING_BLOCK_RANGE_REQUESTED keyed (local_tip,
-// target), time-windowed → no request storm; per-height dedup kept for the
-// small-gap path. Detached spawn; responses pass full canonical verify.
+// Range-sync for large gaps: one batched sync_blocks(from, to) instead of
+// N single-flights. Requester is a single bounded window anchored to the
+// APPLY FRONTIER — never keyed on the caller's (drifting) target height.
+// A live-tip key defeats any (from, to) dedup: every incoming block makes a
+// unique key, so an overlapping request dispatches per block (observed 641k
+// re-requests / 7 blk/s on a 3266-block tail). Stable anchor + progress
+// gate + timeout retry bounds dispatches to ≤2 per window plus 1 per
+// RANGE_SYNC_RETRY_MS while stalled, and cannot wedge: a lost response is
+// re-dispatched on timeout (sync_blocks re-fans to current top peers).
 
 /// Threshold (in blocks) above which the verify stage prefers a single
-/// range-sync over the cascade of single-height requests. Picked to keep
-/// the small-gap regime (1–5 blocks, normal gossip jitter) on the
-/// lighter-weight per-height path while ensuring any genuine catch-up gap
-/// converts to a batched range request.
+/// range-sync over the cascade of single-height requests. Keeps the
+/// small-gap regime (gossip jitter) on the per-height path.
 const RANGE_SYNC_GAP_THRESHOLD: u64 = 5;
 
-/// TTL for in-flight range-sync request dedup. Slightly longer than the
-/// per-height TTL so a cascade of children does not generate overlapping
-/// batched requests for substantially the same range.
-const MISSING_BLOCK_RANGE_TTL_MS: u64 = 60_000; // 60 seconds
+/// Request window size. Matches the serve-side batch cap (MAX_BATCH_BLOCKS)
+/// so one dispatch = one full batch.
+const RANGE_SYNC_WINDOW: u64 = 500;
 
-/// Range-sync dedup map. Key = `(from_height, to_height)`; value =
-/// dispatch timestamp in unix-ms. Lock-free DashMap, evicted on TTL
-/// by `cleanup_missing_block_requests`.
-static MISSING_BLOCK_RANGE_REQUESTED: once_cell::sync::Lazy<
-    dashmap::DashMap<(u64, u64), u64>
-> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
+/// Re-dispatch timeout for the in-flight window (response lost / peer gone).
+const RANGE_SYNC_RETRY_MS: u64 = 10_000;
 
-/// Trigger a range sync covering `from..=to`. Returns true on dispatch,
-/// false if a recent request for the same range is still in cooldown or
-/// the global P2P instance is not yet initialized.
-///
-/// The actual network call (`unified_p2p::sync_blocks`) runs on a detached
-/// task so the verify stage thread is never blocked on I/O.
+/// Single-flight requester state: (window_start, window_end, dispatched_at_ms).
+/// dispatched_at_ms == 0 → nothing in flight. O(1) — no per-range map.
+static RANGE_SYNC_INFLIGHT: once_cell::sync::Lazy<std::sync::Mutex<(u64, u64, u64)>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new((0, 0, 0)));
+
+/// Trigger a range sync from `from` (the apply frontier + 1) toward `to`,
+/// capped to RANGE_SYNC_WINDOW. Dispatches only when: first call, the
+/// frontier consumed ≥ half the in-flight window (pipelined next window),
+/// the frontier moved below the window (rollback re-anchor), or the
+/// in-flight dispatch timed out. Network call runs on a detached task.
 pub fn request_missing_range(from: u64, to: u64) -> bool {
     if to < from {
         return false;
     }
+    let to = to.min(from.saturating_add(RANGE_SYNC_WINDOW - 1));
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    // Single-flight per (from, to) tuple within the cooldown window.
-    let should_dispatch = match MISSING_BLOCK_RANGE_REQUESTED.entry((from, to)) {
-        dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
-            let last = *occupied.get();
-            if now_ms.saturating_sub(last) < MISSING_BLOCK_RANGE_TTL_MS {
-                false
-            } else {
-                *occupied.get_mut() = now_ms;
-                true
-            }
-        }
-        dashmap::mapref::entry::Entry::Vacant(vacant) => {
-            vacant.insert(now_ms);
+    let should_dispatch = {
+        let mut st = RANGE_SYNC_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+        let (win_start, win_end, dispatched_at) = *st;
+        let first = dispatched_at == 0;
+        let progressed = from >= win_start.saturating_add(RANGE_SYNC_WINDOW / 2);
+        // A capped-short window (small gap) fully consumed/left behind — without this,
+        // successive small gaps in one region would throttle to one dispatch per timeout.
+        let beyond = from > win_end;
+        let rolled_back = from < win_start;
+        let stalled = now_ms.saturating_sub(dispatched_at) >= RANGE_SYNC_RETRY_MS;
+        if first || progressed || beyond || rolled_back || stalled {
+            *st = (from, to, now_ms);
             true
+        } else {
+            false
         }
     };
 
@@ -572,6 +571,12 @@ pub fn request_missing_range(from: u64, to: u64) -> bool {
         });
         true
     } else {
+        // Disarm: nothing dispatched, so the armed slot must not suppress the
+        // retry once p2p comes up (first-boot race would cost a dead timeout).
+        {
+            let mut st = RANGE_SYNC_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+            if st.0 == from { st.2 = 0; }
+        }
         if is_debug() {
             println!(
                 "[DBG][PIPELINE] missing_range_request_skipped from={} to={} reason=p2p_not_ready",
@@ -593,12 +598,7 @@ pub fn cleanup_missing_block_requests() {
     MISSING_BLOCK_REQUESTED.retain(|_, last| {
         now_ms.saturating_sub(*last) < MISSING_BLOCK_REQUEST_TTL_MS
     });
-    // v19: range-sync dedup map shares the same retention sweep so it
-    // stays bounded under sustained gap-recovery activity without a
-    // separate cleanup task.
-    MISSING_BLOCK_RANGE_REQUESTED.retain(|_, last| {
-        now_ms.saturating_sub(*last) < MISSING_BLOCK_RANGE_TTL_MS
-    });
+    // Range requester state is a single O(1) slot — nothing to sweep.
 }
 
 // ============================================================================
@@ -724,6 +724,7 @@ pub const PIPELINE_OP_APPLY_STATE: u64 = 24;
 pub const PIPELINE_OP_APPLY_SAVE_BLOCK: u64 = 25;
 pub const PIPELINE_OP_APPLY_SET_HEIGHT: u64 = 26;
 pub const PIPELINE_OP_APPLY_DEFERRED_FX: u64 = 27;
+pub const PIPELINE_OP_APPLY_SEAL_WAIT: u64 = 28;
 
 /// Decode an op marker into a short human-readable string for diagnostics.
 fn op_name(op: u64) -> &'static str {
@@ -739,6 +740,7 @@ fn op_name(op: u64) -> &'static str {
         PIPELINE_OP_APPLY_SAVE_BLOCK => "apply:save_microblock",
         PIPELINE_OP_APPLY_SET_HEIGHT => "apply:set_chain_height",
         PIPELINE_OP_APPLY_DEFERRED_FX => "apply:deferred_side_effects",
+        PIPELINE_OP_APPLY_SEAL_WAIT => "apply:seal_backpressure_wait",
         _ => "unknown",
     }
 }
@@ -1784,7 +1786,7 @@ impl BlockPipeline {
                     // v27 HOLE4: liveness — without this, persistent chain
                     // break at the frontier spins forever (applied=0; the
                     // 5.4h h=53731 wedge). Re-pull canonical range from last
-                    // committed (request_missing_range is self-deduped 60s,
+                    // committed (request_missing_range is single-flight windowed, 10s retry,
                     // detached — safe per break).
                     let local_tip = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                         .load(std::sync::atomic::Ordering::Relaxed);
@@ -2621,6 +2623,41 @@ impl BlockPipeline {
                 && crate::storage::SNAPSHOT_REHYDRATE_IN_PROGRESS.load(Ordering::Acquire) {
                 metrics.mark_apply_idle();
                 continue;
+            }
+
+            // Seal backpressure: never apply more than MAX_UNSEALED_WINDOWS windows past the
+            // contiguous seal / QC-verified frontier (same base and bound as the production
+            // throttle — one seal semantic everywhere). Bounds the apply-vs-seal gap during
+            // bulk catch-up so a joiner cannot reach apply-tip (and registration) while its
+            // seal lags arbitrarily; the mb-sync backfill advances the frontier independently
+            // and releases the wait. seal_base == 0 (young chain, nothing sealed) is exempt.
+            // At the live tip this never fires: production stops at the same bound first.
+            {
+                const SEAL_LAG_CAP: u64 = crate::node::MAX_UNSEALED_WINDOWS * 90;
+                let mut waited_ms: u64 = 0;
+                loop {
+                    // Cheap atomic first: seal_base >= qc frontier, so within-cap here
+                    // proves within-cap overall — no per-block RocksDB read on the hot path.
+                    let qc_f = crate::node::qc_verified_frontier_cached();
+                    if qc_f > 0 && height <= qc_f + SEAL_LAG_CAP {
+                        break;
+                    }
+                    let seal_base = ctx.storage.last_sealed_mb_index().saturating_mul(90).max(qc_f);
+                    if seal_base == 0 || height <= seal_base + SEAL_LAG_CAP {
+                        break;
+                    }
+                    if waited_ms == 0 {
+                        // Distinct op marker: without it the watchdog attributes this wait
+                        // to the LAST marker (apply:dedup_check) and fires false CRIT dumps.
+                        metrics.mark_apply_op(height, PIPELINE_OP_APPLY_SEAL_WAIT);
+                    }
+                    if waited_ms > 0 && waited_ms % 5_000 == 0 && is_warn() {
+                        println!("[WARN][PIPELINE] apply_seal_backpressure h={} seal_base={} cap={}",
+                                 height, seal_base, SEAL_LAG_CAP);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    waited_ms += 250;
+                }
             }
 
             // State application with snapshot + rollback support.
@@ -3638,25 +3675,18 @@ mod tests_v18_active_sync {
 mod tests_v19_range_sync {
     use super::*;
 
-    // Use a disjoint key space from the v18 tests above so cargo's parallel
-    // workers cannot interfere across modules.
-    const FROM_FIRST_CALL: u64 = 1_000_001_001;
-    const TO_FIRST_CALL: u64 = 1_000_001_500;
+    // All tests share the single global RANGE_SYNC_INFLIGHT slot — serialize
+    // them so cargo's parallel workers cannot interleave state.
+    static RANGE_TEST_LOCK: once_cell::sync::Lazy<std::sync::Mutex<()>> =
+        once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
 
-    const FROM_DUPLICATE: u64 = 1_000_002_001;
-    const TO_DUPLICATE: u64 = 1_000_002_500;
+    fn set_state(s: (u64, u64, u64)) {
+        *RANGE_SYNC_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner()) = s;
+    }
 
-    const FROM_CLEANUP_EVICT: u64 = 1_000_003_001;
-    const TO_CLEANUP_EVICT: u64 = 1_000_003_500;
-
-    const FROM_CLEANUP_KEEP: u64 = 1_000_004_001;
-    const TO_CLEANUP_KEEP: u64 = 1_000_004_500;
-
-    const FROM_TTL_EXPIRY: u64 = 1_000_005_001;
-    const TO_TTL_EXPIRY: u64 = 1_000_005_500;
-
-    const FROM_INVALID: u64 = 1_000_006_500;
-    const TO_INVALID: u64 = 1_000_006_001;
+    fn get_state() -> (u64, u64, u64) {
+        *RANGE_SYNC_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
@@ -3665,115 +3695,94 @@ mod tests_v19_range_sync {
             .unwrap_or(0)
     }
 
-    /// First call for a fresh `(from, to)` pair MUST insert the dedup entry.
-    /// The actual network dispatch is gated on `try_get_p2p()` — in unit-test
-    /// context the global is None, so the function returns false; the dedup
-    /// insert MUST still happen so a follow-up call within the TTL window
-    /// is suppressed even if p2p comes online in between (the only honest
-    /// way to differentiate "first call" from "duplicate" is the map state).
+    /// First call must arm the window ANCHORED ON THE FRONTIER and cap the
+    /// target to RANGE_SYNC_WINDOW — one dispatch = one serve-side batch.
+    /// p2p is absent in unit tests, so the slot is then DISARMED (at == 0):
+    /// nothing was sent, the retry must not wait out a phantom timeout.
     #[test]
-    fn range_first_call_inserts_into_dedup_map() {
-        MISSING_BLOCK_RANGE_REQUESTED.remove(&(FROM_FIRST_CALL, TO_FIRST_CALL));
-        let _ = request_missing_range(FROM_FIRST_CALL, TO_FIRST_CALL);
-        assert!(
-            MISSING_BLOCK_RANGE_REQUESTED.contains_key(&(FROM_FIRST_CALL, TO_FIRST_CALL)),
-            "first range call must insert (from, to) into the dedup map"
-        );
-    }
-
-    /// A second call for the SAME `(from, to)` pair within the TTL window
-    /// MUST NOT refresh the timestamp. Without this guarantee, every child
-    /// block landing during a long stall would amplify into another batched
-    /// fetch covering substantially the same range — at 1000-peer scale a
-    /// 500-block gap with 50 in-flight children = 25 000 redundant requests.
-    #[test]
-    fn range_duplicate_within_ttl_is_rejected() {
-        MISSING_BLOCK_RANGE_REQUESTED.remove(&(FROM_DUPLICATE, TO_DUPLICATE));
-        let _ = request_missing_range(FROM_DUPLICATE, TO_DUPLICATE);
-        let first_ts = *MISSING_BLOCK_RANGE_REQUESTED
-            .get(&(FROM_DUPLICATE, TO_DUPLICATE))
-            .expect("first insert must succeed")
-            .value();
-        let _ = request_missing_range(FROM_DUPLICATE, TO_DUPLICATE);
-        let second_ts = *MISSING_BLOCK_RANGE_REQUESTED
-            .get(&(FROM_DUPLICATE, TO_DUPLICATE))
-            .expect("entry must still be present")
-            .value();
+    fn range_first_call_arms_capped_window() {
+        let _g = RANGE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_state((0, 0, 0));
+        let _ = request_missing_range(1_000, 999_999_999);
+        let (ws, we, at) = get_state();
+        assert_eq!(ws, 1_000);
         assert_eq!(
-            first_ts, second_ts,
-            "second range call within TTL must NOT refresh the timestamp"
+            we,
+            1_000 + RANGE_SYNC_WINDOW - 1,
+            "target must be capped to the window, not the drifting tip"
         );
+        assert_eq!(at, 0, "undispatched (p2p absent) slot must be disarmed for retry");
     }
 
-    /// `cleanup_missing_block_requests` MUST evict range entries older than
-    /// `MISSING_BLOCK_RANGE_TTL_MS`. Without this the range dedup map grows
-    /// unboundedly under sustained gap-recovery activity at thousand-node
-    /// deployment scale (every long stall adds one entry per `(from, to)`
-    /// pair seen).
+    /// A drifting target (live tip advancing per block) with the frontier
+    /// still inside the in-flight window MUST NOT re-dispatch. Storm
+    /// regression: (from, to)-keyed dedup made every incoming block a unique
+    /// key → one overlapping re-request per block.
     #[test]
-    fn range_cleanup_evicts_stale_entries() {
-        let stale_ts = now_ms().saturating_sub(MISSING_BLOCK_RANGE_TTL_MS + 1000);
-        MISSING_BLOCK_RANGE_REQUESTED.insert((FROM_CLEANUP_EVICT, TO_CLEANUP_EVICT), stale_ts);
-
-        cleanup_missing_block_requests();
-        assert!(
-            !MISSING_BLOCK_RANGE_REQUESTED.contains_key(&(FROM_CLEANUP_EVICT, TO_CLEANUP_EVICT)),
-            "cleanup must evict range entries older than the TTL"
+    fn range_drifting_target_is_suppressed() {
+        let _g = RANGE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let armed = (2_000u64, 2_499u64, now_ms() - 1_000);
+        set_state(armed);
+        for drift in 0..100u64 {
+            let _ = request_missing_range(2_000, 3_000 + drift);
+        }
+        // Frontier advance below half a window: still covered in-flight.
+        let _ = request_missing_range(2_000 + RANGE_SYNC_WINDOW / 2 - 1, 999_999);
+        assert_eq!(
+            get_state(), armed,
+            "no re-dispatch while the in-flight window is being consumed"
         );
     }
 
-    /// Cleanup MUST NOT evict range entries within the TTL window. False
-    /// positives here would re-dispatch in-flight `sync_blocks` against
-    /// peers and re-introduce the thundering-herd we are trying to prevent.
+    /// Frontier consuming ≥ half the in-flight window MUST re-arm — the
+    /// pipelined next-window dispatch (liveness half of the progress gate).
     #[test]
-    fn range_cleanup_preserves_fresh_entries() {
-        MISSING_BLOCK_RANGE_REQUESTED.insert((FROM_CLEANUP_KEEP, TO_CLEANUP_KEEP), now_ms());
-        cleanup_missing_block_requests();
-        assert!(
-            MISSING_BLOCK_RANGE_REQUESTED.contains_key(&(FROM_CLEANUP_KEEP, TO_CLEANUP_KEEP)),
-            "cleanup must keep range entries inserted within the TTL"
-        );
+    fn range_progress_rearms_next_window() {
+        let _g = RANGE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_state((3_000, 3_499, now_ms() - 1_000));
+        let next_from = 3_000 + RANGE_SYNC_WINDOW / 2;
+        let _ = request_missing_range(next_from, 999_999);
+        let (ws, we, _) = get_state();
+        assert_eq!(ws, next_from, "half-window progress must re-anchor");
+        assert_eq!(we, next_from + RANGE_SYNC_WINDOW - 1);
     }
 
-    /// After TTL expiry, a follow-up range request MUST refresh the
-    /// timestamp. Mirror of the per-height TTL-expiry contract: if the
-    /// previous request was lost (peer offline, packet drop), the network
-    /// MUST be allowed to retry — otherwise a genuinely-missing range that
-    /// the network failed to deliver once would be silently abandoned
-    /// forever.
+    /// Frontier moving BELOW the window start (rollback/reorg) MUST
+    /// re-anchor immediately, not wait out the retry timeout.
     #[test]
-    fn range_ttl_expiry_allows_retry() {
-        let stale_ts = now_ms().saturating_sub(MISSING_BLOCK_RANGE_TTL_MS + 1000);
-        MISSING_BLOCK_RANGE_REQUESTED.insert((FROM_TTL_EXPIRY, TO_TTL_EXPIRY), stale_ts);
-
-        let _ = request_missing_range(FROM_TTL_EXPIRY, TO_TTL_EXPIRY);
-        let new_ts = *MISSING_BLOCK_RANGE_REQUESTED
-            .get(&(FROM_TTL_EXPIRY, TO_TTL_EXPIRY))
-            .expect("entry must still exist")
-            .value();
-        assert!(
-            new_ts > stale_ts,
-            "expired-TTL range retry must refresh the timestamp (was {} now {})",
-            stale_ts, new_ts
-        );
+    fn range_rollback_reanchors() {
+        let _g = RANGE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_state((5_000, 5_499, now_ms() - 1_000));
+        let _ = request_missing_range(4_000, 4_050);
+        let (ws, _, _) = get_state();
+        assert_eq!(ws, 4_000, "rollback below window start must re-anchor");
     }
 
-    /// An inverted range (`to < from`) MUST be rejected without inserting
-    /// into the dedup map. Without this guard a faulty caller could pin
-    /// arbitrary `(from, to)` keys that never legitimately appear in
-    /// dispatch, slowly leaking memory and obscuring real stall patterns
-    /// in operator dashboards.
+    /// A stalled window (response lost, peer gone) MUST re-dispatch after
+    /// RANGE_SYNC_RETRY_MS with the SAME frontier — the anti-wedge half:
+    /// suppression alone would abandon a genuinely missing range forever.
+    /// Observable in tests as at != stale: suppressed would leave the stale
+    /// stamp; the fired path re-arms then disarms to 0 (p2p absent).
+    #[test]
+    fn range_timeout_retries_same_window() {
+        let _g = RANGE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let stale = now_ms() - RANGE_SYNC_RETRY_MS - 1_000;
+        set_state((6_000, 6_499, stale));
+        let _ = request_missing_range(6_000, 6_499);
+        let (ws, _, at) = get_state();
+        assert_eq!(ws, 6_000);
+        assert_ne!(at, stale, "timed-out window must fire the retry path");
+    }
+
+    /// Inverted input (to < from) MUST be rejected without touching the
+    /// in-flight state — a faulty caller must not clobber a live window.
     #[test]
     fn range_inverted_input_is_rejected() {
-        MISSING_BLOCK_RANGE_REQUESTED.remove(&(FROM_INVALID, TO_INVALID));
-        let dispatched = request_missing_range(FROM_INVALID, TO_INVALID);
-        assert!(
-            !dispatched,
-            "inverted range (to < from) must be rejected"
-        );
-        assert!(
-            !MISSING_BLOCK_RANGE_REQUESTED.contains_key(&(FROM_INVALID, TO_INVALID)),
-            "inverted range MUST NOT insert into the dedup map"
-        );
+        let _g = RANGE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let armed = (7_000u64, 7_499u64, now_ms() - 1_000);
+        set_state(armed);
+        let dispatched = request_missing_range(500, 100);
+        assert!(!dispatched, "inverted range (to < from) must be rejected");
+        assert_eq!(get_state(), armed, "inverted input must not clobber in-flight state");
     }
 }

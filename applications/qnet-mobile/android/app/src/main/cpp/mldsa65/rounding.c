@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 /*************************************************
-* Name:        PQCLEAN_DILITHIUM3_CLEAN_power2round
+* Name:        PQCLEAN_MLDSA65_CLEAN_power2round
 *
 * Description: For finite field element a, compute a0, a1 such that
 *              a mod^+ Q = a1*2^D + a0 with -2^{D-1} < a0 <= 2^{D-1}.
@@ -14,7 +14,7 @@
 *
 * Returns a1.
 **************************************************/
-int32_t PQCLEAN_DILITHIUM3_CLEAN_power2round(int32_t *a0, int32_t a)  {
+int32_t PQCLEAN_MLDSA65_CLEAN_power2round(int32_t *a0, int32_t a)  {
     int32_t a1;
 
     a1 = (a + (1 << (D - 1)) - 1) >> D;
@@ -23,7 +23,7 @@ int32_t PQCLEAN_DILITHIUM3_CLEAN_power2round(int32_t *a0, int32_t a)  {
 }
 
 /*************************************************
-* Name:        PQCLEAN_DILITHIUM3_CLEAN_decompose
+* Name:        PQCLEAN_MLDSA65_CLEAN_decompose
 *
 * Description: For finite field element a, compute high and low bits a0, a1 such
 *              that a mod^+ Q = a1*ALPHA + a0 with -ALPHA/2 < a0 <= ALPHA/2 except
@@ -36,7 +36,7 @@ int32_t PQCLEAN_DILITHIUM3_CLEAN_power2round(int32_t *a0, int32_t a)  {
 *
 * Returns a1.
 **************************************************/
-int32_t PQCLEAN_DILITHIUM3_CLEAN_decompose(int32_t *a0, int32_t a) {
+int32_t PQCLEAN_MLDSA65_CLEAN_decompose(int32_t *a0, int32_t a) {
     int32_t a1;
 
     a1  = (a + 127) >> 7;
@@ -49,7 +49,7 @@ int32_t PQCLEAN_DILITHIUM3_CLEAN_decompose(int32_t *a0, int32_t a) {
 }
 
 /*************************************************
-* Name:        PQCLEAN_DILITHIUM3_CLEAN_make_hint
+* Name:        PQCLEAN_MLDSA65_CLEAN_make_hint
 *
 * Description: Compute hint bit indicating whether the low bits of the
 *              input element overflow into the high bits.
@@ -59,7 +59,7 @@ int32_t PQCLEAN_DILITHIUM3_CLEAN_decompose(int32_t *a0, int32_t a) {
 *
 * Returns 1 if overflow.
 **************************************************/
-unsigned int PQCLEAN_DILITHIUM3_CLEAN_make_hint(int32_t a0, int32_t a1) {
+unsigned int PQCLEAN_MLDSA65_CLEAN_make_hint(int32_t a0, int32_t a1) {
     if (a0 > GAMMA2 || a0 < -GAMMA2 || (a0 == -GAMMA2 && a1 != 0)) {
         return 1;
     }
@@ -68,7 +68,7 @@ unsigned int PQCLEAN_DILITHIUM3_CLEAN_make_hint(int32_t a0, int32_t a1) {
 }
 
 /*************************************************
-* Name:        PQCLEAN_DILITHIUM3_CLEAN_use_hint
+* Name:        PQCLEAN_MLDSA65_CLEAN_use_hint
 *
 * Description: Correct high bits according to hint.
 *
@@ -77,10 +77,10 @@ unsigned int PQCLEAN_DILITHIUM3_CLEAN_make_hint(int32_t a0, int32_t a1) {
 *
 * Returns corrected high bits.
 **************************************************/
-int32_t PQCLEAN_DILITHIUM3_CLEAN_use_hint(int32_t a, unsigned int hint) {
+int32_t PQCLEAN_MLDSA65_CLEAN_use_hint(int32_t a, unsigned int hint) {
     int32_t a0, a1;
 
-    a1 = PQCLEAN_DILITHIUM3_CLEAN_decompose(&a0, a);
+    a1 = PQCLEAN_MLDSA65_CLEAN_decompose(&a0, a);
     if (hint == 0) {
         return a1;
     }

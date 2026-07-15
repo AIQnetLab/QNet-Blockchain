@@ -1,25 +1,26 @@
 cmake_minimum_required(VERSION 3.22.1)
 project("dilithium_native" C)
 
-# pqclean dilithium3 clean reference implementation (same as pqcrypto-dilithium 0.5)
-set(DILITHIUM3_CLEAN_SRCS
-    dilithium3/ntt.c
-    dilithium3/packing.c
-    dilithium3/poly.c
-    dilithium3/polyvec.c
-    dilithium3/reduce.c
-    dilithium3/rounding.c
-    dilithium3/sign.c
-    dilithium3/symmetric-shake.c
+# PQClean ml-dsa-65 clean reference (FIPS-204 final) — byte-identical to the node's
+# fips204/pqcrypto-mldsa wallet keygen, so app and node derive the SAME eon per seed.
+set(MLDSA65_CLEAN_SRCS
+    mldsa65/ntt.c
+    mldsa65/packing.c
+    mldsa65/poly.c
+    mldsa65/polyvec.c
+    mldsa65/reduce.c
+    mldsa65/rounding.c
+    mldsa65/sign.c
+    mldsa65/symmetric-shake.c
     common/fips202.c
     randombytes_custom.c
     dilithium_jni.c
 )
 
-add_library(dilithium_native SHARED ${DILITHIUM3_CLEAN_SRCS})
+add_library(dilithium_native SHARED ${MLDSA65_CLEAN_SRCS})
 
 target_include_directories(dilithium_native PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/dilithium3
+    ${CMAKE_CURRENT_SOURCE_DIR}/mldsa65
     ${CMAKE_CURRENT_SOURCE_DIR}/common
     ${CMAKE_CURRENT_SOURCE_DIR}
 )

@@ -1825,6 +1825,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
+        // Privacy: the wallet address may arrive in a header (kept out of the URL /
+        // access logs / caches) instead of ?wallet=. Query stays as fallback.
+        .and(warp::header::optional::<String>("x-qnet-wallet"))
         .and(blockchain_filter.clone())
         .and_then(handle_server_node_status);
 
@@ -1957,6 +1960,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
+        .and(warp::header::optional::<String>("x-qnet-wallet"))
         .and(blockchain_filter.clone())
         .and_then(handle_activations_by_wallet);
 
@@ -1977,6 +1981,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::get())
         .and(warp::query::<HashMap<String, String>>())
+        .and(warp::header::optional::<String>("x-qnet-wallet"))
         .and(blockchain_filter.clone())
         .and_then(handle_verify_activation_onchain);
 
@@ -8231,16 +8236,24 @@ async fn handle_light_node_status(
         }))),
     };
     
+    // On-chain readiness = the EXACT condition the ping handler enforces before accepting an
+    // attestation (load_vrf_public_key present). Node-independent (committed key is uniform across
+    // storage), unlike RAM-registry presence which is gossip-lagged. The client gates self-attest on
+    // this so a ping never fires before the registration TX is applied (no_onchain_key rejection).
+    let onchain_registered = blockchain.get_storage()
+        .load_vrf_public_key(&node_id)
+        .ok().flatten().is_some();
+
     if let Some(p2p) = blockchain.get_unified_p2p() {
         let registry = p2p.get_light_node_registry();
-        
+
         if let Some(node) = registry.get(&node_id) {
             let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&node_id);
             let current_slot = crate::unified_p2p::SimplifiedP2P::get_current_slot();
-            
+
             // Check if has attestation in current window
             let has_attestation = p2p.has_attestation(&node_id, current_slot);
-            
+
             return Ok(warp::reply::json(&json!({
                 "success": true,
                 "node_id": node_id,
@@ -8252,25 +8265,34 @@ async fn handle_light_node_status(
                 "has_attestation_current_slot": has_attestation,
                 "next_ping_time": next_ping_time,
                 "next_ping_window": window_number,
-                "needs_reactivation": !node.is_active || node.consecutive_failures >= 5
+                "needs_reactivation": !node.is_active || node.consecutive_failures >= 5,
+                "onchain_registered": onchain_registered
             })));
         }
     }
-    
+
+    // RAM-registry miss: still report on-chain readiness (a committed node is uniform across
+    // storage even if this node hasn't gossip-learned it yet) so the client can attest through
+    // another node instead of being falsely gated off.
     Ok(warp::reply::json(&json!({
         "success": false,
-        "error": "Node not found"
+        "error": "Node not found",
+        "onchain_registered": onchain_registered
     })))
 }
 
 /// Handle Server node (Super, including Genesis) status check
 /// Returns online status, heartbeat count, and activity info
 async fn handle_server_node_status(
-    params: HashMap<String, String>,
+    mut params: HashMap<String, String>,
+    wallet_hdr: Option<String>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    
+
+    // Privacy: prefer the wallet from the header (never in the URL) over ?wallet=.
+    if let Some(w) = wallet_hdr.filter(|s| !s.is_empty()) { params.insert("wallet".to_string(), w); }
+
     // Query by node_id, wallet (the robust wallet-bridge), or activation_code.
     let activation_code = params.get("activation_code").cloned();
     let node_id = params.get("node_id").cloned();
@@ -8353,8 +8375,11 @@ async fn handle_server_node_status(
                     _ => 9,        // v3.18: Default to Super (Full removed)
                 };
                 
-                // Calculate if node is active (seen in last 15 minutes)
-                let is_online = now - last_seen < 15 * 60;
+                // RAM peer freshness OR the deterministic on-chain heartbeat (identical on
+                // every node): a healthy super must never read offline just because THIS
+                // node's peer view lagged after a reconnect.
+                let chain_alive = blockchain.get_storage().heartbeat_recent_onchain(found_id, cur_height);
+                let is_online = (now - last_seen < 15 * 60) || chain_alive;
 
                 // Pacing: heartbeat_count is the IN-PROGRESS epoch popcount (one bit per 1440-block
                 // subwindow), so a healthy node only reaches the full threshold near epoch end. Compare
@@ -8454,20 +8479,31 @@ async fn handle_server_node_status(
                 Some(w) => {
                     let reputation = get_reputation_from_snapshot(&blockchain, off_id).await;
                     let pending_rewards = wallet_claimable_qnc(&blockchain, &w).await;
+                    // Absent from THIS node's RAM roster ≠ offline: the deterministic
+                    // on-chain heartbeat index is the authority every node agrees on.
+                    let cur_height = blockchain.get_height().await;
+                    let chain_alive = blockchain.get_storage().heartbeat_recent_onchain(off_id, cur_height);
+                    let hb_epoch = cur_height / 14400;
+                    let heartbeat_count = blockchain.get_account(off_id).await.ok().flatten()
+                        .map(|a| crate::node::BlockchainNode::account_heartbeat_count(&a, hb_epoch))
+                        .unwrap_or(0);
+                    let expected = ((cur_height % 14400) / 1440) as u32;
+                    let on_pace = chain_alive && (heartbeat_count as u32) + 1 >= expected;
                     return Ok(warp::reply::json(&json!({
                         "success": true,
                         "registered": true,
                         "node_id": off_id,
-                        "is_online": false,
+                        "is_online": chain_alive,
                         "last_seen": 0,
-                        "heartbeat_count": 0,
+                        "heartbeat_count": heartbeat_count,
                         "required_heartbeats": 9,
-                        "is_reward_eligible": false,
+                        "is_reward_eligible": heartbeat_count >= 9 || on_pace,
                         "reputation": reputation,
-                        "current_block_height": blockchain.get_height().await,
-                        "needs_attention": true,
+                        "current_block_height": cur_height,
+                        "needs_attention": !chain_alive || (heartbeat_count as u32) + 1 < expected,
                         "pending_rewards": pending_rewards,
-                        "message": "Node registered but offline this window."
+                        "message": if chain_alive { "Node online (on-chain heartbeat)." }
+                                   else { "Node registered but offline this window." }
                     })));
                 }
                 None => {
@@ -11635,11 +11671,15 @@ async fn handle_graceful_shutdown(
 /// Handle activation codes query by wallet address for bridge-server
 /// EXTENDED: node_type is now OPTIONAL - returns ALL nodes for wallet if omitted
 async fn handle_activations_by_wallet(
-    params: HashMap<String, String>,
+    mut params: HashMap<String, String>,
+    wallet_hdr: Option<String>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     println!("[ACTIVATIONS] 🔍 Querying activations by wallet");
-    
+
+    // Privacy: wallet may arrive via header (out of the URL); query stays as fallback.
+    if let Some(w) = wallet_hdr.filter(|s| !s.is_empty()) { params.insert("wallet_address".to_string(), w); }
+
     // Extract parameters from query string
     let wallet_address = match params.get("wallet_address") {
         Some(addr) if !addr.is_empty() => addr.clone(),
@@ -12112,9 +12152,12 @@ async fn handle_generate_activation_code(
 // ═══════════════════════════════════════════════════════════════
 
 async fn handle_verify_activation_onchain(
-    params: HashMap<String, String>,
+    mut params: HashMap<String, String>,
+    wallet_hdr: Option<String>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // Privacy: wallet may arrive via header (out of the URL); query stays as fallback.
+    if let Some(w) = wallet_hdr.filter(|s| !s.is_empty()) { params.insert("wallet_address".to_string(), w); }
     let wallet_address = match params.get("wallet_address") {
         Some(addr) if !addr.is_empty() => addr.clone(),
         _ => {

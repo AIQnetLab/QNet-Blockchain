@@ -1,10 +1,11 @@
 /**
  * dilithium_jni.c
- * JNI bridge between Java/Kotlin DilithiumModule and the pqclean Dilithium3
- * C reference implementation.  This is the EXACT same code used by the QNet
- * server's pqcrypto-dilithium 0.5 crate — byte-perfect compatibility.
+ * JNI bridge between Java/Kotlin DilithiumModule and the PQClean ML-DSA-65
+ * (FIPS-204 final) C reference implementation.  This is the EXACT same code
+ * the node uses via the pqcrypto-mldsa crate — byte-perfect keygen/sign/verify,
+ * so app and node derive the SAME eon wallet address from the same seed.
  *
- * Signature size: 3309 bytes (FIPS 204 / pqclean dilithium3)
+ * Signature size: 3309 bytes (ML-DSA-65)
  * Public key size: 1952 bytes
  * Secret key size: 4032 bytes
  */
@@ -13,8 +14,8 @@
 #include <stdlib.h>
 #include <android/log.h>
 
-#include "dilithium3/api.h"
-#include "dilithium3/sign.h"
+#include "mldsa65/api.h"
+#include "mldsa65/sign.h"
 #include "common/fips202.h"
 #include "randombytes_custom.h"
 
@@ -54,9 +55,9 @@ Java_com_qnetmobile_DilithiumModule_nativeGenerateKeypair(
     derive_seed_from_string(seed, seed_len, seed32);
     dilithium_set_keygen_seed(seed32);
 
-    uint8_t pk[PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES];
-    uint8_t sk[PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES];
-    int ret = PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_keypair(pk, sk);
+    uint8_t pk[PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES];
+    uint8_t sk[PQCLEAN_MLDSA65_CLEAN_CRYPTO_SECRETKEYBYTES];
+    int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk, sk);
 
     dilithium_clear_keygen_seed();
     (*env)->ReleaseStringUTFChars(env, seed_str, seed);
@@ -87,29 +88,29 @@ Java_com_qnetmobile_DilithiumModule_nativeSign(
     jsize sk_len  = (*env)->GetArrayLength(env, sk_arr);
     jsize msg_len = (*env)->GetArrayLength(env, msg_arr);
 
-    if (sk_len != PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES) {
+    if (sk_len != PQCLEAN_MLDSA65_CLEAN_CRYPTO_SECRETKEYBYTES) {
         LOGE("nativeSign: bad sk_len=%d (expected %d)", sk_len,
-             PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES);
+             PQCLEAN_MLDSA65_CLEAN_CRYPTO_SECRETKEYBYTES);
         return NULL;
     }
 
-    uint8_t sk[PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES];
+    uint8_t sk[PQCLEAN_MLDSA65_CLEAN_CRYPTO_SECRETKEYBYTES];
     uint8_t *msg = (uint8_t*)malloc((size_t)msg_len);
     if (!msg) return NULL;
 
     (*env)->GetByteArrayRegion(env, sk_arr,  0, sk_len,  (jbyte*)sk);
     (*env)->GetByteArrayRegion(env, msg_arr, 0, msg_len, (jbyte*)msg);
 
-    uint8_t sig[PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_BYTES];
+    uint8_t sig[PQCLEAN_MLDSA65_CLEAN_CRYPTO_BYTES];
     size_t  siglen = 0;
-    int ret = PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_signature(
+    int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(
                   sig, &siglen, msg, (size_t)msg_len, sk);
 
     /* Zero secret key immediately after use — prevent key material in stack residue */
     memset(sk, 0, sizeof(sk));
     free(msg);
 
-    if (ret != 0 || siglen != PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_BYTES) {
+    if (ret != 0 || siglen != PQCLEAN_MLDSA65_CLEAN_CRYPTO_BYTES) {
         LOGE("nativeSign failed: ret=%d siglen=%zu", ret, siglen);
         return NULL;
     }
@@ -131,7 +132,7 @@ Java_com_qnetmobile_DilithiumModule_nativeVerify(
     jsize sig_len = (*env)->GetArrayLength(env, sig_arr);
     jsize msg_len = (*env)->GetArrayLength(env, msg_arr);
 
-    uint8_t pk[PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES];
+    uint8_t pk[PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES];
     uint8_t *sig = (uint8_t*)malloc((size_t)sig_len);
     uint8_t *msg = (uint8_t*)malloc((size_t)msg_len);
     if (!sig || !msg) { free(sig); free(msg); return JNI_FALSE; }
@@ -140,7 +141,7 @@ Java_com_qnetmobile_DilithiumModule_nativeVerify(
     (*env)->GetByteArrayRegion(env, sig_arr, 0, sig_len, (jbyte*)sig);
     (*env)->GetByteArrayRegion(env, msg_arr, 0, msg_len, (jbyte*)msg);
 
-    int ret = PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_verify(
+    int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_verify(
                   sig, (size_t)sig_len, msg, (size_t)msg_len, pk);
     free(sig);
     free(msg);
@@ -165,32 +166,32 @@ Java_com_qnetmobile_DilithiumModule_nativeCompatTest(
     derive_seed_from_string(test_seed, strlen(test_seed), seed32);
     dilithium_set_keygen_seed(seed32);
 
-    uint8_t pk[PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES];
-    uint8_t sk[PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_SECRETKEYBYTES];
-    PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_keypair(pk, sk);
+    uint8_t pk[PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES];
+    uint8_t sk[PQCLEAN_MLDSA65_CLEAN_CRYPTO_SECRETKEYBYTES];
+    PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk, sk);
     dilithium_clear_keygen_seed();
 
-    uint8_t sig[PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_BYTES];
+    uint8_t sig[PQCLEAN_MLDSA65_CLEAN_CRYPTO_BYTES];
     size_t  siglen = 0;
-    PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_signature(
+    PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(
         sig, &siglen, (const uint8_t*)test_msg, msg_len, sk);
 
     /* Verify locally */
-    int ok = PQCLEAN_DILITHIUM3_CLEAN_crypto_sign_verify(
+    int ok = PQCLEAN_MLDSA65_CLEAN_crypto_sign_verify(
                  sig, siglen, (const uint8_t*)test_msg, msg_len, pk);
 
     LOGE("=== PQCLEAN COMPAT TEST ===");
     LOGE("PK_LEN=%d SIG_LEN=%zu SELF_VERIFY=%s",
-         PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES, siglen, ok==0?"true":"false");
+         PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES, siglen, ok==0?"true":"false");
 
     /* Chunk PK hex */
-    char *pk_hex = (char*)malloc(PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES * 2 + 1);
-    bytes_to_hex(pk, PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES, pk_hex);
-    for (int i = 0; i * 1000 < (int)(PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES * 2); i++) {
+    char *pk_hex = (char*)malloc(PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES * 2 + 1);
+    bytes_to_hex(pk, PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES, pk_hex);
+    for (int i = 0; i * 1000 < (int)(PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES * 2); i++) {
         int start = i * 1000;
         int end   = start + 1000;
-        if (end > (int)(PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES * 2))
-            end = (int)(PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES * 2);
+        if (end > (int)(PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES * 2))
+            end = (int)(PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES * 2);
         char chunk[1001];
         memcpy(chunk, pk_hex + start, end - start);
         chunk[end - start] = '\0';
@@ -215,7 +216,7 @@ Java_com_qnetmobile_DilithiumModule_nativeCompatTest(
     char *result_buf  = (char*)malloc(result_len);
     snprintf(result_buf, result_len,
              "OK:PK_LEN=%d:SIG_LEN=%zu:SELF=%s",
-             PQCLEAN_DILITHIUM3_CLEAN_CRYPTO_PUBLICKEYBYTES,
+             PQCLEAN_MLDSA65_CLEAN_CRYPTO_PUBLICKEYBYTES,
              siglen, ok==0?"OK":"FAIL");
 
     jstring ret = (*env)->NewStringUTF(env, result_buf);

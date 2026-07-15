@@ -107,14 +107,13 @@ class NodeConfig:
     
     # Genesis validator addresses (free activation)
     # Format: 19 hex + "eon" + 15 hex + 8 hex SHA3-256 checksum = 45 chars
-    # SOURCE OF TRUTH: genesis_constants.rs (Rust)
-    # v4.1: Updated to 45-char format with 8-hex SHA3-256 checksum
+    # SOURCE OF TRUTH: genesis_constants.rs (Rust). Pure-Dilithium: eon = SHA512(WALLET ML-DSA-65 pk).
     genesis_validators = [
-        "f36ff465a0944fd06cdeonfca0ad004ff9db42e16dbab",  # Bootstrap Node 1
-        "0bac6225a082de1f659eond0c96f1706cf19cc7abf70a",  # Bootstrap Node 2
-        "d216bb23fbe7f853636eon3f16b378b919227e009fb4f",  # Bootstrap Node 3
-        "e5bffcbe8d8cc90afa1eond9c4c2a4e75101e25dc1113",  # Bootstrap Node 4
-        "02af45d56bd1f5d9002eon0eb1c522f96a2f42dfb74cb"   # Bootstrap Node 5
+        "4c83bc6f4c20906b81beon31e92ebc6ffccd7b973e10d",  # Bootstrap Node 1
+        "c81f26da185fd05dcaeeona499b3d9e58d7ec75304f1b",  # Bootstrap Node 2
+        "006a5c220ca2fa77021eon2b5c6703999066d5411e2ff",  # Bootstrap Node 3
+        "a60999a5a40637c1dd6eon975ca9618927edd7c19f38e",  # Bootstrap Node 4
+        "9dd783e0c65cf68467ceondfeaed5e1e47f0242f6aed9"   # Bootstrap Node 5
     ]
 
 @dataclass

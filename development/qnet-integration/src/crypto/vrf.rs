@@ -385,23 +385,26 @@ impl WalletIdentity {
     }
 
     /// Derive EON wallet address from mnemonic seed phrase.
-    /// Uses BIP44 m/44'/9999'/0'/0'/0' to match mobile app WalletManager.js exactly.
+    /// eon = SHA512(WALLET ML-DSA-65 pk), byte-identical to mobile generateQNetAddress.
     /// Format: {19hex}eon{15hex}{8hex SHA3-256 checksum} = 45 chars
     pub fn derive_wallet_address(seed: &str) -> String {
-        // Try BIP44 derivation first (matches mobile app)
-        match crate::crypto::solana_derivation::derive_qnet_address_from_mnemonic(seed) {
-            Ok(addr) => addr,
-            Err(_) => {
-                // Fallback: legacy derivation for non-mnemonic seeds (e.g. raw hex strings in tests)
-                let hash = Sha3_256::digest(format!("QNet_Wallet_v1{}", seed).as_bytes());
-                let hex_str = hex::encode(&hash);
-                let p1 = &hex_str[..19];
-                let p2 = &hex_str[19..34];
-                let body = format!("{}eon{}", p1, p2);
-                let ck = hex::encode(&Sha3_256::digest(body.as_bytes())[..4]);
-                format!("{}eon{}{}", p1, p2, ck)
-            }
+        // Pure-Dilithium identity: eon = SHA512(WALLET ML-DSA-65 pk), byte-identical to the
+        // mobile wallet's generateQNetAddress (same SHAKE-seeded keygen, KAT-proven), so the app
+        // and the node compute the SAME reward/identity address — and node_id — for one seed.
+        // This is the WALLET key the user claims rewards with; the node's consensus signing key
+        // (derive_mldsa65_from_mnemonic) is a separate domain and never the on-chain wallet.
+        let (wallet_pk, _sk) = crate::crypto::genesis_key::derive_wallet_mldsa65_from_mnemonic(seed);
+        if let Some(addr) = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(&hex::encode(&wallet_pk)) {
+            return addr;
         }
+        // Defensive fallback (unreachable for a hex pk): legacy deterministic form.
+        let hash = Sha3_256::digest(format!("QNet_Wallet_v1{}", seed).as_bytes());
+        let hex_str = hex::encode(&hash);
+        let p1 = &hex_str[..19];
+        let p2 = &hex_str[19..34];
+        let body = format!("{}eon{}", p1, p2);
+        let ck = hex::encode(&Sha3_256::digest(body.as_bytes())[..4]);
+        format!("{}eon{}{}", p1, p2, ck)
     }
 
     /// Sign data with Dilithium3 (detached)
@@ -534,6 +537,19 @@ mod tests {
         assert_eq!(a.len(), 45);
         assert!(a.contains("eon"));
     }
+
+    /// Node's wallet address == SHA512(WALLET ML-DSA-65 pk), i.e. byte-identical to the mobile
+    /// wallet's generateQNetAddress — one seed → one on-chain identity for app and node.
+    #[test]
+    fn test_wallet_address_is_dilithium_pk_eon() {
+        let m = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let (pk, _sk) = crate::crypto::genesis_key::derive_wallet_mldsa65_from_mnemonic(m);
+        let expected = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(&hex::encode(&pk)).unwrap();
+        assert_eq!(WalletIdentity::derive_wallet_address(m), expected,
+            "wallet address must be the eon of the WALLET Dilithium pk (app-identical)");
+    }
+
+
 
     #[test]
     fn test_vrf_serialization() {

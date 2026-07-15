@@ -31,7 +31,9 @@ void dilithium_clear_keygen_seed(void) {
 int PQCLEAN_randombytes(uint8_t *output, size_t n) {
     if (g_has_seed && n == 32) {
         memcpy(output, g_seed, 32);
-        g_has_seed = 0;   /* consume once — only keygen calls this with n=32 */
+        g_has_seed = 0;   /* one-shot: armed only right before keygen (set_keygen_seed);
+                             signing's rnd (also n=32) runs after this clears, so it
+                             always draws fresh randomness, never the keygen seed. */
         return 0;
     }
     /* SecRandomCopyBytes: Apple-approved CSPRNG, backed by /dev/random on iOS */
