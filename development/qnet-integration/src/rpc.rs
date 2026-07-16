@@ -5035,8 +5035,23 @@ async fn handle_transaction_submit(
     )
     .with_quantum_signature(Some(dil_sig), Some(dil_pk));
 
-    // Verify the ML-DSA-65 signature exactly as the ingest/gossip path will.
-    if !crate::node::BlockchainNode::verify_user_tx_dilithium(&tx) {
+    // Verify the ML-DSA-65 signature exactly as the ingest/gossip path will, but OFF the RPC runtime
+    // workers via the blocking pool AND admission-bounded (D1): a value-TX flood on the HTTP API — even
+    // localhost/netns, which the per-IP limiter exempts — must not spawn unbounded CPU-bound verifies
+    // that saturate every core and starve consensus. Fail-closed at capacity; fail-closed on join error.
+    let _verify_permit = match crate::node::VALUE_TX_VERIFY_SEM.try_acquire() {
+        Ok(p) => p,
+        Err(_) => return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Server busy: too many concurrent signature verifications",
+            "details": "verify capacity reached; retry shortly"
+        }))),
+    };
+    let tx_for_verify = tx.clone();
+    let verify_ok = tokio::task::spawn_blocking(move || {
+        crate::node::BlockchainNode::verify_user_tx_dilithium(&tx_for_verify)
+    }).await.unwrap_or(false);
+    if !verify_ok {
         println!("[WARN][TX] dilithium_verify_failed from={}", &tx_request.from[..16.min(tx_request.from.len())]);
         return Ok(warp::reply::json(&json!({
             "success": false,

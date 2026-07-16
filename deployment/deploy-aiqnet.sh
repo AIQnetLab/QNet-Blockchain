@@ -115,7 +115,10 @@ module.exports = {
     env: {
       NODE_ENV: 'production',
       PORT: 3000,
-      NEXT_TELEMETRY_DISABLED: 1
+      NEXT_TELEMETRY_DISABLED: 1,
+      // Behind nginx (sets X-Forwarded-For) — lets the per-IP faucet/API rate limiter derive
+      // the real client IP; without it the limiter fails closed with 503 'Service misconfigured'.
+      RATE_LIMIT_TRUSTED_PROXY: '1'
     }
   }]
 }

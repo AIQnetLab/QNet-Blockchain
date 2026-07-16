@@ -1815,7 +1815,22 @@ impl BlockPipeline {
                             let finalized_h = crate::node::LAST_FINALIZED_HEIGHT
                                 .load(std::sync::atomic::Ordering::SeqCst);
                             let disputed_h = mb.height;
-                            if finalized_h > 0 && finalized_h < disputed_h {
+                            // Fork-choice at the DISPUTED height (finality-subordinate, deterministic):
+                            // prefer the strictly higher certified failover round (a round needs a 2f+1
+                            // TimeoutCertificate — unforgeable, identical on every honest node); on EQUAL
+                            // round, the lexicographically-lower block hash. The hash tie-break converges
+                            // same-round self-forks (a restarted producer re-emitting a different block at the
+                            // same height) that a round-only gate leaves split, while a strict single winner
+                            // avoids the mutual disputed_h-2 rollback oscillation.
+                            let (local_round, local_hash) = storage
+                                .load_microblock_auto_format(disputed_h)
+                                .ok().flatten()
+                                .map(|b| (b.timeout_round, b.hash()))
+                                .unwrap_or((0u64, [0u8; 32]));
+                            let incoming_hash = decoded.microblock.hash();
+                            let incoming_outranks = mb.timeout_round > local_round
+                                || (mb.timeout_round == local_round && incoming_hash < local_hash);
+                            if incoming_outranks && finalized_h > 0 && finalized_h < disputed_h {
                                 let now_secs = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_secs())
@@ -2654,6 +2669,12 @@ impl BlockPipeline {
                     if waited_ms > 0 && waited_ms % 5_000 == 0 && is_warn() {
                         println!("[WARN][PIPELINE] apply_seal_backpressure h={} seal_base={} cap={}",
                                  height, seal_base, SEAL_LAG_CAP);
+                    }
+                    // D3: actively drive the seal frontier while parked — the probe fires the
+                    // (self-throttled) mb-sync backfill, so a locally-unsealable window is pulled from
+                    // peers instead of waiting on a frontier nothing advances. Bounded scan, ≤1 call/2s.
+                    if waited_ms % 2_000 == 0 {
+                        let _ = crate::node::qc_verified_frontier_height();
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     waited_ms += 250;

@@ -1593,6 +1593,35 @@ pub fn last_remote_producer_heartbeat_height(producer_id: &str) -> Option<u64> {
     REMOTE_PRODUCER_HEARTBEAT_HEIGHT.get(producer_id).map(|v| *v.value())
 }
 
+/// Regression guard: producer-silence age is measured against the OBSERVED (local-receive) map only,
+/// never the producer-STAMPED map — so a far-future stamp cannot suppress fail-over (anti-gaming),
+/// and a fresh receive stays under the silent threshold.
+#[cfg(test)]
+mod tests_heartbeat_silence {
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    #[test]
+    fn observed_fresh_age_under_threshold() {
+        let p = "hb_guard_fresh";
+        super::REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.insert(p.to_string(), now_ms());
+        let age = super::last_remote_producer_heartbeat_age_ms(p).expect("observed present");
+        assert!(age <= 3000, "fresh observed heartbeat age {}ms must be <= 3000ms silent threshold", age);
+    }
+
+    #[test]
+    fn future_stamp_does_not_reduce_observed_age() {
+        let p = "hb_guard_stamp";
+        // Stale OBSERVED receive (10s ago) → silent by the observed clock.
+        super::REMOTE_PRODUCER_HEARTBEAT_OBSERVED_MS.insert(p.to_string(), now_ms().saturating_sub(10_000));
+        // Byzantine producer stamps a far-future ts — must NOT reduce the observed-based age.
+        super::REMOTE_PRODUCER_HEARTBEAT_MS.insert(p.to_string(), now_ms() + 1_000_000);
+        let age = super::last_remote_producer_heartbeat_age_ms(p).expect("observed present");
+        assert!(age >= 9_000, "future stamp must not shrink observed age (got {}ms)", age);
+    }
+}
+
 // v25: validator liveness — miss tracking + reputation penalty (H9+H16).
 // A permanently-offline validator left in rotation hurts liveness
 // (>=STALL_GRACE_SECS + a timeout-vote round per elected-offline slot) and

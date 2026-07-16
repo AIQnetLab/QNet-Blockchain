@@ -928,6 +928,26 @@ pub(crate) const MAX_UNSEALED_WINDOWS: u64 = 2;
 /// cannot mint unbounded distinct (window, round) vote keys.
 pub const MAX_FAILOVER_ROUND: u64 = 50;
 
+/// Bounds concurrent value-TX ML-DSA-65 verifies across ALL ingress paths (RPC submit + gossip
+/// admission). A flood — even localhost/netns, which the per-IP limiter exempts — then cannot spawn
+/// unbounded CPU-bound verifies that saturate every core and starve the consensus runtime. Fail-
+/// closed: no permit → reject (client resubmits), never an unbounded queue. Sized for many cores.
+pub(crate) static VALUE_TX_VERIFY_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+
+/// Production ceiling as a PURE function of committed-state scalars (identical on every honest node):
+/// pause when the tip outruns finality (>last_finalized + 3*CHECKPOINT_INTERVAL) or the sealed
+/// frontier (>seal_base + MAX_UNSEALED_WINDOWS*MACROBLOCK_INTERVAL). Returns the `awaiting=` reason —
+/// seal takes precedence in the label (matches the log) — or None when production may proceed. A
+/// young chain (last_finalized==0 / seal_base==0) is exempt. Output is a local pacing decision, never
+/// hashed into consensus. Extracted so the boundary invariant is pinned by a regression test.
+pub(crate) fn production_throttle_reason(next_block_height: u64, last_finalized: u64, seal_base: u64) -> Option<&'static str> {
+    const MAX_UNFINALIZED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+    const MAX_UNSEALED_BLOCKS: u64 = MAX_UNSEALED_WINDOWS * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+    let fin_over = last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS;
+    let seal_over = seal_base > 0 && next_block_height > seal_base + MAX_UNSEALED_BLOCKS;
+    if seal_over { Some("macroblock_seal") } else if fin_over { Some("bft_finality") } else { None }
+}
+
 // failover_slot_height REMOVED: the failover vote key derives from the voter's OWN verified tip
 // (window = (tip+1)/90) + f+1 committee-signed amplification — never from a peer-height frontier.
 
@@ -4490,6 +4510,23 @@ impl BlockchainNode {
                 println!("[INFO][SNAP] v14.2 L2_CARRYOVER added={} excluded_dead={} live_committers={} mb_range={}-{} total={}",
                          carryover_count, carryover_excluded_dead, live_committers.len(),
                          carryover_start, macroblock_index.saturating_sub(1), eligible.len());
+            }
+        }
+
+        // Genesis floor: the 5 canonical genesis producers stay permanently eligible, so a fork or
+        // quiet epoch that collapses the committed roster to one committer cannot degenerate the
+        // leader candidate set to len==1 (the mb-boundary production pin). Additive + deterministic.
+        {
+            const GENESIS_FLOOR_REP_BP: u32 = 10000; // 100.00% centipercent, ≥ MIN_REPUTATION_BP
+            for i in 1..=5u32 {
+                let gid = format!("genesis_node_{:03}", i);
+                // Never resurrect a slashed genesis: a verified on-chain equivocation ban zeroes its
+                // reputation (compute_cumulative_ban_set) and the pipeline drops it — the floor must honour
+                // that, else a proven-Byzantine genesis would re-enter at max rep, bypassing slashing.
+                if reputation_map.get(&gid).map_or(false, |r| *r == 0.0) { continue; }
+                if eligible_ids.insert(gid.clone()) {
+                    eligible.push(qnet_state::EligibleProducer { node_id: gid, reputation: GENESIS_FLOOR_REP_BP });
+                }
             }
         }
 
@@ -14997,20 +15034,15 @@ impl BlockchainNode {
                 // pauses at the same height. Placed after election so a throttled elected
                 // leader can yield instead of going silent.
                 {
-                    const MAX_UNFINALIZED_BLOCKS: u64 = 3 * qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
-                    const MAX_UNSEALED_BLOCKS: u64 = MAX_UNSEALED_WINDOWS * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
                     let last_finalized = LAST_FINALIZED_CONSENSUS_ROUND.load(Ordering::SeqCst);
                     let seal_base = try_get_storage()
                         .map(|s| s.last_sealed_mb_index().saturating_mul(90))
                         .unwrap_or(0)
                         .max(qc_verified_frontier_cached());
-                    let fin_over = last_finalized > 0 && next_block_height > last_finalized + MAX_UNFINALIZED_BLOCKS;
-                    let seal_over = seal_base > 0 && next_block_height > seal_base + MAX_UNSEALED_BLOCKS;
-                    if fin_over || seal_over {
+                    if let Some(reason) = production_throttle_reason(next_block_height, last_finalized, seal_base) {
                         if is_warn() {
                             println!("[WARN][PROD] production_throttle height={} finalized={} sealed={} awaiting={}",
-                                     next_block_height, last_finalized, seal_base,
-                                     if seal_over { "macroblock_seal" } else { "bft_finality" });
+                                     next_block_height, last_finalized, seal_base, reason);
                         }
                         // Slot yield: elected but unable to produce → broadcast the canonical
                         // rotation vote (same signed TimeoutVote path; TC still needs n−f, only
@@ -15044,8 +15076,7 @@ impl BlockchainNode {
                                     LAST_TIMEOUT_EMIT_PER_MB.insert(mb_idx, now_u64);
                                     if is_info() {
                                         println!("[INFO][PROD] slot_yield h={} mb={} reason={}",
-                                                 next_block_height, mb_idx,
-                                                 if seal_over { "macroblock_seal" } else { "bft_finality" });
+                                                 next_block_height, mb_idx, reason);
                                     }
                                 }
                             }
@@ -23010,7 +23041,15 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             qnet_state::TransactionType::ContractDeploy |
             qnet_state::TransactionType::ContractCall |
             qnet_state::TransactionType::Swap { .. }) {
-            return Ok(Self::verify_user_tx_dilithium(tx));
+            // CPU-bound ML-DSA-65 open() off the consensus runtime AND admission-bounded: a value-TX
+            // flood must neither occupy the workers polling the producer/heartbeat task nor spawn
+            // unbounded blocking verifies (D1). Fail-closed when at capacity — the client resubmits.
+            let _permit = VALUE_TX_VERIFY_SEM.try_acquire()
+                .map_err(|_| QNetError::ValidationError("verify_overloaded".to_string()))?;
+            let tx_owned = tx.clone();
+            return tokio::task::spawn_blocking(move || Self::verify_user_tx_dilithium(&tx_owned))
+                .await
+                .map_err(|e| QNetError::ValidationError(format!("verify_join_error: {}", e)));
         }
 
         // PURE DILITHIUM: NodeRegistration (client-signed) + NodeReactivation verify by a DIRECT
@@ -28802,5 +28841,59 @@ mod tests_v23_rotation_round {
         // baseline=5, saturating_sub yields 0.
         crate::unified_p2p::record_finalized_round(mb_idx, 5);
         assert_eq!(crate::unified_p2p::get_certified_rotation_round(mb_idx), 0);
+    }
+
+    /// Leader rotation `(round0_idx + timeout_round) % N` is a PERMUTATION of 0..N for every base
+    /// index — so as the 2f+1-certified timeout_round increments, every candidate is visited and an
+    /// honest producer is reached within f+1 rounds (the Tendermint bound; no reputation). Guards
+    /// the round-robin coverage the liveness argument relies on.
+    #[test]
+    fn rotation_visits_every_candidate() {
+        for n in 2usize..=12 {
+            for r0 in 0..n {
+                let seen: std::collections::BTreeSet<usize> = (0..n).map(|t| (r0 + t) % n).collect();
+                assert_eq!(seen, (0..n).collect::<std::collections::BTreeSet<usize>>(),
+                           "rotation must be a permutation of 0..{} (r0={})", n, r0);
+            }
+        }
+    }
+}
+
+/// Regression guard for the production ceiling boundary (production_throttle_reason): a pure
+/// committed-state function; seal precedence in the label; young chain (0 base) exempt.
+#[cfg(test)]
+mod tests_production_throttle {
+    use super::production_throttle_reason;
+
+    #[test]
+    fn finality_open_through_plus90_closed_at_plus91() {
+        let f: u64 = 33390; // checkpoint boundary; seal_base 0 keeps the seal branch inert
+        for next in (f + 1)..=(f + 90) {
+            assert_eq!(production_throttle_reason(next, f, 0), None, "must be OPEN at h={}", next);
+        }
+        assert_eq!(production_throttle_reason(f + 91, f, 0), Some("bft_finality"), "must CLOSE at +91");
+    }
+
+    #[test]
+    fn advancing_finality_reopens() {
+        let f: u64 = 33390;
+        assert_eq!(production_throttle_reason(f + 91, f, 0), Some("bft_finality"));
+        assert_eq!(production_throttle_reason(f + 91, f + 30, 0), None, "advancing finality re-opens");
+        assert_eq!(production_throttle_reason(f + 120, f + 30, 0), None);
+        assert_eq!(production_throttle_reason(f + 121, f + 30, 0), Some("bft_finality"));
+    }
+
+    #[test]
+    fn seal_branch_and_precedence() {
+        let s: u64 = 33480;
+        assert_eq!(production_throttle_reason(s + 180, 0, s), None, "seal OPEN through +180");
+        assert_eq!(production_throttle_reason(s + 181, 0, s), Some("macroblock_seal"), "seal CLOSE at +181");
+        // Both over → seal label wins (matches the awaiting= field / original `if seal_over`).
+        assert_eq!(production_throttle_reason(s + 181, 1, s), Some("macroblock_seal"));
+    }
+
+    #[test]
+    fn zero_bases_never_throttle() {
+        assert_eq!(production_throttle_reason(1_000_000, 0, 0), None);
     }
 }

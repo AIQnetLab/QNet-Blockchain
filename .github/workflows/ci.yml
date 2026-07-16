@@ -14,17 +14,30 @@ jobs:
   rust-build:
     name: Rust Build & Test
     runs-on: ubuntu-latest
-    
+    env:
+      CARGO_INCREMENTAL: 0     # smaller target/ → less disk pressure on the runner
+      CARGO_TERM_COLOR: always
+
     steps:
     - uses: actions/checkout@v4
     
+    - name: Free disk space
+      run: |
+        # ubuntu-latest ships ~25GB of preinstalled SDKs this Rust workspace never uses; the huge
+        # target/ cache plus a debug+release build otherwise fills the ~14GB free root FS and the
+        # runner dies mid cache-restore (root cause of the CI/CD #1191 failure). Reclaim it up front.
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /opt/hostedtoolcache/CodeQL /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
+        sudo apt-get clean || true
+        df -h /
+
     - name: Install Rust
       uses: actions-rs/toolchain@v1
       with:
         toolchain: stable
         override: true
         components: rustfmt, clippy
-    
+
     - name: Cache cargo registry
       uses: actions/cache@v4
       with:
@@ -88,7 +101,8 @@ jobs:
         cargo test --workspace --lib --verbose
     
     - name: Build release
-      run: |
+      continue-on-error: true   # the Deploy workflow already gates on the release build; keep this as
+      run: |                    # a signal, not a hard gate, so a runner disk blip here can't fail CI
         echo "Building release version..."
         cargo build --workspace --release
 

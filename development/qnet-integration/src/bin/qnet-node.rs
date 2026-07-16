@@ -3729,9 +3729,13 @@ async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: f
 async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_hash: &str, required_amount: u64) -> Result<bool, String> {
     println!("📡 PRODUCTION: Verifying 1DEV burn on Solana for node activation...");
     
-    // PRODUCTION: Use network-aware RPC configuration
+    // PRODUCTION: Use network-aware RPC configuration.
+    // Honor an operator-supplied SOLANA_RPC_URL (mirrors the other Solana call sites): the default
+    // public devnet RPC has a tiny history-retention window and returns null for real-but-older burns
+    // (archival RPCs still serve them), which blocks re-onboarding a node whose burn is not recent.
     let network_config = qnet_integration::network_config::get_network_config();
-    let solana_rpc = &network_config.solana.rpc_url;
+    let solana_rpc_override = std::env::var("SOLANA_RPC_URL").ok();
+    let solana_rpc: &str = solana_rpc_override.as_deref().unwrap_or(&network_config.solana.rpc_url);
     let onedev_mint = &network_config.solana.onedev_mint;
     let burn_address = &network_config.solana.burn_address;
     
