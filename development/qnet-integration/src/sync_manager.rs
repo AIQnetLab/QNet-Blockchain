@@ -66,6 +66,24 @@ fn take_sync_nudge() -> bool {
     SYNC_EVENT_NUDGE.swap(false, Ordering::Relaxed)
 }
 
+/// RAII marker for the bulk catch-up window: storage disables the WAL while set (~10× apply throughput,
+/// the difference between a far-behind node converging and falling further behind). Cleared on EVERY
+/// execute_sync exit path so a produced block never applies WAL-off. Production is gated off during
+/// catch-up (coordinator Syncing), so only sync-applied blocks are affected; the crash-window is bounded
+/// by storage's periodic flush and by sync being idempotent on restart.
+struct FastApplyGuard;
+impl FastApplyGuard {
+    fn new() -> Self {
+        crate::node::FAST_SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
+        FastApplyGuard
+    }
+}
+impl Drop for FastApplyGuard {
+    fn drop(&mut self) {
+        crate::node::FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
+
 // ============================================================================
 // SYNC CONFIG
 // ============================================================================
@@ -299,11 +317,16 @@ impl SyncManager {
         let local_h = self.coordinator.chain_height();
         let best = self.p2p.get_best_peer_height();
 
-        // best is floored by the authenticated signed-head tip (get_best_peer_height). Once any signed
-        // head exists, trust it directly — it is unforgeable (Dilithium) and the QC frontier floors the
-        // bulk target, so no genesis HTTP fan-in is needed. The probe below is the cold-start fallback
-        // only, before the first head arrives (SIGNED_HEAD_MAX == 0).
-        if best > 0 && crate::unified_p2p::SIGNED_HEAD_MAX.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        // Trust the authenticated best-peer head directly whenever a signed head exists OR best is not
+        // suspiciously far ahead (≤ local+100). best is clamp_overclaim-bounded (committee/genesis median)
+        // and the bulk target is QC-floored, so a within-band hint can at worst chase a phantom tail that
+        // STALL_ABORTs (bounded) — it can never inject state. This keeps EVERY node that has any peer off
+        // the 5-genesis HTTP fan-out (a fresh cold-joiner into a running network gets peer heights at once),
+        // so a mass simultaneous cold start cannot herd onto the 5 seed IPs. The genesis cross-check below
+        // is reserved for the deep-jump suspicious branch (>100-ahead, no signed head) and true zero-peer
+        // bootstrap, where validating a large unattested jump against the genesis median is warranted.
+        let signed_head = crate::unified_p2p::SIGNED_HEAD_MAX.load(std::sync::atomic::Ordering::Relaxed) > 0;
+        if best > 0 && (signed_head || best <= local_h.saturating_add(100)) {
             return best;
         }
 
@@ -373,19 +396,105 @@ impl SyncManager {
         let frontier = crate::node::qc_verified_frontier_cached();
         let local_h = snap.chain_height;
 
-        // Behind ⟺ the network tip (network_h = QC-frontier-floored, bootstrap-validated) leads the
-        // applied tip beyond the jitter band. Keys on the NETWORK height, not the node's own frontier:
-        // a follower whose own frontier stalled would otherwise never see it fell behind (self-
-        // reference) and silently diverge while believing it is synced. network_h already carries the
-        // QC floor ⇒ never targets below finality; auto_sync_gap absorbs normal gossip lead.
-        let behind = network_h > local_h.saturating_add(self.config.auto_sync_gap);
+        // Three independent deficit dimensions, ONE mechanism (execute_sync) — never parallel drivers.
+        // Keys on the NETWORK height, not the node's own frontier: a follower whose own frontier stalled
+        // would otherwise never see it fell behind (self-reference) and silently diverge. network_h
+        // already carries the QC floor ⇒ never targets below finality.
+        //   bulk  — network tip leads the applied tip beyond the gossip jitter band (auto_sync_gap).
+        //   stall — applied tip frozen past APPLY_STALL_T while a higher head exists: a small-gap wedge
+        //           (a missing microblock behind a contiguity hole) the gap band alone would mask until
+        //           the gap grew large.
+        //   mb    — the network sealed a macroblock object past our contiguous seal frontier. A follower
+        //           at microblock-tip can still miss the checkpoint object that feeds SYNC-ADOPT →
+        //           QC_VERIFIED_FRONTIER, freezing finality with bulk+stall both false. execute_sync's
+        //           macroblock pass (before its microblock early-return) repairs it.
+        let bulk_behind = network_h > local_h.saturating_add(self.config.auto_sync_gap);
 
-        if behind {
+        const APPLY_STALL_T: Duration = Duration::from_secs(12);
+        static APPLY_STALL: std::sync::Mutex<Option<(u64, Instant)>> = std::sync::Mutex::new(None);
+        let stall_behind = {
+            let mut g = APPLY_STALL.lock().unwrap_or_else(|p| p.into_inner());
+            match *g {
+                Some((tip, since)) if tip == local_h =>
+                    network_h > local_h && since.elapsed() > APPLY_STALL_T,
+                _ => { *g = Some((local_h, Instant::now())); false }
+            }
+        };
+
+        let mbi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let sealed = self.storage.last_sealed_mb_index();
+        // Network genuinely ahead on macroblock objects (a behind/cold node whose peers report a higher
+        // tip) — MAX_UNSEALED_WINDOWS absorbs the healthy tail; fires immediately (no time wait).
+        let mb_behind = network_h / mbi > sealed.saturating_add(crate::node::MAX_UNSEALED_WINDOWS);
+
+        // Seal-frozen: the GAP tests above CANNOT catch a QUORUM-WIDE missing macroblock object. When the
+        // whole quorum is missing object K (sealed=K-1), the bft_finality throttle pins every node's tip at
+        // last_finalized+90 = (sealed+1)*90, so no peer reports a higher tip and bulk/stall/mb are all false.
+        // Detect it by TIME: a COMPLETE window sits above the seal frontier (tip >= (sealed+1)*90) yet the
+        // object has not sealed for SEAL_STALL_T — a checkpoint that should form in seconds is missing/unformed.
+        // Threshold is +1 window (NOT +MAX_UNSEALED_WINDOWS): the finality throttle binds one window BELOW the
+        // seal ceiling, so +2 would never see the pin. Timer keyed on at_ceiling-dwell (reset when the window
+        // is not complete or the frontier advances) so a healthy end-of-cycle boundary never false-fires.
+        // sealed>0 mirrors the throttle's seal_base==0 exemption (a slow FIRST checkpoint is not a wedge).
+        const SEAL_STALL_T: Duration = Duration::from_secs(30);
+        static SEAL_STALL: std::sync::Mutex<Option<(u64, Instant)>> = std::sync::Mutex::new(None);
+        let at_ceiling = sealed > 0 && local_h >= sealed.saturating_add(1).saturating_mul(mbi);
+        let seal_frozen = {
+            let mut g = SEAL_STALL.lock().unwrap_or_else(|p| p.into_inner());
+            if at_ceiling {
+                match *g {
+                    Some((s, since)) if s == sealed => since.elapsed() > SEAL_STALL_T,
+                    _ => { *g = Some((sealed, Instant::now())); false }
+                }
+            } else {
+                *g = None;
+                false
+            }
+        };
+
+        if bulk_behind || stall_behind || mb_behind || seal_frozen {
             if is_info() {
-                println!("[INFO][SYNC] desync_detected local={} frontier={} target={} gap={}",
-                         local_h, frontier, network_h, network_h.saturating_sub(local_h));
+                println!("[INFO][SYNC] desync_detected local={} frontier={} target={} gap={} bulk={} stall={} mb={} seal_frozen={}",
+                         local_h, frontier, network_h, network_h.saturating_sub(local_h),
+                         bulk_behind, stall_behind, mb_behind, seal_frozen);
             }
             self.execute_sync(network_h).await;
+        }
+    }
+
+    /// Fetch sealed macroblock OBJECTS the network finalized past our contiguous seal frontier — the
+    /// checkpoint (with its 2f+1 QC) SYNC-ADOPT consumes to advance QC_VERIFIED_FRONTIER. Distinct from
+    /// the microblock catch-up: a follower can hold every microblock yet miss the object, freezing
+    /// finality. network_mb derives from the SAME unified target (QC floor + signed-head ceiling), so no
+    /// second oracle; check_desync (its mb/seal-frozen dimensions) decides WHEN this runs. Bounded per call — the only
+    /// non-snapshot residual is <= SNAPSHOT_SYNC_SWITCH_GAP microblocks (~17 macroblocks); larger deficits
+    /// are bulk-restored by the snapshot fast-path. sync_macroblocks_repair funnels through drive_macroblock_sync's
+    /// single in-flight set, so this shares the one macroblock transport (no parallel fetcher).
+    async fn sync_macroblock_deficit(&self, target: u64) {
+        let mbi = qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL;
+        let network_mb = target / mbi;
+        const MAX_MB_ROUNDS: u32 = 6;
+        for _ in 0..MAX_MB_ROUNDS {
+            let sealed = self.storage.last_sealed_mb_index();
+            // Fetch ANY macroblock object below the network tip we're missing — NOT gated by the
+            // unsealed-tail margin. The seal-frozen wedge is a missing object exactly ONE window above
+            // the frontier (sealed+1); a margin here would skip it. Only runs when check_desync already
+            // decided we're behind, so this never fires on a healthy tail; and if the top window isn't
+            // sealed network-wide yet, sync_macroblocks returns Err and the loop breaks (no spin).
+            if network_mb <= sealed {
+                return;
+            }
+            if is_info() {
+                println!("[INFO][SYNC] mb_deficit sealed={} network_mb={} fetch_from={}",
+                         sealed, network_mb, sealed + 1);
+            }
+            // REPAIR path (un-clamped), NOT the forward sync_macroblocks: the seal-frozen hole is at
+            // sealed+1, which after a snapshot sits AT/BELOW the applied-microblock frontier (the tail
+            // parks 2 windows past the sealed anchor). The forward coordinator would clamp lo to
+            // applied_mb+1 and silently skip the hole → frontier frozen → cold-join never onboards.
+            if self.p2p.sync_macroblocks_repair(sealed + 1, network_mb).await.is_err() {
+                return;
+            }
         }
     }
 
@@ -436,6 +545,11 @@ impl SyncManager {
             if frontier == 0 { target } else { std::cmp::max(frontier, target) }
         };
 
+        // Macroblock-object deficit repair — MUST run before the microblock early-return below. An
+        // MB-only deficit (microblocks at tip, local_h>=target) otherwise returns here without repairing
+        // the seal frontier that feeds SYNC-ADOPT, re-opening the finality gap while blocks look current.
+        self.sync_macroblock_deficit(target).await;
+
         if local_h >= target {
             if is_debug() {
                 println!("[DBG][SYNC] already_at_target local={} target={}", local_h, target);
@@ -454,6 +568,8 @@ impl SyncManager {
         }
 
         self.active.store(true, Ordering::SeqCst);
+        // WAL-off for the whole catch-up (snapshot restore + pipelined apply); cleared on every exit.
+        let _fast_apply = FastApplyGuard::new();
         self.target_height_atomic.store(target, Ordering::Relaxed);
         self.progress_height.store(local_h, Ordering::Relaxed);
 
@@ -533,6 +649,12 @@ impl SyncManager {
                 }
             }
         }
+
+        // Post-snapshot: the restore jumped local_h to the anchor, but the residual macroblock objects
+        // above it (anchor+1 .. tip) are NOT in the snapshot. Fetch them now so the seal frontier lifts
+        // immediately and the parked tail microblocks below unblock — without waiting out a 120s STALL for
+        // the desync tick to re-enter. Idempotent + bounded (repair path, skip-present).
+        self.sync_macroblock_deficit(target).await;
 
         // Cold-join committee dialing: pull the residual tail from the round committee, not just the 5
         // genesis. Idempotent + no-op until the N-2 macroblock for the target is present (genesis era /
@@ -644,13 +766,14 @@ impl SyncManager {
                 frontier_misses = 0; // progress ⇒ peer set is fine; re-dial committee only on genuine stall
             } else if last_progress_at.elapsed() > STALL_ABORT {
                 if is_warn() {
-                    println!("[WARN][SYNC] stall h={} target={} stuck_for={}s — frontier-repair continues",
+                    println!("[WARN][SYNC] stall h={} target={} stuck_for={}s — break to re-detect",
                              apply_tip, target, last_progress_at.elapsed().as_secs());
                 }
-                // Do NOT abort: this loop is the single non-terminating owner of gap progress. A break
-                // here (with the legacy driver still gated on Syncing) would leave NO driver. Reset the
-                // window so the warn re-arms; the frontier pass below keeps re-driving F+1.
-                last_progress_at = Instant::now();
+                // Break (not reset): SyncManager is the SOLE driver post-consolidation, so returning
+                // clears `active` (below) and the desync tick re-enters with a freshly detected target
+                // and a re-armed snapshot fast-path (G4) — the right recovery when 120s of no progress
+                // means the target or peer set is stale, versus retrying the same stuck target in place.
+                break;
             }
 
             // ─────────────────────────────────────────────────────────────────

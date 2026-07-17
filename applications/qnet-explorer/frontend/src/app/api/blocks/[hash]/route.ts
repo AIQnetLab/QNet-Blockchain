@@ -192,9 +192,9 @@ async function fetchBlock(identifier: string): Promise<Block | null> {
   
   // 2. Fallback to Node RPC
   try {
-    const endpoint = isHeight 
-      ? `${NODE_RPC_URL}/api/v1/block/${identifier}`
-      : `${NODE_RPC_URL}/api/v1/block/hash/${identifier}`;
+    const endpoint = isHeight
+      ? `${NODE_RPC_URL}/api/v1/block/${encodeURIComponent(identifier)}`
+      : `${NODE_RPC_URL}/api/v1/block/hash/${encodeURIComponent(identifier)}`;
     
     const response = await fetch(endpoint, {
       headers: { 'Content-Type': 'application/json' },

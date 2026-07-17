@@ -739,6 +739,10 @@ struct RpcResponse {
 struct RpcError {
     code: i32,
     message: String,
+    /// Optional structured payload (e.g. retry_after_secs for -32050 attest_pending).
+    /// None serializes to nothing — wire byte-identical for every pre-existing error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2339,6 +2343,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::get())
         .and(blockchain_filter.clone())
         .and_then(handle_tokens_for_address);
+
+    // Native QNC rich list: top-K holders + authoritative supply. Rate-limited; served from a
+    // short-TTL cache built off the consensus lock (never a per-request full-state scan).
+    let qnc_richlist = api_v1
+        .and(warp::path("richlist"))
+        .and(warp::path::end())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(warp::addr::remote())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_qnc_richlist);
     
     // ============================================================================
     // BENCHMARK ENDPOINTS - Real Transaction Load Testing
@@ -2566,6 +2581,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(nft_deploy)
         .or(wasm_deploy)
         .or(token_info)
+        .or(qnc_richlist)
         .or(token_balance)
         .or(tokens_for_address);
     
@@ -2751,7 +2767,7 @@ async fn handle_rpc(
 
         _ => Err(RpcError {
             code: -32601,
-            message: "Method not found".to_string(),
+            message: "Method not found".to_string(), data: None,
         }),
     };
     
@@ -2773,11 +2789,93 @@ async fn handle_rpc(
     Ok(warp::reply::json(&rpc_response))
 }
 
+/// Attestor-side issuance throttle (admission controller for the whole registration pipeline).
+/// Burns queue in a burn_tx-ASC BTreeMap and are promoted at ATTEST_ISSUE_RATE/sec — a deterministic
+/// order every attestor converges on, so the quorum-of-2f+1 arm rate is bounded network-wide at
+/// (n/need)·rate (~15/block at genesis) with NO blind window from t=0. Promotion pauses while the
+/// TRUE registration backlog (mempool-resident, not-yet-applied — ghosts never enter it) exceeds
+/// ATTEST_VALVE_THRESH, bounding the standing backlog under a synchronized 100k relaunch.
+/// Non-promoted callers get -32050 attest_pending + a monotone retry_after. RAM-only, admission
+/// side, never consensus.
+const ATTEST_PENDING_CAP: usize = 4096;
+const ATTEST_ISSUE_RATE: u64 = 12;      // promotions/sec ≈ 1.5× the 8/block apply drain
+const ATTEST_VALVE_THRESH: usize = 720; // pause issuance above this mempool registration backlog
+const ATTEST_PROMOTED_TTL_SECS: u64 = 600;
+
+struct AttestThrottle {
+    pending: std::collections::BTreeMap<String, ()>,  // burn_tx ASC = issuance order
+    promoted: std::collections::BTreeMap<String, u64>, // burn_tx → promoted-at unix secs
+    last_tick_secs: u64,
+}
+static ATTEST_THROTTLE: Lazy<parking_lot::Mutex<AttestThrottle>> = Lazy::new(|| parking_lot::Mutex::new(
+    AttestThrottle { pending: std::collections::BTreeMap::new(), promoted: std::collections::BTreeMap::new(), last_tick_secs: 0 }));
+
+/// Ok(()) = promoted (sign now). Err(retry_after_secs) = queued/evicted (caller re-polls).
+/// INSERT-THEN-PROMOTE: the caller's key enters PENDING before the promotion tick runs, so a
+/// first-sight burn promotes in the SAME call whenever quota remains and the valve is open —
+/// single-shot flows (server-mediated light registration) succeed first try, and the rate bound
+/// (ISSUE_RATE/sec) still holds exactly because promotion only ever spends tick quota.
+fn attest_throttle_admit(burn_tx: &str) -> Result<(), u64> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut t = ATTEST_THROTTLE.lock();
+    t.promoted.retain(|_, at| now.saturating_sub(*at) < ATTEST_PROMOTED_TTL_SECS);
+    if t.promoted.contains_key(burn_tx) { return Ok(()); }
+    if !t.pending.contains_key(burn_tx) {
+        if t.pending.len() >= ATTEST_PENDING_CAP {
+            let max_key = t.pending.keys().next_back().cloned();
+            match max_key {
+                // Smaller than the retained frontier: displace the max (deterministic global-smallest set).
+                Some(mk) if burn_tx < mk.as_str() => { t.pending.remove(&mk); t.pending.insert(burn_tx.to_string(), ()); }
+                // Beyond the frontier: bounded monotone backoff (full-queue drain time), no rank exists.
+                _ => return Err((ATTEST_PENDING_CAP as u64 / ATTEST_ISSUE_RATE).max(60)),
+            }
+        } else {
+            t.pending.insert(burn_tx.to_string(), ());
+        }
+    }
+    let elapsed = now.saturating_sub(t.last_tick_secs);
+    if elapsed > 0 {
+        t.last_tick_secs = now;
+        let backlog = crate::node::try_get_mempool()
+            .map(|m| m.pending_registration_backlog()).unwrap_or(0);
+        if backlog <= ATTEST_VALVE_THRESH {
+            let quota = (elapsed.min(2) * ATTEST_ISSUE_RATE) as usize; // burst cap = 2 ticks
+            for _ in 0..quota {
+                match t.pending.keys().next().cloned() {
+                    Some(k) => { t.pending.remove(&k); t.promoted.insert(k, now); }
+                    None => break,
+                }
+            }
+        } else if is_info() {
+            println!("[INFO][BURN] attest_valve_paused backlog={} thresh={}", backlog, ATTEST_VALVE_THRESH);
+        }
+    }
+    if t.promoted.contains_key(burn_tx) { return Ok(()); }
+    let rank = t.pending.range(..burn_tx.to_string()).count() as u64;
+    Err(rank / ATTEST_ISSUE_RATE + 1)
+}
+
+/// 30s-TTL cache over fetch_solana_1dev_supply: bounds getTokenSupply cost under mass-join.
+/// Stale-on-outage yields an honest reject upstream, never a stale-cost signature.
+static SUPPLY_CACHE: Lazy<parking_lot::Mutex<Option<(std::time::Instant, (u64, u64))>>> =
+    Lazy::new(|| parking_lot::Mutex::new(None));
+
+async fn cached_solana_1dev_supply() -> Result<(u64, u64), String> {
+    if let Some((at, v)) = *SUPPLY_CACHE.lock() {
+        if at.elapsed().as_secs() < 30 { return Ok(v); }
+    }
+    let v = fetch_solana_1dev_supply().await?;
+    *SUPPLY_CACHE.lock() = Some((std::time::Instant::now(), v));
+    Ok(v)
+}
+
 /// Genesis-side burn-attestation RPC (PRODUCTION half of the burn-oracle). A joining super queries
 /// the 5 genesis; each independently verifies the external Solana 1DEV burn (live RPC — admission
 /// side, NEVER consensus) and returns a Dilithium signature over the canonical burn message. The
 /// super embeds ≥2f+1 of these in its NodeRegistration, which block validation then re-verifies
 /// deterministically (verify_burn_attestation_quorum). Non-genesis nodes return an error.
+/// Issuance runs through the deterministic throttle above; the per-burn Solana verify is persisted
+/// (attburnv_) so re-polls never re-hit Solana.
 async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>) -> Result<Value, RpcError> {
     let params = params.unwrap_or(serde_json::Value::Null);
     let burn_tx = params.get("burn_tx").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -2792,25 +2890,67 @@ async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>
     // membership in THAT epoch's committee (not its own tip), so the apply-time verifier agrees.
     let attest_epoch = params.get("attest_epoch").and_then(|v| v.as_u64()).unwrap_or(0);
     if burn_tx.is_empty() || solana_wallet.is_empty() || qnet_wallet.is_empty() {
-        return Err(RpcError { code: -32602, message: "burn_tx, solana_wallet, qnet_wallet required".to_string() });
+        return Err(RpcError { code: -32602, message: "burn_tx, solana_wallet, qnet_wallet required".to_string(), data: None });
     }
-    // Cheap committee gate first (avoids a wasted Solana lookup on non-members); sign_burn_attestation
-    // re-checks membership + epoch recency authoritatively.
-    if attest_epoch == 0 || !blockchain.is_committee_attestor_for_epoch(attest_epoch) {
-        return Err(RpcError { code: -32601, message: "not an attestor for attest_epoch".to_string() });
+    // Arithmetic epoch bound BEFORE any committee resolution (mirrors sign_burn_attestation):
+    // only ~4 distinct epochs are ever resolvable, so the membership cache below stays complete
+    // and junk attest_epoch values cannot buy macroblock reads + committee sampling per request.
+    let own_epoch = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+        .load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1) / 90 + 1;
+    if attest_epoch == 0 || attest_epoch > own_epoch + 1 || own_epoch > attest_epoch + 2 {
+        return Err(RpcError { code: -32601, message: "not an attestor for attest_epoch".to_string(), data: None });
+    }
+    // Cheap committee gate (avoids a wasted Solana lookup on non-members); own-membership is a pure
+    // fn of the immutable N-2 snapshot per epoch — cache it so resolution cost is once per epoch,
+    // not per request. sign_burn_attestation re-checks membership + recency authoritatively.
+    static ATTEST_MEMBER_CACHE: Lazy<parking_lot::Mutex<Vec<(u64, bool)>>> =
+        Lazy::new(|| parking_lot::Mutex::new(Vec::new()));
+    let is_member = {
+        let cached = ATTEST_MEMBER_CACHE.lock().iter().find(|(e, _)| *e == attest_epoch).map(|(_, m)| *m);
+        match cached {
+            Some(m) => m,
+            None => {
+                let m = blockchain.is_committee_attestor_for_epoch(attest_epoch);
+                let mut c = ATTEST_MEMBER_CACHE.lock();
+                if c.len() >= 4 { c.remove(0); }
+                c.push((attest_epoch, m));
+                m
+            }
+        }
+    };
+    if !is_member {
+        return Err(RpcError { code: -32601, message: "not an attestor for attest_epoch".to_string(), data: None });
+    }
+    // Issuance throttle BEFORE any Solana I/O: a queued caller costs this attestor one BTreeMap probe.
+    if let Err(retry_after_secs) = attest_throttle_admit(&burn_tx) {
+        return Err(RpcError {
+            code: -32050,
+            message: "attest_pending".to_string(),
+            data: Some(json!({ "retry_after_secs": retry_after_secs })),
+        });
     }
     // Recompute the Phase-1 cost from THIS attestor's own Solana supply read (NOT the caller's hint) so
     // a forged hint can't lower the binding cost. Then require the ACTUAL on-Solana burn to cover it.
-    let (total_burned, current_supply) = match fetch_solana_1dev_supply().await {
+    let (total_burned, current_supply) = match cached_solana_1dev_supply().await {
         Ok(v) => v,
-        Err(e) => return Err(RpcError { code: -32000, message: format!("solana_supply_unavailable: {}", e) }),
+        Err(e) => return Err(RpcError { code: -32000, message: format!("solana_supply_unavailable: {}", e), data: None }),
     };
     let cost = qnet_state::Transaction::phase1_activation_cost(total_burned, current_supply);
     // Verify the external Solana 1DEV burn exists AND covers `cost` (live RPC; per-node, off consensus).
-    // Capture the ACTUAL on-Solana burned amount so the attestor signs verified truth, not the caller's hint.
-    let actual_burned = match verify_burn_transaction_exists(&burn_tx, &solana_wallet, cost, 1).await {
-        Ok((true, actual)) => actual,
-        _ => return Err(RpcError { code: -32000, message: format!("burn not verified on Solana or below cost {} 1DEV", cost) }),
+    // First-sight result persisted per burn_tx; the cached amount is still re-checked against the
+    // CURRENT cost so a bucket move yields an honest reject, never a stale-cost signature.
+    let cached_burn = blockchain.get_storage().attest_burn_verified_get(&burn_tx).ok().flatten();
+    let actual_burned = match cached_burn {
+        Some(a) if a >= cost => a,
+        Some(_) => return Err(RpcError { code: -32000, message: format!("verified burn below current cost {} 1DEV", cost), data: None }),
+        None => {
+            let a = match verify_burn_transaction_exists(&burn_tx, &solana_wallet, cost, 1).await {
+                Ok((true, actual)) => actual,
+                _ => return Err(RpcError { code: -32000, message: format!("burn not verified on Solana or below cost {} 1DEV", cost), data: None }),
+            };
+            let _ = blockchain.get_storage().attest_burn_verified_put(&burn_tx, a);
+            a
+        }
     };
     // Surface any divergence between the caller's declared amount and the verified on-chain amount.
     println!("[INFO][BURN] attest_amount declared={} actual_burned={} cost={}", amount, actual_burned, cost);
@@ -2820,7 +2960,7 @@ async fn node_attest_burn(blockchain: Arc<BlockchainNode>, params: Option<Value>
     // embedded burn_amount must equal the amount the counted 2f+1 attestors actually signed).
     match blockchain.sign_burn_attestation(&burn_tx, &qnet_wallet, actual_burned, node_type, cost, attest_epoch) {
         Some((genesis_id, sig)) => Ok(serde_json::json!({ "genesis_id": genesis_id, "sig": sig, "cost": cost, "amount": actual_burned })),
-        None => Err(RpcError { code: -32000, message: "attestation refused (dedup / not committee / stale epoch)".to_string() }),
+        None => Err(RpcError { code: -32000, message: "attestation refused (dedup / not committee / stale epoch)".to_string(), data: None }),
     }
 }
 
@@ -2935,25 +3075,25 @@ async fn chain_get_block(
 ) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| RpcError {
         code: -32602,
-        message: "Invalid params".to_string(),
+        message: "Invalid params".to_string(), data: None,
     })?;
     
     let height = params["height"].as_u64().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing height parameter".to_string(),
+        message: "Missing height parameter".to_string(), data: None,
     })?;
     
     match blockchain.get_block(height).await {
         Ok(Some(block)) => Ok(json!(block)),
         Ok(None) => Err(RpcError {
             code: -32000,
-            message: format!("Block {} not found", height),
+            message: format!("Block {} not found", height), data: None,
         }),
         Err(e) => {
             println!("[WARN][RPC] rpc_error method=chain_get_block height={} err={}", height, e);
             Err(RpcError {
                 code: -32000,
-                message: "internal error".to_string(),
+                message: "internal error".to_string(), data: None,
             })
         }
     }
@@ -2983,32 +3123,32 @@ async fn tx_submit(
 ) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| RpcError {
         code: -32602,
-        message: "Invalid params".to_string(),
+        message: "Invalid params".to_string(), data: None,
     })?;
     
     // Parse transaction from params
     let from = params["from"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing from".to_string(),
+        message: "Missing from".to_string(), data: None,
     })?;
     
     let to = params["to"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing to".to_string(),
+        message: "Missing to".to_string(), data: None,
     })?;
 
     // SECURITY: Validate EON address format (consistent with REST endpoint)
     if let Err(e) = validate_eon_address_with_error(from) {
-        return Err(RpcError { code: -32602, message: format!("Invalid 'from' address: {}", e) });
+        return Err(RpcError { code: -32602, message: format!("Invalid 'from' address: {}", e), data: None });
     }
     if let Err(e) = validate_eon_address_with_error(to) {
-        return Err(RpcError { code: -32602, message: format!("Invalid 'to' address: {}", e) });
+        return Err(RpcError { code: -32602, message: format!("Invalid 'to' address: {}", e), data: None });
     }
 
     // SECURITY: Use as_u64() directly — as_f64()→as u64 causes precision loss for large values
     let amount = params["amount"].as_u64().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing or invalid amount (must be unsigned integer)".to_string(),
+        message: "Missing or invalid amount (must be unsigned integer)".to_string(), data: None,
     })?;
     
     let gas_price = params["gas_price"].as_u64().unwrap_or(qnet_state::transaction::MIN_GAS_PRICE); // floor default (was 1 ⇒ rejected)
@@ -3023,7 +3163,7 @@ async fn tx_submit(
         Some(p) if dilithium_signature.is_some() => p.clone(),
         _ => return Err(RpcError {
             code: -32602,
-            message: "dilithium_signature + dilithium_public_key required (pure-PQ; Ed25519 not accepted on QNet)".to_string(),
+            message: "dilithium_signature + dilithium_public_key required (pure-PQ; Ed25519 not accepted on QNet)".to_string(), data: None,
         }),
     };
     let binds_from = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(&dil_pk)
@@ -3031,7 +3171,7 @@ async fn tx_submit(
     if !binds_from {
         return Err(RpcError {
             code: -32602,
-            message: "dilithium_public_key does not derive to `from` (ownership unproven)".to_string(),
+            message: "dilithium_public_key does not derive to `from` (ownership unproven)".to_string(), data: None,
         });
     }
     
@@ -3069,7 +3209,7 @@ async fn tx_submit(
             println!("[WARN][RPC] rpc_error method=tx_submit err={}", e);
             Err(RpcError {
                 code: -32000,
-                message: "request failed".to_string(),
+                message: "request failed".to_string(), data: None,
             })
         }
     }
@@ -3084,12 +3224,12 @@ async fn tx_get(
 ) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| RpcError {
         code: -32602,
-        message: "Invalid params".to_string(),
+        message: "Invalid params".to_string(), data: None,
     })?;
     
     let tx_hash = params["hash"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing hash parameter".to_string(),
+        message: "Missing hash parameter".to_string(), data: None,
     })?;
     
     // Get transaction from blockchain
@@ -3130,13 +3270,13 @@ async fn tx_get(
         },
         Ok(None) => Err(RpcError {
             code: -32000,
-            message: format!("Transaction {} not found", tx_hash),
+            message: format!("Transaction {} not found", tx_hash), data: None,
         }),
         Err(e) => {
             println!("[WARN][RPC] rpc_error method=tx_get hash={} err={}", tx_hash, e);
             Err(RpcError {
                 code: -32000,
-                message: "internal error".to_string(),
+                message: "internal error".to_string(), data: None,
             })
         }
     }
@@ -3153,7 +3293,7 @@ async fn mempool_submit(
 ) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| RpcError {
         code: -32602,
-        message: "Invalid params".to_string(),
+        message: "Invalid params".to_string(), data: None,
     })?;
     
     // Support both single transaction and batch
@@ -3174,17 +3314,17 @@ async fn mempool_submit(
         // Parse transaction fields
         let from = tx_data["from"].as_str().ok_or_else(|| RpcError {
             code: -32602,
-            message: "Missing from field".to_string(),
+            message: "Missing from field".to_string(), data: None,
         })?;
         
         let to = tx_data["to"].as_str().ok_or_else(|| RpcError {
             code: -32602,
-            message: "Missing to field".to_string(),
+            message: "Missing to field".to_string(), data: None,
         })?;
         
         let amount = tx_data["amount"].as_u64().ok_or_else(|| RpcError {
             code: -32602,
-            message: "Missing amount field".to_string(),
+            message: "Missing amount field".to_string(), data: None,
         })?;
         
         let nonce = tx_data["nonce"].as_u64().unwrap_or(0);
@@ -3194,16 +3334,16 @@ async fn mempool_submit(
         // (address = SHA512(dilithium_pk)); Ed25519 is Solana-only and not accepted on a QNet path.
         let dil_sig = tx_data["dilithium_signature"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| RpcError {
             code: -32602,
-            message: "Missing dilithium_signature - QNet TX require an ML-DSA-65 signature".to_string(),
+            message: "Missing dilithium_signature - QNet TX require an ML-DSA-65 signature".to_string(), data: None,
         })?;
         let dil_pk = tx_data["dilithium_public_key"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| RpcError {
             code: -32602,
-            message: "Missing dilithium_public_key".to_string(),
+            message: "Missing dilithium_public_key".to_string(), data: None,
         })?;
         if crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(dil_pk).as_deref() != Some(from) {
             return Err(RpcError {
                 code: -32602,
-                message: "dilithium_public_key does not derive to `from` (ownership unproven)".to_string(),
+                message: "dilithium_public_key does not derive to `from` (ownership unproven)".to_string(), data: None,
             });
         }
         
@@ -3262,12 +3402,12 @@ async fn account_get_info(
 ) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| RpcError {
         code: -32602,
-        message: "Invalid params".to_string(),
+        message: "Invalid params".to_string(), data: None,
     })?;
     
     let address = params["address"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing address parameter".to_string(),
+        message: "Missing address parameter".to_string(), data: None,
     })?;
     
     match blockchain.get_account(address).await {
@@ -3290,12 +3430,12 @@ async fn account_get_balance(
 ) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| RpcError {
         code: -32602,
-        message: "Invalid params".to_string(),
+        message: "Invalid params".to_string(), data: None,
     })?;
     
     let address = params["address"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing address parameter".to_string(),
+        message: "Missing address parameter".to_string(), data: None,
     })?;
     
     match blockchain.get_balance(address).await {
@@ -3306,7 +3446,7 @@ async fn account_get_balance(
             println!("[WARN][RPC] rpc_error method=account_get_balance address={} err={}", address, e);
             Err(RpcError {
                 code: -32000,
-                message: "internal error".to_string(),
+                message: "internal error".to_string(), data: None,
             })
         }
     }
@@ -3355,12 +3495,12 @@ async fn qrb_get_randomness(
 ) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing params - expected { epoch: number }".to_string(),
+        message: "Missing params - expected { epoch: number }".to_string(), data: None,
     })?;
     
     let epoch = params["epoch"].as_u64().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing or invalid 'epoch' parameter".to_string(),
+        message: "Missing or invalid 'epoch' parameter".to_string(), data: None,
     })?;
     
     // Get macroblock for epoch
@@ -3389,20 +3529,20 @@ async fn qrb_get_randomness(
                     println!("[WARN][RPC] rpc_error method=qrb_get_macroblock_randomness err={}", e);
                     Err(RpcError {
                         code: -32000,
-                        message: "internal error".to_string(),
+                        message: "internal error".to_string(), data: None,
                     })
                 }
             }
         }
         Ok(None) => Err(RpcError {
             code: -32001,
-            message: format!("Epoch {} not yet finalized", epoch),
+            message: format!("Epoch {} not yet finalized", epoch), data: None,
         }),
         Err(e) => {
             println!("[WARN][RPC] rpc_error method=qrb_get_macroblock err={:?}", e);
             Err(RpcError {
                 code: -32000,
-                message: "internal error".to_string(),
+                message: "internal error".to_string(), data: None,
             })
         }
     }
@@ -3420,7 +3560,7 @@ async fn qrb_get_latest_randomness(
     if latest_epoch == 0 {
         return Err(RpcError {
             code: -32001,
-            message: "No epochs finalized yet".to_string(),
+            message: "No epochs finalized yet".to_string(), data: None,
         });
     }
     
@@ -3439,24 +3579,24 @@ async fn qrb_get_randomness_with_seed(
 ) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing params - expected { epoch: number, seed: string }".to_string(),
+        message: "Missing params - expected { epoch: number, seed: string }".to_string(), data: None,
     })?;
     
     let epoch = params["epoch"].as_u64().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing or invalid 'epoch' parameter".to_string(),
+        message: "Missing or invalid 'epoch' parameter".to_string(), data: None,
     })?;
     
     let seed_hex = params["seed"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing 'seed' parameter".to_string(),
+        message: "Missing 'seed' parameter".to_string(), data: None,
     })?;
     
     // Remove 0x prefix if present
     let seed_clean = seed_hex.trim_start_matches("0x");
     let seed_bytes = hex::decode(seed_clean).map_err(|e| RpcError {
         code: -32602,
-        message: format!("Invalid seed hex: {}", e),
+        message: format!("Invalid seed hex: {}", e), data: None,
     })?;
     
     // Get base randomness
@@ -3493,20 +3633,20 @@ async fn qrb_get_randomness_with_seed(
                     println!("[WARN][RPC] rpc_error method=qrb_get_latest_randomness err={}", e);
                     Err(RpcError {
                         code: -32000,
-                        message: "internal error".to_string(),
+                        message: "internal error".to_string(), data: None,
                     })
                 }
             }
         }
         Ok(None) => Err(RpcError {
             code: -32001,
-            message: format!("Epoch {} not yet finalized", epoch),
+            message: format!("Epoch {} not yet finalized", epoch), data: None,
         }),
         Err(e) => {
             println!("[WARN][RPC] rpc_error method=qrb_get_latest_randomness err={:?}", e);
             Err(RpcError {
                 code: -32000,
-                message: "internal error".to_string(),
+                message: "internal error".to_string(), data: None,
             })
         }
     }
@@ -3523,27 +3663,27 @@ async fn device_migration(
 ) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| RpcError {
         code: -32602,
-        message: "Invalid params".to_string(),
+        message: "Invalid params".to_string(), data: None,
     })?;
 
     let activation_code = params["activation_code"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing activation_code parameter".to_string(),
+        message: "Missing activation_code parameter".to_string(), data: None,
     })?;
 
     let new_device_signature = params["new_device_signature"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing new_device_signature parameter".to_string(),
+        message: "Missing new_device_signature parameter".to_string(), data: None,
     })?;
 
     // FIX R22-N6: Require Dilithium3 signature proving ownership of the node's keypair
     let dilithium_sig = params["dilithium_signature"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing dilithium_signature — cryptographic proof required for device migration".to_string(),
+        message: "Missing dilithium_signature — cryptographic proof required for device migration".to_string(), data: None,
     })?;
     let dilithium_pk_hex = params["dilithium_public_key"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing dilithium_public_key — required for signature verification".to_string(),
+        message: "Missing dilithium_public_key — required for signature verification".to_string(), data: None,
     })?;
 
     // Verify Dilithium3/ML-DSA-65 signature over migration payload
@@ -3556,7 +3696,7 @@ async fn device_migration(
                      &activation_code[..16.min(activation_code.len())]);
             return Err(RpcError {
                 code: -32003,
-                message: "Dilithium3 signature verification failed — unauthorized migration attempt".to_string(),
+                message: "Dilithium3 signature verification failed — unauthorized migration attempt".to_string(), data: None,
             });
         }
         println!("[INFO][MIGRATE] dilithium_verified code={}...",
@@ -3574,7 +3714,7 @@ async fn device_migration(
         })),
         Err(e) => Err(RpcError {
             code: -32000,
-            message: format!("Device migration failed: {}", e),
+            message: format!("Device migration failed: {}", e), data: None,
         }),
     }
 }
@@ -3586,12 +3726,12 @@ async fn node_get_transfer_status(
 ) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| RpcError {
         code: -32602,
-        message: "Invalid params".to_string(),
+        message: "Invalid params".to_string(), data: None,
     })?;
     
     let activation_code = params["activation_code"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing activation_code parameter".to_string(),
+        message: "Missing activation_code parameter".to_string(), data: None,
     })?;
     
     // Load activation to check transfer status
@@ -3618,7 +3758,7 @@ async fn node_get_transfer_status(
         })),
         Err(e) => Err(RpcError {
             code: -32000,
-            message: format!("Failed to check transfer status: {}", e),
+            message: format!("Failed to check transfer status: {}", e), data: None,
         }),
     }
 } 
@@ -8402,13 +8542,26 @@ async fn handle_server_node_status(
                 let expected = ((cur_height % 14400) / 1440) as u32;
                 let on_pace = is_online && (heartbeat_count as u32) + 1 >= expected;
 
-                // Eligible if the full epoch threshold is met OR the node is online and on pace.
-                let is_reward_eligible = heartbeat_count >= required_heartbeats || on_pace;
-                
+                // STRICT on-chain truth: registered IFF reg_height is stamped (node_<id>.reg_height).
+                // NEVER the RAM roster and NEVER get_node_wallet — a discovery-cache row keeps
+                // final_wallet with reg_height=None and would fabricate registered:true (the mask
+                // that hid a never-landed NodeRegistration). Emission and producer candidacy both
+                // derive from srtr_/reg_height, so this is the ONE truth the payout actually uses.
+                let onchain = blockchain.get_storage().is_node_registration_onchain(found_id);
+
+                // is_reward_eligible mirrors the EMISSION predicate (srtr_ ∩ heartbeat_count>=9) —
+                // NOT the producer-selection predicate (no warmup/rep-floor: those gate selection,
+                // not payout). on_pace is a mid-epoch APPROXIMATION of the boundary-finalized popcount.
+                let is_reward_eligible = onchain && (heartbeat_count >= required_heartbeats || on_pace);
+
                 // v2.96: CRITICAL FIX - Get reputation from LAST MACROBLOCK SNAPSHOT (not local state)
                 // This ensures ALL nodes return SAME value (blockchain consensus)
-                let reputation = get_reputation_from_snapshot(&blockchain, found_id).await;
-                
+                let reputation = if onchain {
+                    serde_json::json!(get_reputation_from_snapshot(&blockchain, found_id).await)
+                } else {
+                    serde_json::Value::Null
+                };
+
                 // Get block height if available
                 let block_height = blockchain.get_height().await;
                 
@@ -8430,7 +8583,9 @@ async fn handle_server_node_status(
                 
                 return Ok(warp::reply::json(&json!({
                     "success": true,
-                    "registered": true,
+                    "registered": onchain,
+                    "onchain_registered": onchain,
+                    "status": if onchain { "active" } else { "onboarding" },
                     "node_id": found_id,
                     "node_type": node_type,
                     "is_online": is_online,
@@ -8442,9 +8597,9 @@ async fn handle_server_node_status(
                     "reputation": reputation,
                     "current_block_height": block_height,
                     "current_window_start": current_window,
-                    // Attention only when offline or BEHIND pace (missed more than the current subwindow).
-                    "needs_attention": !is_online || (heartbeat_count as u32) + 1 < expected,
-                    // Rewards info (QNC tokens in smallest units)
+                    // Attention when offline, behind pace, or still onboarding (registration not landed).
+                    "needs_attention": !onchain || !is_online || (heartbeat_count as u32) + 1 < expected,
+                    // Rewards info (QNC tokens in smallest units) — wallet-scoped, status-independent.
                     "pending_rewards": pending_rewards
                 })));
             }
@@ -8461,19 +8616,24 @@ async fn handle_server_node_status(
                     // No per-epoch light-eligible reader reachable here; approximate attestation by
                     // online + recent ping (within one ping window) rather than bare registry presence.
                     let is_online = node.is_active && now.saturating_sub(node.last_seen) < 15 * 60;
+                    // Strict on-chain registration truth; is_online stays a labeled approximation.
+                    let onchain = blockchain.get_storage().is_node_registration_onchain(target_id);
                     return Ok(warp::reply::json(&json!({
                         "success": true,
                         "node_id": target_id,
                         "node_type": "Light",
+                        "onchain_registered": onchain,
                         "is_online": is_online,
                         "last_seen": node.last_seen,
                         "last_seen_ago_seconds": now.saturating_sub(node.last_seen),
                         "heartbeat_count": 0,
                         "required_heartbeats": 1,
-                        "is_reward_eligible": is_online,
+                        "is_reward_eligible": onchain && is_online,
                         "reputation": null,
                         "current_block_height": block_height,
-                        "needs_attention": !is_online,
+                        // Attention when offline OR still onboarding (registration not landed) — mirrors
+                        // the super branches so a non-earning light node is never shown all-clear.
+                        "needs_attention": !onchain || !is_online,
                         "pending_rewards": pending_rewards
                     })));
                 }
@@ -8492,7 +8652,10 @@ async fn handle_server_node_status(
             // registered:false + reputation:null — never "Banned", never a phantom "registered".
             match blockchain.get_node_wallet(off_id).await {
                 Some(w) => {
-                    let reputation = get_reputation_from_snapshot(&blockchain, off_id).await;
+                    // get_node_wallet proves a wallet row exists, NOT registration: a discovery-cache
+                    // row keeps final_wallet with reg_height=None. Decide `registered` strictly so an
+                    // offline cache-only node reads onboarding, not a phantom registered:true.
+                    let onchain = blockchain.get_storage().is_node_registration_onchain(off_id);
                     let pending_rewards = wallet_claimable_qnc(&blockchain, &w).await;
                     // Absent from THIS node's RAM roster ≠ offline: the deterministic
                     // on-chain heartbeat index is the authority every node agrees on.
@@ -8504,20 +8667,29 @@ async fn handle_server_node_status(
                         .unwrap_or(0);
                     let expected = ((cur_height % 14400) / 1440) as u32;
                     let on_pace = chain_alive && (heartbeat_count as u32) + 1 >= expected;
+                    let reputation = if onchain {
+                        serde_json::json!(get_reputation_from_snapshot(&blockchain, off_id).await)
+                    } else {
+                        serde_json::Value::Null
+                    };
                     return Ok(warp::reply::json(&json!({
                         "success": true,
-                        "registered": true,
+                        "registered": onchain,
+                        "onchain_registered": onchain,
+                        "status": if onchain { "active" } else { "onboarding" },
                         "node_id": off_id,
                         "is_online": chain_alive,
                         "last_seen": 0,
                         "heartbeat_count": heartbeat_count,
                         "required_heartbeats": 9,
-                        "is_reward_eligible": heartbeat_count >= 9 || on_pace,
+                        "is_reward_eligible": onchain && (heartbeat_count >= 9 || on_pace),
                         "reputation": reputation,
                         "current_block_height": cur_height,
-                        "needs_attention": !chain_alive || (heartbeat_count as u32) + 1 < expected,
+                        "needs_attention": !onchain || !chain_alive || (heartbeat_count as u32) + 1 < expected,
+                        // Wallet-scoped, status-independent: earned rewards stay visible/claimable.
                         "pending_rewards": pending_rewards,
-                        "message": if chain_alive { "Node online (on-chain heartbeat)." }
+                        "message": if !onchain { "Node registration not on-chain yet (onboarding)." }
+                                   else if chain_alive { "Node online (on-chain heartbeat)." }
                                    else { "Node registered but offline this window." }
                     })));
                 }
@@ -15439,16 +15611,21 @@ async fn handle_token_info(
     match blockchain.get_account(&contract_address).await {
         Ok(Some(account)) if account.is_contract => {
             let storage = &account.contract_storage;
-            let is_qrc20 = storage.get("type").map(|t| t == "qrc20").unwrap_or(false);
-            
-            if is_qrc20 {
+            // Serve both fungible (qrc20) and non-fungible (qrc721) standards; NFTs are indivisible.
+            let std_type = storage.get("type").map(|t| t.as_str()).unwrap_or("");
+            let is_token = std_type == "qrc20" || std_type == "qrc721";
+
+            if is_token {
+                let decimals: u8 = if std_type == "qrc721" { 0 }
+                    else { storage.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9) };
                 Ok(warp::reply::json(&json!({
                     "success": true,
                     "token": {
                         "contract_address": contract_address,
+                        "standard": std_type,
                         "name": storage.get("name").cloned().unwrap_or_default(),
                         "symbol": storage.get("symbol").cloned().unwrap_or_default(),
-                        "decimals": storage.get("decimals").and_then(|d| d.parse::<u8>().ok()).unwrap_or(9),
+                        "decimals": decimals,
                         // Optional on-chain token logo (emoji or https URL); "" when the deployer set none
                         // — clients fall back to a generated avatar. Sanitized at deploy (https-only scheme).
                         "logo": storage.get("logo").cloned().unwrap_or_default(),
@@ -15468,7 +15645,7 @@ async fn handle_token_info(
             } else {
                 Ok(warp::reply::json(&json!({
                     "success": false,
-                    "error": "Contract exists but is not a QRC-20 token",
+                    "error": "Contract exists but is not a QRC-20/QRC-721 token",
                     "contract_address": contract_address
                 })))
             }
@@ -15612,6 +15789,51 @@ async fn handle_tokens_for_address(
         "tokens": tokens,
         "token_count": count,
         "source": "blockchain_state"
+    })))
+}
+
+/// GET /api/v1/richlist?limit=N — native QNC rich list served O(K) from the apply-time index:
+/// top-K holders (balance desc, address asc) + holder count read straight from storage, with NO
+/// account scan and NO consensus lock. Supply is the AUTHORITATIVE emission watermark
+/// (get_total_supply), not a balance re-sum (which would omit unclaimed rewards and contract/pool-held
+/// QNC). Rate-limited; percent is balance/circulating. limit clamped 1..=500.
+async fn handle_qnc_richlist(
+    params: std::collections::HashMap<String, String>,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if let Err(resp) = check_api_rate_limit(remote_addr, "read_only") {
+        return Ok(resp);
+    }
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(100).clamp(1, 500);
+
+    // O(K) reads from the rich-list index — no account pass, no consensus lock.
+    let storage = blockchain.get_storage();
+    let holders = storage.richlist_top_k(limit).unwrap_or_default();
+    let holder_count = storage.richlist_holder_count();
+
+    // Authoritative supply figures (brief state lock): minted total + burn-sink balance → circulating.
+    let burn_addr = qnet_state::transaction::CANONICAL_BURN_ADDR;
+    let (total_supply_raw, burned_raw) = {
+        let sm = blockchain.get_state_manager();
+        let state = sm.read().await;
+        (state.get_total_supply(), state.get_balance(burn_addr))
+    };
+    let circulating = total_supply_raw.saturating_sub(burned_raw);
+
+    let rows: Vec<serde_json::Value> = holders.iter().map(|(addr, bal)| {
+        let pct = if circulating > 0 { (*bal as f64) / (circulating as f64) * 100.0 } else { 0.0 };
+        json!({ "address": addr, "balance_raw": bal.to_string(), "percent": format!("{:.4}", pct) })
+    }).collect();
+
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "total_supply_raw": total_supply_raw.to_string(),
+        "circulating_raw": circulating.to_string(),
+        "burned_raw": burned_raw.to_string(),
+        "holder_count": holder_count,
+        "holders": rows,
+        "source": "richlist_index",
     })))
 }
 

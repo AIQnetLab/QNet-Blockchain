@@ -693,3 +693,6 @@ dev-scratch/
 !applications/qnet-explorer/frontend/lib/**
 !applications/qnet-explorer/frontend/src/lib/
 !applications/qnet-explorer/frontend/src/lib/**
+
+# Session working notes — never commit
+/memory/

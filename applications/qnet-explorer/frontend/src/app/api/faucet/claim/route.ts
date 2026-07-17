@@ -117,10 +117,60 @@ function detectEnvironment(_request: NextRequest): 'testnet' | 'mainnet' {
 // ---------------------------------------------------------------------------
 // 1DEV token send (Solana SPL)
 // ---------------------------------------------------------------------------
+// Confirm a submitted tx with a THREE-WAY outcome so the caller can decide whether it is safe to
+// release the anti-double-claim reservation:
+//   'landed'  — tx confirmed on-chain (deliver, keep cooldown).
+//   'failed'  — DEFINITIVE not-landed: an on-chain error, OR the blockhash provably expired without
+//               the tx landing (an expired-blockhash tx can NEVER land) → safe to release + retry.
+//   'unknown' — AMBIGUOUS: RPC flaked / polling window elapsed while the blockhash is still valid, so
+//               the tx may still land (maxRetries keeps rebroadcasting) → KEEP the reservation.
+// Each poll iteration is isolated in try/catch so a transient RPC error never aborts the loop into a
+// false 'failed'.
+async function confirmSig(
+  connection: import('@solana/web3.js').Connection,
+  signature: string,
+  blockhash: string,
+  lastValidBlockHeight: number,
+): Promise<{ status: 'landed' | 'failed' | 'unknown'; err: unknown }> {
+  try {
+    const conf = await connection.confirmTransaction(
+      { signature, blockhash, lastValidBlockHeight },
+      'confirmed',
+    );
+    return conf.value?.err
+      ? { status: 'failed', err: conf.value.err }
+      : { status: 'landed', err: null };
+  } catch {
+    // Poll until the tx lands, definitively errors, or the blockhash provably expires.
+    for (let i = 0; i < 24; i++) {
+      try {
+        const st = await connection.getSignatureStatus(signature, { searchTransactionHistory: true });
+        const s = st.value;
+        if (s) {
+          if (s.err) return { status: 'failed', err: s.err };
+          if (s.confirmationStatus === 'confirmed' || s.confirmationStatus === 'finalized') {
+            return { status: 'landed', err: null };
+          }
+        }
+        // Blockhash expired with no status yet ⇒ the tx can never land ⇒ definitive failure.
+        const currentHeight = await connection.getBlockHeight('confirmed');
+        if (currentHeight > lastValidBlockHeight) {
+          return { status: 'failed', err: 'blockhash_expired' };
+        }
+      } catch {
+        // transient RPC error — ignore this tick, the blockhash may still be valid
+      }
+      await new Promise((r) => setTimeout(r, 2500));
+    }
+    // Polling window elapsed while the blockhash could still be valid — cannot prove it didn't land.
+    return { status: 'unknown', err: 'confirmation_timeout' };
+  }
+}
+
 async function send1DEVTokens(
   address: string,
   amount: number,
-): Promise<{ success: boolean; txHash?: string; error?: string }> {
+): Promise<{ success: boolean; txHash?: string; error?: string; releasable?: boolean }> {
   const TOKEN_MINT = '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ';
   const DECIMALS = 6;
 
@@ -131,7 +181,7 @@ async function send1DEVTokens(
     const {
       createTransferInstruction,
       getAssociatedTokenAddress,
-      createAssociatedTokenAccountInstruction,
+      createAssociatedTokenAccountIdempotentInstruction,
     } = await import('@solana/spl-token');
 
     const rpcEndpoints = [
@@ -141,7 +191,7 @@ async function send1DEVTokens(
 
     const connection = new Connection(rpcEndpoints[0], {
       commitment: 'processed',
-      confirmTransactionInitialTimeout: 3000,
+      confirmTransactionInitialTimeout: 60000,
     });
 
     // Fail-closed: the signing key comes ONLY from the runtime secret (injected
@@ -158,7 +208,7 @@ async function send1DEVTokens(
     const recipientTokenAddress = await getAssociatedTokenAddress(mintPubkey, recipientPubkey);
     const faucetTokenAddress = await getAssociatedTokenAddress(mintPubkey, faucetWallet.publicKey);
 
-    const { blockhash } = await connection.getLatestBlockhash('processed');
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
 
     const transaction = new Transaction();
     transaction.recentBlockhash = blockhash;
@@ -167,9 +217,11 @@ async function send1DEVTokens(
     transaction.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }));
     transaction.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }));
 
-    // Optimistically create associated token account (idempotent)
+    // Create the recipient ATA IDEMPOTENTLY. The non-idempotent variant aborts the whole tx with
+    // IllegalOwner when the ATA already exists — so the transfer below never runs and nothing is
+    // delivered (the historical false-"success" cause). Idempotent = no-op if the ATA already exists.
     transaction.add(
-      createAssociatedTokenAccountInstruction(
+      createAssociatedTokenAccountIdempotentInstruction(
         faucetWallet.publicKey,
         recipientTokenAddress,
         recipientPubkey,
@@ -186,25 +238,28 @@ async function send1DEVTokens(
       ),
     );
 
+    // Confirm on-chain BEFORE reporting success — a submitted-but-failed tx must never read as
+    // delivered. Preflight on so a doomed tx is rejected up front instead of silently accepted.
     const signature = await connection.sendTransaction(transaction, [faucetWallet], {
-      skipPreflight: true,
-      preflightCommitment: 'processed',
-      maxRetries: 0,
+      preflightCommitment: 'confirmed',
+      maxRetries: 3,
     });
-
-    // Fire-and-forget confirmation
-    setTimeout(async () => {
-      try {
-        await connection.confirmTransaction(signature, 'processed');
-      } catch {
-        /* non-critical */
-      }
-    }, 100);
+    const conf = await confirmSig(connection, signature, blockhash, lastValidBlockHeight);
+    if (conf.status !== 'landed') {
+      // 'failed' ⇒ releasable (definitely didn't land); 'unknown' ⇒ NOT releasable (may still land).
+      return {
+        success: false,
+        txHash: signature,
+        error: `On-chain/confirm ${conf.status}: ${JSON.stringify(conf.err)}`,
+        releasable: conf.status === 'failed',
+      };
+    }
 
     return { success: true, txHash: signature };
   } catch (error: unknown) {
+    // Thrown before a signature exists ⇒ nothing was submitted ⇒ safe to release the reservation.
     const msg = error instanceof Error ? error.message : 'Failed to send 1DEV tokens';
-    return { success: false, error: msg };
+    return { success: false, error: msg, releasable: true };
   }
 }
 
@@ -214,14 +269,14 @@ async function send1DEVTokens(
 async function sendSOLTokens(
   address: string,
   amount: number,
-): Promise<{ success: boolean; txHash?: string; error?: string }> {
+): Promise<{ success: boolean; txHash?: string; error?: string; releasable?: boolean }> {
   try {
     const { Connection, Keypair, PublicKey, Transaction, SystemProgram, ComputeBudgetProgram } =
       await import('@solana/web3.js');
 
     const connection = new Connection('https://api.devnet.solana.com', {
       commitment: 'processed',
-      confirmTransactionInitialTimeout: 3000,
+      confirmTransactionInitialTimeout: 60000,
     });
 
     // Fail-closed: signing key sourced only from the runtime secret (same
@@ -234,7 +289,7 @@ async function sendSOLTokens(
     const recipientPubkey = new PublicKey(address);
     const lamports = Math.round(amount * 1e9);
 
-    const { blockhash } = await connection.getLatestBlockhash('processed');
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
     const transaction = new Transaction();
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = faucetWallet.publicKey;
@@ -249,19 +304,24 @@ async function sendSOLTokens(
     );
 
     const signature = await connection.sendTransaction(transaction, [faucetWallet], {
-      skipPreflight: true,
-      preflightCommitment: 'processed',
-      maxRetries: 0,
+      preflightCommitment: 'confirmed',
+      maxRetries: 3,
     });
-
-    setTimeout(async () => {
-      try { await connection.confirmTransaction(signature, 'processed'); } catch { /* non-critical */ }
-    }, 100);
+    // Confirm before reporting success (same discipline as the 1DEV path).
+    const conf = await confirmSig(connection, signature, blockhash, lastValidBlockHeight);
+    if (conf.status !== 'landed') {
+      return {
+        success: false,
+        txHash: signature,
+        error: `On-chain/confirm ${conf.status}: ${JSON.stringify(conf.err)}`,
+        releasable: conf.status === 'failed',
+      };
+    }
 
     return { success: true, txHash: signature };
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : 'Failed to send SOL';
-    return { success: false, error: msg };
+    return { success: false, error: msg, releasable: true };
   }
 }
 
@@ -271,7 +331,7 @@ async function sendSOLTokens(
 async function sendQNCTokens(
   address: string,
   amount: number,
-): Promise<{ success: boolean; txHash?: string; error?: string }> {
+): Promise<{ success: boolean; txHash?: string; error?: string; releasable?: boolean }> {
   const bootstrapNodes = [
     'https://154.38.160.39:8001',
     'https://62.171.157.44:8001',
@@ -294,9 +354,12 @@ async function sendQNCTokens(
       const data = await response.json();
       return { success: true, txHash: data.txHash };
     }
+    // Definitive server-side reject (node returned an error status): nothing was dispensed ⇒ releasable.
     const err = await response.json().catch(() => ({ message: 'QNet faucet request failed' }));
-    return { success: false, error: err.message || 'QNet faucet request failed' };
+    return { success: false, error: err.message || 'QNet faucet request failed', releasable: true };
   } catch {
+    // Network error / timeout after the request left: the node MAY have processed it ⇒ keep the
+    // reservation (releasable stays undefined) so a lost-response claim is not double-dispensed.
     return { success: false, error: 'QNet faucet unavailable' };
   }
 }
@@ -309,7 +372,7 @@ async function sendTokens(
   amount: number,
   address: string,
   environment: 'testnet' | 'mainnet',
-): Promise<{ success: boolean; txHash?: string; error?: string }> {
+): Promise<{ success: boolean; txHash?: string; error?: string; releasable?: boolean }> {
   switch (tokenType) {
     case '1DEV':
       return send1DEVTokens(address, amount);
@@ -318,7 +381,8 @@ async function sendTokens(
     case 'QNC':
       return sendQNCTokens(address, amount);
     default:
-      return { success: false, error: 'Unsupported token type' };
+      // Unsupported type never sent anything ⇒ releasable.
+      return { success: false, error: 'Unsupported token type', releasable: true };
   }
 }
 
@@ -330,9 +394,16 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { walletAddress, amount, tokenType = '1DEV' } = body;
 
-    if (!walletAddress || !amount) {
+    if (!walletAddress) {
       return NextResponse.json(
-        { success: false, error: 'Missing required fields: walletAddress, amount' },
+        { success: false, error: 'Missing required field: walletAddress' },
+        { status: 400 },
+      );
+    }
+    // Amount must be a finite positive number — reject negatives/NaN/strings/objects before any math.
+    if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+      return NextResponse.json(
+        { success: false, error: 'Invalid amount: must be a positive number' },
         { status: 400 },
       );
     }
@@ -392,12 +463,16 @@ export async function POST(request: NextRequest) {
           { status: 429 },
         );
       }
+
+      // Reserve the per-address slot BEFORE dispatching (which now awaits confirmation for seconds), so
+      // concurrent same-wallet claims can't all pass the cooldown check and each send. Released below only
+      // on a hard pre-send / on-chain failure — a landed-but-slow tx keeps the reservation.
+      addressCooldowns.set(walletAddress, Date.now());
     }
 
     const result = await sendTokens(tokenType, amount, walletAddress, environment);
 
     if (result.success) {
-      if (environment !== 'testnet') addressCooldowns.set(walletAddress, Date.now());
       return NextResponse.json({
         success: true,
         txHash: result.txHash,
@@ -408,7 +483,18 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    return NextResponse.json({ success: false, error: result.error }, { status: 500 });
+    // Release the per-address reservation ONLY when the send definitively did not and cannot land
+    // (pre-send failure or a definitive on-chain error / expired blockhash). An AMBIGUOUS outcome
+    // (RPC flake / confirm timeout while the blockhash may still be valid) KEEPS the reservation so a
+    // slow-but-landed tx can never be double-paid on retry. Always echo the signature (when present)
+    // so the money-moving operation is observable on a Solana explorer even on failure.
+    if (environment !== 'testnet' && result.releasable === true) {
+      addressCooldowns.delete(walletAddress);
+    }
+    return NextResponse.json(
+      { success: false, error: result.error, txHash: result.txHash ?? null },
+      { status: 500 },
+    );
   } catch {
     return NextResponse.json({ success: false, error: 'Internal server error' }, { status: 500 });
   }

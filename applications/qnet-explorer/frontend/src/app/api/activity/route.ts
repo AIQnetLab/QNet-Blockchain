@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getTransactions } from '../../../../lib/db';
 import { rateLimit, getClientIdentifier } from '../../../../lib/rate-limit';
-import { mapTxType, formatAmount } from '@/lib/tx-mapping';
+import { enrichActivityRows } from '@/lib/enrich-activity';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 10; // Cache for 10 seconds
@@ -100,19 +100,14 @@ export async function GET(request: NextRequest) {
     // Get transactions from PostgreSQL
     const { transactions, total, currentHeight } = await getTransactions(page, perPage, sortOrder, typeFilter, displayTypes);
 
-    // Lightweight response for list view — no signatures/keys (saves ~80% bandwidth)
-    // Full data available via /api/tx/[hash] for detail pages
-    const responseData = transactions.map((tx) => ({
-      hash: tx.hash,
-      type: mapTxType(tx.tx_type, tx.from_address),
-      from: tx.from_address,
-      to: tx.to_address || 'N/A',
-      amount: formatAmount(tx.amount),
-      block: tx.block,
-      timestamp: tx.timestamp,
-      time: '',
-      status: tx.status || 'confirmed',
-      is_quantum_signed: tx.is_quantum_signed,
+    // Lightweight response for list view — no signatures/keys (saves ~80% bandwidth).
+    // Enriched via the SAME helper as SSR so token rows keep their icon/symbol/amount/
+    // click-through across polls + pagination. status/is_quantum_signed zipped by position.
+    const enriched = await enrichActivityRows(transactions);
+    const responseData = enriched.map((r, i) => ({
+      ...r,
+      status: transactions[i].status || 'confirmed',
+      is_quantum_signed: transactions[i].is_quantum_signed,
     }));
 
   return NextResponse.json({

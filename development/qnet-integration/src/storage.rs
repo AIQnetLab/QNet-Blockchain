@@ -6756,6 +6756,26 @@ impl Storage {
         }
     }
 
+    /// Attestor-local cache of a Solana-verified burn: burn_tx → actual burned amount. Written on the
+    /// first successful live getTransaction verify so throttle re-polls never re-hit Solana for the
+    /// same burn. Admission-side only, never consensus.
+    pub fn attest_burn_verified_put(&self, burn_tx: &str, actual_burned: u64) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        self.persistent.db.put_cf(&cf, format!("attburnv_{}", burn_tx).as_bytes(), actual_burned.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Cached Solana-verified burned amount for `burn_tx`, or None if never verified.
+    pub fn attest_burn_verified_get(&self, burn_tx: &str) -> IntegrationResult<Option<u64>> {
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        match self.persistent.db.get_cf(&cf, format!("attburnv_{}", burn_tx).as_bytes())? {
+            Some(v) if v.len() == 8 => Ok(Some(u64::from_le_bytes(v[..8].try_into().unwrap_or([0u8; 8])))),
+            _ => Ok(None),
+        }
+    }
+
     /// COMMITTED burn→wallet binding (on-chain uniqueness, NOT the genesis-local attested_burn).
     /// Written FIRST-WINS when a burn-backed NodeRegistration is applied; read at block-validation
     /// (verify_burn_attestation_quorum) to reject a second registration reusing the same burn for a
@@ -7457,6 +7477,149 @@ impl Storage {
             if !wallet.is_empty() { out.push((node_id.to_string(), wallet.to_string())); }
         }
         Ok(out)
+    }
+
+    // ── Native-QNC rich-list index (display) ─────────────────────────────────────────────────────
+    // Top-K holders by balance, served O(K) without ever scanning all accounts. Keyed
+    // `rlst_{(u64::MAX-balance) BE}_{addr}` so a forward prefix scan yields balance-descending,
+    // address-ascending order. Companion `rlpos_{addr}` holds the indexed balance so an update knows
+    // which sort key to delete; `rlcnt` is the holder count. Maintained incrementally at apply from a
+    // block's touched addresses, rebuilt from live state at boot/snapshot/reorg. Display-only (in no
+    // root/checkpoint), so a divergence or drift is cosmetic and self-heals on the next rebuild.
+
+    fn rlst_sort_key(addr: &str, balance: u64) -> Vec<u8> {
+        let inv = (u64::MAX - balance).to_be_bytes();
+        let mut k = Vec::with_capacity(5 + 8 + addr.len());
+        k.extend_from_slice(b"rlst_");
+        k.extend_from_slice(&inv);
+        k.extend_from_slice(addr.as_bytes());
+        k
+    }
+
+    /// Apply-time reconcile: `updates[i] = (addr, Some(balance))` when the address is a rich-list holder
+    /// (non-contract, non-system, non-burn, balance>0), else `None` to remove it. One atomic batch;
+    /// apply is serialized per node so the read-old → write-new is race-free. Maintains `rlcnt`.
+    pub fn richlist_reconcile(&self, updates: &[(String, Option<u64>)]) -> IntegrationResult<()> {
+        if updates.is_empty() { return Ok(()); }
+        let cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut delta: i64 = 0;
+        for (addr, new_bal) in updates {
+            let pos_key = format!("rlpos_{}", addr);
+            let old = self.persistent.db.get_cf(&cf, pos_key.as_bytes())?
+                .and_then(|v| v.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes));
+            if let Some(ob) = old {
+                batch.delete_cf(&cf, Self::rlst_sort_key(addr, ob));
+            }
+            match new_bal {
+                Some(nb) => {
+                    batch.put_cf(&cf, Self::rlst_sort_key(addr, *nb), &nb.to_be_bytes());
+                    batch.put_cf(&cf, pos_key.as_bytes(), &nb.to_be_bytes());
+                    if old.is_none() { delta += 1; }
+                }
+                None => {
+                    batch.delete_cf(&cf, pos_key.as_bytes());
+                    if old.is_some() { delta -= 1; }
+                }
+            }
+        }
+        if delta != 0 {
+            let cur = self.persistent.db.get_cf(&cf, b"rlcnt")?
+                .and_then(|v| v.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes)).unwrap_or(0);
+            let next = (cur as i64 + delta).max(0) as u64;
+            batch.put_cf(&cf, b"rlcnt", &next.to_be_bytes());
+        }
+        self.persistent.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Top-K holders (balance desc, address asc) — one bounded forward prefix scan, O(K).
+    pub fn richlist_top_k(&self, k: usize) -> IntegrationResult<Vec<(String, u64)>> {
+        use rocksdb::{IteratorMode, Direction};
+        let cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let prefix = b"rlst_";
+        let mut out: Vec<(String, u64)> = Vec::with_capacity(k.min(1024));
+        let iter = self.persistent.db.iterator_cf(&cf, IteratorMode::From(prefix, Direction::Forward));
+        for item in iter {
+            if out.len() >= k { break; }
+            let (key, val) = match item { Ok(kv) => kv, Err(_) => break };
+            if !key.starts_with(prefix) { break; }
+            if key.len() <= prefix.len() + 8 { continue; }
+            let addr = match std::str::from_utf8(&key[prefix.len() + 8..]) { Ok(s) => s, Err(_) => continue };
+            let bal = val.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes).unwrap_or(0);
+            out.push((addr.to_string(), bal));
+        }
+        Ok(out)
+    }
+
+    /// Total rich-list holders (non-contract, non-system, non-burn, balance>0), O(1).
+    pub fn richlist_holder_count(&self) -> u64 {
+        match self.persistent.db.cf_handle("node_registry") {
+            Some(cf) => self.persistent.db.get_cf(&cf, b"rlcnt").ok().flatten()
+                .and_then(|v| v.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes)).unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// Wipe the rich-list index (prefix range-deletes + reset count) — called before a full rebuild.
+    pub fn richlist_clear(&self) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        // '`' (0x60) = '_'(0x5f)+1, so [start_prefix, prefix+'`') is exactly the prefix's key range.
+        batch.delete_range_cf(&cf, b"rlst_".as_ref(), b"rlst`".as_ref());
+        batch.delete_range_cf(&cf, b"rlpos_".as_ref(), b"rlpos`".as_ref());
+        batch.delete_cf(&cf, b"rlcnt");
+        self.persistent.db.write(batch)?;
+        Ok(())
+    }
+
+    /// One-time marker so the O(N) rich-list rebuild scan runs once at boot, not on every restart.
+    pub fn richlist_index_built(&self) -> bool {
+        match self.persistent.db.cf_handle("node_registry") {
+            Some(cf) => self.persistent.db.get_cf(&cf, b"meta_richlist_index_v1").map(|o| o.is_some()).unwrap_or(false),
+            None => false,
+        }
+    }
+    pub fn set_richlist_index_built(&self) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        self.persistent.db.put_cf(&cf, b"meta_richlist_index_v1", b"1")?;
+        Ok(())
+    }
+
+    /// Full rebuild by streaming the AUTHORITATIVE `accounts` CF (the complete hot∪cold mirror — persist-
+    /// before-evict keeps it complete), not the bounded in-memory cache, so the index + holder_count are
+    /// complete at any holder count. Runs entirely off the state lock; clears then repopulates in bounded
+    /// batches. Returns Err on a storage failure so the caller can leave the one-time marker unset for retry.
+    pub fn richlist_rebuild_from_accounts(&self) -> IntegrationResult<()> {
+        use qnet_state::transaction::CANONICAL_BURN_ADDR;
+        self.richlist_clear()?;
+        let accounts_cf = self.persistent.db.cf_handle("accounts")
+            .ok_or_else(|| IntegrationError::StorageError("accounts column family not found".to_string()))?;
+        let mut batch: Vec<(String, Option<u64>)> = Vec::with_capacity(10_000);
+        let mut total: u64 = 0;
+        for item in self.persistent.db.iterator_cf(&accounts_cf, rocksdb::IteratorMode::Start) {
+            let (k, v) = item.map_err(|e| IntegrationError::StorageError(format!("richlist_iter_err: {}", e)))?;
+            let addr = match String::from_utf8(k.to_vec()) { Ok(s) => s, Err(_) => continue };
+            if addr.as_str() == CANONICAL_BURN_ADDR || addr.starts_with("system_") { continue; }
+            let acct: qnet_state::Account = match bincode::deserialize(&v) { Ok(a) => a, Err(_) => continue };
+            if acct.is_contract || acct.balance == 0 { continue; }
+            batch.push((addr, Some(acct.balance)));
+            if batch.len() >= 10_000 {
+                self.richlist_reconcile(&batch)?;
+                total = total.saturating_add(batch.len() as u64);
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            total = total.saturating_add(batch.len() as u64);
+            self.richlist_reconcile(&batch)?;
+        }
+        if crate::node::is_info() { println!("[INFO][RICHLIST] index_rebuilt holders={}", total); }
+        Ok(())
     }
 
     /// Heartbeat liveness index write (apply path). Key `lhb_{anchor_subwindow:010}_{node_id}` →
@@ -8982,6 +9145,14 @@ impl Storage {
                     let nr_iter = snap.iterator_cf(&nr_cf, rocksdb::IteratorMode::Start);
                     for item in nr_iter {
                         let (key, value) = item?;
+                        // Exclude the display-only rich-list index (rlst_/rlpos_/rlcnt/meta_richlist_
+                        // index_v1): it is NOT covered by registry_root/state_root, so serving it in the
+                        // consensus-bootstrap artifact would (a) let a byzantine server inject a forged
+                        // rich list and (b) diverge snapshot BYTES between honest nodes on a swallowed
+                        // reconcile error. The joiner rebuilds it locally from accounts after promote.
+                        if key.starts_with(b"rlst_") || key.starts_with(b"rlpos_")
+                            || key.starts_with(b"rlcnt") || key.starts_with(b"meta_richlist_index_v1")
+                        { continue; }
                         feed!(encoder, uncompressed_len, &(key.len() as u32).to_le_bytes());
                         feed!(encoder, uncompressed_len, &key);
                         feed!(encoder, uncompressed_len, &(value.len() as u32).to_le_bytes());
@@ -9705,6 +9876,9 @@ impl Storage {
                     if let Err(e) = self.rebuild_registry_lthash(height) {
                         println!("[WARN][SNAPSHOT] registry_lthash_rebuild_failed err={}", e);
                     }
+                    // Never inherit peer-supplied rich-list rows (display-only, snapshot-unverified) —
+                    // the boot rebuild re-derives from the restored accounts.
+                    let _ = self.richlist_clear();
                 }
             }
         }
@@ -10454,6 +10628,24 @@ impl Storage {
         Ok(None)
     }
     
+    /// Binder lineage-walk budget (macroblocks): the max genesis/pin-rooted N-2 QC walk a cold joiner will
+    /// re-verify. SINGLE SOURCE for both the snapshot SELECTION ceiling (download_and_load_snapshot) and the
+    /// binder (verify_snapshot_consensus_binding) so the two can never drift. ~2 weeks at 1 blk/s ⇒ realistic
+    /// binary-WS-pin rotation cadence; a fresh GALC capsule normally keeps the real walk ≈ 0.
+    const SNAPSHOT_MAX_WS_WALK_MB: u64 = 13_440;
+
+    /// Highest macroblock index contiguously present at/above the apply frontier (chain_height/90). Present
+    /// ⟹ inductively QC-verified (stored only after verify_v2). SINGLE SOURCE for the selection ceiling AND
+    /// the binder walk budget so the two extents can never drift. Bounded: chain_height/90 is a tight lower
+    /// bound and any fill-ahead is capped at SNAPSHOT_MAX_WS_WALK_MB, so this never scans O(chain).
+    fn own_contiguous_frontier_mb(&self) -> u64 {
+        let mut f = self.get_chain_height().unwrap_or(0) / 90;
+        while self.get_macroblock_by_height(f.saturating_add(1)).ok().flatten().is_some() {
+            f = f.saturating_add(1);
+        }
+        f
+    }
+
     /// v5.0: Download snapshot from network — chunked parallel download with fallback
     pub async fn download_and_load_snapshot(&self, p2p: &crate::unified_p2p::SimplifiedP2P) -> IntegrationResult<u64> {
         let peers = p2p.get_validated_active_peers();
@@ -10477,29 +10669,48 @@ impl Storage {
         let mut peer_heights: Vec<(String, u64)> = Vec::new();
 
         // A1: settle the genesis-rooted GALC pin BEFORE reading the ceiling — the capsule arrives +
-        // Dilithium-verifies asynchronously, so a fresh cold join (pin==0) must acquire it first, else the
-        // ceiling collapses to the h=90 anchor and the node replays the whole chain. Re-sample the
-        // (f+1-corroborated) network tip EACH pass: at t=0 the height cache can read 0 (peers up, head not
-        // yet reported) so a one-shot gate would skip the wait. should_have_capsule = fresh joiner (own
-        // frontier mb==0) AND network past the first-capsule height (mb >= GALC_MINT_INTERVAL) ⇒ a capsule
-        // provably exists and any peer can serve it. Young chain or an already-advanced node keeps the
-        // fail-open path below (ws_floor / early anchor) unchanged.
+        // Dilithium-verifies asynchronously, so a joiner without a near-tip pin acquires it first to keep the
+        // binder walk ≈ 0. Re-sample the (f+1)-corroborated tip EACH pass: at t=0 the cache can read 0 (peers
+        // up, head not yet reported), so should_have_capsule latches ONLY once a mature tip (mb >=
+        // GALC_MINT_INTERVAL) is corroborated. A corroborated young chain fail-opens; an unproven tip keeps
+        // polling. On mature-tip-but-pin-absent it returns retryable AnchorPending (bounded eclipse floor).
         static COLDJOIN_ANCHOR_PENDING_ROUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         const COLDJOIN_ANCHOR_PENDING_MAX: u64 = 10; // ~2 min of retries, then fail-open (eclipse liveness floor)
-        let own_frontier_mb = self.get_chain_height().unwrap_or(0) / 90;
-        if own_frontier_mb == 0 {                         // only a fresh joiner (no own lineage) waits for the pin
+        // Engage the pin-wait keyed on pin-staleness vs the (f+1)-corroborated mature tip — NOT own_frontier
+        // (concurrent linear sync advancing it, or a prior low-anchor adoption, must never disarm the wait).
+        // Skip it when a near-tip pin is already held OR our own contiguous verified frontier can already bind
+        // a snapshot within the walk budget (no capsule needed). All callers gate this on far-behind.
+        let corr_tip_mb = p2p.corroborated_head_ceiling() / 90;
+        // FRESH (near-tip) pin. Keyed on STALENESS, not mere existence — a stale nonzero pin (old capsule
+        // from a lagging peer) must NOT count as reached. Takes the tip explicitly so the loop re-checks
+        // against the LIVE corroborated tip each pass. Margin = 2 mint intervals, not 1: the capsule roots at
+        // the latest FINALIZED 40-boundary K while corr_tip_mb is the (unfinalized) microblock tip that leads
+        // it by up to ~1 interval (boundary floor + finality lag), so a 1-interval margin would misflag the
+        // freshest mintable capsule as stale for part of each cycle → spurious AnchorPending. 2 intervals
+        // absorbs the gap; a genuinely old capsule (≥2 intervals below tip) is still stale and the resulting
+        // binder walk stays ≤2 intervals (cheap).
+        let pin_fresh = |mb: u64, tip_mb: u64| mb > 0 && tip_mb > 0
+            && mb.saturating_add(2 * crate::galc::GALC_MINT_INTERVAL) > tip_mb;
+        // A node whose own contiguous frontier is within the walk budget of the tip binds cheaply from its
+        // own lineage and needs no capsule — do not stall it in the wait (it would AnchorPending pointlessly).
+        let frontier_can_bind = corr_tip_mb > 0
+            && corr_tip_mb.saturating_sub(self.own_contiguous_frontier_mb()) <= Self::SNAPSHOT_MAX_WS_WALK_MB;
+        if !pin_fresh(crate::galc::effective_pin_checkpoint().0, corr_tip_mb) && !frontier_can_bind {
             const GALC_PIN_WAIT_ATTEMPTS: u32 = 20;       // ≤ ~10s per cold-join call
             const GALC_PIN_WAIT_INTERVAL_MS: u64 = 500;
             let mut should_have_capsule = false;          // set true ONLY on a (f+1)-corroborated mature tip
+            let mut tip_live = corr_tip_mb;
             for i in 0..GALC_PIN_WAIT_ATTEMPTS {
-                if crate::galc::effective_pin_checkpoint().0 > 0 { break; }
-                // (f+1)-corroborated tip only: corroborated_head_ceiling() is the (f+1)-th highest fresh
-                // in-set peer height, or 0 when < f+1 corroborators — a lone lying peer cannot raise it, so
-                // it can't falsely trip the capsule-wait into AnchorPending. 0 = uncorroborated → keep polling.
-                let tip_mb = p2p.corroborated_head_ceiling() / 90;
-                if tip_mb >= crate::galc::GALC_MINT_INTERVAL { should_have_capsule = true; }
-                else if tip_mb > 0 { break; }              // CORROBORATED young chain (< first capsule) → fail-open to h=90
-                // tip_mb == 0: no f+1 corroboration yet → keep polling (never latch from an unproven tip)
+                // Re-read the LIVE (f+1)-corroborated tip each pass: corroborated_head_ceiling() is the
+                // (f+1)-th highest fresh in-set peer height, or 0 when < f+1 corroborators — a lone lying peer
+                // cannot raise it. 0 = uncorroborated → keep polling.
+                tip_live = p2p.corroborated_head_ceiling() / 90;
+                // Break on a FRESH pin (near the live tip), not mere existence: a stale nonzero pin keeps
+                // polling for the near-tip capsule via the re-request below, else the ceiling would collapse.
+                if pin_fresh(crate::galc::effective_pin_checkpoint().0, tip_live) { break; }
+                if tip_live >= crate::galc::GALC_MINT_INTERVAL { should_have_capsule = true; }
+                else if tip_live > 0 { break; }            // CORROBORATED young chain (< first capsule) → fail-open to h=90
+                // tip_live == 0: no f+1 corroboration yet → keep polling (never latch from an unproven tip)
                 if i % 4 == 0 {                            // re-request every ~2s (a reply may be lost)
                     let _ = p2p.broadcast_quic(&crate::unified_p2p::NetworkMessage::RequestGenesisCheckpoint {
                         requester_id: "snapshot_ceiling".to_string(),
@@ -10507,12 +10718,12 @@ impl Storage {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(GALC_PIN_WAIT_INTERVAL_MS)).await;
             }
-            // AnchorPending only when the network PROVABLY has a capsule (mature tip observed) but it hasn't
-            // arrived: return retryable so the caller bails to the desync tick rather than collapsing to h=90.
+            // Mature tip but still no FRESH pin (stale-nonzero OR absent): return retryable AnchorPending so
+            // the caller bails to the desync tick rather than rooting the ceiling at a stale/genesis extent.
             // Bounded escape after COLDJOIN_ANCHOR_PENDING_MAX rounds → fail-open to block-replay (eclipse floor).
             // The counter is process-global (shared across cold-join drivers); in a true eclipse every driver
             // takes the increment (none the reset), so it climbs monotonically to MAX — no livelock.
-            if should_have_capsule && crate::galc::effective_pin_checkpoint().0 == 0 {
+            if should_have_capsule && !pin_fresh(crate::galc::effective_pin_checkpoint().0, tip_live) {
                 let rounds = COLDJOIN_ANCHOR_PENDING_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if rounds <= COLDJOIN_ANCHOR_PENDING_MAX {
                     if crate::node::is_info() {
@@ -10527,25 +10738,26 @@ impl Storage {
             COLDJOIN_ANCHOR_PENDING_ROUNDS.store(0, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Exogenously-verifiable anchor ceiling — genesis-rooted, no peer-tip trust. A cold joiner verifies a
-        // snapshot anchor against two trusted extents: the GALC pin (genesis-signed) and its OWN highest
-        // CONTIGUOUS-present macroblock — present ⟹ inductively QC-verified from genesis (stored only after
-        // verify_v2). Take the higher + a budget-bounded fetch-walk above it. This lifts the ceiling with the
-        // node's own verified lineage instead of collapsing to h=90 on a late capsule (the cold-join wedge).
-        // Snapshot BYTES stay bound to the anchor's 2f+1 snapshot_root on promote, so a high ceiling never
-        // weakens trust. Negotiate the highest snapshot ≤ ceiling; bounded tail replays.
+        // Exogenously-verifiable negotiation ceiling — genesis/pin/frontier-rooted, NEVER a raw peer tip. A
+        // cold joiner may adopt any snapshot whose anchor the binder re-verifies from a trusted root within its
+        // REAL walk budget (SNAPSHOT_MAX_WS_WALK_MB, the same CONSTANT verify_snapshot_consensus_binding
+        // enforces). Roots: the GALC pin, the rotated WS floor, or its OWN highest contiguous-present macro-
+        // block (present ⟹ inductively QC-verified from genesis). Prior code capped this at base+15mb, below
+        // the latest snapshot whenever the verified extent lags it by ≥1 interval (40mb) → the joiner was
+        // forced onto a stale anchor + O(chain) tail. NOTE: the binder credits the pin as a walk root ONLY
+        // when usable (ws_floor < pin ≤ anchor); a capsule minted one interval ABOVE the negotiated anchor
+        // roots the binder at ws_floor instead, so at a boundary crossing an admitted snapshot may be re-
+        // verified from ws_floor/frontier (transiently rejected + retried next tick, never mis-bound). Bytes
+        // stay bound to the anchor's 2f+1 snapshot_root on promote and a forged anchor fails the QC walk →
+        // block replay, so the wide ceiling never weakens weak-subjectivity. base==0 + no mature tip ⇒ h=90.
         let verifiable_ceiling = {
-            const MAX_BINDING_WALK_MB: u64 = 15; // ≈ WALK_BUDGET_SECS / per-mb fetch
             let pin_mb = crate::galc::effective_pin_checkpoint().0;
-            let mut frontier_mb = self.get_chain_height().unwrap_or(0) / 90;
-            while self.get_macroblock_by_height(frontier_mb.saturating_add(1)).ok().flatten().is_some() {
-                frontier_mb = frontier_mb.saturating_add(1);
-            }
-            let base_mb = pin_mb.max(frontier_mb);
-            if base_mb == 0 {
+            let ws_floor_mb = crate::node::effective_ws_checkpoint().0;
+            let base_mb = pin_mb.max(ws_floor_mb).max(self.own_contiguous_frontier_mb());
+            if base_mb == 0 && corr_tip_mb < crate::galc::GALC_MINT_INTERVAL {
                 crate::node::SNAPSHOT_EARLY_ANCHOR_HEIGHT
             } else {
-                base_mb.saturating_add(MAX_BINDING_WALK_MB).saturating_mul(90)
+                base_mb.saturating_add(Self::SNAPSHOT_MAX_WS_WALK_MB).saturating_mul(90)
             }
         };
 
@@ -10773,17 +10985,21 @@ impl Storage {
         let walk_root: (u64, [u8; 32]) =
             if usable(pin.0) { (pin.0, pin.1) } else { ws_floor };
         // Bound the walk so a stale root can't degrade into an unbounded genesis-to-tip re-verify
-        // (DoS-on-self CPU + a wider trust window). The GALC capsule normally keeps the root within a
-        // few macroblocks of the anchor (walk ≈ 0); this is the FALLBACK ceiling when no capsule is
-        // held, sized to ~2 weeks so the binary-pin rotation cadence is realistic. INERT for a young
-        // chain (mb_idx - walk_root.0 small). At a 1000-node committee a full-bound walk is a one-time
-        // ~30 min QC re-verify; with a capsule it never approaches this.
-        const MAX_WS_WALK_MB: u64 = 13_440; // ~1.2M blocks (~2 weeks at 1 blk/s)
-        if mb_idx.saturating_sub(walk_root.0) > MAX_WS_WALK_MB {
+        // (DoS-on-self CPU + a wider trust window). The GALC capsule normally keeps the root within a few
+        // macroblocks of the anchor (walk ≈ 0); this is the FALLBACK ceiling when no capsule is held, sized
+        // to ~2 weeks so the binary-pin rotation cadence is realistic. Measured from the EFFECTIVE walk start
+        // = max(walk_root, own contiguous-present frontier): the fill loop below slides past present ⟹
+        // inductively-verified macroblocks, so the real fetch/verify work is mb_idx - frontier, not
+        // mb_idx - walk_root. Trust still roots at walk_root (pin/ws_floor); the frontier is self-verified,
+        // never peer-claimed, so crediting it adds no attack surface and keeps this budget consistent with
+        // the selection ceiling (which also folds in frontier). INERT for a young chain (span small).
+        const MAX_WS_WALK_MB: u64 = Storage::SNAPSHOT_MAX_WS_WALK_MB; // single-sourced with the selection ceiling
+        let walk_span_root = walk_root.0.max(self.own_contiguous_frontier_mb());
+        if mb_idx.saturating_sub(walk_span_root) > MAX_WS_WALK_MB {
             let _ = self.discard_snapshot_state(snapshot_height);
             return Err(IntegrationError::Other(format!(
-                "snapshot_ws_walk_too_long mb={} ws={} max={} action=upgrade_binary_pin",
-                mb_idx, walk_root.0, MAX_WS_WALK_MB
+                "snapshot_ws_walk_too_long mb={} start={} root={} max={} action=upgrade_binary_pin",
+                mb_idx, walk_span_root, walk_root.0, MAX_WS_WALK_MB
             )));
         }
         // Where to begin filling: from genesis (1) on a fresh chain; just above the walk_root when its
@@ -11099,6 +11315,10 @@ impl Storage {
         self.backfill_roster_indices()?;
         self.rebuild_committed_burn_wallet(height)?;
         self.rebuild_registry_lthash(height)?;
+        // Rich-list index is display-only and NOT snapshot-verified: clear any promoted/inherited rows
+        // + the build marker so the joiner never serves a peer-supplied (possibly forged) rich list.
+        // The boot rebuild then re-derives it locally from the verified accounts.
+        let _ = self.richlist_clear();
         // Wallet→token reverse index (NON-consensus): rebuild from the freshly promoted accounts so a
         // cold-joined node serves per-wallet token lists in O(held). Best-effort — a failure must never
         // wedge the consensus-critical promote. Mark dirty FIRST (drops OWNS_INDEX_READY + clears the
@@ -12039,6 +12259,41 @@ mod v32_9_pattern_c_tests {
         put_account(&storage, b"acct_bbb", b"v2");
         let after = storage.compute_canonical_state_root(90).expect("after");
         assert_ne!(before, after, "root must change when accounts CF mutates");
+    }
+
+    #[test]
+    fn richlist_index_matches_sorted_holders() {
+        let (storage, _dir) = open_test_storage();
+        // Small holder set; a tie (alice/bob both 500) exercises the address-ascending tiebreak.
+        let set: Vec<(String, u64)> = vec![
+            ("addr_charlie".to_string(), 300),
+            ("addr_alice".to_string(),   500),
+            ("addr_bob".to_string(),     500),
+            ("addr_dave".to_string(),    100),
+        ];
+        let updates: Vec<(String, Option<u64>)> =
+            set.iter().map(|(a, b)| (a.clone(), Some(*b))).collect();
+        storage.richlist_reconcile(&updates).expect("reconcile");
+
+        // Expected order: balance desc, then address asc on ties.
+        let mut expected = set.clone();
+        expected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        assert_eq!(storage.richlist_top_k(10).expect("top_k"), expected,
+            "top_k must be balance-desc, address-asc");
+        assert_eq!(storage.richlist_holder_count(), expected.len() as u64,
+            "holder_count must equal the holder total");
+
+        // Removal (None) drops a holder and decrements the count.
+        storage.richlist_reconcile(&[("addr_bob".to_string(), None)]).expect("remove");
+        let after_rm = storage.richlist_top_k(10).expect("top_k after remove");
+        assert!(!after_rm.iter().any(|(a, _)| a == "addr_bob"), "removed holder must be gone");
+        assert_eq!(storage.richlist_holder_count(), (expected.len() - 1) as u64);
+
+        // Balance update re-sorts: dave 100 -> 1000 becomes the top holder.
+        storage.richlist_reconcile(&[("addr_dave".to_string(), Some(1000))]).expect("update");
+        assert_eq!(storage.richlist_top_k(1).expect("top_k updated"),
+            vec![("addr_dave".to_string(), 1000)], "updated top holder must lead");
     }
 
     #[test]

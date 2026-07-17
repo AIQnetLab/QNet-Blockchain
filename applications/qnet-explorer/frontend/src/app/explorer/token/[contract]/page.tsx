@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import TokenIcon from '@/components/TokenIcon';
@@ -29,6 +29,7 @@ interface TokenHolder {
 
 interface TokenData {
   contract_address: string;
+  standard?: string;   // 'qrc20' | 'qrc721' — authoritative token standard from node state
   name: string;
   symbol: string;
   logo?: string;
@@ -105,30 +106,38 @@ export default function TokenPage() {
   const contract = params.contract as string;
 
   const [data, setData] = useState<TokenData | null>(null);
+  // Latest loaded data, readable inside the polling closure without re-creating it — so a transient
+  // poll failure never blanks an already-rendered page into the full error state.
+  const dataRef = useRef<TokenData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hasFetched, setHasFetched] = useState(false);
   const [holders, setHolders] = useState<TokenHolder[]>([]);
   const [holderCount, setHolderCount] = useState<number | null>(null);
   const [holdersTruncated, setHoldersTruncated] = useState(false);
+  const [txLimit, setTxLimit] = useState(50);        // Load-more: recent transfers page size
+  const [holderLimit, setHolderLimit] = useState(100); // Load-more: holders page size
+  const [tab, setTab] = useState<'transfers' | 'holders' | 'contract'>('transfers');
 
   const fetchToken = useCallback(async () => {
     if (!contract) return;
     try {
-      const res = await fetch(`/api/token/${contract}`);
+      const res = await fetch(`/api/token/${contract}?tx=${txLimit}`);
       const result = await res.json();
       if (result.success && result.data) {
+        dataRef.current = result.data;
         setData(result.data);
         setError(null);
       } else {
-        if (!data) setError(result.error || 'Token not found');
+        // Only surface an error if nothing has loaded yet — a transient poll blip keeps last-known.
+        if (!dataRef.current) setError(result.error || 'Token not found');
       }
     } catch {
-      if (!data) setError('Failed to load token');
+      if (!dataRef.current) setError('Failed to load token');
     } finally {
       setHasFetched(true);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [contract]);
+  }, [contract, txLimit]);
 
   useEffect(() => {
     fetchToken();
@@ -146,7 +155,7 @@ export default function TokenPage() {
     if (!contract) return;
     (async () => {
       try {
-        const res = await fetch(`/api/token/${contract}/holders?limit=100`);
+        const res = await fetch(`/api/token/${contract}/holders?limit=${holderLimit}`);
         const result = await res.json();
         if (result.success && result.data) {
           setHolders(result.data.holders || []);
@@ -155,7 +164,7 @@ export default function TokenPage() {
         }
       } catch { /* keep last-known */ }
     })();
-  }, [contract]);
+  }, [contract, holderLimit]);
 
   if (hasFetched && (error || !data)) {
     return (
@@ -169,12 +178,40 @@ export default function TokenPage() {
     return <div className="address-page" />;
   }
 
+  // Token standard, derived from transfer effects (any qrc721 row ⇒ NFT collection). Defaults to
+  // QRC-20 for a token with no transfers yet; can be made node-authoritative later.
+  // Authoritative standard from node state; fall back to transfer-derived for older nodes.
+  const tokenStd = (data.standard === 'qrc721' || data.transfers.some((t) => t.std === 'qrc721')) ? 'QRC-721' : 'QRC-20';
+
+  // Canonical QRC method surface — the token's ABI. Protocol-guaranteed (native standard
+  // logic), not custom bytecode, so it is the same for every token of a given standard.
+  const tokenIface = tokenStd === 'QRC-721'
+    ? [
+        { kind: 'read',  sig: 'ownerOf(tokenId)',               desc: 'Owner of an NFT id' },
+        { kind: 'read',  sig: 'balanceOf(address)',             desc: 'Number of NFTs held' },
+        { kind: 'write', sig: 'transfer(to, tokenId)',          desc: 'Send an NFT' },
+        { kind: 'write', sig: 'approve(spender, tokenId)',      desc: 'Authorize a spender for one NFT' },
+        { kind: 'write', sig: 'transferFrom(from, to, tokenId)', desc: 'Move an approved NFT' },
+        { kind: 'write', sig: 'mint(to, tokenId)',              desc: 'Issue a new NFT (owner)' },
+      ]
+    : [
+        { kind: 'read',  sig: 'balanceOf(address)',             desc: 'Token balance of an address' },
+        { kind: 'read',  sig: 'totalSupply()',                  desc: 'Total tokens in circulation' },
+        { kind: 'read',  sig: 'allowance(owner, spender)',      desc: 'Remaining approved amount' },
+        { kind: 'write', sig: 'transfer(to, amount)',           desc: 'Send tokens' },
+        { kind: 'write', sig: 'approve(spender, amount)',       desc: 'Authorize a spender' },
+        { kind: 'write', sig: 'transferFrom(from, to, amount)', desc: 'Move approved tokens' },
+        { kind: 'write', sig: 'mint(to, amount)',               desc: 'Issue tokens (if mintable, owner)' },
+        { kind: 'write', sig: 'burn(amount)',                   desc: 'Destroy tokens (if burnable)' },
+      ];
+
   return (
     <div className="address-page">
       {/* Header */}
       <div className="block-header">
         <div className="block-header-top">
           <span className="block-label">TOKEN</span>
+          <span className="type-badge type-contract-call">{tokenStd}</span>
           {data.symbol ? <span className="type-badge type-transfer">{data.symbol}</span> : null}
         </div>
         <div className="block-hash-display" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -197,6 +234,10 @@ export default function TokenPage() {
             <span className="detail-value">{data.symbol || 'N/A'}</span>
           </div>
           <div className="detail-row">
+            <span className="detail-label">Standard</span>
+            <span className="detail-value">{tokenStd}</span>
+          </div>
+          <div className="detail-row">
             <span className="detail-label">Contract</span>
             <span className="detail-value">
               <span className="address-link">{truncate(contract, 12, 8)}</span>
@@ -207,24 +248,31 @@ export default function TokenPage() {
             <span className="detail-label">Decimals</span>
             <span className="detail-value">{data.decimals}</span>
           </div>
-          <div className="detail-row">
-            <span className="detail-label">Circulating Supply</span>
-            <span className="detail-value">
-              {data.total_supply}{data.symbol ? ` ${data.symbol}` : ''}
-            </span>
-          </div>
-          <div className="detail-row">
-            <span className="detail-label">Total Issued</span>
-            <span className="detail-value">
-              {data.total_minted}{data.symbol ? ` ${data.symbol}` : ''}
-            </span>
-          </div>
-          <div className="detail-row">
-            <span className="detail-label">Total Burned</span>
-            <span className="detail-value">
-              {data.total_burned}{data.symbol ? ` ${data.symbol}` : ''}
-            </span>
-          </div>
+          {/* Fungible supply figures only. QRC-721 collections keep no on-chain total_supply/minted/burned
+              counter (deliberately — an NFT standard tracks per-token ownership, not a divisible balance),
+              so the node returns 0/0/0; suppress the rows rather than misrepresent a collection as 0 supply. */}
+          {tokenStd !== 'QRC-721' && (
+            <>
+              <div className="detail-row">
+                <span className="detail-label">Circulating Supply</span>
+                <span className="detail-value">
+                  {data.total_supply}{data.symbol ? ` ${data.symbol}` : ''}
+                </span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-label">Total Issued</span>
+                <span className="detail-value">
+                  {data.total_minted}{data.symbol ? ` ${data.symbol}` : ''}
+                </span>
+              </div>
+              <div className="detail-row">
+                <span className="detail-label">Total Burned</span>
+                <span className="detail-value">
+                  {data.total_burned}{data.symbol ? ` ${data.symbol}` : ''}
+                </span>
+              </div>
+            </>
+          )}
           <div className="detail-row">
             <span className="detail-label">Deployer</span>
             <span className="detail-value">
@@ -234,7 +282,17 @@ export default function TokenPage() {
         </div>
       </div>
 
+      {/* Tabs (top-L1 token-page layout): Transfers | Holders | Contract */}
+      <div className="token-tabs">
+        <button className={`token-tab ${tab === 'transfers' ? 'active' : ''}`} onClick={() => setTab('transfers')}>Transfers</button>
+        <button className={`token-tab ${tab === 'holders' ? 'active' : ''}`} onClick={() => setTab('holders')}>
+          Holders{holderCount !== null ? ` (${holderCount})` : ''}
+        </button>
+        <button className={`token-tab ${tab === 'contract' ? 'active' : ''}`} onClick={() => setTab('contract')}>Contract</button>
+      </div>
+
       {/* Holders (off-chain, from the PG tx index) */}
+      {tab === 'holders' && (
       <div className="block-card">
         <h2 className="card-title">Holders{holderCount !== null ? ` (${holderCount})` : ''}</h2>
         {holdersTruncated && (
@@ -268,9 +326,20 @@ export default function TokenPage() {
             </tbody>
           </table>
         )}
+        {holders.length >= holderLimit && holderLimit < 500 && (
+          <div style={{ textAlign: 'center', marginTop: 12 }}>
+            <button
+              onClick={() => setHolderLimit((l) => Math.min(l + 100, 500))}
+              style={{ padding: '6px 18px', borderRadius: 6, border: '1px solid rgba(0,229,240,0.4)',
+                       background: 'transparent', color: '#00e5f0', cursor: 'pointer', fontSize: 13 }}
+            >Load more</button>
+          </div>
+        )}
       </div>
+      )}
 
       {/* Recent transfers */}
+      {tab === 'transfers' && (
       <div className="block-card">
         <h2 className="card-title">Recent Transfers ({data.transfers.length})</h2>
         {data.transfers.length === 0 ? (
@@ -322,7 +391,78 @@ export default function TokenPage() {
             </tbody>
           </table>
         )}
+        {data.transfers.length >= txLimit && txLimit < 500 && (
+          <div style={{ textAlign: 'center', marginTop: 12 }}>
+            <button
+              onClick={() => setTxLimit((l) => Math.min(l + 50, 500))}
+              style={{ padding: '6px 18px', borderRadius: 6, border: '1px solid rgba(0,229,240,0.4)',
+                       background: 'transparent', color: '#00e5f0', cursor: 'pointer', fontSize: 13 }}
+            >Load more</button>
+          </div>
+        )}
       </div>
+      )}
+
+      {/* Contract: verification + standard interface. QRC-20/721 are native-standard
+          contracts (canonical protocol token logic, no custom bytecode) — hence a
+          Standard-Contract attestation, not a source recompile. */}
+      {tab === 'contract' && (
+      <div className="block-card">
+        <h2 className="card-title">Contract</h2>
+        <div className="details-grid">
+          <div className="detail-row">
+            <span className="detail-label">Verification</span>
+            <span className="detail-value" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <span className="type-badge type-transfer">✓ Standard Contract</span>
+              <span style={{ opacity: 0.85 }}>{tokenStd}</span>
+            </span>
+          </div>
+          <div className="detail-row">
+            <span className="detail-label" />
+            <span className="detail-value" style={{ opacity: 0.8, fontSize: '0.9em', lineHeight: 1.55 }}>
+              Native QNet {tokenStd} token — it runs the protocol&apos;s canonical token logic,
+              not custom bytecode. Its behavior is defined by the QNet protocol, so no
+              per-contract source verification is required.
+            </span>
+          </div>
+          <div className="detail-row">
+            <span className="detail-label">Standard</span>
+            <span className="detail-value">{tokenStd}</span>
+          </div>
+          <div className="detail-row">
+            <span className="detail-label">Contract</span>
+            <span className="detail-value">
+              <span className="address-link">{truncate(contract, 12, 8)}</span>
+              <CopyBtn text={contract} />
+            </span>
+          </div>
+          <div className="detail-row">
+            <span className="detail-label">Deployer</span>
+            <span className="detail-value"><AddrLink addr={data.deployer} /></span>
+          </div>
+          <div className="detail-row">
+            <span className="detail-label">Deployed</span>
+            <span className="detail-value">{data.deployed_at || '—'}</span>
+          </div>
+        </div>
+
+        <h3 style={{ margin: '18px 0 8px', fontSize: '0.95rem', opacity: 0.9 }}>Standard Interface</h3>
+        <table className="block-table">
+          <thead>
+            <tr><th>Kind</th><th>Method</th><th>Description</th></tr>
+          </thead>
+          <tbody>
+            {tokenIface.map((m, i) => (
+              <tr key={i}>
+                <td><span className={`type-badge type-${m.kind === 'read' ? 'transfer' : 'contract-call'}`}>{m.kind}</span></td>
+                <td style={{ fontFamily: 'monospace' }}>{m.sig}</td>
+                <td style={{ opacity: 0.85 }}>{m.desc}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      )}
     </div>
   );
 }

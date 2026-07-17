@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { setCache } from '@/lib/explorer-cache';
 import { formatTokenAmount } from '@/lib/token-format';
+import TokenIcon from '@/components/TokenIcon';
 
 // Decoded QRC-20 ContractCall: the contract is the tx `to`, the method + args
 // live in the tx `data` JSON ({"method","args":[...]}). Decimals must be
@@ -137,7 +138,7 @@ const CopyBtn = ({ text }: { text: string }) => {
 // "Transferred X SYMBOL to <addr>", resolving decimals + symbol from the token
 // contract. Falls back to base-unit display if the token lookup fails.
 const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
-  const [meta, setMeta] = useState<{ symbol: string; decimals: number } | null>(null);
+  const [meta, setMeta] = useState<{ symbol: string; decimals: number; logo: string } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -149,6 +150,7 @@ const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
           setMeta({
             symbol: result.data.symbol || '',
             decimals: typeof result.data.decimals === 'number' ? result.data.decimals : 9,
+            logo: result.data.logo || '',
           });
         }
       } catch {
@@ -161,6 +163,7 @@ const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
   // Until decimals are known, show raw base units (still exact, no float).
   const decimals = meta ? meta.decimals : 0;
   const symbol = meta ? meta.symbol : '';
+  const logo = meta ? meta.logo : '';
   const amount = formatTokenAmount(call.amountRaw, decimals);
 
   const addrLink = (addr: string) => {
@@ -184,7 +187,12 @@ const TokenTransferCard = ({ call }: { call: DecodedTokenCall }) => {
         </div>
         <div className="detail-row">
           <span className="detail-label">Amount</span>
-          <span className="detail-value">{amount}{symbol ? ` ${symbol}` : ''}</span>
+          <span className="detail-value">
+            <Link href={`/explorer/token/${call.contract}`} className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <TokenIcon logo={logo} symbol={symbol} address={call.contract} size={16} />
+              <span>{amount}{symbol ? ` ${symbol}` : ''}</span>
+            </Link>
+          </span>
         </div>
         <div className="detail-row">
           <span className="detail-label">Recipient</span>
@@ -331,11 +339,23 @@ export default function TransactionPage() {
           </div>
           <div className="detail-row">
             <span className="detail-label">Amount</span>
-            <span className="detail-value">{tx.amount || '0 QNC'}</span>
+            <span className="detail-value" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              {(tx.amount || '0').includes('QNC') ? (
+                <Link href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <TokenIcon native size={16} />
+                  <span>{tx.amount || '0'}</span>
+                </Link>
+              ) : (
+                <span>{tx.amount || '0'}</span>
+              )}
+            </span>
           </div>
           <div className="detail-row">
             <span className="detail-label">Fee</span>
-            <span className="detail-value">{tx.fee || '0 QNC'}</span>
+            <span className="detail-value" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              {(tx.fee || '0').includes('QNC') && <TokenIcon native size={16} />}
+              <span>{tx.fee || '0'}</span>
+            </span>
           </div>
           <div className="detail-row">
             <span className="detail-label">Nonce</span>

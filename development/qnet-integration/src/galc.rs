@@ -87,11 +87,16 @@ pub fn committee_fields_digest(mb: &qnet_state::MacroBlock) -> [u8; 32] {
     out
 }
 
-// Adopted GALC root (monotonic by index). 0 ⇒ none held ⇒ the binary pin governs.
+// Adopted GALC root (monotonic by index). 0 ⇒ none held ⇒ the binary pin governs. The root is 13 words
+// (index + hash + 2 digests) published as ONE unit: ADOPT_LOCK serializes writers (no torn/regressed
+// publish; the monotonic guard is race-free under it) and GALC_SEQ is a seqlock so a reader never observes
+// an index from one capsule with a hash from another.
 pub static GALC_MB: AtomicU64 = AtomicU64::new(0);
 static GALC_HASH: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static GALC_DIGEST_ANCHOR: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 static GALC_DIGEST_PRED: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static GALC_SEQ: AtomicU64 = AtomicU64::new(0);                 // seqlock generation: even=stable, odd=writing
+static ADOPT_LOCK: Lazy<parking_lot::Mutex<()>> = Lazy::new(|| parking_lot::Mutex::new(()));
 
 fn store32(slot: &[AtomicU64; 4], h: &[u8; 32]) {
     for i in 0..4 {
@@ -116,11 +121,15 @@ fn load32(slot: &[AtomicU64; 4]) -> [u8; 32] {
 pub fn effective_pin_checkpoint() -> (u64, [u8; 32], [u8; 32], [u8; 32]) {
     let (bi, bh) = crate::genesis_constants::ws_checkpoint();
     let (bda, bdp) = crate::genesis_constants::ws_checkpoint_committee_digests();
-    let gi = GALC_MB.load(Ordering::SeqCst);
-    if gi > bi {
-        (gi, load32(&GALC_HASH), load32(&GALC_DIGEST_ANCHOR), load32(&GALC_DIGEST_PRED))
-    } else {
-        (bi, bh, bda, bdp)
+    // Seqlock read: retry while a writer is mid-publish (odd seq) or the seq changed across the read, so the
+    // (index, hash, digests) tuple is always from ONE capsule — never torn across two vintages.
+    loop {
+        let s1 = GALC_SEQ.load(Ordering::Acquire);
+        if s1 & 1 != 0 { std::hint::spin_loop(); continue; }
+        let gi = GALC_MB.load(Ordering::SeqCst);
+        let (gh, ga, gp) = (load32(&GALC_HASH), load32(&GALC_DIGEST_ANCHOR), load32(&GALC_DIGEST_PRED));
+        if GALC_SEQ.load(Ordering::Acquire) != s1 { std::hint::spin_loop(); continue; }
+        return if gi > bi { (gi, gh, ga, gp) } else { (bi, bh, bda, bdp) };
     }
 }
 
@@ -165,11 +174,18 @@ pub async fn verify_capsule(c: &GenesisCheckpoint, expected_network_id: &[u8; 32
 /// Adopt a VERIFIED capsule as the GALC root, monotonically by index. Caller MUST have run
 /// verify_capsule. Only raises the hash-trust root; never touches the finality floor / SNAPSHOT_ANCHOR.
 pub fn adopt_verified(c: &GenesisCheckpoint) {
-    if c.mb_index <= GALC_MB.load(Ordering::SeqCst) { return; } // monotonic-up
+    let _g = ADOPT_LOCK.lock();                                 // serialize writers: guard+publish is atomic
+    if c.mb_index <= GALC_MB.load(Ordering::SeqCst) { return; } // monotonic-up (race-free under the lock)
+    // SeqCst on BOTH seq RMWs (not Release): Release orders only PRIOR writes before the RMW, leaving
+    // the SUBSEQUENT data stores free to become visible before the odd-seq publication on a weakly
+    // ordered target — a reader could then read a torn (index, hash, digest) tuple across two even
+    // seq reads. SeqCst on the seq RMWs + the already-SeqCst data stores gives a single total order.
+    GALC_SEQ.fetch_add(1, Ordering::SeqCst);                    // enter write (odd) — readers retry
     store32(&GALC_HASH, &c.mb_hash);
     store32(&GALC_DIGEST_ANCHOR, &c.committee_digest_anchor);
     store32(&GALC_DIGEST_PRED, &c.committee_digest_pred);
     GALC_MB.store(c.mb_index, Ordering::SeqCst);
+    GALC_SEQ.fetch_add(1, Ordering::SeqCst);                    // exit write (even) — snapshot consistent
     println!("[INFO][GALC] root_adopted mb={} hash={}", c.mb_index, hex::encode(&c.mb_hash[..8]));
 }
 
@@ -274,6 +290,11 @@ pub async fn verify_partial(
     if version != GALC_VERSION || mb_index < 2 { return false; }
     if !crate::genesis_constants::is_legacy_genesis_node(genesis_id) { return false; }
     let pk = match crate::genesis_constants::get_genesis_anchor_pk(genesis_id) { Some(p) => p, None => return false };
+    // Bound concurrent post-quantum verifies (DoS): the receive handler spawns a detached task per message
+    // and the cheap pre-checks above cannot screen a SPOOFED genesis_id (only the sig can), so a flood would
+    // otherwise pile unbounded Dilithium work. Drop when no permit is free — a real partial re-arrives on the
+    // ~hourly mint cadence. Mirrors receive_capsule's gate; mint_tick uses add_partial and is unaffected.
+    let _permit = match VERIFY_SEM.try_acquire() { Ok(p) => p, Err(_) => return false };
     let pre = preimage(version, network_id, mb_index, mb_hash, digest_anchor, digest_pred, minted_at_height);
     qnet_consensus::consensus_crypto::verify_consensus_signature_bound(genesis_id, &pre, sig, &pk).await
 }

@@ -89,12 +89,23 @@ const ActivityRow = memo(function ActivityRow({ item }: { item: ActivityItem }) 
         )}
       </td>
       <td className="col-amount">
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          {item.tokenContract
-            ? <TokenIcon logo={item.tokenLogo} symbol={item.tokenSymbol} address={item.tokenContract} size={16} />
-            : item.type === 'Transfer' && <TokenIcon native size={16} />}
-          <span>{item.amount}</span>
-        </span>
+        {(() => {
+          // Token label click-through: QRC-20 → its contract page, native value → the QNC coin page.
+          const href = item.tokenContract
+            ? `/explorer/token/${item.tokenContract}`
+            : item.amount.includes('QNC') ? '/explorer/qnc' : null;
+          const chip = (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              {item.tokenContract
+                ? <TokenIcon logo={item.tokenLogo} symbol={item.tokenSymbol} address={item.tokenContract} size={16} />
+                : item.amount.includes('QNC') && <TokenIcon native size={16} />}
+              <span>{item.amount}</span>
+            </span>
+          );
+          return href
+            ? <Link href={href} className="token-amount-link">{chip}</Link>
+            : chip;
+        })()}
       </td>
       <td className="col-block">
         <Link href={`/explorer/block/${item.block}`}>{item.block}</Link>

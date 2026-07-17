@@ -299,6 +299,21 @@ const PEER_HEIGHT_ATTEST_TTL_SECS: u64 = 120;
 // genesis spread; a head beyond it is a forged over-claim and is overruled by the median.
 const HEAD_OVERCLAIM_MARGIN: u64 = 90;
 
+/// Widened-oracle head ceiling, TYPE-quarantined: only the registration arm-liveness ladder consumes
+/// it; every sync/failover/clamp consumer takes u64 and cannot accept this by accident. Never unwrap
+/// .0 into a sync target or consensus input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WidenedCeiling(pub u64);
+
+/// Max deficit an armable joiner may show against the WIDENED ceiling / capsule floor:
+/// strict-tier deficit bound + one GALC mint interval (capsule cadence lag) + finality window
+/// (K finalizing → its capsule minting). Linked to the canonical constants so a retune of either
+/// cannot silently desync the widened envelope from the strict bound / real mint cadence.
+pub const DEFICIT_BOUND_WIDE: u64 =
+    crate::node::DEFICIT_BOUND
+    + crate::galc::GALC_MINT_INTERVAL * qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL
+    + 180;
+
 /// v3.0: Check if block is already pending in sync queue
 pub fn is_block_pending_sync(height: u64) -> bool {
     PENDING_SYNC_BLOCKS.contains_key(&height)
@@ -10893,13 +10908,18 @@ impl SimplifiedP2P {
         })
     }
 
-    /// Add peer to regional map
+    /// Add peer to regional map. Dedup by addr: repeated dial attempts at a never-connecting peer
+    /// (bootstrap retries, arm-ladder dials) must not grow the Vec unboundedly — the establishment
+    /// sweep iterates it in full.
     fn add_peer_to_region(&self, peer: PeerInfo) {
         let mut regional_peers = self.regional_peers.lock();
-        regional_peers
+        let entry = regional_peers
             .entry(peer.region.clone())
-            .or_insert_with(Vec::new)
-            .push(peer);
+            .or_insert_with(Vec::new);
+        if entry.iter().any(|p| p.addr == peer.addr) {
+            return;
+        }
+        entry.push(peer);
     }
     
     /// STARTUP FIX: Start regional connection establishment asynchronously (non-blocking startup)  
@@ -17712,7 +17732,9 @@ impl SimplifiedP2P {
     /// in-set peers (round committee ∪ genesis). >=f+1 members attesting a height ⇒ >=1 honest ⇒ a real
     /// lower bound on the true tip, so stragglers cannot demote a tip the honest majority attests (a median
     /// would). 0 if <f+1 fresh corroborators ⇒ the clamp trusts raw (bootstrap/isolated). Self EXCLUDED
-    /// (peer-only). SYNC-HINT oracle ONLY (clamp_overclaim) — never a consensus/failover input.
+    /// (peer-only). SYNC-HINT oracle ONLY — sanctioned consumers: clamp_overclaim and the registration
+    /// arm gate (both liveness hints; the on-chain attest_epoch verifier is the safety backstop) —
+    /// never a consensus/failover input.
     pub fn corroborated_head_ceiling(&self) -> u64 {
         frontier_order_statistic(self.fresh_in_set_peer_heights())
     }
@@ -17736,6 +17758,81 @@ impl SimplifiedP2P {
             })
             .map(|e| e.value().last_block_height)
             .collect()
+    }
+
+    /// WIDENED head ceiling for the arm-liveness ladder ONLY. The newtype hard-quarantines the value:
+    /// clamp_overclaim / get_best_peer_height / sync targeting / failover take u64 and CANNOT consume
+    /// it by accident. Contributors are fresh connected NON-in-set peers (both link directions),
+    /// Sybil-capped at ≤2 per /16 chosen by lexicographically-lowest peer id (not by height — the pick
+    /// is not attacker-steerable), ≤16 total; each height is clamped to local_tip + DEFICIT_BOUND_WIDE
+    /// + HEAD_OVERCLAIM_MARGIN before the order statistic (a HealthPing binds authorship, not truth —
+    /// a tracking liar can otherwise defer the joiner forever). 0 if <4 capped contributors.
+    pub fn corroborated_head_ceiling_widened(&self, local_tip: u64) -> WidenedCeiling {
+        let cc = CURRENT_COMMITTEE.read().clone();
+        let now = self.current_timestamp();
+        let clamp = local_tip
+            .saturating_add(DEFICIT_BOUND_WIDE)
+            .saturating_add(HEAD_OVERCLAIM_MARGIN);
+        let mut by_prefix: std::collections::BTreeMap<String, Vec<(String, u64)>> = std::collections::BTreeMap::new();
+        for e in self.connected_peers_lockfree.iter() {
+            let p = e.value();
+            let ip = p.addr.split(':').next().unwrap_or("");
+            let in_set = cc.members.contains(&p.id) || cc.genesis_ids.contains(&p.id)
+                || crate::genesis_constants::get_genesis_id_by_ip(ip).is_some();
+            if in_set { continue; } // strict oracle territory
+            if p.last_block_height == 0
+                || now.saturating_sub(p.last_height_attested_at) >= PEER_HEIGHT_ATTEST_TTL_SECS { continue; }
+            let prefix = match extract_subnet_prefix(ip, 2) { Some(pfx) => pfx, None => continue };
+            by_prefix.entry(prefix).or_default().push((p.id.clone(), p.last_block_height));
+        }
+        let mut contributors: Vec<u64> = Vec::new();
+        'outer: for (_, mut peers) in by_prefix {
+            peers.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, h) in peers.into_iter().take(2) {
+                contributors.push(h.min(clamp));
+                if contributors.len() >= 16 { break 'outer; }
+            }
+        }
+        WidenedCeiling(frontier_order_statistic(contributors))
+    }
+
+    /// Tier-1.5 of the arm-liveness ladder: dial the EXACT strict-predicate set
+    /// (CURRENT_COMMITTEE.members ∪ genesis_ids) so a starved joiner earns strict corroborators.
+    /// NOT committee_for_height(tip) — a starved joiner's finality lags its tip, and epoch-skewed
+    /// members are absent from the predicate ⇒ add zero corroborators. Salt-ranked, capped, skips
+    /// already-connected; genesis IPs are the pinned always-present floor.
+    pub fn dial_in_set_for_arm(&self) {
+        const ARM_DIAL_K: usize = 16;
+        let cc = CURRENT_COMMITTEE.read().clone();
+        use sha3::{Digest, Sha3_256};
+        let salt = { let mut h = Sha3_256::new(); h.update(self.node_id.as_bytes()); h.finalize() };
+        let mut ranked: Vec<(u64, String)> = cc.members.iter().chain(cc.genesis_ids.iter())
+            .filter(|id| **id != self.node_id)
+            .map(|id| {
+                let mut h = Sha3_256::new(); h.update(&salt); h.update(id.as_bytes());
+                let d = h.finalize();
+                (u64::from_le_bytes(d[0..8].try_into().unwrap_or([0u8; 8])), id.clone())
+            })
+            .collect();
+        ranked.sort_by_key(|(k, _)| *k);
+        let mut addrs: Vec<String> = Vec::new();
+        for (_, id) in ranked {
+            if addrs.len() >= ARM_DIAL_K { break; }
+            if self.peer_id_to_addr.contains_key(&id) { continue; }
+            let addr = if id.starts_with("genesis_node_") {
+                match Self::resolve_genesis_node_address(&id) { Some(a) => a, None => continue }
+            } else {
+                match crate::genesis_constants::get_node_endpoint_ip(&id) { Some(ip) => format!("{}:8001", ip), None => continue }
+            };
+            if self.connected_peers_lockfree.contains_key(&addr) { continue; }
+            addrs.push(addr);
+        }
+        if !addrs.is_empty() {
+            if crate::node::is_info() {
+                println!("[INFO][REG] arm_dial_in_set count={}", addrs.len());
+            }
+            self.connect_to_bootstrap_peers(&addrs);
+        }
     }
 
     /// Anti-forgery CEILING for the height oracle (single source for get_best/get_max_peer_height): a
@@ -19612,43 +19709,6 @@ impl SimplifiedP2P {
             }
             self.request_block_repair(height).await
         }
-    }
-    
-    /// Batch sync for catch-up - request blocks in batches
-    pub async fn batch_sync(&self, from_height: u64, to_height: u64, batch_size: u64) -> Result<(), String> {
-        // v13.0: Guard against inverted ranges
-        if from_height > to_height {
-            if crate::node::is_warn() {
-                println!("[WARN][SYNC] batch_inverted_range from={} to={} skipped", from_height, to_height);
-            }
-            return Ok(());
-        }
-
-        if crate::node::is_info() {
-            println!("[INFO][SYNC] Starting batch sync from {} to {} (batch size: {})",
-                     from_height, to_height, batch_size);
-        }
-
-        let mut current = from_height;
-
-        while current <= to_height {
-            let batch_to = std::cmp::min(current + batch_size - 1, to_height);
-            
-            if crate::node::is_info() {
-                println!("[INFO][SYNC] Syncing batch {}-{}", current, batch_to);
-            }
-            self.sync_blocks(current, batch_to).await?;
-            
-            // Wait a bit between batches to avoid overwhelming the network
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            
-            current = batch_to + 1;
-        }
-        
-        if crate::node::is_info() {
-            println!("[INFO][SYNC] Batch sync complete!");
-        }
-        Ok(())
     }
     
     /// Request consensus state from peers for recovery

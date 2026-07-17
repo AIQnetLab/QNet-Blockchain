@@ -2869,31 +2869,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     
-    // v32.11: idempotency — save_activation_code emits a fresh-timestamped
-    // NodeRegistration+Activation TX pair on every call. The previous "double
-    // call is safe" assumption was wrong: timestamps differ → tx hashes
-    // differ → mempool admits both → 2 broadcasts in 6s → CPU spike on
-    // genesis verify path → producer misses 1-sec deadline → view-change
-    // cascade → minority fork. Skip the fallback if early activation already
-    // persisted the code locally.
+    // save_activation_code is LOCAL-only now (validate + device-register + persist) — the on-chain
+    // NodeRegistration arm lives in the convergence driver spawned at net_ready, so this call is
+    // sync-independent and safe on a cold joiner. Skip once persisted (idempotency: no re-validation
+    // or device re-POST per boot).
     if !activation_code.is_empty() {
         let already_persisted = node.get_storage().load_activation_code()
             .map(|opt| opt.is_some())
             .unwrap_or(false);
-        // Chain is the source of truth: skip the (re)send only if the code is persisted AND this
-        // node's NodeRegistration is already on-chain. If persisted on an earlier boot but the
-        // registration never landed (dropped join-time broadcast), re-send so the binding TX reaches
-        // a producer. One send per boot; the early-activation path is sync-gated (OFF on a cold
-        // joiner) so there is no same-boot double-submit.
-        let reg_onchain = node.get_storage().is_node_registration_onchain(&node.get_node_id());
-        if already_persisted && reg_onchain {
-            if is_info() { println!("[INFO][NODE] activation_persisted reg_onchain=true skip=fallback_call"); }
-        } else if !qnet_integration::node::coordinator_is_synchronized() {
-            // Defer to the sync-gated activation path (single source of truth). A registration whose
-            // burn-attestors are collected pre-sync (local height ~0 → committee_for_height None →
-            // genesis-set fallback) is rejected post-genesis; sending only once synced binds it to the
-            // true N-2 committee. The sync-gated path re-sends until the registration lands on-chain.
-            if is_info() { println!("[INFO][NODE] activation_send_deferred reason=not_synced path=sync_gated"); }
+        if already_persisted {
+            if is_info() { println!("[INFO][NODE] activation_persisted skip=fallback_call"); }
         } else if let Err(e) = node.save_activation_code(&activation_code, node_type).await {
             if is_warn() { println!("[WARN][NODE] activation_code_save_failed err={}", e); }
         }

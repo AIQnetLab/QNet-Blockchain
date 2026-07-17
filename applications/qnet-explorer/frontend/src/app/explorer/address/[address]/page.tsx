@@ -483,7 +483,15 @@ export default function AddressPage() {
                         })()}
                       </td>
                       <td className={isSend ? 'amount-out' : 'amount-in'}>
-                        {isSend ? '-' : '+'}{tx.amount}
+                        {tx.amount.includes('QNC') ? (
+                          <Link href="/explorer/qnc" className="token-amount-link" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                            <TokenIcon native size={16} />
+                            <span>{isSend ? '-' : '+'}{tx.amount}</span>
+                          </Link>
+                        ) : (
+                          // No value moved (Heartbeat/Registration/etc.): bare amount, no +/- sign.
+                          <span>{tx.amount}</span>
+                        )}
                       </td>
                       <td>
                         <Link href={`/explorer/block/${tx.block}`} className="address-link">

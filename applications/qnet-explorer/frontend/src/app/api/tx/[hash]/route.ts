@@ -104,7 +104,7 @@ function parseTxTypeData(raw: unknown): Record<string, unknown> | null {
 // Fetch TX from Node RPC (fallback if not in DB)
 async function fetchTransaction(hash: string): Promise<Record<string, unknown> | null> {
   try {
-    const res = await fetch(`${NODE_RPC_URL}/api/v1/transaction/${hash}`, {
+    const res = await fetch(`${NODE_RPC_URL}/api/v1/transaction/${encodeURIComponent(hash)}`, {
       cache: 'no-store',
       signal: AbortSignal.timeout(3000),
     });
@@ -271,7 +271,7 @@ export async function GET(
       const gasPrice = dbTx.gas_price || 0;
       const gasLimit = dbTx.gas_limit || 0;
       const totalFee = gasPrice * gasLimit;
-      const fee = totalFee > 0 ? formatAmount(totalFee) : '0 QNC';
+      const fee = totalFee > 0 ? formatAmount(totalFee) : '0';
       
       // Get timestamp - if 0, fetch from block
       // Note: PostgreSQL BIGINT may come as string, so convert first
@@ -409,12 +409,12 @@ export async function GET(
     // Calculate fee: gas_price * gas_limit, or 0 for genesis/system transactions
     let fee: string;
     if (isSystemTx) {
-      fee = '0 QNC';
+      fee = '0';
     } else {
       const gasPrice = (tx.gas_price as number) || 0;
       const gasLimit = (tx.gas_limit as number) || 0;
       const totalFee = gasPrice * gasLimit;
-      fee = totalFee > 0 ? formatAmount(totalFee) : '0 QNC';
+      fee = totalFee > 0 ? formatAmount(totalFee) : '0';
     }
     
     // Return ALL fields from transaction

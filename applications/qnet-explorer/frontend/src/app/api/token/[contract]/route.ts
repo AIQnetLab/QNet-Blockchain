@@ -24,6 +24,7 @@ function nodeHeaders(): Record<string, string> {
 // -> { success, token: { contract_address, name, symbol, decimals, total_supply, deployer, deployed_at } }
 interface TokenInfo {
   contract_address: string;
+  standard: string;       // 'qrc20' | 'qrc721' — authoritative token standard from node state
   name: string;
   symbol: string;
   decimals: number;
@@ -61,10 +62,16 @@ export async function GET(
     return NextResponse.json({ success: false, error: 'Contract address required' }, { status: 400 });
   }
 
+  // Recent-transfers page size (Load-more): default 50, capped at 500.
+  const txLimit = Math.min(
+    Math.max(parseInt(new URL(request.url).searchParams.get('tx') || '50', 10) || 50, 1),
+    500,
+  );
+
   // Fetch token metadata from the node (authoritative on-chain state).
   let info: TokenInfo | null = null;
   try {
-    const res = await fetch(`${NODE_API}/api/v1/token/${contract}`, {
+    const res = await fetch(`${NODE_API}/api/v1/token/${encodeURIComponent(contract)}`, {
       headers: nodeHeaders(),
       signal: AbortSignal.timeout(10000),
     });
@@ -72,7 +79,7 @@ export async function GET(
       const body = await res.json().catch(() => null);
       if (body?.success && body.token) {
         const t = body.token as {
-          contract_address?: string; name?: string; symbol?: string; logo?: string;
+          contract_address?: string; standard?: string; name?: string; symbol?: string; logo?: string;
           decimals?: number; total_supply?: number | string; deployer?: string; deployed_at?: string;
           total_minted?: number | string; total_burned?: number | string;
         };
@@ -93,6 +100,7 @@ export async function GET(
           : (typeof v === 'number' && Number.isFinite(v)) ? Math.trunc(v).toString() : '0';
         info = {
           contract_address: t.contract_address || contract,
+          standard: t.standard || 'qrc20',
           name: t.name || '',
           symbol: t.symbol || '',
           logo: sanitizeLogo(t.logo),
@@ -122,7 +130,7 @@ export async function GET(
   // own decimals via the exact string helper.
   let transfers: TokenTransfer[] = [];
   try {
-    const rows = await getContractTokenTransfers(contract, 50);
+    const rows = await getContractTokenTransfers(contract, txLimit);
     transfers = rows.map((r): TokenTransfer => {
       let ts = Number(r.timestamp) || 0;
       if (ts > 0 && ts < 1e12) ts = ts * 1000;

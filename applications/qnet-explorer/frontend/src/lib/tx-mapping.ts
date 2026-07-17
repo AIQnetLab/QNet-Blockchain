@@ -90,9 +90,11 @@ export function mapTxType(
 // Format nanoQNC → QNC with full precision
 // v3.52: Dynamic precision — never lose small amounts, trim trailing zeros
 export function formatAmount(amount: number | string | undefined): string {
-  if (!amount) return '0 QNC';
+  // Zero-value txs (Heartbeat, Registration, Activation, light attestations, system) carry no QNC:
+  // render a bare "0" with NO unit — the render sink also drops the coin icon (unit present iff value).
+  if (!amount) return '0';
   const num = typeof amount === 'string' ? parseFloat(amount) : amount;
-  if (num === 0 || !Number.isFinite(num)) return '0 QNC';
+  if (num === 0 || !Number.isFinite(num)) return '0';
   const qnc = num / 1e9;
 
   if (qnc >= 0.01) {

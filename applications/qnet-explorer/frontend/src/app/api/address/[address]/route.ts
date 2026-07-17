@@ -190,7 +190,7 @@ export async function GET(
   try {
     // Parallel: node balance + node QRC-20 token holdings + PostgreSQL TX history + token transfers
     const [accountResponse, tokens, txResult, tokenTransferRows] = await Promise.all([
-      fetch(`${NODE_API}/api/v1/account/${address}`, {
+      fetch(`${NODE_API}/api/v1/account/${encodeURIComponent(address)}`, {
         headers: nodeHeaders,
         signal: AbortSignal.timeout(10000),
       }).then(r => r.ok ? r.json() : null).catch(() => null),
@@ -306,7 +306,7 @@ export async function GET(
     // and flag history as temporarily unavailable — the address page renders with real
     // data instead of hard-failing. A transient DB blip must not blank the whole page.
     const [accountResponse, tokens] = await Promise.all([
-      fetch(`${NODE_API}/api/v1/account/${address}`, {
+      fetch(`${NODE_API}/api/v1/account/${encodeURIComponent(address)}`, {
         headers: nodeHeaders,
         signal: AbortSignal.timeout(10000),
       }).then(r => r.ok ? r.json() : null).catch(() => null),

@@ -1,6 +1,6 @@
 //! Optimized mempool with binary storage support
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::sync::Arc;
 use parking_lot::RwLock;
 use std::collections::{VecDeque, BTreeMap};
@@ -93,6 +93,13 @@ pub struct SimpleMempool {
     // cross-crate state guard. Key = commitment_dedup_key() tuple. Bounded
     // (~1000×5×~6 ≈ 30k entries) and pruned by prune_committed_epochs_below.
     committed_epochs_cache: Arc<DashMap<(String, u64, u8), ()>>,
+
+    // Live count of distinct NodeRegistrations (commitment type_id 4) resident in the pool.
+    // Live set of NodeRegistration (commitment type_id 4) hashes resident in the pool. SINGLE source
+    // of truth for both the attestor valve (backlog = .len(), TRUE admitted-but-not-yet-applied — ghost
+    // joiners who never submitted never enter it) AND the deterministic inclusion lane (iterate this
+    // set directly, O(pending regs) not O(system bucket)). Maintained in lockstep with commitment_index.
+    pending_registration_hashes: Arc<DashSet<String>>,
 }
 
 impl SimpleMempool {
@@ -120,6 +127,7 @@ impl SimpleMempool {
             persist_remove: Arc::new(RwLock::new(None)),
             // v15.12: on-chain commitment-epoch cache (see struct doc)
             committed_epochs_cache: Arc::new(DashMap::new()),
+            pending_registration_hashes: Arc::new(DashSet::new()),
         }
     }
 
@@ -215,6 +223,7 @@ impl SimpleMempool {
     ) -> Option<String> {
         use dashmap::mapref::entry::Entry;
 
+        let is_registration = key.2 == 4;
         let old_hash = match self.commitment_index.entry(key.clone()) {
             Entry::Occupied(mut e) => Some(std::mem::replace(e.get_mut(), new_hash.to_string())),
             Entry::Vacant(e) => {
@@ -222,6 +231,19 @@ impl SimpleMempool {
                 None
             }
         };
+        // Same-hash re-admission race (identical bytes from two gossip paths): the "old" version IS
+        // the new one — scrubbing would delete the reverse entry just inserted and orphan the
+        // forward entry, leaking the backlog set on eventual removal. Nothing to replace.
+        let old_hash = match old_hash {
+            Some(ref old) if old.as_str() == new_hash => return None,
+            other => other,
+        };
+        // Registration backlog set tracks the CURRENT resident hash per key: insert new, drop old on
+        // replacement (net-zero); a fresh key is net +1. Membership = the true admitted-not-applied set.
+        if is_registration {
+            self.pending_registration_hashes.insert(new_hash.to_string());
+            if let Some(ref old) = old_hash { self.pending_registration_hashes.remove(old); }
+        }
 
         // Reverse index: `new_hash → key` so any future removal path can
         // resolve the forward-index entry without re-parsing the TX.
@@ -272,8 +294,26 @@ impl SimpleMempool {
     /// equals `hash` is cleared.
     fn cleanup_commitment_indices_for_hash(&self, hash: &str) {
         if let Some((_, key)) = self.commitment_reverse.remove(hash) {
-            self.commitment_index.remove_if(&key, |_, current| current == hash);
+            // Drop from the backlog set only when the forward entry is truly gone (a replacement race
+            // leaves the key live under a newer hash — still-resident registration, keep it).
+            if self.commitment_index.remove_if(&key, |_, current| current == hash).is_some()
+                && key.2 == 4
+            {
+                self.pending_registration_hashes.remove(hash);
+            }
         }
+    }
+
+    /// Roll back a commitment registration made this admission attempt (count-rejected TX that never
+    /// entered storage). Mirrors cleanup_commitment_indices_for_hash so the backlog set stays in
+    /// lockstep with commitment_index.
+    fn rollback_commitment_registration(&self, key: &(String, u64, u8), hash: &str) {
+        if self.commitment_index.remove_if(key, |_, current| current == hash).is_some()
+            && key.2 == 4
+        {
+            self.pending_registration_hashes.remove(hash);
+        }
+        self.commitment_reverse.remove(hash);
     }
     
     /// Add raw transaction (optimized with binary option and priority queue)
@@ -420,8 +460,7 @@ impl SimpleMempool {
                 // so a count-rejected TX does not leave a dangling forward-
                 // index entry pointing at a hash that never enters storage.
                 if let Some(ref key) = commitment_key {
-                    self.commitment_index.remove_if(key, |_, current| current == &hash);
-                    self.commitment_reverse.remove(&hash);
+                    self.rollback_commitment_registration(key, &hash);
                 }
                 return false;
             }
@@ -619,8 +658,7 @@ impl SimpleMempool {
                 // v15.5: roll back the commitment registration on count
                 // rejection to keep dedup indices in lockstep with storage.
                 if let Some(ref key) = commitment_key {
-                    self.commitment_index.remove_if(key, |_, current| current == &hash);
-                    self.commitment_reverse.remove(&hash);
+                    self.rollback_commitment_registration(key, &hash);
                 }
                 return false;
             }
@@ -766,6 +804,13 @@ impl SimpleMempool {
                     }
                 };
                 self.commitment_reverse.insert(hash.clone(), key.clone());
+                // Same-hash re-admission: nothing to replace (see replace_or_register_commitment).
+                let prev_hash = prev_hash.filter(|old| old != &hash);
+                // Mirror the single-TX paths: track the current resident reg hash (insert new, drop old).
+                if key.2 == 4 {
+                    self.pending_registration_hashes.insert(hash.clone());
+                    if let Some(ref old) = prev_hash { self.pending_registration_hashes.remove(old); }
+                }
 
                 if let Some(old) = prev_hash {
                     // Evict the prior version from every storage layer.
@@ -941,6 +986,7 @@ impl SimpleMempool {
         // mempool state so no stale entries survive a full reset.
         self.commitment_index.clear();
         self.commitment_reverse.clear();
+        self.pending_registration_hashes.clear();
 
         // v15.9: mirror the wipe to RocksDB. Each hash gets its own
         // persist_remove call so the CF stays consistent with RAM.
@@ -1109,10 +1155,64 @@ impl SimpleMempool {
         if has_system_tx && result.is_empty() {
             eprintln!("[ERR][MEMPOOL] system_tx_lost queue_had={} result={}", total_in_queue, result.len());
         }
-        
+
         result
     }
-    
+
+    /// TRUE registration backlog: distinct NodeRegistrations resident in the pool right now
+    /// (admitted, not yet applied/evicted). O(1). Valve input for the attestor issuance throttle.
+    pub fn pending_registration_backlog(&self) -> usize {
+        self.pending_registration_hashes.len()
+    }
+
+    /// Deterministic registration-inclusion lane: the SAME next `limit` NodeRegistrations on every
+    /// producer, ordered (attest_epoch ASC, burn_tx ASC, tx_hash ASC) — oldest attestation first,
+    /// with a strict total-order tiebreak (hash == SHA3-256(canonical) is enforced at admission).
+    /// Replaces the per-node FIFO prefix of the shared u64::MAX system bucket for type_id 4.
+    ///
+    /// Stale-skip mirrors the verifier epoch bounds (node.rs verify_burn_attestation_quorum:
+    /// attest_epoch==0/future reject + apply>attest+lag reject) APPLIED ONLY TO BURN-BACKED REGS;
+    /// regs with empty burn_tx OR attest_epoch==0 are EXEMPT from both the skip and the burn dedup —
+    /// a crate-local superset of the verifier's genesis exemption (genesis regs carry attest_epoch=0
+    /// + burn_tx="" and must stay includable at any height; all 5 share burn_tx="" so deduping them
+    /// would wedge 4 forever). Non-genesis empty-burn fakes are dropped by producer re-validation.
+    /// `exempt_cap` bounds the exempt class per selection (caller passes the genesis-set size):
+    /// exempt regs sort FIRST (attest_epoch=0), so without the cap a sustained empty-burn junk flood
+    /// would occupy every lane slot and starve burn-backed registrations.
+    /// Scan cost: O(pending registrations) via the dedicated backlog set — NOT O(system bucket).
+    pub fn registrations_for_inclusion(&self, apply_epoch: u64, max_epoch_lag: u64, limit: usize, exempt_cap: usize) -> Vec<(String, Vec<u8>)> {
+        if limit == 0 { return Vec::new(); }
+        // Iterate ONLY the registration hashes (bounded by the valve ~720), never the whole
+        // system-priority bucket of heartbeat/ping/activation TXs.
+        let reg_hashes: Vec<String> = self.pending_registration_hashes.iter().map(|e| e.key().clone()).collect();
+        let mut regs: Vec<(u64, String, String, Vec<u8>)> = Vec::new(); // (attest_epoch, burn_tx, hash, bytes)
+        for hash in reg_hashes {
+            let bytes = match self.get_binary_transaction(&hash) { Some(b) => b, None => continue };
+            let tx = match bincode::deserialize::<Transaction>(&bytes) { Ok(t) => t, Err(_) => continue };
+            if let qnet_state::TransactionType::NodeRegistration { burn_tx, attest_epoch, .. } = tx.tx_type {
+                regs.push((attest_epoch, burn_tx, hash, bytes));
+            }
+        }
+        regs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+        let mut out: Vec<(String, Vec<u8>)> = Vec::with_capacity(limit.min(regs.len()));
+        let mut seen_burns: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut exempt_taken = 0usize;
+        for (attest_epoch, burn_tx, hash, bytes) in regs {
+            let exempt = burn_tx.is_empty() || attest_epoch == 0;
+            if exempt {
+                if exempt_taken >= exempt_cap { continue; }
+                exempt_taken += 1;
+            } else {
+                if attest_epoch > apply_epoch { continue; }                                   // future-epoch: verifier rejects
+                if apply_epoch > attest_epoch.saturating_add(max_epoch_lag) { continue; }     // stale: verifier rejects, owner re-arms
+                if !seen_burns.insert(burn_tx) { continue; }                                  // one burn per block
+            }
+            out.push((hash, bytes));
+            if out.len() >= limit { break; }
+        }
+        out
+    }
+
     /// Remove transactions older than TTL (default 30 minutes)
     pub fn cleanup_expired_transactions(&self, ttl_secs: u64) -> usize {
         let mut expired_hashes = Vec::new();

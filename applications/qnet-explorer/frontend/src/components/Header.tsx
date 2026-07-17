@@ -49,7 +49,8 @@ const HeaderComponent = () => {
   const explorerNavLinks = [
     { href: isLocalDev ? '/' : 'https://aiqnet.io', label: 'Home', external: !isLocalDev },
     { href: '/explorer', label: 'Explorer' },
-    // Tokens are reached via the unified explorer search box — no separate Tokens nav.
+    // QNC (native coin) + QRC-20 tokens are reached by clicking their amount in any tx,
+    // or via the unified explorer search box — no per-token nav item (top-L1 pattern).
   ];
 
   const navLinks = isExplorerDomain ? explorerNavLinks : mainNavLinks;

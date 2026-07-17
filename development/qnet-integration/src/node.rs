@@ -34,10 +34,8 @@ pub const MAX_VALIDATORS: usize = 1000;
 pub const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
 #[allow(dead_code)]
 const MIN_BYZANTINE_NODES: usize = 4; // 3f+1 where f=1
-const FAST_SYNC_THRESHOLD: u64 = 10; // Trigger fast sync if behind by 10+ blocks (lowered from 50 for faster detection)  
 #[allow(dead_code)]
 const FAST_SYNC_TIMEOUT_SECS: u64 = 60; // Fast sync timeout
-const BACKGROUND_SYNC_TIMEOUT_SECS: u64 = 30; // Background sync timeout
 const SNAPSHOT_FULL_INTERVAL: u64 = 43200; // Full snapshot every 12 hours (43,200 microblocks = 480 macroblocks)
 pub const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3600; // Incremental snapshot every 1 hour (3,600 microblocks = 40 macroblocks)
 pub const SNAPSHOT_EARLY_ANCHOR_HEIGHT: u64 = 90; // First consensus-bindable boundary (mb_idx=1): a young chain has a servable snapshot well before the 3600 interval
@@ -218,19 +216,97 @@ pub fn clear_emergency_producer() {
 //   2. All nodes receive SAME message → Select SAME next producer → NO FORK
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// CRITICAL: Global synchronization flags for API access
-// LEGACY: These flags are kept for backward compatibility. New code should use
-// GLOBAL_COORDINATOR.snapshot() for authoritative state.
+// Coordinator FSM (GLOBAL_COORDINATOR.snapshot()) is the authoritative sync state.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-pub static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+// Read cross-file by storage.rs to WAL-disable the bulk-apply fast-path (perf only; on is safe).
 pub static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
-/// Signed NodeRegistration awaiting on-chain inclusion: (node_id, tx_bytes, backoff_tick). The periodic
-/// loop rebroadcasts it (burst then trickle, the third field is the backoff tick) so a join-time
+/// Signed NodeRegistration awaiting on-chain inclusion: (node_id, tx_bytes, backoff_tick, attest_epoch).
+/// The periodic loop rebroadcasts it (burst then trickle, field 3 is the backoff tick) so a join-time
 /// broadcast dropped while poorly connected still reaches a producer, scaling to thousands of joiners.
-/// Cleared when is_node_registration_onchain becomes true.
-pub static PENDING_NODE_REGISTRATION: std::sync::Mutex<Option<(String, Vec<u8>, u32)>> =
+/// Field 4 is the epoch the embedded burn attestations bind — the convergence driver's re-arm edge
+/// (re-collect when current_epoch >= attest_epoch + MAX_ATTEST_EPOCH_LAG, i.e. the bytes went
+/// verifier-stale). Cleared when is_node_registration_onchain becomes true. The driver is the SOLE
+/// arm/re-arm writer; the rebroadcast loop keeps an idempotent on-chain clear.
+pub static PENDING_NODE_REGISTRATION: std::sync::Mutex<Option<(String, Vec<u8>, u32, u64)>> =
     std::sync::Mutex::new(None);
+
+/// Max deficit (strict corroborated ceiling − local tip) at arm time. attest_epoch is pinned at
+/// quorum completion, so the lag-2 verifier window (180 blocks) starts there; 45 leaves the
+/// inclusion lane (backlog<800 draining 8/block ⇒ <100 blocks) inside it with margin.
+pub(crate) const DEFICIT_BOUND: u64 = 45;
+const REG_DRIVER_DEFER_SECS: u64 = 15;      // gate-defer poll (cheap checks only)
+const REG_DRIVER_COOLDOWN_SECS: u64 = 90;   // >=1 epoch between collect attempts (serial 30s reqwest)
+const ARM_TIER2_AT_SECS: u64 = 270;         // strict-starved time before the widened tier engages
+const WC_DEFER_MAX: u32 = 8;                // consecutive widened-defers before the bounded fail-open
+
+/// Driver-local arm-ladder state (strict-starvation clock + widened-defer counter + dial pacing).
+#[derive(Default)]
+pub(crate) struct ArmLadderState {
+    strict_zero_since: Option<std::time::Instant>,
+    wc_defers: u32,
+    last_dial: Option<std::time::Instant>,
+}
+
+/// Fail-closed registration arm gate + anti-livelock ladder.
+/// T1 coordinator_is_production_ready — necessary but fails open alone (Synchronized{0}); T2+T3
+/// carry the fix. T2 strict corroborated ceiling (unified_p2p::corroborated_head_ceiling — the
+/// (f+1)-th highest fresh in-set height, un-floored): 0 ⇒ unknown ⇒ ladder, never arm blind.
+/// T3 local within DEFICIT_BOUND of that ceiling. Ladder when strict starves: Tier-1.5 dials the
+/// exact in-set predicate set to earn corroborators; Tier-2 consults the quarantined widened
+/// ceiling (Sybil-capped, forged-high clamped) floored at the genesis-verified GALC capsule; after
+/// WC_DEFER_MAX widened-only defers the gate fails OPEN into a throttled arm — the attestor-side
+/// epoch bound is the authoritative arbiter, so the worst adversarial outcome is a bounded number
+/// of refused arms, never indefinite denial and never a forged registration.
+fn registration_arm_gate(ladder: &mut ArmLadderState) -> bool {
+    if !coordinator_is_production_ready() { return false; }
+    let p2p = match try_get_p2p() { Some(p) => p, None => return false };
+    let local = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Acquire);
+    let ceiling = p2p.corroborated_head_ceiling();
+    if ceiling > 0 {
+        ladder.strict_zero_since = None;
+        ladder.wc_defers = 0;
+        if ceiling > local.saturating_add(DEFICIT_BOUND) {
+            if is_info() { println!("[INFO][REG] arm_defer reason=behind local={} ceiling={}", local, ceiling); }
+            return false;
+        }
+        return true;
+    }
+    let since = *ladder.strict_zero_since.get_or_insert_with(std::time::Instant::now);
+    // Dial pacing: unreachable in-set addrs must not be re-fed every defer tick (the regional
+    // dial pipeline has no dedup for never-connecting peers) — at most one dial per Tier-2 window.
+    if ladder.last_dial.map_or(true, |t| t.elapsed().as_secs() >= ARM_TIER2_AT_SECS) {
+        ladder.last_dial = Some(std::time::Instant::now());
+        p2p.dial_in_set_for_arm();
+    }
+    if since.elapsed().as_secs() < ARM_TIER2_AT_SECS {
+        if is_info() { println!("[INFO][REG] arm_defer reason=strict_starved tier=1.5 elapsed={}s", since.elapsed().as_secs()); }
+        return false;
+    }
+    let wc = p2p.corroborated_head_ceiling_widened(local);
+    // Capsule macroblock index → height (blocks per macroblock).
+    let capsule_floor = crate::galc::effective_pin_checkpoint().0
+        .saturating_mul(qnet_consensus::checkpoint_bft::MACROBLOCK_INTERVAL);
+    let evidence = wc.0.max(capsule_floor);
+    if evidence <= local.saturating_add(crate::unified_p2p::DEFICIT_BOUND_WIDE) {
+        // Strict is STILL starved — keep the Tier-2 clock running so a failed arm attempt
+        // re-enters at Tier-2 directly (not another full Tier-1.5 wait).
+        ladder.wc_defers = 0;
+        return true;
+    }
+    ladder.wc_defers += 1;
+    if ladder.wc_defers >= WC_DEFER_MAX {
+        println!("[WARN][REG] arm_gate_fail_open defers={} local={} widened={} capsule_floor={}",
+                 WC_DEFER_MAX, local, wc.0, capsule_floor);
+        ladder.wc_defers = 0;
+        return true;
+    }
+    if is_info() {
+        println!("[INFO][REG] arm_defer reason=widened_deficit tier=2 local={} evidence={} defers={}",
+                 local, evidence, ladder.wc_defers);
+    }
+    false
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // L1 ARCHITECTURE: Global coordinator handle for phase-aware decisions
@@ -253,14 +329,15 @@ pub fn coordinator_is_synchronized() -> bool {
     }
 }
 
-/// Check if node is syncing via coordinator (preferred) or legacy flags (fallback).
-/// Use this instead of reading SYNC_IN_PROGRESS directly.
+/// Check if node is syncing via the coordinator FSM (the single source of truth).
 #[inline]
 pub fn coordinator_is_syncing() -> bool {
     if let Some(ref handle) = *GLOBAL_COORDINATOR.read() {
         handle.snapshot().is_syncing()
     } else {
-        SYNC_IN_PROGRESS.load(Ordering::Relaxed) || FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed)
+        // No coordinator installed yet (pre-boot): the FSM is the only sync source of truth,
+        // so nothing is syncing before it exists. The production hard-gate still holds output.
+        false
     }
 }
 
@@ -288,10 +365,6 @@ pub fn coordinator_sync_target() -> u64 {
         0
     }
 }
-
-// v3.0: Event-driven sync completion (NOT polling!)
-// When process_received_blocks reaches this height, it clears SYNC_IN_PROGRESS
-// This is proper event-driven design - flag cleared at the SOURCE, not by polling
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // v3.10: FORK PREVENTION - 4 Critical Bug Fixes
@@ -448,8 +521,6 @@ pub fn should_check_fork() -> bool {
 // valid 2f+1 Dilithium QC under the embedded genesis committee). 0 before the first macroblock (h<90)
 // ⇒ callers fall back to the capped near-tip hint, so the genesis bootstrap is never blocked.
 static QC_VERIFIED_FRONTIER: AtomicU64 = AtomicU64::new(0);
-// Throttle for the frontier's bulk lineage-walk probe (coordinator also dedups overlapping ranges).
-static LAST_FRONTIER_PROBE_SECS: AtomicU64 = AtomicU64::new(0);
 
 // v3.5: Flag to skip slot timing after sync completion
 // PROBLEM: After sync, node may be "ahead" of slot time and wait unnecessarily
@@ -457,9 +528,6 @@ static LAST_FRONTIER_PROBE_SECS: AtomicU64 = AtomicU64::new(0);
 // SOLUTION: Skip slot timing wait on first block after sync if we're producer
 static JUST_COMPLETED_SYNC: AtomicBool = AtomicBool::new(false);
 
-// DEADLOCK PROTECTION: Track when sync started to detect stuck operations
-static SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
-static FAST_SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
 /// v9.0: Progress-based sync timeout. Updated on each synced block.
 /// Deadlock = no progress for 120s (instead of fixed 300s cap).
 pub static LAST_SYNC_PROGRESS_TIME: AtomicU64 = AtomicU64::new(0);
@@ -2410,20 +2478,13 @@ pub(crate) fn qc_verified_frontier_height() -> u64 {
     // peer I/O. The local scan below reports the frontier from whatever has already been QC-stored;
     // the spawned walk extends it for the next call. Skip-present + windowed; fetches objects + N-2
     // anchors so verify_v2_macroblock certifies each before storage.
-    if hint_mb > local_mb {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        // Adaptive cadence: the seal frontier is what gates production AND apply
-        // (backpressure), so when it lags more than the unsealed bound, probe at 1s.
-        let probe_interval = if hint_mb.saturating_sub(local_mb) > MAX_UNSEALED_WINDOWS { 1 } else { 3 };
-        if now.saturating_sub(LAST_FRONTIER_PROBE_SECS.load(Relaxed)) >= probe_interval {
-            LAST_FRONTIER_PROBE_SECS.store(now, Relaxed);
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                let from = local_mb.saturating_add(1).max(1);
-                rt.spawn(async move {
-                    if let Some(p) = try_get_p2p() { let _ = p.sync_macroblocks_repair(from, hint_mb).await; }
-                });
-            }
-        }
+    // Seal frontier lags the applied tip: the SINGLE sync coordinator owns the macroblock fetch. Nudge it
+    // (idempotent flag, no spawn) instead of a parallel repair here — check_desync re-derives the same
+    // deficit from the unified target and execute_sync's macroblock pass fills it. Threshold matches
+    // check_desync's mb dimension (MAX_UNSEALED_WINDOWS absorbs the healthy unsealed tail) so detection
+    // and repair agree; deficits within the tail arrive via normal macroblock gossip.
+    if hint_mb > local_mb.saturating_add(MAX_UNSEALED_WINDOWS) {
+        crate::sync_manager::nudge_sync_check();
     }
     // Highest STORED macroblock object above local progress. Existence ⟹ QC-verified: the only store
     // paths are process_received_macroblock (gated on verify_v2_macroblock before save_macroblock) and
@@ -3769,6 +3830,10 @@ impl BlockchainNode {
         // Runs after Phase 2 so the claim TX's pre-images already exist for rollback.
         Self::apply_merkle_claims(state_guard, storage, &microblock.transactions, block_snapshot.as_deref_mut());
 
+        // Producer fee-credit wallet for the rich-list touched-set (the credit below mutates it and it
+        // is NOT in any tx's affected-addresses). Captured only when a credit is actually applied.
+        let mut richlist_producer_wallet: Option<String> = None;
+
         // ── Phase 3: Credit producer fees (with recalculation) ──
         if microblock.fees_collected > 0 {
             // Recalculate actual fees from transactions to prevent overclaim
@@ -3811,6 +3876,7 @@ impl BlockchainNode {
                 }
             };
             if !producer_wallet.is_empty() {
+                richlist_producer_wallet = Some(producer_wallet.clone());
                 if let Some(ref mut snap) = block_snapshot {
                     snap.record_pre_images(&[producer_wallet.clone()], &state_guard.accounts);
                 }
@@ -3842,6 +3908,10 @@ impl BlockchainNode {
         // ── Phase 5: Finalize merkle tree ──
         result.merkle_root = state_guard.finalize_merkle();
 
+        // Rich-list index (display-only, best-effort): reconcile this block's touched holders. Same
+        // touched-set as the producer-inline path (tx affected-addrs ∪ credited producer wallet).
+        Self::reconcile_richlist_for_block(state_guard, storage, microblock, richlist_producer_wallet.as_deref());
+
         // ── Phase 6: Update chain_state.height ──
         {
             let mut chain_state = state_guard.chain_state.write();
@@ -3851,6 +3921,70 @@ impl BlockchainNode {
         }
 
         result
+    }
+
+    // ── Native-QNC rich-list index (display-only) ────────────────────────────────────────────────
+    // Apply-time reconcile of the top-K holder index for exactly the addresses a block touched, plus
+    // a full rebuild from live state. The index is in NO root/checkpoint — every hook is best-effort:
+    // a storage error is logged and swallowed, NEVER failing block apply. A divergence/drift is
+    // cosmetic and self-heals on the next rebuild (boot / snapshot / reorg).
+
+    /// Reconcile the rich-list index for one applied block. `touched` = union of every per-tx native-
+    /// balance participant (`get_all_affected_addresses`) ∪ the producer fee-credit wallet (which the
+    /// fee credit mutates but is NOT in the affected set). Each touched address is re-classified against
+    /// live state: `Some(balance)` if it is a holder (non-contract, non-system, non-burn, balance>0),
+    /// else `None` to drop it. Display-only + best-effort — never propagates the storage error.
+    fn reconcile_richlist_for_block(
+        state: &StateManager,
+        storage: &crate::storage::Storage,
+        microblock: &MicroBlock,
+        producer_wallet: Option<&str>,
+    ) {
+        use qnet_state::transaction::CANONICAL_BURN_ADDR;
+        let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for tx in &microblock.transactions {
+            for addr in tx.get_all_affected_addresses() {
+                touched.insert(addr);
+            }
+        }
+        if let Some(pw) = producer_wallet {
+            if !pw.is_empty() { touched.insert(pw.to_string()); }
+        }
+        if touched.is_empty() { return; }
+        let mut updates: Vec<(String, Option<u64>)> = Vec::with_capacity(touched.len());
+        for addr in touched {
+            let upd = match state.get_account(&addr) {
+                Some(acct) if !acct.is_contract
+                    && acct.balance > 0
+                    && addr.as_str() != CANONICAL_BURN_ADDR
+                    && !addr.starts_with("system_") => Some(acct.balance),
+                _ => None,
+            };
+            updates.push((addr, upd));
+        }
+        if let Err(e) = storage.richlist_reconcile(&updates) {
+            if is_warn() {
+                println!("[WARN][RICHLIST] reconcile_failed h={} err={}", microblock.height, e);
+            }
+        }
+    }
+
+    /// Full rebuild of the display-only rich-list index. Streams the AUTHORITATIVE `accounts` CF (complete
+    /// hot∪cold mirror) off the state lock, so it is correct at any holder count (the old in-memory-cache
+    /// scan silently dropped evicted cold holders past the cache cap). Returns the storage result so the
+    /// boot caller gates its one-time marker on success (a transient failure then retries next boot).
+    async fn rebuild_richlist_index() -> crate::errors::IntegrationResult<()> {
+        // Offload the unbounded accounts-CF scan to the blocking pool so it never stalls a reactor worker
+        // (mirrors persist_accounts_batch). At scale the scan is many seconds of pure CPU/IO with no yield;
+        // the callers (boot / snapshot-restore / reorg) await this on the shared runtime.
+        let storage = match try_get_storage() {
+            Some(s) => std::sync::Arc::clone(s),
+            None => return Err(crate::errors::IntegrationError::Other("richlist_rebuild_no_storage".to_string())),
+        };
+        match tokio::task::spawn_blocking(move || storage.richlist_rebuild_from_accounts()).await {
+            Ok(res) => res,
+            Err(e) => Err(crate::errors::IntegrationError::Other(format!("richlist_rebuild_join_err: {}", e))),
+        }
     }
 
     // Slashing only for cryptographically provable offenses:
@@ -4341,7 +4475,7 @@ impl BlockchainNode {
     }
 
     async fn create_eligible_producers_snapshot(
-        p2p: &Arc<SimplifiedP2P>,
+        _p2p: &Arc<SimplifiedP2P>,
         consensus_participants: &[String],
         _own_node_id: &str,
         _own_node_type: NodeType,
@@ -4582,15 +4716,10 @@ impl BlockchainNode {
                             macroblock_index,
                         );
                     }
-                    // Trigger async N-2 sync via P2P — downstream guard in
-                    // the v2 committee guard refuses to proceed until
-                    // the macroblock arrives. Keeping full candidate list
-                    // here is harmless because the refusal blocks production.
-                    let missing_mb = macroblock_index.saturating_sub(2);
-                    let p2p_clone = p2p.clone();
-                    tokio::spawn(async move {
-                        let _ = p2p_clone.sync_macroblocks(missing_mb, missing_mb).await;
-                    });
+                    // Nudge the single sync coordinator to backfill the N-2 seed macroblock; the
+                    // downstream v2 committee guard refuses to proceed until it arrives, so keeping
+                    // the full candidate list here is harmless.
+                    crate::sync_manager::nudge_sync_check();
                     // Short-circuit: abort the truncation branch entirely.
                     // Return the current `eligible` list unchanged so the
                     // caller gets a deterministic outcome (full list) that
@@ -8800,6 +8929,17 @@ impl BlockchainNode {
             }
         }
 
+        // Native-QNC rich-list index (display-only) one-time build for a pre-index DB. Marker-guarded
+        // so the O(holders) scan runs once, not on every restart. Snapshot/reorg rebuild separately.
+        if !blockchain.storage.richlist_index_built() {
+            // Set the one-time marker ONLY on a successful rebuild; a transient storage error leaves it
+            // unset so the next boot retries (mirrors the roster-index migration above).
+            match Self::rebuild_richlist_index().await {
+                Ok(()) => { let _ = blockchain.storage.set_richlist_index_built(); }
+                Err(e) => { if is_warn() { println!("[WARN][RICHLIST] boot_rebuild_failed err={} — retry next boot", e); } }
+            }
+        }
+
         // Wallet→token index (NON-consensus): rebuild ONLY when it's not current — not built/clean, OR the
         // durable owns-watermark lags the tip (unclean shutdown lost the last deltas). A clean restart has
         // watermark == tip → skip the O(contracts) rebuild entirely. Rebuild from the in-memory tip (NOT the
@@ -9204,22 +9344,9 @@ impl BlockchainNode {
                         // v32.15: batched range fetch on cold-sync. When the local macroblock store
                         // is empty (fresh node), single-step N-2 backtracking produces O(N)
                         // round-trips. Detect and fetch the whole prefix [0..missing_idx] in one go.
-                        let p2p_for_rotation = blockchain_for_macroblocks.unified_p2p.clone();
-                        let storage_for_check = blockchain_for_macroblocks.storage.clone();
-                        tokio::spawn(async move {
-                            if let Some(p2p) = p2p_for_rotation {
-                                let local_top = storage_for_check
-                                    .get_latest_macroblock_index()
-                                    .unwrap_or(0);
-                                let from = if local_top == 0 { 0 } else { local_top + 1 };
-                                let to = missing_idx;
-                                if to > from && (to - from) > 1 {
-                                    let _ = p2p.sync_macroblocks(from, to).await;
-                                } else {
-                                    let _ = p2p.sync_macroblocks(missing_idx, missing_idx).await;
-                                }
-                            }
-                        });
+                        // Nudge the single sync coordinator to backfill the missing N-2 anchor; the
+                        // macroblock retry passes the strict committee check once it lands.
+                        crate::sync_manager::nudge_sync_check();
                         // Expected rotation flow, not a failure.
                         continue;
                     }
@@ -9501,7 +9628,6 @@ impl BlockchainNode {
         // Replaces ad-hoc sync chunk loop with production-grade sync manager
         // ═══════════════════════════════════════════════════════════════════
         if is_info() { println!("[INFO][SYNC] initial_sync_start"); }
-        SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
         
         // Delegate sync to SyncManager (replaces 400+ lines of ad-hoc sync)
         let sync_handle_for_init = blockchain.sync_handle.clone();
@@ -9543,7 +9669,6 @@ impl BlockchainNode {
             // sync_manager check_desync + the production-loop fast-sync keep driving and emit
             // SyncComplete (frontier-floored via detect_network_height) once the frontier is reached.
             let stored_h = storage_for_sync_check.get_chain_height().unwrap_or(0);
-            SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
             let frontier = crate::node::qc_verified_frontier_height();
             if frontier == 0 || stored_h >= frontier {
                 coordinator_for_sync.try_send(crate::consensus_state::ConsensusEvent::SyncComplete {
@@ -9627,18 +9752,9 @@ impl BlockchainNode {
                     // v3.2: Request missing macroblocks from network
                     // CRITICAL FIX: Increased limit from 10 to 30 to recover faster from DESYNC
                     // Also clear pending queue for these indices to allow re-request
-                    if let Some(ref p2p) = blockchain_for_macrocheck.unified_p2p {
-                        // Gap-repair: one contiguous range over the missing span via the repair
-                        // coordinator (honors below-frontier indices, skip-present so already-held
-                        // indices in a sparse span are not re-requested, width-capped + deduped).
-                        // Replaces the clear-before-request + per-index take(30) flood.
-                        if let (Some(&lo), Some(&hi)) = (missing_macroblocks.iter().min(), missing_macroblocks.iter().max()) {
-                            if is_debug() { println!("[DBG][MB-CHECK] repair range={}-{}", lo, hi); }
-                            if let Err(e) = p2p.sync_macroblocks_repair(lo, hi).await {
-                                if is_warn() { println!("[WARN][MB-CHECK] sync_failed range={}-{} err={}", lo, hi, e); }
-                            }
-                        }
-                    }
+                    // Missing macroblocks detected → nudge the single sync coordinator; its bounded
+                    // macroblock pass repairs the gap (honors below-frontier indices, deduped).
+                    crate::sync_manager::nudge_sync_check();
                 } else if current_height % 180 == 0 {
                     // Log health every 180 blocks (~3 minutes)
                     if is_info() { println!("[INFO][MB-CHECK] verified count={} range={}-{}", 
@@ -11025,40 +11141,30 @@ impl BlockchainNode {
                             // (see v9.7 sync re-check block) and from the periodic registration
                             // loop ONLY when NODE_IS_SYNCHRONIZED == true.
                             // ══════════════════════════════════════════════════════════════
-                            // Single-owner on-chain registration driver: a non-genesis node with an
-                            // activation code must land its NodeRegistration on-chain before producing.
-                            // Arm ONLY when synced (so burn-attestors bind the true N-2 committee, not the
-                            // pre-sync genesis fallback that a post-genesis producer rejects); the periodic
-                            // rebroadcast then re-sends until it lands. If not yet synced, keep waiting in
-                            // THIS loop (sync runs in parallel) — never break into production unregistered.
-                            if !is_bootstrap_node {
+                            // Registration ownership: the spawned convergence driver arms/re-arms the
+                            // NodeRegistration behind its fail-closed frontier gate and re-collects when
+                            // attest_epoch goes stale. This removes the old coordinator_is_synchronized
+                            // sync-gate-on-production for UNREGISTERED joiners — safe because selection
+                            // is srtr_-only (an unregistered node is never VRF-selected). Here: one-time
+                            // LOCAL activation persist (sync-independent) + driver spawn.
+                            if !is_bootstrap_node && self.node_type != NodeType::Light {
                                 let activation_code = std::env::var("QNET_ACTIVATION_CODE").unwrap_or_default();
                                 if !activation_code.is_empty()
                                     && !self.get_storage().is_node_registration_onchain(&self.get_node_id())
                                 {
-                                    if coordinator_is_synchronized() {
-                                        // Arm only when PENDING is empty (don't stack); the rebroadcast drives it.
-                                        let pending_empty = PENDING_NODE_REGISTRATION.lock()
-                                            .map(|g| g.is_none()).unwrap_or(true);
-                                        if pending_empty {
-                                            println!("[INFO][ACTIVATION] node_synced arming=NodeRegistration");
-                                            if let Err(e) = self.save_activation_code(&activation_code, self.node_type).await {
-                                                // Arm failed (e.g. transient burn-attestation RPC blip) — PENDING is
-                                                // still empty, so the rebroadcast cannot drive it. Retry in THIS loop
-                                                // rather than break into production with the registration unsent
-                                                // (the single fragile arm moment that left the 6th validator-only).
-                                                println!("[WARN][ACTIVATION] activation_fail err={} — retry", e);
-                                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                                wait_time += 5;
-                                                continue;
-                                            }
+                                    let already_persisted = self.get_storage().load_activation_code()
+                                        .map(|o| o.is_some()).unwrap_or(false);
+                                    if !already_persisted {
+                                        if let Err(e) = self.save_activation_code(&activation_code, self.node_type).await {
+                                            // Local validation failed (bad mnemonic/burn env) — a config error
+                                            // the driver cannot heal; retry here so the operator sees it.
+                                            println!("[WARN][ACTIVATION] activation_persist_failed err={} — retry", e);
+                                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                            wait_time += 5;
+                                            continue;
                                         }
-                                    } else {
-                                        println!("[INFO][ACTIVATION] await_sync_before_registration");
-                                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                        wait_time += 5;
-                                        continue;
                                     }
+                                    self.spawn_registration_convergence_driver(activation_code);
                                 }
                             }
 
@@ -11146,51 +11252,14 @@ impl BlockchainNode {
             
             if is_info() { println!("[INFO][NODE] net_sync_ok"); }
             
-            // STEP 4: Sync with network if we have data but might be behind
+            // STEP 4: a restarting node with local data may be behind. Delegate catch-up to the SINGLE
+            // sync coordinator (SyncManager) — nudge it to run a desync check now. The production HARD
+            // GATE below (sync_active || !prod_unlocked || !node_synced) holds production until it has
+            // caught up, so no inline pre-production fetch loop is needed here (that duplicated
+            // execute_sync's pipelined catch-up and raced it for the same blocks).
             if local_height > 0 {
-                // CRITICAL FIX: Sync with network before starting production
-                // This prevents creating blocks at wrong height when restarting
-                println!("[INFO][NODE] Syncing with network before starting production...");
-                
-                if let Some(ref p2p) = self.unified_p2p {
-                    // Try to get network height
-                    match p2p.sync_blockchain_height().await {
-                        Ok(network_height) => {
-                            let local_height = self.storage.get_chain_height().unwrap_or(0);
-                            if network_height > local_height {
-                                println!("[INFO][NODE] Network is ahead: {} vs local: {}", network_height, local_height);
-                                println!("[INFO][NODE] sync_before_production blocks={}", network_height.saturating_sub(local_height));
-
-                                // Delivery-verified backbone: loop sync_blocks over the gap.
-                                // sync_blocks window-clamps internally; advance off stored height.
-                                let mut current = local_height;
-                                let mut no_progress = 0u32;
-                                while current < network_height {
-                                    let chunk_end = std::cmp::min(current + 2_000, network_height);
-                                    if let Err(e) = p2p.sync_blocks(current + 1, chunk_end).await {
-                                        println!("[WARN][NODE] sync_before_production failed at {}: {}", current, e);
-                                        break;
-                                    }
-                                    let stored = self.storage.get_chain_height().unwrap_or(current);
-                                    if stored <= current {
-                                        no_progress += 1;
-                                        if no_progress >= 3 { break; }
-                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                        continue;
-                                    }
-                                    no_progress = 0;
-                                    current = stored;
-                                }
-                                if is_info() { println!("[INFO][NODE] sync_ok start_prod"); }
-                            } else {
-                                if is_info() { println!("[INFO][NODE] in_sync h={}", local_height); }
-                            }
-                        }
-                        Err(e) => {
-                            println!("[WARN][NODE] Failed to get network height: {}, starting anyway", e);
-                        }
-                    }
-                }
+                crate::sync_manager::nudge_sync_check();
+                if is_info() { println!("[INFO][NODE] boot_sync_delegated local={}", local_height); }
             }
             
         // Consensus v2: start the always-on Checkpoint-BFT runtime at BOOT (not at the
@@ -13256,7 +13325,7 @@ impl BlockchainNode {
                             // keeping liveness (the synced-built bytes are still re-delivered until inclusion).
                             let mut out = None;
                             let mut clear = false;
-                            if let Some((id, bytes, tick)) = guard.as_mut() {
+                            if let Some((id, bytes, tick, _attest_epoch)) = guard.as_mut() {
                                 let onchain = crate::node::try_get_storage()
                                     .map(|s| s.is_node_registration_onchain(id)).unwrap_or(false);
                                 if onchain {
@@ -13499,12 +13568,9 @@ impl BlockchainNode {
                                                      canonical_height, expected_mb, blocks_since);
                                         }
 
-                                        let p2p_pfp = unified_p2p.clone();
-                                        tokio::spawn(async move {
-                                            if let Some(ref p2p) = p2p_pfp {
-                                                let _ = p2p.sync_macroblocks(expected_mb, expected_mb).await;
-                                            }
-                                        });
+                                        // Nudge the single sync coordinator to backfill the epoch-boundary
+                                        // macroblock; finality trails production and its pass repairs it.
+                                        crate::sync_manager::nudge_sync_check();
                                     }
                                     check_boundary += 90;
                                 }
@@ -13741,13 +13807,15 @@ impl BlockchainNode {
                         let failover_round = crate::unified_p2p::get_certified_rotation_round(mb_idx);
                         update_failover_metrics(local_delay, failover_round);
 
-                        // Bound the failover round: >MAX faults in one window is a sync/partition issue, not
-                        // producer liveness — stop climbing (runaway forensic cert_round=3663) and drive the
-                        // chronic-stall recovery instead. Keyed on the SAME frontier mb the vote uses.
+                        // At MAX_FAILOVER_ROUND, >MAX rotations in one window is a sync/partition issue, not
+                        // producer liveness. HOLD, don't go terminal: the vote round is clamped to the cap in
+                        // emit_macroblock_view_change_vote (DoS bound — no runaway climb), the pacemaker keeps
+                        // emitting the bounded round so progress resumes the instant the partition heals, and
+                        // we drive sync recovery in parallel. Keyed on the SAME frontier mb the vote uses.
                         let failover_capped = failover_round >= MAX_FAILOVER_ROUND;
                         if failover_capped {
                             if is_warn() {
-                                println!("[WARN][TIMEOUT] failover_round_capped round={} cap={} mb={} action=recovery_sync",
+                                println!("[WARN][TIMEOUT] failover_round_capped round={} cap={} mb={} action=hold+recovery_sync",
                                          failover_round, MAX_FAILOVER_ROUND, mb_idx);
                             }
                             CHRONIC_STALL_REQUESTED.store(true, Ordering::Relaxed);
@@ -13770,8 +13838,10 @@ impl BlockchainNode {
                             .map(|(p, _)| !p.is_empty() && p != node_id
                                 && crate::unified_p2p::window_has_vote_from(own_w, &p))
                             .unwrap_or(false);
+                        // No !failover_capped gate — at the cap the pacemaker HOLDS (keeps emitting) rather
+                        // than going terminal; emit_macroblock_view_change_vote clamps the round to the cap.
                         if (local_delay > STALL_GRACE_SECS || leader_yielded) && production_unlocked
-                            && !failover_capped && meshed_esc && boot_ok_esc && !seal_throttled {
+                            && meshed_esc && boot_ok_esc && !seal_throttled {
                             let now_u64 = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -13945,67 +14015,20 @@ impl BlockchainNode {
                         // independent of consensus mechanism. Macroblock finality at the
                         // next 90-block boundary remains the canonical path; this
                         // ensures syncing nodes catch up to it.
-                        static CHRONIC_STALL_LAST_RESYNC: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(0);
-                        const CHRONIC_STALL_THRESHOLD_SECS: u64 = 120;
-                        const CHRONIC_RESYNC_COOLDOWN_SECS: u64 = 120;
+                        // Chronic-stall safety net: after 120s of zero progress (or an escalation request
+                        // raised by the production gate / failover cap), nudge the SINGLE sync coordinator
+                        // to catch up and drop the stale producer election so a fresh one is computed. The
+                        // old inline peer-resync (macroblock repair + bulk sync_blocks) duplicated
+                        // execute_sync's pipeline and raced it; the SyncManager now owns all catch-up.
                         let escalation_requested = CHRONIC_STALL_REQUESTED
                             .swap(false, std::sync::atomic::Ordering::Relaxed);
-                        if local_delay > CHRONIC_STALL_THRESHOLD_SECS || escalation_requested {
-                            let now_u64 = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let last_resync = CHRONIC_STALL_LAST_RESYNC
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            if now_u64.saturating_sub(last_resync) > CHRONIC_RESYNC_COOLDOWN_SECS {
-                                CHRONIC_STALL_LAST_RESYNC.store(
-                                    now_u64, std::sync::atomic::Ordering::Relaxed,
-                                );
-                                let latest_mb = next_height / 90;
-                                let missing_mb = {
-                                    let scan_start = if latest_mb > 10 { latest_mb - 10 } else { 1 };
-                                    let mut first_missing = latest_mb;
-                                    for idx in scan_start..=latest_mb {
-                                        let has_mb = storage.get_macroblock_by_height(idx)
-                                            .map(|mb| mb.is_some())
-                                            .unwrap_or(false);
-                                        if !has_mb {
-                                            first_missing = idx;
-                                            break;
-                                        }
-                                    }
-                                    first_missing
-                                };
-                                println!(
-                                    "[WARN][STALL] chronic_stall h={} delay={}s mb={} first_missing={} action=peer_resync",
-                                    next_height, local_delay, latest_mb, missing_mb
-                                );
-                                if let Some(p2p) = &unified_p2p {
-                                    clear_expected_producer_cache_above(next_height.saturating_sub(1));
-                                    // Backward tip-window repair (at/below frontier) → repair path,
-                                    // no clear-before-request flood.
-                                    let _ = p2p.sync_macroblocks_repair(
-                                        missing_mb.saturating_sub(1), latest_mb,
-                                    ).await;
-                                    // v32.2: adaptive resync range. If gap to network tip > 90,
-                                    // request bulk forward range (up to 1000 blocks) instead of
-                                    // fixed backward 90-block tip window. Tip recovery only when close.
-                                    const BULK_CATCHUP_THRESHOLD: u64 = 90;
-                                    const BULK_CATCHUP_CHUNK: u64 = 1000;
-                                    let quorum_peak = p2p.get_max_peer_height();
-                                    let gap_to_tip = quorum_peak.saturating_sub(next_height);
-                                    if gap_to_tip > BULK_CATCHUP_THRESHOLD {
-                                        let bulk_to = next_height.saturating_add(gap_to_tip.min(BULK_CATCHUP_CHUNK));
-                                        println!("[INFO][SYNC] chronic_stall bulk_catchup from={} to={} gap={}",
-                                                 next_height, bulk_to, gap_to_tip);
-                                        let _ = p2p.sync_blocks(next_height, bulk_to).await;
-                                    } else {
-                                        let resync_from = next_height.saturating_sub(90);
-                                        let _ = p2p.sync_blocks(resync_from, next_height).await;
-                                    }
-                                }
+                        if local_delay > 120 || escalation_requested {
+                            if is_warn() {
+                                println!("[WARN][STALL] chronic_stall h={} delay={}s action=nudge_sync",
+                                         next_height, local_delay);
                             }
+                            clear_expected_producer_cache_above(next_height.saturating_sub(1));
+                            crate::sync_manager::nudge_sync_check();
                         }
 
                         // ═══════════════════════════════════════════════════════════════════
@@ -14039,7 +14062,7 @@ impl BlockchainNode {
                             println!("[WARN][FORK] pipeline_detected fork_h={} local_h={} rollback_to={} anchor_floor={}",
                                      fork_h, local_h, rollback_to, anchor_floor);
 
-                            if let Some(p2p) = &unified_p2p {
+                            if unified_p2p.is_some() {
                                 // 1. Rollback local chain to before fork point
                                 if rollback_to > 0 && rollback_to < local_h {
                                     // v14.8: Atomic claim + finality check.
@@ -14111,21 +14134,16 @@ impl BlockchainNode {
                                             &storage,
                                             rollback_to,
                                         ).await {
+                                            // Reconcile couldn't PROVE the rebuilt state canonical. Don't run
+                                            // a second inline fetch here — the single sync coordinator owns
+                                            // catch-up: post-rollback the local tip drops below finality, so
+                                            // its snapshot fast-path restores wholesale state (and owns) on the
+                                            // nudge below. Mark owns dirty so a crash before that re-derives it.
+                                            storage.mark_owns_index_dirty();
                                             println!(
-                                                "[WARN][STATE] reconcile_unproven target={} err={} action=clean_state_sync",
+                                                "[WARN][STATE] reconcile_unproven target={} err={} action=coordinator_state_sync",
                                                 rollback_to, e,
                                             );
-                                            let tip = crate::node::qc_verified_frontier_height()
-                                                .max(p2p.get_best_peer_height());
-                                            match storage.fast_sync_with_snapshot(p2p, tip, &state).await {
-                                                // fast_sync's promote rebuilds owns; the block_sync fallback
-                                                // doesn't — mark dirty so the next boot re-derives it.
-                                                Ok(()) => println!("[INFO][STATE] clean_state_sync_ok target={}", tip),
-                                                Err(se) => {
-                                                    storage.mark_owns_index_dirty();
-                                                    println!("[WARN][STATE] clean_state_sync_failed err={:?} fallback=block_sync action=owns_dirty", se);
-                                                }
-                                            }
                                         } else {
                                             println!(
                                                 "[INFO][STATE] reconcile_after_pipeline_fork_ok target={}",
@@ -14158,6 +14176,11 @@ impl BlockchainNode {
                                             // leaves it dirty so the next boot rebuilds.
                                             if heal_ok { let _ = storage.set_owns_index_built(rollback_to); }
                                             if is_info() { println!("[INFO][FORK] owns_index_resynced contracts={} to={} clean={}", healed, rollback_to, heal_ok); }
+
+                                            // Rich-list index (display-only): balances changed by the
+                                            // rollback+replay, so rebuild UNCONDITIONALLY (ignore the boot
+                                            // marker). Sibling of the owns resync above.
+                                            let _ = Self::rebuild_richlist_index().await;
                                         }
 
                                         println!("[INFO][FORK] rollback_ok to={} deleted={} blocks",
@@ -14165,19 +14188,12 @@ impl BlockchainNode {
                                     }
                                 }
 
-                                // 2. Resync from peers (fork_height to current network tip)
-                                let sync_to = std::cmp::min(
-                                    p2p.get_best_peer_height(),
-                                    fork_h.saturating_add(200) // bounded resync
-                                );
-                                if sync_to > rollback_to {
-                                    println!("[INFO][FORK] resync range={}-{}", rollback_to + 1, sync_to);
-                                    if let Err(e) = p2p.sync_blocks(rollback_to + 1, sync_to).await {
-                                        eprintln!("[ERR][FORK] resync_fail err={}", e);
-                                    } else {
-                                        println!("[INFO][FORK] resync_ok range={}-{}", rollback_to + 1, sync_to);
-                                    }
-                                }
+                                // Post-rollback the local tip dropped (below finality if we deleted, or
+                                // already behind the fork if we didn't) → hand off to the single sync
+                                // coordinator. Its check_desync fires execute_sync's snapshot fast-path +
+                                // catch-up to pull the canonical chain; no duplicate inline bulk fetch here.
+                                println!("[INFO][FORK] rollback_done to={} action=coordinator_sync", rollback_to);
+                                crate::sync_manager::nudge_sync_check();
                             }
                         }
 
@@ -14267,20 +14283,6 @@ impl BlockchainNode {
                 // Mode 2: gap <= 10 → LIVE SYNC (ShredProtocol real-time blocks)
                 // No more one-shot downloads or emergency sync.
 
-                // DEADLOCK PROTECTION: Guard auto-clears sync flag on drop.
-                // v32.7: also flushes RocksDB so any WAL-disabled writes from
-                // catch-up are persisted before normal-mode writes resume.
-                struct FastSyncGuard {
-                    storage: Arc<Storage>,
-                }
-                impl Drop for FastSyncGuard {
-                    fn drop(&mut self) {
-                        self.storage.flush_db();
-                        FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                        FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
-                    }
-                }
-
                 if let Some(p2p) = &unified_p2p {
                     // Sync target = the attested/quorum network height (sync_blockchain_height /
                     // get_cached_network_height), NOT the raw BEST_PEER_HEIGHT max. The atomic is a
@@ -14339,290 +14341,11 @@ impl BlockchainNode {
                             println!("[WARN][SYNC] behind={} local={} network={}",
                                      height_difference, microblock_height, network_height);
 
-                            // DEADLOCK DETECTION: Clear stuck sync flag
-                            let current_time = get_timestamp_safe();
-
-                            if coordinator_is_syncing() {
-                                let sync_start_time = FAST_SYNC_START_TIME.load(Ordering::Relaxed);
-
-                                if sync_start_time == 0 {
-                                    // Self-heal an inconsistent flag (syncing set, start unrecorded); not a fault.
-                                    if is_debug() { println!("[DBG][SYNC] sync_flag_reset reason=start_time_zero"); }
-                                    FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                                } else {
-                                    let last_progress = LAST_SYNC_PROGRESS_TIME.load(Ordering::Relaxed);
-                                    let progress_ref = if last_progress > 0 { last_progress } else { sync_start_time };
-                                    let since_progress = current_time.saturating_sub(progress_ref);
-                                    const SYNC_NO_PROGRESS_TIMEOUT: u64 = 120;
-
-                                    if since_progress >= SYNC_NO_PROGRESS_TIMEOUT {
-                                        let sync_elapsed = current_time.saturating_sub(sync_start_time);
-                                        println!("[WARN][SYNC] deadlock no_progress={}s total={}s action=clearing",
-                                                 since_progress, sync_elapsed);
-                                        FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                                        FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
-                                    }
-                                }
-                            }
-
-                            // Single cold-join owner: SyncManager (sync_manager.rs) fully drives
-                            // snapshot fast-sync + genesis + block replay. This legacy production-loop
-                            // catch-up defers to it both while SyncManager is in the Syncing phase
-                            // (coordinator_is_syncing) AND during the pre-SyncStart init-sync window
-                            // (SYNC_IN_PROGRESS, set before the init task spawns) — so the two never
-                            // drive a cold-join concurrently.
-                            if !crate::node::coordinator_is_syncing()
-                                && !SYNC_IN_PROGRESS.load(Ordering::SeqCst)
-                                && !FAST_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-                                FAST_SYNC_START_TIME.store(current_time, Ordering::Relaxed);
-                                LAST_SYNC_PROGRESS_TIME.store(current_time, Ordering::Relaxed);
-                                println!("[INFO][SYNC] fast_sync_start gap={}", height_difference);
-
-                                // v15.8: `mut` because the runtime snapshot fast-path
-                                // inside the spawn block below may advance the start
-                                // height after a successful snapshot load.
-                                let mut sync_from_height = if microblock_height == 0 {
-                                    0
-                                } else if microblock_height % ROTATION_INTERVAL_BLOCKS == 0 {
-                                    microblock_height
-                                } else {
-                                    microblock_height + 1
-                                };
-
-                                let p2p_clone = p2p.clone();
-                                let storage_clone = storage.clone();
-                                let height_clone = height.clone();
-                                // SAME StateManager handle the apply pipeline uses — cold-join snapshot
-                                // rehydrate must seed it (else first tail block trips state_root_mismatch).
-                                let state_clone = state.clone();
-
-                                tokio::spawn(async move {
-                                    let _guard = FastSyncGuard { storage: storage_clone.clone() };
-
-                                    // v31.5+v32.8: snapshot fast-path. Cold-start (sync_from=0)
-                                    // retries up to ~5 min waiting for the first network anchor
-                                    // (v32.6 makes that h=90 ≈ 90 s); warm gap > threshold tries
-                                    // once. Either way falls through to block-by-block on failure.
-                                    const RUNTIME_SNAPSHOT_GAP_THRESHOLD: u64 = SNAPSHOT_SYNC_SWITCH_GAP;
-                                    if sync_from_height == 0 || height_difference > RUNTIME_SNAPSHOT_GAP_THRESHOLD {
-                                        let cold_start = sync_from_height == 0;
-                                        let max_retries: u32 = if cold_start { 30 } else { 1 };
-                                        let retry_delay = Duration::from_secs(10);
-                                        if is_info() {
-                                            println!(
-                                                "[INFO][SYNC] runtime_snapshot_try gap={} threshold={} target={} cold_start={}",
-                                                height_difference, RUNTIME_SNAPSHOT_GAP_THRESHOLD,
-                                                network_height, cold_start,
-                                            );
-                                        }
-                                        let mut snapshot_loaded = false;
-                                        for attempt in 1..=max_retries {
-                                            match storage_clone.fast_sync_with_snapshot(&p2p_clone, network_height, &state_clone).await {
-                                                Ok(()) => {
-                                                    let new_local = storage_clone.get_chain_height().unwrap_or(sync_from_height);
-                                                    if new_local + 1 > sync_from_height {
-                                                        sync_from_height = new_local + 1;
-                                                        *height_clone.write().await = new_local;
-                                                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.fetch_max(
-                                                            new_local, std::sync::atomic::Ordering::Release,
-                                                        );
-                                                        println!(
-                                                            "[INFO][SYNC] runtime_snapshot_loaded h={} skipped={} sync_from={} attempt={}",
-                                                            new_local, new_local.saturating_sub(microblock_height),
-                                                            sync_from_height, attempt,
-                                                        );
-                                                    }
-                                                    snapshot_loaded = true;
-                                                    break;
-                                                }
-                                                Err(e) if cold_start && attempt < max_retries => {
-                                                    if is_info() {
-                                                        println!(
-                                                            "[INFO][SYNC] cold_start_snapshot_wait attempt={}/{} reason={:?}",
-                                                            attempt, max_retries, e,
-                                                        );
-                                                    }
-                                                    tokio::time::sleep(retry_delay).await;
-                                                }
-                                                Err(e) => {
-                                                    if is_info() {
-                                                        println!("[INFO][SYNC] runtime_snapshot_unavailable reason={:?} fallback=block_sync", e);
-                                                    }
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        let _ = snapshot_loaded;
-                                    }
-
-                                    // v5.5: Sync genesis block separately if chain is empty
-                                    if sync_from_height == 0 {
-                                        if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
-                                            println!("[WARN][SYNC] genesis_sync_fail: {}", e);
-                                        }
-                                        tokio::time::sleep(Duration::from_secs(1)).await;
-                                    }
-
-                                    // v10.1: LOOP until caught up (not one-shot!)
-                                    // Each iteration downloads a batch, checks remaining gap, continues.
-                                    let mut current_from = sync_from_height;
-                                    let mut batch_num = 0u32;
-                                    let mut stall_count = 0u32; // Track consecutive no-progress iterations
-
-                                    loop {
-                                        // Re-read current network height (may have advanced) via the clamped
-                                        // chokepoint so a forged head can't inflate the bulk target.
-                                        let target = p2p_clone.get_best_peer_height();
-                                        let target = std::cmp::max(target, network_height); // At least initial target
-
-                                        // Sync cursor SLAVED to the real applied chain height: always request
-                                        // from the first genuinely-missing block. A block downloaded but not
-                                        // yet applied (continuity gap) leaves chain height put, so we re-request
-                                        // exactly the hole until it applies — NEVER skip a gap forward (skipping
-                                        // strands the chain at a fixed height, which wedged genesis_node_001).
-                                        current_from = storage_clone.get_chain_height()
-                                            .unwrap_or(current_from);
-
-                                        if current_from >= target {
-                                            println!("[INFO][SYNC] caught_up h={}", current_from);
-                                            break;
-                                        }
-
-                                        let remaining = target.saturating_sub(current_from);
-                                        batch_num += 1;
-
-                                        // STATE MACHINE update
-                                        let progress = if target > 0 {
-                                            ((current_from as f64 / target as f64) * 100.0) as u8
-                                        } else { 0 };
-                                        set_node_state(NodeState::Syncing {
-                                            local_height: current_from,
-                                            target_height: target,
-                                            progress_percent: progress,
-                                        });
-
-                                        println!("[INFO][SYNC] batch={} from={} to={} remaining={}",
-                                                 batch_num, current_from, target, remaining);
-
-                                        // Adaptive timeout: min 60s, ~10 blocks/sec + buffer
-                                        let blocks_to_sync = target.saturating_sub(current_from);
-                                        let timeout_secs = std::cmp::max(60, (blocks_to_sync / 10) + 30);
-
-                                        // Delivery-verified backbone: one window per batch; the outer
-                                        // loop re-checks current_from and dispatches the next window.
-                                        let sync_result = tokio::time::timeout(
-                                            Duration::from_secs(timeout_secs),
-                                            p2p_clone.sync_blocks(current_from + 1, target)
-                                        ).await;
-
-                                        // Update progress timestamp for deadlock detection
-                                        LAST_SYNC_PROGRESS_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
-
-                                        match sync_result {
-                                            Ok(_) => {
-                                                let prev_from = current_from;
-
-                                                // Repair chain height metadata after batch
-                                                match storage_clone.verify_and_repair_chain_height() {
-                                                    Ok(true) => {
-                                                        let repaired = storage_clone.get_chain_height().unwrap_or(current_from);
-                                                        if repaired > current_from {
-                                                            println!("[INFO][SYNC] height_repaired from={} to={}", current_from, repaired);
-                                                            current_from = repaired;
-                                                        }
-                                                    }
-                                                    Ok(false) => {
-                                                        // Walk forward to find actual synced height
-                                                        let mut walk = current_from;
-                                                        while walk < target {
-                                                            if storage_clone.load_microblock(walk + 1).unwrap_or(None).is_some() {
-                                                                walk += 1;
-                                                            } else {
-                                                                break;
-                                                            }
-                                                        }
-                                                        if walk > current_from {
-                                                            let _ = storage_clone.set_chain_height(walk);
-                                                            current_from = walk;
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        // Cursor is re-derived from the real chain height next
-                                                        // iteration — never skip forward on a repair error.
-                                                        println!("[WARN][SYNC] repair_err: {}", e);
-                                                    }
-                                                }
-
-                                                // No-apply-progress detection. The cursor stays pinned to the real
-                                                // gap (re-derived each iteration) — we NEVER skip it forward. Back
-                                                // off so a persistently-missing block doesn't hot-loop the peer.
-                                                if current_from == prev_from {
-                                                    stall_count += 1;
-                                                    if stall_count >= 5 {
-                                                        println!("[WARN][SYNC] no_apply_progress at h={} stall={} — re-requesting gap (no skip)", current_from, stall_count);
-                                                        stall_count = 0;
-                                                        tokio::time::sleep(Duration::from_secs(2)).await;
-                                                    }
-                                                } else {
-                                                    stall_count = 0;
-                                                }
-
-                                                // Update global height
-                                                let mut global_h = height_clone.write().await;
-                                                if current_from > *global_h {
-                                                    *global_h = current_from;
-                                                    crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                                                        current_from,
-                                                        std::sync::atomic::Ordering::Release
-                                                    );
-                                                    let sync_lbpt = storage_clone.load_microblock_auto_format(current_from)
-                                                        .ok().flatten().map(|mb| mb.timestamp)
-                                                        .unwrap_or_else(get_timestamp_safe);
-                                                    LAST_BLOCK_PRODUCED_TIME.store(sync_lbpt, Ordering::Relaxed);
-                                                    LAST_BLOCK_PRODUCED_HEIGHT.store(current_from, Ordering::Relaxed);
-                                                }
-                                                drop(global_h);
-
-                                                // v32.1: re-verify network tip via authoritative peer-quorum height
-                                                // before declaring sync complete. BEST_PEER_HEIGHT alone can lag
-                                                // attestation TTL; pull live quorum max so we don't exit early.
-                                                let best_atomic = p2p_clone.get_best_peer_height();
-                                                let quorum_max = p2p_clone.get_max_peer_height();
-                                                let new_target = best_atomic.max(quorum_max);
-                                                if current_from + 3 >= new_target {
-                                                    println!("[INFO][SYNC] fast_sync_complete h={} network={} (quorum={})",
-                                                             current_from, new_target, quorum_max);
-                                                    break;
-                                                }
-                                                if new_target > best_atomic {
-                                                    crate::unified_p2p::BEST_PEER_HEIGHT.store(new_target, Ordering::Release);
-                                                }
-
-                                                // Cursor advances only via the real chain height (re-derived at
-                                                // loop top) — no blind +1 that could outrun unapplied blocks.
-                                                println!("[INFO][SYNC] batch_done batch={} applied_h={}", batch_num, current_from);
-                                            },
-                                            Err(_) => {
-                                                // Retry the SAME range — the cursor is re-derived from the real
-                                                // chain height next iteration. NEVER skip on timeout (skipping a
-                                                // still-missing block is exactly what stranded genesis_node_001).
-                                                println!("[WARN][SYNC] batch {} timeout after {}s, re-requesting same gap", batch_num, timeout_secs);
-                                                stall_count = stall_count.saturating_add(1);
-                                                tokio::time::sleep(Duration::from_secs(2)).await;
-                                            }
-                                        }
-
-                                        // Safety: max 1000 batches to prevent infinite loop
-                                        if batch_num >= 1000 {
-                                            println!("[ERR][SYNC] max batches reached, stopping");
-                                            break;
-                                        }
-                                    }
-                                    // Guard drop clears FAST_SYNC_IN_PROGRESS
-                                });
-                            } else {
-                                if is_debug() { println!("[DBG][SYNC] fast_sync_in_progress, waiting"); }
-                            }
+                            // Behind the network → nudge the single sync coordinator; its check_desync
+                            // fires execute_sync (snapshot fast-path + pipelined microblock catch-up +
+                            // macroblock pass). Production stays withheld by the hard sync gate until
+                            // caught up, so no inline fetch or per-driver flag is needed here.
+                            crate::sync_manager::nudge_sync_check();
 
                             // Skip this production cycle — node is syncing
                             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -14940,19 +14663,10 @@ impl BlockchainNode {
                             progress_percent: progress,
                         });
                         
-                        // Trigger sync instead of producing
-                        let current_epoch = (our_height / 90) + 1;
-                        let safe_macroblock = current_epoch.saturating_sub(1);
-                        if safe_macroblock > 0 {
-                            let p2p_clone = p2p.clone();
-                            tokio::spawn(async move {
-                                if is_debug() { println!("[DBG][SYNC] req_mb_sync"); }
-                                if let Err(e) = p2p_clone.sync_macroblocks(1, safe_macroblock).await {
-                                    println!("[ERR][SYNC] Macroblock sync failed: {}", e);
-                                }
-                            });
-                        }
-                        
+                        // Behind → nudge the single sync coordinator (execute_sync's macroblock pass
+                        // repairs the deficit); skip producing this round.
+                        crate::sync_manager::nudge_sync_check();
+
                         // Wait and retry
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         continue;
@@ -15833,46 +15547,61 @@ impl BlockchainNode {
                         tx_bytes_list.extend(vote_proof_txs);
                     }
 
-                    // v32.12: per-block activation TX cap. NodeRegistration/Activation
-                    // hit registry+state-apply (deterministic but heavy). Bounding per
-                    // block keeps the producer's 1-sec deadline achievable under mass-
-                    // onboarding burst. Excess returns to mempool — included over next
-                    // blocks. Decode probes only tx_type discriminant (~5µs/tx); other
-                    // TX types pass through unchanged.
+                    // v32.12 + v33 lane: per-block activation TX cap. NodeRegistration/Activation
+                    // hit registry+state-apply (deterministic but heavy); bounding per block keeps
+                    // the producer's 1-sec deadline achievable under mass-onboarding burst.
+                    // NodeRegistration is served EXCLUSIVELY by the deterministic mempool lane
+                    // (attest_epoch, burn_tx, tx_hash ASC — every producer selects the SAME next
+                    // set, oldest attestation first) and ALWAYS stripped from the general stream,
+                    // so cross-producer FIFO nondeterminism can no longer starve a registration.
+                    // NodeActivation fills the remaining heavy budget from the general stream.
                     const MAX_ACTIVATIONS_PER_MICROBLOCK: usize = 10;
-                    let mut activation_count = 0usize;
-                    let mut deferred_activations: Vec<(String, Vec<u8>)> = Vec::new();
+                    let lane_apply_epoch = next_block_height.saturating_sub(1) / 90 + 1;
+                    // exempt_cap = genesis-set size: exempt (empty-burn/epoch-0) regs sort first, so
+                    // capping them keeps a junk flood from starving burn-backed registrations.
+                    let lane_regs = mempool.registrations_for_inclusion(
+                        lane_apply_epoch, 2, MAX_ACTIVATIONS_PER_MICROBLOCK,
+                        crate::genesis_constants::genesis_node_count());
+                    let mut activation_count = lane_regs.len();
+                    if activation_count > 0 && is_info() {
+                        println!("[INFO][MB] registration_lane count={} h={}", activation_count, next_block_height);
+                    }
+                    tx_bytes_list.extend(lane_regs);
+                    let mut deferred_activations = 0usize;
                     let capped_mempool_txs: Vec<(String, Vec<u8>)> = mempool_txs
                         .into_iter()
                         .filter(|(_hash, tx_bytes)| {
-                            let is_activation = bincode::deserialize::<qnet_state::Transaction>(tx_bytes)
-                                .map(|tx| matches!(tx.tx_type,
-                                    qnet_state::TransactionType::NodeRegistration { .. }
-                                    | qnet_state::TransactionType::NodeActivation { .. }
-                                ))
-                                .unwrap_or(false);
-                            if is_activation {
-                                if activation_count < MAX_ACTIVATIONS_PER_MICROBLOCK {
-                                    activation_count += 1;
-                                    true
-                                } else {
-                                    deferred_activations.push((_hash.clone(), tx_bytes.clone()));
-                                    false
+                            let kind = bincode::deserialize::<qnet_state::Transaction>(tx_bytes)
+                                .map(|tx| match tx.tx_type {
+                                    qnet_state::TransactionType::NodeRegistration { .. } => 1u8,
+                                    qnet_state::TransactionType::NodeActivation { .. } => 2u8,
+                                    _ => 0u8,
+                                })
+                                .unwrap_or(0);
+                            match kind {
+                                1 => false, // lane-only: never from the general stream (no double-inclusion)
+                                2 => {
+                                    if activation_count < MAX_ACTIVATIONS_PER_MICROBLOCK {
+                                        activation_count += 1;
+                                        true
+                                    } else {
+                                        deferred_activations += 1;
+                                        false
+                                    }
                                 }
-                            } else {
-                                true
+                                _ => true,
                             }
                         })
                         .collect();
-                    if !deferred_activations.is_empty() && is_info() {
+                    if deferred_activations > 0 && is_info() {
                         println!(
                             "[INFO][MB] activation_cap_applied admitted={}/{} deferred={} h={}",
                             activation_count, MAX_ACTIVATIONS_PER_MICROBLOCK,
-                            deferred_activations.len(), next_block_height,
+                            deferred_activations, next_block_height,
                         );
                     }
 
-                    // Add mempool TXs (capped on activations)
+                    // Add mempool TXs (regs stripped, activations capped)
                     tx_bytes_list.extend(capped_mempool_txs);
                     
                     // ═══════════════════════════════════════════════════════════════════════════
@@ -16841,7 +16570,11 @@ impl BlockchainNode {
                         // validator recomputes the IDENTICAL total in apply_block_to_state Phase 3, so
                         // producer and validators agree (no reward / state_root divergence).
                         let producer_credit = block_fees_collected.saturating_add(block_wasm_fuel_fees);
+                        // Producer fee-credit wallet for the rich-list touched-set (mirror of the
+                        // validator path): captured only when a credit is actually applied.
+                        let mut richlist_producer_wallet: Option<String> = None;
                         if producer_credit > 0 && !producer_wallet.is_empty() {
+                            richlist_producer_wallet = Some(producer_wallet.clone());
                             match state_guard.credit_producer_fees_once(
                                 next_block_height,
                                 &producer_wallet,
@@ -16868,7 +16601,11 @@ impl BlockchainNode {
                         let computed_state_root = state_guard.finalize_merkle();
                         microblock.state_root = computed_state_root;
                         producer_supply_head = state_guard.get_total_supply();
-                        
+
+                        // Rich-list index (display-only, best-effort): reconcile this block's touched
+                        // holders. SAME touched-set as the validator apply path.
+                        Self::reconcile_richlist_for_block(&state_guard, &*storage, &microblock, richlist_producer_wallet.as_deref());
+
                         if is_debug() {
                             println!("[DBG][STATE] state_root computed h={} root={}",
                                      next_block_height, hex::encode(&computed_state_root[..8]));
@@ -17719,152 +17456,10 @@ impl BlockchainNode {
                     
                     // EXISTING: Non-blocking background sync as promised in line 868 comments
                     if let Some(p2p) = &unified_p2p {
-                        // SYNC FIX: Using global SYNC_IN_PROGRESS flag
-                        
-                        // DEADLOCK PROTECTION: Guard that automatically clears sync flag on drop
-                        // v3.0: BUT NOT if initial sync target is still pending!
-                        struct SyncGuard;
-                        impl Drop for SyncGuard {
-                            fn drop(&mut self) {
-                                // v3.0: Don't clear flag if initial sync target not reached!
-                                // This prevents race condition where background sync clears flag
-                                // before initial sync completes
-                                let target = coordinator_sync_target();
-                                if target == 0 {
-                                    // No initial sync target - safe to clear
-                                    SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                                }
-                                SYNC_START_TIME.store(0, Ordering::Relaxed); // Clear deadlock timer
-                            }
-                        }
-                        
-                        // DEADLOCK DETECTION: Check if background sync is stuck
-                        // CRITICAL FIX v2.21.3: Also detect stuck sync with start_time=0 (never set)
-                        // v3.0: Skip deadlock detection if initial sync target is pending
-                        let current_time = get_timestamp_safe();
-                        let initial_sync_target = coordinator_sync_target();
-
-                        if coordinator_is_syncing() && initial_sync_target == 0 {
-                            // Only run deadlock detection for background sync, not initial sync
-                            let sync_start_time = SYNC_START_TIME.load(Ordering::Relaxed);
-
-                            // CRITICAL FIX: If start_time is 0 but flag is set - sync is stuck!
-                            // This can happen if flag was set but task never started
-                            if sync_start_time == 0 {
-                                println!("[WARN][SYNC] deadlock_detected start_time=0 action=clearing_flag");
-                                SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                            } else {
-                                let sync_elapsed = current_time.saturating_sub(sync_start_time);
-
-                                if sync_elapsed >= BACKGROUND_SYNC_TIMEOUT_SECS {
-                                    println!("[WARN][SYNC] deadlock_detected bg_sync_stuck={}s action=clearing_flag", sync_elapsed);
-                                    SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
-                                    SYNC_START_TIME.store(0, Ordering::Relaxed);
-                                }
-                            }
-                        }
-
-                        // Only start new sync if not already running
-                        if !coordinator_is_syncing() {
-                        // PRODUCTION: Background sync without blocking microblock timing
-                        let p2p_clone = p2p.clone();
-                        let storage_clone = storage.clone();
-                        let height_clone = height.clone();
-                        let current_height = microblock_height;
-                        let node_id_for_sync = node_id.clone();
-                            
-                            // Mark sync as in progress
-                            SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
-                            SYNC_START_TIME.store(current_time, Ordering::Relaxed); // Record start time
-                        
-                        tokio::spawn(async move {
-                                // PRODUCTION: Guard ensures flag is cleared even on panic/error
-                                let _guard = SyncGuard;
-                                
-                                // CRITICAL FIX: Try cached height first, fallback to fresh async query
-                                // This ensures sync ALWAYS happens even if cache is empty/expired
-                                let network_height = match p2p_clone.get_cached_network_height() {
-                                    Some(h) => Some(h),
-                                    None => {
-                                        // Cache miss - query network directly (CRITICAL for 5-node networks)
-                                        // PRODUCTION v2.19.21: Now uses async HTTP client
-                                        match p2p_clone.sync_blockchain_height().await {
-                                            Ok(h) => {
-                                                if is_trace() { println!("[TRC][SYNC] cache_miss net_h={}", h); }
-                                                Some(h)
-                                            },
-                                            Err(e) => {
-                                                println!("[WARN][SYNC] Failed to get network height: {}", e);
-                                                None
-                                            }
-                                        }
-                                    }
-                                };
-                                
-                                if let Some(network_height) = network_height {
-                                // Floor the bg-sync target on the QC-verified frontier (frontier==0 ⇒ unchanged,
-                                // genesis-safe). No upper cap: a far-behind joiner must target the true tip, not
-                                // frontier+window — the apply-horizon now admits the full in-flight window.
-                                let frontier = qc_verified_frontier_height();
-                                let network_height = if frontier == 0 { network_height }
-                                    else { network_height.max(frontier) };
-                                if network_height > current_height {
-                                    let height_difference = network_height.saturating_sub(current_height);
-
-                                    // CRITICAL FIX v2.21.3: Detect significant lag and use FAST_SYNC mode
-                                    // Previous bug: FAST_SYNC only triggered in producer loop
-                                    // Non-producers could fall behind without triggering fast recovery
-                                    if height_difference > FAST_SYNC_THRESHOLD {
-                                        println!("[INFO][SYNC] fast_sync_start behind={} local={} network={}",
-                                                 height_difference, current_height, network_height);
-                                    } else {
-                                        println!("[INFO][SYNC] bg_sync_download blocks={}-{}",
-                                                 current_height + 1, network_height);
-                                    }
-                                    
-                                    // TIMEOUT PROTECTION: Adaptive timeout based on blocks to sync
-                                    // CRITICAL FIX v2.21.3: More time for larger syncs
-                                    let timeout_secs = if height_difference > FAST_SYNC_THRESHOLD {
-                                        std::cmp::max(60, (height_difference / 10) + 30)  // Min 60s for fast sync
-                                    } else {
-                                        30  // Standard 30s for background sync
-                                    };
-                                    
-                                    // Delivery-verified backbone: sync_blocks over the gap (window-clamped).
-                                    let sync_result = tokio::time::timeout(
-                                        Duration::from_secs(timeout_secs),
-                                        p2p_clone.sync_blocks(current_height + 1, network_height)
-                                    ).await;
-                                    
-                                    match sync_result {
-                                        Ok(_) => {
-                                    // Update global height atomically
-                                    if let Ok(Some(_)) = storage_clone.load_microblock(network_height) {
-                                        *height_clone.write().await = network_height;
-                                        if is_info() { println!("[INFO][SYNC] bg_sync h={}", network_height); }
-                                        
-                                        // SYNC COMPLETE: Reputation recovery handled via block processing
-                                        // DeterministicReputationState.process_block() gives rewards for production
-                                        if network_height > current_height + 50 {
-if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_sync, network_height - current_height); }
-                                        }
-                                    }
-                                        },
-                                        Err(_) => {
-                                            println!("[WARN][SYNC] Background sync timeout after 30s");
-                                }
-                            }
-                                }
-                            }
-                                // Flag automatically cleared by guard drop
-                        });
-                        
-                        // EXISTING: Non-blocking - continue immediately without waiting
-                        if is_debug() { println!("[DBG][SYNC] bg_sync producer={}", current_producer); }
-                        } else {
-                            // SYNC FIX: Skip if sync already in progress
-                            println!("[INFO][SYNC] bg_sync_in_progress skipping=true");
-                        }
+                        // Non-producer fell behind → nudge the single sync coordinator (execute_sync
+                        // owns snapshot fast-path + pipelined catch-up). Non-blocking: the main loop
+                        // proceeds and the production hard-gate withholds output until caught up.
+                        crate::sync_manager::nudge_sync_check();
                         
                         // CRITICAL: Check if we already have the next block locally
                         // FIX: For non-producer, expected height is NEXT block height
@@ -18121,8 +17716,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                 std::process::exit(1);
                                             }
 
-                                            let resync_from = expected_height_timeout.saturating_sub(5);
-                                            let _ = p2p_check.sync_blocks(resync_from, expected_height_timeout).await;
+                                            // Targeted frontier repair exhausted → hand off to the single
+                                            // sync coordinator (snapshot fast-path + catch-up) instead of a
+                                            // duplicate inline bulk fetch here.
+                                            crate::sync_manager::nudge_sync_check();
                                             FAILOVER_IN_PROGRESS.store(false, Ordering::Relaxed);
                                             return;
                                         }
@@ -18270,10 +17867,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             // v14.7.2: No PFP degradation. Missing macroblocks are recovered
                             // by the regular 2f+1 commit/reveal consensus at the next 90-block
                             // boundary, or by direct sync from peers.
-                            if let Some(ref p2p) = p2p_check {
-                                let _ = p2p.sync_macroblocks(expected_macroblock, expected_macroblock).await;
-                            }
-                            let _ = storage_check;
+                            // Nudge the single sync coordinator to backfill the missing macroblock
+                            // object; the next 2f+1 boundary or its macroblock pass repairs it.
+                            crate::sync_manager::nudge_sync_check();
+                            let _ = (storage_check, p2p_check);
                         }
                     });
                     
@@ -18308,12 +17905,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
 
                         if !macroblock_exists {
                             println!("[WARN][MB] mb_gap_sync blocks_without_mb={}", blocks_since_trigger);
-                            if let Some(ref p2p) = unified_p2p {
-                                let p2p_clone = p2p.clone();
-                                tokio::spawn(async move {
-                                    let _ = p2p_clone.sync_macroblocks(expected_macroblock, expected_macroblock).await;
-                                });
-                            }
+                            // Nudge the single sync coordinator to fill the macroblock gap.
+                            crate::sync_manager::nudge_sync_check();
                         } else {
                             if is_debug() { println!("[DBG][MB] mb_ok mb={}", expected_macroblock); }
                         }
@@ -19705,38 +19298,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     let mb_idx = required_macroblock;
                     println!("[WARN][CAND] mb={} NOT_FOUND h={} — abstaining this round, requesting from peers",
                              mb_idx, current_height);
-                    let p2p_sync = p2p.clone();
-                    tokio::spawn(async move {
-                        let _ = p2p_sync.sync_macroblocks(mb_idx, mb_idx).await;
-                    });
+                    // Nudge the single sync coordinator to backfill the missing macroblock; we abstain
+                    // from this election round meanwhile (2f+1 others keep consensus alive).
+                    crate::sync_manager::nudge_sync_check();
                     // Not excluded: the bounded walk-back below self-heals the set from the most-recent
                     // finalized snapshot; true desync is logged only if no fallback is found.
                     
-                    // Trigger async sync for missing MacroBlock
-                    let current_tasks = ACTIVE_MACROBLOCK_CHECK_TASKS.load(std::sync::atomic::Ordering::Relaxed);
-                    if current_tasks < MAX_CONCURRENT_MACROBLOCK_CHECKS {
-                        let p2p_clone = p2p.clone();
-                        let missing_index = required_macroblock;
-                        
-                        ACTIVE_MACROBLOCK_CHECK_TASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        
-                        tokio::spawn(async move {
-                            struct TaskGuard;
-                            impl Drop for TaskGuard {
-                                fn drop(&mut self) {
-                                    ACTIVE_MACROBLOCK_CHECK_TASKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                            let _guard = TaskGuard;
-                            
-                            crate::unified_p2p::clear_macroblock_pending_sync(missing_index);
-                            
-                            println!("[INFO][SYNC] requesting_missing_mb idx={} reason=consensus_recovery", missing_index);
-                            if let Err(e) = p2p_clone.sync_macroblocks(missing_index, missing_index).await {
-                                println!("[WARN][SYNC] mb={} sync_failed={}", missing_index, e);
-                            }
-                        });
-                    }
+                    // Duplicate macroblock backfill removed — the nudge above already drives the single
+                    // sync coordinator to fetch it; the bounded walk-back below self-heals the set.
                     
                     // P1.5 self-healing: N-2 absent must NOT collapse the
                     // participant set to empty (that froze finality
@@ -20696,7 +20265,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             //   3. Inside spawn, re-check storage after the 45s delay (another task
                             //      may have saved it in the meantime).
                             // ═══════════════════════════════════════════════════════════════════
-                            if let Some(ref p2p_sync) = p2p {
+                            if let Some(ref _p2p_sync) = p2p {
                                 // Guard 1: storage pre-check (O(1) hash index lookup).
                                 let already_saved = storage.get_macroblock_by_height(macroblock_index)
                                     .map(|mb| mb.is_some())
@@ -20707,7 +20276,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 let insert_pending = crate::unified_p2p::mark_macroblock_pending_sync(macroblock_index);
 
                                 if !already_saved && insert_pending {
-                                    let p2p_for_sync = p2p_sync.clone();
                                     let storage_for_sync = storage.clone();
                                     let mb_idx = macroblock_index;
 
@@ -20727,20 +20295,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
 
                                         println!("[INFO][SYNC] mb_request_unsynced mb={}", mb_idx);
 
-                                        // Request with retries
-                                        for attempt in 1..=3 {
-                                            // Re-check before each retry (we may have received via broadcast)
-                                            if let Ok(Some(_)) = storage_for_sync.get_macroblock_by_height(mb_idx) {
-                                                break;
-                                            }
-                                            if let Err(e) = p2p_for_sync.sync_macroblocks(mb_idx, mb_idx).await {
-                                                println!("[WARN][SYNC] mb_request_failed attempt={}/3 mb={} err={}", attempt, mb_idx, e);
-                                                tokio::time::sleep(Duration::from_secs(5)).await;
-                                            } else {
-                                                println!("[INFO][SYNC] mb_request_sent mb={}", mb_idx);
-                                                break;
-                                            }
-                                        }
+                                        // Still unsynced after the wait → nudge the single sync coordinator;
+                                        // its macroblock pass backfills the object.
+                                        crate::sync_manager::nudge_sync_check();
                                         crate::unified_p2p::clear_macroblock_pending_sync(mb_idx);
                                     });
                                 } else if crate::node::is_debug() {
@@ -21154,32 +20711,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                                                  prev_mb_idx, round_gap, MAX_CONSENSUS_GAP); 
                                                     }
                                                     
-                                                    let p2p_sync = p2p_ref.clone();
-                                                    let mb_to_sync = prev_mb_idx;
-                                                    
-                                                    tokio::spawn(async move {
-                                                        // Small delay to not overload
-                                                        tokio::time::sleep(Duration::from_secs(2)).await;
-                                                        
-                                                        // v2.49: Sync directly from peers who have this MB
-                                                        for attempt in 1..=3 {
-                                                            match p2p_sync.sync_macroblocks(mb_to_sync, mb_to_sync).await {
-                                                                Ok(_) => {
-                                                                    if is_info() { 
-                                                                        println!("[INFO][RETRY] mb={} sync=ok attempt={}", mb_to_sync, attempt); 
-                                                                    }
-                                                                    break;
-                                                                }
-                                                                Err(e) => {
-                                                                    if is_warn() { 
-                                                                        println!("[WARN][RETRY] mb={} sync=fail attempt={} err={}", 
-                                                                                 mb_to_sync, attempt, e); 
-                                                                    }
-                                                                    tokio::time::sleep(Duration::from_secs(3)).await;
-                                                                }
-                                                            }
-                                                        }
-                                                    });
+                                                    // Macroblock too old for consensus (gap>epoch) → nudge the
+                                                    // single sync coordinator to download it directly.
+                                                    crate::sync_manager::nudge_sync_check();
                                                 }
                                             }
                                         }
@@ -21202,7 +20736,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 }
                                 
                                 let storage_check = storage.clone();
-                                let p2p_sync = p2p_ref.clone();
                                 let mb_index = macroblock_index;
                                 
                                 ACTIVE_MACROBLOCK_CHECK_TASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -21227,25 +20760,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                             println!("[WARN][MB-SYNC] mb={} status=missing source=broadcast action=requesting", mb_index);
                                         }
                                         
-                                        for attempt in 1..=3 {
-                                            if let Err(e) = p2p_sync.sync_macroblocks(mb_index, mb_index).await {
-                                                if is_warn() {
-                                                    println!("[WARN][MB-SYNC] mb={} attempt={}/3 result=fail err={}", mb_index, attempt, e);
-                                                }
-                                                tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
-                                            } else {
-                                                tokio::time::sleep(Duration::from_secs(2)).await;
-                                                let received = storage_check.get_macroblock_by_height(mb_index)
-                                                    .map(|mb| mb.is_some())
-                                                    .unwrap_or(false);
-                                                if received {
-                                                    if is_info() {
-                                                        println!("[INFO][MB-SYNC] mb={} status=received source=sync", mb_index);
-                                                    }
-                                                    break;
-                                                }
-                                            }
-                                        }
+                                        // Missing after the broadcast window → nudge the single sync
+                                        // coordinator to backfill the macroblock object.
+                                        crate::sync_manager::nudge_sync_check();
                                     } else {
                                         if is_debug() {
                                             println!("[DBG][MB-SYNC] mb={} status=received source=broadcast", mb_index);
@@ -21333,7 +20850,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let current_cert = p2p.get_highest_certified_round(mb_index);
         let f = committee.len().saturating_sub(1) / 3;
         let observed = crate::unified_p2p::highest_failover_round_with_support(mb_index, f + 1);
-        let next_round = current_cert.saturating_add(1).max(observed);
+        // DoS bound + hold-at-cap: never vote past MAX_FAILOVER_ROUND. Past it, >MAX rotations in one
+        // window is a sync/partition problem, not leader liveness — clamping stops the runaway
+        // certified-round climb while the pacemaker keeps voting the bounded round, so progress resumes
+        // the instant connectivity/finality returns (the failover loop drives sync recovery in parallel).
+        let next_round = current_cert.saturating_add(1).max(observed).min(MAX_FAILOVER_ROUND);
 
         // Voter's own sync state: last sealed macroblock (high_qc) + verified tip — hints and
         // accountability inside the signed payload; never quorum-read by verifiers.
@@ -23604,7 +23125,21 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let url = format!("http://{}:8001/", ip);
             let resp = match client.post(&url).json(&body).send().await { Ok(r) => r, Err(_) => continue };
             let json: serde_json::Value = match resp.json().await { Ok(j) => j, Err(_) => continue };
-            let result = match json.get("result") { Some(r) => r, None => continue };
+            let result = match json.get("result") {
+                Some(r) => r,
+                None => {
+                    // -32050 attest_pending: the attestor's issuance throttle queued this burn —
+                    // a non-vote this round; the convergence driver re-collects next cooldown.
+                    // Tolerates absent data/retry_after (older attestors, plain errors).
+                    if let Some(err) = json.get("error") {
+                        if err.get("code").and_then(|c| c.as_i64()) == Some(-32050) {
+                            let ra = err.get("data").and_then(|d| d.get("retry_after_secs")).and_then(|v| v.as_u64()).unwrap_or(0);
+                            if is_info() { println!("[INFO][REG] attest_pending member={} retry_after={}s", member_id, ra); }
+                        }
+                    }
+                    continue;
+                }
+            };
             let gid = result.get("genesis_id").and_then(|v| v.as_str()).unwrap_or("");
             let sig = result.get("sig").and_then(|v| v.as_str()).unwrap_or("");
             let signed_cost = result.get("cost").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -24382,144 +23917,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
     pub async fn start_sync_if_needed(&self) -> Result<(), QNetError> {
         // CRITICAL: Mark node as syncing to prevent consensus participation
         if is_info() { println!("[INFO][SYNC] sync_check_start"); }
-        
-        // Set a flag that we're syncing (prevents producing blocks)
-        let _is_syncing = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        
-        // PRODUCTION: Try to load from snapshot first for fast sync
-        if let Ok(latest_snapshot) = self.storage.get_latest_snapshot_height() {
-            if let Some(snapshot_height) = latest_snapshot {
-                let current_height = self.get_height().await;
-                
-                // If we're far behind and have a snapshot, use it
-                if current_height < snapshot_height.saturating_sub(1000) {
-                    println!("[INFO][SYNC] snapshot_found h={} loading=true", snapshot_height);
-                    
-                    // Local own snapshot (trusted, self-created) → load directly into live state.
-                    if let Err(e) = self.storage.load_state_snapshot(snapshot_height, false).await {
-                        println!("[WARN][SYNC] Failed to load snapshot: {}, falling back to normal sync", e);
-                    } else {
-                        // Update our height to snapshot height
-                        *self.height.write().await = snapshot_height;
-                        if is_info() { println!("[INFO][SYNC] snapshot_loaded h={}", snapshot_height); }
-                        // Heal reward shards the snapshot carried a root but not a leaf-set for (certified-verified).
-                        let _ = Self::backfill_reward_shards(&self.storage);
-                        
-                        // Continue syncing from snapshot height
-                        if let Some(ref p2p) = self.unified_p2p {
-                            if let Some(network_height) = p2p.get_cached_network_height() {
-                                if network_height > snapshot_height {
-                                    println!("[INFO][SYNC] post_snapshot_sync blocks={}-{}", snapshot_height + 1, network_height);
-                                    return self.sync_blocks(snapshot_height + 1, network_height).await;
-                                }
-                            }
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        
-        // Check if we have pending sync from previous run
-        if let Ok(Some((_from, to, current))) = self.storage.load_sync_progress() {
-            if is_info() { println!("[INFO][SYNC] resume from={} to={}", current, to); }
-            
-            if let Some(ref p2p) = self.unified_p2p {
-                // Continue sync from where we left off
-                if let Err(e) = p2p.batch_sync(current, to, 100).await {
-                    return Err(QNetError::SyncError(format!("Sync failed: {}", e)));
-                }
-                
-                // Clear sync progress after successful completion
-                self.storage.clear_sync_progress()?;
-                if is_info() { println!("[INFO][SYNC] sync_ok"); }
-            }
-        } else {
-            // Check if we're behind the network
-            if let Some(ref p2p) = self.unified_p2p {
-                let peers = p2p.get_validated_active_peers();
-                if !peers.is_empty() {
-                    let current_height = self.get_height().await;
-                    
-                    // CRITICAL FIX: Query network height from peers
-                    let network_height = self.query_network_height().await?;
-                    
-                    if is_debug() { println!("[DBG][SYNC] local={} net={}", current_height, network_height); }
-                    
-                    // If we're behind, start sync
-                    if network_height > current_height + 10 { // Allow 10 block tolerance
-                        println!("[WARN][SYNC] Node is {} blocks behind, starting sync...", 
-                                 network_height - current_height);
-                        
-                        // Light nodes are thin clients - they don't sync blocks
-                        // They get all data (balance, TX history) via RPC from Super nodes
-                        if self.node_type == NodeType::Light {
-                            if is_info() { println!("[INFO][SYNC] light_node_skip reason=thin_client"); }
-                        } else {
-                            // Super nodes sync complete history
-                            // For new nodes (height 0 or 1), start from block 1 (first microblock)
-                            let sync_from = if current_height <= 1 { 1 } else { current_height + 1 };
-                            
-                            // Sync to network height
-                            self.sync_blocks(sync_from, network_height).await?;
-                            
-                            // PRODUCTION v2.19.12: Sync macroblocks for Super nodes
-                            // Macroblocks contain consensus data and state roots
-                            let local_macro_index = current_height / 90;
-                            let network_macro_index = network_height / 90;
-                            if network_macro_index > local_macro_index {
-                                if is_info() {
-                                    println!("[INFO][MACROBLOCK-SYNC] syncing_macroblocks from={} to={}", 
-                                             local_macro_index + 1, network_macro_index);
-                                }
-                                self.sync_macroblocks(local_macro_index + 1, network_macro_index).await?;
-                            }
-                        }
-                    } else {
-                        if is_info() { println!("[INFO][SYNC] up_to_date"); }
-                    }
-                } else {
-                    println!("[WARN][SYNC] No peers available for sync check");
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Sync blocks from network
-    pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), QNetError> {
-        // v13.0: Guard against inverted ranges (from > to)
-        // This can happen when height calculations underflow or peers report stale data.
-        // Without this guard, `from..=to` with from > to creates an empty range but
-        // save_sync_progress records a broken state → infinite empty sync loop on restart.
-        if from_height > to_height {
-            if is_warn() {
-                println!("[WARN][SYNC] inverted_range from={} to={} skipped", from_height, to_height);
-            }
-            return Ok(());
-        }
 
-        if let Some(ref p2p) = self.unified_p2p {
-            // Start sync process
-            if is_info() { println!("[INFO][SYNC] block_sync {}-{}", from_height, to_height); }
-            
-            // Save sync progress for recovery
-            self.storage.save_sync_progress(from_height, to_height, from_height)?;
-            
-            // Use batch sync for efficiency
-            if let Err(e) = p2p.batch_sync(from_height, to_height, 100).await {
-                return Err(QNetError::SyncError(format!("Batch sync failed: {}", e)));
-            }
-            
-            // Clear sync progress after success
-            self.storage.clear_sync_progress()?;
-            if is_info() { println!("[INFO][SYNC] sync_complete"); }
-            
-            Ok(())
-        } else {
-            Err(QNetError::NetworkError("P2P network not initialized".to_string()))
-        }
+        // Single cold-join owner: the SyncManager (present iff this node has p2p — always true on the main
+        // BlockchainNode, spawned at boot before this call) fully drives snapshot fast-sync + tail replay +
+        // steady catch-up. The legacy boot bulk-sync it superseded is removed: running it here double-drove
+        // macroblock/block fetch and churned the apply frontier the cold-join anchor negotiation reads. A
+        // node without p2p has nothing to sync at boot.
+        if is_info() { println!("[INFO][SYNC] sync_owner=coordinator legacy_boot_sync=deferred"); }
+        Ok(())
     }
     
     /// Handle incoming sync request from peer
@@ -25438,30 +24843,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         Ok(())
     }
     
-    /// Sync macroblocks from network
-    /// PRODUCTION: Requests macroblocks from peers and waits for response
-    pub async fn sync_macroblocks(&self, from_index: u64, to_index: u64) -> Result<(), QNetError> {
-        // v13.0: Guard against inverted macroblock ranges
-        if from_index > to_index {
-            if is_warn() {
-                println!("[WARN][SYNC] inverted_macroblock_range from={} to={} skipped", from_index, to_index);
-            }
-            return Ok(());
-        }
-
-        if let Some(ref p2p) = self.unified_p2p {
-            if is_info() { println!("[INFO][SYNC] macroblock_sync from={} to={}", from_index, to_index); }
-            // Single delegation to the P2P coordinator, which windows + overlap-dedups internally.
-            // The old manual 10-wide re-batching here fought that window (overlapping chunks) — drop it.
-            if let Err(e) = p2p.sync_macroblocks(from_index, to_index).await {
-                if is_warn() { println!("[WARN][SYNC] macroblock_sync_failed from={} to={} err={}", from_index, to_index, e); }
-            }
-            Ok(())
-        } else {
-            Err(QNetError::NetworkError("P2P system not available".to_string()))
-        }
-    }
-    
     /// Start the producer liveness watchdog: a 500 ms-tick tokio task that
     /// reads PRODUCER_HEARTBEAT_MS and warns on silence (3 s → producer_silent,
     /// 10 s → producer_dead), each escalation once per episode, re-armed on
@@ -25553,59 +24934,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     .unwrap_or_default()
                     .as_secs();
                 
-                // Check FAST_SYNC_IN_PROGRESS health (defined in start_microblock_production)
-                // Note: We cannot directly access the static from here, but we track timing
-                
-                // PRODUCTION: If a sync flag has been stuck for > 120 seconds, something is wrong
-                // This is a safety net that should rarely trigger with Guard pattern in place
-                
+                // Sync liveness is owned by the SyncManager (single coordinator): its `active` flag is
+                // scoped by a guard cleared on every execute_sync exit, so there is no stuck-flag to poll.
                 println!("[INFO][SYNC] health_monitor_active interval=30s");
             }
         });
-    }
-    
-    /// Query network height from connected peers
-    pub async fn query_network_height(&self) -> Result<u64, QNetError> {
-        if let Some(ref p2p) = self.unified_p2p {
-            // Try to get cached network height first (fast path)
-            if let Some(cached_height) = p2p.get_cached_network_height() {
-                println!("[INFO][SYNC] cached_network_height h={}", cached_height);
-                return Ok(cached_height);
-            }
-            
-            // If no cache, query peers directly
-            let peers = p2p.get_validated_active_peers();
-            if peers.is_empty() {
-                println!("[WARN][SYNC] No peers available, using local height");
-                return Ok(self.get_height().await);
-            }
-            
-            // v2.24.3: QUIC-ONLY SYNC - Use cached heights from PeerInfo
-            // Heights are updated via heartbeats and block broadcasts (no HTTP queries needed)
-            // SCALABILITY: O(n) where n = connected peers, zero network overhead
-            let mut heights: Vec<u64> = peers.iter()
-                .filter(|p| p.last_block_height > 0)  // Only peers with known height
-                .map(|p| p.last_block_height)
-                .collect();
-            
-            // Log peer heights for debugging
-            for peer in peers.iter().filter(|p| p.last_block_height > 0).take(3) {
-                println!("[DBG][SYNC] peer_height peer={} h={} source=cache", peer.id, peer.last_block_height);
-            }
-            
-            // Take median height for Byzantine fault tolerance
-            if !heights.is_empty() {
-                heights.sort();
-                let median = heights[heights.len() / 2];
-                println!("[INFO][SYNC] network_consensus_height median={}", median);
-                Ok(median)
-            } else {
-                println!("[WARN][SYNC] No cached peer heights - waiting for heartbeats, using local height");
-                Ok(self.get_height().await)
-            }
-        } else {
-            Err(QNetError::NetworkError("P2P network not initialized".to_string()))
-        }
     }
     
     /// Recover consensus state after restart
@@ -25823,10 +25156,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let is_genesis_code = bootstrap_whitelist.contains(&code);
         
         // PRODUCTION: Initialize blockchain registry with real QNet nodes
-        let qnet_rpc = std::env::var("QNET_RPC_URL")
-            .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        let qnet_rpc = Self::resolve_genesis_rpc_url();
         
         if is_genesis_code {
             println!("[INFO][ACTIVATION] genesis_bootstrap_code code={}", code);
@@ -26053,210 +25383,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             println!("[INFO][ACTIVATION] burn_tx_saved");
         }
         
-        // Register Super nodes in reward system (not Genesis or Light nodes)
-        // Light nodes register through mobile app via RPC
-        // Genesis nodes register separately
-        if !bootstrap_whitelist.contains(&code) && node_type != NodeType::Light {
-            // v3.18: Super node type removed
-            let mut reward_manager = self.reward_manager.write().await;
-            let reward_node_type = match node_type {
-                NodeType::Super => RewardNodeType::Super,
-                NodeType::Light => RewardNodeType::Light,
-            };
-            
-            if let Err(e) = reward_manager.register_node(
-                self.node_id.clone(),
-                reward_node_type,
-                wallet_address.clone()
-            ) {
-                eprintln!("[WARN][REWARDS] Failed to register node in reward system: {}", e);
-            } else {
-                if is_info() { println!("[INFO][REWARDS] node_registered id={} type={:?}", 
-                         self.node_id, node_type); }
-                if is_debug() { println!("[DBG][REWARDS] wallet={}...", &wallet_address[..20.min(wallet_address.len())]); }
-            }
-            
-            // v2.71: Create ON-CHAIN NodeRegistration TX for Super nodes
-            // This ensures wallet→node binding is immutable and verifiable by all nodes
-            // v3.18: Super node type removed
-            let qnet_node_type = match node_type {
-                NodeType::Super => qnet_state::NodeType::Super,
-                NodeType::Light => qnet_state::NodeType::Light,
-            };
-            
-            // Use activation code hash as registration proof
-            let registration_proof = registry.hash_activation_code_for_blockchain(code)
-                .unwrap_or_else(|_| blake3::hash(code.as_bytes()).to_hex().to_string());
-            
-            // v3.35: Auto-detect public API endpoint for Super nodes
-            // By default = PUBLIC (auto-detect IP)
-            // Set QNET_HIDE_IP=1 to hide your IP (empty endpoint)
-            let api_endpoint = if qnet_node_type == qnet_state::NodeType::Super {
-                if std::env::var("QNET_HIDE_IP").is_ok() {
-                    // Operator explicitly chose to hide IP
-                    String::new()
-                } else {
-                    // Auto-detect public IP and create endpoint
-                    let public_ip = std::env::var("QNET_PUBLIC_IP")
-                        .or_else(|_| std::env::var("EXTERNAL_IP"))
-                        .or_else(|_| std::env::var("HOST_IP"))
-                        .unwrap_or_default();
-                    
-                    if !public_ip.is_empty() {
-                        format!("http://{}:8001", public_ip)
-                    } else {
-                        // No IP detected - node won't serve mobile apps
-                        String::new()
-                    }
-                }
-            } else {
-                // Light nodes: NEVER have api_endpoint (privacy)
-                String::new()
-            };
-            
-            let mut registration_tx = Self::create_node_registration_tx_with_endpoint(
-                &self.node_id,
-                qnet_node_type,
-                &wallet_address,
-                &registration_proof,
-                &api_endpoint,
-            );
-
-            // Phase-1 burn-attestation (PRODUCTION half): when the gate is active, collect the genesis
-            // quorum that proves the Solana 1DEV burn on-chain and embed it so block validation accepts
-            // the registration. Inert below the gate height ⇒ current onboarding is byte-for-byte
-            // unchanged (this whole block is skipped). Set before the final hash below.
-            {
-                let cur_h = self.storage.get_chain_height().unwrap_or(0);
-                if qnet_state::feature_gates::is_active("burn_attestation_required", cur_h) {
-                    let b_tx = std::env::var("QNET_BURN_TX_HASH").unwrap_or_default();
-                    let b_amt: u64 = std::env::var("QNET_BURN_AMOUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let mnemonic = std::env::var("QNET_WALLET_SEED").unwrap_or_default();
-                    let solana_wallet = crate::crypto::solana_derivation::derive_solana_address_from_mnemonic(&mnemonic)
-                        .unwrap_or_default();
-                    if !b_tx.is_empty() && !solana_wallet.is_empty() {
-                        // Re-derive (qnet_node_type was moved into the registration builder above).
-                        let qnt = match node_type {
-                            NodeType::Super => qnet_state::NodeType::Super,
-                            NodeType::Light => qnet_state::NodeType::Light,
-                        };
-                        // Local Phase-1 cost (advisory hint only); each attestor recomputes + signs its own.
-                        let cost_hint = match crate::rpc::fetch_solana_1dev_supply().await {
-                            Ok((tb, cs)) => qnet_state::Transaction::phase1_activation_cost(tb, cs),
-                            Err(_) => 0,
-                        };
-                        // QNET_BURN_AMOUNT (b_amt) is now only an operator hint; the embedded burn_amount
-                        // is the committee-certified agreed_amount (== what the counted 2f+1 signed), so an
-                        // honest over-burn (declared < actual) still verifies. For the exact-burn case
-                        // (declared == actual) agreed_amount == b_amt ⇒ identical registration as before.
-                        let (attestors, agreed_cost, agreed_amount, agreed_epoch) = Self::collect_burn_attestations(
-                            &b_tx, &solana_wallet, &wallet_address, b_amt, qnt, cost_hint, &self.storage).await;
-                        // Arm gate = quorum of the committee OF agreed_epoch — the SAME committee the
-                        // attestors signed for and the on-chain verifier re-resolves (M-5), so the local
-                        // `need` EXACTLY matches the verifier's threshold (no arm/apply straddle). Genesis
-                        // era ⇒ the genesis set; post-genesis None ⇒ this node can't read that epoch's N-2
-                        // committee ⇒ abort/retry (never arm bytes the verifier rejects forever).
-                        let arm_genesis_era = agreed_epoch <= 2;
-                        let arm_rep_h = agreed_epoch.saturating_sub(1) * 90 + 1;
-                        let arm_committee_len = match Self::committee_for_height(&self.storage, arm_rep_h) {
-                            Some(c) => c.len(),
-                            None if arm_genesis_era => crate::genesis_constants::genesis_node_count(),
-                            None => {
-                                eprintln!("[WARN][REG] burn_attest_committee_unavailable epoch={} — can't read N-2 committee; retrying arm after resync", agreed_epoch);
-                                return Err(QNetError::NetworkError(format!(
-                                    "burn_attest_committee_unavailable epoch={}", agreed_epoch)));
-                            }
-                        };
-                        let need = qnet_consensus::checkpoint_bft::quorum_size(arm_committee_len);
-                        if attestors.len() < need {
-                            // Sub-quorum ⇒ ABORT the arm (return Err) so the single-owner onboarding driver
-                            // re-collects fresh attestations against the current committee next tick. Arming a
-                            // sub-quorum TX would rebroadcast fixed bytes every validator rejects forever (the
-                            // permanent-wedge anti-pattern). Likely transient cause surfaced for the operator.
-                            eprintln!("[WARN][REG] burn_attest_sub_quorum got={}/{} declared={} — retrying arm (check committee :8001 + Solana burn-RPC reachability)",
-                                      attestors.len(), need, b_amt);
-                            return Err(QNetError::NetworkError(format!(
-                                "burn_attest_sub_quorum got={} need={}", attestors.len(), need)));
-                        }
-                        if let qnet_state::TransactionType::NodeRegistration {
-                            burn_tx: bt, burn_amount: ba, burn_cost: bc, burn_attestors: at, attest_epoch: ae, ..
-                        } = &mut registration_tx.tx_type {
-                            *bt = b_tx; *ba = agreed_amount; *bc = agreed_cost; *at = attestors; *ae = agreed_epoch;
-                        }
-                    }
-                }
-            }
-
-            // Pure ML-DSA-65 signing for User Super Nodes. Keys are created ON THIS NODE — sign
-            // locally before submitting to mempool. This prevents any block producer from forging
-            // a NodeRegistration for a foreign wallet: the wallet MUST be the EON derived from this
-            // Dilithium key (native_bound, verified at block validation). Ed25519 was an illusory
-            // leg — quantum-breakable, no identity binding — removed.
-            {
-                let canonical_msg = format!("client_node_reg:{}:{}:{}:{}",
-                    self.node_id, wallet_address, registration_proof, registration_tx.timestamp);
-
-                // Dilithium3 from WalletIdentity (post-quantum)
-                // Uses consensus-compatible format: "dilithium_sig_{node_id}_{base64(...)}"
-                // PK is embedded inside the base64 payload — TX is self-contained.
-                if let Some(ref identity) = self.wallet_identity {
-                    match identity.sign_consensus(&self.node_id, canonical_msg.as_bytes()) {
-                        Ok(consensus_sig) => {
-                            registration_tx.dilithium_signature = Some(consensus_sig);
-                            registration_tx.dilithium_public_key = Some(hex::encode(&identity.dilithium_pk));
-                        }
-                        Err(e) => {
-                            eprintln!("[WARN][REG] dilithium3_sign_failed: {}", e);
-                        }
-                    }
-                }
-
-                // Mark as client-signed → other nodes MUST verify both signatures
-                registration_tx.data = Some(format!("client_node_reg:{}:{}:{}:",
-                    self.node_id, wallet_address, registration_proof));
-                registration_tx.hash = registration_tx.calculate_hash();
-
-                println!("[INFO][REG] signed dilithium3={} node={}",
-                    registration_tx.dilithium_signature.is_some(),
-                    self.node_id);
-            }
-            
-            // Add to mempool for inclusion in next block
-            let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
-            let tx_hash = registration_tx.hash.clone();
-            if self.mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
-                if is_info() {
-                    println!("[INFO][REG] onchain_tx_submitted node={} wallet={}... hash={}...",
-                             self.node_id,
-                             &wallet_address[..16.min(wallet_address.len())],
-                             &tx_hash[..16.min(tx_hash.len())]);
-                }
-                // Arm the backoff rebroadcast: the periodic loop re-sends this until it lands on-chain
-                // (burst then trickle). The third field is the backoff tick counter — start at 0.
-                if let Ok(mut pend) = PENDING_NODE_REGISTRATION.lock() {
-                    *pend = Some((self.node_id.clone(), tx_bytes.clone(), 0));
-                }
-                // Deliver with the same guarantee as NodeActivation: producer-direct gossip + direct
-                // fan-out to every genesis node. A fresh joiner usually has no producer info yet, so a
-                // single gossip is fragile; the genesis fan-out ensures the binding TX reaches the
-                // network even before sync completes.
-                if let Some(ref p2p) = self.unified_p2p {
-                    let _ = p2p.broadcast_transaction(tx_bytes.clone());
-                    let tx_msg = crate::unified_p2p::NetworkMessage::Transaction { data: tx_bytes };
-                    let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
-                    for ip in &genesis_ips {
-                        p2p.send_network_message(&format!("{}:8001", ip), tx_msg.clone());
-                    }
-                    if is_info() { println!("[INFO][REG] registration_tx_broadcast hash={} genesis={}", &tx_hash[..16.min(tx_hash.len())], genesis_ips.len()); }
-                }
-            } else {
-                // TX did not enter the local mempool (pool full / already-present race) ⇒ PENDING is NOT
-                // armed and the rebroadcast has nothing to send. Return Err so the onboarding driver retries
-                // the arm instead of breaking into production unregistered (the M-1 validator-only failure).
-                eprintln!("[WARN][REG] onchain_tx_failed node={} — will retry", self.node_id);
-                return Err(QNetError::NetworkError(format!("registration_tx_not_submitted node={}", self.node_id)));
-            }
-        }
+        // Reward registration + the on-chain NodeRegistration arm moved to the single-owner
+        // convergence driver (drive_registration_convergence): it re-collects burn attestations when
+        // attest_epoch goes stale and arms behind the fail-closed frontier gate. This fn is the
+        // one-time LOCAL activation path only: validate + device-register + persist.
 
         // v4.9: USER SUPER NODE MIGRATION TRACKING
         // Register device_id on a genesis node's RocksDB via lightweight REST API.
@@ -26266,10 +25396,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // NOTE: Genesis nodes are EXCLUDED (they use IP-based auth, not activation codes).
         if !is_genesis_code {
             let device_sig = self.get_device_signature();
-            let genesis_url = std::env::var("QNET_RPC_URL")
-                .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                    .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
-                .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+            let genesis_url = Self::resolve_genesis_rpc_url();
             
             let node_id_for_log = self.node_id.clone();
             let node_id_for_body = self.node_id.clone();
@@ -26310,7 +25437,291 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         println!("[INFO][ACTIVATION] code_saved binding=blockchain_registry");
         Ok(())
     }
-    
+
+    /// Genesis RPC URL from env: QNET_RPC_URL, else the first QNET_GENESIS_NODES entry.
+    pub(crate) fn resolve_genesis_rpc_url() -> String {
+        std::env::var("QNET_RPC_URL")
+            .or_else(|_| std::env::var("QNET_GENESIS_NODES")
+                .map(|nodes| { let ip = nodes.split(',').next().unwrap_or("127.0.0.1").trim().to_string(); format!("http://{}:8001", ip) }))
+            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string())
+    }
+
+    /// One registration-convergence attempt (SOLE arm writer of PENDING_NODE_REGISTRATION):
+    /// build + burn-attest + sign + submit + broadcast the on-chain NodeRegistration, then re-run
+    /// the activation half (device registry + reward register) whose early-boot run drops its
+    /// NodeActivation while the global mempool is not yet installed. Associated fn (no &self) so the
+    /// boot-spawned driver loop owns it; Err ⇒ the driver retries next cooldown with FRESH
+    /// attestations (never rebroadcasts bytes the verifier rejects forever).
+    async fn drive_registration_convergence(
+        node_id: String,
+        node_type: NodeType,
+        wallet_address: String,
+        registration_proof: String,
+        api_endpoint: String,
+        code: String,
+        device_sig: String,
+        qnet_rpc: String,
+        storage: Arc<Storage>,
+        mempool: Arc<qnet_mempool::SimpleMempool>,
+        unified_p2p: Option<Arc<crate::unified_p2p::SimplifiedP2P>>,
+        wallet_identity: Option<Arc<crate::crypto::vrf::WalletIdentity>>,
+        reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
+    ) -> Result<(), QNetError> {
+        let qnet_node_type = match node_type {
+            NodeType::Super => qnet_state::NodeType::Super,
+            NodeType::Light => qnet_state::NodeType::Light,
+        };
+
+        let mut registration_tx = Self::create_node_registration_tx_with_endpoint(
+            &node_id,
+            qnet_node_type.clone(),
+            &wallet_address,
+            &registration_proof,
+            &api_endpoint,
+        );
+
+        // Re-arm edge default: the current tip's epoch (pre-gate arms never carry attestations).
+        let tip_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        let mut armed_epoch = tip_h.saturating_sub(1) / 90 + 1;
+
+        // Burn reference: env (docker -e) with the persisted fallback (save_activation_code stores
+        // it) so a restart without QNET_BURN_TX_HASH still arms a burn-backed registration instead
+        // of attestation-less bytes the verifier rejects forever.
+        let burn_tx_ref = std::env::var("QNET_BURN_TX_HASH").ok().filter(|s| !s.is_empty())
+            .or_else(|| storage.get_activation_burn_tx().ok().filter(|s| !s.is_empty()))
+            .unwrap_or_default();
+
+        // Phase-1 burn-attestation (PRODUCTION half): when the gate is active, collect the committee
+        // quorum that proves the Solana 1DEV burn and embed it so block validation accepts the
+        // registration. Inert below the gate height.
+        {
+            let cur_h = storage.get_chain_height().unwrap_or(0);
+            if qnet_state::feature_gates::is_active("burn_attestation_required", cur_h) {
+                let b_tx = burn_tx_ref.clone();
+                let b_amt: u64 = std::env::var("QNET_BURN_AMOUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let mnemonic = std::env::var("QNET_WALLET_SEED").unwrap_or_default();
+                let solana_wallet = crate::crypto::solana_derivation::derive_solana_address_from_mnemonic(&mnemonic)
+                    .unwrap_or_default();
+                if !b_tx.is_empty() && !solana_wallet.is_empty() {
+                    // Local Phase-1 cost (advisory hint only); each attestor recomputes + signs its own.
+                    let cost_hint = match crate::rpc::fetch_solana_1dev_supply().await {
+                        Ok((tb, cs)) => qnet_state::Transaction::phase1_activation_cost(tb, cs),
+                        Err(_) => 0,
+                    };
+                    // The embedded burn_amount is the committee-certified agreed_amount (== what the
+                    // counted 2f+1 signed); QNET_BURN_AMOUNT is only an operator hint.
+                    let (attestors, agreed_cost, agreed_amount, agreed_epoch) = Self::collect_burn_attestations(
+                        &b_tx, &solana_wallet, &wallet_address, b_amt, qnet_node_type, cost_hint, &storage).await;
+                    // Arm gate = quorum of the committee OF agreed_epoch — the SAME committee the
+                    // attestors signed for and the on-chain verifier re-resolves (M-5). Genesis era ⇒
+                    // the genesis set; post-genesis None ⇒ this node can't read that epoch's N-2
+                    // committee ⇒ abort/retry (never arm bytes the verifier rejects forever).
+                    let arm_genesis_era = agreed_epoch <= 2;
+                    let arm_rep_h = agreed_epoch.saturating_sub(1) * 90 + 1;
+                    let arm_committee_len = match Self::committee_for_height(&storage, arm_rep_h) {
+                        Some(c) => c.len(),
+                        None if arm_genesis_era => crate::genesis_constants::genesis_node_count(),
+                        None => {
+                            eprintln!("[WARN][REG] burn_attest_committee_unavailable epoch={} — retrying arm after resync", agreed_epoch);
+                            return Err(QNetError::NetworkError(format!(
+                                "burn_attest_committee_unavailable epoch={}", agreed_epoch)));
+                        }
+                    };
+                    let need = qnet_consensus::checkpoint_bft::quorum_size(arm_committee_len);
+                    if attestors.len() < need {
+                        // Sub-quorum ⇒ abort this attempt; the driver re-collects fresh attestations
+                        // next cooldown (covers -32050 attest_pending waves from the issuance throttle).
+                        eprintln!("[WARN][REG] burn_attest_sub_quorum got={}/{} declared={} — retrying next cooldown",
+                                  attestors.len(), need, b_amt);
+                        return Err(QNetError::NetworkError(format!(
+                            "burn_attest_sub_quorum got={} need={}", attestors.len(), need)));
+                    }
+                    if let qnet_state::TransactionType::NodeRegistration {
+                        burn_tx: bt, burn_amount: ba, burn_cost: bc, burn_attestors: at, attest_epoch: ae, ..
+                    } = &mut registration_tx.tx_type {
+                        *bt = b_tx; *ba = agreed_amount; *bc = agreed_cost; *at = attestors; *ae = agreed_epoch;
+                    }
+                    armed_epoch = agreed_epoch;
+                }
+            }
+        }
+
+        // Pure ML-DSA-65 signing. Keys are created ON THIS NODE — the wallet MUST be the EON derived
+        // from this Dilithium key (native_bound, verified at block validation), so no block producer
+        // can forge a NodeRegistration for a foreign wallet.
+        {
+            let canonical_msg = format!("client_node_reg:{}:{}:{}:{}",
+                node_id, wallet_address, registration_proof, registration_tx.timestamp);
+            if let Some(ref identity) = wallet_identity {
+                match identity.sign_consensus(&node_id, canonical_msg.as_bytes()) {
+                    Ok(consensus_sig) => {
+                        registration_tx.dilithium_signature = Some(consensus_sig);
+                        registration_tx.dilithium_public_key = Some(hex::encode(&identity.dilithium_pk));
+                    }
+                    Err(e) => {
+                        eprintln!("[WARN][REG] dilithium3_sign_failed: {}", e);
+                    }
+                }
+            }
+            // Mark as client-signed → other nodes MUST verify both signatures
+            registration_tx.data = Some(format!("client_node_reg:{}:{}:{}:",
+                node_id, wallet_address, registration_proof));
+            registration_tx.hash = registration_tx.calculate_hash();
+            println!("[INFO][REG] signed dilithium3={} node={}",
+                registration_tx.dilithium_signature.is_some(), node_id);
+        }
+
+        // Submit + arm + deliver.
+        let tx_bytes = bincode::serialize(&registration_tx).unwrap_or_default();
+        let tx_hash = registration_tx.hash.clone();
+        if mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), 0) {
+            if is_info() {
+                println!("[INFO][REG] onchain_tx_submitted node={} wallet={}... hash={}...",
+                         node_id,
+                         &wallet_address[..16.min(wallet_address.len())],
+                         &tx_hash[..16.min(tx_hash.len())]);
+            }
+            // Arm the backoff rebroadcast (field 3 = backoff tick, field 4 = re-arm edge epoch).
+            if let Ok(mut pend) = PENDING_NODE_REGISTRATION.lock() {
+                *pend = Some((node_id.clone(), tx_bytes.clone(), 0, armed_epoch));
+            }
+            // Producer-direct gossip + direct fan-out to every genesis node (same delivery guarantee
+            // as NodeActivation — a fresh joiner usually has no producer info yet).
+            if let Some(ref p2p) = unified_p2p {
+                let _ = p2p.broadcast_transaction(tx_bytes.clone());
+                let tx_msg = crate::unified_p2p::NetworkMessage::Transaction { data: tx_bytes };
+                let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
+                for ip in &genesis_ips {
+                    p2p.send_network_message(&format!("{}:8001", ip), tx_msg.clone());
+                }
+                if is_info() { println!("[INFO][REG] registration_tx_broadcast hash={} genesis={}", &tx_hash[..16.min(tx_hash.len())], genesis_ips.len()); }
+            }
+        } else {
+            // Not in the local mempool ⇒ PENDING is NOT armed and the rebroadcast has nothing to send.
+            eprintln!("[WARN][REG] onchain_tx_failed node={} — will retry", node_id);
+            return Err(QNetError::NetworkError(format!("registration_tx_not_submitted node={}", node_id)));
+        }
+
+        // Folded activation half: re-run the device registration NOW that the global mempool exists —
+        // the early-boot run (activation_validation) silently drops its NodeActivation before the
+        // mempool handle is installed. register_or_migrate_device is idempotent (register-or-migrate).
+        {
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let b_tx = burn_tx_ref.clone();
+            let b_amt: u64 = std::env::var("QNET_BURN_AMOUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let registry = crate::activation_validation::BlockchainActivationRegistry::new(Some(qnet_rpc.clone()));
+            let node_info = crate::activation_validation::NodeInfo {
+                activation_code: registration_proof.clone(),
+                wallet_address: wallet_address.clone(),
+                device_signature: device_sig.clone(),
+                node_type: format!("{:?}", node_type),
+                activated_at: timestamp,
+                last_seen: timestamp,
+                migration_count: 0,
+                node_id: node_id.clone(),
+                burn_tx_hash: b_tx,
+                phase: 1,
+                burn_amount: b_amt,
+            };
+            if let Err(e) = registry.register_or_migrate_device(&code, node_info, &device_sig).await {
+                println!("[WARN][ACTIVATION] device_register_failed err={}", e);
+            }
+            let reward_node_type = match node_type {
+                NodeType::Super => RewardNodeType::Super,
+                NodeType::Light => RewardNodeType::Light,
+            };
+            if let Err(e) = reward_manager.write().await.register_node(
+                node_id.clone(), reward_node_type, wallet_address.clone()) {
+                eprintln!("[WARN][REWARDS] Failed to register node in reward system: {}", e);
+            } else if is_info() {
+                println!("[INFO][REWARDS] node_registered id={} type={:?}", node_id, node_type);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Spawn the single-owner registration-convergence driver (once per process). Owns every
+    /// arm/re-arm of PENDING_NODE_REGISTRATION behind the fail-closed arm gate, on a dedicated task
+    /// (collect is serial 30s reqwest — never on the maintenance loop). Production does NOT wait on
+    /// registration: an unregistered node is absent from srtr_ and is never VRF-selected, so
+    /// decoupling changes nothing in selection or failover.
+    pub(crate) fn spawn_registration_convergence_driver(&self, code: String) {
+        static DRIVER_SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if DRIVER_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
+        let node_id = self.node_id.clone();
+        let node_type = self.node_type;
+        let storage = self.storage.clone();
+        let mempool = self.mempool.clone();
+        let unified_p2p = self.unified_p2p.clone();
+        let wallet_identity = self.wallet_identity.clone();
+        let reward_manager = self.reward_manager.clone();
+        let wallet_address = self.get_wallet_address();
+        let device_sig = self.get_device_signature();
+        let qnet_rpc = Self::resolve_genesis_rpc_url();
+        let registration_proof = crate::activation_validation::BlockchainActivationRegistry::new(Some(qnet_rpc.clone()))
+            .hash_activation_code_for_blockchain(&code)
+            .unwrap_or_else(|_| blake3::hash(code.as_bytes()).to_hex().to_string());
+        // Public API endpoint (Super only): QNET_HIDE_IP hides it, else the auto-detected public IP.
+        let api_endpoint = if node_type == NodeType::Super && std::env::var("QNET_HIDE_IP").is_err() {
+            let public_ip = std::env::var("QNET_PUBLIC_IP")
+                .or_else(|_| std::env::var("EXTERNAL_IP"))
+                .or_else(|_| std::env::var("HOST_IP"))
+                .unwrap_or_default();
+            if public_ip.is_empty() { String::new() } else { format!("http://{}:8001", public_ip) }
+        } else { String::new() };
+        tokio::spawn(async move {
+            let mut ladder = ArmLadderState::default();
+            let mut was_onchain = false;
+            loop {
+                if storage.is_node_registration_onchain(&node_id) {
+                    // Registered: drop to a low-frequency watchdog instead of exiting — a bounded reorg
+                    // that rolls back the registration block must re-arm (the process-latch prevents a
+                    // respawn, so the driver itself owns recovery). Announce once on first landing.
+                    if !was_onchain {
+                        println!("[INFO][REG] convergence_done id={} registration=onchain", node_id);
+                        was_onchain = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(REG_DRIVER_COOLDOWN_SECS)).await;
+                    continue;
+                }
+                if was_onchain {
+                    println!("[WARN][REG] registration_rolled_back id={} — re-arming", node_id);
+                    was_onchain = false;
+                    ladder = ArmLadderState::default();
+                }
+                if !registration_arm_gate(&mut ladder) {
+                    tokio::time::sleep(std::time::Duration::from_secs(REG_DRIVER_DEFER_SECS)).await;
+                    continue;
+                }
+                // Re-arm edge: verifier-fresh PENDING bytes stay (the rebroadcast delivers them);
+                // re-collect only when PENDING is empty or its attest_epoch went stale.
+                let cur_epoch = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
+                    .load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1) / 90 + 1;
+                let pending_fresh = PENDING_NODE_REGISTRATION.lock()
+                    .map(|g| matches!(&*g, Some((_, _, _, ae)) if cur_epoch < ae + 2))
+                    .unwrap_or(false);
+                if pending_fresh {
+                    tokio::time::sleep(std::time::Duration::from_secs(REG_DRIVER_DEFER_SECS)).await;
+                    continue;
+                }
+                // Single-owner clear-then-arm: stale bytes are replaced wholesale (the mempool
+                // commitment index collapses same-node_id versions — no double-submit).
+                if let Ok(mut g) = PENDING_NODE_REGISTRATION.lock() { *g = None; }
+                match Self::drive_registration_convergence(
+                    node_id.clone(), node_type, wallet_address.clone(), registration_proof.clone(),
+                    api_endpoint.clone(), code.clone(), device_sig.clone(), qnet_rpc.clone(),
+                    storage.clone(), mempool.clone(), unified_p2p.clone(), wallet_identity.clone(),
+                    reward_manager.clone(),
+                ).await {
+                    Ok(()) => { if is_info() { println!("[INFO][REG] convergence_armed id={}", node_id); } }
+                    Err(e) => println!("[WARN][REG] convergence_attempt_failed err={} — retry", e),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(REG_DRIVER_COOLDOWN_SECS)).await;
+            }
+        });
+    }
+
     /// Load activation code from persistent storage
     pub async fn load_activation_code(&self) -> Result<Option<(String, NodeType)>, QNetError> {
         match self.storage.load_activation_code()
