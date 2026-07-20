@@ -99,7 +99,7 @@ export async function detectPushProvider() {
  */
 export async function registerLightNode(nodeId, walletAddress, quantumPubkey, quantumSignature, burnTxHash = null, burnAmount = null, burnWallet = null, ed25519Signature = null, signatureTimestamp = null, pingPubkey = null, pingDelegationCert = null) {
   const pushProvider = await detectPushProvider();
-  const apiUrl = await getRandomBootstrapNodeAsync();
+  const targetUrl = await getRandomBootstrapNodeAsync();
 
   const registrationData = {
     node_id: nodeId,
@@ -135,7 +135,7 @@ export async function registerLightNode(nodeId, walletAddress, quantumPubkey, qu
 
   try {
     console.log('[Push] registering light node wallet=...' + (registrationData.wallet_address || '').slice(-8));
-    const response = await fetch(`${apiUrl}/api/v1/light-node/register`, {
+    const response = await fetch(`${targetUrl}/api/v1/light-node/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(registrationData),
@@ -361,6 +361,9 @@ export async function respondToChallenge(nodeId, challenge, responseUrl) {
             if (pingPkHex) {
               const dilithiumSig = await signWithDilithium(challenge, pingSkHex, pingPkHex, pingNodeId);
               const formattedSignature = `ping_dilithium:${dilithiumSig}`;
+              // Present the ping delegation so the genesis verifies it against our committed on-chain key and
+              // refreshes its ping-key store — overwrites any pre-registration gossip poison. Optional/graceful.
+              const pingCert = await AsyncStorage.getItem(`qnet_ping_cert_${pingNodeId}`);
 
               const apiUrl = responseUrl || await getRandomBootstrapNodeAsync();
               const response = await fetch(
@@ -372,6 +375,8 @@ export async function respondToChallenge(nodeId, challenge, responseUrl) {
                     node_id: pingNodeId,
                     challenge,
                     signature: formattedSignature,
+                    ...(pingPkHex ? { ping_pubkey: pingPkHex } : {}),
+                    ...(pingCert ? { ping_delegation_cert: pingCert } : {}),
                   }),
                 }
               );
@@ -409,7 +414,7 @@ export async function respondToChallenge(nodeId, challenge, responseUrl) {
  * on ANY wakeup (push, background fetch, app open) — no dependency on FCM delivery.
  * Deduped per epoch locally; the node dedupes per epoch too.
  */
-export async function selfAttestIfNeeded(nodeId) {
+export async function selfAttestIfNeeded(nodeId, force = false) {
   try {
     const pingNodeId = nodeId || await AsyncStorage.getItem('qnet_ping_node_id');
     if (!pingNodeId) return false;
@@ -419,7 +424,8 @@ export async function selfAttestIfNeeded(nodeId) {
     if (!height || height < 3) return false;
     const epoch = Math.floor(height / 14400);
     const last = await AsyncStorage.getItem('qnet_last_self_attest_epoch');
-    if (last !== null && parseInt(last, 10) === epoch) return false;
+    // force = user pressed "I'm Back" — re-attest even if already done this epoch (B: attestation IS reactivation).
+    if (!force && last !== null && parseInt(last, 10) === epoch) return false;
     // Registration gate: don't attest before the node's on-chain key is committed — a ping is only
     // accepted once load_vrf_public_key(node_id) is present (else rejected no_onchain_key /
     // ping_dilithium_node_not_found). onChainRegistered mirrors that exact server condition and is
@@ -469,6 +475,7 @@ export async function teardownLightNode() {
         await Keychain.resetGenericPassword({ service: `qnet_ping_sk_${pingNodeId}` });
       } catch (e) {}
       await AsyncStorage.removeItem(`qnet_ping_dilithium_pk_${pingNodeId}`);
+      await AsyncStorage.removeItem(`qnet_ping_cert_${pingNodeId}`);
     }
     await AsyncStorage.multiRemove([
       'qnet_light_node_info',
@@ -511,7 +518,8 @@ export async function setUnifiedPushEndpoint(endpoint) {
 }
 
 /**
- * Check Light node status (is active, failure count, etc.)
+ * Check Light node status. B: needs_reactivation is derived on-chain (committed attestation recency),
+ * node-independent — a single fetch to ANY node is authoritative (no fan-out / optimistic window).
  */
 export async function checkNodeStatus() {
   try {
@@ -521,52 +529,54 @@ export async function checkNodeStatus() {
     }
 
     const nodeInfo = JSON.parse(nodeInfoStr);
-    const apiUrl = getRandomBootstrapNode();
+    const nodeId = nodeInfo.nodeId;
+    const apiUrl = await getRandomBootstrapNodeAsync();
 
-    const response = await fetch(
-      `${apiUrl}/api/v1/light-node/status?node_id=${encodeURIComponent(nodeInfo.nodeId)}`,
-      { method: 'GET' }
-    );
+    let result = null;
+    let fetchErr = null;
+    try {
+      const r = await fetch(`${apiUrl}/api/v1/light-node/status?node_id=${encodeURIComponent(nodeId)}`, { method: 'GET' });
+      result = await r.json();
+    } catch (e) { fetchErr = e; }
 
-    const result = await response.json();
+    // Block height for the "Next Rewards" display.
+    let currentBlockHeight = 0;
+    try {
+      const heightResp = await fetch(`${apiUrl}/api/v1/status`, { method: 'GET' });
+      if (heightResp.ok) {
+        const heightData = await heightResp.json();
+        currentBlockHeight = heightData.height || heightData.current_height || 0;
+      }
+    } catch (_) {}
 
-    if (result.success) {
-      // Update local status
-      nodeInfo.isActive = result.is_active;
-      nodeInfo.consecutiveFailures = result.consecutive_failures;
-      nodeInfo.needsReactivation = result.needs_reactivation;
-      nodeInfo.nextPingTime = result.next_ping_time;
-      await AsyncStorage.setItem('qnet_light_node_info', JSON.stringify(nodeInfo));
-
-      // Also fetch current block height for "Next Rewards" display
-      let currentBlockHeight = 0;
-      try {
-        const heightResp = await fetch(`${apiUrl}/api/v1/status`, { method: 'GET' });
-        if (heightResp.ok) {
-          const heightData = await heightResp.json();
-          currentBlockHeight = heightData.height || heightData.current_height || 0;
-        }
-      } catch (_) {}
-
-      return {
-        registered: true,
-        nodeId: result.node_id,
-        isActive: result.is_active,
-        consecutiveFailures: result.consecutive_failures,
-        lastSeen: result.last_seen,
-        pushType: result.push_type,
-        hasAttestationCurrentSlot: result.has_attestation_current_slot,
-        nextPingTime: result.next_ping_time,
-        nextPingWindow: result.next_ping_window,
-        needsReactivation: result.needs_reactivation,
-        currentBlockHeight,
-        // On-chain registration readiness (undefined on older nodes) — authoritative gate for
-        // self-attest: a ping is only accepted once the node's key is committed on-chain.
-        onChainRegistered: result.onchain_registered,
-      };
+    if (!result || !result.success) {
+      // Distinguish a transport failure (result null) from a real success:false verdict: on a network hiccup
+      // return a TRUTHY error so the UI shows the neutral 'Checking…' state, never a false 'Not Activated'.
+      // onChainRegistered must stay UNKNOWN (null) on a transient failure — a definitive `false` here makes
+      // selfAttestIfNeeded's `onChainRegistered === false` gate SKIP the epoch attestation on a mere network
+      // hiccup (a live node would miss its window). Emit a real boolean ONLY when the server actually replied.
+      return { registered: false,
+               error: result ? result.error : ((fetchErr && (fetchErr.message || 'unreachable')) || 'unreachable'),
+               onChainRegistered: result ? !!result.onchain_registered : null, currentBlockHeight };
     }
 
-    return { registered: false, error: result.error };
+    const needsReactivation = result.needs_reactivation === true;
+    nodeInfo.isActive = !needsReactivation;
+    nodeInfo.needsReactivation = needsReactivation;
+    nodeInfo.nextPingTime = result.next_ping_time;
+    await AsyncStorage.setItem('qnet_light_node_info', JSON.stringify(nodeInfo));
+
+    return {
+      registered: true,
+      nodeId,
+      isActive: !needsReactivation,
+      hasAttestationCurrentSlot: result.has_attestation_current_slot === true,
+      nextPingTime: result.next_ping_time,
+      nextPingWindow: result.next_ping_window,
+      needsReactivation,
+      currentBlockHeight,
+      onChainRegistered: !!result.onchain_registered,
+    };
   } catch (error) {
     console.warn('[Push] Status check failed:', error.message || error);
     return { registered: false, error: error.message };
@@ -616,7 +626,7 @@ export async function refreshFcmTokenOnServer(nodeId) {
     }
 
     // Dilithium3 ping-delegation signature: "token_refresh:{node_id}:{timestamp}".
-    // Load ping SK from Keychain + ping PK from AsyncStorage (same path as reactivateNode).
+    // Load ping SK from Keychain + ping PK from AsyncStorage (same path as selfAttestIfNeeded).
     const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
     if (!isDilithiumAvailable()) {
       return { success: false, error: 'Dilithium3 module required for token refresh' };
@@ -715,100 +725,6 @@ export async function isTokenRefreshNeeded() {
   }
 }
 
-/**
- * Reactivate Light node (called when user clicks "I'm back" button)
- * Returns true if reactivation successful
- */
-export async function reactivateNode() {
-  try {
-    const nodeInfoStr = await AsyncStorage.getItem('qnet_light_node_info');
-    if (!nodeInfoStr) {
-      console.warn('[Push] No node to reactivate');
-      return { success: false, error: 'Node not registered' };
-    }
-
-    const nodeInfo = JSON.parse(nodeInfoStr);
-
-    // Sign reactivation with the Dilithium3 ping delegation key stored in Keychain
-    // (AFTER_FIRST_UNLOCK — no password required, works when wallet is locked).
-    const { signWithDilithium, isDilithiumAvailable } = require('../crypto/DilithiumCrypto');
-    if (!isDilithiumAvailable()) {
-      return { success: false, error: 'Dilithium3 module required for node reactivation' };
-    }
-
-    const Keychain = require('react-native-keychain');
-    const pingNodeId = nodeInfo.nodeId || await AsyncStorage.getItem('qnet_ping_node_id');
-    if (!pingNodeId) {
-      return { success: false, error: 'Node ID not found' };
-    }
-
-    const keychainEntry = await Keychain.getGenericPassword({
-      service: `qnet_ping_sk_${pingNodeId}`,
-    });
-    if (!keychainEntry || !keychainEntry.password) {
-      return { success: false, error: 'Ping delegation key unavailable — please re-register the node' };
-    }
-
-    const pingSkHex = keychainEntry.password;
-    const pingPkHex = await AsyncStorage.getItem(`qnet_ping_dilithium_pk_${pingNodeId}`);
-    if (!pingPkHex) {
-      return { success: false, error: 'Ping public key not found — please re-register the node' };
-    }
-
-    const timestamp = Math.floor(Date.now() / 1000);
-    const message = `reactivate:${pingNodeId}:${timestamp}`;
-    const dilithiumSig = await signWithDilithium(message, pingSkHex, pingPkHex, pingNodeId);
-    const signatureStr = `ping_dilithium:${dilithiumSig}`;
-
-    // Include fresh FCM token so server updates all genesis nodes
-    const pushProvider = await detectPushProvider();
-
-    const apiUrl = getRandomBootstrapNode();
-    const response = await fetch(`${apiUrl}/api/v1/light-node/reactivate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        node_id: nodeInfo.nodeId,
-        wallet_address: nodeInfo.walletAddress,
-        signature: signatureStr,
-        timestamp: timestamp,
-        device_token: pushProvider.token || undefined,
-        push_type: pushProvider.type,
-      }),
-    });
-
-    const result = await response.json();
-
-    if (result.success) {
-      console.log('[Push] ✅ Node reactivated:', result.was_reactivated ? 'yes' : 'already active');
-      
-      // Update local status
-      nodeInfo.isActive = true;
-      nodeInfo.needsReactivation = false;
-      nodeInfo.consecutiveFailures = 0;
-      nodeInfo.nextPingTime = result.next_ping_time;
-      nodeInfo.nextPingWindow = result.next_ping_window;
-      await AsyncStorage.setItem('qnet_light_node_info', JSON.stringify(nodeInfo));
-
-      // Re-setup polling if needed
-      if (nodeInfo.pushType === PushType.POLLING && result.next_ping_time) {
-        await setupPollingService(nodeInfo.nodeId, result.next_ping_time);
-      }
-
-      return {
-        success: true,
-        wasReactivated: result.was_reactivated,
-        nextPingTime: result.next_ping_time,
-        message: result.message,
-      };
-    }
-
-    return { success: false, error: result.error };
-  } catch (error) {
-    console.warn('[Push] Reactivation failed:', error.message || error);
-    return { success: false, error: error.message };
-  }
-}
 
 /**
  * Initialize push service
@@ -1048,8 +964,7 @@ export default {
   
   // Light node status (for mobile ping system)
   checkNodeStatus,
-  reactivateNode,
-  
+
   // FCM token refresh (automatic, Ed25519-signed)
   refreshFcmTokenOnServer,
   isTokenRefreshNeeded,

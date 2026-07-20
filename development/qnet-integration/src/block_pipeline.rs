@@ -143,6 +143,39 @@ static FAILOVER_CERT_PULL_TIMES: once_cell::sync::Lazy<
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 const FAILOVER_CERT_PULL_COOLDOWN_SECS: u64 = 2;
 
+// The sync/repair supersede path (supersede_stored_from_sync) processes an already-stored height ONLY
+// when THIS node explicitly SOLICITED it via request_block_repair (its own TailDiverged tail). This is
+// the structural DoS boundary: gate the UNsolicited, never the solicited.
+//   - Unsolicited stored-height batch deliveries are ignored — the ungated live-gossip decode path
+//     (decode_stage) already converges unsolicited winners, so nothing is lost.
+//   - The honest solicited winner is NEVER rate-gated, so a flooder cannot starve it (the earlier
+//     shared per-second budget WAS itself a liveness-DoS: an attacker draining it froze convergence).
+//   - An attacker can only force work at heights we ourselves asked to repair (our own diverged tail,
+//     ≤ window, TTL-expired); each such delivery is input-capped == output-capped (1:1 bandwidth, no
+//     amplification) — a transport-layer flood, not a consensus bug.
+static REPAIR_SOLICITED: once_cell::sync::Lazy<
+    dashmap::DashMap<u64, u64>   // height -> expiry (unix secs)
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
+const REPAIR_SOLICITED_TTL_SECS: u64 = 30;
+// = the pipeline's max_block_bytes, so a legit stored block (any size the pipeline accepted) is never
+// false-rejected — otherwise a restarted voter could not converge to a large failover winner.
+const MAX_SUPERSEDE_INPUT: usize = 50 * 1024 * 1024;
+
+/// Mark a height as SOLICITED for repair — the node asked a peer for it (e.g. TailDiverged reconcile),
+/// so a stored-height batch delivery of exactly this height is routed to fork-choice supersede rather
+/// than ignored. Marking a not-yet-stored height is harmless (it never reaches the stored-height branch).
+pub(crate) fn mark_repair_solicited(height: u64) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    REPAIR_SOLICITED.insert(height, now.saturating_add(REPAIR_SOLICITED_TTL_SECS));
+    if REPAIR_SOLICITED.len() > 512 { REPAIR_SOLICITED.retain(|_, e| *e > now); }
+}
+fn is_repair_solicited(height: u64) -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    REPAIR_SOLICITED.get(&height).map(|e| *e > now).unwrap_or(false)
+}
+
 /// Cache parent hash after apply commit / verify success / self-save.
 #[inline]
 pub fn cache_block_hash(height: u64, hash: [u8; 32]) {
@@ -166,8 +199,35 @@ pub fn lookup_block_hash(height: u64) -> Option<[u8; 32]> {
     RECENT_BLOCK_HASHES.get(&height).map(|e| *e.value())
 }
 
-/// Deterministic microblock fork-choice (failover race): a same-height block from
-/// a STRICTLY HIGHER 2f+1-certified rotation round supersedes the one we hold.
+/// Equal-absolute-round fork-choice tie-break for a PRE-VERIFY competitor (gossip-duplicate / repair /
+/// anchor-recovery — verify_stage is skipped or not-yet-run, so the bytes are UNVERIFIED). The incoming
+/// block supersedes the one we hold at this height ONLY if it is a GENUINE same-round self-fork with a
+/// canonically-lower signature. Checks, cheapest-first:
+///   1. we actually HOLD a competitor (`our` is Some) — nothing to supersede otherwise;
+///   2. incoming.producer == our stored producer — the SELF-FORK invariant. Our stored producer is
+///      already the leader-verified canonical one, so a legitimate same-height/round competitor (a
+///      restarted producer re-emitting a different block) must be the SAME producer. A DIFFERENT
+///      producer self-signing a sibling for a height it does not own is an equivocation/hijack — it must
+///      NOT win a sig tie-break (that was the reorg-DoS: any registered node could grind a lower sig and
+///      force a wasteful rollback);
+///   3. Sha3(incoming.sig) < Sha3(our.sig) — deterministic single winner (no oscillation);
+///   4. incoming is VALIDLY producer-signed — closes signature-grinding (attacker has no producer key).
+/// Byte-identical rule at every pre-verify fork-choice site so fork-choice is one network-wide function.
+fn equal_round_selffork_supersedes(incoming: &qnet_state::MicroBlock, our: Option<(&str, &[u8])>) -> bool {
+    let (our_producer, our_sig) = match our { Some(t) => t, None => return false };
+    if incoming.producer != our_producer { return false; }
+    use sha3::Digest;
+    if sha3::Sha3_256::digest(&incoming.signature).as_slice() >= sha3::Sha3_256::digest(our_sig).as_slice() {
+        return false;
+    }
+    crate::node::verify_microblock_producer_sig_sync(incoming)
+}
+
+/// Deterministic microblock fork-choice (failover race): a same-height block from a STRICTLY HIGHER
+/// 2f+1-certified rotation round — or an EQUAL round self-fork (same producer, lower Sha3(signature),
+/// validly signed) — supersedes the one we hold. This is the stored-height leg of the ONE network-wide
+/// fork-choice rule (gossip re-delivery AND solicited repair both funnel here), byte-identical to the
+/// anchor_recovery / apply-resolver sites via equal_round_selffork_supersedes.
 /// Routes it to the finality-guarded reorg via FORK_RECOVERY_HEIGHT — the existing
 /// recovery rolls back (never below finality), reconciles state, and resyncs to the
 /// certified chain. Both timeout_round values share the per-height baseline, so the
@@ -175,25 +235,24 @@ pub fn lookup_block_hash(height: u64) -> Option<[u8; 32]> {
 /// Byzantine cannot forge a TC); height must be above finality; per-height cooldown
 /// bounds re-triggers; the resync re-verifies every block. One bounded decode, only
 /// for stored heights above finality.
-fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBlock) {
+fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBlock, p2p: Option<&SimplifiedP2P>) {
     let h = block.height;
     if h == 0 { return; }
     let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
     if h <= finalized { return; } // never reorg finalized history
 
-    let our_round = match storage.load_microblock_auto_format(h) {
-        Ok(Some(mb)) => mb.timeout_round,
+    let (our_round, our_baseline, our_producer, our_sig) = match storage.load_microblock_auto_format(h) {
+        Ok(Some(mb)) => (mb.timeout_round, mb.carried_baseline, mb.producer, mb.signature),
         _ => return,
     };
-
-    // Fast path: if no round higher than ours is 2f+1-certified, no competitor can
-    // win — skip the decode entirely (the common no-failover case). Absolute units.
     let mb_idx = h / 90;
-    let baseline = crate::unified_p2p::get_baseline_round(mb_idx);
-    let certified_abs = crate::unified_p2p::highest_certified_round_for(mb_idx);
-    if our_round.saturating_add(baseline) >= certified_abs { return; }
 
-    // Bounded decode (zstd|raw → MicroBlock) just to read the incoming round.
+    // Decode the competitor (zstd|raw → MicroBlock); microblocks are KB so this is cheap per duplicate.
+    // zstd::Decoder::new never inspects the input, so a RAW-bincode block (the sync/repair serve path
+    // sends uncompressed bincode; only gossip compresses) yields Ok here and fails on read_to_end —
+    // that MUST fall back to the raw bytes, NOT return, or every sync/repair-delivered competitor
+    // dead-ends before the cert-pull + supersede below (boundary re-freeze for restarted voters).
+    // Mirrors decode_stage's three-branch decode.
     const MAX_DECOMPRESSED: usize = 50 * 1024 * 1024;
     let decompressed = match zstd::stream::Decoder::new(&block.data[..]) {
         Ok(dec) => {
@@ -201,19 +260,74 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
             let mut buf = Vec::new();
             match dec.take(MAX_DECOMPRESSED as u64 + 1).read_to_end(&mut buf) {
                 Ok(_) if buf.len() <= MAX_DECOMPRESSED => buf,
-                _ => return,
+                Ok(_) => return,                // real decompression bomb over the cap
+                Err(_) => block.data.clone(),   // not zstd (raw bincode from sync/repair serve) → use as-is
             }
         }
         Err(_) => block.data.clone(),
     };
     let incoming = match bincode::deserialize::<qnet_state::MicroBlock>(&decompressed) {
-        Ok(mb) if mb.height == h && mb.timeout_round > our_round => mb,
-        _ => return, // decode failed, height mismatch, or not a higher round → keep ours
+        Ok(mb) if mb.height == h => mb,
+        _ => return, // decode failed or height mismatch → keep ours
     };
 
-    // The higher round must itself be 2f+1-certified (a forged round is ignored
-    // here and would also fail the v23.1 ingest gate on resync).
-    if incoming.timeout_round.saturating_add(baseline) > certified_abs { return; }
+    // Fork-choice by ABSOLUTE round (relative + carried baseline, both from the block bytes — a
+    // same-height loser-apply can no longer pollute the ranking): a STRICTLY HIGHER 2f+1-certified round
+    // wins; on an EQUAL round, the lower Sha3(signature) wins. The equal-round tie-break converges a
+    // same-round self-fork (a restarted producer re-emitting a different block at h) that a strict `>`
+    // gate would leave split forever — and it MUST live here because both gossip re-delivery AND solicited
+    // repair funnel through this function, so without it a node holding the equal-round loser never
+    // converges (boundary re-freeze). Byte-identical to the anchor_recovery / apply-resolver tie-break.
+    let incoming_abs = incoming.timeout_round.saturating_add(incoming.carried_baseline);
+    let our_abs = our_round.saturating_add(our_baseline);
+    let incoming_wins = if incoming_abs > our_abs {
+        // Adopt the competitor's ATTACHED 2f+1 TimeoutProof BEFORE reading the certified round, so a node
+        // that missed the separate TC broadcast learns the round in-band; the higher round wins ONLY if
+        // 2f+1-certified (a forged round advances nothing → not certified → ignored). Adopt only in this
+        // higher-round branch — an equal/lower round needs no new round authority.
+        if let (Some(pb), Some(p)) = (incoming.timeout_proof.as_ref(), p2p) { p.adopt_timeout_proof_bytes(pb); }
+        let certified_abs = crate::unified_p2p::highest_certified_round_for(mb_idx);
+        if incoming_abs > certified_abs {
+            // Higher round not yet 2f+1-certified locally. The competitor's timeout_proof is WIRE-ONLY
+            // (storage serve strips it), and the one-shot TC broadcast may have been missed — so a copy
+            // delivered via sync/repair carries no adoptable proof. Actively PULL this window's
+            // TimeoutCertificate (rate-limited per mb_idx, shared bucket with verify_stage) so
+            // HIGHEST_CERTIFIED_ROUND advances and the NEXT delivery of this competitor supersedes.
+            // Without this, a node that missed the seconds-long live-gossip window sits on the losing
+            // tail forever ⇒ its checkpoint content_ok never converges ⇒ boundary re-freeze.
+            if let Some(p) = p2p {
+                let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).unwrap_or(0);
+                let due = FAILOVER_CERT_PULL_TIMES.get(&mb_idx)
+                    .map(|t| now_secs.saturating_sub(*t) >= FAILOVER_CERT_PULL_COOLDOWN_SECS)
+                    .unwrap_or(true);
+                if due {
+                    FAILOVER_CERT_PULL_TIMES.insert(mb_idx, now_secs);
+                    if FAILOVER_CERT_PULL_TIMES.len() > 64 {
+                        let keep_from = mb_idx.saturating_sub(16);
+                        FAILOVER_CERT_PULL_TIMES.retain(|k, _| *k >= keep_from);
+                    }
+                    p.request_timeout_proofs(mb_idx, mb_idx);
+                }
+            }
+            return;
+        }
+        true
+    } else if incoming_abs == our_abs {
+        // Equal absolute round self-fork: the round is the one we already hold (== certified for it), so
+        // no new round authority is needed — converge on the lower Sha3(signature) (single deterministic
+        // winner). No cert pull: the round is not higher than what we already accepted.
+        //
+        // Equal-round self-fork: converge via the shared PRE-VERIFY tie-break (same producer as our
+        // leader-verified stored block + lower Sha3(sig) + valid producer signature). This runs on
+        // UNVERIFIED gossip/repair bytes with no 2f+1-TC to lean on, so the producer-authorization +
+        // signature check inside the helper is what stops a registered node grinding a lower sig to
+        // force a wasteful reorg. See equal_round_selffork_supersedes.
+        equal_round_selffork_supersedes(&incoming, Some((&our_producer, &our_sig)))
+    } else {
+        return; // strictly lower absolute round → keep ours
+    };
+    if !incoming_wins { return; } // equal round, but OUR signature is the canonical (lower) one
 
     // Per-height cooldown (shared with macroblock-anchored recovery).
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -237,6 +351,29 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
         println!("[WARN][FORK] round_supersede h={} our_round={} new_round={} action=reorg_to_certified",
                  h, our_round, incoming.timeout_round);
     }
+}
+
+/// Route a sync/repair-delivered block at an ALREADY-STORED height through the SAME fork-choice
+/// supersede the gossip decode path uses. The batch-sync ingress (handle_blocks_batch) drops stored
+/// heights before the pipeline, so without this a higher-2f+1-certified-round failover winner
+/// delivered by sync or by fix B's request_block_repair never reaches maybe_supersede — and a
+/// restarted/late voter that missed the live-gossip window can never converge its losing tail
+/// (boundary re-freeze). Cheap: maybe_supersede early-returns for finalized heights before any decode.
+pub(crate) fn supersede_stored_from_sync(storage: &Arc<Storage>, height: u64, data: &[u8], from_peer: &str, p2p: &SimplifiedP2P) {
+    // Process a stored-height batch delivery ONLY if THIS node solicited this exact height via
+    // request_block_repair (its own diverged tail). Unsolicited stored-height deliveries are ignored —
+    // the ungated gossip decode path already converges unsolicited winners. This removes the batch-
+    // flood DoS surface entirely AND guarantees the honest solicited winner is never rate-gated (the
+    // earlier shared per-second budget was itself a liveness-DoS: an attacker draining it froze
+    // convergence). Size cap = pipeline max_block_bytes so a legit large winner is never false-rejected;
+    // a solicited-height flood is pure 1:1 bandwidth (transport concern), not amplification.
+    if !is_repair_solicited(height) { return; }
+    if data.len() > MAX_SUPERSEDE_INPUT { return; }
+    let block = IngestBlock {
+        height, data: data.to_vec(), block_type: "micro".to_string(),
+        from_peer: from_peer.to_string(), received_at: 0,
+    };
+    maybe_supersede_by_certified_round(storage, &block, Some(p2p));
 }
 
 /// Record that `peer_id` reported a hash_chain_break at `height`.
@@ -1405,7 +1542,7 @@ impl BlockPipeline {
                 .map(|opt| opt.is_some())
                 .unwrap_or(false)
             {
-                maybe_supersede_by_certified_round(&storage, &block);
+                maybe_supersede_by_certified_round(&storage, &block, unified_p2p.as_deref());
                 metrics.duplicates_skipped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -1822,14 +1959,39 @@ impl BlockPipeline {
                             // same-round self-forks (a restarted producer re-emitting a different block at the
                             // same height) that a round-only gate leaves split, while a strict single winner
                             // avoids the mutual disputed_h-2 rollback oscillation.
-                            let (local_round, local_hash) = storage
+                            // Load the LOCAL competitor as an Option: at a NON-stored disputed height there
+                            // is nothing to tie-break against, so the equal-round branch must NOT fire (the
+                            // old `[0u8;32]` default happened to make hash<min false; an empty-sig default
+                            // would make Sha3(incoming)<Sha3(empty) grindable — a reorg-DoS). We keep the
+                            // Option and gate the equal-round case on it via equal_round_selffork_supersedes.
+                            let local_opt = storage
                                 .load_microblock_auto_format(disputed_h)
-                                .ok().flatten()
-                                .map(|b| (b.timeout_round, b.hash()))
-                                .unwrap_or((0u64, [0u8; 32]));
-                            let incoming_hash = decoded.microblock.hash();
-                            let incoming_outranks = mb.timeout_round > local_round
-                                || (mb.timeout_round == local_round && incoming_hash < local_hash);
+                                .ok().flatten();
+                            let (local_round, local_baseline) = local_opt.as_ref()
+                                .map(|b| (b.timeout_round, b.carried_baseline))
+                                .unwrap_or((0u64, 0u64));
+                            // Adopt the block's attached 2f+1 TimeoutProof so a higher round it carries advances
+                            // our certified map in-band; a higher round then wins ONLY if 2f+1-certified
+                            // (unforgeable — a raw round could not, which caused the rollback storm). Equal round
+                            // → lower Sha3(signature) (single deterministic winner, byte-identical to the apply-path
+                            // resolver, converges a same-round self-fork). One fork-choice rule network-wide.
+                            if let (Some(pb), Some(p)) = (decoded.microblock.timeout_proof.as_ref(), unified_p2p.as_ref()) {
+                                p.adopt_timeout_proof_bytes(pb);
+                            }
+                            // Compare ABSOLUTE rounds (relative + carried baseline), both from the block
+                            // bytes — a same-height loser-apply can no longer inflate the ranking.
+                            let incoming_abs = mb.timeout_round.saturating_add(mb.carried_baseline);
+                            let local_abs = local_round.saturating_add(local_baseline);
+                            let incoming_outranks = if incoming_abs > local_abs {
+                                crate::unified_p2p::failover_round_authorized(mb.height / 90, mb.timeout_round, mb.carried_baseline)
+                            } else if incoming_abs == local_abs {
+                                // Equal round: only a genuine same-producer self-fork (valid sig, lower hash)
+                                // supersedes, and only if we actually HOLD a competitor here (None ⇒ false).
+                                equal_round_selffork_supersedes(&decoded.microblock,
+                                    local_opt.as_ref().map(|b| (b.producer.as_str(), b.signature.as_slice())))
+                            } else {
+                                false
+                            };
                             if incoming_outranks && finalized_h > 0 && finalized_h < disputed_h {
                                 let now_secs = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -2027,7 +2189,11 @@ impl BlockPipeline {
                 // stays replayable and is re-accepted once the cert (re-broadcast by the
                 // producer at certification) arrives, or via sync (which skips this gate,
                 // trusting macroblock finality). Round 0 (happy path) needs no cert. O(1).
-                if mb.timeout_round > 0 {
+                // Gate on the ABSOLUTE round (timeout_round + carried_baseline > 0), not just
+                // timeout_round: a Byzantine round-0 leader can stamp timeout_round=0 with an
+                // inflated (signed) carried_baseline; without this the block would skip the gate,
+                // apply, and record_finalized_round(mb, 0+huge) would poison the window baseline.
+                if mb.timeout_round > 0 || mb.carried_baseline > 0 {
                     // Authorise the failover round with the SAME predicate the producer used to
                     // pick it — `highest_certified_round_for(mb_idx) >= round + baseline`, keyed by
                     // mb_idx + ABSOLUTE round. HIGHEST_CERTIFIED_ROUND advances ONLY on a same-round
@@ -2044,7 +2210,7 @@ impl BlockPipeline {
                         p2p.adopt_timeout_proof_bytes(pb);
                     }
                     let round_certified =
-                        crate::unified_p2p::failover_round_authorized(mb.height / 90, mb.timeout_round);
+                        crate::unified_p2p::failover_round_authorized(mb.height / 90, mb.timeout_round, mb.carried_baseline);
                     if !round_certified {
                         // PULL-ON-REJECT: the round IS legitimate (a producer reached it via a
                         // same-round 2f+1), but the proving TimeoutCertificate never arrived — its
@@ -2088,17 +2254,43 @@ impl BlockPipeline {
 
                 if let Some((expected, expected_round)) = crate::node::get_expected_producer(mb.height) {
                     if mb.producer != expected {
-                        if mb.timeout_round != expected_round {
-                            // Category A: Timeout divergence — different round claimed.
-                            // Bounded above by the v23.1 authenticity gate; this branch
-                            // covers honest gossip-window divergence (within drift) where
-                            // the claim is plausible but doesn't match our cached view.
-                            // Signature + hash chain + macroblock 2f+1 commit still enforce
-                            // correctness; the BFT-driven rotation converges once vote
-                            // gossip propagates.
-                            if is_info() {
-                                println!("[INFO][PIPELINE] timeout_divergence h={} our_round={} block_round={} our_prod={} block_prod={}",
-                                         mb.height, expected_round, mb.timeout_round, expected, mb.producer);
+                        // Compare/derive on the ABSOLUTE round (timeout_round + carried_baseline, both
+                        // signed) — the cache now stores absolute. carried_baseline is producer-supplied
+                        // and only sum-constrained by auth, so deriving the leader from the RELATIVE
+                        // timeout_round alone let a Byzantine member re-partition a certified round R into
+                        // (t, R-t), choosing t so candidates[(round0_idx+t)%N]==itself and passing the
+                        // hard gate. Absolute pins the leader to candidates[(round0_idx+R)%N] regardless
+                        // of the split → the free choice of t is eliminated.
+                        let incoming_abs_round = mb.timeout_round.saturating_add(mb.carried_baseline);
+                        if incoming_abs_round != expected_round {
+                            // Category A: block claims a DIFFERENT round than our cached view. The
+                            // round>0 gate above already proved that round is 2f+1-certified, so its
+                            // leader is deterministic — re-derive it for the BLOCK's round and HARD
+                            // REJECT a producer that isn't that round's elected leader. Closes the
+                            // certified-round production hijack (a Byzantine node borrowing a valid TC
+                            // to produce off-slot at a height our cached round hasn't caught up to).
+                            // Cache miss (we haven't computed that window's roster — lag/cold-join) ⇒
+                            // keep soft: the block stays replayable and is re-checked once we derive
+                            // the roster or via macroblock 2f+1 finality.
+                            match crate::node::expected_producer_for_round(mb.height, incoming_abs_round) {
+                                Some(leader) if mb.producer != leader => {
+                                    if is_warn() {
+                                        println!(
+                                            "[WARN][PIPELINE] producer_hijack_reject h={} round={} leader={} got={} from={}",
+                                            mb.height, mb.timeout_round, leader, mb.producer, decoded.from_peer
+                                        );
+                                    }
+                                    metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                _ => {
+                                    // Correct leader for its round (our cache merely lagged), or roster
+                                    // not yet derivable ⇒ accept; BFT rotation + fork-choice converge.
+                                    if is_info() {
+                                        println!("[INFO][PIPELINE] timeout_divergence h={} our_round={} block_round={} our_prod={} block_prod={}",
+                                                 mb.height, expected_round, mb.timeout_round, expected, mb.producer);
+                                    }
+                                }
                             }
                         } else {
                             // Category B: same rank, DIFFERENT producer → unauthorised.
@@ -2935,7 +3127,10 @@ impl BlockPipeline {
                         // committee.
                         crate::unified_p2p::record_finalized_round(
                             height / 90,
-                            block.microblock.timeout_round,
+                            // Record the ABSOLUTE round (relative + carried baseline). max() then lands on
+                            // the canonical winner's absolute — a losing same-height sibling can no longer
+                            // push the baseline above it (the double-count hardening).
+                            block.microblock.timeout_round.saturating_add(block.microblock.carried_baseline),
                         );
                         // v33: feed the deterministic window-content accumulator at commit.
                         crate::node::accumulate_window_block(height, &block.microblock);
@@ -3073,6 +3268,14 @@ impl BlockPipeline {
                             let st = ctx.storage.clone();
                             tokio::task::spawn_blocking(move || {
                                 crate::node::BlockchainNode::persist_local_reward_root(&*st, epoch, total, &committed_root, c_per, c_cnt);
+                            });
+                        }
+                        // B: light-eligibility recency index — same off-lock, off-foreground treatment as
+                        // the emission root; the O(roster) snapshot never stalls the commit pipeline at scale.
+                        if let Some(h) = apply_result.deferred_light_elig {
+                            let st = ctx.storage.clone();
+                            tokio::task::spawn_blocking(move || {
+                                crate::node::BlockchainNode::populate_light_elig_at_boundary(&*st, h);
                             });
                         }
                         for mb_idx in &apply_result.deferred_emission_mbs {
@@ -3343,7 +3546,7 @@ impl BlockPipeline {
                 // baseline>0 (a 2nd+ failover in the same window), the relative LHS is understated
                 // by `baseline` and this proactive backfill misfires (missed/slow cert catch-up).
                 let block_round_abs = block_timeout_round
-                    .saturating_add(crate::unified_p2p::get_baseline_round(mb_idx));
+                    .saturating_add(block.microblock.carried_baseline);
                 if block_round_abs > local_certified {
                     if let Some(ref p2p) = ctx.unified_p2p {
                         if is_info() {

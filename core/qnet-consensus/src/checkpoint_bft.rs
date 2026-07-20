@@ -506,18 +506,24 @@ impl TimeoutCertificate {
         verify_qc: Q,
     ) -> Result<(), &'static str>
     where
-        F: Fn(&TimeoutMsg) -> bool,
+        F: Fn(&TimeoutMsg) -> bool + Sync,
         Q: Fn(&QuorumCertificate) -> bool,
     {
         let q = quorum_size(committee.len());
         if q == 0 || self.timeouts.len() < q { return Err("tc_below_quorum"); }
+        // Cheap structural checks first (serial): a garbage TC is rejected here before the expensive sigs.
         let mut seen = HashSet::new();
         for t in &self.timeouts {
             if t.index != self.index { return Err("tc_index_mismatch"); }
             if !seen.insert(t.voter.as_str()) { return Err("tc_duplicate_voter"); }
             if !committee.iter().any(|c| c == &t.voter) { return Err("tc_non_member"); }
-            if !verify_timeout_sig(t) { return Err("tc_bad_sig"); }
         }
+        // Verify the (up to ≈quorum, ≤1000) ML-DSA timeout signatures IN PARALLEL — mirror
+        // QuorumCertificate::verify. A serial loop made a 1000-committee TC a ~3.3s single-threaded block
+        // on the consensus select-loop task (timer/finality starvation at scale); par_iter spreads the
+        // per-sig Dilithium open across cores. all() ≡ serial AND (short-circuits); order is irrelevant.
+        use rayon::prelude::*;
+        if !self.timeouts.par_iter().all(|t| verify_timeout_sig(t)) { return Err("tc_bad_sig"); }
         if let Some(hq) = &self.high_qc {
             if !verify_qc(hq) { return Err("tc_bad_high_qc"); }
         }

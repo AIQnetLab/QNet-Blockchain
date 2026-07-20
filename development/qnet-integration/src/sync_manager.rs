@@ -141,19 +141,10 @@ pub struct SyncHandle {
 }
 
 impl SyncHandle {
-    /// Request sync to a target height.
-    pub async fn sync_to(&self, target: u64) -> bool {
-        self.command_tx.send(SyncCommand::SyncTo { target }).await.is_ok()
-    }
-
-    /// Request sync to network height (auto-detected).
+    /// Request sync to network height (auto-detected). Sole external entry — the driver otherwise
+    /// self-triggers via nudge_sync_check() + the periodic desync tick.
     pub async fn sync_to_network(&self) -> bool {
         self.command_tx.send(SyncCommand::SyncToNetwork).await.is_ok()
-    }
-
-    /// Stop current sync.
-    pub async fn stop(&self) -> bool {
-        self.command_tx.send(SyncCommand::Stop).await.is_ok()
     }
 
     /// Is sync currently active?
@@ -173,9 +164,7 @@ impl SyncHandle {
 
 /// Commands sent to the sync manager.
 enum SyncCommand {
-    SyncTo { target: u64 },
     SyncToNetwork,
-    Stop,
 }
 
 
@@ -257,19 +246,10 @@ impl SyncManager {
             tokio::select! {
                 Some(cmd) = self.command_rx.recv() => {
                     match cmd {
-                        SyncCommand::SyncTo { target } => {
-                            self.execute_sync(target).await;
-                        }
                         SyncCommand::SyncToNetwork => {
                             let network_h = self.detect_network_height().await;
                             if network_h > 0 {
                                 self.execute_sync(network_h).await;
-                            }
-                        }
-                        SyncCommand::Stop => {
-                            self.active.store(false, Ordering::SeqCst);
-                            if is_info() {
-                                println!("[INFO][SYNC] stopped_by_command");
                             }
                         }
                     }

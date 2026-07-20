@@ -34,8 +34,6 @@ pub const MAX_VALIDATORS: usize = 1000;
 pub const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
 #[allow(dead_code)]
 const MIN_BYZANTINE_NODES: usize = 4; // 3f+1 where f=1
-#[allow(dead_code)]
-const FAST_SYNC_TIMEOUT_SECS: u64 = 60; // Fast sync timeout
 const SNAPSHOT_FULL_INTERVAL: u64 = 43200; // Full snapshot every 12 hours (43,200 microblocks = 480 macroblocks)
 pub const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3600; // Incremental snapshot every 1 hour (3,600 microblocks = 40 macroblocks)
 pub const SNAPSHOT_EARLY_ANCHOR_HEIGHT: u64 = 90; // First consensus-bindable boundary (mb_idx=1): a young chain has a servable snapshot well before the 3600 interval
@@ -711,6 +709,74 @@ pub fn get_expected_producer(height: u64) -> Option<(String, u64)> {
     EXPECTED_PRODUCER_CACHE.read().get(&height).cloned()
 }
 
+/// Re-derive the deterministic leader for `height` at an ARBITRARY rotation round — the
+/// producer==leader hard-gate at ingest needs the leader for the BLOCK's claimed round, not
+/// our locally-cached round. Reuses the round-0 baseline `CACHED_PRODUCER_SELECTION` (round0
+/// producer + ordered candidate roster per leadership_round): leader = candidates[(round0_idx
+/// + round) % N], the exact formula the producer uses (select_microblock_producer_with_round).
+/// None ⇒ this node hasn't computed that window's roster yet (lag/cold-join) ⇒ caller keeps the
+/// soft path (the round is already TC-certified, the block stays replayable). O(N), N ≤ 1000.
+pub fn expected_producer_for_round(height: u64, round: u64) -> Option<String> {
+    let lr = if height <= 30 { 0 } else { (height - 1) / 30 };
+    let entry = producer_cache::CACHED_PRODUCER_SELECTION.get(&lr)?;
+    let (round0_producer, candidates) = entry.value();
+    if candidates.is_empty() { return None; }
+    let round0_idx = candidates.iter().position(|(id, _)| id == round0_producer)?;
+    Some(candidates[(round0_idx + round as usize) % candidates.len()].0.clone())
+}
+
+/// SYNC producer-signature check for the fork-choice EQUAL-round tie-break. maybe_supersede runs on
+/// UNVERIFIED gossip/repair bytes (verify_stage is skipped for a stored-height duplicate), so a forged
+/// competitor whose (unsigned) `signature` field is ground to a lower hash could otherwise trigger a
+/// wasteful reorg. This rejects any block not validly signed by its producer — a grinded random sig
+/// fails the Dilithium verify, so only a GENUINE same-round self-fork (re-signed by the real producer,
+/// who has the key) can win the tie-break. Mirrors the v4 path of the async verify_microblock_signature:
+/// Block_Sig_v23.1 digest + detached ML-DSA-65 against the producer's registered VRF PK. h==0/genesis
+/// never reaches here (maybe_supersede early-returns h==0); relaunch-from-scratch has no legacy sigs.
+pub(crate) fn verify_microblock_producer_sig_sync(mb: &qnet_state::MicroBlock) -> bool {
+    let sig_str = match std::str::from_utf8(&mb.signature) { Ok(s) => s, Err(_) => return false };
+    let sig_hex = match sig_str.strip_prefix("dilithium3_v4:") { Some(x) => x, None => return false };
+    let sig_bytes = match hex::decode(sig_hex) { Ok(b) => b, Err(_) => return false };
+    let pk = match crate::genesis_constants::get_vrf_public_key(&mb.producer) { Some(p) => p, None => return false };
+    use sha3::Digest;
+    let mut hasher = sha3::Sha3_256::new();
+    hasher.update(b"Block_Sig_v23.1");
+    hasher.update(&mb.height.to_be_bytes());
+    hasher.update(&mb.timestamp.to_be_bytes());
+    hasher.update(&mb.merkle_root);
+    hasher.update(&mb.previous_hash);
+    hasher.update(&mb.state_root);
+    hasher.update(mb.producer.as_bytes());
+    if let Some(ref vrf_out) = mb.vrf_output { hasher.update(vrf_out); }
+    hasher.update(&mb.timeout_round.to_be_bytes());
+    hasher.update(&mb.carried_baseline.to_be_bytes());
+    let msg_hash = hasher.finalize();
+    use pqcrypto_mldsa::mldsa65 as dilithium3;
+    use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
+    let d3_pk = match <dilithium3::PublicKey as PkTrait>::from_bytes(&pk) { Ok(p) => p, Err(_) => return false };
+    let d3_sig = match <dilithium3::DetachedSignature as SigTrait>::from_bytes(&sig_bytes) { Ok(s) => s, Err(_) => return false };
+    dilithium3::verify_detached_signature(&d3_sig, msg_hash.as_ref(), &d3_pk).is_ok()
+}
+
+#[cfg(test)]
+mod producer_round_tests {
+    // A1 ingest hard-gate derivation: leader for an arbitrary round rotates deterministically off the
+    // round-0 baseline, and a window we never computed yields None (caller keeps the soft path).
+    #[test]
+    fn expected_producer_for_round_rotates_deterministically() {
+        let roster: Vec<(String, f64)> = (0..5).map(|i| (format!("n{}", i), 0.0)).collect();
+        // leadership_round 2 = heights 61..=90; round-0 elected leader = n3 (idx 3).
+        super::producer_cache::CACHED_PRODUCER_SELECTION.insert(2, ("n3".to_string(), roster));
+        // leader(R) = candidates[(3 + R) % 5]
+        assert_eq!(super::expected_producer_for_round(61, 0).as_deref(), Some("n3"));
+        assert_eq!(super::expected_producer_for_round(61, 1).as_deref(), Some("n4"));
+        assert_eq!(super::expected_producer_for_round(90, 2).as_deref(), Some("n0")); // wrap
+        assert_eq!(super::expected_producer_for_round(75, 5).as_deref(), Some("n3")); // full cycle
+        assert_eq!(super::expected_producer_for_round(999_991, 1), None);             // uncomputed ⇒ soft path
+        super::producer_cache::CACHED_PRODUCER_SELECTION.remove(&2);
+    }
+}
+
 /// v3.31: Clear stale entries above rollback height
 pub fn clear_expected_producer_cache_above(max_height: u64) {
     let mut cache = EXPECTED_PRODUCER_CACHE.write();
@@ -812,7 +878,18 @@ fn recency_subwindow_indices(scan_end: u64) -> (u64, u64) {
 /// activation: legacy epoch_start (byte-exact to the deployed binary, so a mixed-version net agrees on
 /// the light bitmap until the flip). The bitmap CREATOR and the reward READER use this identically;
 /// pure fn of the epoch ⇒ they never diverge. For a fresh genesis set the gate to 0. Pure ⇒ deterministic.
-fn light_roster_cutoff(epoch: u64) -> u64 {
+/// Stable 5-genesis light shard of a node_id — roster-size-INDEPENDENT (unlike the old positional split,
+/// whose contiguous boundaries shifted as the roster grew, moving a node's owner between attest time and
+/// bitmap-build time). blake3(node_id) → u64(first 8 bytes LE) % 5. THE ONE canonical shard fn: the bitmap
+/// builder and EVERY reader (emission recompute, ping-commitment collector, snapshot_light_eligible) map
+/// bits↔nodes by enumerating the deterministic sorted roster with a per-shard counter — bit i in shard g is
+/// the i-th sorted node with light_shard_of()==g — so all nodes agree byte-for-byte on the committed bitmap.
+pub(crate) fn light_shard_of(node_id: &str) -> usize {
+    let h = blake3::hash(node_id.as_bytes());
+    (u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap_or([0u8; 8])) % 5) as usize
+}
+
+pub(crate) fn light_roster_cutoff(epoch: u64) -> u64 {
     let epoch_start = epoch.saturating_mul(14400);
     if qnet_state::feature_gates::is_active("light_reg_epoch_roster", epoch_start) {
         epoch_start + (14400 - 50)
@@ -932,6 +1009,13 @@ pub static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 // chain's lifetime production deficit.
 pub static STALL_PROGRESS_HEIGHT: AtomicU64 = AtomicU64::new(0);
 pub static STALL_PROGRESS_WALL: AtomicU64 = AtomicU64::new(0);
+// A4: no-progress timer for the 180s deadlock-escape ceiling, keyed on the certified VIEW
+// (mb_idx, certified failover_round) instead of applied height. B's tail-convergence reorgs thrash
+// LAST_BLOCK_PRODUCED_HEIGHT (hence STALL_PROGRESS_WALL), which kept resetting the height-based
+// ceiling and starved the escape from the alive-but-stuck 4-of-5 deadlock. This resets ONLY when the
+// certified round genuinely advances (correct PBFT view-timer semantics). MAX = unset (view 0 is real).
+pub static ROUND_ENTRY_VIEW: AtomicU64 = AtomicU64::new(u64::MAX);
+pub static ROUND_ENTRY_WALL: AtomicU64 = AtomicU64::new(0);
 
 // Producer liveness watchdog. Forensic: node 002 went silent 85.6 s at
 // h=154345 (a sync RocksDB call under compaction blocked the async runtime;
@@ -1714,8 +1798,10 @@ pub fn record_block_equivocation(
     header_a: qnet_state::EquivocationHeader,
     header_b: qnet_state::EquivocationHeader,
 ) {
-    // MicroBlock::hash() format (height, ts, prev, merkle, producer, round) — for the
-    // legacy macroblock-slashing drain and as the equivocation key.
+    // Equivocation identity key over the signable header fields (height, ts, prev, merkle,
+    // producer, round, carried_baseline). carried_baseline is now a signed, hash-distinguishing
+    // field, so a same-producer double-sign that differs ONLY in carried_baseline must NOT collapse
+    // to the "same block" early-out below — otherwise that provable equivocation escapes slashing.
     let block_hash = |h: &qnet_state::EquivocationHeader| -> [u8; 32] {
         let mut hasher = Sha3_256::new();
         hasher.update(&height.to_le_bytes());
@@ -1724,6 +1810,7 @@ pub fn record_block_equivocation(
         hasher.update(&h.merkle_root);
         hasher.update(producer_id.as_bytes());
         hasher.update(&h.timeout_round.to_le_bytes());
+        hasher.update(&h.carried_baseline.to_le_bytes());
         let mut out = [0u8; 32];
         out.copy_from_slice(&hasher.finalize());
         out
@@ -2987,6 +3074,9 @@ pub struct BlockApplyResult {
     /// (epoch, total, committed_root, c_per, c_cnt) — emission reward recompute the caller runs
     /// AFTER the state write-lock so the O(recipients) merkle build never blocks block apply.
     pub deferred_emission_root: Option<(u64, u64, String, u64, u32)>,
+    /// Boundary height whose committed light-eligibility the caller snapshots into the light_elig_ recency
+    /// index — run AFTER the state write-lock so the O(roster) scan never blocks block apply at scale.
+    pub deferred_light_elig: Option<u64>,
 }
 
 /// Outcome of resolving a wallet's per-epoch claim against the sharded reward structure.
@@ -3466,28 +3556,25 @@ impl BlockchainNode {
             }
         }
 
-        // LIGHT: recompute from on-chain eligibility bitmaps mapped through the deterministic
-        // pre-epoch roster (sorted node_registry, NOT the RAM mirror) + the same linear 5-genesis
-        // sharding the producer used, so every node maps bits→nodes identically. STREAMED: two
-        // lrtr_ walks (count, then positional bit-test) — memory O(eligible), never an O(roster)
-        // Vec on the emission path (at millions of light nodes that Vec was a multi-100MB spike).
+        // LIGHT: recompute from on-chain eligibility bitmaps mapped through the deterministic pre-epoch
+        // roster (sorted node_registry, NOT the RAM mirror) using the SAME stable hash-shard the producer
+        // used (light_shard_of + per-shard counter ⇒ bit i in shard g = i-th sorted node with shard==g), so
+        // every node maps bits→nodes identically. STREAMED (one lrtr_ walk) — memory O(eligible), never an
+        // O(roster) Vec on the emission path (at millions of light nodes that Vec was a multi-100MB spike).
         {
             let cutoff = light_roster_cutoff(epoch_num);
-            let mut total = 0usize;
-            let _ = storage.light_roster_for_each(cutoff, |_, _| { total += 1; });
-            if total > 0 {
-                let per = (total + 4) / 5;
-                let bitmaps = storage.load_light_bitmaps(epoch_num).unwrap_or_default();
-                let mut pos = 0usize;
+            let bitmaps = storage.load_light_bitmaps(epoch_num).unwrap_or_default();
+            if !bitmaps.is_empty() {
+                let mut counters = [0usize; 5];
                 let _ = storage.light_roster_for_each(cutoff, |node_id, wallet| {
-                    let gidx = pos / per;
-                    let local_i = pos - gidx * per;
+                    let gidx = light_shard_of(node_id);
+                    let local_i = counters[gidx];
+                    counters[gidx] += 1;
                     if let Some(bm) = bitmaps.get(&gidx) {
                         if bm.get(local_i / 8).map(|b| b & (1 << (local_i % 8)) != 0).unwrap_or(false) {
                             eligible.push((node_id.to_string(), wallet.to_string()));
                         }
                     }
-                    pos += 1;
                 });
             }
         }
@@ -3628,6 +3715,7 @@ impl BlockchainNode {
             deferred_emission_mbs: Vec::new(),
             deferred_reward_clears: Vec::new(),
             deferred_emission_root: None,
+            deferred_light_elig: None,
         };
 
         // ── Phase 1: Process emission TXs — update total_supply + parse reward accruals ──
@@ -3821,6 +3909,9 @@ impl BlockchainNode {
 
         // Epoch-boundary super reward-eligibility snapshot (deterministic; replaces per-TX writer).
         Self::populate_super_elig_at_boundary(state_guard, storage, h);
+        // Defer the O(roster) light-eligibility snapshot to the caller, AFTER the state write-lock
+        // (mirror deferred_emission_root) — a read-only recency index must never stall block apply at scale.
+        if h != 0 && h % 14400 == 0 { result.deferred_light_elig = Some(h); }
 
         // ── Phase 2b: Merkle reward claims (proof-verified credit, batched) ──
         // A claim TX is RewardDistribution from system_rewards_pool carrying
@@ -4462,6 +4553,8 @@ impl BlockchainNode {
         hasher.update(producer.as_bytes());
         if let Some(ref vrf) = hdr.vrf_output { hasher.update(vrf); }
         hasher.update(&hdr.timeout_round.to_be_bytes());
+        // v23.2: bind carried_baseline (matches sign_microblock_with_dilithium).
+        hasher.update(&hdr.carried_baseline.to_be_bytes());
         let digest = hasher.finalize();
         // Wire format: "dilithium3_v4:" + hex(detached_sig).
         let sig_str = match std::str::from_utf8(&hdr.signature) { Ok(s) => s, Err(_) => return false };
@@ -5545,13 +5638,21 @@ impl BlockchainNode {
     /// apply, so the producer of a bitmap-carrying block stamps its own shard IDENTICALLY — else its
     /// light reward roster diverges from validators at the emission boundary → reward_root fork.
     fn index_light_eligibility_bitmap(storage: &crate::storage::Storage, h: u64, tx: &qnet_state::Transaction) {
-        if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, bitmap_compressed, .. } = &tx.tx_type {
+        if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, epoch, bitmap_compressed, .. } = &tx.tx_type {
             if let Some(gidx) = genesis_id.strip_prefix("genesis_node_")
                 .and_then(|n| n.parse::<usize>().ok())
                 .filter(|n| (1..=5).contains(n)).map(|n| n - 1)
             {
-                if let Ok(bm) = zstd::decode_all(&bitmap_compressed[..]) {
-                    let _ = storage.save_light_bitmap(h / 14400, gidx, &bm);
+                // File under the TX's own (signed) epoch — the epoch the bitmap was built for and that the
+                // emission reader loads — NOT the inclusion height h/14400. A bitmap that drifts across the
+                // epoch boundary (late inclusion) must still land under its built epoch, else that shard loses
+                // the epoch's rewards. Bound to {current, just-ended} epoch vs inclusion so a stale/future-dated
+                // epoch cannot plant a bitmap. Deterministic on every node (h and epoch are canonical).
+                let inc_epoch = h / 14400;
+                if *epoch <= inc_epoch && *epoch + 1 >= inc_epoch {
+                    if let Ok(bm) = zstd::decode_all(&bitmap_compressed[..]) {
+                        let _ = storage.save_light_bitmap(*epoch, gidx, &bm);
+                    }
                 }
             }
         }
@@ -5933,6 +6034,20 @@ impl BlockchainNode {
         match storage.save_super_eligible_batch(finalized_epoch, &eligible) {
             Ok(()) => if is_info() { println!("[INFO][REWARDS] super_elig_snapshot epoch={} eligible={}", finalized_epoch, eligible.len()); },
             Err(e) => if is_warn() { println!("[WARN][REWARDS] super_elig_snapshot_failed epoch={} err={}", finalized_epoch, e); },
+        }
+    }
+
+    /// B (liveness-from-chain): at the epoch boundary, snapshot the finalized epoch's committed light
+    /// eligibility into the light_elig_ recency index (storage streams + chunks — scale-safe). Read-only
+    /// w.r.t. reward_root; run OFF the state write-lock (spawn_blocking) by both apply paths so the
+    /// O(roster) scan never stalls block apply, and re-derived at boot for the last few epochs.
+    pub(crate) fn populate_light_elig_at_boundary(storage: &crate::storage::Storage, h: u64) {
+        const EPOCH_BLOCKS: u64 = 14400;
+        if h == 0 || h % EPOCH_BLOCKS != 0 { return; }
+        let finalized_epoch = h / EPOCH_BLOCKS - 1;
+        match storage.snapshot_light_eligible(finalized_epoch, light_roster_cutoff(finalized_epoch)) {
+            Ok(n) => if is_info() { println!("[INFO][REWARDS] light_elig_snapshot epoch={} attested={}", finalized_epoch, n); },
+            Err(e) => if is_warn() { println!("[WARN][REWARDS] light_elig_snapshot_failed epoch={} err={}", finalized_epoch, e); },
         }
     }
 
@@ -6591,142 +6706,6 @@ impl BlockchainNode {
         Ok(tx)
     }
 
-    /// PRODUCTION v2.78: Collect Light node attestations from P2P RAM storage
-    /// Reads attestations created by continuous pinging system (rpc.rs)
-    /// 
-    /// ARCHITECTURE v2.78:
-    ///   - Continuous system pings Light nodes throughout epoch (240 slots)
-    ///   - Attestations stored in P2P RAM (light_node_attestations)
-    ///   - PingCommitment TXs contain only samples (10%) for Merkle verification
-    ///   - This function reads FULL attestation list from RAM for rewards
-    /// 
-    /// Arguments:
-    /// - storage: Arc reference to blockchain storage (for block height context)
-    /// - p2p: Arc reference to P2P (for attestation lookup)
-    /// - window_start_height: Start of EPOCH (e.g., 0 for epoch 0)
-    /// - window_end_height: End of EPOCH (e.g., 14400 for epoch 0)
-    /// 
-    /// Returns: HashMap<light_node_id, ping_count=1> - deduplicated Light nodes
-    /// 
-    /// v2.89 HYBRID APPROACH:
-    /// 1. PRIMARY: Read LightNodeEligibilityBitmap TXs from blockchain (on-chain proof)
-    /// 2. FALLBACK: If no bitmap TXs, use P2P RAM attestations (backward compat)
-    pub(crate) async fn collect_ping_commitments_from_blocks(
-        storage: &Arc<Storage>,
-        p2p: &Arc<SimplifiedP2P>,
-        window_start_height: u64,
-        window_end_height: u64,
-    ) -> Result<std::collections::HashMap<String, u32>, QNetError> {
-        use std::collections::HashMap;
-        
-        if is_info() {
-            println!("[INFO][PING-COLLECTION] Collecting Light node data for blocks {}-{}",
-                     window_start_height, window_end_height);
-        }
-        
-        // v2.89: PRIMARY - Read LightNodeEligibilityBitmap TXs from blockchain
-        let mut bitmap_eligible: HashMap<String, u32> = HashMap::new();
-        let mut found_bitmap_txs = 0u32;
-        
-        // v2.89 CRITICAL: Get registry ONCE at start - must be consistent for all TX!
-        // This is the "epoch snapshot" - all bitmap TX in this window use same registry
-        let registry = p2p.get_all_light_node_ids_sorted();
-        let total_light_nodes = registry.len();
-        let nodes_per_genesis = (total_light_nodes + 4) / 5; // Same for all Genesis
-        
-        if is_info() {
-            println!("[INFO][PING-COLLECTION] Registry snapshot: {} Light nodes, {} per Genesis",
-                     total_light_nodes, nodes_per_genesis);
-        }
-        
-        // Scan the FULL commitment window — same logic as heartbeats (no 50-block restriction).
-        // Bitmap TX can land anywhere in the epoch, not only in the last 50 blocks.
-        let scan_start = window_start_height;
-        
-        // v2.89: Track processed Genesis to prevent duplicate TX processing
-        let mut processed_genesis: std::collections::HashSet<String> = std::collections::HashSet::new();
-        
-        // v3.15 FIX: Use load_microblock_auto_format to handle EfficientMicroBlock format
-        for height in scan_start..=window_end_height {
-            if let Ok(Some(block)) = storage.load_microblock_auto_format(height) {
-                for tx in &block.transactions {
-                    if let qnet_state::TransactionType::LightNodeEligibilityBitmap {
-                        genesis_id,
-                        epoch: _,
-                        total_assigned,
-                        eligible_count,
-                        bitmap_compressed,
-                    } = &tx.tx_type {
-                        // v2.89: Skip duplicate TX from same Genesis (only process first)
-                        if processed_genesis.contains(genesis_id) {
-                            if is_warn() {
-                                println!("[WARN][LIGHT-BITMAP] Skipping duplicate TX from {}", genesis_id);
-                            }
-                            continue;
-                        }
-                        processed_genesis.insert(genesis_id.clone());
-                        
-                        // Decompress bitmap
-                        if let Ok(bitmap) = zstd::decode_all(&bitmap_compressed[..]) {
-                            // Parse genesis_id to get shard assignment
-                            let genesis_idx = genesis_id.strip_prefix("genesis_node_")
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .map(|n| n.saturating_sub(1))
-                                .unwrap_or(0) as usize;
-                            
-                            let shard_start = genesis_idx * nodes_per_genesis;
-                            
-                            // Read bitmap and add eligible nodes
-                            let mut local_count = 0u32;
-                            for (bit_idx, byte) in bitmap.iter().enumerate() {
-                                for bit in 0..8 {
-                                    let local_idx = bit_idx * 8 + bit;
-                                    if local_idx >= *total_assigned as usize {
-                                        break;
-                                    }
-                                    if (byte >> bit) & 1 == 1 {
-                                        let global_idx = shard_start + local_idx;
-                                        if global_idx < total_light_nodes {
-                                            let node_id = &registry[global_idx];
-                                            bitmap_eligible.insert(node_id.clone(), 1);
-                                            local_count += 1;
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            if is_info() {
-                                println!("[INFO][LIGHT-BITMAP] Parsed {} bitmap: {} eligible (expected {})",
-                                         genesis_id, local_count, eligible_count);
-                            }
-                            found_bitmap_txs += 1;
-                        } else if is_warn() {
-                            println!("[WARN][LIGHT-BITMAP] Failed to decompress bitmap from {}", genesis_id);
-                        }
-                    }
-                }
-            }
-        }
-        
-        // ON-CHAIN ONLY: BitmapTX is the authoritative proof.
-        // No fallback — if BitmapTX didn't land in this window, Light node
-        // is simply not eligible this epoch (retry mechanism ensures delivery
-        // with gas_price=u64::MAX + 3 retries + ACK forwarding).
-        if found_bitmap_txs > 0 {
-            if is_info() {
-                println!("[INFO][PING-COLLECTION] ON-CHAIN: {} bitmap TXs, {} unique Light nodes",
-                         found_bitmap_txs, bitmap_eligible.len());
-            }
-        } else {
-            if is_warn() {
-                println!("[WARN][PING-COLLECTION] No bitmap TXs found in blocks {}-{} — Light nodes not eligible this epoch",
-                         window_start_height, window_end_height);
-            }
-        }
-        
-        Ok(bitmap_eligible)
-    }
-    
     /// DEPRECATED: This function is unused. Use process_reward_window_internal() instead.
     /// Retained for reference only — will be removed in a future cleanup.
     #[allow(dead_code)]
@@ -8992,6 +8971,15 @@ impl BlockchainNode {
                 Ok(_) => {}
                 Err(e) => println!("[WARN][NODE] registry_lthash_rebuild_boot err={}", e),
             }
+            // B: re-derive the light_elig_ recency index for the last few committed epochs so a restarted /
+            // snapshot-joined node answers status recency identically until the next boundary refresh.
+            {
+                let e = boot_h / 14400;
+                for d in 1..=3u64 {
+                    let ep = match e.checked_sub(d) { Some(x) => x, None => break };
+                    let _ = blockchain.storage.snapshot_light_eligible(ep, light_roster_cutoff(ep));
+                }
+            }
         }
         
         // v4.3: Restore P2P light node registry from blockchain storage (RocksDB)
@@ -10258,14 +10246,20 @@ impl BlockchainNode {
                             }
                             return Err(format!("FORK_BELOW_FINALIZED:{}", microblock.height));
                         }
-                        // Round-aware deterministic fork choice (single authority, consistent with the
-                        // pipeline's certified-round supersession): a strictly HIGHER rotation round wins
-                        // (failover supersedes a stale primary); equal round → lower sig_hash (VRF-bound,
-                        // non-grindable). Identical on every node ⇒ no divergence.
+                        // Round-aware deterministic fork choice (single authority, consistent with the pipeline's
+                        // certified-round supersession + anchor_recovery): a strictly HIGHER rotation round wins
+                        // ONLY if 2f+1-certified (the block's proof was adopted at ingest; a raw uncertified higher
+                        // round must not win — that was the divergence source); equal round → lower Sha3(signature)
+                        // (VRF-bound, non-grindable). Identical on every node ⇒ no divergence.
                         let new_sig_hash = Sha3_256::digest(&microblock.signature);
                         let existing_sig_hash = Sha3_256::digest(&existing_block.signature);
-                        let incoming_wins = match microblock.timeout_round.cmp(&existing_block.timeout_round) {
-                            std::cmp::Ordering::Greater => true,
+                        // Rank by ABSOLUTE round (relative + carried baseline), both from block bytes —
+                        // a same-height loser-apply can no longer inflate the ranking (baseline double-count).
+                        let incoming_abs = microblock.timeout_round.saturating_add(microblock.carried_baseline);
+                        let existing_abs = existing_block.timeout_round.saturating_add(existing_block.carried_baseline);
+                        let incoming_wins = match incoming_abs.cmp(&existing_abs) {
+                            std::cmp::Ordering::Greater =>
+                                crate::unified_p2p::failover_round_authorized(microblock.height / 90, microblock.timeout_round, microblock.carried_baseline),
                             std::cmp::Ordering::Less => false,
                             std::cmp::Ordering::Equal => new_sig_hash.as_slice() < existing_sig_hash.as_slice(),
                         };
@@ -11577,18 +11571,30 @@ impl BlockchainNode {
                                     .map(|id| id.saturating_sub(1))
                                     .unwrap_or(0);
                                 
-                                // Deterministic pre-epoch roster (sorted node_registry, height-pinned),
-                                // NOT the RAM mirror, so the reward reader maps bits→nodes identically.
-                                let sorted_registry: Vec<String> = crate::node::try_get_storage()
-                                    .and_then(|s| s.light_roster_sorted(light_roster_cutoff(current_epoch)).ok())
-                                    .map(|r| r.into_iter().map(|(id, _)| id).collect())
-                                    .unwrap_or_default();
-                                let total_light_nodes = sorted_registry.len() as u32;
-                                
-                                // v2.95 FIX: Skip TX creation if no Light nodes registered
-                                // Genesis nodes should REST when there's nothing to ping
+                                // Deterministic pre-epoch roster streamed ONCE (not materialized): one pass
+                                // yields the full roster size and, for THIS genesis's hash-shard, the local
+                                // index count + attested local indices. bit i in shard g = the i-th sorted-roster
+                                // node with light_shard_of()==g — the IDENTICAL enumeration every reader (emission
+                                // recompute, snapshot_light_eligible) uses ⇒ byte-identical committed bitmap.
+                                // O(1) memory at 10M nodes (no O(roster) Vec) on this once-per-epoch genesis path.
+                                let attested_set: std::collections::HashSet<&str> =
+                                    attested_light_ids.iter().map(|s| s.as_str()).collect();
+                                let mut total_light_nodes: u32 = 0;
+                                let mut total_assigned: u32 = 0;
+                                let mut eligible_indices: Vec<u32> = Vec::new();
+                                if let Some(s) = crate::node::try_get_storage() {
+                                    let _ = s.light_roster_for_each(light_roster_cutoff(current_epoch), |id, _w| {
+                                        total_light_nodes += 1;
+                                        if light_shard_of(id) == genesis_idx as usize {
+                                            let local_i = total_assigned;
+                                            total_assigned += 1;
+                                            if attested_set.contains(id) { eligible_indices.push(local_i); }
+                                        }
+                                    });
+                                }
+
+                                // v2.95: Skip if no Light nodes registered (genesis rests when nothing to ping).
                                 if total_light_nodes == 0 {
-                                    // Mark as confirmed to avoid repeated checks
                                     let mut status = HeartbeatCommitmentStatus::new("no_light_nodes".to_string(), current_height);
                                     status.mark_confirmed(current_height);
                                     bitmap_tracker.insert(current_epoch, status);
@@ -11596,51 +11602,20 @@ impl BlockchainNode {
                                         println!("[DBG][LIGHT-BITMAP] No Light nodes registered - skipping epoch={}", current_epoch);
                                     }
                                 } else {
-                                
-                                // Build index lookup map: node_id -> global_index
-                                let index_map: std::collections::HashMap<String, u32> = sorted_registry
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(idx, id)| (id.clone(), idx as u32))
-                                    .collect();
-                                
-                                let nodes_per_genesis = (total_light_nodes + 4) / 5; // Ceiling division
-                                let my_start = genesis_idx * nodes_per_genesis;
-                                let my_end = std::cmp::min(my_start + nodes_per_genesis, total_light_nodes);
 
-                                if my_start >= my_end {
+                                if total_assigned == 0 {
                                     let mut status = HeartbeatCommitmentStatus::new("no_assigned_nodes".to_string(), current_height);
                                     status.mark_confirmed(current_height);
                                     bitmap_tracker.insert(current_epoch, status);
                                     if is_info() {
-                                        println!("[INFO][LIGHT-BITMAP] Genesis {} shard empty (start={} >= end={}, total={}) - skip",
-                                                 genesis_idx + 1, my_start, my_end, total_light_nodes);
+                                        println!("[INFO][LIGHT-BITMAP] Genesis {} shard empty (total={}) - skip",
+                                                 genesis_idx + 1, total_light_nodes);
                                     }
                                 } else {
 
-                                let total_assigned = my_end - my_start;
-
-                                // Convert attested light nodes to shard-local indices.
-                                // global_idx is deduplicated by node_id thanks to filter_map:
-                                // if multiple attestations exist for the same light_node_id we
-                                // still produce exactly one local index for that node, because
-                                // filter_map skips None and we collect into a Vec (duplicates
-                                // at this stage are later deduplicated by the bitmap set-bit logic).
-                                // Only nodes whose global index falls inside [my_start, my_end)
-                                // are counted — this is the shard ownership check.
-                                // Source set is already deduped (per-epoch node_id set); map each to its
-                                // shard-local index, keeping only those owned by this genesis shard.
-                                let eligible_indices: Vec<u32> = attested_light_ids.iter()
-                                    .filter_map(|light_node_id| {
-                                        index_map.get(light_node_id)
-                                            .filter(|&&global_idx| global_idx >= my_start && global_idx < my_end)
-                                            .map(|&global_idx| global_idx - my_start)
-                                    })
-                                    .collect();
-
                                 if is_info() {
-                                    println!("[INFO][LIGHT-BITMAP] Genesis {} shard [{},{}) → {} eligible / {} assigned Light nodes",
-                                             genesis_idx + 1, my_start, my_end, eligible_indices.len(), total_assigned);
+                                    println!("[INFO][LIGHT-BITMAP] Genesis {} hash-shard → {} eligible / {} assigned Light nodes",
+                                             genesis_idx + 1, eligible_indices.len(), total_assigned);
                                 }
                                 
                                 // Create bitmap TX
@@ -11816,7 +11791,7 @@ impl BlockchainNode {
                                         }
                                     }
                                 }
-                                } // Close else block for my_start < my_end (shard has nodes)
+                                } // Close else block for total_assigned > 0 (shard has nodes)
                                 } // Close else block for total_light_nodes > 0
                             }
                         }
@@ -12276,6 +12251,7 @@ impl BlockchainNode {
                                 fees_collected: 0, // v3.18: Genesis block has no fees
                                 state_root: [0u8; 32], // v3.27: Will be set after TX application
                                 timeout_round: 0, // v14.0: Genesis has no timeout
+                                carried_baseline: 0, // Option C: genesis baseline is 0 (no failover)
                                 timeout_proof: None, // #80: happy path, no failover proof
                             };
                             
@@ -13807,6 +13783,19 @@ impl BlockchainNode {
                         let failover_round = crate::unified_p2p::get_certified_rotation_round(mb_idx);
                         update_failover_metrics(local_delay, failover_round);
 
+                        // A4: no-progress age keyed on the certified VIEW (mb_idx, failover_round), NOT
+                        // applied height — B's tail-convergence reorgs thrash the height anchor and kept
+                        // resetting the height-based ceiling. Re-stamp only on a genuine view change /
+                        // init / backward-wall step (mirrors the STALL_PROGRESS_WALL guard above), so
+                        // round_age grows monotonically through a true deadlock and the ceiling matures.
+                        let view_key = (mb_idx << 8) | failover_round.min(0xFF);
+                        let prev_view = ROUND_ENTRY_VIEW.swap(view_key, Ordering::Relaxed);
+                        let ventry = ROUND_ENTRY_WALL.load(Ordering::Relaxed);
+                        if view_key != prev_view || ventry == 0 || wall_now < ventry {
+                            ROUND_ENTRY_WALL.store(wall_now, Ordering::Relaxed);
+                        }
+                        let round_age = wall_now.saturating_sub(ROUND_ENTRY_WALL.load(Ordering::Relaxed));
+
                         // At MAX_FAILOVER_ROUND, >MAX rotations in one window is a sync/partition issue, not
                         // producer liveness. HOLD, don't go terminal: the vote round is clamped to the cap in
                         // emit_macroblock_view_change_vote (DoS bound — no runaway climb), the pacemaker keeps
@@ -13861,10 +13850,15 @@ impl BlockchainNode {
                             // failover with expected=- and unable to re-elect a producer for the gap.
                             // Own-window only: for an amplified (higher) target the local expected-
                             // producer is meaningless — no suppression, no miss-recording there.
+                            // Elect on the ABSOLUTE certified round (node-independent), matching the
+                            // producer election + A1 gate. `failover_round` (get_certified_rotation_round)
+                            // is RELATIVE and depends on the local baseline; using it here would diverge
+                            // this node's expected-producer from the canonical leader. The metrics/view-key
+                            // labels below stay relative (display only).
                             let expected_producer = if mb_idx == own_w {
                                 Some(Self::select_microblock_producer_with_round(
                                     failover_height, &unified_p2p, &node_id, node_type, Some(&storage), &poh,
-                                    failover_round,
+                                    crate::unified_p2p::highest_certified_round_for(mb_idx),
                                 ).await).filter(|p| !p.is_empty())
                             } else { None };
 
@@ -13874,8 +13868,11 @@ impl BlockchainNode {
                             // fires unconditionally (pacemaker on lack of PROGRESS,
                             // not liveness). Fixes the alive-but-stuck permanent
                             // lock (h=144001 self_exclude missing_prev).
+                            // A4: view-keyed age (thrash-immune) drives the hard ceiling, so B's reorg
+                            // height-churn can't keep starving the deadlock escape. STALL_GRACE_SECS
+                            // (line above) still uses local_delay — healthy-path timing unchanged.
                             let progress_ceiling_exceeded =
-                                local_delay > D2_PROGRESS_HARD_CEILING_SECS;
+                                round_age > D2_PROGRESS_HARD_CEILING_SECS;
 
                             let suppression_reason: Option<&'static str> =
                                 if progress_ceiling_exceeded {
@@ -13883,7 +13880,17 @@ impl BlockchainNode {
                                 } else {
                                     match expected_producer.as_deref() {
                                         Some(p) if p == node_id.as_str() => {
-                                            Some("self_expected")
+                                            // A4 self-yield: never withhold the single decisive view-change
+                                            // vote once ≥ n−f−1 distinct committee peers already want to
+                                            // rotate off us (same absolute-round TIMEOUT_VOTES the TC tally
+                                            // reads — no f+1, no clock). We stop leading once the TC forms,
+                                            // so still exactly one leader per certified round. Otherwise the
+                                            // 4-of-5 alive-but-stuck deadlock waits out the full hard ceiling.
+                                            if crate::unified_p2p::round_one_short_of_quorum(mb_idx, &node_id) {
+                                                None
+                                            } else {
+                                                Some("self_expected")
+                                            }
                                         }
                                         Some(p) => {
                                             // Suppress only if the producer's heartbeat is FRESH and targeting
@@ -14105,6 +14112,18 @@ impl BlockchainNode {
                                         match storage.rebuild_registry_lthash(rollback_to) {
                                             Ok(n) if n > 0 => { if is_info() { println!("[INFO][FORK] registry_lthash_rebuilt orphans_pruned={} to={}", n, rollback_to); } }
                                             Err(e) => { if is_warn() { println!("[WARN][FORK] registry_lthash_rebuild_fail to={} err={}", rollback_to, e); } }
+                                            _ => {}
+                                        }
+
+                                        // Consensus reward side-indices (super_elig_/light_bm_) are non-height-keyed,
+                                        // so an orphan block that wrote a current/future-epoch entry above rollback_to
+                                        // leaves a phantom the canonical re-apply overwrites per-key but never CLEARS →
+                                        // divergent emission set → reward_root fork. Clear the orphan epochs here (inside
+                                        // the barrier; per-index bounds in the fn doc); the live pipeline re-applies
+                                        // canonical forward and re-derives the correct set. Reorg-path only.
+                                        match storage.reconcile_reward_indices_above_epoch(rollback_to) {
+                                            Ok(c) if c > 0 => { if is_info() { println!("[INFO][FORK] reward_indices_reconciled cleared={} to={}", c, rollback_to); } }
+                                            Err(e) => { if is_warn() { println!("[WARN][FORK] reward_indices_reconcile_fail to={} err={}", rollback_to, e); } }
                                             _ => {}
                                         }
 
@@ -14702,15 +14721,24 @@ impl BlockchainNode {
                 // STRICT same-round 2f+1 CERTIFIED-ONLY for producer selection:
                 // `get_certified_rotation_round` is identical on every honest node,
                 // so all nodes elect the same producer — the h=556 split-brain fix.
-                let timeout_round: u64 =
-                    crate::unified_p2p::get_certified_rotation_round(mb_idx);
+                let (timeout_round, carried_baseline): (u64, u64) =
+                    crate::unified_p2p::rotation_round_and_baseline(mb_idx);
+                // Elect on the ABSOLUTE certified round (= timeout_round + carried_baseline ==
+                // HIGHEST_CERTIFIED_ROUND[mb], node-independent), NOT the RELATIVE timeout_round. The
+                // relative round subtracts the LOCAL, pollutable get_baseline_round, so two honest nodes
+                // with divergent baselines (from applying different same-height fork-tail blocks) would
+                // compute different rotation offsets and could each elect THEMSELVES → dual off-slot
+                // production. Auth (failover_round_authorized) and fork-choice already reconstruct the
+                // absolute round from signed block bytes; election was the last layer still on the local
+                // relative baseline. The block still STAMPS (timeout_round=relative, carried_baseline) so
+                // the wire format / signature domain is unchanged.
+                let certified_abs = timeout_round.saturating_add(carried_baseline);
 
-                // Producer = PURE function of the 2f+1-certified round (candidates+base from
-                // macroblock N-2, round from get_certified_rotation_round) → identical on every
-                // node once the round cert propagates. NO node-local sticky lock: it pinned a
-                // timing-dependent leader (whoever a node first saw on failover entry) that
-                // diverged across nodes at the SAME round → Category-B producer_unauthorised_reject
-                // storm → window divergence → macroblock finality stall. Transient round-lag is
+                // Producer = PURE function of the 2f+1-certified ABSOLUTE round (candidates+base from
+                // macroblock N-2) → identical on every node once the round cert propagates. NO node-local
+                // sticky lock: it pinned a timing-dependent leader (whoever a node first saw on failover
+                // entry) that diverged across nodes at the SAME round → Category-B producer_unauthorised_
+                // reject storm → window divergence → macroblock finality stall. Transient round-lag is
                 // resolved by the certified-round fork-choice on ingest, not by local state.
                 let current_producer = Self::select_microblock_producer_with_round(
                     next_block_height,
@@ -14719,7 +14747,7 @@ impl BlockchainNode {
                     node_type,
                     Some(&storage),
                     &poh,
-                    timeout_round,
+                    certified_abs,
                 ).await;
 
                 if is_info() && timeout_round > 0 {
@@ -14737,8 +14765,9 @@ impl BlockchainNode {
                 // and the BFT-certified property of `timeout_round`. There is
                 // no clock-derived input to this cache write, so cross-node
                 // cache divergence (the v22 root cause of the h=4742 fork) is
-                // structurally impossible after this commit.
-                cache_expected_producer(next_block_height, &current_producer, timeout_round);
+                // structurally impossible after this commit. Cache the ABSOLUTE round (matches the
+                // election above and the A1 gate's block.timeout_round+carried_baseline reconstruction).
+                cache_expected_producer(next_block_height, &current_producer, certified_abs);
 
                 let mut is_my_turn_to_produce = current_producer == node_id;
 
@@ -16392,9 +16421,16 @@ impl BlockchainNode {
                         // Restores the v14.0 producer-authority-proof invariant
                         // that v22 had erased by hardcoding 0.
                         timeout_round,
+                        // Carry the baseline this block was stamped against (from the SAME snapshot as
+                        // timeout_round) so abs = timeout_round + carried_baseline is node-independent.
+                        carried_baseline,
                         // #80: attach the 2f+1 TimeoutProof that certified this failover round so a
-                        // lagging receiver adopts it in-band (round 0 → None, no proof needed).
-                        timeout_proof: if timeout_round > 0 {
+                        // lagging receiver adopts it in-band. Key on the ABSOLUTE round
+                        // (timeout_round + carried_baseline > 0): a resumed happy-path block after an
+                        // in-window certified failover carries timeout_round=0 but carried_baseline>0,
+                        // and its receiver's ingest gate now demands certified>=carried_baseline — so
+                        // the proof must ride along for in-band adoption. Pure happy path (abs=0) → None.
+                        timeout_proof: if timeout_round > 0 || carried_baseline > 0 {
                             crate::unified_p2p::certified_timeout_proof_bytes(next_block_height / 90)
                         } else { None },
                     };
@@ -16542,6 +16578,14 @@ impl BlockchainNode {
 
                         // Epoch-boundary super reward-eligibility snapshot (same fn as the apply path).
                         Self::populate_super_elig_at_boundary(&state_guard, &*storage, next_block_height);
+                        // light_elig is a read-only recency index (backfilled at boot) — snapshot it OFF the
+                        // state write-lock so the O(roster) scan never stalls the producer at scale.
+                        if next_block_height != 0 && next_block_height % 14400 == 0 {
+                            if let Some(st) = crate::node::try_get_storage() {
+                                let st = st.clone();
+                                tokio::task::spawn_blocking(move || crate::node::BlockchainNode::populate_light_elig_at_boundary(&st, next_block_height));
+                            }
+                        }
 
                         // v3 merkle-claim credit (same fn as the apply path) BEFORE state_root so a
                         // producer crediting claims in its OWN block matches validators (no state_root split).
@@ -16992,7 +17036,8 @@ impl BlockchainNode {
                         // case h=15886 → h=15899 producer mute).
                         crate::unified_p2p::record_finalized_round(
                             height_for_storage / 90,
-                            microblock.timeout_round,
+                            // ABSOLUTE round (relative + carried baseline) — see block_pipeline.rs apply mirror.
+                            microblock.timeout_round.saturating_add(microblock.carried_baseline),
                         );
                         // v33: feed the deterministic window-content accumulator at commit.
                         accumulate_window_block(height_for_storage, &microblock);
@@ -21028,6 +21073,11 @@ impl BlockchainNode {
         }
         // v23.1: bind timeout_round to the signed digest.
         hasher.update(&microblock.timeout_round.to_be_bytes());
+        // v23.2: bind carried_baseline too. abs_round = timeout_round + carried_baseline, so the
+        // baseline half is equally consensus-relevant — leaving it unsigned would let a peer-relay
+        // mutate it in transit (signature still verifies against the unsigned remainder) and poison
+        // record_finalized_round / fork-choice, re-opening the exact malleability v23.1 closed.
+        hasher.update(&microblock.carried_baseline.to_be_bytes());
         let message_hash = hasher.finalize();
         
         // Sign with VRF instance (Dilithium3 detached signature)
@@ -21144,6 +21194,8 @@ impl BlockchainNode {
             }
             // v23.1: bind timeout_round to the signed digest (matches signer).
             hasher2.update(&microblock.timeout_round.to_be_bytes());
+            // v23.2: bind carried_baseline (matches signer) — see sign_microblock_with_dilithium.
+            hasher2.update(&microblock.carried_baseline.to_be_bytes());
             let msg_hash = hasher2.finalize();
 
             // Verify Dilithium3 detached signature
@@ -24916,27 +24968,15 @@ impl BlockchainNode {
 
     /// Start health monitor for sync flags (prevents permanent deadlock)
     fn start_sync_health_monitor() {
-        // PRODUCTION: Health check runs in background to detect and clear stuck sync flags
+        // Liveness heartbeat only. Sync liveness is owned by the SyncManager (single coordinator): its
+        // `active` flag is scoped by a guard cleared on every execute_sync exit, so there is no stuck flag
+        // to poll here.
         tokio::spawn(async move {
-            use std::sync::atomic::AtomicU64;
-            
-            // Track timestamps when flags were set
-            #[allow(dead_code)]
-            static FAST_SYNC_SET_AT: AtomicU64 = AtomicU64::new(0);
-            #[allow(dead_code)]
-            static NORMAL_SYNC_SET_AT: AtomicU64 = AtomicU64::new(0);
-            
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                
-                let _now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                
-                // Sync liveness is owned by the SyncManager (single coordinator): its `active` flag is
-                // scoped by a guard cleared on every execute_sync exit, so there is no stuck-flag to poll.
-                println!("[INFO][SYNC] health_monitor_active interval=30s");
+                if is_info() {
+                    println!("[INFO][SYNC] health_monitor_active interval=30s");
+                }
             }
         });
     }
@@ -27463,6 +27503,7 @@ mod tests {
                 fees_collected: 0,
                 state_root: [0u8; 32],
                 timeout_round: 0,
+                carried_baseline: 0,
                 timeout_proof: None,
             };
             let data = bincode::serialize(&mb).expect("serialize");
@@ -27615,21 +27656,61 @@ mod tests {
     }
 
     #[test]
-    fn light_shards_partition_roster() {
-        // The linear 5-genesis shards must tile the roster with no gap/overlap, so every Light
-        // node maps to exactly one genesis bitmap (producer + reader use this identical formula).
-        for total in [1usize, 4, 5, 23, 100, 100_003] {
-            let per = (total + 4) / 5;
-            let mut covered = 0usize;
-            let mut prev_end = 0usize;
-            for gidx in 0..5usize {
-                let start = (gidx * per).min(total);
-                let end = (start + per).min(total);
-                assert_eq!(start, prev_end, "shard {} must start where the previous ended (total={})", gidx, total);
-                covered += end - start;
-                prev_end = end;
+    fn light_hash_shard_bitmap_round_trip() {
+        // Fork-safety: the bitmap builder and every reader (emission recompute, ping-commitment collector,
+        // snapshot_light_eligible) map bits↔nodes via the SAME stable hash-shard (light_shard_of + a per-shard
+        // sorted counter: bit i in shard g = the i-th sorted roster node with light_shard_of()==g). Build
+        // per-shard bitmaps for a roster + eligible subset, decode them, and assert the exact set round-trips.
+        use std::collections::{HashMap, HashSet};
+        let mut roster: Vec<String> = (0..2000u32)
+            .map(|i| format!("light_mobile_{:016x}", (i as u64).wrapping_mul(0x9E3779B97F4A7C15)))
+            .collect();
+        roster.sort();
+        let eligible_ref: HashSet<&String> = roster.iter().step_by(3).collect(); // every 3rd node attests
+
+        for id in &roster { assert!(light_shard_of(id) < 5, "every node maps to a shard in 0..5"); }
+
+        // BUILDER: per-shard bitmap; bit li set iff the li-th sorted shard member is eligible.
+        let mut bitmaps: HashMap<usize, Vec<u8>> = HashMap::new();
+        let mut totals = [0usize; 5];
+        {
+            let mut counters = [0usize; 5];
+            for id in &roster {
+                let g = light_shard_of(id);
+                let li = counters[g];
+                counters[g] += 1;
+                totals[g] += 1;
+                if eligible_ref.contains(id) {
+                    let bm = bitmaps.entry(g).or_default();
+                    let byte = li / 8;
+                    if bm.len() <= byte { bm.resize(byte + 1, 0); }
+                    bm[byte] |= 1 << (li % 8);
+                }
             }
-            assert_eq!(covered, total, "shards must cover the full roster (total={})", total);
+        }
+
+        // READER: same enumeration recovers the eligible set from the bitmaps.
+        let mut recovered: HashSet<String> = HashSet::new();
+        {
+            let mut counters = [0usize; 5];
+            for id in &roster {
+                let g = light_shard_of(id);
+                let li = counters[g];
+                counters[g] += 1;
+                if let Some(bm) = bitmaps.get(&g) {
+                    if bm.get(li / 8).map(|b| b & (1 << (li % 8)) != 0).unwrap_or(false) {
+                        recovered.insert(id.clone());
+                    }
+                }
+            }
+        }
+
+        let expected: HashSet<String> = eligible_ref.iter().map(|s| (*s).clone()).collect();
+        assert_eq!(recovered, expected, "hash-shard bitmap must round-trip the exact eligible set (builder == reader)");
+        assert_eq!(totals.iter().sum::<usize>(), roster.len(), "shards partition the roster");
+        // With a large uniform roster each shard should be within a few % of total/5 (no positional skew).
+        for (g, &t) in totals.iter().enumerate() {
+            assert!(t > roster.len() / 8, "shard {} unexpectedly small ({} of {})", g, t, roster.len());
         }
     }
 
@@ -27805,6 +27886,7 @@ mod tests {
             state_root: [0u8; 32],
             vrf_output: None,
             timeout_round: round,
+            carried_baseline: 0,
             signature: Vec::new(),
         }
     }
@@ -27827,6 +27909,7 @@ mod tests {
         hasher.update(producer.as_bytes());
         if let Some(ref vrf) = h.vrf_output { hasher.update(vrf); }
         hasher.update(&h.timeout_round.to_be_bytes());
+        hasher.update(&h.carried_baseline.to_be_bytes());
         let digest = hasher.finalize();
         let sig = pqcrypto_mldsa::mldsa65::detached_sign(digest.as_ref(), sk);
         format!("dilithium3_v4:{}", hex::encode(sig.as_bytes())).into_bytes()

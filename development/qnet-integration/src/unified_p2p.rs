@@ -1227,6 +1227,15 @@ static TC_CLAIM_PULL_BUDGET: Lazy<Arc<parking_lot::Mutex<(u64, u32)>>> =
 static ANCHOR_PULL_BUDGET: Lazy<Arc<parking_lot::Mutex<(u64, u32)>>> =
     Lazy::new(|| Arc::new(parking_lot::Mutex::new((0, 0))));
 
+/// Same, for block-repair requests (request_block_repair) — check_content's TailDiverged branch can
+/// spawn one repair per diverged tail height (up to a full window) from a single proposal, and a
+/// re-sendable attacker proposal cycles fresh garbage tails, so the ~3x-peer fan-out is globally
+/// capped + per-height cooldowned regardless of how many heights an unauthenticated proposal forces.
+static REPAIR_REQUEST_BUDGET: Lazy<Arc<parking_lot::Mutex<(u64, u32)>>> =
+    Lazy::new(|| Arc::new(parking_lot::Mutex::new((0, 0))));
+/// Cooldown per height for the block-repair request (secs).
+static REPAIR_REQUEST_TIMES: Lazy<Arc<DashMap<u64, u64>>> = Lazy::new(|| Arc::new(DashMap::new()));
+
 /// Canonical signed payload of a failover vote — domain-tagged + versioned; the ONE builder shared
 /// by signer and verifier. anchor = hash(macroblock w-2) (zeros for w<3): fork-binds the vote to
 /// QC-sealed state every honest voter shares; high_qc/tip are the voter's own (sync hints +
@@ -1307,6 +1316,31 @@ pub fn lowest_window_with_support(above_w: u64) -> Option<u64> {
         }
     }
     None
+}
+
+/// A4 self-yield gate: true if some LIVE failover round (> certified) for window `w` already holds
+/// ≥ (quorum − 1) DISTINCT committee votes NOT including `voter` — so THIS node's own vote is the
+/// single decisive one that forms the same-round n−f TimeoutCertificate rotating the network off
+/// itself. Reads the SAME voter-deduped, committee-filtered TIMEOUT_VOTES the TC tally uses at the
+/// identical (window, ABSOLUTE round) key — NEVER an f+1 threshold, NEVER a cross-round aggregate,
+/// NEVER the wall clock — so it cannot resurrect the h=556 f+1-minority-drives-rotation split. It
+/// only lifts this node's self-vote suppression; the emitted vote stays committee/anchor/sig-gated
+/// and the node ceases to lead once the TC forms (exactly one leader per certified round). O(votes).
+pub fn round_one_short_of_quorum(w: u64, voter: &str) -> bool {
+    let committee = match failover_committee_for_window(w) { Some(c) => c, None => return false };
+    let quorum = qnet_consensus::checkpoint_bft::quorum_size(committee.len());
+    if quorum == 0 { return false; }
+    let certified = highest_certified_round_for(w);
+    for e in TIMEOUT_VOTES.iter() {
+        let (kw, kr) = *e.key();
+        if kw != w || kr <= certified { continue; } // live rounds only — a consumed round is no rotation demand
+        let voters = e.value();
+        if voters.contains_key(voter) { continue; }  // we already voted this round ⇒ not withholding
+        if voters.keys().filter(|v| v.as_str() != voter).count() >= quorum.saturating_sub(1) {
+            return true;
+        }
+    }
+    false
 }
 
 /// True if `voter` holds a stored (sig-verified, committee-filtered, deduped) timeout vote for
@@ -1456,6 +1490,17 @@ pub fn get_certified_rotation_round(mb_index: u64) -> u64 {
     certified.saturating_sub(baseline)
 }
 
+/// Live-frontier producer helper: returns (relative_round, baseline) from ONE baseline snapshot so
+/// the stamped block satisfies `timeout_round + carried_baseline == HIGHEST_CERTIFIED_ROUND[mb]` by
+/// construction. Because both fields come from the SAME `baseline`, any pollution in the local
+/// baseline CANCELS in the reconstructed absolute round (= certified_abs regardless of baseline) —
+/// this is what makes carrying the baseline in-block node-independent AND producer-pollution-immune.
+pub fn rotation_round_and_baseline(mb_index: u64) -> (u64, u64) {
+    let baseline = get_baseline_round(mb_index);
+    let certified = HIGHEST_CERTIFIED_ROUND.get(&mb_index).map(|v| *v).unwrap_or(0);
+    (certified.saturating_sub(baseline), baseline)
+}
+
 /// #80: serialized 2f+1 TimeoutProof certifying the current failover round for `mb_index`. The
 /// producer attaches it to a round>0 microblock so a lagging receiver adopts the round in-band
 /// instead of wedging. None on the happy path (no failover round certified). O(1) DashMap read.
@@ -1494,10 +1539,14 @@ pub fn highest_failover_round_with_support(mb_index: u64, support: usize) -> u64
 /// Both the producer and this gate read the same `HIGHEST_CERTIFIED_ROUND[mb_idx]`, advanced
 /// only by a same-round 2f+1 `TimeoutProof`, so they can never disagree on whether a round is
 /// authorised. A round>0 block is admitted iff its absolute round is 2f+1-certified. O(1).
-pub fn failover_round_authorized(mb_index: u64, block_round: u64) -> bool {
-    if block_round == 0 { return true; } // happy path: no failover, no certificate required
-    let baseline = get_baseline_round(mb_index);
-    highest_certified_round_for(mb_index) >= block_round.saturating_add(baseline)
+pub fn failover_round_authorized(mb_index: u64, block_round: u64, carried_baseline: u64) -> bool {
+    // ABSOLUTE round = block_round + the baseline the block CARRIES (node-independent), NOT the local
+    // get_baseline_round (which a same-height loser-apply pollutes). Compare to the window-keyed 2f+1 ceiling.
+    // NO block_round==0 short-circuit: carried_baseline is signed but producer-supplied, so a Byzantine
+    // round-0 leader could stamp carried_baseline=huge; the abs<=certified check must run for EVERY block
+    // (a genuine happy path has abs=baseline<=certified, so certified>=0+cb still holds; only a forged
+    // inflated baseline — abs>certified — is rejected, blocking the record_finalized_round poison).
+    highest_certified_round_for(mb_index) >= block_round.saturating_add(carried_baseline)
 }
 
 /// (f+1)-th highest of a fresh-height multiset (≥1 honest ≥ it). SYNC-HINT REGISTER ONLY — feeds
@@ -14729,7 +14778,21 @@ impl SimplifiedP2P {
                     }
                     return;
                 }
-                
+
+                // SECURITY: reject a future-dated registered_at (clock-skew bound only). Gossip is
+                // unauthenticated for a not-yet-on-chain node (the Dilithium proof only opens over the public
+                // wallet_address), so an unbounded timestamp would let an attacker pin registered_at≈u64::MAX
+                // and permanently freeze the newer-only dedupe below against the real node's later registration.
+                {
+                    let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    if registered_at > now_secs.saturating_add(300) {
+                        if crate::node::is_warn() {
+                            println!("[WARN][GOSSIP] future_registered_at_rejected node={} ts={}", node_id, registered_at);
+                        }
+                        return;
+                    }
+                }
+
                 // DEDUPE: Check if already in registry
                 {
                     let registry = self.light_node_registry.read();
@@ -14777,8 +14840,39 @@ impl SimplifiedP2P {
                         }
                         return;
                     }
+
+                    // SECURITY: identity continuity. The mobile Dilithium proof only opens over the PUBLIC
+                    // wallet_address, so any freshly-minted key passes it — it does NOT bind the key to the
+                    // node's identity. A node's quantum key is activation-derived (immutable), so a gossip
+                    // carrying a DIFFERENT key for a known node_id is an identity-swap/hijack attempt. Bind
+                    // to the established key (RAM entry, else the committed VRF key) and reject a mismatch.
+                    // This gates BOTH the is_active overwrite below and the persisted-drop clear.
+                    if !quantum_pubkey.is_empty() {
+                        // VRF-ONLY: the committed on-chain key is the sole authoritative, un-poisonable
+                        // identity. (C trims the RAM quantum_pubkey to empty, so the former RAM fallback was
+                        // dead.) A not-yet-on-chain pseudonym has no established key to bind to; once it
+                        // commits on-chain its own gossip matches the VRF key and any pre-registration poison
+                        // is rejected here — an attacker can never produce a VRF-matching key.
+                        let established = self.storage.as_ref()
+                            .and_then(|s| s.load_vrf_public_key(&node_id).ok().flatten())
+                            .map(hex::encode);
+                        if let Some(est) = established {
+                            if est != quantum_pubkey {
+                                if crate::node::is_warn() {
+                                    println!("[WARN][GOSSIP] identity_mismatch_rejected node={}", node_id);
+                                }
+                                return;
+                            }
+                        }
+                    }
                 }
-                
+
+                // C: ping keys → dedicated CF (read per-ping), written only AFTER the identity guard above
+                // passes so a forged key cannot poison it. The resident entry below keeps the crypto EMPTY.
+                if let Some(s) = &self.storage {
+                    let _ = s.save_light_ping_keys(&node_id, &ping_pubkey, &ping_delegation_cert);
+                }
+
                 // Store in local registry with LRU eviction
                 {
                     let mut registry = self.light_node_registry.write();
@@ -14801,20 +14895,21 @@ impl SimplifiedP2P {
                         }
                     }
                     
+                    // Trimmed resident entry — heavy crypto lives in the VRF/ping-key CFs (read on demand).
                     registry.insert(node_id.clone(), LightNodeRegistrationData {
                         node_id: node_id.clone(),
                         wallet_address: wallet_address.clone(),
-                        device_token_hash: device_token_hash.clone(),
-                        quantum_pubkey: quantum_pubkey.clone(),
+                        device_token_hash: String::new(),
+                        quantum_pubkey: String::new(),
                         registered_at,
-                        signature: signature.clone(),
+                        signature: String::new(),
                         push_type: push_type.clone(),
                         unified_push_endpoint: unified_push_endpoint.clone(),
                         last_seen,
                         consecutive_failures,
                         is_active,
-                        ping_pubkey: ping_pubkey.clone(),
-                        ping_delegation_cert: ping_delegation_cert.clone(),
+                        ping_pubkey: String::new(),
+                        ping_delegation_cert: String::new(),
                     });
                 }
                 
@@ -15039,9 +15134,18 @@ impl SimplifiedP2P {
                     });
                 }
                 
-                // v2.89: eligibility is recorded ONLY on origination (this genesis's own ping
-                // reply), so each genesis holds just its own 1/5 shard — not the broadcast set.
-                // Gossip below is for propagation/observability only.
+                // Record into the per-epoch eligibility set IF this node is in OUR shard — so a reply
+                // (push or self-attest) that landed on a DIFFERENT genesis still reaches this shard-owner's
+                // committed bitmap. Shard-filtered (bitmap-identical committed-roster split) ⇒ memory stays
+                // at this genesis's 1/5, and each node is counted by exactly one shard owner. The pinger
+                // signature was verified above. block_height is NOT signature-covered (relay-tamperable), so
+                // record ONLY for the CURRENT local epoch — a forged future block_height would otherwise drive
+                // the prune in record_light_epoch_eligible and wipe the live epoch's eligibility set.
+                let local_epoch = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) / 14400;
+                if block_height / 14400 == local_epoch
+                    && self.node_in_my_shard_for_epoch(local_epoch, &light_node_id) {
+                    self.record_light_epoch_eligible(block_height, &light_node_id);
+                }
 
                 // WHITEPAPER: Light nodes have FIXED reputation of 70
                 // NO reputation changes for Light nodes - they are always eligible if attested
@@ -16898,16 +17002,30 @@ impl SimplifiedP2P {
     pub fn get_light_node_registry(&self) -> HashMap<String, LightNodeRegistrationData> {
         self.light_node_registry.read().clone()
     }
+
+    /// Point-read one light node without cloning the whole registry (scale: millions of entries).
+    pub fn get_light_node(&self, node_id: &str) -> Option<LightNodeRegistrationData> {
+        self.light_node_registry.read().get(node_id).cloned()
+    }
     
     /// Register Light node locally and gossip to network
     pub fn register_light_node(&self, registration: LightNodeRegistrationData) {
-        // Store locally
+        // C: ping keys → dedicated CF (read per-ping); resident entry keeps pubkey/sig/ping-keys EMPTY so
+        // it stays ~300B at tens of millions of nodes. Identity comes from the committed VRF key.
+        if let Some(s) = &self.storage {
+            let _ = s.save_light_ping_keys(&registration.node_id, &registration.ping_pubkey, &registration.ping_delegation_cert);
+        }
         {
             let mut registry = self.light_node_registry.write();
-            registry.insert(registration.node_id.clone(), registration.clone());
+            registry.insert(registration.node_id.clone(), LightNodeRegistrationData {
+                quantum_pubkey: String::new(), signature: String::new(),
+                ping_pubkey: String::new(), ping_delegation_cert: String::new(),
+                device_token_hash: String::new(),
+                ..registration.clone()
+            });
         }
-        
-        // Gossip to network (pure ML-DSA-65 + PING DELEGATION v7.0)
+
+        // Gossip to network — the FULL `registration` values (below), NOT the trimmed resident entry.
         let msg = NetworkMessage::LightNodeRegistration {
             node_id: registration.node_id,
             wallet_address: registration.wallet_address,
@@ -16943,9 +17061,8 @@ impl SimplifiedP2P {
         
         for (node_id, wallet_address, _node_type, registered_at) in nodes {
             if !registry.contains_key(&node_id) {
-                // Restore the persisted liveness FSM instead of resurrecting to active — a dropped node
-                // stays dropped across a genesis restart until it re-attests (honors manual reactivation).
-                let inactive = self.storage.as_ref().map(|s| s.is_light_inactive(&node_id)).unwrap_or(false);
+                // B: liveness is derived from on-chain attestation recency, not a persisted flag — seed
+                // active; the ping-wakeup scheduler re-derives whom to wake from committed eligibility.
                 registry.insert(node_id.clone(), LightNodeRegistrationData {
                     node_id,
                     wallet_address,
@@ -16956,8 +17073,8 @@ impl SimplifiedP2P {
                     push_type: PushType::Polling,
                     unified_push_endpoint: None,
                     last_seen: registered_at,
-                    consecutive_failures: if inactive { 5 } else { 0 },
-                    is_active: !inactive,
+                    consecutive_failures: 0,
+                    is_active: true,
                     ping_pubkey: String::new(),         // Populated on re-registration
                     ping_delegation_cert: String::new(),// Populated on re-registration
                 });
@@ -17222,7 +17339,6 @@ impl SimplifiedP2P {
         let our_genesis_idx = std::env::var("QNET_BOOTSTRAP_ID")
             .ok().and_then(|id| id.parse::<usize>().ok())
             .map(|id| id.saturating_sub(1)).unwrap_or(0);
-        const GENESIS_COUNT: usize = 5;
 
         if crate::node::is_info() {
             println!("[INFO][GENESIS-PING] Genesis node {} (idx={}) checking Light nodes to ping slot={}",
@@ -17233,33 +17349,38 @@ impl SimplifiedP2P {
         let reg_len = registry.len();
 
         // Rebuild this genesis's per-slot buckets only when the window rolls or the registry size changes.
-        // Linear sharding over the SORTED registry (must match bitmap creation). O(N log N) once per window,
-        // not every 60s tick — the O(N log N) clone+sort per tick did not scale to millions of light nodes.
+        // Stable hash-shard (light_shard_of == our_genesis_idx) — roster-size-independent, so a node's owner
+        // NEVER changes as the registry grows (no mid-epoch reshard) and it matches the committed bitmap's
+        // shard exactly, so a reply always reaches the genesis that commits it. O(N) once per window.
         let need_rebuild = { let c = self.light_ping_slot_cache.read(); c.0 != current_window || c.1 != reg_len };
         if need_rebuild {
-            let mut ids: Vec<&String> = registry.keys().collect();
-            ids.sort();
-            let nodes_per_genesis = (reg_len + GENESIS_COUNT - 1) / GENESIS_COUNT;
-            let my_start = our_genesis_idx * nodes_per_genesis;
-            let my_end = std::cmp::min(my_start + nodes_per_genesis, reg_len);
             let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 240];
-            for i in my_start..my_end {
-                let id = ids[i];
+            for id in registry.keys() {
+                if crate::node::light_shard_of(id) != our_genesis_idx { continue; }
                 let slot = Self::calculate_randomized_slot(id, current_window) as usize;
                 buckets[slot].push(id.clone());
             }
             *self.light_ping_slot_cache.write() = (current_window, reg_len, buckets);
         }
 
-        // Read the 3 grace slots {cur, cur-1, cur-2} (mod 240) — same window as is_light_node_ping_slot
-        // (slot_diff<=2). is_active/consecutive_failures/attested are mutable ⇒ filtered per tick.
+        // Read the 3 grace slots {cur, cur-1, cur-2} (mod 240). B: wake only plausibly-live nodes —
+        // attested (own-shard recency, epoch map held once) or registered within the grace window. Dormant
+        // nodes stop being woken (they self-attest on return); a fresh node gets its first ping via
+        // registered_at. Liveness authority is on-chain; this is only a derived whom-to-wake hint.
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        const WAKE_GRACE_EPOCHS: u64 = 3;
+        let elig = self.epoch_light_eligible.read();
+        let attested_recent = |id: &str| (0..WAKE_GRACE_EPOCHS)
+            .any(|d| elig.get(&current_window.saturating_sub(d)).map(|s| s.contains(id)).unwrap_or(false));
+        let this_epoch = |id: &str| elig.get(&current_window).map(|s| s.contains(id)).unwrap_or(false);
         let cache = self.light_ping_slot_cache.read();
         for g in 0..=2u64 {
             let s = ((current_slot + 240 - g) % 240) as usize;
             for node_id in cache.2.get(s).into_iter().flatten() {
                 let node = match registry.get(node_id) { Some(n) => n, None => continue };
-                if !node.is_active || node.consecutive_failures >= 5 { continue; }
-                if self.has_attestation_in_window(node_id) { continue; }
+                if this_epoch(node_id) { continue; }  // already attested this epoch — nothing to wake
+                let fresh = now_secs.saturating_sub(node.registered_at) < WAKE_GRACE_EPOCHS * 14400;
+                if !fresh && !attested_recent(node_id) { continue; }  // dormant — self-attests on return
                 result.push((node.clone(), PingerRole::Primary));
             }
         }
@@ -17269,30 +17390,6 @@ impl SimplifiedP2P {
                      our_genesis_idx + 1, result.len(), reg_len);
         }
         result
-    }
-    
-    /// Mark Light node as failed (no response to ping)
-    /// After 5 consecutive failures, node is marked inactive
-    pub fn mark_light_node_ping_failed(&self, node_id: &str) {
-        let mut flipped_inactive = false;
-        {
-            let mut registry = self.light_node_registry.write();
-            if let Some(node) = registry.get_mut(node_id) {
-                node.consecutive_failures = node.consecutive_failures.saturating_add(1);
-                if node.consecutive_failures >= 5 && node.is_active {
-                    node.is_active = false;
-                    flipped_inactive = true;
-                    if crate::node::is_info() {
-                        println!("[WARN][P2P] Node {} marked inactive after {} consecutive failures",
-                                 node_id, node.consecutive_failures);
-                    }
-                }
-            }
-        }
-        // Persist the drop so a genesis restart does not silently resurrect it (honors manual reactivation).
-        if flipped_inactive {
-            if let Some(s) = &self.storage { s.mark_light_inactive(node_id); }
-        }
     }
     
     /// Update push_type + last_seen for a light node (called on token-refresh).
@@ -17308,32 +17405,6 @@ impl SimplifiedP2P {
         }
     }
 
-    /// Mark Light node as successful (responded to ping)
-    /// Resets failure counter and marks as active
-    pub fn mark_light_node_ping_success(&self, node_id: &str) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-            
-        let mut registry = self.light_node_registry.write();
-        if let Some(node) = registry.get_mut(node_id) {
-            let was_inactive = !node.is_active;
-            
-            node.last_seen = now;
-            node.consecutive_failures = 0;
-            node.is_active = true;
-            
-            if was_inactive {
-                if let Some(s) = &self.storage { s.clear_light_inactive(node_id); }
-                if crate::node::is_info() {
-                    println!("[INFO][P2P] Node {} reactivated after successful ping", node_id);
-                }
-            }
-        }
-    }
-    
-    
     /// Gossip Light Node attestation after successful ping
     pub fn gossip_light_node_attestation(&self, attestation: LightNodeAttestation) {
         let msg = NetworkMessage::LightNodeAttestation {
@@ -17365,33 +17436,6 @@ impl SimplifiedP2P {
     pub fn get_light_node_count(&self) -> usize {
         let registry = self.light_node_registry.read();
         registry.len()
-    }
-    
-    /// v2.89: Get Light node index by ID (for bitmap creation)
-    /// Returns deterministic index based on sorted order of node IDs
-    pub fn get_light_node_index(&self, node_id: &str) -> Option<u32> {
-        let registry = self.light_node_registry.read();
-        
-        // Get sorted list of all node IDs for deterministic ordering
-        let mut ids: Vec<_> = registry.keys().collect();
-        ids.sort();
-        
-        // Find index of this node
-        ids.iter().position(|&id| id == node_id).map(|i| i as u32)
-    }
-    
-    /// v2.89: Get ALL Light node IDs sorted (for bitmap index mapping)
-    /// CRITICAL: Returns ALL registered nodes, NOT just active ones!
-    /// This ensures bitmap indices are consistent between creation and reading.
-    /// Inactive nodes simply have bit=0 in bitmap (no reward).
-    pub fn get_all_light_node_ids_sorted(&self) -> Vec<String> {
-        let registry = self.light_node_registry.read();
-        
-        // Return ALL node IDs, sorted for deterministic ordering
-        // NO FILTER - this must match get_light_node_index() ordering!
-        let mut ids: Vec<_> = registry.keys().cloned().collect();
-        ids.sort();
-        ids
     }
     
     /// Register this node as active Super node and broadcast announcement (ASYNC)
@@ -17980,6 +18024,20 @@ impl SimplifiedP2P {
     }
     
 
+    /// Is `node_id` in THIS genesis's shard? Stable hash-shard (crate::node::light_shard_of) — O(1),
+    /// roster-size-INDEPENDENT, no cache: a node's shard never changes as the roster grows, so record-time
+    /// and bitmap-build-time always agree. Non-genesis ⇒ false (its eligibility feeds no committed bitmap).
+    fn node_in_my_shard_for_epoch(&self, _epoch: u64, node_id: &str) -> bool {
+        let idx = match std::env::var("QNET_BOOTSTRAP_ID").ok()
+            .filter(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .and_then(|id| id.parse::<usize>().ok())
+        {
+            Some(n) => n.saturating_sub(1),
+            None => return false,
+        };
+        crate::node::light_shard_of(node_id) == idx
+    }
+
     /// Record an attested light node into the per-epoch eligibility set (uncapped) + prune old epochs.
     fn record_light_epoch_eligible(&self, block_height: u64, light_node_id: &str) {
         const EPOCH_BLOCKS: u64 = 14400;
@@ -18393,6 +18451,12 @@ impl SimplifiedP2P {
                 if storage.load_microblock(height).unwrap_or(None).is_some() {
                     clear_block_pending_sync(height);
                     skipped_exists += 1;
+                    // A sync/repair-delivered block at a height we ALREADY hold may be a higher-2f+1-
+                    // certified-round failover WINNER — route it through the SAME fork-choice supersede
+                    // the gossip decode path uses. Without this the batch path drops it here, before the
+                    // pipeline, so fix B's request_block_repair reconcile can never converge a restarted/
+                    // late voter that missed the seconds-long live-gossip window (boundary re-freeze).
+                    crate::block_pipeline::supersede_stored_from_sync(&storage, height, &data, &sender_id, self);
                     continue;
                 }
                 // Mark as pending (tracking only, not a gate)
@@ -19027,29 +19091,6 @@ impl SimplifiedP2P {
         Err(format!("Macroblock sync failed: all peers did not respond for idx={}-{}", from_index, to_index))
     }
     
-    /// Get current macroblock index from chain height
-    /// PRODUCTION: Macroblock index = (height / 90), rounded up for partial
-    /// PRODUCTION v2.19.21: Now async (uses async sync_blockchain_height)
-    pub async fn get_current_macroblock_index(&self) -> u64 {
-        // v2.51: Lock-free height estimation
-        let has_reliable_peer = self.connected_peers_lockfree.iter()
-            .any(|entry| entry.value().reputation() >= 50.0);
-        
-        if !has_reliable_peer {
-            return 0;
-        }
-        
-        if let Ok(network_height) = self.sync_blockchain_height().await {
-            if network_height == 0 {
-                0
-            } else {
-                (network_height.saturating_add(89)) / 90
-            }
-        } else {
-            0
-        }
-    }
-    
     // =========================================================================
     // END MACROBLOCK SYNC METHODS
     // =========================================================================
@@ -19565,10 +19606,39 @@ impl SimplifiedP2P {
     /// Used by anti-fork protection to get missing blocks before producing
     /// ═══════════════════════════════════════════════════════════════════════════
     pub async fn request_block_repair(&self, height: u64) -> Result<(), String> {
+        // Allow-list this exact height so its stored-height batch reply is routed to fork-choice
+        // supersede (supersede_stored_from_sync) instead of ignored — this is the SOLICITED path that
+        // converges a diverged tail. Marking a not-yet-stored height is harmless (TTL-expired).
+        crate::block_pipeline::mark_repair_solicited(height);
+        // DoS: bound the repair fan-out (each call sends to up to 3 peers). check_content's TailDiverged
+        // branch can drive one call per diverged height (up to a full window) from a single re-sendable
+        // proposal → attacker-drainable ~3x reflection per height. Global token bucket + per-height
+        // cooldown (mirrors ANCHOR_PULL_BUDGET / FAILOVER_CERT_PULL): a legit divergence (a few tail
+        // heights) is well within budget; a garbage-tail flood is capped regardless of key cycling. The
+        // allow-list mark above stays (the SOLICITED supersede path is now producer-signature-gated, so a
+        // marked-but-unsent height is harmless), so convergence still works when a retry gets budget.
+        {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            const REPAIR_REQUESTS_PER_SEC: u32 = 16;
+            const REPAIR_COOLDOWN_SECS: u64 = 2;
+            {
+                let mut b = REPAIR_REQUEST_BUDGET.lock();
+                if b.0 != now { *b = (now, 0); }
+                if b.1 >= REPAIR_REQUESTS_PER_SEC { return Ok(()); }
+                b.1 += 1;
+            }
+            let last = REPAIR_REQUEST_TIMES.get(&height).map(|v| *v).unwrap_or(0);
+            if now.saturating_sub(last) < REPAIR_COOLDOWN_SECS { return Ok(()); }
+            REPAIR_REQUEST_TIMES.insert(height, now);
+            if REPAIR_REQUEST_TIMES.len() > 4096 {
+                REPAIR_REQUEST_TIMES.retain(|_, t| now.saturating_sub(*t) < 60);
+            }
+        }
         if crate::node::is_info() {
             println!("[INFO][SYNC] Requesting repair for block #{}", height);
         }
-        
+
         // Repair only from peers proven (authenticated height) to hold the block — co-stragglers serve
         // empty and stall the deferred-drain cascade. Fall back to any active peer if none known ahead.
         let mut peers = self.get_sync_peers_filtered_by_height(8, height);
@@ -22863,6 +22933,17 @@ impl SimplifiedP2P {
             }
             return;
         }
+        // Round bound (mirror handle_timeout_vote #295): a legit failover round never exceeds
+        // certified+MAX_FAILOVER_ROUND. Caps the (window,round) key space BEFORE the quorum-many
+        // Dilithium verify in verify_timeout_certificate, so a peer cannot cycle timeout_round to
+        // unbounded novel keys (each bypassing the dedup above) and force an unbounded verify storm —
+        // this path is reachable with UNVERIFIED block bytes via maybe_supersede's adopt.
+        if timeout_round > highest_certified_round_for(height).saturating_add(crate::node::MAX_FAILOVER_ROUND) {
+            if crate::node::is_debug() {
+                println!("[DBG][TIMEOUT] tc_round_oob h={} round={} action=drop", height, timeout_round);
+            }
+            return;
+        }
 
         if anchor.len() != 32 {
             if crate::node::is_warn() {
@@ -25225,6 +25306,18 @@ mod tests {
         lower_tc_window_floor(2); // fork rollback moved the tip into window 2
         assert_eq!(observed_tc_window_floor(), 2, "rollback lowers the floor → re-vote enabled");
 
+        // ── A4 self-yield gate: the self-expected leader emits its single decisive view-change vote
+        // once (quorum − 1) DISTINCT committee peers already want to rotate off it — never at f+1,
+        // never cross-round, and never if it already voted this round.
+        test_clear_timeout_state();
+        let sw = 0u64; // genesis window: committee = 5 ⇒ quorum 4 ⇒ decisive at 3 others
+        test_insert_timeout_vote(sw, 1, "g_a");
+        test_insert_timeout_vote(sw, 1, "g_b");
+        assert!(!round_one_short_of_quorum(sw, "g_e"), "2 < quorum-1 ⇒ our vote not yet decisive");
+        test_insert_timeout_vote(sw, 1, "g_c"); // 3 distinct = quorum-1
+        assert!(round_one_short_of_quorum(sw, "g_e"), "quorum-1 others ⇒ self-yield fires");
+        assert!(!round_one_short_of_quorum(sw, "g_a"), "already voted this round ⇒ not withholding");
+
         test_clear_timeout_state();
     }
 
@@ -25250,26 +25343,25 @@ mod tests {
     #[test]
     fn failover_round_authorized_matches_producer_authority() {
         // Unique mb_idx values so the global consensus DashMaps don't collide with other tests.
+        // baseline is now CARRIED in the block (3rd arg), not read from LAST_FINALIZED_ROUND_PER_MB.
         let mb = 9_100_001u64;
         // 2f+1 certified ABSOLUTE round 12 for this macroblock.
         HIGHEST_CERTIFIED_ROUND.insert(mb, 12);
-        LAST_FINALIZED_ROUND_PER_MB.insert(mb, 0); // baseline 0
-        assert!(failover_round_authorized(mb, 0),  "round 0 (happy path) is always authorised");
-        assert!(failover_round_authorized(mb, 11), "round below certified is authorised");
-        assert!(failover_round_authorized(mb, 12), "round == certified is authorised");
-        assert!(!failover_round_authorized(mb, 13), "round above certified is NOT authorised (uncertified/forged)");
+        assert!(failover_round_authorized(mb, 0, 0),  "round 0 (happy path) is always authorised");
+        assert!(failover_round_authorized(mb, 11, 0), "round below certified is authorised");
+        assert!(failover_round_authorized(mb, 12, 0), "round == certified is authorised");
+        assert!(!failover_round_authorized(mb, 13, 0), "round above certified is NOT authorised (uncertified/forged)");
 
-        // Non-zero baseline ⇒ the comparison is in ABSOLUTE units (block_round + baseline).
+        // Non-zero carried baseline ⇒ the comparison is in ABSOLUTE units (block_round + carried_baseline).
         let mb2 = 9_100_002u64;
         HIGHEST_CERTIFIED_ROUND.insert(mb2, 12);    // absolute certified round
-        LAST_FINALIZED_ROUND_PER_MB.insert(mb2, 5); // baseline 5
-        assert!(failover_round_authorized(mb2, 7),  "abs 7+5=12 <= 12 → authorised");
-        assert!(!failover_round_authorized(mb2, 8), "abs 8+5=13 > 12 → rejected");
+        assert!(failover_round_authorized(mb2, 7, 5),  "abs 7+5=12 <= 12 → authorised");
+        assert!(!failover_round_authorized(mb2, 8, 5), "abs 8+5=13 > 12 → rejected");
 
         // No certified round recorded ⇒ only the happy path (round 0) passes.
         let mb3 = 9_100_003u64;
-        assert!(failover_round_authorized(mb3, 0),  "uninitialised mb: round 0 still ok");
-        assert!(!failover_round_authorized(mb3, 1), "uninitialised mb: any failover round rejected");
+        assert!(failover_round_authorized(mb3, 0, 0),  "uninitialised mb: round 0 still ok");
+        assert!(!failover_round_authorized(mb3, 1, 0), "uninitialised mb: any failover round rejected");
     }
 
     /// Test rate limiter functionality

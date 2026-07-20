@@ -1801,17 +1801,6 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_ping_response);
 
-    // Light node reactivation endpoint (for returning after being offline)
-    let light_node_reactivate = api_v1
-        .and(warp::path("light-node"))
-        .and(warp::path("reactivate"))
-        .and(warp::path::end())
-        .and(warp::post())
-        .and(warp::body::content_length_limit(64 * 1024)) // 64KB max
-        .and(warp::body::json())
-        .and(blockchain_filter.clone())
-        .and_then(handle_light_node_reactivate);
-
     // Light node status endpoint (check if active/inactive)
     let light_node_status = api_v1
         .and(warp::path("light-node"))
@@ -2546,7 +2535,6 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(light_node_token_refresh)
         .or(light_node_ping_response_get)
         .or(light_node_ping_response_post)
-        .or(light_node_reactivate)
         .or(light_node_status)
         .or(server_node_status)
         .or(light_node_next_ping)
@@ -6135,59 +6123,8 @@ async fn handle_network_ping(
 
 // F0.2 REMOVED: verify_dilithium_client_signature — dead (no callers after the pure-Dilithium cutover).
 
-/// PRODUCTION v2.78: Verify Dilithium signature (for registration/reactivation)
-/// ARCHITECTURE: Pure Dilithium verification using quantum crypto system
-async fn verify_dilithium_signature(node_id: &str, message: &str, signature: &str) -> bool {
-    use crate::node::try_get_quantum_crypto;
-    
-    // Basic validation
-    if node_id.is_empty() || message.is_empty() || signature.is_empty() || signature.len() < 32 {
-        if crate::node::is_warn() {
-            println!("[WARN][DILITHIUM] sig_invalid reason=empty_params node={}", node_id);
-        }
-        return false;
-    }
-    
-    // PRODUCTION: Lock-free quantum crypto
-    let crypto = match try_get_quantum_crypto() {
-        Some(c) => c,
-        None => {
-            if crate::node::is_warn() {
-                println!("[WARN][DILITHIUM] crypto_not_initialized node={}", node_id);
-            }
-            return false;
-        }
-    };
-    
-    // Create DilithiumSignature struct
-    let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
-        signature: signature.to_string(),
-        algorithm: "CRYSTALS-Dilithium3".to_string(),
-        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-        strength: "quantum-resistant".to_string(),
-    };
-    
-    match crypto.verify_dilithium_signature(message, &dilithium_sig, node_id).await {
-        Ok(is_valid) => {
-            if is_valid {
-                if crate::node::is_info() {
-                    println!("[INFO][DILITHIUM] sig_verified node={}", node_id);
-                }
-            } else {
-                if crate::node::is_warn() {
-                    println!("[WARN][DILITHIUM] sig_verify_failed node={}", node_id);
-                }
-            }
-            is_valid
-        }
-        Err(e) => {
-            if crate::node::is_warn() {
-                println!("[WARN][DILITHIUM] verify_error err={} node={}", e, node_id);
-            }
-            false
-        }
-    }
-}
+// REMOVED: verify_dilithium_signature — dead after the /reactivate endpoint retired (B: reactivation is
+// self-attest; light identity verifies via the ping-delegation chain against the on-chain key).
 
 /// PRODUCTION v2.78: Verify Light node signature (pure post-quantum Dilithium3 / ML-DSA-65)
 /// ARCHITECTURE: Light nodes use compact_bin Dilithium3 signature format
@@ -6240,22 +6177,15 @@ async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: 
     if signature.starts_with("ping_dilithium:") {
         let inner_sig = &signature[15..]; // Skip "ping_dilithium:" prefix
 
-        let (ping_pk_hex, delegation_cert, quantum_pk) = if let Some(p2p) = blockchain.get_unified_p2p() {
-            let registry = p2p.get_light_node_registry();
-            if let Some(node) = registry.get(node_id) {
-                (
-                    node.ping_pubkey.clone(),
-                    node.ping_delegation_cert.clone(),
-                    node.quantum_pubkey.clone(),
-                )
-            } else {
+        // C: ping keys live in the dedicated CF (point-read), not the trimmed RAM registry.
+        let (ping_pk_hex, delegation_cert) = match blockchain.get_storage().get_light_ping_keys(node_id) {
+            Some(kv) => kv,
+            None => {
                 if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] ping_dilithium_node_not_found node={}", node_id);
+                    println!("[WARN][LIGHT] ping_keys_missing node={} action=reject_ping_dilithium", node_id);
                 }
                 return false;
             }
-        } else {
-            return false;
         };
 
         if ping_pk_hex.is_empty() || delegation_cert.is_empty() {
@@ -6277,10 +6207,6 @@ async fn verify_light_node_signature(node_id: &str, challenge: &str, signature: 
                 return false;
             }
         };
-        if !quantum_pk.is_empty() && quantum_pk != onchain_pk_hex {
-            if crate::node::is_warn() { println!("[WARN][LIGHT] ram_key_mismatch_onchain node={}", node_id); }
-            return false;
-        }
         let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, node_id);
         let delegation_ok = verify_mobile_dilithium_signature(&delegation_msg, &delegation_cert, &onchain_pk_hex);
         if !delegation_ok {
@@ -6731,24 +6657,14 @@ async fn handle_light_node_token_refresh(
     }
     let inner_sig = &req.signature[15..]; // Skip "ping_dilithium:" prefix
 
-    // Load ping_pubkey + ping_delegation_cert + quantum_pubkey from the light-node registry.
-    let (ping_pk_hex, delegation_cert, quantum_pk) = if let Some(p2p) = blockchain.get_unified_p2p() {
-        let registry = p2p.get_light_node_registry();
-        if let Some(node) = registry.get(&req.node_id) {
-            (
-                node.ping_pubkey.clone(),
-                node.ping_delegation_cert.clone(),
-                node.quantum_pubkey.clone(),
-            )
-        } else {
+    // C: ping keys live in the dedicated CF (point-read), not the trimmed RAM registry.
+    let (ping_pk_hex, delegation_cert) = match blockchain.get_storage().get_light_ping_keys(&req.node_id) {
+        Some(kv) => kv,
+        None => {
             return Ok(warp::reply::json(&serde_json::json!({
-                "success": false, "error": "Node not found"
+                "success": false, "error": "Node not found or missing ping delegation"
             })));
         }
-    } else {
-        return Ok(warp::reply::json(&serde_json::json!({
-            "success": false, "error": "internal error"
-        })));
     };
 
     if ping_pk_hex.is_empty() || delegation_cert.is_empty() {
@@ -6772,16 +6688,6 @@ async fn handle_light_node_token_refresh(
             })));
         }
     };
-
-    // RAM-poison guard: RAM quantum_pubkey (gossip-set) must match the on-chain key.
-    if !quantum_pk.is_empty() && quantum_pk != onchain_pk_hex {
-        if crate::node::is_warn() {
-            println!("[WARN][LIGHT] token_refresh_ram_key_mismatch_onchain node={}", req.node_id);
-        }
-        return Ok(warp::reply::json(&serde_json::json!({
-            "success": false, "error": "Invalid signature"
-        })));
-    }
 
     // Step 1: Verify the delegation cert authorizing ping_pubkey, against the on-chain key.
     let delegation_msg = format!("delegate_ping:{}:{}", ping_pk_hex, req.node_id);
@@ -6951,38 +6857,39 @@ async fn handle_light_node_register(
         })));
     }
 
-    // Reject if this wallet already has an on-chain registered node.
-    // Deriving the pseudonym first is O(1) and avoids all heavy Solana/crypto work below.
+    // Already-registered wallet re-registering = a RETURN, not a fresh activation: a plain restore
+    // (node still active) or a reactivation after a drop / wallet-restore ping-key rotation. Detect it
+    // O(1) up front so we skip the heavy burn re-verification below, yet still fall through to re-verify
+    // the identity signature, refresh the ping key, and gossip is_active=true — which reaches the
+    // shard-owner genesis (sole holder of the non-gossiped drop) so it reactivates and resumes pinging.
+    // No new on-chain TX is created (see the tx_required=false return).
+    let mut reactivating_existing = false;
     {
         let pseudonym = generate_light_node_pseudonym(&register_request.wallet_address);
-
-        // PRIMARY CHECK: blockchain state (accurate on synced nodes)
-        let state_mgr = blockchain.get_state_manager();
-        let state = state_mgr.read().await;
-        if state.is_node_registered(&pseudonym) {
-            let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&pseudonym);
-            println!("[INFO][LIGHT] registration_rejected reason=already_registered pseudonym={}", pseudonym);
-            return Ok(warp::reply::json(&json!({
-                "success": true,
-                "already_registered": true,
-                "node_id": pseudonym,
-                "node_type": "light",
-                "next_ping_time": next_ping_time,
-                "next_ping_window": window_number,
-                "message": "Node already registered. Your existing node has been restored."
-            })));
-        }
-        drop(state);
-
-        // SECONDARY CHECK: in-memory gossip-synced registry.
-        // Guards against fresh-restart nodes where blockchain state is empty but the
-        // network has already gossipped the registration. Prevents duplicate registrations
-        // when the requesting node is unsynced (e.g. after a data wipe + restart).
-        {
-            let registry = LIGHT_NODE_REGISTRY.lock();
-            if registry.contains_key(&pseudonym) {
+        let registered_on_chain = {
+            let state_mgr = blockchain.get_state_manager();
+            let state = state_mgr.read().await;
+            state.is_node_registered(&pseudonym)
+        };
+        let registered_in_gossip = LIGHT_NODE_REGISTRY.lock().contains_key(&pseudonym);
+        if registered_on_chain || registered_in_gossip {
+            // SECURITY: reactivation/ping-key rotation may run ONLY if the caller proves the node's
+            // established identity. The quantum keypair is activation-derived (immutable), so the legit
+            // owner presents the pubkey already committed as the node's VRF key. The mobile Dilithium sig
+            // opens over the PUBLIC wallet_address (forgeable with any key), so we bind here: incoming
+            // quantum_pubkey MUST equal the committed VRF key. Match → reactivate (skip burn re-verify).
+            // Mismatch or key-not-yet-committed-here → mutate nothing, return already_registered inertly
+            // (a synced genesis — the shard owner always is — performs the real reactivation).
+            let identity_ok = hex::decode(&register_request.quantum_pubkey).ok()
+                .zip(blockchain.get_storage().load_vrf_public_key(&pseudonym).ok().flatten())
+                .map(|(incoming, committed)| incoming == committed)
+                .unwrap_or(false);
+            if identity_ok {
+                reactivating_existing = true;
+                println!("[INFO][LIGHT] reactivation_on_register pseudonym={}", pseudonym);
+            } else {
                 let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&pseudonym);
-                println!("[INFO][LIGHT] registration_rejected reason=already_in_gossip_registry pseudonym={}", pseudonym);
+                println!("[INFO][LIGHT] registration_rejected reason=already_registered pseudonym={}", pseudonym);
                 return Ok(warp::reply::json(&json!({
                     "success": true,
                     "already_registered": true,
@@ -7002,8 +6909,11 @@ async fn handle_light_node_register(
     // To verify: reconstruct XOR key from burn data → decrypt → compare wallet.
     // NO in-memory registry needed. NO node state needed. Code IS the proof.
     // burn_tx_hash + burn_amount are MANDATORY (sent from mobile AsyncStorage).
+    // Skipped for an already-registered RETURN: the burn was verified at the original registration and
+    // the node is on-chain; re-registration only refreshes the ping key + reactivates. Identity is
+    // still proven by the mandatory Dilithium gossip signature below.
     // ═══════════════════════════════════════════════════════════════════════════════
-    {
+    if !reactivating_existing {
         let registry = &*GLOBAL_ACTIVATION_REGISTRY;
         let code = &register_request.node_id;
         let wallet = &register_request.wallet_address;
@@ -7520,7 +7430,25 @@ async fn handle_light_node_register(
     
     // Calculate next ping time for this node
     let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&light_node_pseudonym);
-    
+
+    // Already-registered RETURN: the registry insert + register_light_node above gossiped is_active=true
+    // (+ the refreshed ping key), reaching the shard-owner genesis to reactivate it. No new on-chain TX
+    // is needed (the node is already registered), so tx_required=false.
+    if reactivating_existing {
+        return Ok(warp::reply::json(&json!({
+            "success": true,
+            "already_registered": true,
+            "reactivated": true,
+            "node_id": light_node_pseudonym,
+            "node_type": "light",
+            "tx_required": false,
+            "push_type": push_type_str,
+            "next_ping_time": next_ping_time,
+            "next_ping_window": window_number,
+            "message": "Node reactivated and restored."
+        })));
+    }
+
     Ok(warp::reply::json(&json!({
         "success": true,
         "message": "Light node registered successfully with privacy protection",
@@ -7854,6 +7782,27 @@ async fn handle_light_node_ping_response(
         }
     }
 
+    // Anti-poison: if the request presents its ping delegation, refresh the ping-key CF before verifying,
+    // so the node's own authenticated ping overwrites any pre-registration gossip poison. The overwrite is
+    // bound to (a) a cert that verifies under the node's committed on-chain key AND (b) a valid ping signature
+    // under the PRESENTED key — so a replay of an old (pp,cert) with a garbage ping sig cannot downgrade the
+    // stored key, while a node whose CF was poisoned heals it with its own correctly-signed ping.
+    if let (Some(pp), Some(cert)) = (params.get("ping_pubkey"), params.get("ping_delegation_cert")) {
+        if !pp.is_empty() && !cert.is_empty() && signature.starts_with("ping_dilithium:") {
+            let inner_ping_sig = &signature[15..];
+            if let Ok(Some(vrf)) = blockchain.get_storage().load_vrf_public_key(&node_id) {
+                let onchain_pk_hex = hex::encode(vrf);
+                let delegation_msg = format!("delegate_ping:{}:{}", pp, node_id);
+                if verify_mobile_dilithium_signature(&delegation_msg, cert, &onchain_pk_hex)
+                    && verify_mobile_dilithium_signature(&challenge, inner_ping_sig, pp) {
+                    let _ = blockchain.get_storage().save_light_ping_keys(&node_id, pp, cert);
+                } else if crate::node::is_warn() {
+                    println!("[WARN][LIGHT] presented_ping_delegation_rejected node={}", node_id);
+                }
+            }
+        }
+    }
+
     // PRODUCTION v2.78: Verify Light node post-quantum Dilithium3 signature
     let signature_valid = verify_light_node_signature(&node_id, &challenge, &signature, &blockchain).await;
 
@@ -7971,10 +7920,7 @@ async fn handle_light_node_ping_response(
         let wallet_address = {
             // Level 1: P2P registry (gossip-synced + restored from RocksDB on startup)
             let from_p2p = blockchain.get_unified_p2p()
-                .and_then(|p2p| {
-                    let registry = p2p.get_light_node_registry();
-                    registry.get(&node_id).map(|r| r.wallet_address.clone())
-                });
+                .and_then(|p2p| p2p.get_light_node(&node_id).map(|r| r.wallet_address.clone()));
             
             if let Some(addr) = from_p2p {
                 Some(addr)
@@ -8013,11 +7959,6 @@ async fn handle_light_node_ping_response(
         let _ = reward_manager.record_ping_attempt(&node_id, true, 50);
         let _ = blockchain.get_storage().save_ping_attempt(&node_id, now, true, 50);
         let _ = blockchain.get_storage().save_node_registration(&node_id, "light", &wallet_addr, INITIAL_REPUTATION);
-    }
-    
-    // Mark node as successfully responding (resets failure counter, reactivates if inactive)
-    if let Some(p2p) = blockchain.get_unified_p2p() {
-        p2p.mark_light_node_ping_success(&node_id);
     }
     
     println!("[LIGHT] 📡 Light node {} responded and attested in slot {}", node_id, current_slot);
@@ -8086,24 +8027,16 @@ async fn handle_light_node_pending_challenge(
         }))),
     };
     
-    // Security: Verify node exists and is registered for polling
+    // Security: Verify node exists and is registered for polling (point-read: no full-map clone)
     if let Some(p2p) = blockchain.get_unified_p2p() {
-        let registry = p2p.get_light_node_registry();
-        match registry.get(&node_id) {
+        match p2p.get_light_node(&node_id) {
             Some(node) => {
-                // Only polling nodes can use this endpoint
+                // Only polling nodes can use this endpoint. Liveness is on-chain (B): a poll always yields
+                // the challenge; answering it records eligibility, which IS the reactivation.
                 if !matches!(node.push_type, crate::unified_p2p::PushType::Polling) {
                     return Ok(warp::reply::json(&json!({
                         "success": false,
                         "error": "This endpoint is only for polling-mode nodes"
-                    })));
-                }
-                // Check if node is active
-                if !node.is_active || node.consecutive_failures >= 5 {
-                    return Ok(warp::reply::json(&json!({
-                        "success": false,
-                        "error": "Node is inactive. Please reactivate first.",
-                        "needs_reactivation": true
                     })));
                 }
             }
@@ -8245,138 +8178,6 @@ fn validate_unified_push_endpoint(endpoint: &str) -> Result<(), String> {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
-struct ReactivateRequest {
-    node_id: String,
-    wallet_address: String,
-    signature: String,  // Signature of "reactivate:{node_id}:{timestamp}"
-    timestamp: u64,
-    #[serde(default)]
-    device_token: Option<String>,
-    #[serde(default)]
-    push_type: Option<String>,
-}
-
-/// Handle Light node reactivation request
-/// Called when user clicks "I'm back" button after being offline
-async fn handle_light_node_reactivate(
-    request: ReactivateRequest,
-    blockchain: Arc<BlockchainNode>,
-) -> Result<impl Reply, Rejection> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    
-    // Timestamp must be within 5 minutes
-    if now.abs_diff(request.timestamp) > 300 {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Request expired. Timestamp must be within 5 minutes."
-        })));
-    }
-    
-    // Verify signature
-    let message = format!("reactivate:{}:{}", request.node_id, request.timestamp);
-    let signature_valid = verify_dilithium_signature(&request.node_id, &message, &request.signature).await;
-    
-    if !signature_valid {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Invalid signature"
-        })));
-    }
-    
-    // Check if node exists and is actually inactive
-    let (exists, was_inactive) = if let Some(p2p) = blockchain.get_unified_p2p() {
-        let registry = p2p.get_light_node_registry();
-        if let Some(node) = registry.get(&request.node_id) {
-            (true, !node.is_active || node.consecutive_failures >= 5)
-        } else {
-            (false, false)
-        }
-    } else {
-        (false, false)
-    };
-    
-    if !exists {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Node not found. Please register first."
-        })));
-    }
-    
-    if !was_inactive {
-        return Ok(warp::reply::json(&json!({
-            "success": true,
-            "message": "Node is already active",
-            "node_id": request.node_id,
-            "was_reactivated": false
-        })));
-    }
-    
-    // Reactivate the node
-    if let Some(p2p) = blockchain.get_unified_p2p() {
-        p2p.mark_light_node_ping_success(&request.node_id);
-        if crate::node::is_info() {
-            println!("[INFO][LIGHT] node_reactivated node={}", request.node_id);
-        }
-    }
-
-    // Update FCM token if provided (covers token refresh during offline period)
-    if let Some(ref token) = request.device_token {
-        if !token.is_empty() {
-            let pt = request.push_type.as_deref().unwrap_or("fcm");
-            let pt_normalized = match pt {
-                "unifiedpush" => "unifiedpush",
-                "polling"     => "polling",
-                _             => "fcm",
-            };
-            if let Err(e) = blockchain.get_storage().save_fcm_token(
-                &request.node_id, token, pt_normalized, None,
-            ) {
-                if crate::node::is_warn() {
-                    println!("[WARN][LIGHT] reactivate_token_save_failed node={} err={}", request.node_id, e);
-                }
-            } else {
-                if let Some(p2p) = blockchain.get_unified_p2p() {
-                    let now_ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                    p2p.update_light_node_push_type(&request.node_id, pt_normalized, now_ts);
-                }
-                // Sync token to peer genesis nodes
-                let node_id_c = request.node_id.clone();
-                let token_c = token.clone();
-                let pt_c = pt_normalized.to_string();
-                let our_ip = {
-                    use crate::genesis_constants::GENESIS_NODE_IPS;
-                    let bid = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
-                    GENESIS_NODE_IPS.iter().find(|(_, id)| *id == bid)
-                        .map(|(ip, _)| ip.to_string()).unwrap_or_default()
-                };
-                tokio::spawn(async move {
-                    sync_fcm_token_to_genesis_peers(&node_id_c, &token_c, &pt_c, None, &our_ip).await;
-                });
-                if crate::node::is_info() {
-                    println!("[INFO][LIGHT] reactivate_token_updated node={} push={}", request.node_id, pt_normalized);
-                }
-            }
-        }
-    }
-
-    // Calculate next ping time
-    let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&request.node_id);
-    
-    Ok(warp::reply::json(&json!({
-        "success": true,
-        "message": "Node reactivated successfully",
-        "node_id": request.node_id,
-        "was_reactivated": true,
-        "next_ping_time": next_ping_time,
-        "next_ping_window": window_number
-    })))
-}
-
 /// Handle Light node status check
 /// Returns current activity status and failure count
 async fn handle_light_node_status(
@@ -8399,36 +8200,61 @@ async fn handle_light_node_status(
         .load_vrf_public_key(&node_id)
         .ok().flatten().is_some();
 
+    // B: liveness is derived from the committed attestation-eligibility index (node-independent, durable),
+    // NOT a per-genesis RAM FSM. needs_reactivation = registered on-chain but not attested in the last two
+    // COMMITTED epochs. Any genesis returns the same answer; the app resolves it by self-attesting on wake.
+    let cur_height = blockchain.get_storage().get_chain_height().unwrap_or(0);
+    let attested_recent = blockchain.get_storage().light_attested_recent_onchain(&node_id, cur_height);
+    let needs_reactivation = onchain_registered && !attested_recent;
+    let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&node_id);
+
     if let Some(p2p) = blockchain.get_unified_p2p() {
-        let registry = p2p.get_light_node_registry();
-
-        if let Some(node) = registry.get(&node_id) {
-            let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&node_id);
+        if let Some(node) = p2p.get_light_node(&node_id) {
             let current_slot = crate::unified_p2p::SimplifiedP2P::get_current_slot();
-
-            // Check if has attestation in current window
             let has_attestation = p2p.has_attestation(&node_id, current_slot);
-
+            // Agree with the ping-scheduler's liveness view (get_light_nodes_to_ping). A node that attested
+            // in the current — not-yet-committed — epoch (converged across genesis via attestation gossip) or
+            // is within the fresh-registration grace is live now, even though light_elig_ only records it at
+            // the next boundary. Without this a just-activated / just-reactivated node reads OFFLINE for up to
+            // a full epoch and the app loops redundant self-attests. Non-consensus: this only shapes the UI verdict.
+            const WAKE_GRACE_SECS: u64 = 3 * 14400;
+            let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            let fresh = now_secs.saturating_sub(node.registered_at) < WAKE_GRACE_SECS;
+            let attested_now = p2p.has_attestation_in_window(&node_id);
+            let needs_reactivation = needs_reactivation && !attested_now && !fresh;
             return Ok(warp::reply::json(&json!({
                 "success": true,
                 "node_id": node_id,
-                "is_active": node.is_active,
-                "consecutive_failures": node.consecutive_failures,
-                "last_seen": node.last_seen,
+                "is_active": !needs_reactivation,
                 "registered_at": node.registered_at,
                 "push_type": format!("{:?}", node.push_type),
                 "has_attestation_current_slot": has_attestation,
                 "next_ping_time": next_ping_time,
                 "next_ping_window": window_number,
-                "needs_reactivation": !node.is_active || node.consecutive_failures >= 5,
+                "needs_reactivation": needs_reactivation,
                 "onchain_registered": onchain_registered
             })));
         }
     }
 
-    // RAM-registry miss: still report on-chain readiness (a committed node is uniform across
-    // storage even if this node hasn't gossip-learned it yet) so the client can attest through
-    // another node instead of being falsely gated off.
+    // RAM-registry miss: the recency index is committed and node-independent, so still answer
+    // authoritatively when the node is on-chain. Apply the same current-epoch attestation grace as the
+    // RAM-hit branch so the verdict is identical across genesis (honors "any genesis returns the same answer").
+    if onchain_registered {
+        let attested_now = blockchain.get_unified_p2p().map(|p| p.has_attestation_in_window(&node_id)).unwrap_or(false);
+        let needs_reactivation = needs_reactivation && !attested_now;
+        return Ok(warp::reply::json(&json!({
+            "success": true,
+            "node_id": node_id,
+            "is_active": !needs_reactivation,
+            "has_attestation_current_slot": attested_now,
+            "next_ping_time": next_ping_time,
+            "next_ping_window": window_number,
+            "needs_reactivation": needs_reactivation,
+            "onchain_registered": true
+        })));
+    }
+
     Ok(warp::reply::json(&json!({
         "success": false,
         "error": "Node not found",
@@ -8604,18 +8430,22 @@ async fn handle_server_node_status(
                 })));
             }
 
-            // Not in active Super/Genesis list — check light_node_registry
+            // Not in active Super/Genesis list — check light_node_registry (point-read: no full-map clone)
             if target_id.starts_with("light_") {
-                let registry = p2p.get_light_node_registry();
-                if let Some(node) = registry.get(target_id) {
+                if let Some(node) = p2p.get_light_node(target_id) {
                     let block_height = blockchain.get_height().await;
                     let pending_rewards = match blockchain.get_node_wallet(target_id).await {
                         Some(wallet) => wallet_claimable_qnc(&blockchain, &wallet).await,
                         None => 0,
                     };
-                    // No per-epoch light-eligible reader reachable here; approximate attestation by
-                    // online + recent ping (within one ping window) rather than bare registry presence.
-                    let is_online = node.is_active && now.saturating_sub(node.last_seen) < 15 * 60;
+                    // B: online = attested on-chain in the last committed epochs, OR attesting in the current
+                    // (uncommitted) epoch, OR within the fresh-registration grace — mirrors handle_light_node_status
+                    // so a just-(re)activated live node is not reported OFFLINE for up to a full epoch.
+                    const WAKE_GRACE_SECS: u64 = 3 * 14400;
+                    let fresh = now.saturating_sub(node.registered_at) < WAKE_GRACE_SECS;
+                    let is_online = blockchain.get_storage().light_attested_recent_onchain(target_id, block_height)
+                        || p2p.has_attestation_in_window(target_id)
+                        || fresh;
                     // Strict on-chain registration truth; is_online stays a labeled approximation.
                     let onchain = blockchain.get_storage().is_node_registration_onchain(target_id);
                     return Ok(warp::reply::json(&json!({
@@ -9434,68 +9264,8 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                     while futures.next().await.is_some() {}
                 }
                 
-                // ================================================================
-                // CHECK FOR UNANSWERED PINGS (mark failures at end of slot)
-                // ================================================================
-                // After grace period (3 minutes), check if nodes responded
-                // This runs at slot N+3 to check slot N
-                let check_slot = if current_slot >= 3 { current_slot - 3 } else { 240 - 3 + current_slot };
-
-                // Use the same GENESIS LINEAR SHARDING as get_light_nodes_to_ping().
-                // The old SHA3-based calculate_light_node_shard() used 0-255 shards
-                // which almost never matched the 0-4 genesis shard_id → failures
-                // were never counted and rewards never accumulated.
-                let nodes_in_check_slot: Vec<String> = {
-                    let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
-                        .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                        .unwrap_or(false);
-
-                    if !is_genesis {
-                        Vec::new()
-                    } else {
-                        let our_genesis_idx = std::env::var("QNET_BOOTSTRAP_ID")
-                            .ok()
-                            .and_then(|id| id.parse::<usize>().ok())
-                            .map(|id| id.saturating_sub(1))
-                            .unwrap_or(0);
-                        const GENESIS_COUNT: usize = 5;
-
-                        let registry = p2p.get_light_node_registry();
-                        let mut all_nodes: Vec<_> = registry.values().cloned().collect();
-                        all_nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-                        let total = all_nodes.len();
-                        if total == 0 {
-                            Vec::new()
-                        } else {
-                            let nodes_per_genesis = (total + GENESIS_COUNT - 1) / GENESIS_COUNT;
-                            let my_start = std::cmp::min(our_genesis_idx * nodes_per_genesis, total);
-                            let my_end = std::cmp::min(my_start + nodes_per_genesis, total);
-
-                            all_nodes[my_start..my_end]
-                                .iter()
-                                .filter(|node| {
-                                    node.is_active &&
-                                    SimplifiedP2P::calculate_randomized_slot(&node.node_id, SimplifiedP2P::get_current_window_number()) == check_slot
-                                })
-                                .map(|n| n.node_id.clone())
-                                .collect()
-                        }
-                    }
-                };
-
-                for node_id in nodes_in_check_slot {
-                    // Check if attestation exists for the checked slot
-                    if !p2p.has_attestation(&node_id, check_slot) {
-                        // No attestation = no response = failure
-                        p2p.mark_light_node_ping_failed(&node_id);
-                    }
-                }
-
-                // INACTIVE PROBING DISABLED: Reactivation is manual-only
-                // via /api/v1/light-node/reactivate (user presses "I'm back").
-                // Rationale: automatic probing adds O(inactive_nodes) load per
-                // window on every genesis node with no guarantee the device is
-                // actually online. Manual reactivation is zero-cost for genesis.
+                // B: no ping-failure accrual — liveness is derived from committed attestation recency and
+                // the wake-scheduler stops waking dormant nodes on its own. Reactivation = self-attest.
             }
             
             // ================================================================

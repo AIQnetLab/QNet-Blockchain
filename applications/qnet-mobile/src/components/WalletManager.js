@@ -5746,6 +5746,9 @@ export class WalletManager {
               dilithiumKeys.publicKey,
               systemPseudonym,
             );
+            // Persist the cert so ping-response / self-attest can present it to a genesis for on-chain-key
+            // verification (anti-poison: the node's own authenticated ping key overwrites any gossip poison).
+            await AsyncStorage.setItem(`qnet_ping_cert_${systemPseudonym}`, pingDelegationCert);
             await AsyncStorage.setItem('qnet_ping_node_id', systemPseudonym);
             console.log('[Registration] Ping delegation cert created (quantum-safe)');
           } catch (pingErr) {

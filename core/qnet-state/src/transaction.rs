@@ -302,6 +302,11 @@ pub struct EquivocationHeader {
     pub state_root: [u8; 32],
     pub vrf_output: Option<[u8; 32]>,
     pub timeout_round: u64,
+    // Carried rotation baseline: the paired half of abs = timeout_round + carried_baseline.
+    // Bound into Block_Sig_v23.1 alongside timeout_round so the equivocation proof re-verifies
+    // the SAME signed digest (both fields are consensus-relevant and cryptographically bound).
+    #[serde(default)]
+    pub carried_baseline: u64,
     pub signature: Vec<u8>,
 }
 
@@ -4709,7 +4714,7 @@ mod tests_qrc20_self_transfer {
 
         // Deploy consumed nonce 1; subsequent transfers use 2, 3 (else the idempotent-apply nonce gate
         // treats them as replays and no-ops). Recompute the hash after stamping the nonce.
-        let mut mkxfer = |nonce: u64, amt: &str| {
+        let mkxfer = |nonce: u64, amt: &str| {
             let mut t = qrc20_call(alice, &contract, "transfer", &format!("[\"{}\",\"{}\"]", bob, amt));
             t.nonce = nonce;
             t.hash = t.calculate_hash();

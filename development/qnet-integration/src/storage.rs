@@ -844,6 +844,9 @@ impl PersistentStorage {
                 ColumnFamilyDescriptor::new("poh_state", create_hot_cf_opts()),
                 ColumnFamilyDescriptor::new("contract_storage", create_cf_opts()),
                 ColumnFamilyDescriptor::new("fcm_tokens", create_cf_opts()),
+                // Light-node ping delegation keys (operational, non-consensus): key=node_id, value JSON
+                // {ping_pubkey, ping_delegation_cert}. Read per-ping so the hot crypto stays off the RAM registry.
+                ColumnFamilyDescriptor::new("light_ping_keys", create_cf_opts()),
                 // Cold-join staging: a downloaded snapshot is restored HERE, verified, then
                 // promoted into the live state CFs. Live state is never mutated before the
                 // consensus binding passes, so a rejected snapshot leaves no orphaned state.
@@ -904,7 +907,7 @@ impl PersistentStorage {
             "blocks", "transactions", "accounts", "metadata", "microblocks", "consensus",
             "sync_state", "pending_rewards", "node_registry", "ping_history", "failover_events",
             "snapshots", "tx_index", "tx_by_address", "attestations", "heartbeats", "poh_state",
-            "contract_storage", "fcm_tokens", "mempool", "cross_shard_pending", "cross_shard_receipts",
+            "contract_storage", "fcm_tokens", "light_ping_keys", "mempool", "cross_shard_pending", "cross_shard_receipts",
             "accounts_stage", "node_registry_stage", "pending_rewards_stage", "contract_storage_stage",
             "merkle_leaves", "merkle_nodes", "wallet_token",
         ];
@@ -1311,7 +1314,7 @@ impl PersistentStorage {
                         "pending_rewards", "node_registry", "ping_history",
                         "failover_events", "snapshots", "tx_index",
                         "tx_by_address", "attestations", "heartbeats", "poh_state",
-                        "contract_storage", "fcm_tokens", "mempool",
+                        "contract_storage", "fcm_tokens", "light_ping_keys", "mempool",
                         "cross_shard_pending", "cross_shard_receipts"];
         
         for cf_name in &cf_names {
@@ -1352,7 +1355,7 @@ impl PersistentStorage {
                         "pending_rewards", "node_registry", "ping_history",
                         "failover_events", "snapshots", "tx_index",
                         "tx_by_address", "attestations", "heartbeats", "poh_state",
-                        "contract_storage", "fcm_tokens", "mempool",
+                        "contract_storage", "fcm_tokens", "light_ping_keys", "mempool",
                         "cross_shard_pending", "cross_shard_receipts"];
 
         for cf_name in &cf_names {
@@ -1388,7 +1391,7 @@ impl PersistentStorage {
                         "pending_rewards", "node_registry", "ping_history",
                         "failover_events", "snapshots", "tx_index",
                         "tx_by_address", "attestations", "heartbeats", "poh_state",
-                        "contract_storage", "fcm_tokens", "mempool",
+                        "contract_storage", "fcm_tokens", "light_ping_keys", "mempool",
                         "cross_shard_pending", "cross_shard_receipts"];
         
         for cf_name in &cf_names {
@@ -4338,6 +4341,7 @@ impl Storage {
                                 state_root: mb.state_root,
                                 vrf_output: mb.vrf_output,
                                 timeout_round: mb.timeout_round,
+                                carried_baseline: mb.carried_baseline,
                                 signature: mb.signature.clone(),
                             };
                             crate::node::record_block_equivocation(height, &new_producer, to_header(exist), to_header(inc));
@@ -4560,6 +4564,7 @@ impl Storage {
             state_root: microblock.state_root,
             // v14.0: Timeout round for producer authority proof
             timeout_round: microblock.timeout_round,
+            carried_baseline: microblock.carried_baseline,
         };
         
         // Step 3: Prepare PoH state for inclusion in atomic batch
@@ -5289,6 +5294,7 @@ impl Storage {
                         state_root: efficient_block.state_root,
                         // v14.0: Timeout round for producer authority
                         timeout_round: efficient_block.timeout_round,
+                        carried_baseline: efficient_block.carried_baseline,
                         // #80: proof lives on the wire (gossip ingest); local read never re-adopts.
                         timeout_proof: None,
                     };
@@ -5582,6 +5588,7 @@ impl Storage {
             state_root: efficient_block.state_root,
             // v14.0: Timeout round for producer authority
             timeout_round: efficient_block.timeout_round,
+            carried_baseline: efficient_block.carried_baseline,
             // #80: proof lives on the wire (gossip ingest); local read never re-adopts.
             timeout_proof: None,
         };
@@ -6707,6 +6714,56 @@ impl Storage {
         Ok(out)
     }
 
+    /// REORG ONLY: clear the CONSENSUS reward side-indices that an orphaned-fork block could have written
+    /// above `up_to_height`, so the reorged node's emission `eligible` set cannot diverge from a from-genesis
+    /// node (→ reward_root fork). Both are non-height-keyed, so orphans can only be pruned by epoch, and the
+    /// two need DIFFERENT bounds because they update differently:
+    ///   • super_elig_{E}_{node_id} is ADD-ONLY (save_super_eligible_batch never clears the epoch) and is
+    ///     stamped at height (E+1)*14400. Any entry with E >= from_epoch was written STRICTLY above rollback_to
+    ///     (a canonical node at rollback_to has not crossed that boundary) => pure orphan => clear. The live
+    ///     forward pipeline re-derives super_elig_{from_epoch} from canonical account state when it re-crosses
+    ///     the boundary. super_elig_{from_epoch-1} (stamped at from_epoch*14400 <= rollback_to) is legitimate
+    ///     and preserved.
+    ///   • light_bm_{E}_{gidx} is OVERWRITE-PER-KEY, so any epoch a genesis is online-on-canonical for self-
+    ///     heals when it re-commits its bitmap. Clear only STRICTLY-FUTURE epochs (E > from_epoch): a canonical
+    ///     node at rollback_to holds no legitimate bitmap for a future epoch, so those are pure orphans (covers
+    ///     the rare genesis-offline-on-canonical case where no overwrite arrives). light_bm_{from_epoch} is
+    ///     LEFT intact — it may be a legitimate current-epoch bitmap committed in the last-50-block window
+    ///     at/below rollback_to, and clearing it risks a reward the reconcile-replay floor (snapshot <=
+    ///     rollback_to) would not re-derive; an orphan copy self-heals via the canonical re-commit before that
+    ///     epoch's emission.
+    /// light_elig_ is deliberately NOT touched: it is a NON-consensus recency index (read only by /node/status
+    /// for epochs {e-1,e-2} < from_epoch, never a cleared epoch), self-heals each boundary + range-prunes to
+    /// ~3 epochs, and a full scan of its up-to-~40M rows under the rollback barrier would stall consensus for
+    /// zero reward_root benefit. Call ONLY on the reorg-rollback path (forward re-apply follows); boot/snapshot
+    /// inherit an already-reconciled index with no re-apply. Finalized past epochs are immutable + untouched.
+    pub fn reconcile_reward_indices_above_epoch(&self, up_to_height: u64) -> IntegrationResult<u32> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let from_epoch = up_to_height / 14400;
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut cleared = 0u32;
+        // (prefix, min_epoch_inclusive): super_elig_ clears the current epoch (its from_epoch entry is always
+        // an orphan); light_bm_ only strictly-future (current-epoch bitmap may be legitimate + self-healing).
+        for (prefix, min_epoch) in [(&b"super_elig_"[..], from_epoch), (&b"light_bm_"[..], from_epoch.saturating_add(1))] {
+            for item in self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward)) {
+                // Fail LOUD, not silent: a mid-scan iterator error would leave orphan keys un-reconciled (the
+                // very phantom-fork this closes) — propagate so the reorg caller logs it instead of breaking.
+                let (k, _) = item.map_err(|e| IntegrationError::StorageError(
+                    format!("reconcile_reward_indices iterator error (reconcile incomplete): {}", e)))?;
+                if !k.starts_with(prefix) { break; }
+                // key = {prefix}{epoch}_{...}; the epoch is the digits up to the first '_' after the prefix.
+                let rest = &k[prefix.len()..];
+                let end = rest.iter().position(|&b| b == b'_').unwrap_or(rest.len());
+                if let Some(e) = std::str::from_utf8(&rest[..end]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                    if e >= min_epoch { batch.delete_cf(&cf, &k); cleared += 1; }
+                }
+            }
+        }
+        if cleared > 0 { self.persistent.db.write(batch)?; }
+        Ok(cleared)
+    }
+
     /// Mark a super-node eligible for an epoch's reward (heartbeat popcount ≥ threshold), keyed
     /// per (epoch, node_id). Written at apply when the tally crosses the threshold — idempotent
     /// O(1) put. Lets the emission recompute read O(eligible) instead of an O(registered) per-super
@@ -7071,8 +7128,9 @@ impl Storage {
     /// (cbw + this), not three, under the rollback barrier. Why prune is needed: cbw + lt_state are
     /// reg_height-bounded so they already exclude orphans, but the reward-roster readers
     /// (super_registrations_sorted, light_roster_sorted) scan srtr_/lrtr_ KEYS directly, so an orphan-
-    /// ONLY registration (never re-registered canonically) would keep its key and shift the positional
-    /// reward shard → reward_root divergence; deleting node_ also stops backfill_roster_indices from
+    /// ONLY registration (never re-registered canonically) would keep its key and shift the hash-shard
+    /// per-shard counter (local index) of every later same-shard member → reward_root divergence; deleting
+    /// node_ also stops backfill_roster_indices from
     /// resurrecting it. Canonical target+1.. is re-added by the live apply pipeline on re-sync. Call at
     /// EVERY height-reset site (boot, snapshot-apply, both reorg paths) so a reorged/snapshot-joined/
     /// crash-recovered node is byte-identical to a from-genesis node. Returns the orphan count. Atomic.
@@ -7158,6 +7216,56 @@ impl Storage {
             if let Ok(s) = std::str::from_utf8(&k[pb.len()..]) { out.push(s.to_string()); }
         }
         Ok(out)
+    }
+
+    /// B (liveness-from-chain): snapshot the finalized epoch's committed light-eligibility into a per-node
+    /// recency index `light_elig_{epoch:010}_{node_id}`. Decodes the committed light bitmaps through the
+    /// deterministic pre-epoch roster (SAME sharding the emission path uses), streamed (no O(roster) Vec)
+    /// and chunked (bounded WriteBatch) for tens of millions of nodes. Read-only w.r.t. reward_root — the
+    /// reward path recomputes from light_bm_ directly; this index only serves O(1) status recency.
+    pub fn snapshot_light_eligible(&self, epoch: u64, cutoff: u64) -> IntegrationResult<usize> {
+        let cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        let bitmaps = self.load_light_bitmaps(epoch).unwrap_or_default();
+        let mut batch = rocksdb::WriteBatch::default();
+        let (mut n, mut inbatch) = (0usize, 0usize);
+        // Stable hash-shard (SAME as the bitmap builder + emission reader): bit i in shard g = the i-th
+        // sorted roster node with light_shard_of()==g. Streamed (no O(roster) Vec), one walk.
+        if !bitmaps.is_empty() {
+            let mut counters = [0usize; 5];
+            let _ = self.light_roster_for_each(cutoff, |node_id, _w| {
+                let gidx = crate::node::light_shard_of(node_id);
+                let local_i = counters[gidx];
+                counters[gidx] += 1;
+                if let Some(bm) = bitmaps.get(&gidx) {
+                    if bm.get(local_i / 8).map(|b| b & (1 << (local_i % 8)) != 0).unwrap_or(false) {
+                        batch.put_cf(&cf, format!("light_elig_{:010}_{}", epoch, node_id).as_bytes(), &[]);
+                        n += 1; inbatch += 1;
+                        if inbatch >= 100_000 { let _ = self.persistent.db.write(std::mem::take(&mut batch)); inbatch = 0; }
+                    }
+                }
+            });
+        }
+        // Recency needs ~2 epochs; range-delete anything older than a small window so the index stays
+        // bounded (one range-delete, zero-padded key ⇒ lexical order == numeric order).
+        if epoch >= 4 {
+            batch.delete_range_cf(&cf, b"light_elig_0000000000_".as_ref(),
+                format!("light_elig_{:010}_", epoch - 3).as_bytes());
+        }
+        self.persistent.db.write(batch)?;
+        Ok(n)
+    }
+
+    /// B: did node_id attest in either of the last two COMMITTED epochs? Node-independent, two O(1)
+    /// point-reads. The in-progress epoch (cur_height/14400) is not committed yet, so check e-1 and e-2.
+    pub fn light_attested_recent_onchain(&self, node_id: &str, cur_height: u64) -> bool {
+        let cf = match self.persistent.db.cf_handle("pending_rewards") { Some(c) => c, None => return false };
+        let e = cur_height / 14400;
+        for ep in [e.saturating_sub(1), e.saturating_sub(2)] {
+            if self.persistent.db.get_cf(&cf, format!("light_elig_{:010}_{}", ep, node_id).as_bytes())
+                .ok().flatten().is_some() { return true; }
+        }
+        false
     }
 
     /// Append an emission epoch to the sorted, append-only reward-epochs index (deduped).
@@ -7297,25 +7405,6 @@ impl Storage {
         self.save_node_registration_inner(node_id, node_type, wallet, reputation, Some(reg_height), Some(burn_tx), vrf_pk)
     }
 
-    /// Light-node liveness FSM persistence (durable across genesis restart). A separate metadata-CF key,
-    /// NOT the registry_root-committed node_ row ⇒ zero consensus impact. Written only on the is_active
-    /// FLIP (drop-after-5-misses / reactivate), so a restart does not silently resurrect a dropped node.
-    pub fn mark_light_inactive(&self, node_id: &str) {
-        if let Some(cf) = self.persistent.db.cf_handle("metadata") {
-            let _ = self.persistent.db.put_cf(&cf, format!("lninact_{}", node_id).as_bytes(), b"1");
-        }
-    }
-    pub fn clear_light_inactive(&self, node_id: &str) {
-        if let Some(cf) = self.persistent.db.cf_handle("metadata") {
-            let _ = self.persistent.db.delete_cf(&cf, format!("lninact_{}", node_id).as_bytes());
-        }
-    }
-    pub fn is_light_inactive(&self, node_id: &str) -> bool {
-        self.persistent.db.cf_handle("metadata")
-            .and_then(|cf| self.persistent.db.get_cf(&cf, format!("lninact_{}", node_id).as_bytes()).ok().flatten())
-            .is_some()
-    }
-
     fn save_node_registration_inner(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64, reg_height: Option<u64>, burn_tx: Option<&str>, vrf_pk: Option<&[u8]>) -> IntegrationResult<()> {
         let registry_cf = self.persistent.db.cf_handle("node_registry")
             .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
@@ -7407,8 +7496,14 @@ impl Storage {
             }
             if node_type == "light" {
                 let ik = format!("lrtr_{}", node_id);
+                // Height IMMUTABLE once chain-stamped (mirror the node_ row above): keep the FIRST stamped
+                // height, not a re-presented one, so the cutoff-filtered roster is byte-identical between an
+                // apply-history node (this live write) and a snapshot/backfill-rebuilt node (which derives
+                // lrtr_ from node_'s first-stamped reg_height). Using the raw incoming h would re-stamp
+                // H1→H2 and, for any epoch cutoff in (H1,H2], shift the per-shard counter → reward_root fork.
+                let eff_h = prior_height.unwrap_or(h);
                 let mut val = Vec::with_capacity(8 + final_wallet.len());
-                val.extend_from_slice(&h.to_be_bytes());
+                val.extend_from_slice(&eff_h.to_be_bytes());
                 val.extend_from_slice(final_wallet.as_bytes());
                 batch.put_cf(&registry_cf, ik.as_bytes(), &val);
             }
@@ -7469,8 +7564,8 @@ impl Storage {
             if !k.starts_with(prefix) { break; }
             let node_id = match std::str::from_utf8(&k[prefix.len()..]) { Ok(s) => s, Err(_) => continue };
             if v.len() < 8 { continue; }
-            // Value = reg_height (8B BE) ++ wallet. Cutoff applied at READ (constraint b) so inserts
-            // of newer nodes never shift the positions of older ones (the positional 5-genesis shard).
+            // Value = reg_height (8B BE) ++ wallet. Cutoff applied at READ (constraint b) so inserts of
+            // newer nodes never shift the hash-shard per-shard counter (local index) of older members.
             let h = u64::from_be_bytes(v[..8].try_into().unwrap_or([0u8; 8]));
             if h >= before_height { continue; }
             let wallet = match std::str::from_utf8(&v[8..]) { Ok(s) => s, Err(_) => continue };
@@ -8469,6 +8564,25 @@ impl Storage {
         if token.is_empty() { None } else { Some((token, push_type, endpoint)) }
     }
 
+    /// C: light ping delegation keys — operational CF read per-ping so the crypto stays off the RAM
+    /// registry. Written at register / gossip-receive AFTER the identity guard passes; No-op on empty.
+    pub fn save_light_ping_keys(&self, node_id: &str, ping_pubkey: &str, ping_delegation_cert: &str) -> IntegrationResult<()> {
+        if ping_pubkey.is_empty() { return Ok(()); }
+        let cf = self.persistent.db.cf_handle("light_ping_keys")
+            .ok_or_else(|| IntegrationError::StorageError("light_ping_keys column family not found".to_string()))?;
+        let v = json!({ "ping_pubkey": ping_pubkey, "ping_delegation_cert": ping_delegation_cert });
+        self.persistent.db.put_cf(&cf, node_id.as_bytes(), v.to_string().as_bytes())?;
+        Ok(())
+    }
+    pub fn get_light_ping_keys(&self, node_id: &str) -> Option<(String, String)> {
+        let cf = self.persistent.db.cf_handle("light_ping_keys")?;
+        let raw = self.persistent.db.get_cf(&cf, node_id.as_bytes()).ok()??;
+        let j: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        let pk = j["ping_pubkey"].as_str().unwrap_or("").to_string();
+        if pk.is_empty() { return None; }
+        Some((pk, j["ping_delegation_cert"].as_str().unwrap_or("").to_string()))
+    }
+
     // ============================================
     // PRODUCTION: ATTESTATION STORAGE (Light nodes)
     // ============================================
@@ -9111,6 +9225,10 @@ impl Storage {
                     let rewards_iter = snap.iterator_cf(&rewards_cf, rocksdb::IteratorMode::Start);
                     for item in rewards_iter {
                         let (key, value) = item?;
+                        // Skip the derived light_elig_ recency index (whole-network × 4 epochs = up to ~40M
+                        // keys at 10M light nodes): promote_snapshot_staging clears pending_rewards anyway and
+                        // the joiner re-derives light_elig_ at boot, so shipping it only bloats the snapshot.
+                        if key.starts_with(b"light_elig_") { continue; }
                         feed!(encoder, uncompressed_len, &(key.len() as u32).to_le_bytes());
                         feed!(encoder, uncompressed_len, &key);
                         feed!(encoder, uncompressed_len, &(value.len() as u32).to_le_bytes());
@@ -12388,6 +12506,40 @@ mod v32_9_pattern_c_tests {
     }
 
     #[test]
+    fn reorg_reconcile_clears_reward_indices_with_asymmetric_epoch_bounds() {
+        // Reorg reconcile of the CONSENSUS reward indices, rollback_to in epoch 5 (from_epoch=5):
+        //  • super_elig_ (ADD-only, stamped at (E+1)*14400): clear E >= 5 (its epoch-5 entry is written above
+        //    rollback_to ⇒ always an orphan); preserve finalized epoch 4.
+        //  • light_bm_ (overwrite-per-key, self-heals via re-commit): clear only strictly-future E > 5;
+        //    preserve epoch-5 (may be a legitimate last-50-block bitmap ≤ rollback_to) and epoch 4.
+        //  • light_elig_ (non-consensus recency): NOT scanned/touched at all.
+        let (storage, _dir) = open_test_storage();
+        for e in [4u64, 5, 6] {
+            storage.save_light_bitmap(e, 0, &[0b1]).unwrap();
+            storage.save_super_eligible(e, "super_a").unwrap();
+            let cf = storage.persistent.db.cf_handle("pending_rewards").unwrap();
+            storage.persistent.db.put_cf(&cf, format!("light_elig_{:010}_lx", e).as_bytes(), &[]).unwrap();
+        }
+        let cleared = storage.reconcile_reward_indices_above_epoch(5 * 14400 + 100).unwrap(); // from_epoch = 5
+        assert_eq!(cleared, 3, "super_elig_ {{5,6}} + light_bm_ {{6}} = 3 keys");
+        // Epoch 4 (finalized) fully preserved.
+        assert!(storage.load_light_bitmaps(4).unwrap().contains_key(&0), "epoch 4 light_bm_ preserved");
+        assert_eq!(storage.load_super_eligible(4).unwrap(), vec!["super_a".to_string()], "epoch 4 super_elig_ preserved");
+        // Epoch 5 = current: super_elig_ cleared (orphan), light_bm_ PRESERVED (legitimate/self-healing).
+        assert!(storage.load_super_eligible(5).unwrap().is_empty(), "epoch 5 super_elig_ cleared");
+        assert!(storage.load_light_bitmaps(5).unwrap().contains_key(&0), "epoch 5 light_bm_ preserved (current epoch)");
+        // Epoch 6 = strictly future: both cleared.
+        assert!(storage.load_super_eligible(6).unwrap().is_empty(), "epoch 6 super_elig_ cleared");
+        assert!(storage.load_light_bitmaps(6).unwrap().is_empty(), "epoch 6 light_bm_ cleared");
+        // light_elig_ untouched for every epoch (recency index is out of reconcile scope).
+        let cf = storage.persistent.db.cf_handle("pending_rewards").unwrap();
+        for e in [4u64, 5, 6] {
+            assert!(storage.persistent.db.get_cf(&cf, format!("light_elig_{:010}_lx", e).as_bytes()).unwrap().is_some(),
+                    "epoch {} light_elig_ must be untouched", e);
+        }
+    }
+
+    #[test]
     fn seal_watermark_is_reader_derived_and_race_immune() {
         // The contiguous seal watermark drives production backpressure; it must equal the largest F
         // with macroblock_1..F all present, be derived by the READER (not a racy writer RMW), skip
@@ -12790,19 +12942,19 @@ mod v32_9_pattern_c_tests {
         crate::rpc::REWARD_REBUILD_SKIP.clear();
     }
 
-    // Positional 5-genesis sharding (mirrors node.rs reward + producer): roster sorted by node_id,
-    // per=(total+4)/5, shard g = roster[g*per .. (g+1)*per]; bit i within a shard ⇒ roster member.
+    // Stable hash 5-genesis sharding (mirrors node.rs/storage.rs readers): shard g = the ordered set of
+    // sorted-roster nodes with light_shard_of()==g; bit i within shard g's bitmap ⇒ the i-th such member.
     fn shard_eligible(roster: &[(String, String)], bitmaps: &[(usize, Vec<u8>)]) -> Vec<(String, String)> {
-        let total = roster.len();
-        if total == 0 { return Vec::new(); }
-        let per = (total + 4) / 5;
+        let bm: std::collections::HashMap<usize, &Vec<u8>> = bitmaps.iter().map(|(g, b)| (*g, b)).collect();
+        let mut counters = [0usize; 5];
         let mut out = Vec::new();
-        for (gidx, bm) in bitmaps {
-            let my_start = (gidx * per).min(total);
-            let my_end = (my_start + per).min(total);
-            for local_i in 0..(my_end - my_start) {
-                if bm.get(local_i / 8).map(|b| b & (1 << (local_i % 8)) != 0).unwrap_or(false) {
-                    out.push(roster[my_start + local_i].clone());
+        for entry in roster {
+            let g = crate::node::light_shard_of(&entry.0);
+            let local_i = counters[g];
+            counters[g] += 1;
+            if let Some(b) = bm.get(&g) {
+                if b.get(local_i / 8).map(|x| x & (1 << (local_i % 8)) != 0).unwrap_or(false) {
+                    out.push(entry.clone());
                 }
             }
         }
@@ -12869,6 +13021,40 @@ mod v32_9_pattern_c_tests {
                    storage.super_registrations_sorted_scan().unwrap(), "post-backfill super mismatch");
         assert_eq!(storage.light_roster_sorted(before).unwrap(),
                    storage.light_roster_sorted_scan(before).unwrap(), "post-backfill light mismatch");
+    }
+
+    #[test]
+    fn light_reregister_keeps_first_height_index_matches_scan() {
+        // A light node re-registered at a LATER chain height must keep its FIRST stamped height in BOTH the
+        // node_ row (source of truth / backfill) and the lrtr_ index value (live-apply write). Otherwise an
+        // apply-history node (lrtr_=H2) and a snapshot/backfill-rebuilt node (lrtr_=H1, derived from node_)
+        // disagree on the cutoff for any epoch whose before_height lands in (H1,H2] → different reward roster
+        // → per-shard counter shift → reward_root fork between apply-history and snapshot-joined nodes.
+        let (storage, _dir) = open_test_storage();
+        let (h1, h2) = (10u64, 100u64);
+        storage.save_node_registration_at_height("light_x", "light", "wx", 70.0, h1).unwrap();
+        storage.save_node_registration_at_height("light_x", "light", "wx", 70.0, h2).unwrap(); // re-stamp higher
+        // Index reader == node_ scan for every cutoff spanning the re-stamp gap.
+        for before in [h1 + 1, (h1 + h2) / 2, h2, h2 + 1] {
+            assert_eq!(storage.light_roster_sorted(before).unwrap(),
+                       storage.light_roster_sorted_scan(before).unwrap(),
+                       "lrtr_ index != node_ scan at cutoff {}", before);
+        }
+        // Effective height is the FIRST (H1): included once the cutoff passes H1, not H2.
+        assert!(storage.light_roster_sorted(h1 + 1).unwrap().iter().any(|(id, _)| id == "light_x"),
+                "re-registered node must use its FIRST height (H1) for the cutoff");
+        // Backfill (rebuilds lrtr_ from node_) reproduces the identical index.
+        let cf = storage.persistent.db.cf_handle("node_registry").unwrap();
+        let mut del = rocksdb::WriteBatch::default();
+        for item in storage.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (k, _) = item.unwrap();
+            if k.starts_with(b"lrtr_") { del.delete_cf(&cf, &k); }
+        }
+        storage.persistent.db.write(del).unwrap();
+        storage.backfill_roster_indices().unwrap();
+        assert_eq!(storage.light_roster_sorted(h1 + 1).unwrap(),
+                   storage.light_roster_sorted_scan(h1 + 1).unwrap(),
+                   "post-backfill lrtr_ index != node_ scan (re-register)");
     }
 
     // Read every (key, value) row of a CF into a sorted map for set-equality checks.

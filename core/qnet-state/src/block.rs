@@ -99,9 +99,20 @@ pub struct MicroBlock {
     // Backward compatible: old blocks deserialize as timeout_round=0 (primary leader).
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Timeout round used for leader selection (0 = primary leader, >0 = failover)
+    /// Timeout round used for leader selection (0 = primary leader, >0 = failover). RELATIVE to
+    /// `carried_baseline`: the ABSOLUTE window failover round is `timeout_round + carried_baseline`.
     #[serde(default)]
     pub timeout_round: u64,
+
+    /// The per-mb rotation baseline the producer read when it stamped this block, carried IN the
+    /// block bytes (hashed) so the ABSOLUTE round = `timeout_round + carried_baseline` is a pure
+    /// function of the committed identity — every honest node reconstructs the SAME absolute round
+    /// regardless of apply-order / reorg / cold-join (no local LAST_FINALIZED_ROUND_PER_MB term).
+    /// 0 at a window start / happy path. Fixes the loser-apply baseline double-count (permanent
+    /// boundary-failover divergence). Producer derives it and timeout_round from ONE baseline
+    /// snapshot, so `timeout_round + carried_baseline == certified_abs` holds by construction.
+    #[serde(default)]
+    pub carried_baseline: u64,
 
     /// #80: bincode 2f+1 TimeoutProof certifying this block's failover round (round>0 only; None on
     /// the happy path). Excluded from `hash()` — self-authenticating via its own committee
@@ -465,9 +476,13 @@ pub struct EfficientMicroBlock {
     // v14.0: TIMEOUT ROUND — Producer Authority Proof
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Timeout round used for leader selection (0 = primary, >0 = failover)
+    /// Timeout round used for leader selection (0 = primary, >0 = failover). RELATIVE to carried_baseline.
     #[serde(default)]
     pub timeout_round: u64,
+
+    /// Rotation baseline carried in-block; absolute round = timeout_round + carried_baseline (see MicroBlock).
+    #[serde(default)]
+    pub carried_baseline: u64,
 }
 
 /// Light microblock header for mobile nodes
@@ -890,6 +905,8 @@ impl MicroBlock {
             state_root: [0u8; 32],
             // v14.0: Timeout round (default 0 = primary leader)
             timeout_round: 0,
+            // rotation baseline carried in-block (0 at window start / happy path)
+            carried_baseline: 0,
             // #80: no failover proof on the happy path
             timeout_proof: None,
         }
@@ -912,13 +929,16 @@ impl MicroBlock {
         hasher.update(self.producer.as_bytes());
         // v23.1: bind timeout_round to block identity (see header above).
         hasher.update(&self.timeout_round.to_le_bytes());
+        // Bind the carried rotation baseline: absolute round = timeout_round + carried_baseline, so
+        // the reconstructed round is a property of the committed bytes (node-independent).
+        hasher.update(&self.carried_baseline.to_le_bytes());
 
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
         hash
     }
-    
+
     /// Convert to light header for mobile nodes
     pub fn to_light_header(&self) -> LightMicroBlock {
         LightMicroBlock {
@@ -996,6 +1016,7 @@ impl EfficientMicroBlock {
             state_root: [0u8; 32],
             // v14.0: Timeout round (default 0 = primary leader)
             timeout_round: 0,
+            carried_baseline: 0,
         }
     }
 
@@ -1050,6 +1071,7 @@ impl EfficientMicroBlock {
             state_root: microblock.state_root,
             // v14.0: Copy timeout_round from source microblock
             timeout_round: microblock.timeout_round,
+            carried_baseline: microblock.carried_baseline,
         }
     }
 
@@ -1089,6 +1111,8 @@ impl EfficientMicroBlock {
         hasher.update(self.producer.as_bytes());
         // v23.1: bind timeout_round to block identity (see MicroBlock::hash header).
         hasher.update(&self.timeout_round.to_le_bytes());
+        // MUST stay byte-identical to MicroBlock::hash: bind carried_baseline (see MicroBlock::hash).
+        hasher.update(&self.carried_baseline.to_le_bytes());
 
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
