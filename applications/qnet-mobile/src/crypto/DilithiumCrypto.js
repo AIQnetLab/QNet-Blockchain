@@ -201,6 +201,20 @@ export async function signWithDilithium(message, secretKeyHex, publicKeyHex, nod
 }
 
 /**
+ * FIX-5: sign a message and return the HEX of the RAW detached ML-DSA-65 signature (3309 bytes = 6618
+ * hex chars) — no envelope, no base64, no embedded message, no pubkey. This is what the node's
+ * raw-detached value-TX verifier (verify_user_tx_dilithium) expects on the wire.
+ * @returns {Promise<string>} hex of the raw 3309-byte detached signature
+ */
+export async function signDetached(message, secretKeyHex) {
+  if (!DilithiumModule) {
+    throw new Error('DilithiumModule native module not found');
+  }
+  const result = await DilithiumModule.signDetached(message, secretKeyHex);
+  return result.signature;
+}
+
+/**
  * Verify a Dilithium3 signature locally (for testing/debugging).
  */
 export async function verifyDilithium(message, signatureHex, publicKeyHex) {

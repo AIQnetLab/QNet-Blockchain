@@ -170,6 +170,37 @@ class DilithiumModule(reactContext: ReactApplicationContext) :
     }
 
     /**
+     * FIX-5: sign a message and return ONLY the RAW detached ML-DSA-65 signature (3309 bytes) as hex —
+     * no "dilithium_sig_" envelope, no base64, no embedded message, no pubkey trailer. This is what the
+     * node's raw-detached value-TX verifier expects. nativeSign already produces the detached signature.
+     */
+    @ReactMethod
+    fun signDetached(
+        message: String,
+        secretKeySeed: String,
+        promise: Promise
+    ) {
+        if (!nativeAvailable) {
+            promise.reject("DILITHIUM_NATIVE_UNAVAILABLE", "Post-quantum crypto is unavailable on this device build.")
+            return
+        }
+        try {
+            val messageBytes = message.toByteArray(Charsets.UTF_8)
+            val skBytes: ByteArray = resolveSecretKey(secretKeySeed)
+            val sigBytes = nativeSign(skBytes, messageBytes)
+                ?: throw RuntimeException("nativeSign returned null")
+            if (sigBytes.size != SIGNATURE_SIZE) {
+                throw RuntimeException("Unexpected sig size: ${sigBytes.size} (expected $SIGNATURE_SIZE)")
+            }
+            val result = Arguments.createMap()
+            result.putString("signature", bytesToHex(sigBytes)) // hex of the raw 3309-byte detached sig
+            promise.resolve(result)
+        } catch (e: Throwable) {
+            promise.reject("DILITHIUM_SIGN_ERROR", "Failed to sign (detached) with Dilithium3: ${e.message}", e)
+        }
+    }
+
+    /**
      * Verify a Dilithium3 signature (local verification / testing).
      */
     @ReactMethod

@@ -3147,20 +3147,25 @@ async fn tx_submit(
     // check is verify_user_tx_dilithium at submit_transaction downstream.
     let dilithium_signature = params["dilithium_signature"].as_str().map(|s| s.to_string()).filter(|s| !s.is_empty());
     let dilithium_public_key = params["dilithium_public_key"].as_str().map(|s| s.to_string()).filter(|s| !s.is_empty());
-    let dil_pk = match &dilithium_public_key {
-        Some(p) if dilithium_signature.is_some() => p.clone(),
-        _ => return Err(RpcError {
-            code: -32602,
-            message: "dilithium_signature + dilithium_public_key required (pure-PQ; Ed25519 not accepted on QNet)".to_string(), data: None,
-        }),
-    };
-    let binds_from = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(&dil_pk)
-        .map(|e| e == from).unwrap_or(false);
-    if !binds_from {
+    // The signature is ALWAYS mandatory (pure-PQ; Ed25519 is Solana-only, not accepted on QNet).
+    if dilithium_signature.is_none() {
         return Err(RpcError {
             code: -32602,
-            message: "dilithium_public_key does not derive to `from` (ownership unproven)".to_string(), data: None,
+            message: "dilithium_signature required (pure-PQ; Ed25519 not accepted on QNet)".to_string(), data: None,
         });
+    }
+    // FIX-5 pk-elision: the pubkey may be OMITTED once it is committed on-chain (the first-use TX carries
+    // it and binds it write-once). When present, verify its from-binding early (cheap reject); when absent,
+    // submit_transaction rehydrates it from committed state and rejects if it cannot be resolved.
+    if let Some(p) = &dilithium_public_key {
+        let binds_from = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(p)
+            .map(|e| e == from).unwrap_or(false);
+        if !binds_from {
+            return Err(RpcError {
+                code: -32602,
+                message: "dilithium_public_key does not derive to `from` (ownership unproven)".to_string(), data: None,
+            });
+        }
     }
     
     // Create transaction
@@ -3181,8 +3186,9 @@ async fn tx_submit(
             amount,
         },
         data: None, // no data for simple transfer
-        dilithium_signature,      // QUANTUM v2.25: Optional post-quantum signature
-        dilithium_public_key,     // QUANTUM v2.25: Optional post-quantum pubkey
+        // FIX-5: JSON hop carries HEX of the raw detached sig (3309 B) / raw pk (1952 B, elidable → None)
+        dilithium_signature: dilithium_signature.as_deref().and_then(|s| hex::decode(s).ok()),
+        dilithium_public_key: dilithium_public_key.as_deref().and_then(|s| hex::decode(s).ok()),
         chain_id: 0,
     };
 
@@ -3353,8 +3359,9 @@ async fn mempool_submit(
                 amount,
             },
             data: None, // no data for simple transfer
-            dilithium_signature: Some(dil_sig.to_string()),
-            dilithium_public_key: Some(dil_pk.to_string()),
+            // FIX-5: hex(raw detached sig) / hex(raw pk) -> bytes
+            dilithium_signature: hex::decode(dil_sig).ok(),
+            dilithium_public_key: hex::decode(dil_pk).ok(),
             chain_id: 0,
         };
 
@@ -3757,15 +3764,28 @@ async fn handle_account_info(
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     match blockchain.get_account(&address).await {
-        Ok(account) => Ok(warp::reply::json(&account)),
-        Err(_) => {
+        Ok(Some(account)) => {
+            // FIX-5: project the account for the wire. Two reasons the raw pk must NOT be serialized here:
+            // (a) it is a 1952-byte JSON array on EVERY balance poll — unaffordable at 10M light clients;
+            // (b) the only thing a wallet needs is whether its key is already committed, so it can decide
+            // pk-elision. `has_dilithium_pk` is that GROUND TRUTH — never infer it from nonce>=1, because a
+            // node-constructed NodeActivation raises the wallet's nonce WITHOUT binding the wallet key.
+            let has_dilithium_pk = account.dilithium_public_key.as_ref().map_or(false, |p| p.len() == 1952);
+            let mut v = serde_json::to_value(&account).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("dilithium_public_key");
+                obj.insert("has_dilithium_pk".to_string(), json!(has_dilithium_pk));
+            }
+            Ok(warp::reply::json(&v))
+        }
+        Ok(None) | Err(_) => {
             let default_account = json!({
                 "address": address,
                 "balance": 0,
                 "nonce": 0,
                 "is_node": false,
                 "node_type": null,
-    
+                "has_dilithium_pk": false,
                 "reputation": 0.0
             });
             Ok(warp::reply::json(&default_account))
@@ -4840,6 +4860,7 @@ async fn handle_macroblock_proof(
         "reward_root": hex::encode(cp.reward_root),
         "registry_root": hex::encode(cp.registry_root),
         "logs_root": hex::encode(cp.logs_root),
+        "dilithium_pk_root": hex::encode(cp.dilithium_pk_root), // FIX-5: hashed after logs_root (see checkpointHash)
         "total_supply": cp.total_supply,
         "timestamp": cp.timestamp,
         "proposer": cp.proposer,
@@ -5129,19 +5150,19 @@ async fn handle_transaction_submit(
             "success": false, "error": "value TX requires dilithium_signature (pure-PQ)"
         }))),
     };
-    let dil_pk = match tx_request.dilithium_public_key.as_ref().filter(|p| !p.is_empty()) {
-        Some(p) => p.clone(),
-        None => return Ok(warp::reply::json(&json!({
-            "success": false, "error": "value TX requires dilithium_public_key (pure-PQ)"
-        }))),
-    };
-    // Address binding: `from` MUST be the address derived from the signing ML-DSA-65 key.
-    match crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(&dil_pk) {
-        Some(d) if d == tx_request.from => {}
-        _ => return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "from not derived from dilithium_public_key (ownership unproven)"
-        }))),
+    // FIX-5 pk-elision: the pubkey is OPTIONAL once it is committed on-chain (the first-use TX carries
+    // it and binds it write-once). When present, bind `from` to it here (cheap early reject). When
+    // elided, submit_transaction below is the authoritative gate: it rehydrates the pk from committed
+    // state and rejects if unresolvable — add_transaction_to_mempool delegates straight to it.
+    let dil_pk = tx_request.dilithium_public_key.as_ref().filter(|p| !p.is_empty()).cloned();
+    if let Some(ref p) = dil_pk {
+        match crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(p) {
+            Some(d) if d == tx_request.from => {}
+            _ => return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "from not derived from dilithium_public_key (ownership unproven)"
+            }))),
+        }
     }
 
     // Create the transaction (pure Dilithium — no Ed25519 signature/public_key).
@@ -5161,34 +5182,41 @@ async fn handle_transaction_submit(
         },
         None,
     )
-    .with_quantum_signature(Some(dil_sig), Some(dil_pk));
+    // FIX-5: hex(raw detached sig) / hex(raw pk) -> bytes; bad hex -> None -> verify rejects.
+    // An ELIDED pk stays None here and on into the mempool — it is never re-added to the wire.
+    .with_quantum_signature(hex::decode(&dil_sig).ok(), dil_pk.as_deref().and_then(|p| hex::decode(p).ok()));
 
     // Verify the ML-DSA-65 signature exactly as the ingest/gossip path will, but OFF the RPC runtime
     // workers via the blocking pool AND admission-bounded (D1): a value-TX flood on the HTTP API — even
     // localhost/netns, which the per-IP limiter exempts — must not spawn unbounded CPU-bound verifies
     // that saturate every core and starve consensus. Fail-closed at capacity; fail-closed on join error.
-    let _verify_permit = match crate::node::VALUE_TX_VERIFY_SEM.try_acquire() {
-        Ok(p) => p,
-        Err(_) => return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Server busy: too many concurrent signature verifications",
-            "details": "verify capacity reached; retry shortly"
-        }))),
-    };
-    let tx_for_verify = tx.clone();
-    let verify_ok = tokio::task::spawn_blocking(move || {
-        crate::node::BlockchainNode::verify_user_tx_dilithium(&tx_for_verify)
-    }).await.unwrap_or(false);
-    if !verify_ok {
-        println!("[WARN][TX] dilithium_verify_failed from={}", &tx_request.from[..16.min(tx_request.from.len())]);
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Dilithium signature verification failed",
-            "details": "ML-DSA-65 signature does not match the transaction data or the bound key"
-        })));
+    // Runs ONLY when the pk is on the wire. An ELIDED pk cannot be opened here (no state access in the
+    // RPC layer); that TX is resolved+verified by submit_transaction, which add_transaction_to_mempool
+    // delegates to — so the authoritative ML-DSA-65 gate is never skipped, only relocated.
+    if dil_pk.is_some() {
+        let _verify_permit = match crate::node::VALUE_TX_VERIFY_SEM.try_acquire() {
+            Ok(p) => p,
+            Err(_) => return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Server busy: too many concurrent signature verifications",
+                "details": "verify capacity reached; retry shortly"
+            }))),
+        };
+        let tx_for_verify = tx.clone();
+        let verify_ok = tokio::task::spawn_blocking(move || {
+            crate::node::BlockchainNode::verify_user_tx_dilithium(&tx_for_verify)
+        }).await.unwrap_or(false);
+        if !verify_ok {
+            println!("[WARN][TX] dilithium_verify_failed from={}", &tx_request.from[..16.min(tx_request.from.len())]);
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Dilithium signature verification failed",
+                "details": "ML-DSA-65 signature does not match the transaction data or the bound key"
+            })));
+        }
+        println!("[INFO][TX] dilithium_verified from={} to={}",
+                 &tx_request.from[..8.min(tx_request.from.len())], &tx_request.to[..8.min(tx_request.to.len())]);
     }
-    println!("[INFO][TX] dilithium_verified from={} to={}",
-             &tx_request.from[..8.min(tx_request.from.len())], &tx_request.to[..8.min(tx_request.to.len())]);
 
     // Log quantum TX if present
     if tx.is_quantum_signed() {
@@ -5221,10 +5249,13 @@ async fn handle_transaction_submit(
                     println!("[WARN][TX] mempool_rejected from={} err={}", 
                              &tx_request.from[..16.min(tx_request.from.len())],
                              e);
+                    // Surface the real reason: the client's self-heal paths key on it (a pk_unresolved
+                    // reject must make an eliding wallet re-attach the pubkey; a nonce reject must make it
+                    // refetch). A fixed "request failed" string made those retries dead code.
                     let error_response = json!({
                         "success": false,
                         "error": "Failed to add transaction to mempool",
-                        "details": "request failed"
+                        "details": format!("{:?}", e)
                     });
                     Ok(warp::reply::json(&error_response))
                 }
@@ -9582,8 +9613,8 @@ async fn handle_claim_rewards(
                 public_key: None,
                 tx_type: qnet_state::TransactionType::RewardDistribution,
                 data: Some(data),
-                dilithium_signature: claim_request.dilithium_signature.clone(),
-                dilithium_public_key: claim_request.dilithium_public_key.clone(),
+                dilithium_signature: claim_request.dilithium_signature.clone().map(String::into_bytes),
+                dilithium_public_key: claim_request.dilithium_public_key.clone().map(String::into_bytes),
                 chain_id: 0,
             };
             tx.hash = tx.calculate_hash();
@@ -10552,8 +10583,8 @@ async fn sign_node_registration_tx(tx: &mut qnet_state::Transaction, producer_no
     if let Some(crypto) = try_get_quantum_crypto() {
         match crypto.create_consensus_signature(producer_node_id, &canonical_msg).await {
             Ok(dilithium_sig) => {
-                tx.dilithium_signature  = Some(dilithium_sig.signature);
-                tx.dilithium_public_key = Some(producer_node_id.to_string());
+                tx.dilithium_signature  = Some(dilithium_sig.signature.into_bytes());
+                tx.dilithium_public_key = Some(producer_node_id.to_string().into_bytes());
                 println!("[INFO][REG] node_registration_tx signed dilithium3={}", producer_node_id);
             }
             Err(e) => {
@@ -13095,6 +13126,9 @@ async fn handle_node_registration_client_submit(
     // Only light nodes use client-side TX creation.
     // Super node registration is server-initiated (requires server-side authorization + staking).
     if req.node_type != "light" {
+        if crate::node::is_warn() {
+            println!("[WARN][NODE-REG-CLIENT] reject node={} reason=node_type_not_light", req.node_id);
+        }
         return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "Only light node self-registration is supported via this endpoint"
@@ -13103,12 +13137,18 @@ async fn handle_node_registration_client_submit(
 
     // Validate EON address: from and wallet_address must be identical
     if req.from != req.wallet_address {
+        if crate::node::is_warn() {
+            println!("[WARN][NODE-REG-CLIENT] reject node={} reason=from_ne_wallet", req.node_id);
+        }
         return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "from and wallet_address must match"
         })));
     }
     if let Err(e) = validate_eon_address_with_error(&req.from) {
+        if crate::node::is_warn() {
+            println!("[WARN][NODE-REG-CLIENT] reject node={} reason=invalid_eon", req.node_id);
+        }
         return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "Invalid wallet address",
@@ -13127,6 +13167,9 @@ async fn handle_node_registration_client_submit(
         let suffix_ok = req.node_id.starts_with("light_")
             && req.node_id.rsplit('_').next() == Some(&expected_suffix[..16]);
         if !suffix_ok {
+            if crate::node::is_warn() {
+                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=node_id_not_pseudonym", req.node_id);
+            }
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "node_id is not the wallet-derived pseudonym"
@@ -13148,6 +13191,9 @@ async fn handle_node_registration_client_submit(
             ) {
                 Ok(true) => {}
                 _ => {
+                    if crate::node::is_warn() {
+                        println!("[WARN][NODE-REG-CLIENT] reject node={} reason=owner_signature_invalid", req.node_id);
+                    }
                     return Ok(warp::reply::json(&json!({
                         "success": false,
                         "error": "owner_signature invalid — not the burning wallet's owner"
@@ -13156,6 +13202,9 @@ async fn handle_node_registration_client_submit(
             }
         }
         _ => {
+            if crate::node::is_warn() {
+                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=burn_wallet_or_owner_sig_missing", req.node_id);
+            }
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "burn_wallet + owner_signature required (proof of wallet ownership)"
@@ -13174,6 +13223,9 @@ async fn handle_node_registration_client_submit(
         .map(crate::crypto::solana_derivation::eon_from_solana_address)
         .as_deref() == Some(req.wallet_address.as_str());
     if !native_bound && !solana_bound {
+        if crate::node::is_warn() {
+            println!("[WARN][NODE-REG-CLIENT] reject node={} reason=wallet_not_derived", req.node_id);
+        }
         return Ok(warp::reply::json(&json!({
             "success": false,
             "error": "wallet_address not derived from dilithium_public_key or burn_wallet (ownership unproven)"
@@ -13187,6 +13239,9 @@ async fn handle_node_registration_client_submit(
             .unwrap_or_default()
             .as_secs();
         if now.abs_diff(req.timestamp) > 300 {
+            if crate::node::is_warn() {
+                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=timestamp_stale skew={}s", req.node_id, now.abs_diff(req.timestamp));
+            }
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "Request timestamp too old or too far in future (max 5 min)"
@@ -13194,58 +13249,12 @@ async fn handle_node_registration_client_submit(
         }
     }
 
-    // Message: "client_node_reg:{node_id}:{wallet_address}:{registration_proof}:{timestamp}"
-    let message = format!("client_node_reg:{}:{}:{}:{}",
-        req.node_id, req.wallet_address, req.registration_proof, req.timestamp);
-
-    // PURE DILITHIUM: QNet identity is Dilithium-ONLY. Ed25519 is a Solana-only credential (used for
-    // the Solana address + owner_signature bridge) and is NEVER verified on a QNet path.
-    // For a native (dilithium-derived) wallet the client_node_reg Dilithium
-    // signature is the authoritative wallet-control proof and is MANDATORY — it must verify under the
-    // SAME dilithium_public_key the binding derived wallet_address from (an attacker cannot bind a
-    // victim's key without also forging its ML-DSA signature). Solana-imported wallets use owner_signature.
-    if native_bound {
-        let (dil_sig, dil_pk) = match (&req.dilithium_signature, &req.dilithium_public_key) {
-            (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => (s, p),
-            _ => return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "native registration requires dilithium_signature + dilithium_public_key (pure-PQ)"
-            }))),
-        };
-        if !verify_mobile_dilithium_signature(&message, dil_sig, dil_pk) {
-            println!("[WARN][NODE-REG-CLIENT] dilithium_sig_invalid node={}", req.node_id);
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Dilithium3 signature verification failed"
-            })));
-        }
-    } else if let (Some(ref dil_sig), Some(ref dil_pk)) = (&req.dilithium_signature, &req.dilithium_public_key) {
-        // Solana-imported path: Dilithium optional, but if present it must be valid.
-        if !dil_sig.is_empty() && !dil_pk.is_empty()
-            && !verify_mobile_dilithium_signature(&message, dil_sig, dil_pk) {
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Dilithium3 signature verification failed"
-            })));
-        }
-    }
-
-    // Early state-level check: reject already-registered nodes before mempool
-    // This gives immediate feedback to the client and prevents mempool pollution
-    {
-        let state_mgr = blockchain.get_state_manager();
-        let state = state_mgr.read().await;
-        if state.is_node_registered(&req.node_id) {
-            return Ok(warp::reply::json(&json!({
-                "success": false,
-                "error": "Node already registered",
-                "node_id": req.node_id
-            })));
-        }
-    }
-
-    // Build NodeRegistration TX — always Light (super is blocked above)
-    // Light nodes never expose an endpoint (mobile privacy)
+    // Build the on-chain NodeRegistration TX NOW (Light only; super is blocked above) so the SAME strict
+    // verifier the producer/block-validator uses (verify_node_lifecycle_dilithium: raw detached sig
+    // len==3309 + pk len==1952 over the canonical client_node_reg message) gates admission. This makes
+    // the admission accept-set a SUBSET of the block-validation accept-set by construction — the asymmetry
+    // that let a sig pass here and get poison-evicted at the producer is closed. Burn fields are stamped
+    // after this gate (they are not part of the signed message).
     let mut reg_tx = crate::node::BlockchainNode::create_node_registration_tx_with_timestamp(
         &req.node_id,
         qnet_state::NodeType::Light,
@@ -13254,20 +13263,57 @@ async fn handle_node_registration_client_submit(
         "",
         Some(req.timestamp),
     );
-
-    // Mark as client-signed so build_canonical_verify_message uses the correct format
-    // Light nodes never expose an API endpoint (mobile privacy) — empty string
+    // Mark client-signed so build_canonical_verify_message selects the client_node_reg preimage.
     reg_tx.data = Some(format!("client_node_reg:{}:{}:{}:",
         req.node_id, req.wallet_address, req.registration_proof));
-
-    // PURE DILITHIUM: the NodeRegistration TX carries ONLY the Dilithium sig as its authoritative proof
-    // (set below); the legacy Ed25519 signature/public_key are not verified on any QNet path, so they are
-    // not stamped onto the on-chain TX.
-    if let Some(dil_sig) = req.dilithium_signature {
-        reg_tx.dilithium_signature = Some(dil_sig);
+    // FIX-5 wire: client sends HEX of the raw detached sig (3309 B) + raw pk (1952 B). A malformed hex
+    // decodes to None → the gate below rejects (never a silent sig-less admission).
+    if let Some(ref dil_sig) = req.dilithium_signature {
+        reg_tx.dilithium_signature = hex::decode(dil_sig).ok();
     }
-    if let Some(dil_pk) = req.dilithium_public_key {
-        reg_tx.dilithium_public_key = Some(dil_pk);
+    if let Some(ref dil_pk) = req.dilithium_public_key {
+        reg_tx.dilithium_public_key = hex::decode(dil_pk).ok();
+    }
+
+    // Signature gate — SAME verifier as the producer/block-validator. Native (Dilithium-derived) wallet:
+    // the client_node_reg sig is MANDATORY. Solana-imported wallet: optional (authority = owner_signature
+    // + 2f+1 burn quorum), but if present it must verify — mirroring the producer's `Some(sig)=>verify,_=>true`.
+    let has_sig = reg_tx.dilithium_signature.as_deref().map_or(false, |s| !s.is_empty());
+    if native_bound {
+        if !has_sig || !crate::node::BlockchainNode::verify_node_lifecycle_dilithium(&reg_tx) {
+            if crate::node::is_warn() {
+                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=dilithium_sig_invalid", req.node_id);
+            }
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "native registration requires a valid ML-DSA-65 signature (pure-PQ)"
+            })));
+        }
+    } else if has_sig && !crate::node::BlockchainNode::verify_node_lifecycle_dilithium(&reg_tx) {
+        if crate::node::is_warn() {
+            println!("[WARN][NODE-REG-CLIENT] reject node={} reason=dilithium_sig_invalid", req.node_id);
+        }
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "ML-DSA-65 signature verification failed"
+        })));
+    }
+
+    // Early state-level check: reject already-registered nodes before mempool
+    // This gives immediate feedback to the client and prevents mempool pollution
+    {
+        let state_mgr = blockchain.get_state_manager();
+        let state = state_mgr.read().await;
+        if state.is_node_registered(&req.node_id) {
+            if crate::node::is_warn() {
+                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=already_registered", req.node_id);
+            }
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Node already registered",
+                "node_id": req.node_id
+            })));
+        }
     }
 
     // Option A: embed the Solana 1DEV burn so this ON-CHAIN Light registration passes burn-attestation
@@ -13285,6 +13331,9 @@ async fn handle_node_registration_client_submit(
         let proof_input = format!("{}:{}:{}", burn_tx, req.node_id, req.wallet_address);
         let proof_hash = blake3::hash(proof_input.as_bytes()).to_hex().to_string();
         if proof_hash.get(..32) != Some(req.registration_proof.as_str()) {
+            if crate::node::is_warn() {
+                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=burn_proof_mismatch", req.node_id);
+            }
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "burn_tx_hash does not match the signed registration_proof"
@@ -13313,6 +13362,9 @@ async fn handle_node_registration_client_submit(
             Some(c) => c.len(),
             None if arm_genesis_era => crate::genesis_constants::genesis_node_count(),
             None => {
+                if crate::node::is_warn() {
+                    println!("[WARN][NODE-REG-CLIENT] reject node={} reason=committee_unavailable epoch={} (retryable)", req.node_id, agreed_epoch);
+                }
                 return Ok(warp::reply::json(&json!({
                     "success": false,
                     "error": "burn-attestation committee unavailable (node syncing); retry shortly",
@@ -13322,6 +13374,9 @@ async fn handle_node_registration_client_submit(
         };
         let need = qnet_consensus::checkpoint_bft::quorum_size(arm_committee_len);
         if attestors.len() < need {
+            if crate::node::is_warn() {
+                println!("[WARN][NODE-REG-CLIENT] reject node={} reason=burn_quorum_not_reached got={} need={} (retryable)", req.node_id, attestors.len(), need);
+            }
             return Ok(warp::reply::json(&json!({
                 "success": false,
                 "error": "burn-attestation quorum not yet reached; retry shortly",
@@ -13928,8 +13983,9 @@ async fn handle_contract_deploy(
     );
     // Carry the caller's ML-DSA-65 signature so the value-TX gate verifies it (over the canonical
     // "contract_deploy:{from}:{code_hash}:{nonce}" message) and binds the key to `from`.
-    tx.dilithium_signature = Some(request.dilithium_signature.clone());
-    tx.dilithium_public_key = Some(request.dilithium_public_key.clone());
+    // FIX-5: hex(raw detached) -> bytes; value gate verifies
+    tx.dilithium_signature = hex::decode(&request.dilithium_signature).ok();
+    tx.dilithium_public_key = hex::decode(&request.dilithium_public_key).ok();
     tx.hash = tx.calculate_hash();
 
     // Submit to mempool
@@ -13994,6 +14050,13 @@ fn verify_mobile_dilithium_signature(
             Ok(b) => b,
             Err(_) => return false,
         };
+        // Strict FIPS-204 detached sig = exactly 3309 B. Without this an over-long blob (sig ‖ extra)
+        // still open()s — the extra folds into the recovered message — so admission accepts what the
+        // strict block-validator (verify_node_lifecycle_dilithium: len==3309) rejects, splitting the
+        // two accept-sets and poison-evicting the TX at the producer.
+        if sig_bytes.len() != 3309 {
+            return false;
+        }
         let mut signed_msg = sig_bytes;
         signed_msg.extend_from_slice(expected_message.as_bytes());
         let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
@@ -14004,9 +14067,10 @@ fn verify_mobile_dilithium_signature(
             Ok(sm) => sm,
             Err(_) => return false,
         };
+        // Accept ONLY if open() recovers EXACTLY expected_message (belt to the length gate above).
         return match dilithium3::open(&signed_message, &public_key) {
-            Ok(_) => { println!("[INFO][DILITHIUM] mobile_raw_hex_verified"); true }
-            Err(_) => { println!("[WARN][DILITHIUM] mobile_raw_hex_failed"); false }
+            Ok(recovered) => recovered.as_slice() == expected_message.as_bytes(),
+            Err(_) => false,
         };
     }
     
@@ -14249,10 +14313,11 @@ async fn handle_contract_call(
     }
     
     // State-changing call requires the ML-DSA-65 signature (pure-Dilithium; Ed25519 is Solana-only).
-    if request.dilithium_signature.is_none() || request.dilithium_public_key.is_none() {
+    // FIX-5: the PUBKEY is optional — elided once committed on-chain; submit_transaction rehydrates it.
+    if request.dilithium_signature.is_none() {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Dilithium signature and public_key required for state-changing contract calls"
+            "error": "Dilithium signature required for state-changing contract calls"
         })));
     }
     
@@ -14268,11 +14333,13 @@ async fn handle_contract_call(
     // eon_from_qnet_dilithium_pubkey(dpk)==from. The client MUST sign that exact message in the
     // "dilithium_sig_{pk}_{b64}" wire format with a wallet key whose eon == from.
     let dilithium_sig = request.dilithium_signature.clone().unwrap_or_default();
+    // FIX-5: empty ⇒ ELIDED pk (resolved from committed state by submit_transaction, which also rejects
+    // it if unresolvable). Only the signature is structurally mandatory here.
     let dilithium_pk = request.dilithium_public_key.clone().unwrap_or_default();
-    if dilithium_sig.is_empty() || dilithium_pk.is_empty() {
+    if dilithium_sig.is_empty() {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "dilithium_signature + dilithium_public_key required (pure-PQ; ML-DSA-65)"
+            "error": "dilithium_signature required (pure-PQ; ML-DSA-65)"
         })));
     }
 
@@ -14304,8 +14371,10 @@ async fn handle_contract_call(
     );
     // Carry the caller's ML-DSA-65 signature so the value-TX gate verifies it (over the canonical
     // "contract_call:{from}:{sha3(tx.data calldata)}:{nonce}" message) and binds the key to `from`.
-    tx.dilithium_signature = Some(dilithium_sig.clone());
-    tx.dilithium_public_key = Some(dilithium_pk.clone());
+    // FIX-5: hex(raw detached) -> bytes; value gate verifies
+    tx.dilithium_signature = hex::decode(&dilithium_sig).ok();
+    // Elided pk stays None all the way into the mempool — never re-added to the wire (FIX-5 TPS win).
+    tx.dilithium_public_key = if dilithium_pk.is_empty() { None } else { hex::decode(&dilithium_pk).ok() };
     tx.hash = tx.calculate_hash();
 
     let tx_hash = tx.hash.clone();
@@ -15045,8 +15114,9 @@ async fn handle_wasm_deploy(
             "code": request.code.trim(),
             "code_hash": code_hash
         })).unwrap_or_default()),
-        dilithium_signature: Some(request.dilithium_signature.clone()),
-        dilithium_public_key: Some(request.dilithium_public_key.clone()),
+        // FIX-5: hex(raw detached) -> bytes; value gate verifies
+        dilithium_signature: hex::decode(&request.dilithium_signature).ok(),
+        dilithium_public_key: hex::decode(&request.dilithium_public_key).ok(),
         chain_id: 0,
     };
     tx.hash = tx.calculate_hash();
@@ -15157,8 +15227,9 @@ async fn handle_nft_deploy(
             "symbol": request.symbol,
             "code_hash": code_hash
         })).unwrap_or_default()),
-        dilithium_signature: Some(request.dilithium_signature.clone()),
-        dilithium_public_key: Some(request.dilithium_public_key.clone()),
+        // FIX-5: hex(raw detached) -> bytes; value gate verifies
+        dilithium_signature: hex::decode(&request.dilithium_signature).ok(),
+        dilithium_public_key: hex::decode(&request.dilithium_public_key).ok(),
         chain_id: 0,
     };
     tx.hash = tx.calculate_hash();
@@ -15329,8 +15400,9 @@ async fn handle_token_deploy(
             "initial_supply": request.initial_supply.to_string(),
             "code_hash": code_hash
         })).unwrap_or_default()),
-        dilithium_signature: Some(request.dilithium_signature.clone()),
-        dilithium_public_key: Some(request.dilithium_public_key.clone()),
+        // FIX-5: hex(raw detached) -> bytes; value gate verifies
+        dilithium_signature: hex::decode(&request.dilithium_signature).ok(),
+        dilithium_public_key: hex::decode(&request.dilithium_public_key).ok(),
         chain_id: 0,
     };
 
@@ -15975,15 +16047,16 @@ async fn run_benchmark_generator(
             let elapsed = report_start.elapsed().as_secs_f64();
             let current_tps = if elapsed > 0.0 { sent as f64 / elapsed } else { 0.0 };
             
-            println!("[BENCHMARK] 📊 Progress: {}/{} ({:.0} TPS)", sent, total_transactions, current_tps);
+            println!("[BENCHMARK] 📊 Progress: {}/{} ({:.0} submit/s)", sent, total_transactions, current_tps);
             
             // FIXED v2.26.2: Direct atomic update instead of async loop
             // Previous version caused async deadlock with get_status().await in tight loop
             let manager_sent = BENCHMARK_MANAGER.transactions_sent.load(Ordering::SeqCst);
             let delta = sent.saturating_sub(manager_sent);
             if delta > 0 {
+                // Track SUBMITTED only. Never fabricate `confirmed` from `sent` — this endpoint measures
+                // submission/admission, not on-chain confirmation. Real confirmed-TPS = qnet-loadtest.
                 BENCHMARK_MANAGER.transactions_sent.fetch_add(delta, Ordering::SeqCst);
-                BENCHMARK_MANAGER.transactions_confirmed.fetch_add(delta, Ordering::SeqCst);
             }
             
             // Update peak TPS directly
@@ -16042,10 +16115,11 @@ async fn run_benchmark_generator(
     println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("[BENCHMARK] ⚡ Workers used:    {}", num_workers);
     println!("[BENCHMARK] 📦 Total sent:      {}", final_sent);
-    println!("[BENCHMARK] ✅ Confirmed:       {}", final_confirmed);
+    println!("[BENCHMARK] 📥 Admitted (mempool, NOT on-chain): {}", final_confirmed);
     println!("[BENCHMARK] ❌ Errors:          {}", final_errors);
     println!("[BENCHMARK] ⏱️  Duration:        {:.2}s", elapsed);
-    println!("[BENCHMARK] 🚀 ACTUAL TPS:      {:.0}", final_tps);
+    println!("[BENCHMARK] 🚀 Submission rate (tx/s): {:.0}", final_tps);
+    println!("[BENCHMARK] ℹ️  Submission/admission only — confirmed on-chain TPS: use qnet-loadtest.");
     println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 

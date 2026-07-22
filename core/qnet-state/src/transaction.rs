@@ -307,6 +307,11 @@ pub struct EquivocationHeader {
     // the SAME signed digest (both fields are consensus-relevant and cryptographically bound).
     #[serde(default)]
     pub carried_baseline: u64,
+    // Blocker-3: sha3 over the block's ordered per-tx WIRE dilithium_public_key presence, bound into
+    // Block_Sig_v23.1 so a relay stripping/adding a first-use pk (block hash unchanged — pk is elided
+    // from the tx preimage) flips the signed digest ⇒ sig fails ⇒ tampered copy rejected, not deferred.
+    #[serde(default)]
+    pub pk_digest: [u8; 32],
     pub signature: Vec<u8>,
 }
 
@@ -677,20 +682,20 @@ pub struct Transaction {
     /// Call data
     pub data: Option<String>,
     
-    /// QUANTUM v2.25: Optional CRYSTALS-Dilithium3 signature for post-quantum security
-    /// When present: TX is quantum-resistant + 50% higher gas cost
-    /// Format: hex-encoded ML-DSA-65 signature (~3309 bytes = 6618 hex chars)
-    /// Use case: High-value transfers, enterprise, paranoid users
-    /// NOTE: No skip_serializing_if - bincode requires all fields to be serialized
+    /// FIX-5: RAW detached ML-DSA-65 signature bytes (exactly 3309 B). No hex, no
+    /// "dilithium_sig_" envelope, no base64, no embedded message, no [pk_len][pk] trailer —
+    /// bincode length-prefixes it directly on the P2P/mempool/block wire. Value TXs carry the
+    /// detached signature over the ASCII sign-preimage (build_canonical_verify_message);
+    /// node-signed system TXs carry the same raw detached bytes (signer resolved separately).
     #[serde(default)]
-    pub dilithium_signature: Option<String>,
-    
-    /// QUANTUM v2.25: Dilithium public key for signature verification
-    /// Required when dilithium_signature is present
-    /// Format: hex-encoded Dilithium public key (~1952 bytes = 3904 hex chars)
-    /// NOTE: No skip_serializing_if - bincode requires all fields to be serialized
+    pub dilithium_signature: Option<Vec<u8>>,
+
+    /// FIX-5: RAW ML-DSA-65 public key bytes (exactly 1952 B), ELIDABLE. Present only on an
+    /// address's FIRST on-chain tx (account has no bound pk yet); None thereafter — the verifier
+    /// loads the pk bound to the sender's Account (from == format_eon(SHA512(pk)) commits to it).
+    /// bincode encodes an elided pk as a single tag byte.
     #[serde(default)]
-    pub dilithium_public_key: Option<String>,
+    pub dilithium_public_key: Option<Vec<u8>>,
 
     /// FIX R23-M1: Chain ID for cross-chain replay protection.
     /// Testnet=1337, Mainnet=1, Devnet=31337. Included in canonical_bytes() so
@@ -1052,7 +1057,7 @@ impl Transaction {
     /// ARCHITECTURE: For HYBRID signatures (Ed25519 + Dilithium)
     /// Pure Dilithium not supported - use Hybrid for quantum resistance
     /// v2.101: CRITICAL - Must recalculate hash after changing fields!
-    pub fn with_quantum_signature(mut self, dilithium_sig: Option<String>, dilithium_pk: Option<String>) -> Self {
+    pub fn with_quantum_signature(mut self, dilithium_sig: Option<Vec<u8>>, dilithium_pk: Option<Vec<u8>>) -> Self {
         self.dilithium_signature = dilithium_sig;
         self.dilithium_public_key = dilithium_pk;
         // v2.101: Recalculate hash after changing fields to pass validate()
@@ -1151,7 +1156,10 @@ impl Transaction {
     /// - Ed25519 only: Fast, classical (64 bytes, standard gas)
     /// - Hybrid (Ed25519+Dilithium): Quantum-resistant (~2.6KB, +50% gas)
     pub fn is_quantum_signed(&self) -> bool {
-        self.dilithium_signature.is_some() && self.dilithium_public_key.is_some()
+        // FIX-5: gate on the SIGNATURE only — the pk is legitimately elided after first use, so an
+        // elided-pk value TX is still quantum-signed and must keep the +50% gas premium (else nodes
+        // would split on the fee).
+        self.dilithium_signature.is_some()
     }
     
     /// QUANTUM v2.78: Get effective gas price (50% higher for HYBRID TX)
@@ -1247,6 +1255,30 @@ impl Transaction {
                 | TransactionType::EquivocationProof { .. }
                 | TransactionType::VoteEquivocationProof { .. }
         )
+    }
+
+    /// The value-transfer classes eligible for FIX-5 pk-elision + dilithium_pk_root binding. SINGLE
+    /// source of truth: every ingest/apply/producer/bind site MUST agree on this set, or the
+    /// admission and block-accept sets drift and a producer can include a TX validators reject
+    /// (the registry_root / 2f+1-checkpoint wedge class). Was hand-cloned ~9× with live drift (Swap
+    /// missing in the two ingest gates).
+    pub fn is_value_class(&self) -> bool {
+        matches!(&self.tx_type,
+            TransactionType::Transfer { .. }
+            | TransactionType::ContractDeploy
+            | TransactionType::ContractCall
+            | TransactionType::Swap { .. })
+    }
+
+    /// True iff this TX's wire pk must be bound to `from` in the account store AND folded into
+    /// dilithium_pk_root. SINGLE source of truth for BOTH: the two must commit to an IDENTICAL set, else a
+    /// rebuilt / reorged / snapshot-joined node recomputes a different root than a continuously-running one
+    /// (a checkpoint-content split). Value class + exact ML-DSA-65 length + a well-formed eon `from` — the
+    /// account slot is WRITE-ONCE, so binding the wrong bytes poisons it for that wallet forever.
+    pub fn binds_dilithium_pk(&self) -> bool {
+        self.is_value_class()
+            && self.dilithium_public_key.as_ref().map_or(false, |pk| pk.len() == 1952)
+            && is_valid_eon_address(&self.from)
     }
 
     /// v15.5: Returns true for the subset of system TXs that have
@@ -1431,8 +1463,8 @@ impl Transaction {
     /// Calculate transaction hash as hex string
     /// Get canonical serialization for hash calculation (excludes hash and signatures)
     /// PRODUCTION: Deterministic bincode serialization ensures consistent hashing
-    /// NOTE: public_key/dilithium_public_key ARE included in canonical_bytes
-    /// because they're set BEFORE hash calculation (client-side signing)
+    /// NOTE: `public_key` IS included (set BEFORE hash calculation, client-side signing).
+    /// `dilithium_public_key` is EXCLUDED since FIX-5 — see the elision note in the body.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         // Create canonical version: all fields except hash and signatures
         // public_key IS included - must be set before calculate_hash()!
@@ -1440,7 +1472,11 @@ impl Transaction {
         canonical.hash = String::new();
         canonical.signature = None;
         canonical.dilithium_signature = None;
-        
+        // FIX-5: pk is elidable (shipped once, then None) — it MUST be out of the hash preimage,
+        // else an elided TX would hash differently than its first-use form. Safe: from ==
+        // format_eon(SHA512(pk)) already commits to the key, and `from` stays in the preimage.
+        canonical.dilithium_public_key = None;
+
         // Deterministic canonical serialization (includes tx_type, data, all fields)
         // FIX R22-S3: unwrap_or_default() silently produced empty Vec on failure,
         // causing ALL failed TXs to hash to the same SHA3-256(empty) constant.
@@ -2099,6 +2135,31 @@ impl Transaction {
         // Post-quantum signing is now MANDATORY for all value TX and the address itself is
         // the from<->key binding (enforced at ingest), so a per-account opt-in flag +
         // registered-key check is redundant. No apply-time PQ gate is needed.
+
+        // FIX-5 (pk-elision): bind the sender's ML-DSA-65 pk to its Account on FIRST on-chain use
+        // so later TXs may elide the 1952-byte key and still verify against this stored one. Write-
+        // once + idempotent (re-apply no-ops). The eon(pk)==from bind and signature validity were
+        // already enforced at ingest; this only persists the committed key, and
+        // from == format_eon(SHA512(pk)) makes it self-certifying. The pk is DELIBERATELY EXCLUDED
+        // from hash_account/state_root (see state.rs) — it is committed separately by the 2f+1
+        // Checkpoint field `dilithium_pk_root`, which is what a snapshot is verified against.
+        //
+        // The filter is load-bearing, not defensive: this slot is WRITE-ONCE, so binding the wrong
+        // bytes poisons it forever and the real wallet key could never bind (elision permanently
+        // broken for that wallet). Node-constructed lifecycle TXs (NodeActivation/NodeRegistration)
+        // put a node_id string or a VRF key in this field with the WALLET as `from`, so they must
+        // not bind. binds_dilithium_pk() is the ONE predicate every consumer of this field uses
+        // (deferred_pk_binds / applied_pk_binds → dpk_lt_bind), so the account store and the
+        // dilithium_pk_root accumulator commit to an IDENTICAL set by construction, not by convention.
+        if let Some(pk) = self.dilithium_public_key.as_ref() {
+            if self.binds_dilithium_pk() {
+                if let Some(acct) = accounts.get_mut(&self.from) {
+                    if acct.dilithium_public_key.is_none() {
+                        acct.dilithium_public_key = Some(pk.clone());
+                    }
+                }
+            }
+        }
 
         match &self.tx_type {
             TransactionType::Transfer { from, to, amount } => {
@@ -4146,8 +4207,9 @@ mod tests_v34_heartbeat {
             },
             data: None,
             // v35: the heartbeat's single Dilithium sig lives here (over the anchor message).
-            dilithium_signature: Some("deadbeef".to_string()),
-            dilithium_public_key: Some(node_id.to_string()),
+            // FIX-5: raw-byte fields — test-only placeholder bytes (structural test, not a real sig).
+            dilithium_signature: Some(b"deadbeef".to_vec()),
+            dilithium_public_key: Some(node_id.as_bytes().to_vec()),
             chain_id: 0,
         };
         tx.hash = tx.calculate_hash();

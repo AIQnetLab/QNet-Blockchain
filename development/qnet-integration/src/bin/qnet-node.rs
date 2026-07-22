@@ -2406,6 +2406,26 @@ async fn detect_region_from_local_interfaces() -> Result<Region, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Crash observability. Installed before any spawn so every panic is traced.
+    // panic=abort (workspace Cargo.toml) ends the process on any panic with no
+    // JoinError for watchdogs to observe — this stderr line is the only crash
+    // trace, and stderr is what the container captures (docker logs). Written
+    // directly to stderr (no Mutex) so a poisoned lock during a cascade can't
+    // swallow it.
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let loc = info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let msg = info.payload().downcast_ref::<&str>().copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("<non-string panic>");
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        eprintln!("[FATAL][PANIC] loc={} thread={} msg={}", loc, thread, msg);
+        eprintln!("[FATAL][PANIC] backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+        let _ = std::io::stderr().flush();
+    }));
+
     // SECURITY: Prevent direct execution - ONLY Docker or Mobile allowed
     if !std::path::Path::new("/.dockerenv").exists() && 
        std::env::var("DOCKER_ENV").is_err() &&
@@ -3091,11 +3111,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::select! {
         _ = node_handle => {
-            println!("[SHUTDOWN] Node monitoring ended unexpectedly");
+            // The monitor is an infinite loop; it ending is a fault (a deliberate
+            // stop uses process::exit directly). Exit non-zero so the orchestrator
+            // restarts instead of reading this as a clean shutdown.
+            eprintln!("[CRIT][SHUTDOWN] monitor_task_ended action=exit_for_restart");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            std::process::exit(1);
         }
         _ = shutdown_handler => {}
     }
-    
+
     Ok(())
 }
 
@@ -3123,23 +3148,9 @@ async fn redirect_logs_to_file(log_path: &std::path::Path) -> Result<(), std::io
     println!("📝 Logs redirected to: {}", log_path_str);
     println!("📖 View logs with: tail -f {}", log_path_str);
     
-    // Set up a custom logger that writes to the file
-    use std::sync::Mutex;
-    use std::sync::Arc;
-    
-    let log_file_arc = Arc::new(Mutex::new(log_file));
-    let log_file_for_panic = log_file_arc.clone();
-    
-    // Set up panic handler to log panics
-    std::panic::set_hook(Box::new(move |panic_info| {
-        if let Ok(mut log_file) = log_file_for_panic.lock() {
-            let _ = writeln!(log_file, "[PANIC] {}: {}", 
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-                panic_info);
-            let _ = log_file.flush();
-        }
-    }));
-    
+    // Panic tracing is the unconditional stderr hook set at main() top (before any
+    // spawn, survives panic=abort). No per-mode set_hook here — it would clobber it.
+
     // For production daemon mode, we'll use env_logger with file output
     // The actual log redirection is handled by the Docker container or systemd
     println!("✅ Log redirection configured for daemon mode");
@@ -3159,20 +3170,13 @@ fn configure_production_mode() {
     std::env::set_var("QNET_MICROBLOCK_PRODUCER", "1");
     
     std::env::set_var("QNET_HIGH_FREQUENCY", "1");
-    std::env::set_var("QNET_MAX_TPS", "12800000");
     std::env::set_var("QNET_MEMPOOL_SIZE", "20000000");
     std::env::set_var("QNET_BATCH_SIZE", "200000");
     std::env::set_var("QNET_PARALLEL_VALIDATION", "1");
     std::env::set_var("QNET_PARALLEL_THREADS", "16");
     std::env::set_var("QNET_COMPRESSION", "1");
-    
-    
-    std::env::set_var("QNET_ENABLE_SHARDING", "1");
-    std::env::set_var("QNET_SHARD_COUNT", "256");
     std::env::set_var("QNET_USE_LOCKFREE", "1"); // DashMap for lock-free operations
-    
-    println!("⚡ ULTRA HIGH-PERFORMANCE: 12.8M TPS theoretical max (50K × 256 shards)");
-    println!("🚀 Quantum blockchain optimizations: Lock-free + Sharding + Parallel + 80MB blocks (v4.1)");
+    // Sharding is deferred (single-shard); do NOT advertise it via env/logs.
         
     // Default server configuration (user will choose during setup)
     std::env::set_var("QNET_FULL_SYNC", "1");

@@ -250,6 +250,12 @@ pub struct Checkpoint {
     /// CRITICAL: block_logs must be byte-identical across the validator + producer drain paths, else
     /// this root diverges and the macroblock QC never reaches 2f+1. [0;32] only for a log-less window.
     pub logs_root: Hash,
+    /// FIX-5: QC-signed LtHash digest over all committed (address -> ML-DSA-65 pk) bindings.
+    /// 2f+1 certify it ⇒ a node joining via an UNTRUSTED snapshot verifies its restored per-account
+    /// pubkeys match the committed set — a malicious snapshot that omits/alters an account's pk fails
+    /// this root (→ snapshot rejected) instead of stalling that account's pk-elided TXs at 100k cold-
+    /// join. [0;32] until the first pk is bound (all accounts still ship pk).
+    pub dilithium_pk_root: Hash,
     /// QC-signed total minted supply as of window_head_height. The apply-accumulated
     /// emission total (genesis=0, monotonic +emit_rewards). QC-signed ⇒ 2f+1 certify it ⇒
     /// a cold-joiner reads this QC-bound value instead of summing restored balances (which
@@ -283,6 +289,7 @@ impl Checkpoint {
         h.update(self.reward_root);
         h.update(self.registry_root);
         h.update(self.logs_root);
+        h.update(self.dilithium_pk_root);
         h.update(self.total_supply.to_le_bytes());
         h.update(self.timestamp.to_le_bytes());
         h.update(self.proposer.as_bytes());
@@ -611,7 +618,7 @@ mod tests {
         let mut c = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 90,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3),
-            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0),total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let x = c.hash();
         c.proposer_sig = vec![9, 9, 9];   // sig change must NOT change hash
@@ -704,13 +711,32 @@ mod tests {
         let c = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 90,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3),
-            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),total_supply: 1_000_000, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0),total_supply: 1_000_000, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let base = c.hash();
         assert_eq!(c.hash(), base, "hash must be deterministic for fixed fields");
         let mut d = c.clone();
         d.total_supply = 2_000_000;        // value change MUST change hash
         assert_ne!(d.hash(), base, "total_supply must be in the QC-signed hash");
+    }
+
+    #[test]
+    fn checkpoint_hash_binds_dilithium_pk_root() {
+        // dilithium_pk_root MUST be bound into the QC-signed hash: an untrusted-snapshot joiner verifies its
+        // restored per-account ML-DSA-65 pubkeys against this 2f+1-certified digest. If the field were
+        // dropped from the preimage, a node could publish any value without breaking the QC — the elided-pk
+        // snapshot attack this field exists to close. Mirrors checkpoint_hash_binds_total_supply.
+        let c = Checkpoint {
+            index: 1, parent_qc: None, window_head_height: 90,
+            window_mb_hashes: vec![h(1), h(2)], state_root: h(3),
+            beacon: h(4), epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),
+            dilithium_pk_root: h(7), total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+        };
+        let base = c.hash();
+        assert_eq!(c.hash(), base, "hash must be deterministic for fixed fields");
+        let mut d = c.clone();
+        d.dilithium_pk_root = h(8);        // value change MUST change hash
+        assert_ne!(d.hash(), base, "dilithium_pk_root must be in the QC-signed hash");
     }
 
     #[test]
@@ -878,7 +904,7 @@ mod tests {
         let child = Checkpoint {
             index: 5, parent_qc: Some(parent_qc), window_head_height: 450,
             window_mb_hashes: vec![h(1)], state_root: h(2), beacon: h(3),
-            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),total_supply: 0, timestamp: 0, proposer: "n0".into(), proposer_sig: vec![],
+            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0),total_supply: 0, timestamp: 0, proposer: "n0".into(), proposer_sig: vec![],
         };
         let child_qc = mk_qc(&committee, child.hash(), 5, 3);
         assert_eq!(commits_parent(&child, &child_qc), Some(4)); // C4 final
@@ -894,7 +920,7 @@ mod tests {
         let c = Checkpoint {
             index: 7, parent_qc: Some(qc.clone()), window_head_height: 630,
             window_mb_hashes: vec![h(1), h(2)], state_root: h(3), beacon: h(4),
-            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0),total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
+            epoch_commitment: h(0), reward_root: h(0), registry_root: h(0), logs_root: h(0), dilithium_pk_root: h(0),total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![1,2,3],
         };
         let bytes = bincode::serialize(&c).unwrap();
         let back: Checkpoint = bincode::deserialize(&bytes).unwrap();

@@ -142,6 +142,16 @@ pub struct Account {
     /// pure post-apply recompute, so it can never drift. Appended LAST to keep bincode positional layout.
     #[serde(default)]
     pub storage_root: [u8; 32],
+
+    /// FIX-5 (pk-elision): the account holder's RAW ML-DSA-65 public key (1952 B), bound ONCE at
+    /// the account's first on-chain transaction and immutable thereafter. Lets later transactions
+    /// ELIDE the 1952-byte key from the wire and still verify against this stored one. Folded into
+    /// hash_account (state_root) so a snapshot cannot serve a wrong verify-key without failing state
+    /// verification. `from == format_eon(SHA512(pk))` makes the binding self-consistent. None until
+    /// the account has sent its first tx (receive-only wallets never populate it). Appended LAST to
+    /// keep the bincode positional layout of the pre-FIX-5 fields.
+    #[serde(default)]
+    pub dilithium_public_key: Option<Vec<u8>>,
 }
 
 /// Account state (alias for compatibility)
@@ -200,6 +210,7 @@ impl Default for AccountState {
             heartbeat_final_count: 0,
             last_claimed_epoch: 0,
             storage_root: *crate::state::EMPTY_STORAGE_ROOT,
+            dilithium_public_key: None,
         }
     }
 }
@@ -282,6 +293,7 @@ impl Account {
             heartbeat_final_count: 0,
             last_claimed_epoch: 0,
             storage_root: *crate::state::EMPTY_STORAGE_ROOT,
+            dilithium_public_key: None, // FIX-5: bound at first-use apply, not construction
         }
     }
 
@@ -307,6 +319,7 @@ impl Account {
             heartbeat_final_count: 0,
             last_claimed_epoch: 0,
             storage_root: *crate::state::EMPTY_STORAGE_ROOT,
+            dilithium_public_key: None, // FIX-5: bound at first-use apply, not construction
         }
     }
 

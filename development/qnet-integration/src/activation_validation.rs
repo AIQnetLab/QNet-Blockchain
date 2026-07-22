@@ -1990,8 +1990,8 @@ impl BlockchainActivationRegistry {
                 if let Some(crypto) = crate::node::try_get_quantum_crypto() {
                     match crypto.create_consensus_signature(&local_node_id, &canonical_msg).await {
                         Ok(dil) => {
-                            transaction.dilithium_signature = Some(dil.signature);
-                            transaction.dilithium_public_key = Some(local_node_id);
+                            transaction.dilithium_signature = Some(dil.signature.into_bytes());
+                            transaction.dilithium_public_key = Some(local_node_id.into_bytes());
                         }
                         Err(e) => {
                             // Pre-install signing attempt is benign — the TX is re-signed after

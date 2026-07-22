@@ -42,6 +42,16 @@ pub static SNAPSHOT_REHYDRATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// the reader skips the O(N) scan fallback. Until then a wallet with no index hits still falls back.
 pub static OWNS_INDEX_READY: AtomicBool = AtomicBool::new(false);
 
+/// Bumped on every macroblock body that BECOMES present (any index, contiguous or not). The pipeline's
+/// committee-deferred redrive keys on this: a committee defer clears exactly when its N-2 macroblock
+/// lands, so this is the precise trigger — unlike the contiguous `last_sealed_mb_index`, which an
+/// out-of-order sync ingest leaves pinned behind a hole. Process-local (the deferred map is too), so no
+/// persistence is needed; only CHANGE is observed.
+static MACROBLOCK_SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic count of macroblock bodies that became present in this process. See `MACROBLOCK_SAVE_SEQ`.
+pub fn macroblock_save_seq() -> u64 { MACROBLOCK_SAVE_SEQ.load(Ordering::Relaxed) }
+
 /// Timestamp when rollback started (for timeout protection)
 static ROLLBACK_START_TIME: AtomicU64 = AtomicU64::new(0);
 
@@ -2817,6 +2827,9 @@ impl PersistentStorage {
             // a writer-side read-modify-write would lose updates and freeze the
             // frontier. Body writes stay independent per-index; the reader folds them.
             db.write(batch)?;
+            // This index BECAME present (the idempotent-skip above returned early otherwise) — signal the
+            // pipeline's committee-deferred redrive, whose clear condition is exactly "macroblock n2 exists".
+            MACROBLOCK_SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
             println!("[INFO][STORAGE] macroblock_saved h={}", height);
             Ok(())
         })
@@ -4342,6 +4355,9 @@ impl Storage {
                                 vrf_output: mb.vrf_output,
                                 timeout_round: mb.timeout_round,
                                 carried_baseline: mb.carried_baseline,
+                                // Blocker-3: capture the signed pk_digest so the on-chain proof re-verify
+                                // reconstructs the SAME Block_Sig_v23.1 digest as the producer.
+                                pk_digest: crate::node::microblock_pk_digest(&mb.transactions),
                                 signature: mb.signature.clone(),
                             };
                             crate::node::record_block_equivocation(height, &new_producer, to_header(exist), to_header(inc));
@@ -6954,6 +6970,325 @@ impl Storage {
             Ok(Some(v)) => crate::registry_lthash::LtHash::from_bytes(&v),
             _ => crate::registry_lthash::LtHash::new(),
         }
+    }
+
+    // ── FIX-5: dilithium_pk_root — QC-signed LtHash over committed (address -> ML-DSA-65 pk) bindings ──
+    const DPK_LT_STATE_KEY: &'static [u8] = b"dpk_lt_state";
+
+    fn dpk_lt_load(&self) -> crate::registry_lthash::LtHash {
+        let cf = match self.persistent.db.cf_handle("metadata") { Some(c) => c, None => return crate::registry_lthash::LtHash::new() };
+        match self.persistent.db.get_cf(&cf, Self::DPK_LT_STATE_KEY) {
+            Ok(Some(v)) => crate::registry_lthash::LtHash::from_bytes(&v),
+            _ => crate::registry_lthash::LtHash::new(),
+        }
+    }
+
+    fn dpk_root_seal_get(&self, height: u64) -> Option<[u8; 32]> {
+        let cf = self.persistent.db.cf_handle("metadata")?;
+        let mut key = b"dpkr_seal_".to_vec();
+        key.extend_from_slice(&height.to_be_bytes());
+        match self.persistent.db.get_cf(&cf, &key) {
+            Ok(Some(v)) if v.len() == 32 => { let mut out = [0u8; 32]; out.copy_from_slice(&v); Some(out) }
+            _ => None,
+        }
+    }
+
+    /// From-scratch: fold every account holding a bound 1952-byte ML-DSA-65 pk. O(accounts-with-pk).
+    /// Fallback for `compute_dilithium_pk_root` + source for `rebuild_dilithium_pk_lthash`.
+    fn dpk_lt_from_accounts(&self) -> crate::registry_lthash::LtHash {
+        self.dpk_lt_from_accounts_cf("accounts")
+    }
+
+    /// From-scratch dpk accumulator over an explicit accounts CF: "accounts" (live recompute /
+    /// boot / reorg) or "accounts_stage" (cold-join snapshot-verify, before promotion). Order-
+    /// independent, so iteration order is irrelevant — identical root on every node.
+    fn dpk_lt_from_accounts_cf(&self, cf_name: &str) -> crate::registry_lthash::LtHash {
+        let mut lt = crate::registry_lthash::LtHash::new();
+        let cf = match self.persistent.db.cf_handle(cf_name) { Some(c) => c, None => return lt };
+        for item in self.persistent.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (_, v) = match item { Ok(kv) => kv, Err(_) => break };
+            let acct: qnet_state::Account = match bincode::deserialize(&v) { Ok(a) => a, Err(_) => continue };
+            if let Some(ref pk) = acct.dilithium_public_key {
+                if pk.len() == 1952 { lt.add(&crate::registry_lthash::pk_row_lanes(&acct.address, pk)); }
+            }
+        }
+        lt
+    }
+
+    /// Recompute `dilithium_pk_root` from the STAGED accounts (`accounts_stage`) for the untrusted-
+    /// snapshot verify — mirror of `compute_registry_root_staged`. No seal exists during staging, so
+    /// this is always the from-scratch scan over the restored per-account pubkeys.
+    pub fn compute_dilithium_pk_root_staged(&self) -> [u8; 32] {
+        self.dpk_lt_from_accounts_cf("accounts_stage").root()
+    }
+
+    /// QC-signed digest of ALL committed (address -> ML-DSA-65 pk) bindings. FAST PATH = the per-
+    /// checkpoint seal; FALLBACK = one from-scratch O(active-senders) accounts scan (only on a snapshot
+    /// cold-join before the anchor seal exists). Bound into the macroblock Checkpoint as
+    /// `dilithium_pk_root` so a node joining via an UNTRUSTED snapshot verifies its restored per-account
+    /// pubkeys match the 2f+1-committed set — closing the elided-pk snapshot DoS at 100k cold-join.
+    /// The pk is write-once + immutable, so the accumulator == its value as-of any height >= last bind;
+    /// the seal pins the checkpoint head for the light client + snapshot verify.
+    pub fn compute_dilithium_pk_root(&self, height: u64) -> [u8; 32] {
+        if let Some(seal) = self.dpk_root_seal_get(height) { return seal; }
+        self.dpk_lt_from_accounts().root()
+    }
+
+    /// Seal-STRICT variant for CONSENSUS compute sites (checkpoint fields). Fast path = the per-head seal;
+    /// on a MISS it HEALS from the live accumulator when the pk-bind watermark proves it still equals the
+    /// as-of-`height` value (recovery for a dropped seal-write — see body), else `None` ⇒ the caller DEFERS.
+    /// It never falls back to the lossy tip-scoped accounts scan: that set is as-of this node's TIP, not
+    /// `height`, and pk carries no height, so publishing it would diverge from peers whenever a first-use
+    /// bind lands in (height, tip]. Snapshot cold-join keeps the scan.
+    pub fn compute_dilithium_pk_root_sealed(&self, height: u64) -> Option<[u8; 32]> {
+        if let Some(seal) = self.dpk_root_seal_get(height) { return Some(seal); }
+        // Recovery for a dropped seal-write: a transient RocksDB error at apply must NOT permanently mute
+        // this node's checkpoint votes at `height` (the finality-lag redrive re-signals the same head and
+        // would hit the same miss). pk is write-once, so the live accumulator == its as-of-`height` value
+        // IFF no bind landed after `height` — the watermark proves that. Re-seal from the live accumulator
+        // and return it. If a later bind diverged the accumulator, the as-of-`height` value is truly
+        // unrecoverable ⇒ still defer (None): quorum tolerates one node's rare residual defer.
+        if height >= self.dpk_last_bind_height() && self.seal_dilithium_pk_root(height).is_ok() {
+            return self.dpk_root_seal_get(height);
+        }
+        None
+    }
+
+    /// Bind an account's pk into the incremental LtHash exactly ONCE (marker `dpkctd_{addr}`). Called
+    /// from the DETERMINISTIC apply-commit (producer-inline AND validator) for each value-TX sender
+    /// whose account now carries a pk — NEVER the detached accounts persist (flush-timing non-det).
+    /// pk write-once ⇒ marker makes re-calls idempotent. One WriteBatch (accumulator + marker + journal
+    /// atomic). The journal row `dpkj_{height}{addr}` = 32-byte row seed gives the bind a HEIGHT, so a
+    /// reorg can subtract exactly the orphaned binds (rollback_dpk_binds_above) — the same height-bound
+    /// discipline cbw/registry_lthash already have. Pruned once the height is finality-covered.
+    pub fn dpk_lt_bind(&self, address: &str, pk: &[u8], height: u64) -> IntegrationResult<()> {
+        if pk.len() != 1952 { return Ok(()); }
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata cf missing".to_string()))?;
+        let mut marker = b"dpkctd_".to_vec();
+        marker.extend_from_slice(address.as_bytes());
+        if matches!(self.persistent.db.get_cf(&cf, &marker), Ok(Some(_))) { return Ok(()); }
+        let seed = crate::registry_lthash::pk_row_seed(address, pk);
+        let mut lt = self.dpk_lt_load();
+        lt.add(&crate::registry_lthash::lanes_from_seed(&seed));
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf, Self::DPK_LT_STATE_KEY, lt.to_bytes().as_ref());
+        batch.put_cf(&cf, &marker, &[1u8]);
+        let mut jk = b"dpkj_".to_vec();
+        jk.extend_from_slice(&height.to_be_bytes());
+        jk.extend_from_slice(address.as_bytes());
+        batch.put_cf(&cf, &jk, &seed);
+        self.persistent.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Reorg heal: subtract every journaled bind with height > `target` — the exact inverse of
+    /// dpk_lt_bind per orphaned entry, so the accumulator matches a from-genesis node at `target`.
+    /// Also drops the orphaned markers (unblocks the canonical re-bind) and stale seals above `target`.
+    /// O(rolled-back binds); one atomic batch, accumulator co-written. Call INSIDE the rollback barrier
+    /// only (applies quiesced ⇒ no concurrent bind). The bind watermark may now over-report — safe:
+    /// heal-on-read only gets stricter.
+    pub fn rollback_dpk_binds_above(&self, target: u64) -> IntegrationResult<u32> {
+        use rocksdb::{IteratorMode, Direction};
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata cf missing".to_string()))?;
+        let mut lt = self.dpk_lt_load();
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut n = 0u32;
+        let mut from = b"dpkj_".to_vec();
+        from.extend_from_slice(&(target.saturating_add(1)).to_be_bytes());
+        for item in self.persistent.db.iterator_cf(&cf, IteratorMode::From(&from, Direction::Forward)) {
+            let (k, v) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(b"dpkj_") { break; }
+            if v.len() == 32 && k.len() > 13 {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&v);
+                lt.remove(&crate::registry_lthash::lanes_from_seed(&seed));
+                let mut m = b"dpkctd_".to_vec();
+                m.extend_from_slice(&k[13..]);
+                batch.delete_cf(&cf, &m);
+                n += 1;
+            }
+            batch.delete_cf(&cf, &k);
+        }
+        // Seals above target are orphan-branch values; canonical re-apply re-seals each head.
+        let mut sfrom = b"dpkr_seal_".to_vec();
+        sfrom.extend_from_slice(&(target.saturating_add(1)).to_be_bytes());
+        for item in self.persistent.db.iterator_cf(&cf, IteratorMode::From(&sfrom, Direction::Forward)) {
+            let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(b"dpkr_seal_") { break; }
+            batch.delete_cf(&cf, &k);
+        }
+        if n > 0 {
+            batch.put_cf(&cf, Self::DPK_LT_STATE_KEY, lt.to_bytes().as_ref());
+        }
+        self.persistent.db.write(batch)?;
+        Ok(n)
+    }
+
+    /// Highest block height at which a pk bind mutated the accumulator. `compute_dilithium_pk_root_sealed`
+    /// heals a lost seal only for heights >= this: pk is write-once, so the live accumulator still equals
+    /// the as-of-height value there, whereas a later bind makes an earlier head's value unrecoverable.
+    pub fn dpk_last_bind_height(&self) -> u64 {
+        let cf = match self.persistent.db.cf_handle("metadata") { Some(c) => c, None => return 0 };
+        match self.persistent.db.get_cf(&cf, b"dpk_last_bind_h") {
+            Ok(Some(v)) if v.len() == 8 => u64::from_be_bytes(v[..8].try_into().unwrap_or_default()),
+            _ => 0,
+        }
+    }
+
+    /// Advance the pk-bind watermark to `max(current, height)` — monotonic, since a reorg re-applying a
+    /// lower head re-adds nothing under the write-once markers, so the watermark must never regress.
+    /// Called once per block whose apply drained >=1 pk bind, on both apply paths.
+    pub fn note_dpk_bind_height(&self, height: u64) -> IntegrationResult<()> {
+        if height <= self.dpk_last_bind_height() { return Ok(()); }
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata cf missing".to_string()))?;
+        self.persistent.db.put_cf(&cf, b"dpk_last_bind_h", &height.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Seal `dpkr_seal_{H}` = sha3(dpk_lt) at a checkpoint head (mirror seal_registry_root); prune one
+    /// retention window down. Called on BOTH apply paths beside seal_registry_root, after the binds.
+    pub fn seal_dilithium_pk_root(&self, height: u64) -> IntegrationResult<()> {
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata cf missing".to_string()))?;
+        let root = self.dpk_lt_load().root();
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut key = b"dpkr_seal_".to_vec();
+        key.extend_from_slice(&height.to_be_bytes());
+        batch.put_cf(&cf, &key, &root);
+        if height >= Self::REGISTRY_SEAL_RETENTION {
+            let mut old = b"dpkr_seal_".to_vec();
+            old.extend_from_slice(&(height - Self::REGISTRY_SEAL_RETENTION).to_be_bytes());
+            batch.delete_cf(&cf, &old);
+        }
+        self.persistent.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Prune bind-journal entries at/below `finalized_height` — the caller passes the SAME value that
+    /// guards `begin_finality_guarded_rollback`, so no still-rollback-eligible bind is ever dropped (the
+    /// local macroblock-body frontier runs AHEAD of finality during catch-up and MUST NOT be the floor).
+    /// INVARIANT: call ONLY from the LIVE post-boot apply path — LAST_FINALIZED_HEIGHT is then settled and
+    /// only advances (fetch_max), so prune-floor <= any future rollback floor. The two boot content-gate
+    /// stores (which may LOWER finality to enable fork-healing rollback) run before the first live prune.
+    /// Cap bounds one call; the FIFO-oldest remainder drains at the next checkpoint head (self-draining,
+    /// no starvation) — a mass first-use burst is a bounded transient, never unbounded growth.
+    pub fn prune_dpk_journal(&self, finalized_height: u64) -> IntegrationResult<()> {
+        use rocksdb::{IteratorMode, Direction};
+        if finalized_height == 0 { return Ok(()); }
+        let cf = match self.persistent.db.cf_handle("metadata") { Some(c) => c, None => return Ok(()) };
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut pruned = 0u32;
+        for item in self.persistent.db.iterator_cf(&cf, IteratorMode::From(b"dpkj_", Direction::Forward)) {
+            let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(b"dpkj_") || k.len() < 13 { break; }
+            let h = u64::from_be_bytes(k[5..13].try_into().unwrap_or_default());
+            if h > finalized_height || pruned >= 100_000 { break; }
+            batch.delete_cf(&cf, &k);
+            pruned += 1;
+        }
+        if pruned > 0 { self.persistent.db.write(batch)?; }
+        Ok(())
+    }
+
+    /// Rebuild dpk_lt + the `dpkctd_` markers from the accounts CF (boot + post-snapshot-apply +
+    /// post-reorg self-heal). Mirror rebuild_registry_lthash. Setting markers here is load-bearing: a
+    /// later re-assertion of an existing account's pk must NOT double-add after a rebuild. CRITICAL for
+    /// reorg: FIRST wipe every stale `dpkctd_` marker (the accounts CF is height-versioned, so a
+    /// rollback can strip an account's pk — but the marker lives in the un-rolled-back metadata CF; a
+    /// surviving marker would make the canonical re-bind a silent no-op ⇒ the accumulator drifts from a
+    /// from-genesis node ⇒ dilithium_pk_root fork). One atomic batch: clear markers → re-add present.
+    /// Shared core: clear every count-marker, then fold each authoritative (address, pk) bind into a
+    /// fresh LtHash, writing the accumulator LAST. Chunked so neither the marker sweep nor the fold
+    /// spikes memory at target scale (millions of value-sending accounts). Crash-safety: the accumulator
+    /// key is written last, and a crash mid-rebuild leaves stale markers the next rebuild clears first.
+    fn rebuild_dpk_lthash_core<I: Iterator<Item = (String, Vec<u8>)>>(&self, binds: I) -> IntegrationResult<u32> {
+        use rocksdb::{IteratorMode, Direction};
+        const DPK_REBUILD_CHUNK: usize = 20_000;
+        let cf = self.persistent.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata cf missing".to_string()))?;
+        let mut lt = crate::registry_lthash::LtHash::new();
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut pending = 0usize;
+        // Clear every existing count-marker so a rollback-orphaned account cannot block its re-bind.
+        let mprefix = b"dpkctd_".as_ref();
+        for item in self.persistent.db.iterator_cf(&cf, IteratorMode::From(mprefix, Direction::Forward)) {
+            let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(mprefix) { break; }
+            batch.delete_cf(&cf, &k);
+            pending += 1;
+            if pending >= DPK_REBUILD_CHUNK {
+                self.persistent.db.write(std::mem::take(&mut batch))?;
+                pending = 0;
+            }
+        }
+        let mut n = 0u32;
+        for (address, pk) in binds {
+            if pk.len() != 1952 { continue; }
+            lt.add(&crate::registry_lthash::pk_row_lanes(&address, &pk));
+            let mut m = b"dpkctd_".to_vec();
+            m.extend_from_slice(address.as_bytes());
+            batch.put_cf(&cf, &m, &[1u8]);
+            n += 1;
+            pending += 1;
+            if pending >= DPK_REBUILD_CHUNK {
+                self.persistent.db.write(std::mem::take(&mut batch))?;
+                pending = 0;
+            }
+        }
+        // Accumulator LAST: it is the value every reader trusts, so it must not become visible before the
+        // markers that justify it.
+        batch.put_cf(&cf, Self::DPK_LT_STATE_KEY, lt.to_bytes().as_ref());
+        self.persistent.db.write(batch)?;
+        // A rebuild sets the accumulator to as-of-tip WITHOUT per-bind heights, so the heal-on-read guard
+        // in compute_dilithium_pk_root_sealed must not keep trusting a watermark that predates it: raise
+        // the watermark to the tip. Monotonic max ⇒ this only ever makes the guard STRICTER (defer instead
+        // of heal), never looser, so it cannot introduce a wrong-heal on any path.
+        let _ = self.note_dpk_bind_height(self.get_chain_height().unwrap_or(0));
+        // Journal consistency after a full refold: an entry whose marker was NOT re-created belongs to
+        // a bind absent from the rebuilt set — drop it so a later reorg cannot subtract a row the
+        // accumulator no longer holds. O(journal) = unfinalized window only.
+        {
+            use rocksdb::{IteratorMode, Direction};
+            let mut jbatch = rocksdb::WriteBatch::default();
+            for item in self.persistent.db.iterator_cf(&cf, IteratorMode::From(b"dpkj_", Direction::Forward)) {
+                let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+                if !k.starts_with(b"dpkj_") || k.len() < 13 { break; }
+                let mut m = b"dpkctd_".to_vec();
+                m.extend_from_slice(&k[13..]);
+                if !matches!(self.persistent.db.get_cf(&cf, &m), Ok(Some(_))) {
+                    jbatch.delete_cf(&cf, &k);
+                }
+            }
+            self.persistent.db.write(jbatch)?;
+        }
+        Ok(n)
+    }
+
+    /// Recompute the dpk accumulator by SCANNING the accounts CF. Correct ONLY on the snapshot paths
+    /// (apply + promote), where that CF *is* the verified restored state. NOT for boot (best-effort CF
+    /// tail can be lost — boot feeds the in-memory tip via `rebuild_dilithium_pk_lthash_from`) and NOT
+    /// for reorg (the rollback subtracts journaled binds via `rollback_dpk_binds_above`).
+    pub fn rebuild_dilithium_pk_lthash(&self) -> IntegrationResult<u32> {
+        let acf = match self.persistent.db.cf_handle("accounts") { Some(c) => c, None => return Ok(0) };
+        let src = self.persistent.db.iterator_cf(&acf, rocksdb::IteratorMode::Start)
+            .filter_map(|item| {
+                let (_, v) = item.ok()?;
+                let acct: qnet_state::Account = bincode::deserialize(&v).ok()?;
+                let pk = acct.dilithium_public_key?;
+                if pk.len() == 1952 { Some((acct.address, pk)) } else { None }
+            });
+        self.rebuild_dpk_lthash_core(src)
+    }
+
+    /// Recompute the dpk accumulator from an EXPLICIT authoritative (address, pk) set. The boot path feeds
+    /// the in-memory StateManager tip here: the applied microblock log is authoritative, while the accounts
+    /// CF is a best-effort background mirror whose tail an unclean restart can drop — scanning it at boot
+    /// would omit rows AND clear their markers, forking that node's dilithium_pk_root permanently.
+    pub fn rebuild_dilithium_pk_lthash_from(&self, binds: &[(String, Vec<u8>)]) -> IntegrationResult<u32> {
+        self.rebuild_dpk_lthash_core(binds.iter().map(|(a, p)| (a.clone(), p.clone())))
     }
 
     /// Read a per-checkpoint-head seal `rr_seal_{H}` = sha3(lt_state as-of reg_height<=H), if present.
@@ -9994,6 +10329,11 @@ impl Storage {
                     if let Err(e) = self.rebuild_registry_lthash(height) {
                         println!("[WARN][SNAPSHOT] registry_lthash_rebuild_failed err={}", e);
                     }
+                    // FIX-5: derive dilithium_pk_root LtHash from the restored accounts (metadata CF is
+                    // not snapshot-carried) so elided-pk verify + the next checkpoint match the network.
+                    if let Err(e) = self.rebuild_dilithium_pk_lthash() {
+                        println!("[WARN][SNAPSHOT] dilithium_pk_lthash_rebuild_failed err={}", e);
+                    }
                     // Never inherit peer-supplied rich-list rows (display-only, snapshot-unverified) —
                     // the boot rebuild re-derives from the restored accounts.
                     let _ = self.richlist_clear();
@@ -11312,6 +11652,21 @@ impl Storage {
                             hex::encode(&cp.registry_root[..8]), hex::encode(&computed_rr[..8]),
                         )));
                     }
+                    // FIX-5: same anti-forge boundary for the per-account ML-DSA-65 pk set. The account
+                    // merkle (state_root) does NOT cover pk (excluded from hash_account by design), so an
+                    // untrusted snapshot server could serve correct balances but omit/alter an account's
+                    // pk → a joiner would stall that account's ELIDED TXs forever (unresolvable signer)
+                    // or admit a rebound key. Recompute dilithium_pk_root over the STAGED accounts and
+                    // compare to the QC-certified cp.dilithium_pk_root. Same gate as registry_root.
+                    let computed_dpk = self.compute_dilithium_pk_root_staged();
+                    if computed_dpk != cp.dilithium_pk_root {
+                        self.discard_snapshot_state(snapshot_height)?;
+                        return Err(IntegrationError::Other(format!(
+                            "snapshot_dilithium_pk_root_mismatch h={} mb={} committed={} computed={}",
+                            snapshot_height, mb_idx,
+                            hex::encode(&cp.dilithium_pk_root[..8]), hex::encode(&computed_dpk[..8]),
+                        )));
+                    }
                 }
                 None => {
                     self.discard_snapshot_state(snapshot_height)?;
@@ -11433,6 +11788,9 @@ impl Storage {
         self.backfill_roster_indices()?;
         self.rebuild_committed_burn_wallet(height)?;
         self.rebuild_registry_lthash(height)?;
+        // FIX-5: dilithium_pk_root LtHash from the promoted live accounts — same fail-closed discipline
+        // as cbw/registry (Err leaves staging + marker so the promote retries, never finalizes stale).
+        self.rebuild_dilithium_pk_lthash()?;
         // Rich-list index is display-only and NOT snapshot-verified: clear any promoted/inherited rows
         // + the build marker so the joiner never serves a peer-supplied (possibly forged) rich list.
         // The boot rebuild then re-derives it locally from the verified accounts.
@@ -12794,6 +13152,91 @@ mod v32_9_pattern_c_tests {
         storage.rebuild_registry_lthash(head).unwrap();
         assert_eq!(storage.registry_lt_load().root(), live, "rebuilt accumulator == live (all regs <= head)");
         assert_eq!(storage.compute_registry_root(head), live, "rebuild seals the tip ⇒ O(1) read == live");
+    }
+
+    #[test]
+    fn dpk_lthash_incremental_matches_rebuild() {
+        // FIX-5: the incremental per-block bind (dpk_lt_bind, marker-guarded) MUST yield a
+        // dilithium_pk_root byte-identical to the from-scratch rebuild over the accounts CF
+        // (boot/snapshot/reorg) — else a producer that bound pks incrementally forks from a
+        // snapshot-joined node that rebuilt them. Also: order-independent, duplicate-immune,
+        // pkless accounts contribute nothing.
+        let (storage, _dir) = open_test_storage();
+        let pk_a = vec![0xA1u8; 1952];
+        let pk_b = vec![0xB2u8; 1952];
+        let mut acct_a = qnet_state::Account::new("addrA".to_string());
+        acct_a.dilithium_public_key = Some(pk_a.clone());
+        let mut acct_b = qnet_state::Account::new("addrB".to_string());
+        acct_b.dilithium_public_key = Some(pk_b.clone());
+        let acct_c = qnet_state::Account::new("addrC".to_string()); // no pk (elided / not-yet-bound)
+        storage.persistent.persist_accounts_sync(&[
+            ("addrA".to_string(), acct_a),
+            ("addrB".to_string(), acct_b),
+            ("addrC".to_string(), acct_c),
+        ]).unwrap();
+        // Incremental binds in an ARBITRARY order + a duplicate (the marker must absorb it).
+        storage.dpk_lt_bind("addrB", &pk_b, 10).unwrap();
+        storage.dpk_lt_bind("addrA", &pk_a, 11).unwrap();
+        storage.dpk_lt_bind("addrB", &pk_b, 12).unwrap(); // duplicate ⇒ marker no-op (no double-add)
+        let incremental = storage.dpk_lt_load().root();
+        // From-scratch rebuild over the accounts CF (the boot / snapshot-promote / reorg path).
+        storage.rebuild_dilithium_pk_lthash().unwrap();
+        let rebuilt = storage.dpk_lt_load().root();
+        assert_eq!(incremental, rebuilt, "incremental bind == from-scratch rebuild (order-independent, no double-add)");
+        // Root == LtHash over EXACTLY the pk-bearing accounts (addrC pkless ⇒ excluded).
+        let mut scratch = crate::registry_lthash::LtHash::new();
+        scratch.add(&crate::registry_lthash::pk_row_lanes("addrA", &pk_a));
+        scratch.add(&crate::registry_lthash::pk_row_lanes("addrB", &pk_b));
+        assert_eq!(rebuilt, scratch.root(), "root == LtHash over exactly the pk-bearing accounts");
+        // Seal ⇒ O(1) checkpoint read equals the live accumulator.
+        storage.seal_dilithium_pk_root(90).unwrap();
+        assert_eq!(storage.compute_dilithium_pk_root(90), incremental, "seal ⇒ O(1) checkpoint read == live root");
+    }
+
+    #[test]
+    fn dpk_rollback_subtracts_orphan_binds() {
+        // Reorg: journaled binds above target are subtracted exactly, markers cleared (re-bind
+        // unblocked), and the result is byte-identical to a node that never saw the orphan branch.
+        let (storage, _dir) = open_test_storage();
+        let pk_a = vec![0xA1u8; 1952];
+        let pk_b = vec![0xB2u8; 1952];
+        let pk_c = vec![0xC3u8; 1952];
+        storage.dpk_lt_bind("addrA", &pk_a, 40).unwrap();  // canonical (<= target)
+        let canonical = storage.dpk_lt_load().root();
+        storage.dpk_lt_bind("addrB", &pk_b, 55).unwrap();  // orphan branch
+        storage.dpk_lt_bind("addrC", &pk_c, 61).unwrap();  // orphan branch
+        storage.seal_dilithium_pk_root(60).unwrap();       // orphan-branch seal
+        let n = storage.rollback_dpk_binds_above(50).unwrap();
+        assert_eq!(n, 2, "exactly the two orphan binds subtracted");
+        assert_eq!(storage.dpk_lt_load().root(), canonical, "accumulator == pre-orphan canonical");
+        assert!(storage.dpk_root_seal_get(60).is_none(), "orphan seal dropped");
+        // Marker cleared ⇒ the canonical re-bind of the same account lands (not a marker no-op).
+        storage.dpk_lt_bind("addrB", &pk_b, 51).unwrap();
+        let mut expect = crate::registry_lthash::LtHash::new();
+        expect.add(&crate::registry_lthash::pk_row_lanes("addrA", &pk_a));
+        expect.add(&crate::registry_lthash::pk_row_lanes("addrB", &pk_b));
+        assert_eq!(storage.dpk_lt_load().root(), expect.root(), "canonical re-bind == from-scratch");
+        // Idempotent on an empty range.
+        assert_eq!(storage.rollback_dpk_binds_above(50).unwrap(), 1, "re-bind at 51 subtracted again");
+        assert_eq!(storage.dpk_lt_load().root(), canonical, "back to canonical");
+    }
+
+    #[test]
+    fn dpk_journal_prune_respects_finality_floor() {
+        // prune_dpk_journal must drop ONLY finality-covered entries (height <= floor); rollback-eligible
+        // entries above the floor MUST survive so a later reorg can still subtract them.
+        let (storage, _dir) = open_test_storage();
+        let pk = vec![0xD4u8; 1952];
+        storage.dpk_lt_bind("a1", &pk, 100).unwrap();
+        storage.dpk_lt_bind("a2", &pk, 200).unwrap();
+        storage.dpk_lt_bind("a3", &pk, 300).unwrap();
+        storage.prune_dpk_journal(0).unwrap();   // finalized=0 ⇒ no-op
+        assert_eq!(storage.rollback_dpk_binds_above(50).unwrap(), 3, "floor 0 pruned nothing");
+        storage.dpk_lt_bind("a1", &pk, 100).unwrap();
+        storage.dpk_lt_bind("a2", &pk, 200).unwrap();
+        storage.dpk_lt_bind("a3", &pk, 300).unwrap();
+        storage.prune_dpk_journal(200).unwrap();  // finalized=200 ⇒ drops 100,200; keeps 300
+        assert_eq!(storage.rollback_dpk_binds_above(50).unwrap(), 1, "only the above-floor bind (300) survives");
     }
 
     #[test]

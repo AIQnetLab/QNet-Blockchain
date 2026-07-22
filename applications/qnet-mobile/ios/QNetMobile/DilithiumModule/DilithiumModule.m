@@ -217,6 +217,48 @@ RCT_EXPORT_METHOD(sign:(NSString *)message
 }
 
 /**
+ * FIX-5: signDetached(message, secretKeySeed) → { signature }
+ * Returns ONLY the RAW detached ML-DSA-65 signature (3309 bytes) as hex — no "dilithium_sig_" envelope,
+ * no base64, no embedded message, no pubkey trailer. Matches the node's raw-detached value-TX verifier.
+ */
+RCT_EXPORT_METHOD(signDetached:(NSString *)message
+                  secretKeySeed:(NSString *)secretKeySeed
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+{
+    uint8_t sk[DILITHIUM_SK_SIZE];
+    BOOL isRawHex = (secretKeySeed.length == DILITHIUM_SK_SIZE * 2) &&
+                    hexToBytes(secretKeySeed, sk, DILITHIUM_SK_SIZE);
+    if (!isRawHex) {
+        const char *seedStr = secretKeySeed.UTF8String;
+        uint8_t seed32[32];
+        deriveSeedFromString(seedStr, strlen(seedStr), seed32);
+        dilithium_set_keygen_seed(seed32);
+        uint8_t pk_tmp[DILITHIUM_PK_SIZE];
+        if (PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk_tmp, sk) != 0) {
+            dilithium_clear_keygen_seed();
+            reject(@"DILITHIUM_SIGN_ERROR", @"Failed to re-derive keypair from seed", nil);
+            return;
+        }
+        dilithium_clear_keygen_seed();
+    }
+
+    const uint8_t *msgBytes = (const uint8_t *)message.UTF8String;
+    size_t msgLen = strlen(message.UTF8String);
+    uint8_t sig[DILITHIUM_SIG_SIZE];
+    size_t  sigLen = 0;
+    int ret = PQCLEAN_MLDSA65_CLEAN_crypto_sign_signature(sig, &sigLen, msgBytes, msgLen, sk);
+    memset(sk, 0, DILITHIUM_SK_SIZE);
+
+    if (ret != 0 || sigLen != DILITHIUM_SIG_SIZE) {
+        reject(@"DILITHIUM_SIGN_ERROR",
+               [NSString stringWithFormat:@"signDetached failed: ret=%d sigLen=%zu", ret, sigLen], nil);
+        return;
+    }
+    resolve(@{ @"signature": bytesToHex(sig, sigLen) }); // hex of the raw 3309-byte detached sig
+}
+
+/**
  * verify(message, signatureHex, publicKeyHex) → boolean
  *
  * signatureHex: hex-encoded raw 3309-byte signature (not the formatted string).

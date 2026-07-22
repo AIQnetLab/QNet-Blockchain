@@ -3215,10 +3215,15 @@ const WalletScreen = () => {
       delete loadedWallet._migratedFromVersion;
 
       setWallet(loadedWallet);
-      
+
       // Load balance in parallel
       loadBalance(loadedWallet.publicKey);
-      
+
+      // Retry a pending on-chain node registration if one was left unlanded. Password is available here;
+      // the wallet ML-DSA key that signs the on-chain TX can't be decrypted on a background push wake, so
+      // unlock is the retry point. Fire-and-forget — never blocks the UI.
+      walletManager.retryPendingOnchainRegistration(pw).catch(() => {});
+
       // Restore activation state + cached server status from AsyncStorage immediately
       // Then verify on-chain in background — clear stale cache if not found
       Promise.all([

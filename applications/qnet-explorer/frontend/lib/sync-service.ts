@@ -297,8 +297,9 @@ function transformTransaction(
   const amount = Number(tx.amount) || 0;
   const nonce = Number(tx.nonce) || 0;
 
-  const isQuantumSigned = !!(tx.is_quantum_signed || 
-    (tx.dilithium_signature && tx.dilithium_public_key));
+  // FIX-5: gate on the SIGNATURE only — under pk-elision dilithium_public_key is null for every tx
+  // after an address's first on-chain use, so requiring it would mislabel signed txs as "Unsigned".
+  const isQuantumSigned = !!(tx.is_quantum_signed || tx.dilithium_signature);
 
   const fromRaw = tx.from || tx.from_address;
   if (!fromRaw || (typeof fromRaw === 'string' && fromRaw.length === 0)) {
@@ -341,8 +342,10 @@ function transformTransaction(
     gas_limit: Math.max(0, Number(tx.gas_limit) || 0),
     signature: tx.signature ? String(tx.signature) : null,
     public_key: tx.public_key ? String(tx.public_key) : null,
-    dilithium_signature: tx.dilithium_signature ? String(tx.dilithium_signature) : null,
-    dilithium_public_key: tx.dilithium_public_key ? String(tx.dilithium_public_key) : null,
+    // FIX-5: node emits hex of the raw detached sig / raw pk; bytesToHex passes a hex string through
+    // and also maps a serde number[] fallback → hex. pk is often null now (elided after first use).
+    dilithium_signature: tx.dilithium_signature ? bytesToHex(tx.dilithium_signature) : null,
+    dilithium_public_key: tx.dilithium_public_key ? bytesToHex(tx.dilithium_public_key) : null,
     tx_type: mapTxType((tx.tx_type || tx.type) as string | object | undefined),
     tx_type_data: extractTxTypeData((tx.tx_type || tx.type) as string | object | undefined),
     data: tx.data ? (String(tx.data).length > 100000 ? String(tx.data).substring(0, 100000) : String(tx.data)) : null,

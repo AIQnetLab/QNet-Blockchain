@@ -393,8 +393,8 @@ export async function GET(
     // Determine transaction signature type
     const from = (tx.from_address || tx.from || 'unknown') as string;
     const isSystemTx = from.startsWith('system_') || from === 'genesis' || blockHeight === 0;
-    const isQuantumSigned = !!(tx.is_quantum_signed || 
-      (tx.dilithium_signature && tx.dilithium_public_key));
+    // FIX-5: sig-only (pk elided after first use → requiring it would mislabel signed txs Unsigned)
+    const isQuantumSigned = !!(tx.is_quantum_signed || tx.dilithium_signature);
     
     // 3 signature types
     let signatureType: string;

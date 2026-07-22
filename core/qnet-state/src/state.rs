@@ -824,6 +824,13 @@ impl StateMerkleTree {
         // consensus-bound, else nodes diverge on which epochs an account already claimed.
         hasher.update(b"LCE:");
         hasher.update(&account.last_claimed_epoch.to_le_bytes());
+        // FIX-5 (pk-elision): dilithium_public_key is DELIBERATELY EXCLUDED from the leaf hash. The
+        // account `address` (hashed above) already IS a cryptographic commitment to the key —
+        // address == format_eon(SHA512(pk)) — so folding the pk in would double-commit the same
+        // information and force every balance/light proof to carry the 1952-byte key. Integrity of
+        // the stored key is instead self-certified by `eon(pk)==address`, checked at every verify
+        // and once at snapshot-apply (a tampered pk fails derivation → snapshot rejected). This keeps
+        // proofs small and the leaf schema byte-identical to pre-FIX-5 for balance-proof verifiers.
         // EXCLUDED from hash (non-deterministic or metadata-only):
         //   - reputation: f64 is non-deterministic across platforms
         //   - is_node, node_type, created_at, updated_at: metadata only
@@ -1834,6 +1841,25 @@ impl StateManager {
         }
         None
     }
+
+    /// FIX-5: read ONLY an account's committed ML-DSA-65 pubkey WITHOUT cloning the whole Account.
+    /// `get_account` clones balance + nonce + all token/contract_storage entries; the elided-pk verify
+    /// hot path (rehydrate_elided_pk) needs just the 1952-byte pk. At a ≤1000-node committee running max
+    /// TPS with active elision, every value-TX would otherwise pay a full-Account clone per verify — this
+    /// clones only the pk Vec (in-memory ref read in place; disk fallback loads one cold account). None if
+    /// absent or the account carries no bound pk (first-use / never-transacted).
+    pub fn get_account_dilithium_pk(&self, address: &str) -> Option<Vec<u8>> {
+        if let Some(acc) = self.accounts.get(address) {
+            return acc.dilithium_public_key.clone();
+        }
+        let store_guard = self.disk_store.read();
+        if let Some(ref store) = *store_guard {
+            if let Some(account) = store.load_account(address) {
+                return account.dilithium_public_key;
+            }
+        }
+        None
+    }
     
     /// Update account
     /// v3.22: Uses lazy Merkle update - call finalize_merkle() after batch updates
@@ -2104,6 +2130,7 @@ impl StateManager {
             last_claimed_epoch: 0,
             // Inert for this native (is_contract=false) reconstruction — the SROOT branch never reads it.
             storage_root: [0u8; 32],
+            dilithium_public_key: None, // FIX-5: inert for proof reconstruction (not part of TokenBalanceProof leaf inputs)
         };
 
         StateMerkleTree::verify_proof(
@@ -2151,6 +2178,7 @@ impl StateManager {
             heartbeat_final_count: proof.heartbeat_final_count,
             last_claimed_epoch: proof.last_claimed_epoch,
             storage_root: proof.storage_root,
+            dilithium_public_key: None, // FIX-5: contract accounts never sign → never bind a pk (None reproduces the leaf)
         };
         StateMerkleTree::verify_proof(&proof.contract_address, &account, &proof.account_proof, &proof.state_root)
     }

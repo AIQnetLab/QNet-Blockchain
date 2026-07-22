@@ -394,31 +394,48 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                     },
                 }
             }
-            Effect::Finalize { index, head_height, state_root } => {
-                // Finalize a checkpoint on ITS OWN QC'd head + state_root — NOT via a macroblock body.
-                // Macroblocks seal only on /macro_interval boundaries; intra-window checkpoints on the
-                // faster /cp_interval cadence have none, so the old macroblock-coupled check deferred
-                // them forever, froze the finality marker, and wedged the chain. Fail-stop: advance the
-                // monotonic marker (LAST_FINALIZED_HEIGHT, read by the production_gate / sync / RPC) ONLY
-                // if our local microblock tip reached the head AND our locally-applied state at the head
-                // matches the QC'd state_root (never finalize a root we didn't reproduce). Monotonic ⇒
-                // a stale/replayed Finalize never regresses it, and finality never outruns the applied tip.
+            Effect::Finalize { index, head_height, state_root, mb_hashes } => {
+                // Finalize a checkpoint on ITS OWN QC'd head + state_root + per-height body hashes — NOT via
+                // a macroblock body (intra-window checkpoints on the /cp_interval cadence have none). Advance
+                // the monotonic marker ONLY if: tip reached the head AND local head state == QC'd state_root
+                // AND every local body in the window matches the QC'd mb_hashes. The last gate is the safety
+                // fix: a same-state-different-body failover fork tail passes state_root but NOT the body-hash
+                // check, so finality can never pin a fork. Sub-anchor history (snapshot-carried) is trusted.
                 let chain_h = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
                 let local_root = storage.load_microblock_auto_format(head_height).ok().flatten()
                     .map(|m| m.state_root);
-                if checkpoint_finalizable(chain_h, head_height, local_root, state_root) {
+                let anchor_ok = crate::node::SNAPSHOT_ANCHOR_MB.load(Ordering::SeqCst).saturating_mul(90) >= head_height;
+                let win = mb_hashes.len() as u64;
+                // ONE window scan, shared by the gate below and the repair loop (two hand-rolled passes each
+                // re-loaded every body). Same comparator as every other finality-advance path.
+                let verdict = if !anchor_ok && win > 0 && win <= head_height {
+                    let start = head_height - (win - 1);
+                    Some(crate::node::BlockchainNode::window_content_verdict(
+                        &storage, &mb_hashes, start, head_height))
+                } else { None };
+                let content_ok = anchor_ok
+                    || verdict.as_ref().map_or(false, |(miss, mism)| miss.is_empty() && mism.is_empty());
+                if content_ok && checkpoint_finalizable(chain_h, head_height, local_root, state_root) {
                     if head_height > crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::Acquire) {
                         crate::node::try_advance_finality(head_height, "BFT2");
                         if crate::node::is_info() {
                             println!("[INFO][BFT2] checkpoint_final round={} finalized_h={}", index, head_height);
                         }
                     }
-                } else if crate::node::is_warn() {
-                    // Transient: chain tip not yet at the head, or (fail-stop) our state diverges. The
-                    // run-loop timer re-emits via committed_finalize() until caught up; §4.5 sync repairs a
-                    // genuine state divergence. NOT the old permanent defer (no macroblock dependency now).
-                    println!("[WARN][BFT2] finalize_deferred round={} head_h={} chain_h={} state_match={}",
-                             index, head_height, chain_h, local_root == Some(state_root));
+                } else {
+                    // Transient (tip below head) OR fail-stop (state/body divergence). The run-loop timer
+                    // re-emits via committed_finalize() until caught up. On a body divergence, solicit repair
+                    // for the window so fork-choice supersedes the local losing tail; self-throttled.
+                    // Reuse the single scan above; capped like every other repair kick (self-throttled anyway).
+                    if let Some((missing, mismatched)) = verdict.as_ref() {
+                        for h in missing.iter().chain(mismatched.iter()).take(32) {
+                            let _ = p2p.request_block_repair(*h).await;
+                        }
+                    }
+                    if crate::node::is_warn() {
+                        println!("[WARN][BFT2] finalize_deferred round={} head_h={} chain_h={} state_match={} content_ok={}",
+                                 index, head_height, chain_h, local_root == Some(state_root), content_ok);
+                    }
                 }
             }
         }
@@ -439,6 +456,7 @@ pub enum V2Event {
         banned: Vec<String>,           // QC-bound cumulative ban set (binds stored banned_validators)
         reward_root: Hash,             // per-epoch reward merkle root ([0;32] off emission boundary)
         registry_root: Hash,           // deterministic Super/genesis registry digest (snapshot-forge defence)
+        dilithium_pk_root: Hash,       // FIX-5: (address->pk) LtHash digest (elided-pk snapshot-forge defence)
         logs_root: Hash,               // consensus event logs root (native QRC-20/721 + WASM), ACTIVE from genesis (gate=0)
         total_supply: u64,             // QC-bound total minted supply (cold-joiner reads this, not balance sum)
     },
@@ -462,6 +480,7 @@ struct WindowContent {
     banned: Vec<String>,   // QC-bound cumulative ban set (folded into epoch_commitment)
     reward_root: Hash,     // per-epoch reward merkle root, QC-certified via Checkpoint.reward_root
     registry_root: Hash,   // Super/genesis registry digest, QC-certified via Checkpoint.registry_root
+    dilithium_pk_root: Hash, // FIX-5: (address->pk) digest, QC-certified via Checkpoint.dilithium_pk_root
     logs_root: Hash,       // consensus event logs root (native QRC-20/721 + WASM), ACTIVE from genesis (gate=0)
     total_supply: u64,     // total minted supply, QC-certified via Checkpoint.total_supply
 }
@@ -477,7 +496,7 @@ fn try_propose(
     match buf.get(&w) {
         Some(c) => {
             *committee = c.committee.clone(); // committee is per-window (epoch); QC/TC verify against it
-            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root, c.logs_root, c.total_supply)
+            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root, c.dilithium_pk_root, c.logs_root, c.total_supply)
         }
         None => Vec::new(),
     }
@@ -515,6 +534,7 @@ fn check_content(storage: &Storage, buf: &std::collections::HashMap<u64, WindowC
         || qnet_consensus::checkpoint_bft::epoch_commitment(&c.eligible, &c.committee, &c.banned) != cp.epoch_commitment
         || cp.reward_root != c.reward_root
         || (qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height) && cp.registry_root != c.registry_root)
+        || (qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height) && cp.dilithium_pk_root != c.dilithium_pk_root)
         || (qnet_state::feature_gates::is_active("logs_root_required", cp.window_head_height) && cp.logs_root != c.logs_root)
         || (qnet_state::feature_gates::is_active("registry_root_required", cp.window_head_height) && cp.total_supply != c.total_supply)
     { return ContentCheck::Reject; }
@@ -609,10 +629,10 @@ pub fn route_inbound(data: Vec<u8>) {
 pub fn signal_window_end(
     index: u64, head_height: u64, mb_hashes: Vec<Hash>, state_root: Hash, beacon: Hash,
     committee: Vec<String>, eligible_producers: Vec<u8>, banned: Vec<String>, reward_root: Hash,
-    registry_root: Hash, logs_root: Hash, total_supply: u64,
+    registry_root: Hash, dilithium_pk_root: Hash, logs_root: Hash, total_supply: u64,
 ) {
     if let Some(tx) = V2_TX.get() {
-        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root, registry_root, logs_root, total_supply });
+        let _ = tx.send(V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee, eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, logs_root, total_supply });
     }
 }
 
@@ -749,7 +769,7 @@ pub async fn run(
                             Err(_) => Vec::new(),
                         }
                     }
-                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned, reward_root, registry_root, logs_root, total_supply } => {
+                    V2Event::WindowEnd { index, head_height, mb_hashes, state_root, beacon, committee: cmt, eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, logs_root, total_supply } => {
                         // Buffer this window's content (head microblock's real timestamp rides in
                         // the QC-agreed checkpoint). Then propose the contiguous next window if we
                         // lead, and replay buffered inbound.
@@ -757,7 +777,7 @@ pub async fn run(
                         let head_ts = storage.load_microblock_auto_format(head_height)
                             .ok().flatten().map(|m| m.timestamp).unwrap_or(0);
                         window_buf.insert(index, WindowContent {
-                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root, logs_root, total_supply,
+                            mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, logs_root, total_supply,
                         });
                         if window_buf.len() > MAX_WINDOW_BUF {
                             if let Some(&lo) = window_buf.keys().min() { window_buf.remove(&lo); }
@@ -862,10 +882,10 @@ pub async fn run(
                 // attempt every tick while the committed head is ahead of finality. try_advance_finality
                 // is monotonic + guarded (chain_h ≥ head, state match) ⇒ a no-op once caught up and it
                 // NEVER advances finality past the applied tip.
-                if let Some((head, sr)) = driver.committed_finalize() {
+                if let Some((head, sr, mbh)) = driver.committed_finalize() {
                     if head > crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::Acquire) {
                         let idx = driver.committed_index();
-                        execute(vec![Effect::Finalize { index: idx, head_height: head, state_root: sr }], &node_id, &p2p, &storage).await;
+                        execute(vec![Effect::Finalize { index: idx, head_height: head, state_root: sr, mb_hashes: mbh }], &node_id, &p2p, &storage).await;
                     }
                 }
             }
@@ -925,7 +945,7 @@ mod content_gate_tests {
 
     fn wc(hashes: Vec<[u8; 32]>, sr: [u8; 32], beacon: [u8; 32]) -> WindowContent {
         WindowContent { mb_hashes: hashes, state_root: sr, beacon, head_ts: 0, committee: vec![],
-            eligible: vec![], banned: vec![], reward_root: [0u8; 32], registry_root: [0u8; 32],
+            eligible: vec![], banned: vec![], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32],
             logs_root: [0u8; 32], total_supply: 0 }
     }
 
@@ -933,7 +953,7 @@ mod content_gate_tests {
         Checkpoint { index: head / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL, parent_qc: None,
             window_head_height: head, window_mb_hashes: hashes, state_root: sr, beacon,
             epoch_commitment: qnet_consensus::checkpoint_bft::epoch_commitment(&[], &[], &[]),
-            reward_root: [0u8; 32], registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0,
+            reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0,
             timestamp: 0, proposer: "p".to_string(), proposer_sig: vec![] }
     }
 

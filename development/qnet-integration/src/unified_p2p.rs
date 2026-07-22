@@ -3153,6 +3153,16 @@ pub struct ShredProtocolChunk {
     /// to detect chunk corruption/tampering before expensive full-block validation.
     #[serde(default)]
     pub block_hash: Option<[u8; 32]>,
+    /// TPS/self-describing FEC: the number of Reed-Solomon CODING (parity) shreds the PRODUCER actually
+    /// generated for this block. The decoder MUST reconstruct with `ReedSolomon::new(total_chunks,
+    /// num_coding_shreds)` — the SAME dimensions the encoder used. Guessing it (the legacy `total*0.5`
+    /// estimate) mismatches an adaptive-redundancy encoder (2.0–2.5×) and makes `rs.reconstruct()` return
+    /// Ok-but-WRONG bytes (caught downstream by block_hash ⇒ discard ⇒ repair storm under load). Carried
+    /// on EVERY chunk so any first-seen chunk sizes the parity vector correctly. serde(default)=0 means
+    /// "producer didn't populate it" ⇒ decoder falls back to the legacy estimate (never hit at fresh
+    /// genesis, where every chunk carries the true count).
+    #[serde(default)]
+    pub num_coding_shreds: usize,
 }
 
 /// v2.26: Producer certificate for block signature verification
@@ -6721,23 +6731,34 @@ impl SimplifiedP2P {
         // higher base redundancy — one dropped chunk on a 5-node mesh is 25%
         // perceived loss vs ~5% on 100 nodes, and recovery needs 67% of
         // chunks. Large committees (1000+) get statistical resilience from
-        // fan-out, so extra redundancy isn't worth the bandwidth. Tiers:
-        // <100KB 2.0x genesis / 1.5x scale; <500KB 2.0 / 1.75; <2MB 2.0;
-        // ≥2MB 2.5. Proxy for committee size: connected_peers_lockfree ≤50.
+        // fan-out, so extra redundancy isn't worth the bandwidth. Tiers
+        // (genesis small-committee / large-committee scale):
+        // <100KB 2.0x / 1.5x; <500KB 2.0 / 1.75; ≥500KB 2.0 / 1.5.
+        // Proxy for committee size: connected_peers_lockfree ≤50.
         let live_peer_count = self.connected_peers_lockfree.len();
         let small_committee = live_peer_count <= 50;
         let adaptive_redundancy = if original_block_size < 100_000 {
             if small_committee { 2.0 } else { SHRED_PROTOCOL_REDUNDANCY_FACTOR } // genesis: 2x; large: 1.5x
         } else if original_block_size < 500_000 {
             if small_committee { 2.0 } else { 1.75 }
-        } else if original_block_size < 2_000_000 {
-            2.0   // Large blocks - 100% redundancy
         } else {
-            2.5   // Very large blocks - extra safety
+            // Large blocks are the MAX-TPS regime, and redundancy multiplies every relay's egress — the
+            // exact TPS ceiling. Small committees (genesis) keep 2.0× (100% parity): one dropped shred on a
+            // few-node mesh is a large fraction and there are few alternate relay paths. A LARGE committee
+            // gets statistical resilience from the deep relay tree + loss-retransmitting QUIC, so 1.5× (lose
+            // up to 1/3 of shreds and still reconstruct) is ample — a direct ~33% egress cut = ~33% more TPS
+            // headroom at scale. Self-describing FEC (num_coding_shreds) makes this safe: the decoder always
+            // matches whatever ratio the producer chose. Live-tunable; genesis (small_committee) is unchanged.
+            if small_committee { 2.0 } else { 1.5 }
         };
         
-        let parity_count = ((total_chunks as f32) * (adaptive_redundancy - 1.0)).ceil() as usize;
-        
+        // GF(2^8) hard limit: data + parity ≤ 255 total shards (reed_solomon_erasure::galois_8). Cap the
+        // adaptive parity so a near-max block still gets REAL Reed-Solomon coding instead of the
+        // replication fallback in generate_parity_chunks (which cannot reconstruct a missing data shred).
+        // The decoder reads this exact capped count via num_coding_shreds, so dimensions always agree.
+        let parity_count = (((total_chunks as f32) * (adaptive_redundancy - 1.0)).ceil() as usize)
+            .min(255usize.saturating_sub(total_chunks));
+
         // Generate Reed-Solomon parity chunks
         let parity_chunks = self.generate_parity_chunks(&chunks, parity_count);
         
@@ -6790,7 +6811,9 @@ impl SimplifiedP2P {
             &validated_peers,
             height,
         );
-        
+        // FIX-3: relay tree over the canonical committee (None during genesis epochs ⇒ flat fallback).
+        let committee_roster = self.shred_committee_roster(height);
+
         // Collect all chunk messages
         let mut chunk_sends: Vec<(PeerInfo, NetworkMessage)> = Vec::new();
         
@@ -6808,9 +6831,22 @@ impl SimplifiedP2P {
                 // v2.26: Certificate only in chunk #0 (saves bandwidth, still atomic)
                 certificate: if chunk_index == 0 { producer_certificate.clone() } else { None },
                 block_hash: Some(block_hash),  // FIX R23-P3
+                num_coding_shreds: parity_count,  // self-describing FEC: decoder matches our RS dimensions
             };
 
-            let target_peers = self.select_shred_protocol_targets(&routing_tree, chunk_index, shred_protocol_fanout);
+            let target_peers = match committee_roster.as_ref().filter(|r| !r.is_empty()) {
+                // Committee tree: deterministic fanout (network-agreed) so the heap shape is identical
+                // on every member. Flat fallback keeps the adaptive value (redundancy only, no tree).
+                Some(roster) => {
+                    let t = self.shred_seed_targets(roster, chunk_index, shred_tree_fanout(roster.len()));
+                    // Empty ⇒ the rotated root AND all its children are unreachable (churn / partial outage);
+                    // without this the chunk is seeded to NOBODY. Honour the documented flat fallback.
+                    if t.is_empty() {
+                        self.select_shred_protocol_targets(&routing_tree, chunk_index, shred_protocol_fanout)
+                    } else { t }
+                }
+                None => self.select_shred_protocol_targets(&routing_tree, chunk_index, shred_protocol_fanout),
+            };
             let msg = NetworkMessage::ShredProtocolChunk { chunk: shred_protocol_chunk };
 
             for peer in target_peers {
@@ -6840,11 +6876,20 @@ impl SimplifiedP2P {
                     None
                 },
                 block_hash: Some(block_hash),  // FIX R23-P3
+                num_coding_shreds: parity_count,  // self-describing FEC (same value on every chunk)
             };
             
-            let target_peers = self.select_shred_protocol_targets(&routing_tree, total_chunks + parity_index, shred_protocol_fanout);
+            let target_peers = match committee_roster.as_ref().filter(|r| !r.is_empty()) {
+                Some(roster) => {
+                    let t = self.shred_seed_targets(roster, total_chunks + parity_index, shred_tree_fanout(roster.len()));
+                    if t.is_empty() {
+                        self.select_shred_protocol_targets(&routing_tree, total_chunks + parity_index, shred_protocol_fanout)
+                    } else { t }
+                }
+                None => self.select_shred_protocol_targets(&routing_tree, total_chunks + parity_index, shred_protocol_fanout),
+            };
             let msg = NetworkMessage::ShredProtocolChunk { chunk: shred_protocol_chunk };
-            
+
             for peer in target_peers {
                 chunk_sends.push((peer, msg.clone()));
             }
@@ -7147,6 +7192,49 @@ impl SimplifiedP2P {
         sorted_peers
     }
 
+    /// FIX-3: the canonical ordered committee for `height` (byte-identical on every node), used as the
+    /// relay-tree roster. None ⇒ genesis epochs / N-2 gap ⇒ caller falls back to the local-peer flat relay.
+    fn shred_committee_roster(&self, height: u64) -> Option<Vec<String>> {
+        if let Some(r) = SHRED_ROSTER_CACHE.get(&height) { return Some(r.clone()); }
+        let storage = self.storage.as_ref()?;
+        let roster = crate::node::BlockchainNode::committee_for_height(storage, height)?;
+        SHRED_ROSTER_CACHE.insert(height, roster.clone());
+        if SHRED_ROSTER_CACHE.len() > 512 {
+            let lo = height.saturating_sub(256);
+            SHRED_ROSTER_CACHE.retain(|k, _| *k >= lo);
+        }
+        Some(roster)
+    }
+
+    /// Resolve a committee node_id to a connected PeerInfo (None ⇒ not currently reachable → that
+    /// subtree pulls the block via handle_block_request; index positions stay canonical regardless).
+    fn resolve_committee_peer(&self, id: &str) -> Option<PeerInfo> {
+        let addr = self.get_peer_address_by_id(id)?;
+        self.connected_peers_lockfree.get(&addr).map(|e| e.value().clone())
+    }
+
+    /// Tier-0 seed targets for `chunk_index` over the committee tree: the rotated root, or — when this
+    /// producer IS the root or the root is unreachable — the root's direct children (so no chunk stalls
+    /// at an absent/self root). Self is always excluded. Empty ⇒ caller uses the flat-relay fallback.
+    fn shred_seed_targets(&self, roster: &[String], chunk_index: usize, fanout: usize) -> Vec<PeerInfo> {
+        let m = roster.len();
+        if m == 0 { return Vec::new(); }
+        let root = shred_tree_root(m, chunk_index);
+        let root_id = &roster[root];
+        if *root_id != self.node_id {
+            if let Some(p) = self.resolve_committee_peer(root_id) {
+                return vec![p];
+            }
+        }
+        // Producer is the root, or root unreachable → seed the root's (logical-0) children directly.
+        shred_tree_children(m, fanout, chunk_index, root).into_iter()
+            .filter_map(|ci| {
+                let id = &roster[ci];
+                if *id == self.node_id { None } else { self.resolve_committee_peer(id) }
+            })
+            .collect()
+    }
+
     /// Per-block version: sorted Kademlia order, then deterministic shuffle
     /// seeded by `block_height`. Use this on producer-broadcast and on
     /// forwarding paths that have the height in scope.
@@ -7195,11 +7283,13 @@ impl SimplifiedP2P {
     fn handle_shred_protocol_chunk(&self, from_peer: &str, chunk: ShredProtocolChunk) {
         let height = chunk.block_height;
         
-        // CRITICAL: Skip chunks for blocks already in blockchain
-        // This handles node restart case where processed_shred_blocks is empty
+        // Skip stale below-tip chunks EXCEPT a repair we solicited: a >1MB failover winner is served over
+        // the shred transport (handle_sync_request size-splits at SHRED_THRESHOLD), so a blanket drop here
+        // strands the fork-choice supersede (the P2 convergence path). Solicited-only (our own
+        // request_block_repair marks it, 30s TTL) — a peer cannot force below-tip reassembly. The
+        // reconstructed block funnels to maybe_supersede_by_certified_round (round + producer-sig gated).
         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-        if height <= local_height {
-            // Block already in blockchain, ignore stale chunks
+        if height <= local_height && !crate::block_pipeline::is_repair_solicited(height) {
             return;
         }
         
@@ -7244,7 +7334,14 @@ impl SimplifiedP2P {
         // CRITICAL FIX v2.19.24: Skip chunks for already processed blocks
         // This prevents infinite loop where chunks keep being forwarded and reconstructed
         if self.processed_shred_blocks.contains(&height) {
-            // Block already reconstructed, ignore duplicate chunks
+            // We already reconstructed this block, so skip re-assembly — but forwarding is a DUTY: our
+            // children still need this chunk, and a node becomes reconstructable at ~2/3 of the stream, so
+            // returning outright silenced the relay for every block's TAIL chunks (their whole subtree then
+            // fell back to per-chunk repair). The per-chunk forward-once dedup inside the forwarder is the
+            // loop guard; below-tip chunks are never relayed (targeted repair, not propagation).
+            if height > local_height {
+                self.forward_shred_protocol_chunk(from_peer, chunk);
+            }
             return;
         }
         
@@ -7274,16 +7371,34 @@ impl SimplifiedP2P {
             }
             return;
         }
-        if chunk.chunk_index >= chunk.total_chunks && !chunk.is_parity {
+        // DoS: bound the chunk_index for BOTH kinds. A DATA chunk must be < total_chunks. A PARITY chunk is
+        // indexed total_chunks + parity_index and was previously UNBOUNDED — a single crafted parity chunk
+        // with chunk_index≈usize::MAX drove `parity_chunks.resize(idx+1, ..)` in the receiver-cache path to a
+        // capacity-overflow panic (panic=abort ⇒ node crash) or a multi-GB OOM. GF(2^8) caps any legitimate
+        // total shard index at 255 (data + parity ≤ 255), so any index ≥ that from any peer is hostile.
+        // Parity cap is the GF(2^8) remainder (255 - data), matching the ENCODER's own bound; the old
+        // +170 admitted a total shard index up to 340, contradicting the rationale above.
+        let bad_index = if chunk.is_parity {
+            chunk.chunk_index < chunk.total_chunks
+                || chunk.chunk_index >= chunk.total_chunks
+                    + 255usize.saturating_sub(chunk.total_chunks)
+        } else {
+            chunk.chunk_index >= chunk.total_chunks
+        };
+        if bad_index {
             if crate::node::is_warn() {
-                println!("[WARN][SHRED] reject_bad_index idx={} total={}", chunk.chunk_index, chunk.total_chunks);
+                println!("[WARN][SHRED] reject_bad_index idx={} total={} parity={}",
+                         chunk.chunk_index, chunk.total_chunks, chunk.is_parity);
             }
             return;
         }
-        // Cap pending assemblies to prevent memory exhaustion from future blocks
+        // Cap pending assemblies to prevent memory exhaustion from future blocks. A SOLICITED repair is
+        // exempt: it is the only path that unwedges a diverged tail (P2 convergence) and is self-throttled
+        // (16/s budget + 2s per height), so junk future-height assemblies must not be able to starve it.
         const MAX_PENDING_ASSEMBLIES: usize = 30;
         if !self.shred_protocol_assemblies.contains_key(&height)
            && self.shred_protocol_assemblies.len() >= MAX_PENDING_ASSEMBLIES
+           && !crate::block_pipeline::is_repair_solicited(height)
         {
             return; // don't start new assembly if too many pending
         }
@@ -7293,15 +7408,28 @@ impl SimplifiedP2P {
         // v2.60: Added is_new_chunk to prevent infinite forwarding loops
         let (should_reconstruct_all, should_reconstruct_parity, total_chunks, chunks_count, parity_count, is_new_chunk);
 
+        // Self-describing FEC: size the parity vector from the PRODUCER's OWN coding count (carried on
+        // every chunk), so the decoder's ReedSolomon dimensions match the encoder's EXACTLY. Guessing it
+        // (the legacy `total*0.5` estimate) mismatches the adaptive-redundancy encoder ⇒ Ok-but-wrong
+        // reconstructed bytes. A pre-field chunk (num_coding_shreds==0) falls back to the legacy estimate;
+        // Cap at the ENCODER's own GF(2^8) bound (255 - data): the old 170 let a peer seed parity_count=170
+        // with total=170, so ReedSolomon::new(170,170)=340>256 failed on EVERY reconstruct for that height
+        // (parity recovery disabled until the sweep evicted the assembly).
+        let coding_shreds = if chunk.num_coding_shreds > 0 {
+            chunk.num_coding_shreds.min(255usize.saturating_sub(chunk.total_chunks))
+        } else {
+            ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize
+        };
+
         {
             // Scoped block to release DashMap lock before calling reconstruct
             let mut assembly = self.shred_protocol_assemblies.entry(height)
                 .or_insert_with(|| ShredProtocolBlockAssembly {
                     height,
                     chunks_received: vec![None; chunk.total_chunks],
-                    parity_chunks: vec![None; ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize],
+                    parity_chunks: vec![None; coding_shreds],
                     total_chunks: chunk.total_chunks,
-                    parity_count: ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize,
+                    parity_count: coding_shreds,
                     original_block_size: chunk.original_block_size,  // CRITICAL: Store for reconstruction
                     is_macroblock: chunk.is_macroblock,  // PRODUCTION: Track block type
                     started_at: Instant::now(),
@@ -7316,6 +7444,31 @@ impl SimplifiedP2P {
                 if let Some(bh) = chunk.block_hash {
                     assembly.expected_block_hash = Some(bh);
                 }
+            }
+
+            // Cross-chunk consistency: a chunk whose framing disagrees with the assembly's first-seen values
+            // (a DIFFERENT block reusing this height, a stale replay, or a malicious relay) must NOT be
+            // merged — mixing two blocks' shreds is what produced the corrupt oversized-buffer symptom.
+            // The binding fields are block IDENTITY + DATA layout: block_hash, total_chunks (data count) and
+            // original_block_size are source-independent (the block splits into the same 512KB data chunks
+            // regardless of who re-encodes it). num_coding_shreds is DELIBERATELY EXCLUDED — the live-
+            // broadcast and bulk-sync paths legitimately choose different redundancy for the SAME block, and
+            // a data chunk is interchangeable across both; a parity chunk that overflows the assembly's
+            // parity vector is already dropped by the bounds check below, so it needs no framing reject.
+            // Reject silently — honest shreds / repair carry the truth, and block_hash at reconstruct is the
+            // final safety net.
+            let framing_ok = assembly.total_chunks == chunk.total_chunks
+                && assembly.original_block_size == chunk.original_block_size
+                && match (assembly.expected_block_hash, chunk.block_hash) {
+                    (Some(eh), Some(bh)) => eh == bh,
+                    _ => true, // a chunk without a hash can't contradict; the hash-bearing majority sets it
+                };
+            if !framing_ok {
+                if crate::node::is_warn() {
+                    println!("[WARN][SHRED] framing_mismatch h={} drop_chunk idx={} from={}",
+                             height, chunk.chunk_index, get_privacy_id_for_addr(from_peer));
+                }
+                return;
             }
 
             // v26 D4: accept cert from ANY chunk carrying it (idempotent
@@ -7484,7 +7637,11 @@ impl SimplifiedP2P {
         // Problem: Without is_new_chunk check, duplicates forwarded 292x causing network storm
         // Solution: Forward ONLY if chunk is new AND block not ready for reconstruction
         // v26 D4b: keep forwarding until cert is in hand (not raw chunk #0).
-        let should_forward = is_new_chunk && !should_reconstruct_all && (!should_reconstruct_parity || !cert_present);
+        // FIX-3: forward every NEW chunk to our committee-tree children — a DUTY, not gated on whether we
+        // can already reconstruct. Loop-safe via the per-chunk forward-once dedup inside the forwarder.
+        // A solicited below-tip repair chunk (admitted above) is reconstructed locally but NEVER relayed:
+        // it is a targeted repair for us, not live propagation, and caught-up children would only drop it.
+        let should_forward = is_new_chunk && height > local_height;
         if should_forward {
             self.forward_shred_protocol_chunk(from_peer, chunk.clone());
         }
@@ -7640,10 +7797,9 @@ impl SimplifiedP2P {
             }
         };
 
-        // CRITICAL: Don't forward chunks for already processed blocks (prevents infinite loop)
-        if self.processed_shred_blocks.contains(&chunk.block_height) {
-            return;
-        }
+        // FIX-3: forwarding is a DUTY — do NOT stop relaying just because THIS node already reconstructed
+        // the block; our children still need their chunks. The per-chunk forward-once dedup below is the
+        // sole loop guard (stale chunks are already dropped upstream by the height<=local check).
 
         // Per-chunk forward-once dedup (cascade-depth bound). The legacy
         // relay forwarded on EVERY arrival → O(F^h) duplicate emissions,
@@ -7668,43 +7824,50 @@ impl SimplifiedP2P {
             return;
         }
 
-        // v24: Per-block deterministic shuffle so the forwarding peer set
-        // rotates over time and no peer is permanently excluded by Kademlia
-        // bucket alignment. Same `block_height` seed → identical routing on
-        // every honest node forwarding the same chunk.
-        let validated_peers = self.get_validated_active_peers();
-        let routing_tree = self.build_shred_protocol_routing_tree_for_block(
-            &validated_peers,
-            chunk.block_height,
-        );
-        let shred_protocol_fanout = self.get_shred_protocol_fanout();
-        
-        // Get our external IP for additional self-check
-        let our_ip = self.external_ip.read().clone();
-        let our_node_id = self.node_id.clone();
-        
-        let forward_targets: Vec<_> = routing_tree.iter()
-            .filter(|p| {
-                // Exclude original sender
-                if p.addr == original_sender {
-                    return false;
-                }
-                // CRITICAL: Exclude self by node_id (primary check)
-                if p.id == our_node_id {
-                    return false;
-                }
-                // CRITICAL: Exclude self by IP (secondary check)
-                if let Some(ref own_ip) = our_ip {
-                    let peer_ip = p.addr.split(':').next().unwrap_or("");
-                    if peer_ip == own_ip {
-                        return false;
+        // FIX-3: forward to MY children in the canonical committee tree — provable coverage, O(m) relay,
+        // and forwarding is a DUTY (independent of whether we can already reconstruct). A child is never
+        // our parent/self in an F-ary heap, so the sender is structurally excluded. Not in the committee
+        // ⇒ don't relay (we pull the block). Genesis epochs (roster None) ⇒ legacy flat relay fallback.
+        let forward_targets: Vec<PeerInfo> = match self.shred_committee_roster(chunk.block_height)
+            .filter(|r| !r.is_empty())
+        {
+            Some(roster) => {
+                let m = roster.len();
+                match roster.iter().position(|id| *id == self.node_id) {
+                    None => Vec::new(),
+                    Some(my_idx) => {
+                        // Deterministic fanout (network-agreed) — same F-ary heap on every member.
+                        let fanout = shred_tree_fanout(m);
+                        shred_tree_children(m, fanout, chunk.chunk_index, my_idx).into_iter()
+                            .filter_map(|ci| {
+                                let id = &roster[ci];
+                                if *id == self.node_id { None } else { self.resolve_committee_peer(id) }
+                            })
+                            .collect()
                     }
                 }
-                true
-            })
-            .take(shred_protocol_fanout)
-            .cloned()
-            .collect();
+            }
+            None => {
+                let validated_peers = self.get_validated_active_peers();
+                let routing_tree = self.build_shred_protocol_routing_tree_for_block(&validated_peers, chunk.block_height);
+                let shred_protocol_fanout = self.get_shred_protocol_fanout();
+                let our_ip = self.external_ip.read().clone();
+                let our_node_id = self.node_id.clone();
+                routing_tree.iter()
+                    .filter(|p| {
+                        if p.addr == original_sender { return false; }
+                        if p.id == our_node_id { return false; }
+                        if let Some(ref own_ip) = our_ip {
+                            let peer_ip = p.addr.split(':').next().unwrap_or("");
+                            if peer_ip == own_ip { return false; }
+                        }
+                        true
+                    })
+                    .take(shred_protocol_fanout)
+                    .cloned()
+                    .collect()
+            }
+        };
         
         // Forward chunk via QUIC (binary, fast)
         let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
@@ -9003,6 +9166,7 @@ impl SimplifiedP2P {
                 is_macroblock,
                 certificate: None,
                 block_hash: Some(block_hash),
+                num_coding_shreds: parity_chunk_count,  // self-describing FEC
             };
 
             let msg = NetworkMessage::ShredProtocolChunk { chunk };
@@ -9026,10 +9190,11 @@ impl SimplifiedP2P {
                 is_macroblock,
                 certificate: None,
                 block_hash: Some(block_hash),
+                num_coding_shreds: parity_chunk_count,  // self-describing FEC
             };
-            
+
             let msg = NetworkMessage::ShredProtocolChunk { chunk };
-            
+
             if transport.broadcast_to(quic_addr, &msg).await.is_ok() {
                 sent_count += 1;
             }
@@ -19610,6 +19775,9 @@ impl SimplifiedP2P {
         // supersede (supersede_stored_from_sync) instead of ignored — this is the SOLICITED path that
         // converges a diverged tail. Marking a not-yet-stored height is harmless (TTL-expired).
         crate::block_pipeline::mark_repair_solicited(height);
+        // A losing block we already reconstructed via shred sits in processed_shred_blocks; forget it so a
+        // solicited >1MB competitor's chunks reconstruct once (re-added on that reconstruct → dedup restored).
+        self.processed_shred_blocks.remove(&height);
         // DoS: bound the repair fan-out (each call sends to up to 3 peers). check_content's TailDiverged
         // branch can drive one call per diverged height (up to a full window) from a single re-sendable
         // proposal → attacker-drainable ~3x reflection per height. Global token bucket + per-height
@@ -25856,6 +26024,178 @@ mod tests {
         let compressed = zstd_compress_for_test(&[]);
         let decoded = decompress_zstd_bounded(&compressed, 1024).expect("empty input must decode");
         assert!(decoded.is_empty(), "empty input decodes to empty output");
+    }
+}
+
+// FIX-3: Turbine-style relay tree over the CANONICAL committee (committee_for_height — byte-identical
+// on every node), so a complete F-ary heap on its indices is a network-agreed tree. Leader egress
+// becomes O(root_fanout) and total relay O(m) with provable coverage (unit-tested below). Rotated by
+// chunk_index so different chunks seed at different roots. Non-committee nodes are not tree members —
+// they PULL (handle_block_request serves finalized blocks to any peer). Pure index math; addressing +
+// send happens in the broadcast/forward methods.
+
+/// Physical committee index of the tier-0 root for `chunk_index` over an m-node committee.
+fn shred_tree_root(m: usize, chunk_index: usize) -> usize {
+    if m == 0 { 0 } else { chunk_index % m }
+}
+
+/// Deterministic committee-tree fanout — a pure function of roster size m, so every member builds the
+/// SAME F-ary heap and coverage is provable. The per-node latency/peer-count get_shred_protocol_fanout is
+/// NOT usable here: two honest members in different latency buckets would pick different F and orphan
+/// index bands (a node's f=8 parent skips the children an f=16 sibling covers). Adaptive fanout stays only
+/// for the genesis flat-relay fallback (roster None), where it is a redundancy knob, not a tree parameter.
+fn shred_tree_fanout(m: usize) -> usize {
+    match m {
+        0..=64 => 8,
+        65..=1024 => 16,
+        _ => 32,
+    }
+}
+
+/// Per-block cache of the FIX-3 relay-tree committee roster. All ~255 chunks of one block share the same
+/// committee_for_height(h); without this the hot broadcast/forward path pays a RocksDB read + full
+/// MacroBlock deserialize + O(N) VRF sample PER CHUNK (255/block at 100k+ candidates). Bounded to recent.
+static SHRED_ROSTER_CACHE: once_cell::sync::Lazy<dashmap::DashMap<u64, Vec<String>>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// Physical committee indices of `my_idx`'s children in the rotated F-ary heap (empty ⇒ leaf).
+fn shred_tree_children(m: usize, fanout: usize, chunk_index: usize, my_idx: usize) -> Vec<usize> {
+    if m <= 1 || fanout == 0 || my_idx >= m { return Vec::new(); }
+    let root = chunk_index % m;
+    let my_logical = (my_idx + m - root) % m; // (my_idx - root) mod m
+    let mut out = Vec::new();
+    for k in 1..=fanout {
+        match my_logical.checked_mul(fanout).and_then(|x| x.checked_add(k)) {
+            Some(cl) if cl < m => out.push((root + cl) % m),
+            _ => break,
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod shred_tree_tests {
+    use super::{shred_tree_root, shred_tree_children};
+
+    // BFS from the seeded root via children() — models producer→root→relay.
+    fn covered(m: usize, f: usize, chunk: usize) -> std::collections::BTreeSet<usize> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut q = std::collections::VecDeque::new();
+        let root = shred_tree_root(m, chunk);
+        seen.insert(root);
+        q.push_back(root);
+        while let Some(n) = q.pop_front() {
+            for c in shred_tree_children(m, f, chunk, n) {
+                if seen.insert(c) { q.push_back(c); }
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn full_coverage_all_configs() {
+        for &m in &[1usize, 2, 5, 50, 200, 1000] {
+            for &f in &[8usize, 16] {
+                for chunk in 0..=m.min(40) {
+                    let seen = covered(m, f, chunk);
+                    assert_eq!(seen.len(), m, "m={} f={} chunk={} covered={}", m, f, chunk, seen.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn children_valid_and_distinct() {
+        for &m in &[5usize, 50, 1000] {
+            for &f in &[8usize, 16] {
+                for &chunk in &[0usize, 3, m - 1] {
+                    for i in 0..m {
+                        let ch = shred_tree_children(m, f, chunk, i);
+                        for &c in &ch { assert!(c < m, "child {} >= m {}", c, m); }
+                        let uniq: std::collections::BTreeSet<_> = ch.iter().collect();
+                        assert_eq!(uniq.len(), ch.len(), "duplicate child at m={} i={}", m, i);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Self-describing FEC round-trip: the invariant behind carrying `num_coding_shreds` on every shred — the
+// decoder MUST reconstruct with the SAME (data, parity) dimensions the producer encoded with, or
+// `rs.reconstruct()` returns Ok-but-WRONG bytes. These tests exercise the exact codec the shred path uses
+// (reed_solomon_erasure::galois_8), independent of any P2P instance.
+#[cfg(test)]
+mod shred_fec_tests {
+    use reed_solomon_erasure::galois_8::ReedSolomon;
+
+    // Encode `data` shards → `parity` coding shards; return the full padded shard vector.
+    fn encode(data: &[Vec<u8>], parity: usize, shard_len: usize) -> Vec<Vec<u8>> {
+        let rs = ReedSolomon::new(data.len(), parity).expect("rs new");
+        let mut shards: Vec<Vec<u8>> = data.iter()
+            .map(|d| { let mut v = d.clone(); v.resize(shard_len, 0); v })
+            .collect();
+        for _ in 0..parity { shards.push(vec![0u8; shard_len]); }
+        rs.encode(&mut shards).expect("rs encode");
+        shards
+    }
+
+    #[test]
+    fn matched_dims_recover_dropped_data_shreds() {
+        // Producer: 8 data + 6 coding (a 1.75× tier). Drop up to 6 data shreds; the decoder that uses the
+        // SAME (8, 6) dims must recover every original data shred exactly.
+        let (n, p, len) = (8usize, 6usize, 64usize);
+        let orig: Vec<Vec<u8>> = (0..n).map(|i| vec![(i as u8).wrapping_mul(37).wrapping_add(1); len]).collect();
+        let coded = encode(&orig, p, len);
+        for drop in 0..=p {
+            let mut shards: Vec<Option<Vec<u8>>> = coded.iter().cloned().map(Some).collect();
+            for i in 0..drop { shards[i] = None; } // lose `drop` data shreds (≤ parity ⇒ recoverable)
+            let rs = ReedSolomon::new(n, p).expect("decoder rs");
+            rs.reconstruct(&mut shards).expect("reconstruct");
+            for i in 0..n {
+                assert_eq!(shards[i].as_ref().unwrap(), &orig[i],
+                           "matched (n={},p={}) must recover data shard {} after dropping {}", n, p, i, drop);
+            }
+        }
+    }
+
+    #[test]
+    fn undersized_parity_guess_loses_reconstructability() {
+        // The REAL effect of guessing the coding count (the reed_solomon_erasure coding matrix is
+        // index-stable, so a subset of coding shards still decodes CORRECTLY — it does NOT produce wrong
+        // bytes). The bug is that the legacy decoder sized its parity vector to total*0.5 and DROPPED every
+        // coding shred beyond that, throwing away half the producer's redundancy — so under heavier loss it
+        // can no longer reconstruct, falling to repair. Here: producer 8 data + 6 coding; lose 5 data shreds
+        // (> the 4 the legacy guess keeps, ≤ the 6 real). The self-described decoder (parity=6) recovers;
+        // the guess decoder (parity=4) cannot even be fed enough shards to reach the data count.
+        let (n, p_enc, len) = (8usize, 6usize, 64usize);
+        let orig: Vec<Vec<u8>> = (0..n).map(|i| vec![(i as u8).wrapping_mul(37).wrapping_add(1); len]).collect();
+        let coded = encode(&orig, p_enc, len); // 8 data + 6 coding
+
+        // SELF-DESCRIBED decoder (parity=6): keeps all 6 coding shreds, loses 5 data ⇒ 3 data + 6 coding =
+        // 9 ≥ 8 ⇒ reconstructs.
+        {
+            let mut shards: Vec<Option<Vec<u8>>> = coded.iter().cloned().map(Some).collect();
+            for i in 0..5 { shards[i] = None; }
+            let rs = ReedSolomon::new(n, p_enc).expect("decoder rs");
+            rs.reconstruct(&mut shards).expect("self-described decoder must reconstruct");
+            for i in 0..n {
+                assert_eq!(shards[i].as_ref().unwrap(), &orig[i], "self-described recovers data shard {}", i);
+            }
+        }
+
+        // LEGACY guess decoder (parity=4): it would have DROPPED coding shreds 4 and 5, so at most 3 data +
+        // 4 coding = 7 < 8 ⇒ below the RS data count ⇒ cannot reconstruct. Model that: only the first 4
+        // coding shreds are available to it.
+        {
+            let mut shards: Vec<Option<Vec<u8>>> =
+                coded.iter().take(n + 4).cloned().map(Some).collect(); // 8 data + 4 coding
+            for i in 0..5 { shards[i] = None; }
+            let available = shards.iter().filter(|s| s.is_some()).count();
+            assert!(available < n,
+                    "legacy 0.5× guess keeps only {} shreds (< {} data) ⇒ cannot reconstruct this loss",
+                    available, n);
+        }
     }
 }
 

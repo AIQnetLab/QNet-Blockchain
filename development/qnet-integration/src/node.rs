@@ -520,6 +520,13 @@ pub fn should_check_fork() -> bool {
 // ⇒ callers fall back to the capped near-tip hint, so the genesis bootstrap is never blocked.
 static QC_VERIFIED_FRONTIER: AtomicU64 = AtomicU64::new(0);
 
+// Content-verified finality ceiling (height = highest macroblock index ×90 whose every local body hash
+// matches its QC-certified list, contiguously from the anchor). QC_VERIFIED_FRONTIER certifies a
+// macroblock's OWN 2f+1 QC but NOT that this node holds the matching microblock BODIES; a node with a
+// losing-fork tail below the frontier must not adopt-finalize over it (the node-001 h=30780 safety
+// violation). SYNC-ADOPT floors on THIS. Monotone; re-derived from storage, bounded per advance call.
+static CONTENT_VERIFIED_FRONTIER: AtomicU64 = AtomicU64::new(0);
+
 // v3.5: Flag to skip slot timing after sync completion
 // PROBLEM: After sync, node may be "ahead" of slot time and wait unnecessarily
 // while network expects block from it immediately
@@ -750,12 +757,121 @@ pub(crate) fn verify_microblock_producer_sig_sync(mb: &qnet_state::MicroBlock) -
     if let Some(ref vrf_out) = mb.vrf_output { hasher.update(vrf_out); }
     hasher.update(&mb.timeout_round.to_be_bytes());
     hasher.update(&mb.carried_baseline.to_be_bytes());
+    // Blocker-3: bind the WIRE pk-presence (matches signer) so a pk-stripped fork copy fails this
+    // tie-break verify instead of being accepted as a validly-signed sibling.
+    hasher.update(&microblock_pk_digest(&mb.transactions));
     let msg_hash = hasher.finalize();
     use pqcrypto_mldsa::mldsa65 as dilithium3;
     use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
     let d3_pk = match <dilithium3::PublicKey as PkTrait>::from_bytes(&pk) { Ok(p) => p, Err(_) => return false };
     let d3_sig = match <dilithium3::DetachedSignature as SigTrait>::from_bytes(&sig_bytes) { Ok(s) => s, Err(_) => return false };
     dilithium3::verify_detached_signature(&d3_sig, msg_hash.as_ref(), &d3_pk).is_ok()
+}
+
+/// Blocker-3: digest binding a block's WIRE pk-presence into the producer signature. The block hash +
+/// merkle_root exclude each tx's dilithium_public_key (FIX-5 pk-elision), so a relay can strip/add a
+/// first-use wire pk and produce a byte-different-but-SAME-HASH block the victim can't verify → the
+/// apply frontier defers forever. Folding this digest into Block_Sig_v23.1 makes any such tamper flip
+/// the signed digest ⇒ the producer sig fails ⇒ the corrupt copy is rejected (re-fetched from an honest
+/// peer), never accepted-by-hash. Honest propagation preserves the wire form byte-faithfully (elided
+/// stays elided, first-use stays present), so it is stable across relays; only tampering diverges it.
+/// Note: `None` and `Some(empty)` both encode "elided" and MUST fold identically — a length-0 marker.
+pub(crate) fn microblock_pk_digest(txs: &[qnet_state::Transaction]) -> [u8; 32] {
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(b"pkdg1");
+    for tx in txs {
+        match tx.dilithium_public_key.as_deref() {
+            Some(pk) if !pk.is_empty() => {
+                h.update(&(pk.len() as u32).to_be_bytes());
+                h.update(pk);
+            }
+            _ => { h.update(&0u32.to_be_bytes()); }
+        }
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+#[cfg(test)]
+mod fix5_kat_tests {
+    // FIX-5 Known-Answer Test: a wallet-signed value-TX in the NEW raw-detached wire format must pass
+    // the PRODUCTION value verifier + the API-1 eon(pk)==from bind. ML-DSA-65 sign is hedged/randomized
+    // so this asserts the verify RELATION + identity derivation (deterministic), not byte-identical sig
+    // production. The mobile JS harness (qnet-mobile __tests__/fix5_kat) mirrors this with the SAME
+    // preimage string + same eon derivation, so app-produced bytes verify on the node.
+    use pqcrypto_mldsa::mldsa65 as d3;
+    use pqcrypto_traits::sign::{PublicKey as PkT, DetachedSignature as SigT};
+
+    #[test]
+    fn fix5_value_tx_raw_detached_verifies_and_binds() {
+        // 1. Fresh ML-DSA-65 keypair; the wallet address is eon(SHA512(pk_bytes)).
+        let (pk, sk) = d3::keypair();
+        let pk_bytes = pk.as_bytes().to_vec();
+        assert_eq!(pk_bytes.len(), 1952, "pk must be 1952 raw bytes");
+        let from = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(&pk_bytes)
+            .expect("eon derivation");
+        let to = crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(
+            d3::keypair().0.as_bytes()).expect("second eon");
+
+        // 2. Build a Transfer TX and its canonical SIGN preimage (unchanged by FIX-5).
+        let mut tx = qnet_state::Transaction::new(
+            from.clone(), Some(to.clone()), 1_000_000_000u64, 0, 10, 10_000, 1_700_000_000, None,
+            qnet_state::TransactionType::Transfer { from: from.clone(), to: to.clone(), amount: 1_000_000_000 },
+            None,
+        );
+        let msg = super::BlockchainNode::build_canonical_verify_message(&tx);
+        assert!(msg.starts_with("transfer:"), "preimage = transfer:...");
+
+        // 3. RAW detached signature (3309 bytes) over the preimage — the FIX-5 wire form.
+        let sig = d3::detached_sign(msg.as_bytes(), &sk);
+        let sig_bytes = sig.as_bytes().to_vec();
+        assert_eq!(sig_bytes.len(), 3309, "detached sig must be 3309 raw bytes");
+        tx = tx.with_quantum_signature(Some(sig_bytes.clone()), Some(pk_bytes.clone()));
+
+        // 4. The PRODUCTION verifier accepts these exact bytes (wire pk present = first-use).
+        assert!(super::BlockchainNode::verify_user_tx_dilithium(&tx),
+                "raw-detached value-TX must verify on the node");
+
+        // 5. API-1 bind holds; a wrong pk (different key) must FAIL the bind.
+        assert_eq!(
+            crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(&pk_bytes).as_deref(),
+            Some(from.as_str()));
+        let mut forged = tx.clone();
+        forged = forged.with_quantum_signature(Some(sig_bytes), Some(d3::keypair().0.as_bytes().to_vec()));
+        assert!(!super::BlockchainNode::verify_user_tx_dilithium(&forged),
+                "a pk not deriving to `from` must be rejected");
+
+        // 6. Detached verify == the raw relation the JS harness reproduces.
+        let d3_pk = <d3::PublicKey as PkT>::from_bytes(&pk_bytes).unwrap();
+        let d3_sig = <d3::DetachedSignature as SigT>::from_bytes(sig.as_bytes()).unwrap();
+        assert!(d3::verify_detached_signature(&d3_sig, msg.as_bytes(), &d3_pk).is_ok());
+    }
+
+    // Regression guard: the NODE-BINARY lifecycle signer must emit the RAW detached wire form
+    // (3309 B sig + 1952 B pk) that verify_node_lifecycle_dilithium requires. The envelope form
+    // (sign_consensus) is length-gated out and silently killed super registration + reactivation.
+    #[test]
+    fn fix5_node_lifecycle_signer_roundtrips_through_verifier() {
+        use pqcrypto_traits::sign::SecretKey as SkT;
+        let (pk, sk) = d3::keypair();
+        let identity = crate::crypto::vrf::WalletIdentity::from_seed_and_keys(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            pk.as_bytes().to_vec(), sk.as_bytes().to_vec()).expect("identity");
+        let node_id = "super_node_lifecycle_kat";
+        let mut tx = qnet_state::Transaction::new(
+            node_id.to_string(), None, 0, 0, 0, 0, 1_700_000_000, None,
+            qnet_state::TransactionType::NodeReactivation {
+                node_id: node_id.to_string(), current_height: 100,
+                last_macroblock_hash: String::new(), last_macroblock_index: 1,
+            }, None);
+        super::BlockchainNode::sign_reactivation_tx(&mut tx, node_id, Some(&identity));
+        assert_eq!(tx.dilithium_signature.as_ref().map(|s| s.len()), Some(3309), "raw detached sig");
+        assert_eq!(tx.dilithium_public_key.as_ref().map(|p| p.len()), Some(1952), "raw pk");
+        assert!(super::BlockchainNode::verify_node_lifecycle_dilithium(&tx),
+                "node-signed NodeReactivation must verify raw-detached");
+    }
 }
 
 #[cfg(test)]
@@ -1080,11 +1196,59 @@ pub(crate) const MAX_UNSEALED_WINDOWS: u64 = 2;
 /// cannot mint unbounded distinct (window, round) vote keys.
 pub const MAX_FAILOVER_ROUND: u64 = 50;
 
-/// Bounds concurrent value-TX ML-DSA-65 verifies across ALL ingress paths (RPC submit + gossip
-/// admission). A flood — even localhost/netns, which the per-IP limiter exempts — then cannot spawn
-/// unbounded CPU-bound verifies that saturate every core and starve the consensus runtime. Fail-
-/// closed: no permit → reject (client resubmits), never an unbounded queue. Sized for many cores.
-pub(crate) static VALUE_TX_VERIFY_SEM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+/// Value-TX ML-DSA-65 verify concurrency, sized to cores. TWO reserved pools so a cheap mempool
+/// flood on the admission lane can never starve consensus block-validation (cross-lane DoS).
+fn value_verify_permits() -> usize {
+    std::env::var("QNET_VALUE_VERIFY_PERMITS").ok().and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).max(4)
+}
+/// Admission lane (RPC + gossip): try_acquire, fail-closed — the external client resubmits.
+pub(crate) static VALUE_TX_VERIFY_SEM: once_cell::sync::Lazy<tokio::sync::Semaphore> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Semaphore::new(value_verify_permits()));
+/// Block-validation lane: reserved pool, AWAITED. A valid block is never rejected for local CPU
+/// busy — the reject verdict must stay a pure function of TX bytes, never of local load.
+pub(crate) static BLOCK_VERIFY_SEM: once_cell::sync::Lazy<tokio::sync::Semaphore> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Semaphore::new(value_verify_permits()));
+
+/// Which verify lane a caller runs on — selects the semaphore + acquire policy above.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifyLane { Admission, Block }
+
+/// FIX-5 pk-elision resolution verdict (see BlockchainNode::rehydrate_elided_pk).
+///   Resolved      — wire pk present, or filled from committed state → verify may proceed.
+///   Unresolved    — elided AND no committed pk for tx.from → caller MUST defer, NEVER hard-reject
+///                   (an absent committed pk is indistinguishable from not-yet-synced; rejecting it
+///                   would let a snapshot/catch-up node deterministically drop a valid canonical
+///                   block → fork).
+///   NotApplicable — not an elidable value TX → leave untouched.
+pub(crate) enum PkResolve { Resolved, Unresolved, NotApplicable }
+
+/// Producer pre-apply classification for one candidate tx (see BlockchainNode::producer_tx_prepare).
+///   Admit         — keep in the block, no signature verify needed (system TX, sig-less burn-authorized reg).
+///   Evict         — genuinely inadmissible (bad structure / missing sig) → drop AND remove from mempool.
+///   Defer         — elided value-TX whose committed pk isn't present on THIS node yet → exclude from THIS
+///                   block but KEEP in mempool for a later block (mirror the validator's committee_deferred;
+///                   hard-evicting a not-yet-resolvable VALID tx would silently lose it).
+///   Verify(clone) — needs an ML-DSA-65 verify; the clone carries the (possibly rehydrated) pk.
+pub(crate) enum TxPrep { Admit, Evict, Defer, Verify(qnet_state::Transaction) }
+
+/// Positive-only ML-DSA-65 verify memo. A hit proves this exact (pk, sig, canonical-msg) already
+/// passed open()+eon-bind, so admission's verify is not repeated at block-validation / producer
+/// re-check (halves value-TX verify CPU). Bounded, approximate eviction — a miss just re-verifies.
+/// Never keyed on tx.hash (sig-unbound → forgeable) and negatives are never stored (flood-DoS).
+static VALUE_VERIFY_CACHE: once_cell::sync::Lazy<dashmap::DashMap<[u8; 32], ()>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+const VALUE_VERIFY_CACHE_CAP: usize = 262_144; // ~8 MB of 32-byte keys
+
+fn value_verify_cache_put(key: [u8; 32]) {
+    let c: &dashmap::DashMap<[u8; 32], ()> = &VALUE_VERIFY_CACHE;
+    if c.len() >= VALUE_VERIFY_CACHE_CAP {
+        // Drop a couple of arbitrary entries to stay bounded (O(1); a miss re-verifies).
+        let victims: Vec<[u8; 32]> = c.iter().take(2).map(|e| *e.key()).collect();
+        for v in victims { c.remove(&v); }
+    }
+    c.insert(key, ());
+}
 
 /// Production ceiling as a PURE function of committed-state scalars (identical on every honest node):
 /// pause when the tip outruns finality (>last_finalized + 3*CHECKPOINT_INTERVAL) or the sealed
@@ -3069,6 +3233,9 @@ pub struct BlockApplyResult {
     // vrf/consensus pubkey (tx.dilithium_public_key) → registry_root binds sha3 of it for light-client
     // committee verification. Empty for activation/pseudonym rows (the NodeRegistration row is authoritative).
     pub deferred_registrations: Vec<(String, String, String, String, String)>,
+    /// FIX-5: (sender_address, raw ML-DSA-65 pk) for each value-TX carrying a wire pk (first-use).
+    /// Drained at commit into the dilithium_pk_root LtHash (marker-guarded ⇒ once per account).
+    pub deferred_pk_binds: Vec<(String, Vec<u8>)>,
     pub deferred_emission_mbs: Vec<u64>,
     pub deferred_reward_clears: Vec<(String, u64)>,
     /// (epoch, total, committed_root, c_per, c_cnt) — emission reward recompute the caller runs
@@ -3712,6 +3879,7 @@ impl BlockchainNode {
             reward_accruals: Vec::new(),
             deferred_pool3: 0,
             deferred_registrations: Vec::new(),
+            deferred_pk_binds: Vec::new(),
             deferred_emission_mbs: Vec::new(),
             deferred_reward_clears: Vec::new(),
             deferred_emission_root: None,
@@ -3827,6 +3995,13 @@ impl BlockchainNode {
                     block_wasm_fuel_fees = block_wasm_fuel_fees.saturating_add(tx.wasm_fuel_fee(tx_wasm_fuel));
                 }
 
+                // FIX-5: collect the sender ML-DSA-65 pk for dilithium_pk_root (drained + marker-guarded
+                // once/account at commit). Only value TXs with a WIRE pk (first-use); elided later txs are None.
+                if tx.binds_dilithium_pk() {
+                    if let Some(pk) = tx.dilithium_public_key.as_ref() {
+                        result.deferred_pk_binds.push((tx.from.clone(), pk.clone()));
+                    }
+                }
                 // Collect deferred side effects from successful TXs
                 match &tx.tx_type {
                     qnet_state::TransactionType::NodeActivation {
@@ -3857,7 +4032,7 @@ impl BlockchainNode {
                         // Bind the consensus pubkey ONLY for consensus participants (super/genesis): light
                         // nodes are mobile clients, never in the committee, so their key is irrelevant to QC
                         // verification — keep light rows' vrf empty (semantic + matches the registry recompute).
-                        let reg_vrf = if matches!(node_type, qnet_state::NodeType::Super) { tx.dilithium_public_key.clone().unwrap_or_default() } else { String::new() };
+                        let reg_vrf = if matches!(node_type, qnet_state::NodeType::Super) { tx.dilithium_public_key.as_ref().map(hex::encode).unwrap_or_default() } else { String::new() };
                         result.deferred_registrations.push((node_id.clone(), type_str.to_string(), wallet_address.clone(), burn_tx.clone(), reg_vrf));
                     }
                     qnet_state::TransactionType::NodeActivation { node_type, .. } => {
@@ -4206,6 +4381,7 @@ impl BlockchainNode {
         // state.
         let replayed: u64;
         let mode: &'static str;
+        let computed_root: [u8; 32];
         {
             let sg = state.write().await;
 
@@ -4256,6 +4432,9 @@ impl BlockchainNode {
                 applied = applied.saturating_add(1);
             }
             replayed = applied;
+            // Root captured under the SAME lock: after release a concurrent apply may advance the
+            // state past target and a post-release read would spuriously mismatch.
+            computed_root = sg.finalize_merkle();
         } // <-- single lock release after full reconcile
 
         println!(
@@ -4270,51 +4449,23 @@ impl BlockchainNode {
             ));
         }
 
-        // v32.15: fail-closed gate. Verify the reconciled state against the
-        // 2f+1-bound snapshot_root in the finalized macroblock at the boundary
-        // (Pattern C, v32.9). Mismatch ⇒ recovery produced divergent state ⇒
-        // reject so the caller re-syncs from canonical instead of forking.
-        // No binding at this boundary ⇒ cannot verify, accept with warning
-        // (legitimate at pre-binding/early heights).
-        // Fail-closed by default: the ONLY accepted outcome is a recomputed state_root that
-        // equals the 2f+1-bound macroblock snapshot_root (Pattern C). Every other path —
-        // pre-finality height, missing/undecodable anchor, no binding, mismatch, recompute
-        // error — returns Err so the caller discards and resyncs from canonical QC state.
-        let mb_idx = target_height / 90;
-        if mb_idx == 0 {
-            // h<90: no finalized macroblock to prove canonicity ⇒ resync (block-sync from
-            // genesis is cheap pre-finality). Never accept unverified recovery state.
-            return Err(format!("reconcile_pre_finality target={} action=resync", target_height));
+        // Fail-closed verify: the reconciled in-memory merkle root must equal the CANONICAL block's
+        // state_root at target — the same per-block root every validator checked at apply, stored in
+        // the surviving microblock. Any other outcome ⇒ Err ⇒ caller resyncs from canonical QC state.
+        // (The former gate read consensus_data.snapshot_root, which no producer ever sets — the binder
+        // migrated to macroblock.state_root — so reconcile could never prove and ALWAYS fell to resync.)
+        let expected_root = match storage.load_microblock_auto_format(target_height) {
+            Ok(Some(mb)) => mb.state_root,
+            _ => return Err(format!("reconcile_no_target_block target={} action=resync", target_height)),
+        };
+        if computed_root != expected_root {
+            return Err(format!(
+                "reconcile_root_mismatch target={} expected={} computed={} action=resync",
+                target_height, hex::encode(&expected_root[..8]), hex::encode(&computed_root[..8]),
+            ));
         }
-        let mb_bytes = match storage.get_macroblock_by_height(mb_idx) {
-            Ok(Some(b)) => b,
-            _ => return Err(format!("reconcile_anchor_unavailable mb={} target={} action=resync", mb_idx, target_height)),
-        };
-        let mb = match bincode::deserialize::<qnet_state::MacroBlock>(&mb_bytes) {
-            Ok(m) => m,
-            Err(e) => return Err(format!("reconcile_anchor_decode mb={} err={:?} action=resync", mb_idx, e)),
-        };
-        let expected_root = match mb.consensus_data.snapshot_root {
-            Some(r) => r,
-            None => return Err(format!("reconcile_no_binding mb={} target={} action=resync", mb_idx, target_height)),
-        };
-        match storage.compute_canonical_state_root(target_height) {
-            Ok(computed) if computed == expected_root => {
-                println!("[INFO][STATE] reconcile_verified mb={} target={} root={} pattern=C",
-                         mb_idx, target_height, hex::encode(&computed[..8]));
-            }
-            Ok(computed) => {
-                return Err(format!(
-                    "reconcile_root_mismatch target={} mb={} expected={} computed={} action=resync",
-                    target_height, mb_idx, hex::encode(&expected_root[..8]), hex::encode(&computed[..8]),
-                ));
-            }
-            Err(e) => {
-                return Err(format!(
-                    "reconcile_verify_unavailable target={} mb={} err={:?} action=resync", target_height, mb_idx, e,
-                ));
-            }
-        }
+        println!("[INFO][STATE] reconcile_verified target={} root={}",
+                 target_height, hex::encode(&computed_root[..8]));
         Ok(())
     }
 
@@ -4555,6 +4706,9 @@ impl BlockchainNode {
         hasher.update(&hdr.timeout_round.to_be_bytes());
         // v23.2: bind carried_baseline (matches sign_microblock_with_dilithium).
         hasher.update(&hdr.carried_baseline.to_be_bytes());
+        // Blocker-3: bind pk_digest (captured from the block's txs at header extraction) so this
+        // equivocation-proof re-verify reconstructs the SAME signed digest as the producer.
+        hasher.update(&hdr.pk_digest);
         let digest = hasher.finalize();
         // Wire format: "dilithium3_v4:" + hex(detached_sig).
         let sig_str = match std::str::from_utf8(&hdr.signature) { Ok(s) => s, Err(_) => return false };
@@ -5147,7 +5301,7 @@ impl BlockchainNode {
             // B1: announce the node's VRF pubkey on-chain (canonical carrier) so it rides the snapshot's
             // node_registry copy → a snapshot-joiner has every super's vrf_pk for committee sampling + the
             // snapshot vrf_pk-completeness gate. None when the local key isn't installed yet (no regression).
-            dilithium_public_key: crate::genesis_constants::get_vrf_public_key(node_id).map(|pk| hex::encode(&pk)),
+            dilithium_public_key: crate::genesis_constants::get_vrf_public_key(node_id),
             chain_id: 0,
         };
 
@@ -5249,10 +5403,13 @@ impl BlockchainNode {
         // Dilithium3 identity key (verified against the on-chain VRF key at block validation).
         // Ed25519 was an illusory second leg — quantum-breakable, no identity binding — removed.
         if let Some(identity) = wallet_identity {
-            match identity.sign_consensus(node_id, canonical_msg.as_bytes()) {
-                Ok(consensus_sig) => {
-                    tx.dilithium_signature = Some(consensus_sig);
-                    tx.dilithium_public_key = Some(hex::encode(&identity.dilithium_pk));
+            // FIX-5 wire: RAW detached sig (3309 B) + RAW pk (1952 B) — the exact form every verifier
+            // (verify_node_lifecycle_dilithium) requires. sign_consensus's envelope string is length-gated
+            // out (len != 3309), which silently killed reactivation network-wide.
+            match identity.sign(canonical_msg.as_bytes()) {
+                Ok(detached_sig) => {
+                    tx.dilithium_signature = Some(detached_sig);
+                    tx.dilithium_public_key = Some(identity.dilithium_pk.to_vec());
                 }
                 Err(e) => {
                     eprintln!("[WARN][REACTIVATION] dilithium3_sign_failed: {}", e);
@@ -5558,9 +5715,10 @@ impl BlockchainNode {
                     // (rebuild_committed_burn_wallet). This call site runs AFTER save, too late for the
                     // verify(h+1) read, so it must not be the binding's writer.
 
-                    // v4.6: Extract VRF public key from on-chain TX (non-genesis nodes)
-                    if let Some(ref pk_hex) = tx.dilithium_public_key {
-                        if pk_hex.len() == crate::crypto::vrf::D3_PK_BYTES * 2 {
+                    // v4.6: Extract VRF public key from on-chain TX (non-genesis nodes).
+                    // FIX-5: the TX carries the pk as RAW 1952 bytes (no hex hop).
+                    if let Some(ref pk_bytes) = tx.dilithium_public_key {
+                        if pk_bytes.len() == crate::crypto::vrf::D3_PK_BYTES {
                             // Log if registering key from unsigned TX (no proof-of-possession)
                             if tx.dilithium_signature.is_none() || tx.dilithium_signature.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
                                 // Genesis identities install their key from the trusted genesis block
@@ -5573,45 +5731,45 @@ impl BlockchainNode {
                                              &node_id[..16.min(node_id.len())]);
                                 }
                             }
-                            if let Ok(pk_bytes) = hex::decode(pk_hex) {
+                            {
                                 // Persist to disk unconditionally so the registry CF — and every snapshot of
                                 // it — stays vrf-complete even when the key already arrived in RAM via gossip.
-                                if let Err(e) = storage.save_vrf_public_key(node_id, pk_hex) {
+                                // Storage keeps the hex format (registry-CF row convention unchanged).
+                                if let Err(e) = storage.save_vrf_public_key(node_id, &hex::encode(pk_bytes)) {
                                     if crate::node::is_warn() {
                                         println!("[WARN][STORAGE] vrf_pk_save_failed node={} err={}", node_id, e);
                                     }
                                 }
                                 if !crate::genesis_constants::has_vrf_key(node_id) {
-                                    crate::genesis_constants::register_vrf_public_key(node_id, &pk_bytes);
+                                    crate::genesis_constants::register_vrf_public_key(node_id, pk_bytes);
                                     // TX was chain signature-validated before here ⇒ (node_id, pk) authenticated.
-                                    let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, &pk_bytes);
+                                    let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, pk_bytes);
                                     if is_info() {
                                         println!("[INFO][VRF-KEY] on_chain_registered node={} pk_hash={}",
-                                                 node_id, &pk_hex[..16]);
+                                                 node_id, hex::encode(&pk_bytes[..8]));
                                     }
                                 }
                             }
                         }
                     }
                 }
-                // v9.4: NodeReactivation — register VRF key if present (same as NodeRegistration)
+                // v9.4: NodeReactivation — register VRF key if present (same as NodeRegistration).
+                // FIX-5: pk rides as RAW 1952 bytes; storage row stays hex.
                 qnet_state::TransactionType::NodeReactivation { node_id, .. } => {
-                    if let Some(ref pk_hex) = tx.dilithium_public_key {
-                        if pk_hex.len() == crate::crypto::vrf::D3_PK_BYTES * 2 {
+                    if let Some(ref pk_bytes) = tx.dilithium_public_key {
+                        if pk_bytes.len() == crate::crypto::vrf::D3_PK_BYTES {
                             if !crate::genesis_constants::has_vrf_key(node_id) {
-                                if let Ok(pk_bytes) = hex::decode(pk_hex) {
-                                    crate::genesis_constants::register_vrf_public_key(node_id, &pk_bytes);
-                                    // v14.8: Mirror to consensus-layer registry (chain-authenticated).
-                                    let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, &pk_bytes);
-                                    if let Err(e) = storage.save_vrf_public_key(node_id, pk_hex) {
-                                        if crate::node::is_warn() {
-                                            println!("[WARN][STORAGE] vrf_pk_save_failed node={} err={}", node_id, e);
-                                        }
+                                crate::genesis_constants::register_vrf_public_key(node_id, pk_bytes);
+                                // v14.8: Mirror to consensus-layer registry (chain-authenticated).
+                                let _ = qnet_consensus::consensus_crypto::register_consensus_pk_from_chain(node_id, pk_bytes);
+                                if let Err(e) = storage.save_vrf_public_key(node_id, &hex::encode(pk_bytes)) {
+                                    if crate::node::is_warn() {
+                                        println!("[WARN][STORAGE] vrf_pk_save_failed node={} err={}", node_id, e);
                                     }
-                                    if is_info() {
-                                        println!("[INFO][VRF-KEY] reactivation_registered node={} pk_hash={}",
-                                                 node_id, &pk_hex[..16]);
-                                    }
+                                }
+                                if is_info() {
+                                    println!("[INFO][VRF-KEY] reactivation_registered node={} pk_hash={}",
+                                             node_id, hex::encode(&pk_bytes[..8]));
                                 }
                             }
                         }
@@ -5699,7 +5857,7 @@ impl BlockchainNode {
         node_type: &qnet_state::NodeType,
         wallet: &str,
         burn_tx: &str,
-        dilithium_pk: Option<&String>,
+        dilithium_pk: Option<&Vec<u8>>,
         height: u64,
     ) {
         let type_str = match node_type {
@@ -5707,7 +5865,8 @@ impl BlockchainNode {
             qnet_state::NodeType::Light => "light",
         };
         let vrf = if matches!(node_type, qnet_state::NodeType::Super) {
-            dilithium_pk.and_then(|s| hex::decode(s).ok())
+            // FIX-5: pk rides the TX as raw bytes — accept only an exact ML-DSA-65 key
+            dilithium_pk.filter(|v| v.len() == crate::crypto::vrf::D3_PK_BYTES).cloned()
         } else { None };
         let _ = storage.save_node_registration_at_height_burn_vrf(node_id, type_str, wallet, 1.0, height, burn_tx, vrf.as_deref());
         if !burn_tx.is_empty() {
@@ -5785,7 +5944,7 @@ impl BlockchainNode {
             // anchor installation would produce different TX hashes across
             // peers and the genesis block would itself fork.
             if let Some(anchor_pk) = crate::genesis_constants::get_genesis_anchor_pk(&node_id) {
-                tx.dilithium_public_key = Some(hex::encode(&anchor_pk));
+                tx.dilithium_public_key = Some(anchor_pk.to_vec());
                 tx.hash = tx.calculate_hash();
             } else if is_info() {
                 println!(
@@ -5971,8 +6130,8 @@ impl BlockchainNode {
             gas_limit: 0,
             nonce: epoch * 10 + subwindow + 1,
             data: None,
-            dilithium_signature: Some(hb_sig.signature),
-            dilithium_public_key: Some(node_id.to_string()),
+            dilithium_signature: Some(hb_sig.signature.into_bytes()),
+            dilithium_public_key: Some(node_id.to_string().into_bytes()),
             chain_id: 0,
         };
         tx.hash = tx.calculate_hash();
@@ -6424,8 +6583,8 @@ impl BlockchainNode {
         
         match crypto.create_consensus_signature(node_id, &canonical_message).await {
             Ok(dilithium_sig) => {
-                commitment_tx.dilithium_signature = Some(dilithium_sig.signature);
-                commitment_tx.dilithium_public_key = Some(node_id.to_string());
+                commitment_tx.dilithium_signature = Some(dilithium_sig.signature.into_bytes());
+                commitment_tx.dilithium_public_key = Some(node_id.to_string().into_bytes());
                 
                 if is_info() {
                     println!("[INFO][PING-COMMIT] TX signed with Dilithium3(node) node={}", node_id);
@@ -7798,11 +7957,11 @@ impl BlockchainNode {
             LAST_VRF_KEY_ANNOUNCE_HEIGHT.store(vrf_init, std::sync::atomic::Ordering::Relaxed);
 
             // v9.0: Initialize finalized height/round to prevent accepting stale consensus msgs.
-            // CRITICAL: LAST_FINALIZED_HEIGHT stores mb_index * 90 (microblock height),
-            // NOT raw mb_index. All other 7 code paths use mb_index * 90 format.
-            // Startup must match to prevent finality check miscalculation.
-            let finalized_mb_index = pre_snapshot_chain_height / 90;
-            let finalized_round = finalized_mb_index * 90;
+            // CONTENT-GATED (P3): never boot-finalize a window whose local bodies diverge from the QC —
+            // a node that applied a losing fork (chain_height reflects it) but hasn't been repaired to
+            // canonical must NOT pin finality on the fork across the restart (else the finality-guarded
+            // rollback can never heal it). Ceiling = highest content-matching sealed window <= chain_height.
+            let finalized_round = Self::boot_content_finality_ceiling(&storage, pre_snapshot_chain_height);
             LAST_FINALIZED_CONSENSUS_ROUND.store(finalized_round, std::sync::atomic::Ordering::SeqCst);
             LAST_FINALIZED_HEIGHT.store(finalized_round, std::sync::atomic::Ordering::SeqCst);
 
@@ -8971,6 +9130,24 @@ impl BlockchainNode {
                 Ok(_) => {}
                 Err(e) => println!("[WARN][NODE] registry_lthash_rebuild_boot err={}", e),
             }
+            // FIX-5: dilithium_pk_root LtHash (metadata CF, not snapshot-carried) — recompute the pk
+            // accumulator + count-markers so a restarted / crash-recovered node is byte-identical to a
+            // from-genesis node. Derive from the in-memory tip (NOT the accounts CF, whose best-effort
+            // replayed tail an unclean restart can drop → scanning it would omit rows AND clear their
+            // markers, forking dpk_root forever). Same authoritative-source discipline as owns above.
+            let dpk_binds: Vec<(String, Vec<u8>)> = {
+                let sg = blockchain.state.read().await;
+                sg.accounts.iter()
+                    .filter_map(|e| e.value().dilithium_public_key.as_ref()
+                        .filter(|pk| pk.len() == 1952)
+                        .map(|pk| (e.key().clone(), pk.clone())))
+                    .collect()
+            };
+            match blockchain.storage.rebuild_dilithium_pk_lthash_from(&dpk_binds) {
+                Ok(n) if n > 0 => println!("[INFO][NODE] dilithium_pk_lthash_rebuilt_at_boot bindings={}", n),
+                Ok(_) => {}
+                Err(e) => println!("[WARN][NODE] dilithium_pk_lthash_rebuild_boot err={}", e),
+            }
             // B: re-derive the light_elig_ recency index for the last few committed epochs so a restarted /
             // snapshot-joined node answers status recency identically until the next boundary refresh.
             {
@@ -9914,8 +10091,8 @@ impl BlockchainNode {
                 if let Some(p2p) = p2p {
                     for tx in &microblock.transactions {
                         if let qnet_state::TransactionType::Heartbeat { node_id, anchor_height, anchor_hash, .. } = &tx.tx_type {
-                            let hb_sig = tx.dilithium_signature.as_deref().unwrap_or("");
-                            Self::verify_heartbeat_tx(node_id, *anchor_height, anchor_hash, hb_sig, microblock.height, storage, p2p)
+                            let hb_sig = tx.dilithium_signature.as_deref().map(|s| String::from_utf8_lossy(s).into_owned()).unwrap_or_default();
+                            Self::verify_heartbeat_tx(node_id, *anchor_height, anchor_hash, &hb_sig, microblock.height, storage, p2p)
                                 .await
                                 .map_err(|e| format!("invalid_heartbeat_tx: {}", e))?;
                         }
@@ -10538,11 +10715,12 @@ impl BlockchainNode {
     pub async fn start(&mut self) -> Result<(), QNetError> {
         println!("[INFO][NODE] starting");
 
-        // PRODUCTION v2.57: Log runtime isolation
+        // Log only the runtimes actually on the hot path (broadcast + sigverify).
         let stats = crate::unified_p2p::get_runtime_stats();
-        println!("[INFO][RUNTIME] cpus={} stages: BROADCAST({}t) SIGVERIFY({}t) BANKING({}t) REPLAY({}t) total={}t",
-                 stats.cpu_count, stats.broadcast_threads, stats.sigverify_threads,
-                 stats.banking_threads, stats.replay_threads, stats.total());
+        if is_info() {
+            println!("[INFO][RUNTIME] cpus={} broadcast={}t sigverify={}t",
+                     stats.cpu_count, stats.broadcast_threads, stats.sigverify_threads);
+        }
 
         // ─────────────────────────────────────────────────────────────────
         // v16.1: INSTALL GENESIS PK ANCHORS BEFORE ANY P2P TRAFFIC
@@ -11637,8 +11815,8 @@ impl BlockchainNode {
                                         if let Some(crypto) = try_get_quantum_crypto() {
                                             match crypto.create_consensus_signature(&node_id, &canonical_msg).await {
                                                 Ok(dilithium_sig) => {
-                                                    tx.dilithium_signature = Some(dilithium_sig.signature);
-                                                    tx.dilithium_public_key = Some(node_id.clone());
+                                                    tx.dilithium_signature = Some(dilithium_sig.signature.into_bytes());
+                                                    tx.dilithium_public_key = Some(node_id.clone().into_bytes());
                                                 }
                                                 Err(e) => {
                                                     if is_warn() {
@@ -11907,6 +12085,24 @@ impl BlockchainNode {
             });
         }
 
+        // Periodic mempool TTL sweep (60s): drop never-confirmed TXs (underpriced / nonce-gapped) so a
+        // stuck TX cannot hold a slot + sender quota forever. QNET_MEMPOOL_TTL secs (default 1800).
+        // Expired != confirmed, so it is NOT added to included_tx_hashes — re-submission stays open.
+        {
+            let mempool_ttl = self.mempool.clone();
+            let ttl_secs: u64 = std::env::var("QNET_MEMPOOL_TTL").ok()
+                .and_then(|s| s.parse().ok()).filter(|&t| t > 0).unwrap_or(1800);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(60));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    let n = mempool_ttl.cleanup_expired_transactions(ttl_secs);
+                    if n > 0 && is_info() { println!("[INFO][MEMPOOL] ttl_evicted count={} ttl_secs={}", n, ttl_secs); }
+                }
+            });
+        }
+
         // GALC: periodic genesis mint task (every node ticks; no-op for non-genesis / nothing-new). On
         // genesis nodes it signs + broadcasts a partial for the latest finalized macroblock on the
         // cadence; partials aggregate to a >=2f+1 capsule on every node, giving cold joiners a fresh
@@ -11945,11 +12141,13 @@ impl BlockchainNode {
         let microblock_interval = self.microblock_interval;
         let is_leader = self.is_leader.clone();
         let node_id = self.node_id.clone();
-        let parallel_validator = self.parallel_validator.clone();
+        // Verification now runs as a pre-apply filter (producer_tx_admissible) inline in the loop; the
+        // former post-apply parallel-validator gate is gone. Field retained for the ParallelExecutor path.
+        let _parallel_validator = self.parallel_validator.clone();
         let node_type = self.node_type;
         let _consensus_nonce_storage = self.consensus_nonce_storage.clone();
         let _last_block_attempt = self.last_block_attempt.clone();
-        let perf_config = self.perf_config.clone();
+        let _perf_config = self.perf_config.clone();
         let rotation_tracker = self.rotation_tracker.clone();
         let poh_for_spawn = self.poh.clone();
         let parallel_executor_for_spawn = self.parallel_executor.clone();
@@ -14114,6 +14312,14 @@ impl BlockchainNode {
                                             Err(e) => { if is_warn() { println!("[WARN][FORK] registry_lthash_rebuild_fail to={} err={}", rollback_to, e); } }
                                             _ => {}
                                         }
+                                        // dilithium_pk_root: subtract journaled orphan binds (height > target) —
+                                        // exact inverse of the apply-time bind, inside the barrier (applies
+                                        // quiesced ⇒ no concurrent bind). Symmetric with cbw/registry_lthash.
+                                        match storage.rollback_dpk_binds_above(rollback_to) {
+                                            Ok(n) if n > 0 => { if is_info() { println!("[INFO][FORK] dpk_binds_rolled_back n={} to={}", n, rollback_to); } }
+                                            Err(e) => { if is_warn() { println!("[WARN][FORK] dpk_rollback_fail to={} err={}", rollback_to, e); } }
+                                            _ => {}
+                                        }
 
                                         // Consensus reward side-indices (super_elig_/light_bm_) are non-height-keyed,
                                         // so an orphan block that wrote a current/future-epoch entry above rollback_to
@@ -14168,6 +14374,8 @@ impl BlockchainNode {
                                                 "[INFO][STATE] reconcile_after_pipeline_fork_ok target={}",
                                                 rollback_to,
                                             );
+                                            // dilithium_pk_root already healed INSIDE the rollback barrier
+                                            // (rollback_dpk_binds_above) — no state-dependent rebuild here.
                                             // Heal the NON-consensus wallet→token reverse index against the
                                             // reconciled truth. Owns-deltas are a best-effort background write
                                             // that is NOT rolled back, so an orphaned block's flushed Clear for a
@@ -15670,6 +15878,12 @@ impl BlockchainNode {
                     // IMPORTANT: Use the SAME hash from mempool, not recalculated!
                     let mut included_tx_hashes: Vec<String> = Vec::new();
                     let mut invalid_tx_hashes: Vec<String> = Vec::new();
+                    // VALID-but-not-included TXs that MUST stay in the mempool for a later block (NOT marked
+                    // confirmed / removed at the post-save cleanup below): pre-verify DEFER (elided value-TX
+                    // whose committed pk isn't present yet) + gas/fuel-limit TRUNCATION. included_tx_hashes is
+                    // captured at the early validation stage, so without this the post-save bulk removal would
+                    // evict + confirm these and they'd never be re-pulled.
+                    let mut keep_in_mempool: std::collections::HashSet<String> = std::collections::HashSet::new();
                     
                     // PRODUCTION v2.46: PARALLEL deserialization and validation with rayon
                     // Achieves 100K+ TPS by utilizing all CPU cores
@@ -16051,8 +16265,8 @@ impl BlockchainNode {
                     
                     // Log only every 100 blocks or when there are transactions
                     if log_block(next_block_height) || !txs.is_empty() {
-                        let tps = txs.len() as f64 * perf_config.shard_count as f64;
-                        if is_info() { println!("[INFO][BLOCK] h={} peers={} txs={} tps={:.0}", next_block_height, peer_count, txs.len(), tps); }
+                        // Real per-block tx count only; no fabricated shard-multiplied TPS.
+                        if is_info() { println!("[INFO][BLOCK] h={} peers={} txs={}", next_block_height, peer_count, txs.len()); }
                     }
                     
                     let _consensus_result: Option<u64> = None; // NO consensus for microblocks - Byzantine consensus ONLY for macroblocks
@@ -16337,6 +16551,78 @@ impl BlockchainNode {
                         continue;
                     }
                     
+                    // ═══ VERIFY-BEFORE-APPLY (mirror the block-validator's verify stage EXACTLY) ═══
+                    // Classify + verify the candidate set BEFORE the microblock body is frozen and BEFORE any
+                    // state/registry mutation, so an inadmissible tx can never be applied+materialised into
+                    // registry_root and then rejected+abandoned (the consensus-root divergence that split a
+                    // producer from 2f+1). ONE state read-lock rehydrates elided value-TX pubkeys into
+                    // VERIFY-ONLY clones — the block body + mempool stay ELIDED (the pk-elision TPS win),
+                    // byte-identical to block_pipeline's verify stage. Three outcomes per tx:
+                    //   ADMIT — keep in the block · EVICT — inadmissible → drop + remove from mempool ·
+                    //   DEFER — elided value-TX whose committed pk isn't present on THIS node yet (first-use
+                    //           TX not applied, or still syncing) → exclude from THIS block but KEEP in the
+                    //           mempool for a later block (mirror the validator's committee_deferred; hard-
+                    //           evicting a not-yet-resolvable VALID tx would silently lose it).
+                    if !txs.is_empty() {
+                        let snap_in_progress = crate::storage::SNAPSHOT_REHYDRATE_IN_PROGRESS
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        let mut verify_clones: Vec<(usize, qnet_state::Transaction)> = Vec::new();
+                        let mut evict_idx: Vec<usize> = Vec::new();
+                        let mut defer_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                        {
+                            // Cheap per-tx classification + elided-pk rehydration under ONE read-lock; the
+                            // CPU-bound ML-DSA verifies run AFTER the lock is dropped (below).
+                            let sg = state.read().await;
+                            for (i, tx) in txs.iter().enumerate() {
+                                match Self::producer_tx_prepare(tx, &*sg, snap_in_progress) {
+                                    TxPrep::Admit => {}
+                                    TxPrep::Evict => evict_idx.push(i),
+                                    TxPrep::Defer => { defer_idx.insert(i); }
+                                    TxPrep::Verify(clone) => verify_clones.push((i, clone)),
+                                }
+                            }
+                        }
+                        // Parallel ML-DSA verify of the resolved clones OFF the state lock (512 per batch to
+                        // stay within the 1s slot at ≤200k txs/block, ML-DSA verify ~150µs).
+                        let mut bad_verify: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                        if !verify_clones.is_empty() {
+                            let batches: Vec<Vec<_>> = verify_clones.chunks(512).map(|c| c.to_vec()).collect();
+                            let mut futs = Vec::with_capacity(batches.len());
+                            for batch in batches {
+                                // spawn_blocking: the CPU-bound ML-DSA-65 verify runs on the blocking pool,
+                                // NOT the async-runtime workers that carry consensus/P2P — mirrors the FIX-1
+                                // lane rule (the old tokio::spawn ran sync crypto inline on a runtime worker,
+                                // so a cold VALUE_VERIFY_CACHE could blow the 1s producer slot).
+                                futs.push(tokio::task::spawn_blocking(move || {
+                                    let mut bad = Vec::new();
+                                    for (i, clone) in batch {
+                                        if !Self::producer_tx_verify_sig(&clone) { bad.push(i); }
+                                    }
+                                    bad
+                                }));
+                            }
+                            for f in futs { if let Ok(b) = f.await { for i in b { bad_verify.insert(i); } } }
+                        }
+                        // EVICT (evict_idx ∪ bad_verify) → drop + remove from mempool. DEFER → drop only.
+                        let evict_set: std::collections::HashSet<usize> =
+                            evict_idx.iter().copied().chain(bad_verify.iter().copied()).collect();
+                        if !evict_set.is_empty() {
+                            let evict_hashes: Vec<String> = evict_set.iter().map(|&i| txs[i].hash.clone()).collect();
+                            mempool.batch_remove_transactions(&evict_hashes);
+                        }
+                        // DEFERRED txs stay in the mempool for a later block — exclude them from the post-save
+                        // confirm/remove (captured here, while defer_idx still indexes txs, BEFORE the retain).
+                        for &i in defer_idx.iter() { keep_in_mempool.insert(txs[i].hash.clone()); }
+                        if !evict_set.is_empty() || !defer_idx.is_empty() {
+                            if is_warn() {
+                                println!("[WARN][MB] pre_verify h={} evicted={} deferred={}",
+                                    next_block_height, evict_set.len(), defer_idx.len());
+                            }
+                            let mut i = 0usize;
+                            txs.retain(|_| { let keep = !evict_set.contains(&i) && !defer_idx.contains(&i); i += 1; keep });
+                        }
+                    }
+
                     // ═══════════════════════════════════════════════════════════════════
                     // v3.18: Calculate fees_collected BEFORE creating microblock
                     // Fees go directly to producer (Pool 2 removed)
@@ -16378,6 +16664,9 @@ impl BlockchainNode {
                             println!("[INFO][BLOCK] gas_limit_applied total_tx={} included_tx={} gas_used={} max_gas={} fuel_used={} max_fuel={}",
                                      txs.len(), limit_idx, block_gas_used, block_gas_limit, block_fuel_used, block_fuel_limit);
                         }
+                        // Truncated TXs are VALID, they just didn't fit — keep them in the mempool for the next
+                        // block (exclude from the post-save confirm/remove, which runs over the early hash set).
+                        for tx in &txs[limit_idx..] { keep_in_mempool.insert(tx.hash.clone()); }
                         txs.truncate(limit_idx);
                     }
                     
@@ -16446,6 +16735,12 @@ impl BlockchainNode {
                     // that fails apply on EVERY node would still be written by the producer ALONE, so its
                     // node_registry / cbw / registry_root diverge from the network.
                     let mut applied_reg_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    // FIX-5: (address, pk) bindings from THIS block's successfully-applied value TXs — the
+                    // producer mirror of the validator's BlockApplyResult.deferred_pk_binds. Collected here
+                    // (apply-Ok only) and drained into dilithium_pk_root BEFORE the seal, so producer and
+                    // validator commit an identical set. It CANNOT ride the applied_reg_hashes gate below:
+                    // that set holds only NodeRegistration/NodeActivation hashes.
+                    let mut applied_pk_binds: Vec<(String, Vec<u8>)> = Vec::new();
                     // total_supply as-of this head, captured under the same lock that minted it (A2 seal below).
                     let producer_supply_head: u64;
                     // QRC-20 owns-index deltas for THIS producer's block — collected under the state lock,
@@ -16550,6 +16845,14 @@ impl BlockchainNode {
                                     qnet_state::TransactionType::NodeRegistration { .. }
                                     | qnet_state::TransactionType::NodeActivation { .. }) {
                                     applied_reg_hashes.insert(tx.hash.clone());
+                                }
+                                // FIX-5: same apply-Ok gate for the value classes, collecting the (address,
+                                // pk) rows that go into dilithium_pk_root — byte-identical to the validator's
+                                // BlockApplyResult.deferred_pk_binds (node.rs, apply_block_to_state).
+                                if tx.binds_dilithium_pk() {
+                                    if let Some(pk) = tx.dilithium_public_key.as_ref() {
+                                        applied_pk_binds.push((tx.from.clone(), pk.clone()));
+                                    }
                                 }
                             }
                         }
@@ -16656,55 +16959,12 @@ impl BlockchainNode {
                         }
                     }
 
-                    // Producer applies its own block INLINE (bypassing apply_block_to_state's
-                    // deferred_registrations), so it must stamp reg_height + the backing burn for its
-                    // OWN block's registrations exactly as a peer-applying validator does — otherwise
-                    // the producer's node_ entry has no reg_height and rebuild_committed_burn_wallet /
-                    // the reward roster drop it, diverging from synced peers. Mirror of the peer-apply
-                    // deferred consumer (block_pipeline.rs).
-                    for tx in &txs {
-                        // Heartbeat liveness index (lhb_) — mirror of the peer-apply writer. Unconditional
-                        // per INCLUDED tx (the body scan it replaces reads the block body, not apply status).
-                        if let qnet_state::TransactionType::Heartbeat { node_id: hb_id, anchor_height: hb_anchor, .. } = &tx.tx_type {
-                            let _ = storage.index_heartbeat_inclusion(hb_id, *hb_anchor, next_block_height);
-                        }
-                        // Only TXs whose state-apply SUCCEEDED (same gate the validator's deferred path uses).
-                        if !applied_reg_hashes.contains(&tx.hash) { continue; }
-                        match &tx.tx_type {
-                            qnet_state::TransactionType::NodeRegistration {
-                                node_id: rid, node_type: rtype, wallet_address: rwallet, burn_tx: rburn, ..
-                            } => {
-                                // Single canonical derivation (vrf super-only + cbw), byte-identical to the
-                                // peer-apply path — else the producer's own registry_root row diverges → fork.
-                                Self::write_registration_row(&storage, rid, rtype, rwallet, rburn, tx.dilithium_public_key.as_ref(), next_block_height);
-                            }
-                            qnet_state::TransactionType::NodeActivation { node_type: ntype, phase, .. } => {
-                                // Mirror apply_block_to_state EXACTLY: Phase2 is consumed by the pool3 arm and
-                                // stamps NO registry rows — skip here too (else registry_root/reward-roster
-                                // diverge → content_ok never 2f+1 → halt). Phase1/other → super self-registers
-                                // its canonical pseudonym; no phantom tx-hash row (one wallet = one row).
-                                if matches!(phase, qnet_state::account::ActivationPhase::Phase2) { continue; }
-                                if matches!(ntype, qnet_state::account::NodeType::Super) {
-                                    let pseudonym = crate::rpc::generate_super_node_pseudonym(&tx.from);
-                                    let _ = storage.save_node_registration_at_height_burn(
-                                        &pseudonym, "super", &tx.from, 1.0, next_block_height, "");
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // registry_root seal (LtHash): at a checkpoint head, capture sha3(lt_state) for THIS
-                    // block's roster AFTER all of its registrations updated lt_state (loop above) and
-                    // BEFORE save below — so the WindowEnd checkpoint compute (gated on the head being
-                    // loadable, which happens at save) always reads a present, complete seal. Mirror of
-                    // the validator path (block_pipeline). Fires once per checkpoint head, incl. zero-
-                    // registration heads. The producer's later cache re-write (cache_node_registrations,
-                    // reg_height None) does NOT touch lt_state, so this is the block's final accumulator.
-                    if next_block_height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
-                        let _ = storage.seal_registry_root(next_block_height);
-                        let _ = storage.seal_total_supply(next_block_height, producer_supply_head);
-                    }
+                    // Durable registry materialisation (node_/srtr_/lrtr_ + the registry_root /
+                    // dilithium_pk_root / total_supply LtHash seals) is MOVED BELOW — it now runs ONLY
+                    // after the block passes signing + structural validation + the fork/exists guard, so a
+                    // rejected or abandoned candidate can never write a registry_root delta the saved chain
+                    // won't back (the consensus-root divergence that permanently split a producer from
+                    // 2f+1). Mirror of the validator: materialise after acceptance, before save.
 
                     // QUANTUM VTS: Mix microblock into VTS chain for cryptographic time proof
                     if let Some(ref poh) = poh {
@@ -16821,138 +17081,12 @@ impl BlockchainNode {
                         continue;
                     }
                     
-                    // Production parallel validation if enabled
-                    if let Some(validator) = &parallel_validator {
-                        let validation_start = Instant::now();
-                        let tx_batches: Vec<Vec<_>> = txs.chunks(1000).map(|chunk| chunk.to_vec()).collect();
-                        
-                        // Real parallel validation of transaction batches
-                        let mut validation_futures = Vec::new();
-                        for batch in tx_batches {
-                            let _validator_clone = validator.clone();
-                            validation_futures.push(tokio::spawn(async move {
-                                // Validate each transaction in parallel
-                                for tx in batch {
-                                    // v2.93: System TX bypass signature/amount validation
-                                    // CRITICAL FIX: Check by tx_type NOT just by from field!
-                                    // HeartbeatCommitment has from=node_id, not "system_*"
-                                    // v5.1: client-signed NodeRegistration (data starts with "client_node_reg:")
-                                    // is NOT a system TX — its Ed25519+Dilithium signatures MUST be verified.
-                                    // Only genesis/server NodeRegistration (no prefix) retains system bypass.
-                                    let is_client_nodereg = matches!(tx.tx_type,
-                                        qnet_state::TransactionType::NodeRegistration { .. }
-                                    ) && tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:");
-                                    
-                                    // Canonical system-TX predicate (single source of truth) + system_*
-                                    // net. Client-signed NodeRegistration stays NON-system so its
-                                    // Ed25519+Dilithium are verified below. The inline list had dropped
-                                    // NodeActivation → activation TX rejected → super-node never onboards.
-                                    let is_system_tx = !is_client_nodereg
-                                        && (tx.is_system_tx() || tx.from.starts_with("system_"));
-                                    
-                                    if is_system_tx {
-                                        // System TX: only basic validation (no signature/amount check)
-                                        continue;
-                                    }
-                                    
-                                    // REAL PRODUCTION VALIDATION - not a stub!
-                                    if let Err(_) = tx.validate() {
-                                        return Some(tx.hash.clone());
-                                    }
-                                    // NodeRegistration has amount=0 by protocol — exempt from amount check.
-                                    // NodeReactivation has amount=0 + a single Dilithium3 signature — verify it.
-                                    // All other user TX must have non-zero amount and a Dilithium3 (ML-DSA-65) signature.
-                                    let is_node_reactivation = matches!(tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. });
-                                    if is_client_nodereg {
-                                        // Single source of truth for signature validity: the SAME deterministic
-                                        // wire-key verifier admission runs (verify_dilithium_tx_signature_async).
-                                        // Opens against tx.dilithium_public_key with a dual-label strip and NO
-                                        // first-reg skip / NO gossip-seeded VRF registry — so a reg that passed
-                                        // admission can never fail here. The prior inline path stripped only the
-                                        // node_id label and read the RAM registry, so a re-included reg flipped
-                                        // PASS→FAIL and wedged the producer. Sig-less imported-wallet first-reg is
-                                        // authorised by the 2f+1 burn quorum at ingest → accept (mirror admission).
-                                        let sig_ok = match tx.dilithium_signature.as_ref() {
-                                            Some(s) if !s.is_empty() => Self::verify_node_lifecycle_dilithium(&tx),
-                                            _ => true,
-                                        };
-                                        if !sig_ok {
-                                            if crate::node::is_warn() {
-                                                println!("[WARN][BLOCK-VALIDATION] NodeRegistration sig invalid from={}", tx.from);
-                                            }
-                                            return Some(tx.hash.clone());
-                                        }
-                                    } else if is_node_reactivation {
-                                        // Same single deterministic wire-key verifier as admission AND the
-                                        // receive-side (block_pipeline → verify_node_lifecycle_dilithium). The prior
-                                        // inline path opened vs the gossip-seeded RAM VRF registry, so a producer
-                                        // with a stale/unseeded key could reject its OWN admission-valid,
-                                        // receiver-acceptable reactivation → the same producer wedge as the reg bug.
-                                        // Authority = the node's committed registration (only a registered node
-                                        // reactivates) + per-mb-epoch dedup at apply; the sig is non-repudiation.
-                                        if !Self::verify_node_lifecycle_dilithium(&tx) {
-                                            if crate::node::is_warn() {
-                                                println!("[WARN][BLOCK-VALIDATION] NodeReactivation sig invalid from={}", tx.from);
-                                            }
-                                            return Some(tx.hash.clone());
-                                        }
-                                    } else if matches!(tx.tx_type,
-                                        qnet_state::TransactionType::Transfer { .. } |
-                                        qnet_state::TransactionType::ContractDeploy |
-                                        qnet_state::TransactionType::ContractCall |
-                                        qnet_state::TransactionType::Swap { .. }
-                                    ) {
-                                        // Pure ML-DSA-65 value TX (signature:None). Verify the mandatory
-                                        // Dilithium sig + API-1 identity bind on the producer path too
-                                        // (verify_user_tx_dilithium folds in eon(dpk)==from). amount==0 is
-                                        // illegal only for Transfer (ContractDeploy/Call/Swap may be 0).
-                                        if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty())
-                                            || !Self::verify_user_tx_dilithium(&tx)
-                                        {
-                                            return Some(tx.hash.clone());
-                                        }
-                                        if matches!(tx.tx_type, qnet_state::TransactionType::Transfer { .. }) && tx.amount == 0 {
-                                            return Some(tx.hash.clone());
-                                        }
-                                    } else if tx.signature.as_ref().map_or(true, |s| s.is_empty()) || tx.amount == 0 {
-                                        return Some(tx.hash.clone());
-                                    }
-                                }
-                                None
-                            }));
-                        }
-                        
-                        // Wait for all parallel validations; collect the hash of any tx that failed so a
-                        // poison tx is evicted (below) rather than left to hot-loop the producer.
-                        let mut poison_tx_hashes: Vec<String> = Vec::new();
-                        for future in validation_futures {
-                            if let Ok(Some(hash)) = future.await {
-                                poison_tx_hashes.push(hash);
-                            }
-                        }
-                        let all_valid = poison_tx_hashes.is_empty();
+                    // Per-tx signature/validity verification now runs as a PRE-APPLY filter (above, before
+                    // the microblock body is frozen) — mirror of the validator's verify→apply order. An
+                    // inadmissible tx is dropped + evicted there, so it is never applied or materialised;
+                    // the old post-apply "verify → poison-evict → continue" wedge (apply+materialise, THEN
+                    // reject, orphaning a registry_root LtHash delta) is gone.
 
-                        let validation_time = validation_start.elapsed();
-
-                        if !all_valid {
-                            // A tx that fails producer validation must never wedge the block: evict it from
-                            // the local mempool so the next tick rebuilds the body without it (eviction is
-                            // per-node, non-consensus). Guarantees no un-appliable tx can hot-loop the producer.
-                            mempool.batch_remove_transactions(&poison_tx_hashes);
-                            if crate::node::is_warn() {
-                                println!("[WARN][MB] producer_poison_tx_evicted count={} elapsed={}ms",
-                                    poison_tx_hashes.len(), validation_time.as_millis());
-                            }
-                            // v3.4: CRITICAL - Clear broadcast flag before continue
-                            crate::unified_p2p::BLOCK_BROADCAST_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
-                            continue;
-                        }
-                        
-                        if validation_time.as_millis() > 100 {
-                            println!("[WARN][MB] parallel_validation_slow elapsed={}ms", validation_time.as_millis());
-                        }
-                    }
-                    
                     // Calculate TPS for this microblock
                     let tps = (txs.len() as f64) / current_interval.as_secs_f64();
                     
@@ -16965,11 +17099,10 @@ impl BlockchainNode {
                             continue;
                         }
                     }
-                    
-                    // PRODUCTION: Use ultra-modern storage with delta encoding and compression
-                    // QUANTUM: Always use async storage for consistent timing
-                    // CRITICAL FIX: Save block with minimal blocking (serialize in main thread, save async)
-                    // This ensures block exists before height increment, but doesn't block on I/O
+
+                    // Serialize the (now final) microblock BEFORE materialising durable registry state, so the
+                    // ONLY step remaining after the seals is the block save — a serialize failure aborts with
+                    // zero durable registry/seal writes (no orphaned registry_root delta).
                     let microblock_data = match bincode::serialize(&microblock) {
                         Ok(data) => data,
                         Err(e) => {
@@ -16978,7 +17111,71 @@ impl BlockchainNode {
                             continue;
                         }
                     };
-                    
+
+                    // ═══ COMMITTED: materialise durable registry state (mirror the validator's post-accept,
+                    // pre-save order). Reached ONLY after the pre-apply verify filter + signing + structural
+                    // validation + the fork/exists guard + serialize above passed, so every registry_root /
+                    // dilithium_pk_root LtHash delta written here is backed by the block saved immediately below
+                    // — a rejected or abandoned candidate can no longer orphan a consensus-root delta.
+                    // save_block_with_delta (below) makes h loadable; the WindowEnd checkpoint compute is gated
+                    // on that, so sealing here guarantees the seals exist before any checkpoint reads them.
+                    for tx in &txs {
+                        // Heartbeat liveness index (lhb_) — mirror of the peer-apply writer. Unconditional
+                        // per INCLUDED tx (the body scan it replaces reads the block body, not apply status).
+                        if let qnet_state::TransactionType::Heartbeat { node_id: hb_id, anchor_height: hb_anchor, .. } = &tx.tx_type {
+                            let _ = storage.index_heartbeat_inclusion(hb_id, *hb_anchor, next_block_height);
+                        }
+                        // Only TXs whose state-apply SUCCEEDED (same gate the validator's deferred path uses).
+                        if !applied_reg_hashes.contains(&tx.hash) { continue; }
+                        match &tx.tx_type {
+                            qnet_state::TransactionType::NodeRegistration {
+                                node_id: rid, node_type: rtype, wallet_address: rwallet, burn_tx: rburn, ..
+                            } => {
+                                // Single canonical derivation (vrf super-only + cbw), byte-identical to the
+                                // peer-apply path — else the producer's own registry_root row diverges → fork.
+                                Self::write_registration_row(&storage, rid, rtype, rwallet, rburn, tx.dilithium_public_key.as_ref(), next_block_height);
+                            }
+                            qnet_state::TransactionType::NodeActivation { node_type: ntype, phase, .. } => {
+                                // Mirror apply_block_to_state EXACTLY: Phase2 stamps NO registry rows (pool3
+                                // arm consumes it). Phase1/other → super self-registers its canonical pseudonym.
+                                if matches!(phase, qnet_state::account::ActivationPhase::Phase2) { continue; }
+                                if matches!(ntype, qnet_state::account::NodeType::Super) {
+                                    let pseudonym = crate::rpc::generate_super_node_pseudonym(&tx.from);
+                                    let _ = storage.save_node_registration_at_height_burn(
+                                        &pseudonym, "super", &tx.from, 1.0, next_block_height, "");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // FIX-5: drain this block's value-TX pk bindings into the dilithium_pk_root LtHash
+                    // (marker-guarded ⇒ once/account) BEFORE the seal — outside the loop above, whose
+                    // applied_reg_hashes gate admits only registration/activation hashes.
+                    for (addr, pk) in &applied_pk_binds {
+                        let _ = storage.dpk_lt_bind(addr, pk, next_block_height);
+                    }
+                    // Watermark the highest accumulator-mutating height so a later dropped seal is
+                    // healable-on-read only while the live accumulator still equals its as-of-height value.
+                    if !applied_pk_binds.is_empty() {
+                        let _ = storage.note_dpk_bind_height(next_block_height);
+                    }
+                    // registry_root / dilithium_pk_root / total_supply seals at a checkpoint head, after all
+                    // of this block's registrations updated lt_state and BEFORE save — mirror of the validator.
+                    if next_block_height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
+                        let _ = storage.seal_registry_root(next_block_height);
+                        // Surface a dropped dpk seal-write (its compute fallback is not height-bounded, so a
+                        // silent miss later diverges the checkpoint field).
+                        if let Err(e) = storage.seal_dilithium_pk_root(next_block_height) {
+                            if is_warn() { println!("[WARN][SEAL] dpk_root_seal_fail h={} err={}", next_block_height, e); }
+                        }
+                        // Bind-journal prune bounded by the finality floor (same value the rollback guard uses).
+                        let _ = storage.prune_dpk_journal(
+                            LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::Relaxed));
+                        let _ = storage.seal_total_supply(next_block_height, producer_supply_head);
+                    }
+
+                    // PRODUCTION: durable save (delta-encoded + compressed). microblock_data was serialized
+                    // above, BEFORE materialisation, so no abort path remains between the seals and this save.
                     let storage_clone = storage.clone();
                     let height_for_storage = microblock.height;
                     let p2p_for_reward = unified_p2p.clone();
@@ -17065,6 +17262,14 @@ impl BlockchainNode {
                         // CRITICAL v2.26: Remove included TX from mempool AFTER block is saved!
                         // This prevents re-processing the same TX in future blocks
                         // v2.26: Direct access - SimpleMempool is already thread-safe
+                        // included_tx_hashes was captured at the early validation stage; a tx dropped AFTER
+                        // that (pre-verify DEFER, or gas/fuel truncation) is VALID-but-not-included and must
+                        // NOT be confirmed/removed here (else it is lost — never re-pulled). Genuinely-invalid
+                        // drops (dup-burn/unbacked-activation, evicted sigs) are NOT in keep_in_mempool, so
+                        // they are still confirmed+removed exactly as before.
+                        if !keep_in_mempool.is_empty() {
+                            included_tx_hashes.retain(|h| !keep_in_mempool.contains(h));
+                        }
                         if !included_tx_hashes.is_empty() {
                             // PROTOCOL: Record hashes as confirmed (prevents re-add via delayed gossip)
                             mempool.record_included_txs(&included_tx_hashes);
@@ -17872,20 +18077,10 @@ impl BlockchainNode {
                 // PRODUCTION: NON-BLOCKING MACROBLOCK - Swiss watch precision without stops!
                 // Microblocks continue flowing while macroblock consensus runs in background
                 if microblock_height.saturating_sub(last_macroblock_trigger) == 90 {
-                    // PRODUCTION: Performance report every macroblock
-                    let shard_count = perf_config.shard_count;
-                    let blocks_per_second = 1.0; // 1 microblock per second
-                    let avg_tx_per_block = perf_config.batch_size;
-                    let theoretical_tps = blocks_per_second * avg_tx_per_block as f64 * shard_count as f64;
-                    
-                    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                    println!("[INFO][MB] macroblock_boundary height={} consensus=background", microblock_height);
-                    println!("[INFO][MB] microblocks_continue arch=zero_downtime");
-                    println!("[INFO][MB] tps_capacity={:.0} shards={} tx_per_block={}",
-                             theoretical_tps, shard_count, avg_tx_per_block);
-                    println!("[INFO][MB] quantum_optimizations lock_free=true sharding=true parallel=true");
-                    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                    println!("[INFO][MB] consensus_boundary all_nodes");
+                    // Macroblock boundary: consensus runs in the background, microblocks keep flowing.
+                    if is_info() {
+                        println!("[INFO][MB] macroblock_boundary height={} consensus=background", microblock_height);
+                    }
                     
                     // PRODUCTION: Check macroblock status asynchronously (non-blocking)
                     let storage_check = storage.clone();
@@ -20044,11 +20239,14 @@ impl BlockchainNode {
                     // setting finality to 50*90=4500 blocks stall recovery from rolling back.
                     // Every L1 (Ethereum FFG, Tendermint) only finalizes blocks that ACTUALLY exist.
                     let round = highest * 90;
-                    let safe_finality = round.min(chain_height);
+                    // CONTENT-GATED (P3): cap finality at the highest content-matching sealed window, so a
+                    // restarted node that applied a losing fork (but wasn't yet repaired to canonical)
+                    // never boot-finalizes the fork. Also caps at chain_height (applied-tip floor).
+                    let safe_finality = Self::boot_content_finality_ceiling(&storage, chain_height);
                     LAST_FINALIZED_CONSENSUS_ROUND.store(safe_finality, std::sync::atomic::Ordering::SeqCst);
                     LAST_FINALIZED_HEIGHT.store(safe_finality, std::sync::atomic::Ordering::SeqCst);
                     if safe_finality < round {
-                        println!("[WARN][CONSENSUS-LISTENER] finality_capped mb_round={} chain_h={} safe={} — microblocks incomplete",
+                        println!("[WARN][CONSENSUS-LISTENER] finality_capped mb_round={} chain_h={} safe={} — content-unverified or microblocks incomplete",
                                  round, chain_height, safe_finality);
                     }
                     println!("[INFO][MB] consensus_init last_mb={} round={} finality_h={} chain_h={}",
@@ -20102,11 +20300,15 @@ impl BlockchainNode {
                             let qcf = QC_VERIFIED_FRONTIER.load(std::sync::atomic::Ordering::Relaxed);
                             let tip_mb = (crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT
                                 .load(std::sync::atomic::Ordering::Relaxed) / mi) * mi;
-                            let adoptable = qcf.min(tip_mb);
+                            // Floor on the content-verified ceiling: adopt-finalize only over windows whose
+                            // local bodies match their QC-certified hashes, never over a losing-fork tail.
+                            // Re-clamp at tip_mb: CONTENT_VERIFIED_FRONTIER is monotone, so a tip regression
+                            // (rollback) below it must not let finality outrun the applied tip.
+                            let adoptable = Self::advance_content_verified_frontier(&storage, qcf.min(tip_mb)).min(tip_mb);
                             if adoptable > LAST_FINALIZED_CONSENSUS_ROUND.load(std::sync::atomic::Ordering::SeqCst)
                                 && try_advance_finality(adoptable, "SYNC-ADOPT") && is_info() {
-                                println!("[INFO][MB] sync_adopt_finality adopted={} qc_frontier={} tip_mb={}",
-                                         adoptable, qcf, tip_mb);
+                                println!("[INFO][MB] sync_adopt_finality adopted={} qc_frontier={} tip_mb={} content_fr={}",
+                                         adoptable, qcf, tip_mb, CONTENT_VERIFIED_FRONTIER.load(std::sync::atomic::Ordering::Relaxed));
                             }
                         }
                         // Re-drive the driver's FRONTIER checkpoint (intra OR macro) when finality
@@ -20225,6 +20427,13 @@ impl BlockchainNode {
                                         // registry_root as of this intra head — deterministic, enforced (gated)
                                         // by content_ok like every checkpoint; the field is in the QC hash regardless.
                                         let registry_root = storage_cp.compute_registry_root(b);
+                                        // Seal-strict: None ⇒ not yet sealed ⇒ defer (mirrors total_supply
+                                        // below). The lossy fallback is tip-scoped, not height-scoped, so
+                                        // publishing it would silently diverge this node's checkpoint.
+                                        let dilithium_pk_root = match storage_cp.compute_dilithium_pk_root_sealed(b) {
+                                            Some(r) => r,
+                                            None => return,
+                                        };
                                         // QC-bound total minted supply as of this intra head — read from the
                                         // height-sealed ts_seal_{b} (NOT the live counter). None ⇒ not yet sealed ⇒ defer.
                                         let total_supply = match storage_cp.get_total_supply_at(b) {
@@ -20233,7 +20442,7 @@ impl BlockchainNode {
                                         };
                                         crate::consensus_v2_node::signal_window_end(
                                             cp_index, b, h_vec, state_root, beacon, committee, Vec::new(), Vec::new(), [0u8; 32],
-                                            registry_root, [0u8; 32], total_supply,
+                                            registry_root, dilithium_pk_root, [0u8; 32], total_supply,
                                         );
                                         if crate::node::is_info() {
                                             println!("[INFO][BFT2] intra_checkpoint_signalled cp_index={} head={} k={}", cp_index, b, k);
@@ -20644,6 +20853,12 @@ impl BlockchainNode {
                                         // via Checkpoint.registry_root so an untrusted-snapshot joiner can verify the
                                         // restored node_registry (source of cbw + attestor VRF keys). reg_height<=end_height.
                                         let registry_root = storage_cons.compute_registry_root(end_height);
+                                        // Seal-strict (mirrors total_supply below): None ⇒ not yet sealed ⇒ defer,
+                                        // never publish the tip-scoped fallback into a QC-bound field.
+                                        let dilithium_pk_root = match storage_cons.compute_dilithium_pk_root_sealed(end_height) {
+                                            Some(r) => r,
+                                            None => return,
+                                        };
                                         // QC-bound total minted supply as of the window head — read from the
                                         // height-sealed ts_seal_{end_height} (NOT the live counter, which races the
                                         // in-block mint). None ⇒ this head not yet applied+sealed ⇒ defer.
@@ -20663,7 +20878,7 @@ impl BlockchainNode {
                                         crate::consensus_v2_node::signal_window_end(
                                             end_height / qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL,
                                             end_height, mb_hashes, state_root, beacon, committee, eligible_bytes, banned_for_epoch, reward_root,
-                                            registry_root, logs_root, total_supply,
+                                            registry_root, dilithium_pk_root, logs_root, total_supply,
                                         );
                                         return;
                                     }
@@ -21078,8 +21293,11 @@ impl BlockchainNode {
         // mutate it in transit (signature still verifies against the unsigned remainder) and poison
         // record_finalized_round / fork-choice, re-opening the exact malleability v23.1 closed.
         hasher.update(&microblock.carried_baseline.to_be_bytes());
+        // Blocker-3: bind the WIRE pk-presence of this block's txs so a relay cannot strip/add a first-use
+        // pk (block hash unchanged, pk elided from the tx preimage) without breaking this signature.
+        hasher.update(&microblock_pk_digest(&microblock.transactions));
         let message_hash = hasher.finalize();
-        
+
         // Sign with VRF instance (Dilithium3 detached signature)
         // VRF instance holds the persistent keypair loaded from DilithiumKeyManager at startup
         let global_vrf = GLOBAL_VRF_INSTANCE.lock();
@@ -21196,6 +21414,9 @@ impl BlockchainNode {
             hasher2.update(&microblock.timeout_round.to_be_bytes());
             // v23.2: bind carried_baseline (matches signer) — see sign_microblock_with_dilithium.
             hasher2.update(&microblock.carried_baseline.to_be_bytes());
+            // Blocker-3: bind the received block's WIRE pk-presence (matches signer). A tampered copy
+            // (first-use pk stripped/added) recomputes a different digest ⇒ sig fails ⇒ rejected + re-fetched.
+            hasher2.update(&microblock_pk_digest(&microblock.transactions));
             let msg_hash = hasher2.finalize();
 
             // Verify Dilithium3 detached signature
@@ -22074,29 +22295,45 @@ impl BlockchainNode {
             // binding (closes API-1 forge-from-any-address) and PQ is mandatory (closes AC-3).
             // Ed25519 is NOT the authorization for these classes. Non-value user TX (registration/
             // activation/proofs) keep the existing signature path (migrated in later F0.1 sub-steps).
-            let is_value_tx = matches!(tx.tx_type,
-                qnet_state::TransactionType::Transfer { .. } |
-                qnet_state::TransactionType::ContractDeploy |
-                qnet_state::TransactionType::ContractCall
-            );
+            // Shared value-class predicate (Transfer|ContractDeploy|ContractCall|Swap) — MUST match the
+            // apply/producer/bind set, or an elided-pk TX admission rejects but apply accepts (accept-set drift).
+            let is_value_tx = tx.is_value_class();
             if is_value_tx {
-                let dpk = match tx.dilithium_public_key.as_ref().filter(|k| !k.is_empty()) {
-                    Some(k) => k,
-                    None => return Err(QNetError::ValidationError(
-                        "[REJECT][AUTH] value TX requires dilithium_public_key (pure-PQ)".to_string())),
-                };
                 if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
                     return Err(QNetError::ValidationError(
                         "[REJECT][AUTH] value TX requires dilithium_signature (pure-PQ)".to_string()));
                 }
-                // Address binding: `from` MUST be the address derived from the signing PQ key.
-                match crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(dpk) {
-                    Some(derived) if derived == tx.from => {}
-                    _ => return Err(QNetError::ValidationError(
-                        "[REJECT][AUTH] from_pubkey_mismatch (dilithium)".to_string())),
-                }
-                if !Self::verify_dilithium_tx_signature_async(&tx).await? {
-                    return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
+                // FIX-5 pk-elision: the 1952-byte pubkey may be OMITTED once it is committed on-chain (the
+                // first-use TX carries it and binds it write-once). Resolve it into a VERIFY-ONLY clone —
+                // the mempool keeps the ELIDED form so the pk never re-enters the wire (block + gossip stay
+                // lean, which is the whole TPS win). Unresolved ⇒ cheap reject BEFORE any signature verify,
+                // so an unresolvable-elided flood costs a state lookup, never a CPU-bound ML-DSA-65 open.
+                if tx.dilithium_public_key.as_ref().map_or(true, |k| k.is_empty()) {
+                    let mut probe = tx.clone();
+                    {
+                        let sg = self.state.read().await;
+                        if !matches!(Self::rehydrate_elided_pk(&mut probe, &*sg), PkResolve::Resolved) {
+                            return Err(QNetError::ValidationError(
+                                "[REJECT][AUTH] pk_unresolved: include dilithium_public_key on the first-use TX".to_string()));
+                        }
+                    }
+                    // eon(pk)==from holds by construction (the pk was read from the `from`-keyed account,
+                    // and binding required that check) and verify_user_tx_dilithium re-asserts it anyway.
+                    if !Self::verify_dilithium_tx_signature_async(&probe, VerifyLane::Admission).await? {
+                        return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
+                    }
+                } else {
+                    // Wire pk present (first-use, or a non-eliding client): bind `from` to the supplied key
+                    // early (cheap reject) — closes API-1 forge-from-any-address — then verify.
+                    let dpk = tx.dilithium_public_key.as_ref().expect("non-empty checked above");
+                    match crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(dpk) {
+                        Some(derived) if derived == tx.from => {}
+                        _ => return Err(QNetError::ValidationError(
+                            "[REJECT][AUTH] from_pubkey_mismatch (dilithium)".to_string())),
+                    }
+                    if !Self::verify_dilithium_tx_signature_async(&tx, VerifyLane::Admission).await? {
+                        return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
+                    }
                 }
             } else {
                 // Non-value user TX — QNet is pure post-quantum: Ed25519 is a Solana-only credential
@@ -22112,7 +22349,7 @@ impl BlockchainNode {
                         return Err(QNetError::ValidationError(
                             "[REJECT][AUTH] user TX requires dilithium_signature + dilithium_public_key (pure-PQ)".to_string()));
                     }
-                    if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                    if !Self::verify_dilithium_tx_signature_async(&tx, VerifyLane::Admission).await? {
                         return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
                     }
                 }
@@ -22340,18 +22577,12 @@ impl BlockchainNode {
                 qnet_state::TransactionType::NodeActivation { .. } |
                 // v35: Heartbeat is Dilithium-only (no Ed25519) — skip the Ed25519
                 // batch; its Dilithium sig is verified in validate_and_add.
-                qnet_state::TransactionType::Heartbeat { .. } |
-                // Pure ML-DSA-65 user value TXs (signature:None): Ed25519 not carried. Authenticated
-                // by the MANDATORY ML-DSA-65 verify (verify_user_tx_dilithium: sig over the canonical
-                // message + eon(dpk)==from identity bind) at BOTH gossip admission
-                // (validate_and_add_network_transaction is_value_tx) AND block_pipeline receive-verify,
-                // so exempting them from this Ed25519 batch does not weaken authenticity — it is the
-                // fix that lets pure-PQ transfers enter a block at all (they carry no Ed25519).
-                qnet_state::TransactionType::Transfer { .. } |
-                qnet_state::TransactionType::ContractDeploy |
-                qnet_state::TransactionType::ContractCall |
-                qnet_state::TransactionType::Swap { .. }
-            );
+                qnet_state::TransactionType::Heartbeat { .. }
+            // Pure ML-DSA-65 user value TXs (signature:None): Ed25519 not carried. Authenticated by the
+            // MANDATORY ML-DSA-65 verify (verify_user_tx_dilithium: canonical-message sig + eon(dpk)==from
+            // bind) at BOTH gossip admission AND block_pipeline receive-verify, so the Ed25519 exemption
+            // does not weaken authenticity — it is what lets pure-PQ transfers enter a block at all.
+            ) || tx.is_value_class();
 
             if is_unsigned_system_tx {
                 // These TXs have no user Ed25519 — skip batch verify, evaluated later
@@ -22601,7 +22832,7 @@ impl BlockchainNode {
     /// Routing the apply path through this helper closes the divergence
     /// permanently: a future TX type that adopts a new signature format
     /// only needs to be handled here, and both paths pick it up.
-    pub(crate) async fn verify_dilithium_tx_signature_async(tx: &qnet_state::Transaction) -> Result<bool, QNetError> {
+    pub(crate) async fn verify_dilithium_tx_signature_async(tx: &qnet_state::Transaction, lane: VerifyLane) -> Result<bool, QNetError> {
         use crate::quantum_crypto::DilithiumSignature;
 
         // PURE DILITHIUM (F0.1): value-moving user TX are authorised by a DIRECT ML-DSA-65 verify
@@ -22609,17 +22840,17 @@ impl BlockchainNode {
         // (eon_from_qnet_dilithium_pubkey(dpk)==from), NOT the consensus node_id->pk registry path
         // below (which is for node identities, with its own squat-guard). Registration/activation
         // keep the existing path (their own message format + handler proof).
-        if matches!(tx.tx_type,
-            qnet_state::TransactionType::Transfer { .. } |
-            qnet_state::TransactionType::ContractDeploy |
-            qnet_state::TransactionType::ContractCall |
-            qnet_state::TransactionType::Swap { .. }) {
-            // CPU-bound ML-DSA-65 open() off the consensus runtime AND admission-bounded: a value-TX
-            // flood must neither occupy the workers polling the producer/heartbeat task nor spawn
-            // unbounded blocking verifies (D1). Fail-closed when at capacity — the client resubmits.
-            let _permit = VALUE_TX_VERIFY_SEM.try_acquire()
-                .map_err(|_| QNetError::ValidationError("verify_overloaded".to_string()))?;
+        if tx.is_value_class() {
+            // CPU-bound ML-DSA-65 open() off the consensus runtime. Lane-scoped pool: admission
+            // sheds under load (client resubmits); block-validation AWAITS its reserved pool so a
+            // valid block is never rejected for local busy — the verdict stays pure over TX bytes.
             let tx_owned = tx.clone();
+            let _permit = match lane {
+                VerifyLane::Admission => VALUE_TX_VERIFY_SEM.try_acquire()
+                    .map_err(|_| QNetError::ValidationError("verify_overloaded".to_string()))?,
+                VerifyLane::Block => BLOCK_VERIFY_SEM.acquire().await
+                    .map_err(|_| QNetError::ValidationError("verify_sem_closed".to_string()))?,
+            };
             return tokio::task::spawn_blocking(move || Self::verify_user_tx_dilithium(&tx_owned))
                 .await
                 .map_err(|e| QNetError::ValidationError(format!("verify_join_error: {}", e)));
@@ -22640,17 +22871,23 @@ impl BlockchainNode {
             };
         }
 
+        // FIX-5: node-signed SYSTEM TXs (Heartbeat/ping/commitment/bitmap) keep the registry-envelope
+        // convention — a DIFFERENT, legitimate signature scheme from wallet value-TXs (node-identity
+        // key resolved via CONSENSUS_PK_REGISTRY, not the eon address). Their signers store the
+        // `dilithium_sig_{label}_{b64}` envelope as UTF-8 bytes in the Vec<u8> field; recover it here
+        // so verify_dilithium_signature (and its determinism) stays byte-identical. Value-TXs were
+        // already dispatched to the raw-detached verifier above, so this arm only sees system TXs.
         let dilithium_sig = match &tx.dilithium_signature {
-            Some(sig) if !sig.is_empty() => sig.clone(),
+            Some(sig) if !sig.is_empty() => String::from_utf8_lossy(sig).into_owned(),
             _ => return Ok(true),
         };
 
         // v5.1: signer_id selection depends on TX type and signing path:
         //   1. Client-signed NodeRegistration (data starts with "client_node_reg:"):
         //      The mobile client embeds node_id (pseudonym like "light_mobile_XXXXXXXX") in the
-        //      Dilithium signature format "dilithium_sig_{node_id}_{base64}". signer_id must be
-        //      node_id, NOT dilithium_public_key (which is the raw hex key — a different format).
-        //   2. All other TX: use dilithium_public_key as the node/signer identity for key lookup.
+        //      Dilithium signature envelope; signer_id must be node_id.
+        //   2. All other system TX: dilithium_public_key carries the node/signer identity (node_id
+        //      label as UTF-8 bytes under FIX-5) used for CONSENSUS_PK_REGISTRY lookup.
         let signer_id = match &tx.tx_type {
             qnet_state::TransactionType::NodeRegistration { node_id, .. }
                 if tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:") =>
@@ -22658,7 +22895,11 @@ impl BlockchainNode {
                 node_id.clone()
             }
             _ => match &tx.dilithium_public_key {
-                Some(pk) if !pk.is_empty() => pk.clone(),
+                // Exactly 1952 bytes = a RAW ML-DSA-65 key rode the wire (server-signed registration /
+                // heartbeat-anchor) → hex it, byte-identical to the pre-FIX-5 hex-string signer_id the
+                // registry verifier expects. Anything else is a node_id label carried as UTF-8 bytes.
+                Some(pk) if pk.len() == 1952 => hex::encode(pk),
+                Some(pk) if !pk.is_empty() => String::from_utf8_lossy(pk).into_owned(),
                 _ => return Err(QNetError::ValidationError(
                     "dilithium_public_key required when dilithium_signature is present".to_string()
                 )),
@@ -22693,6 +22934,29 @@ impl BlockchainNode {
         }
     }
 
+    /// FIX-5: fill an elided value-TX's dilithium_public_key from the COMMITTED in-mem StateManager.
+    /// Resolves ONLY from `State::get_account` (never the detached accounts CF, never an intra-block
+    /// scratch view) so two honest validators feed byte-identical pk bytes into verify_detached. A
+    /// wire pk that is already present is NEVER overwritten — it flows through the eon(pk)==from bind
+    /// in verify_user_tx_dilithium_inner, which rejects a bogus supplied key.
+    pub(crate) fn rehydrate_elided_pk(
+        tx: &mut qnet_state::Transaction,
+        state: &qnet_state::State,
+    ) -> PkResolve {
+        if !tx.is_value_class() {
+            return PkResolve::NotApplicable;
+        }
+        if tx.dilithium_public_key.as_deref().map_or(false, |p| !p.is_empty()) {
+            return PkResolve::Resolved; // wire pk present (first-use, or client not yet eliding)
+        }
+        // Lean accessor: clone ONLY the 1952-byte pk, never the whole Account (balance/nonce/token
+        // storage) — the elided-verify hot path runs per value-TX at ≤1000-committee max TPS.
+        match state.get_account_dilithium_pk(&tx.from) {
+            Some(pk) if pk.len() == 1952 => { tx.dilithium_public_key = Some(pk); PkResolve::Resolved }
+            _ => PkResolve::Unresolved,
+        }
+    }
+
     /// PURE DILITHIUM (F0.1): direct ML-DSA-65 verification for USER value transactions. A user
     /// wallet's key is NOT a registered node identity, so the consensus node_id->pk registry path is
     /// wrong here. Proves BOTH that the ML-DSA-65 signature is valid over the canonical message under
@@ -22702,65 +22966,123 @@ impl BlockchainNode {
     /// Wire format (produced by the mobile/ext wallet, signer_id = raw pubkey hex):
     ///   `dilithium_sig_{pk_hex}_{base64([sig_len:4LE][SignedMessage][pk_len:4LE][pk])}`
     pub(crate) fn verify_user_tx_dilithium(tx: &qnet_state::Transaction) -> bool {
-        use base64::engine::general_purpose;
-        use base64::Engine;
+        // FIX-5: RAW detached ML-DSA-65 verify. The pk is present on the TX because ingest REHYDRATES
+        // an elided pk from committed account state BEFORE verify (rehydrate_elided_pk); a value TX
+        // whose account has no committed pk and carries none stays pk-less → rejected here.
+        let (sig, pk) = match (tx.dilithium_signature.as_deref(), tx.dilithium_public_key.as_deref()) {
+            (Some(s), Some(p)) if s.len() == 3309 && p.len() == 1952 => (s, p),
+            _ => return false,
+        };
+        // Verify-result memo (positive-only): key binds sig+pk+preimage+from — folding `from` keeps an
+        // elided-then-rehydrated memo sender-bound; never tx.hash (sig-unbound → forgeable).
+        let msg = Self::build_canonical_verify_message(tx);
+        let key: [u8; 32] = {
+            use sha3::{Digest, Sha3_256};
+            let mut h = Sha3_256::new();
+            h.update(pk);
+            h.update(sig);
+            h.update(msg.as_bytes());
+            h.update(tx.from.as_bytes());
+            h.finalize().into()
+        };
+        if VALUE_VERIFY_CACHE.contains_key(&key) { return true; }
+        let ok = Self::verify_user_tx_dilithium_inner(tx, sig, pk, &msg);
+        if ok { value_verify_cache_put(key); }
+        ok
+    }
+
+    /// Uncached RAW detached ML-DSA-65 value-TX verify: verify_detached over the canonical message +
+    /// eon(pk)==from bind. sig=3309 B, pk=1952 B (both raw, no envelope/base64/open). Caller supplies
+    /// the already-validated sig/pk/preimage (wire pk, or the pk rehydrated from committed state).
+    fn verify_user_tx_dilithium_inner(tx: &qnet_state::Transaction, sig: &[u8], pk: &[u8], msg: &str) -> bool {
         use pqcrypto_mldsa::mldsa65 as dilithium3;
-        use pqcrypto_traits::sign::{SignedMessage as SmTrait, PublicKey as PkTrait};
+        use pqcrypto_traits::sign::{DetachedSignature as SigTrait, PublicKey as PkTrait};
 
-        let sig_str = match tx.dilithium_signature.as_ref() {
-            Some(s) if !s.is_empty() => s,
-            _ => return false,
-        };
-        let pk_hex = match tx.dilithium_public_key.as_ref() {
-            Some(p) if !p.is_empty() => p,
-            _ => return false,
-        };
-        let pk_bytes = match hex::decode(pk_hex) {
-            Ok(b) if b.len() == 1952 => b,
-            _ => return false,
-        };
-        // The client wraps the signature with signer_id = the raw ML-DSA-65 public-key hex.
-        let prefix = format!("dilithium_sig_{}_", pk_hex);
-        let b64 = match sig_str.strip_prefix(&prefix) {
-            Some(x) => x,
-            None => return false,
-        };
-        let combined = match general_purpose::STANDARD.decode(b64) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        // Layout: [sig_len:4LE][SignedMessage][pk_len:4LE][pk]
-        if combined.len() < 8 { return false; }
-        let sig_len = match combined[0..4].try_into() {
-            Ok(a) => u32::from_le_bytes(a) as usize,
-            Err(_) => return false,
-        };
-        if combined.len() < 4 + sig_len { return false; }
-        let sm_bytes = &combined[4..4 + sig_len];
-
-        let signed_msg = match dilithium3::SignedMessage::from_bytes(sm_bytes) {
+        let d3_sig = match <dilithium3::DetachedSignature as SigTrait>::from_bytes(sig) {
             Ok(s) => s,
             Err(_) => return false,
         };
-        let pk = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
+        let d3_pk = match <dilithium3::PublicKey as PkTrait>::from_bytes(pk) {
             Ok(p) => p,
             Err(_) => return false,
         };
-        // open() verifies the signature AND returns the embedded message.
-        let opened = match dilithium3::open(&signed_msg, &pk) {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-        if opened != Self::build_canonical_verify_message(tx).as_bytes() {
+        if dilithium3::verify_detached_signature(&d3_sig, msg.as_bytes(), &d3_pk).is_err() {
             return false;
         }
-        // API-1 identity bind — enforced HERE so EVERY value-TX verify path (gossip admission, rpc
-        // submit, block_pipeline receive-verify, producer-local) requires it, not just ingest: the
-        // signing key MUST derive to the sender. Without it a Byzantine producer could block-include
-        // a transfer signed by an attacker key over `transfer:{victim}:...` (theft) that never passed
-        // admission. Pure/deterministic (SHA512(pk) derivation + tx.from), safe on the apply path.
-        crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(pk_hex).as_deref()
+        // API-1 identity bind over RAW pk bytes — enforced HERE so EVERY value-TX verify path (gossip
+        // admission, rpc submit, block_pipeline receive-verify, producer-local) requires it, not just
+        // ingest: the signing key MUST derive to the sender. Without it a Byzantine producer could
+        // block-include a transfer signed by an attacker key over `transfer:{victim}:...` (theft).
+        crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(pk).as_deref()
             == Some(tx.from.as_str())
+    }
+
+    /// Producer pre-apply classification of ONE candidate tx (called under a state read-lock; cheap —
+    /// the heavy ML-DSA verify runs OFF the lock in producer_tx_verify_sig). Byte-identical to the
+    /// block-validator's verify stage (block_pipeline): a value-TX pubkey is rehydrated from committed
+    /// state into a VERIFY-ONLY clone (the block body + mempool stay ELIDED — the pk-elision TPS win),
+    /// and an elided value-TX whose committed pk isn't present yet DEFERS (never hard-evicts — an absent
+    /// committed pk is indistinguishable from not-yet-synced; dropping it would silently lose a valid tx).
+    /// This is what makes producer apply verify-then-commit: a tx can never be applied+materialised into
+    /// registry_root and then rejected+abandoned (the wedge that split a producer from 2f+1).
+    fn producer_tx_prepare(tx: &qnet_state::Transaction, state: &qnet_state::State, snap_in_progress: bool) -> TxPrep {
+        let is_client_nodereg = matches!(tx.tx_type,
+            qnet_state::TransactionType::NodeRegistration { .. }
+        ) && tx.data.as_deref().unwrap_or("").starts_with("client_node_reg:");
+        let is_system_tx = !is_client_nodereg
+            && (tx.is_system_tx() || tx.from.starts_with("system_"));
+        if is_system_tx {
+            return TxPrep::Admit;
+        }
+        if tx.validate().is_err() {
+            return TxPrep::Evict;
+        }
+        if tx.is_value_class() {
+            // Pure ML-DSA-65 value TX: mandatory Dilithium sig (API-1 bind is in verify_user_tx_dilithium).
+            if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
+                return TxPrep::Evict;
+            }
+            // amount==0 illegal only for Transfer (ContractDeploy/Call/Swap may be 0).
+            if matches!(tx.tx_type, qnet_state::TransactionType::Transfer { .. }) && tx.amount == 0 {
+                return TxPrep::Evict;
+            }
+            // Mid-snapshot-rehydrate: State is half-materialized ⇒ an elided pk is unresolved ⇒ DEFER
+            // (mirror the validator + apply-path guard); never verify against partial committed state.
+            let elided = tx.dilithium_public_key.as_deref().map_or(true, |p| p.is_empty());
+            if snap_in_progress && elided {
+                return TxPrep::Defer;
+            }
+            let mut clone = tx.clone();
+            match Self::rehydrate_elided_pk(&mut clone, state) {
+                PkResolve::Unresolved => TxPrep::Defer,           // committed pk not present yet → retry later
+                _ => TxPrep::Verify(clone),                        // wire pk, or filled from committed state
+            }
+        } else if is_client_nodereg {
+            // Sig-less imported-wallet first-reg is authorised by the 2f+1 burn quorum at ingest.
+            match tx.dilithium_signature.as_ref() {
+                Some(s) if !s.is_empty() => TxPrep::Verify(tx.clone()),
+                _ => TxPrep::Admit,
+            }
+        } else if matches!(tx.tx_type, qnet_state::TransactionType::NodeReactivation { .. }) {
+            TxPrep::Verify(tx.clone())
+        } else {
+            // Remaining node-signed TXs: require a non-empty legacy signature + non-zero amount (no crypto).
+            if tx.signature.as_ref().map_or(true, |s| s.is_empty()) || tx.amount == 0 {
+                TxPrep::Evict
+            } else {
+                TxPrep::Admit
+            }
+        }
+    }
+
+    /// The CPU-bound ML-DSA-65 verify for a prepared (rehydrated) clone — value-TX vs lifecycle-TX
+    /// dispatch, run OFF the state lock so a ≤1000-committee max-TPS block verifies its txs in parallel.
+    fn producer_tx_verify_sig(tx: &qnet_state::Transaction) -> bool {
+        if tx.is_value_class() {
+            Self::verify_user_tx_dilithium(tx)
+        } else {
+            Self::verify_node_lifecycle_dilithium(tx)
+        }
     }
 
     /// PURE DILITHIUM: direct ML-DSA-65 verification for NodeRegistration (client-signed) +
@@ -22769,65 +23091,36 @@ impl BlockchainNode {
     /// (the gossip-seeded registry's Tier2/3 split was the confirmed fork surface). Identity
     /// authority (that this key is entitled to this node_id/wallet) is bound separately from
     /// COMMITTED state at ingest: the 2f+1 burn quorum (first-reg) or the committed vrf_pk
-    /// point-read (re-reg/reactivation). Wire (WalletIdentity::sign_consensus): signer label is
-    /// node_id (reg) / tx.from (reactivation); b64 = [sig_len:4LE][SignedMessage][pk_len:4LE][pk].
+    /// point-read (re-reg/reactivation). FIX-5 wire: RAW detached sig (3309 B) + RAW pk (1952 B) —
+    /// no envelope/label/base64; lifecycle TXs ALWAYS carry the pk (it is the attestation root,
+    /// never elided).
     pub(crate) fn verify_node_lifecycle_dilithium(tx: &qnet_state::Transaction) -> bool {
-        use base64::engine::general_purpose;
-        use base64::Engine;
         use pqcrypto_mldsa::mldsa65 as dilithium3;
-        use pqcrypto_traits::sign::{SignedMessage as SmTrait, PublicKey as PkTrait};
+        use pqcrypto_traits::sign::{DetachedSignature as SigTrait, PublicKey as PkTrait};
 
-        let sig_str = match tx.dilithium_signature.as_ref() {
-            Some(s) if !s.is_empty() => s,
+        if !matches!(&tx.tx_type,
+            qnet_state::TransactionType::NodeRegistration { .. } |
+            qnet_state::TransactionType::NodeReactivation { .. }) {
+            return false;
+        }
+        let sig = match tx.dilithium_signature.as_deref() {
+            Some(s) if s.len() == 3309 => s,
             _ => return false,
         };
-        let pk_hex = match tx.dilithium_public_key.as_ref() {
-            Some(p) if !p.is_empty() => p,
+        let pk = match tx.dilithium_public_key.as_deref() {
+            Some(p) if p.len() == 1952 => p,
             _ => return false,
         };
-        let pk_bytes = match hex::decode(pk_hex) {
-            Ok(b) if b.len() == 1952 => b,
-            _ => return false,
-        };
-        // Signer label the client wrapped the sig with. Two live conventions produce the same
-        // `dilithium_sig_{LABEL}_{b64}` layout: the mobile/ext wallet labels with the pk hex (value-TX
-        // convention), the node binary labels with node_id (== tx.from for reactivation). The label is
-        // only a delimiter — security is the ML-DSA-65 open() below — so accept either.
-        let node_label = match &tx.tx_type {
-            qnet_state::TransactionType::NodeRegistration { node_id, .. } => node_id.as_str(),
-            qnet_state::TransactionType::NodeReactivation { .. } => tx.from.as_str(),
-            _ => return false,
-        };
-        let b64 = match sig_str.strip_prefix(&format!("dilithium_sig_{}_", pk_hex))
-            .or_else(|| sig_str.strip_prefix(&format!("dilithium_sig_{}_", node_label)))
-        {
-            Some(x) => x,
-            None => return false,
-        };
-        let combined = match general_purpose::STANDARD.decode(b64) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        if combined.len() < 8 { return false; }
-        let sig_len = match combined[0..4].try_into() {
-            Ok(a) => u32::from_le_bytes(a) as usize,
-            Err(_) => return false,
-        };
-        if combined.len() < 4 + sig_len { return false; }
-        let sm_bytes = &combined[4..4 + sig_len];
-        let signed_msg = match dilithium3::SignedMessage::from_bytes(sm_bytes) {
+        let d3_sig = match <dilithium3::DetachedSignature as SigTrait>::from_bytes(sig) {
             Ok(s) => s,
             Err(_) => return false,
         };
-        let pk = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
+        let d3_pk = match <dilithium3::PublicKey as PkTrait>::from_bytes(pk) {
             Ok(p) => p,
             Err(_) => return false,
         };
-        // open() verifies the sig AND recovers the embedded message; bind it to the canonical preimage.
-        match dilithium3::open(&signed_msg, &pk) {
-            Ok(m) => m == Self::build_canonical_verify_message(tx).as_bytes(),
-            Err(_) => false,
-        }
+        dilithium3::verify_detached_signature(
+            &d3_sig, Self::build_canonical_verify_message(tx).as_bytes(), &d3_pk).is_ok()
     }
 
     /// Shared system-TX identity binds — enforced on BOTH the gossip-admission path
@@ -22866,7 +23159,7 @@ impl BlockchainNode {
         match &tx.tx_type {
             // Bitmap: signer MUST be the genesis whose shard it declares (anti cross-shard hijack).
             TT::LightNodeEligibilityBitmap { genesis_id, .. } => {
-                if tx.dilithium_public_key.as_deref() != Some(genesis_id.as_str()) {
+                if tx.dilithium_public_key.as_deref() != Some(genesis_id.as_bytes()) {
                     return Err(format!(
                         "LightNodeEligibilityBitmap genesis_id={} != signer={:?} (cross-shard forbidden)",
                         genesis_id, tx.dilithium_public_key));
@@ -22874,7 +23167,7 @@ impl BlockchainNode {
             }
             // Ping: signer MUST be the node the commitment is attributed to (apply dedups on `from`).
             TT::PingCommitmentWithSampling { .. } => {
-                if tx.dilithium_public_key.as_deref() != Some(tx.from.as_str()) {
+                if tx.dilithium_public_key.as_deref() != Some(tx.from.as_bytes()) {
                     return Err(format!(
                         "PingCommitment from={} != signer={:?} (slot-squat forbidden)",
                         tx.from, tx.dilithium_public_key));
@@ -22886,7 +23179,7 @@ impl BlockchainNode {
             // equal (create_heartbeat_tx: from=node_id, dilithium_public_key=node_id).
             TT::Heartbeat { node_id, .. } => {
                 if tx.from.as_str() != node_id.as_str()
-                    || tx.dilithium_public_key.as_deref() != Some(node_id.as_str())
+                    || tx.dilithium_public_key.as_deref() != Some(node_id.as_bytes())
                 {
                     return Err(format!(
                         "Heartbeat identity split: from={} node_id={} signer={:?} (must be equal)",
@@ -23374,7 +23667,7 @@ impl BlockchainNode {
                 return Err(QNetError::ValidationError(
                     "[REJECT][GOSSIP] NodeActivation requires a Dilithium3 signature (post-quantum identity binding)".to_string()));
             }
-            match Self::verify_dilithium_tx_signature_async(&tx).await {
+            match Self::verify_dilithium_tx_signature_async(&tx, VerifyLane::Admission).await {
                 Ok(true) => {}
                 _ => return Err(QNetError::ValidationError(
                     "[REJECT][GOSSIP] NodeActivation Dilithium3 signature invalid or signer not registered".to_string())),
@@ -23449,7 +23742,7 @@ impl BlockchainNode {
                     ));
                 }
 
-                if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                if !Self::verify_dilithium_tx_signature_async(&tx, VerifyLane::Admission).await? {
                     return Err(QNetError::ValidationError("Invalid Dilithium signature on commitment TX".to_string()));
                 }
 
@@ -23459,7 +23752,7 @@ impl BlockchainNode {
                 // → cross-shard reward hijack / denial-of-commit). Genuine bitmaps set
                 // dilithium_public_key = node_id = genesis_id, so they pass.
                 if let qnet_state::TransactionType::LightNodeEligibilityBitmap { genesis_id, .. } = &tx.tx_type {
-                    if tx.dilithium_public_key.as_deref() != Some(genesis_id.as_str()) {
+                    if tx.dilithium_public_key.as_deref() != Some(genesis_id.as_bytes()) {
                         return Err(QNetError::ValidationError(format!(
                             "LightNodeEligibilityBitmap genesis_id={} != signer={:?} (cross-shard forbidden)",
                             genesis_id, tx.dilithium_public_key
@@ -23482,7 +23775,7 @@ impl BlockchainNode {
                         "Heartbeat REQUIRES Dilithium signature".to_string()
                     ));
                 }
-                if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                if !Self::verify_dilithium_tx_signature_async(&tx, VerifyLane::Admission).await? {
                     return Err(QNetError::ValidationError(
                         "Invalid Dilithium signature on Heartbeat".to_string()
                     ));
@@ -23492,28 +23785,40 @@ impl BlockchainNode {
             // PURE DILITHIUM (F0.1): mirror the RPC ingest — value-moving user classes require ONE
             // mandatory ML-DSA-65 signature bound to `from` via the address (API-1 + AC-3). A forged
             // TX must never even enter the mempool, so the same gate runs on the gossip path.
-            let is_value_tx = matches!(tx.tx_type,
-                qnet_state::TransactionType::Transfer { .. } |
-                qnet_state::TransactionType::ContractDeploy |
-                qnet_state::TransactionType::ContractCall
-            );
+            // Shared value-class predicate (Transfer|ContractDeploy|ContractCall|Swap) — MUST match the
+            // apply/producer/bind set, or an elided-pk TX admission rejects but apply accepts (accept-set drift).
+            let is_value_tx = tx.is_value_class();
             if is_value_tx {
-                let dpk = match tx.dilithium_public_key.as_ref().filter(|k| !k.is_empty()) {
-                    Some(k) => k,
-                    None => return Err(QNetError::ValidationError(
-                        "[REJECT][AUTH] value TX requires dilithium_public_key (pure-PQ)".to_string())),
-                };
                 if tx.dilithium_signature.as_ref().map_or(true, |s| s.is_empty()) {
                     return Err(QNetError::ValidationError(
                         "[REJECT][AUTH] value TX requires dilithium_signature (pure-PQ)".to_string()));
                 }
-                match crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey(dpk) {
-                    Some(derived) if derived == tx.from => {}
-                    _ => return Err(QNetError::ValidationError(
-                        "[REJECT][AUTH] from_pubkey_mismatch (dilithium)".to_string())),
-                }
-                if !Self::verify_dilithium_tx_signature_async(&tx).await? {
-                    return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
+                // FIX-5 pk-elision (gossip mirror of the RPC ingest): a relayed value TX arrives WITHOUT the
+                // pubkey once it is committed on-chain. Resolve into a verify-only clone and keep the elided
+                // form in the mempool, so the pk is never re-added on the relay hop. Unresolved ⇒ cheap
+                // reject before sig-verify (a peer relaying unresolvable-elided TXs cannot burn our CPU).
+                if tx.dilithium_public_key.as_ref().map_or(true, |k| k.is_empty()) {
+                    let mut probe = tx.clone();
+                    {
+                        let sg = self.state.read().await;
+                        if !matches!(Self::rehydrate_elided_pk(&mut probe, &*sg), PkResolve::Resolved) {
+                            return Err(QNetError::ValidationError(
+                                "[REJECT][AUTH] pk_unresolved (gossip): no committed pubkey for sender".to_string()));
+                        }
+                    }
+                    if !Self::verify_dilithium_tx_signature_async(&probe, VerifyLane::Admission).await? {
+                        return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
+                    }
+                } else {
+                    let dpk = tx.dilithium_public_key.as_ref().expect("non-empty checked above");
+                    match crate::crypto::solana_derivation::eon_from_qnet_dilithium_pubkey_bytes(dpk) {
+                        Some(derived) if derived == tx.from => {}
+                        _ => return Err(QNetError::ValidationError(
+                            "[REJECT][AUTH] from_pubkey_mismatch (dilithium)".to_string())),
+                    }
+                    if !Self::verify_dilithium_tx_signature_async(&tx, VerifyLane::Admission).await? {
+                        return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
+                    }
                 }
             } else {
                 // Non-value user TX — pure post-quantum (mirror the RPC ingest). Ed25519 is Solana-only
@@ -23530,7 +23835,7 @@ impl BlockchainNode {
                             "[REJECT][AUTH] user TX requires dilithium sig+pubkey (pure-PQ) (type={:?})",
                             std::mem::discriminant(&tx.tx_type))));
                     }
-                    if !Self::verify_dilithium_tx_signature_async(&tx).await? {
+                    if !Self::verify_dilithium_tx_signature_async(&tx, VerifyLane::Admission).await? {
                         return Err(QNetError::ValidationError("Invalid Dilithium signature".to_string()));
                     }
                 }
@@ -23779,7 +24084,6 @@ impl BlockchainNode {
     pub async fn submit_benchmark_batch_pq(&self, transactions: Vec<qnet_state::Transaction>) -> Result<usize, QNetError> {
         use crate::benchmark::BenchmarkManager;
         use pqcrypto_mldsa::mldsa65 as dilithium3;
-        use pqcrypto_traits::sign::{PublicKey as PqPublicKey, SignedMessage as PqSignedMessage};
 
         let benchmark_mode = std::env::var("QNET_BENCHMARK_MODE")
             .map(|v| v == "true" || v == "1")
@@ -23803,34 +24107,33 @@ impl BlockchainNode {
                 continue;
             }
 
-            // Pure ML-DSA-65 verification — TX must carry the Dilithium signature + pubkey
-            let pq_ok = match (&tx.dilithium_signature, &tx.dilithium_public_key) {
-                (Some(sig_hex), Some(pk_hex)) => {
-                    let sig_bytes = hex::decode(sig_hex).unwrap_or_default();
-                    let pk_bytes  = hex::decode(pk_hex).unwrap_or_default();
-
-                    // Reconstruct canonical message (same format as TX generator)
-                    let receiver = tx.to.as_deref().unwrap_or("");
-                    let msg = format!(
-                        "{}|{}|{}|{}|{}|{}|{}",
-                        tx.from, receiver, tx.amount, tx.nonce,
-                        tx.gas_price, tx.gas_limit, tx.timestamp
-                    );
-
-                    let pk_result  = <dilithium3::PublicKey as PqPublicKey>::from_bytes(&pk_bytes);
-                    let sig_result = <dilithium3::SignedMessage as PqSignedMessage>::from_bytes(&sig_bytes);
-
-                    match (pk_result, sig_result) {
-                        (Ok(pk), Ok(signed_msg)) => {
-                            // dilithium3::open() returns the message bytes on success
-                            dilithium3::open(&signed_msg, &pk)
-                                .map(|recovered| recovered == msg.as_bytes())
-                                .unwrap_or(false)
+            // Pure ML-DSA-65 verification. FIX-5: the fields hold RAW bytes (no hex, no envelope) and the
+            // generator signs with detached_sign — hex-decoding raw bytes and then calling open() on a
+            // DETACHED signature were both leftovers that made every benchmark TX fail verification.
+            let pq_ok = {
+                use pqcrypto_traits::sign::{PublicKey as PkTrait, DetachedSignature as SigTrait};
+                match (tx.dilithium_signature.as_deref(), tx.dilithium_public_key.as_deref()) {
+                    (Some(sig_bytes), Some(pk_bytes))
+                        if sig_bytes.len() == 3309 && pk_bytes.len() == 1952 =>
+                    {
+                        // Reconstruct canonical message (same format as TX generator)
+                        let receiver = tx.to.as_deref().unwrap_or("");
+                        let msg = format!(
+                            "{}|{}|{}|{}|{}|{}|{}",
+                            tx.from, receiver, tx.amount, tx.nonce,
+                            tx.gas_price, tx.gas_limit, tx.timestamp
+                        );
+                        match (
+                            <dilithium3::PublicKey as PkTrait>::from_bytes(pk_bytes),
+                            <dilithium3::DetachedSignature as SigTrait>::from_bytes(sig_bytes),
+                        ) {
+                            (Ok(pk), Ok(sig)) =>
+                                dilithium3::verify_detached_signature(&sig, msg.as_bytes(), &pk).is_ok(),
+                            _ => false,
                         }
-                        _ => false,
                     }
+                    _ => false, // benchmark TX must carry a raw detached sig + pubkey
                 }
-                _ => false, // PQ TX must have both dilithium fields
             };
 
             if !pq_ok {
@@ -23960,7 +24263,7 @@ impl BlockchainNode {
             "node_type": format!("{:?}", self.node_type),
             "region": format!("{:?}", self.region),
             "node_id": self.node_id,
-            "sharding_enabled": self.perf_config.enable_sharding,
+            "sharding_enabled": false, // deferred; coordinator pinned off regardless of config
             "parallel_validation": self.perf_config.parallel_validation,
         }))
     }
@@ -24523,6 +24826,78 @@ impl BlockchainNode {
         Self::select_consensus_committee(&ids, index, &self.storage)
     }
 
+    /// Content-verify heights [start..=end] against the QC-certified per-height hash list
+    /// (macroblock.micro_blocks == cp.window_mb_hashes, bound by the 2f+1 QC at verify_v2_macroblock).
+    /// Returns (missing, mismatched) local heights. Finality must NOT advance while either is non-empty:
+    /// a mismatch is a local losing-fork body repair/supersede must replace first (else finality would
+    /// pin a fork — the node-001 h=30780 safety violation). Same hash comparator as check_content.
+    pub(crate) fn window_content_verdict(storage: &crate::storage::Storage, certified: &[[u8; 32]], start: u64, end: u64) -> (Vec<u64>, Vec<u64>) {
+        let mut missing = Vec::new();
+        let mut mismatched = Vec::new();
+        for h in start..=end {
+            let i = (h - start) as usize;
+            match storage.load_microblock_auto_format(h).ok().flatten() {
+                Some(mb) => if certified.get(i).map_or(true, |c| mb.hash() != *c) { mismatched.push(h); },
+                None => missing.push(h),
+            }
+        }
+        (missing, mismatched)
+    }
+
+    /// Raise the contiguous content-verified finality ceiling toward `ceiling_round`: from the current
+    /// frontier, content-verify each next macroblock window's bodies against its QC-certified hash list;
+    /// stop at the first missing/divergent window. anchor-trusted (snapshot) windows pass without reads.
+    /// Bounded per call (a cold joiner converges over a few ticks); monotone via fetch_max. Returns the
+    /// resulting ceiling. This is the finality floor SYNC-ADOPT must respect so a fork tail cannot finalize.
+    fn advance_content_verified_frontier(storage: &crate::storage::Storage, ceiling_round: u64) -> u64 {
+        // Floor at the finalized height: everything at/below it was content-verified BEFORE it finalized
+        // (the P3 invariant), and its bodies may since have been pruned (6-epoch retention). Without this
+        // floor a from-genesis node (anchor 0) re-walks from window 1, hits the first pruned-body window,
+        // breaks, and pins the frontier at 0 forever — silently disabling the SYNC-ADOPT finality path on
+        // any chain older than the retention window.
+        let mut fr = CONTENT_VERIFIED_FRONTIER.load(std::sync::atomic::Ordering::Relaxed)
+            .max(LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::SeqCst));
+        let mut steps = 0u32;
+        while fr < ceiling_round && steps < 64 {
+            steps += 1;
+            let idx = fr / 90 + 1;
+            if SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst) >= idx { fr = idx * 90; continue; }
+            let mb = match storage.get_macroblock_by_height(idx).ok().flatten()
+                .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok()) {
+                Some(m) => m, None => break,
+            };
+            let (missing, mismatched) = Self::window_content_verdict(storage, &mb.micro_blocks, (idx - 1) * 90 + 1, idx * 90);
+            if missing.is_empty() && mismatched.is_empty() { fr = idx * 90; } else { break; }
+        }
+        CONTENT_VERIFIED_FRONTIER.fetch_max(fr, std::sync::atomic::Ordering::Relaxed);
+        fr
+    }
+
+    /// Boot finality ceiling: the highest stored (2f+1-QC-verified) macroblock whose window's LOCAL
+    /// bodies match its QC-certified hashes, walking DOWN from chain_height's window. Closes the
+    /// restart-during-fork safety hole — a node that durably APPLIED a losing fork X (so chain_height
+    /// reflects X) but has NOT yet had repair replace X with the canonical Y must NOT boot-finalize X.
+    /// A content MISMATCH (fork) or an absent macroblock (window not QC-sealed) steps down; a matching
+    /// window is the ceiling. Missing bodies within a matching window are pruned-old (finalized before
+    /// prune) — window_content_verdict returns them as `missing` not `mismatched`, so they don't stop
+    /// the ceiling. O(fork depth) — O(1) for an honest node whose top sealed window matches.
+    fn boot_content_finality_ceiling(storage: &crate::storage::Storage, chain_height: u64) -> u64 {
+        let anchor = SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst);
+        let mut idx = chain_height / 90;
+        while idx > anchor {
+            match storage.get_macroblock_by_height(idx).ok().flatten()
+                .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok()) {
+                Some(mb) => {
+                    let (_, mismatched) = Self::window_content_verdict(storage, &mb.micro_blocks, (idx - 1) * 90 + 1, idx * 90);
+                    if mismatched.is_empty() { break; } // canonical window ⇒ ceiling here
+                }
+                None => {} // no QC-sealed macroblock for this window ⇒ not final ⇒ step down
+            }
+            idx -= 1;
+        }
+        (idx * 90).min(chain_height)
+    }
+
     pub async fn process_received_macroblock(&self, received: crate::unified_p2p::ReceivedBlock) -> Result<(), QNetError> {
         let index = received.height;  // For macroblocks, height = index
         
@@ -24680,17 +25055,23 @@ impl BlockchainNode {
                 // deadlock. Finality must never outrun the locally-applied microblock tip.
                 let expected_start = if index == 1 { 1 } else { (index - 1) * 90 + 1 };
                 let anchor_trusted = SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst) >= index;
-                let mut all_present = true;
-                for h in expected_start..=index * 90 {
-                    if self.storage.load_microblock(h)?.is_none() { all_present = false; break; }
-                }
-                if all_present || anchor_trusted {
+                // Content-verify against the already-saved macroblock's QC-certified hash list — same guard
+                // as the new-save branch, so a divergent local tail body cannot finalize via this path either.
+                let (missing, mismatched) = Self::window_content_verdict(&self.storage, &macroblock.micro_blocks, expected_start, index * 90);
+                if (missing.is_empty() && mismatched.is_empty()) || anchor_trusted {
                     if try_advance_finality(round, "MB-SYNC-DEDUP") {
                         println!("[INFO][MB-SYNC] finality_catchup mb={} round={} prev_round={}", index, round, prev_round);
                     }
-                } else if is_debug() {
-                    println!("[DBG][MB-SYNC] dedup_skip_finality mb={} round={} reason=missing_microblocks finality_at={}",
-                             index, round, prev_round);
+                } else {
+                    if !mismatched.is_empty() {
+                        println!("[WARN][MB-SYNC] finality_deferred_content mb={} round={} mismatched={} missing={} (dedup)",
+                                 index, round, mismatched.len(), missing.len());
+                    }
+                    if let Some(p2p) = self.unified_p2p.as_ref() {
+                        for h in mismatched.iter().chain(missing.iter()).take(32) {
+                            let _ = p2p.request_block_repair(*h).await;
+                        }
+                    }
                 }
             }
         } else {
@@ -24700,18 +25081,15 @@ impl BlockchainNode {
             let expected_start = if index == 1 { 1 } else { (index - 1) * 90 + 1 };
             let expected_end = index * 90;
             
-            let mut missing_microblocks = Vec::new();
-            for height in expected_start..=expected_end {
-                if self.storage.load_microblock(height)?.is_none() {
-                    missing_microblocks.push(height);
-                }
-            }
-            
-            if !missing_microblocks.is_empty() && is_debug() {
-                // Expected during sync: macroblock headers arrive ahead of the microblocks the bulk
-                // pipeline backfills bottom-up. A real stall surfaces via behind=/deadlock logs, not here.
-                println!("[DBG][MB-SYNC] mb={} references {} missing microblocks (first {})",
-                         index, missing_microblocks.len(), missing_microblocks[0]);
+            // Content-verify (not just presence) against the QC-certified hash list.
+            let (missing_microblocks, mismatched_microblocks) =
+                Self::window_content_verdict(&self.storage, &macroblock.micro_blocks, expected_start, expected_end);
+
+            if (!missing_microblocks.is_empty() || !mismatched_microblocks.is_empty()) && is_debug() {
+                // Missing = bulk pipeline still backfilling (benign during sync). Mismatched = a local
+                // losing-fork body — repair/supersede must replace it before finality can advance.
+                println!("[DBG][MB-SYNC] mb={} missing={} mismatched={}",
+                         index, missing_microblocks.len(), mismatched_microblocks.len());
             }
             
             // Save macroblock to storage
@@ -24738,13 +25116,23 @@ impl BlockchainNode {
                 // snapshot carries the state, so finality advances without the sub-anchor microblocks
                 // the snapshot legitimately omits. anchor==0 (warm node) ⇒ original present-guard.
                 let anchor_trusted = SNAPSHOT_ANCHOR_MB.load(std::sync::atomic::Ordering::SeqCst) >= index;
-                if missing_microblocks.is_empty() || anchor_trusted {
+                if (missing_microblocks.is_empty() && mismatched_microblocks.is_empty()) || anchor_trusted {
                     if try_advance_finality(round, "MB-SYNC") {
                         println!("[INFO][MB-SYNC] finalized_round_updated mb={} round={} finality_h={}", index, round, round);
                     }
-                } else if is_debug() {
-                    println!("[DBG][MB-SYNC] skip_finality_update mb={} round={} missing_microblocks={} finality_at={}",
-                             index, round, missing_microblocks.len(), prev_round);
+                } else {
+                    // Do NOT finalize a window that still holds a missing or divergent body. Solicit repair
+                    // for both classes; a mismatched height's canonical body supersedes the local fork on
+                    // delivery, and the finality-lag re-drive re-attempts once all 90 match. Self-throttled.
+                    if !mismatched_microblocks.is_empty() {
+                        println!("[WARN][MB-SYNC] finality_deferred_content mb={} round={} mismatched={} missing={}",
+                                 index, round, mismatched_microblocks.len(), missing_microblocks.len());
+                    }
+                    if let Some(p2p) = self.unified_p2p.as_ref() {
+                        for h in mismatched_microblocks.iter().chain(missing_microblocks.iter()).take(32) {
+                            let _ = p2p.request_block_repair(*h).await;
+                        }
+                    }
                 }
             }
             
@@ -25593,10 +25981,13 @@ impl BlockchainNode {
             let canonical_msg = format!("client_node_reg:{}:{}:{}:{}",
                 node_id, wallet_address, registration_proof, registration_tx.timestamp);
             if let Some(ref identity) = wallet_identity {
-                match identity.sign_consensus(&node_id, canonical_msg.as_bytes()) {
-                    Ok(consensus_sig) => {
-                        registration_tx.dilithium_signature = Some(consensus_sig);
-                        registration_tx.dilithium_public_key = Some(hex::encode(&identity.dilithium_pk));
+                // FIX-5 wire: RAW detached sig (3309 B) + RAW pk (1952 B) — the exact form the client-reg
+                // verifier (verify_node_lifecycle_dilithium) requires. The envelope form (sign_consensus)
+                // is length-gated out (len != 3309), which silently killed super-node onboarding.
+                match identity.sign(canonical_msg.as_bytes()) {
+                    Ok(detached_sig) => {
+                        registration_tx.dilithium_signature = Some(detached_sig);
+                        registration_tx.dilithium_public_key = Some(identity.dilithium_pk.to_vec());
                     }
                     Err(e) => {
                         eprintln!("[WARN][REG] dilithium3_sign_failed: {}", e);
@@ -26104,8 +26495,8 @@ impl BlockchainNode {
                             confirmations: Some(0),
                             time_to_finality: Some(90), // Max time to macroblock
                             // QUANTUM v2.25.2: Dilithium signature info
-                            dilithium_signature: tx.dilithium_signature,
-                            dilithium_public_key: tx.dilithium_public_key,
+                            dilithium_signature: tx.dilithium_signature.map(hex::encode),
+                            dilithium_public_key: tx.dilithium_public_key.map(hex::encode),
                         }));
                     }
                 }
@@ -26199,8 +26590,8 @@ impl BlockchainNode {
                     confirmations: Some(confirmations),
                     time_to_finality: Some(time_to_finality),
                     // QUANTUM v2.25.2: Dilithium signature info
-                    dilithium_signature: tx.dilithium_signature,
-                    dilithium_public_key: tx.dilithium_public_key,
+                    dilithium_signature: tx.dilithium_signature.map(hex::encode),
+                    dilithium_public_key: tx.dilithium_public_key.map(hex::encode),
                 }))
             }
             Ok(None) => Ok(None),
@@ -27000,9 +27391,12 @@ pub struct TransactionInfo {
 }
 
 impl TransactionInfo {
-    /// QUANTUM v2.25.2: Check if transaction has Dilithium signature
+    /// QUANTUM v2.25.2: Check if transaction has Dilithium signature.
+    /// FIX-5: SIGNATURE-only — the pubkey is elidable once committed on-chain (the node rehydrates it),
+    /// so requiring it here would label every elided TX "unsigned" in the RPC/explorer view. Mirrors the
+    /// consensus-side qnet_state::Transaction::is_quantum_signed.
     pub fn is_quantum_signed(&self) -> bool {
-        self.dilithium_signature.is_some() && self.dilithium_public_key.is_some()
+        self.dilithium_signature.is_some()
     }
     
     /// QUANTUM v2.25.2: Get effective gas price (50% higher for Dilithium TX)
@@ -27205,6 +27599,102 @@ mod tests {
         assert!(checkpoint_participation_allowed(false, 250, mb_end));     // syncing, ahead of end → yes
         assert!(!checkpoint_participation_allowed(false, 179, mb_end));    // syncing, missing last block → defer
         assert!(!checkpoint_participation_allowed(false, 0, mb_end));      // syncing, no window → defer
+    }
+
+    // P3 test microblock: distinct body per (height,tag) so hash() differs; all other fields inert.
+    #[cfg(test)]
+    fn p3_micro(height: u64, tag: u8) -> qnet_state::MicroBlock {
+        qnet_state::MicroBlock {
+            height, timestamp: 0, transactions: vec![], producer: "genesis_node_001".to_string(),
+            signature: vec![0u8; 64], merkle_root: [tag; 32], previous_hash: [0u8; 32],
+            poh_hash: vec![], poh_count: 0, vrf_output: None, vrf_proof: None, fees_collected: 0,
+            state_root: [0u8; 32], timeout_round: 0, carried_baseline: 0, timeout_proof: None,
+        }
+    }
+
+    // P3 SAFETY (content-not-presence finality): window_content_verdict is the comparator every
+    // finality-advance path funnels through. A local body whose hash differs from the QC-certified hash
+    // MUST be `mismatched` (so finality cannot advance over it — the node-001 h=30780 "finalized its own
+    // same-state fork" violation); a genuinely-absent body is `missing` not `mismatched` (a matching
+    // window with pruned-old bodies is not wrongly blocked); a too-short certified list is fail-closed.
+    #[test]
+    fn window_content_verdict_flags_fork_not_pruned() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+
+        let mut certified: Vec<[u8; 32]> = Vec::new();
+        for h in 1u64..=4 {
+            let mb = p3_micro(h, h as u8);
+            certified.push(mb.hash());
+            storage.save_microblock(h, &bincode::serialize(&mb).expect("ser")).expect("save");
+        }
+
+        // Honest window: stored == certified ⇒ nothing deferred (the happy path is never blocked).
+        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &certified, 1, 4);
+        assert!(miss.is_empty() && mism.is_empty(), "honest window must not defer");
+
+        // QC certified a DIFFERENT body at height 3 than the one we locally hold (the 001 fork).
+        let mut forked = certified.clone();
+        forked[2] = [0xEE; 32];
+        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &forked, 1, 4);
+        assert_eq!(mism, vec![3], "fork body flagged mismatched ⇒ finality must not advance");
+        assert!(miss.is_empty());
+
+        // Absent (pruned-old) bodies at 5,6: the None arm fires ⇒ `missing`, never `mismatched`.
+        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &certified, 1, 6);
+        assert_eq!(miss, vec![5, 6]);
+        assert!(mism.is_empty());
+
+        // Fail-closed: a certified list shorter than the range counts uncovered heights as mismatched.
+        let (miss, mism) = BlockchainNode::window_content_verdict(&storage, &certified[..2], 1, 4);
+        assert!(miss.is_empty());
+        assert_eq!(mism, vec![3, 4], "heights beyond the certified list are fail-closed");
+    }
+
+    // P3 SAFETY (restart-during-fork): a node that durably APPLIED a losing fork must NOT boot-finalize
+    // it. boot_content_finality_ceiling walks DOWN from chain_height's window; a content-mismatched
+    // (fork) window steps down, the first window whose local bodies match its QC-certified hashes is the
+    // ceiling. Canonical window 1 + fork window 2 ⇒ ceiling clamps to 90; both-canonical ⇒ 180 (the
+    // clamp is content-driven, not a cap).
+    #[tokio::test]
+    async fn boot_content_finality_ceiling_clamps_below_a_fork_window() {
+        use std::sync::atomic::Ordering;
+        // Snapshot anchor 0 (default) so the walk is not short-circuited by an anchor.
+        crate::node::SNAPSHOT_ANCHOR_MB.store(0, Ordering::SeqCst);
+
+        // Build a storage with window 1 canonical and window 2 either canonical or a fork.
+        async fn build(window2_forked: bool) -> (tempfile::TempDir, crate::storage::Storage) {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let storage = crate::storage::Storage::new(dir.path().to_str().unwrap()).expect("storage");
+            let mut w1 = Vec::new();
+            for h in 1u64..=90 {
+                let mb = p3_micro(h, (h % 250 + 1) as u8);
+                w1.push(mb.hash());
+                storage.save_microblock(h, &bincode::serialize(&mb).expect("ser")).expect("save");
+            }
+            let mut w2 = Vec::new();
+            for h in 91u64..=180 {
+                let mb = p3_micro(h, (h % 250 + 1) as u8);
+                // Certify the stored body when canonical; certify an obviously-wrong hash when forked.
+                w2.push(if window2_forked { [0xFF; 32] } else { mb.hash() });
+                storage.save_microblock(h, &bincode::serialize(&mb).expect("ser")).expect("save");
+            }
+            let cd = qnet_state::ConsensusData::default();
+            storage.save_macroblock(1, &qnet_state::MacroBlock::new(1, 0, [0u8; 32], w1, [0u8; 32], cd.clone())).await.expect("mb1");
+            storage.save_macroblock(2, &qnet_state::MacroBlock::new(2, 0, [0u8; 32], w2, [0u8; 32], cd)).await.expect("mb2");
+            (dir, storage)
+        }
+
+        // Fork in window 2: a node that applied through height 180 must clamp its boot finality to 90.
+        let (_d1, s_fork) = build(true).await;
+        crate::node::CONTENT_VERIFIED_FRONTIER.store(0, Ordering::Relaxed);
+        assert_eq!(BlockchainNode::boot_content_finality_ceiling(&s_fork, 180), 90,
+                   "fork window 2 must clamp boot finality to the window-1 top");
+
+        // Both windows canonical: the ceiling reaches 180 — proves the clamp is content-driven.
+        let (_d2, s_ok) = build(false).await;
+        assert_eq!(BlockchainNode::boot_content_finality_ceiling(&s_ok, 180), 180,
+                   "two canonical windows ⇒ full ceiling");
     }
 
     // Phase-2A recency window (genesis rule, no gate): prev = cur-1 SPANS the epoch boundary so the
@@ -27483,7 +27973,7 @@ mod tests {
                 nonce: 1,
                 data: None,
                 dilithium_signature: None,
-                dilithium_public_key: Some(node_id.to_string()),
+                dilithium_public_key: Some(node_id.to_string().into_bytes()),
                 chain_id: 0,
             }
         }
@@ -27565,10 +28055,11 @@ mod tests {
     // diverges from synced peers and proposal_content never reaches 2f+1. Pins creator == peer == vrf-bound.
     #[test]
     fn genesis_apply_writes_vrf_byte_identical_to_peer() {
-        let pk_hex = "a1b2c3d4e5f60718"; // genesis consensus key bytes (any valid hex)
+        // FIX-5: the on-chain pk rides as RAW bytes; write_registration_row binds it only at the exact
+        // ML-DSA-65 key length, so use a valid-length placeholder so the vrf row is actually written.
         let mut gtx = BlockchainNode::create_node_registration_tx_with_timestamp(
             "genesis_node_001", qnet_state::NodeType::Super, "walletG", "genesis", "", Some(0));
-        gtx.dilithium_public_key = Some(pk_hex.to_string());
+        gtx.dilithium_public_key = Some(vec![0xABu8; crate::crypto::vrf::D3_PK_BYTES]);
 
         // Creator path (the fix): reg_height 0 + vrf via the shared canonical writer.
         let _dc = tempfile::TempDir::new().expect("tempdir");
@@ -27578,7 +28069,7 @@ mod tests {
         // Peer-apply path: the deferred consumer writes the same row (super ⇒ vrf from the TX pubkey).
         let _dp = tempfile::TempDir::new().expect("tempdir");
         let peer = crate::storage::Storage::new(_dp.path().to_str().unwrap()).expect("storage");
-        let vrf = hex::decode(pk_hex).unwrap();
+        let vrf = vec![0xABu8; crate::crypto::vrf::D3_PK_BYTES]; // FIX-5: raw pk bytes, same as the TX carries
         peer.save_node_registration_at_height_burn_vrf("genesis_node_001", "super", "walletG", 1.0, 0, "", Some(vrf.as_slice())).unwrap();
         assert_eq!(creator.compute_registry_root(0), peer.compute_registry_root(0),
                    "genesis creator path must be byte-identical to the peer-apply path");
@@ -27887,6 +28378,7 @@ mod tests {
             vrf_output: None,
             timeout_round: round,
             carried_baseline: 0,
+            pk_digest: [0u8; 32],
             signature: Vec::new(),
         }
     }
@@ -27910,6 +28402,7 @@ mod tests {
         if let Some(ref vrf) = h.vrf_output { hasher.update(vrf); }
         hasher.update(&h.timeout_round.to_be_bytes());
         hasher.update(&h.carried_baseline.to_be_bytes());
+        hasher.update(&h.pk_digest);
         let digest = hasher.finalize();
         let sig = pqcrypto_mldsa::mldsa65::detached_sign(digest.as_ref(), sk);
         format!("dilithium3_v4:{}", hex::encode(sig.as_bytes())).into_bytes()
@@ -27927,6 +28420,7 @@ mod tests {
             reward_root: [0u8; 32],
             registry_root: [0u8; 32],
             logs_root: [0u8; 32],
+            dilithium_pk_root: [0u8; 32],
             total_supply: 0,
             timestamp: 1000,
             proposer: node.to_string(),

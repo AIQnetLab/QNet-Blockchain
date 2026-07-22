@@ -126,6 +126,45 @@ pub fn row_lanes(node_id: &str, wallet: &str, reg_height: u64, burn: &str, vrf_p
     lanes
 }
 
+/// FIX-5: LtHash row for one account's (address -> ML-DSA-65 pk) binding. Bound into the 2f+1
+/// Checkpoint as `dilithium_pk_root` so a node joining via an UNTRUSTED snapshot can verify the
+/// restored per-account pubkeys match the committed set — a malicious snapshot that omits/alters an
+/// account's pk fails the root check (→ snapshot rejected) instead of stalling that account's elided
+/// TXs forever at 100k cold-join. Same SOUND-INCREMENTAL LtHash primitive as the registry: O(1) to
+/// add per first-use pk-bind, O(1) to read via the per-checkpoint seal, collision-resistant on an
+/// adversary-chosen snapshot set (plain additive set-hash is forgeable; LtHash is not). Length-
+/// prefixed so no address/pk pair aliases another. Domain-separated from the registry row.
+pub fn pk_row_lanes(address: &str, pk: &[u8]) -> [u16; LANES] {
+    lanes_from_seed(&pk_row_seed(address, pk))
+}
+
+/// 32-byte seed of a dpk row. Journaled per unfinalized bind (dpkj_): 32 bytes reproduce the full
+/// lane vector for reorg subtraction without storing the 1952-byte pk.
+pub fn pk_row_seed(address: &str, pk: &[u8]) -> [u8; 32] {
+    let mut seed = Sha3_256::new();
+    Digest::update(&mut seed, b"qnet-dpk-row-v1");
+    Digest::update(&mut seed, (address.len() as u32).to_le_bytes());
+    Digest::update(&mut seed, address.as_bytes());
+    Digest::update(&mut seed, (pk.len() as u32).to_le_bytes());
+    Digest::update(&mut seed, pk);
+    seed.finalize().into()
+}
+
+/// Expand a row seed into its lane vector (SHAKE256 stream, LE u16 lanes).
+pub fn lanes_from_seed(seed: &[u8; 32]) -> [u16; LANES] {
+    let mut xof = Shake256::default();
+    xof.update(seed);
+    let mut reader = xof.finalize_xof();
+    let mut buf = [0u8; STATE_BYTES];
+    reader.read(&mut buf);
+
+    let mut lanes = [0u16; LANES];
+    for i in 0..LANES {
+        lanes[i] = u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]);
+    }
+    lanes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +225,15 @@ mod tests {
         let mut s2 = LtHash::new();
         s2.add(&row_lanes("super_a", "wA", 10, "bA", b"key_forged"));
         assert_ne!(s1.root(), s2.root(), "a swapped consensus pubkey must change the root");
+    }
+
+    #[test]
+    fn pk_seed_expand_equals_direct() {
+        // Journal stores the 32-byte seed; subtraction re-expands it. Must equal the add-path lanes.
+        let pk = vec![7u8; 1952];
+        let direct = pk_row_lanes("eon_addr", &pk);
+        let via_seed = lanes_from_seed(&pk_row_seed("eon_addr", &pk));
+        assert_eq!(direct, via_seed);
     }
 
     #[test]

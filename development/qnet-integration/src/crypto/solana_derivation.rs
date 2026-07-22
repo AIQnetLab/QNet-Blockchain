@@ -359,6 +359,17 @@ pub fn eon_from_qnet_dilithium_pubkey(dilithium_pubkey_hex: &str) -> Option<Stri
     eon_from_qnet_pubkey(dilithium_pubkey_hex)
 }
 
+/// FIX-5: EON from RAW 1952-byte ML-DSA-65 pk bytes (no hex hop). SHA512(pk_bytes) -> EON — byte-for-
+/// byte identical to eon_from_qnet_dilithium_pubkey(hex::encode(pk)). Used by the raw-byte value-TX
+/// verifier so the from<->key bind runs directly on the wire/rehydrated pk bytes.
+pub fn eon_from_qnet_dilithium_pubkey_bytes(pk: &[u8]) -> Option<String> {
+    use sha2::{Sha512, Digest as Sha2Digest};
+    if pk.len() != 1952 { return None; }
+    let mut h = Sha512::new();
+    h.update(pk);
+    Some(format_eon_from_sha512_hex(&hex::encode(h.finalize())))
+}
+
 pub fn eon_from_solana_address(solana_address: &str) -> String {
     use sha2::{Sha512, Digest as Sha2Digest};
     let mut h = Sha512::new();

@@ -170,7 +170,7 @@ pub(crate) fn mark_repair_solicited(height: u64) {
     REPAIR_SOLICITED.insert(height, now.saturating_add(REPAIR_SOLICITED_TTL_SECS));
     if REPAIR_SOLICITED.len() > 512 { REPAIR_SOLICITED.retain(|_, e| *e > now); }
 }
-fn is_repair_solicited(height: u64) -> bool {
+pub(crate) fn is_repair_solicited(height: u64) -> bool {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs()).unwrap_or(0);
     REPAIR_SOLICITED.get(&height).map(|e| *e > now).unwrap_or(false)
@@ -241,8 +241,8 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     let finalized = crate::node::LAST_FINALIZED_HEIGHT.load(Ordering::SeqCst);
     if h <= finalized { return; } // never reorg finalized history
 
-    let (our_round, our_baseline, our_producer, our_sig) = match storage.load_microblock_auto_format(h) {
-        Ok(Some(mb)) => (mb.timeout_round, mb.carried_baseline, mb.producer, mb.signature),
+    let (our_round, our_baseline, our_producer, our_sig, our_hash) = match storage.load_microblock_auto_format(h) {
+        Ok(Some(mb)) => { let hh = mb.hash(); (mb.timeout_round, mb.carried_baseline, mb.producer, mb.signature, hh) },
         _ => return,
     };
     let mb_idx = h / 90;
@@ -278,9 +278,34 @@ fn maybe_supersede_by_certified_round(storage: &Arc<Storage>, block: &IngestBloc
     // gate would leave split forever — and it MUST live here because both gossip re-delivery AND solicited
     // repair funnel through this function, so without it a node holding the equal-round loser never
     // converges (boundary re-freeze). Byte-identical to the anchor_recovery / apply-resolver tie-break.
+    // Content-QC authority DOMINATES the round heuristic below finality: a 2f+1-QC-certified macroblock
+    // is stronger evidence than any TC-round rank. If h's window is sealed and the incoming body equals
+    // the QC-certified hash at h while ours does NOT, adopt unconditionally — converging the case where a
+    // LOWER-round original that WON the checkpoint is repair-delivered against a higher-round fork the
+    // checkpoint rejected (the round gate below would refuse it and P3's content-defer would wedge
+    // forever). Hash match against the 2f+1 list is unforgeable → no round/producer/sig gate. The
+    // macroblock is the same object the MB-SYNC deferral saved before soliciting this repair.
+    // Resolve h's 2f+1-QC-certified body hash (if its window macroblock is stored). Content-QC authority is
+    // TOTAL below finality, in BOTH directions — a one-sided override turns the wedge into an A->B->A flap:
+    //   * WE hold the certified body, the competitor does NOT  => never leave it (return). Otherwise the
+    //     round heuristic below reorgs us onto the checkpoint-REJECTED higher-round sibling, and an adversary
+    //     re-gossiping that sibling holds our finality at h forever.
+    //   * the COMPETITOR holds the certified body, we do NOT    => adopt unconditionally (content_wins).
+    let certified_hash = {
+        let window_k = (h - 1) / 90 + 1;
+        storage.get_macroblock_by_height(window_k).ok().flatten()
+            .and_then(|b| bincode::deserialize::<qnet_state::MacroBlock>(&b).ok())
+            .and_then(|mb| { let start = (window_k - 1) * 90 + 1; mb.micro_blocks.get((h - start) as usize).copied() })
+    };
+    if let Some(c) = certified_hash {
+        if our_hash == c && incoming.hash() != c { return; } // keep the certified body — content dominates round
+    }
+    let content_wins = certified_hash.map_or(false, |c| incoming.hash() == c && our_hash != c);
     let incoming_abs = incoming.timeout_round.saturating_add(incoming.carried_baseline);
     let our_abs = our_round.saturating_add(our_baseline);
-    let incoming_wins = if incoming_abs > our_abs {
+    let incoming_wins = if content_wins {
+        true
+    } else if incoming_abs > our_abs {
         // Adopt the competitor's ATTACHED 2f+1 TimeoutProof BEFORE reading the certified round, so a node
         // that missed the separate TC broadcast learns the round in-band; the higher round wins ONLY if
         // 2f+1-certified (a forged round advances nothing → not certified → ignored). Adopt only in this
@@ -1350,6 +1375,7 @@ impl BlockPipeline {
         // it as `Semaphore::new(1)` is harmless — one in-flight acquire
         // at a time inside a single-task stage.
         let verify_permits_stage = Arc::new(tokio::sync::Semaphore::new(1));
+        let state_verify = ctx.state.clone(); // FIX-5: deterministic pk source (same handle apply_stage uses)
         tokio::spawn(Self::verify_stage(
             sig_verified_rx,
             verify_tx,
@@ -1359,6 +1385,7 @@ impl BlockPipeline {
             ctx.node_id.clone(),
             p2p_verify,
             verify_permits_stage,
+            state_verify,
         ));
 
         // Stage 3: Verify → Apply (state transitions + storage write + ALL side effects)
@@ -1636,6 +1663,10 @@ impl BlockPipeline {
         // attestations) so up to `permits` blocks can verify concurrently
         // without re-ordering the deferred-buffer / hash-chain state.
         verify_permits: Arc<tokio::sync::Semaphore>,
+        // FIX-5: committed in-mem State — the ONLY deterministic source for an elided value-TX's
+        // dilithium_public_key (never the detached accounts CF). Legal because the parent-continuity
+        // gate pins apply-frontier == H-1 when the value-TX batch runs (see the batch below).
+        state: Arc<RwLock<crate::StateManager>>,
     ) {
         // Suppress unused warning until callers acquire the permit. The
         // intentional design: hold a reference so the semaphore is
@@ -1656,6 +1687,11 @@ impl BlockPipeline {
         // parent IS present (burn gate runs post parent-check), so the contiguity drain never revisits them
         // — re-driven when their committee becomes available (see redrive below). Bounded by DEFERRED_MAX.
         let mut committee_deferred: HashMap<u64, DecodedBlock> = HashMap::new();
+        // Watermark of the last deferred re-drive (see the drain below): (applied tip, sealed-macroblock
+        // index). BOTH move independently and gate the two defer reasons — pk_unresolved clears when the
+        // chain APPLIES the committing block (chain_h moves); the N-2-committee defer clears when the N-2
+        // MACROBLOCK is sealed (sealed_mb moves, chain_h does NOT). MAX ⇒ the first pass always runs.
+        let mut last_redrive_wm: (u64, u64) = (u64::MAX, u64::MAX);
 
         // Gossip horizon: drop blocks > GOSSIP_HORIZON ahead of the local
         // tip BEFORE the deferred buffer. Root cause = catch-up backpressure
@@ -1718,9 +1754,21 @@ impl BlockPipeline {
             // Process this block, then try to drain deferred chain
             let mut to_process = vec![decoded];
 
-            // Re-drive burn-gated blocks once their N-2 committee is applied (parent already present, so the
-            // contiguity drain never revisits them). Skipped when empty (the norm); O(committee_deferred).
-            if !committee_deferred.is_empty() {
+            // Re-drive deferred blocks once their gate can have changed (parent already present, so the
+            // contiguity drain never revisits them). This map holds BOTH defer reasons, so the watermark is
+            // the pair of their EXACT clear-triggers — never chain_height, which advances every block:
+            //   * committee defer (N-2 absent) clears iff macroblock n2 BECOMES PRESENT → macroblock_save_seq
+            //     (counts any body, contiguous or not; last_sealed_mb_index would stay pinned behind an
+            //     out-of-order sync hole while committee_for_height already resolves).
+            //   * pk defer (elided pk uncommitted) clears iff a pk is COMMITTED → dpk_last_bind_height, which
+            //     moves exactly on the apply that binds one.
+            // Keying on chain_height instead re-ran the FULL verify (incl. the signature batch) for every
+            // entry on EVERY inbound block — a never-resolvable block was permanent attacker-planted CPU
+            // load. Both components are rare events, so the drain now fires only when a defer can truly
+            // clear. Skipped when empty (the norm); O(committee_deferred).
+            let cur_wm = (crate::storage::macroblock_save_seq(), storage.dpk_last_bind_height());
+            if !committee_deferred.is_empty() && cur_wm != last_redrive_wm {
+                last_redrive_wm = cur_wm;
                 let ready: Vec<u64> = committee_deferred.keys().copied()
                     .filter(|h| !crate::node::BlockchainNode::n2_committee_absent(&storage, *h))
                     .collect();
@@ -1860,6 +1908,20 @@ impl BlockPipeline {
                             mb.height,
                             &decoded.from_peer,
                         );
+
+                        // P2 walk-to-divergence: a hash_chain_break on a FAILOVER (round>0) block means our
+                        // stored PARENT may be a losing-fork block whose canonical, higher-certified-round
+                        // replacement we lack. Solicit the parent height so the certified-round fork-choice
+                        // (supersede_stored_from_sync) supersedes it and the rollback deepens ONE height
+                        // toward the true divergence point; the next re-sync repeats until the chains link —
+                        // instead of failing hash_chain_break forever on the same height (the non-convergent
+                        // h=79230 wedge). Safe either way: if OUR parent is canonical, the fetched parent is
+                        // same/lower round ⇒ no supersede. Self-throttled (2s/height, 16/s bucket).
+                        if (mb.timeout_round > 0 || mb.carried_baseline > 0) && mb.height > 1 {
+                            if let Some(ref p2p) = unified_p2p {
+                                let _ = p2p.request_block_repair(mb.height - 1).await;
+                            }
+                        }
 
                         // Broadcast observer-side rejection if we have the P2P
                         // handle and this isn't a self-emitted block (a producer
@@ -2408,47 +2470,75 @@ impl BlockPipeline {
                 // from CONSENSUS_PK_REGISTRY). The old inline hex decoder hard-rejected
                 // the system format -> froze testnet at h=14350 (commitment window).
                 // Helper batches verifies on SIGVERIFY_RUNTIME (parallel, not seq await).
+                // FIX-5: resolve any ELIDED value-TX pk from committed in-mem State on a CLONE, then
+                // verify. This State read is DETERMINISTIC — the parent-continuity gate above pins
+                // apply-frontier == H-1, so State is complete & canonical for every account < H (never
+                // the detached accounts CF). The decoded microblock / raw shreds stay ELIDED (we clone),
+                // so forwarded + stored wire bytes are unchanged. A wire pk that IS present is never
+                // overwritten (its eon(pk)==from bind still runs). API-1 receive-path close: value TXs
+                // are ALWAYS verified (a signatureless forged value TX → verify false → hard-reject).
                 let mut dilithium_invalid = 0usize;
+                let mut pk_unresolved = false;
                 {
                     use futures::future::join_all;
-                    let verify_futures: Vec<_> = decoded.microblock.transactions
-                        .iter()
-                        .filter(|tx| {
+                    let snap_in_progress = crate::storage::SNAPSHOT_REHYDRATE_IN_PROGRESS
+                        .load(Ordering::Acquire);
+                    let mut rehydrated: Vec<qnet_state::Transaction> = Vec::new();
+                    {
+                        // ONE read-lock for the whole block's value-TX batch, released BEFORE the verifies.
+                        let sg = state.read().await;
+                        for tx in &decoded.microblock.transactions {
                             // Merkle reward-claims (system_rewards_pool) are authorized by the per-proof
                             // re-verify in apply, not a client sig — exempt from PQ re-verify here.
                             if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution)
-                                && tx.from == "system_rewards_pool" {
-                                return false;
+                                && tx.from == "system_rewards_pool" { continue; }
+                            let is_value = tx.is_value_class();
+                            if is_value {
+                                // During a snapshot rehydrate, State is half-materialized → treat any
+                                // elided value-TX as unresolved + defer (mirror the apply-path guard).
+                                if snap_in_progress
+                                    && tx.dilithium_public_key.as_deref().map_or(true, |p| p.is_empty()) {
+                                    pk_unresolved = true; break;
+                                }
+                                let mut c = tx.clone();
+                                match crate::node::BlockchainNode::rehydrate_elided_pk(&mut c, &*sg) {
+                                    crate::node::PkResolve::Unresolved => { pk_unresolved = true; break; }
+                                    _ => rehydrated.push(c),
+                                }
+                            } else if matches!(&tx.dilithium_signature, Some(s) if !s.is_empty()) {
+                                rehydrated.push(tx.clone());
                             }
-                            // API-1 receive-path close: value TXs (Transfer/ContractDeploy/ContractCall/Swap)
-                            // are exempt from the Ed25519 batch (is_unsigned_system_tx), so a SIGNATURELESS
-                            // forged value TX would otherwise skip this presence-filter and never reach the
-                            // eon(dpk)==from bind — a Byzantine producer draining any account on the sole
-                            // receive-side gate. ALWAYS verify them: verify_dilithium_tx_signature_async
-                            // delegates value TXs to verify_user_tx_dilithium (sig over canonical msg +
-                            // eon(dpk)==from), which returns false when the sig is absent → block hard-
-                            // rejected below. Pure/deterministic (TX bytes only). Genesis (h==0) is skipped
-                            // by the branch above, so reserved-sender bootstrap TXs are unaffected.
-                            if matches!(tx.tx_type,
-                                qnet_state::TransactionType::Transfer { .. }
-                                | qnet_state::TransactionType::ContractDeploy
-                                | qnet_state::TransactionType::ContractCall
-                                | qnet_state::TransactionType::Swap { .. }) {
-                                return true;
-                            }
-                            matches!(&tx.dilithium_signature, Some(s) if !s.is_empty())
-                        })
-                        .map(|tx| crate::node::BlockchainNode::verify_dilithium_tx_signature_async(tx))
-                        .collect();
-                    if !verify_futures.is_empty() {
+                        }
+                    } // read-lock dropped here
+                    if !pk_unresolved && !rehydrated.is_empty() {
+                        let verify_futures: Vec<_> = rehydrated.iter()
+                            .map(|tx| crate::node::BlockchainNode::verify_dilithium_tx_signature_async(tx, crate::node::VerifyLane::Block))
+                            .collect();
                         let results = join_all(verify_futures).await;
                         for r in results {
                             match r {
-                                Ok(true) => {} // valid — wrapper format + registry + math all OK
+                                // Block lane AWAITS its reserved pool, so an Err here is a genuine
+                                // verify failure (never local backpressure) → count as invalid.
+                                Ok(true) => {}
                                 Ok(false) | Err(_) => dilithium_invalid += 1,
                             }
                         }
                     }
+                }
+
+                if pk_unresolved {
+                    // FIX-5 DEFER (NOT reject): an elided value-TX whose committed pk isn't present on
+                    // THIS node yet is indistinguishable from not-yet-synced — retry as the chain
+                    // advances via the committee_deferred drain. Hard-rejecting here would fork a
+                    // snapshot/catch-up node off the canonical chain. Bounded by DEFERRED_MAX.
+                    let dh = decoded.height;
+                    if committee_deferred.len() < DEFERRED_MAX {
+                        committee_deferred.insert(dh, decoded);
+                        if is_debug() { println!("[DBG][PIPELINE] pk_deferred h={} reason=elided_pk_uncommitted", dh); }
+                    } else {
+                        metrics.verify_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
                 }
 
                 if dilithium_invalid > 0 {
@@ -2596,9 +2686,10 @@ impl BlockPipeline {
                             return None;
                         }
                         let node_id = tx.from.as_str();
-                        let wire_pk = tx.dilithium_public_key.as_deref().and_then(|h| hex::decode(h).ok());
+                        // FIX-5: the TX carries the pk as RAW 1952 bytes — compare directly.
+                        let wire_pk = tx.dilithium_public_key.as_deref();
                         match (wire_pk, storage.load_vrf_public_key(node_id)) {
-                            (Some(w), Ok(Some(c))) if !w.is_empty() && w == c => None,
+                            (Some(w), Ok(Some(c))) if !w.is_empty() && w == c.as_slice() => None,
                             _ => Some(node_id.to_string()),
                         }
                     });
@@ -2725,11 +2816,14 @@ impl BlockPipeline {
             }
 
             // Bound committee-deferred the same way (its re-drive is committee-arrival, not tip contiguity).
+            // Evict pk-deferred entries whose height the chain has already APPLIED: a canonical block now
+            // fills that height, so the deferred fork-block is dead and must not be re-verified on every
+            // inbound block (a Byzantine producer's elided-never-committed-pk block would otherwise re-run
+            // the full verify indefinitely). Runs unconditionally; a residual cap bounds far-ahead spam.
+            let chain_h = storage.get_chain_height().unwrap_or(0);
+            committee_deferred.retain(|h, _| *h > chain_h);
             if committee_deferred.len() > 100 {
-                let chain_h = storage.get_chain_height().unwrap_or(0);
-                if chain_h > 500 {
-                    committee_deferred.retain(|h, _| *h > chain_h - 500);
-                }
+                committee_deferred.retain(|h, _| *h < chain_h + 500);
             }
         }
     }
@@ -3071,11 +3165,29 @@ impl BlockPipeline {
                     let vrf = if vrf_pk_hex.is_empty() { None } else { hex::decode(vrf_pk_hex).ok() };
                     let _ = ctx.storage.save_node_registration_at_height_burn_vrf(node_id, type_str, wallet, 1.0, height, burn_tx, vrf.as_deref());
                 }
+                // FIX-5: bind this block's value-TX pubkeys into the dilithium_pk_root LtHash
+                // (marker-guarded ⇒ once/account, deterministic) BEFORE the seal below.
+                for (addr, pk) in &apply_result.deferred_pk_binds {
+                    let _ = ctx.storage.dpk_lt_bind(addr, pk, height);
+                }
+                // Watermark the highest height that mutated the accumulator so a later dropped seal can be
+                // healed-on-read only while the live accumulator still equals its as-of-height value.
+                if !apply_result.deferred_pk_binds.is_empty() {
+                    let _ = ctx.storage.note_dpk_bind_height(height);
+                }
                 // registry_root seal (LtHash): at a checkpoint head, after all of this block's
                 // registrations updated lt_state and BEFORE save_microblock — mirror of the producer.
                 // Fires once per checkpoint head incl. zero-registration heads.
                 if height % qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL == 0 {
                     let _ = ctx.storage.seal_registry_root(height);
+                    // A dropped dpk seal-write later diverges the checkpoint field (compute_dilithium_pk_root's
+                    // no-seal fallback is not height-bounded), so surface it instead of swallowing.
+                    if let Err(e) = ctx.storage.seal_dilithium_pk_root(height) {
+                        if crate::node::is_warn() { println!("[WARN][SEAL] dpk_root_seal_fail h={} err={}", height, e); }
+                    }
+                    // Bind-journal prune bounded by the finality floor (same value the rollback guard uses).
+                    let _ = ctx.storage.prune_dpk_journal(
+                        crate::node::LAST_FINALIZED_HEIGHT.load(std::sync::atomic::Ordering::Relaxed));
                     // Same head: seal total_supply as-of this height (apply-deterministic on both paths)
                     // so the checkpoint reads a height-bound value, never the live counter.
                     let _ = ctx.storage.seal_total_supply(height, state_guard.get_total_supply());

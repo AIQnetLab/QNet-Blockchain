@@ -27,7 +27,7 @@ pub enum Effect {
     Relay(ConsensusMsg),                        // Qc / Tc: already complete, just broadcast
     // Proposer seals the macroblock: QC (finality) + next-epoch eligible producers + committee.
     Persist { checkpoint: Checkpoint, qc: QuorumCertificate, eligible_producers: Vec<u8>, committee: Vec<NodeId> },
-    Finalize { index: u64, head_height: u64, state_root: Hash }, // checkpoint final ⇒ microblocks ≤ head_height irreversible; state_root = the QC'd head root, re-checked locally before advancing the marker
+    Finalize { index: u64, head_height: u64, state_root: Hash, mb_hashes: Vec<Hash> }, // checkpoint final ⇒ microblocks ≤ head_height irreversible; state_root + per-height mb_hashes = the QC'd window content, re-checked against local bodies before advancing the marker (never finalize a same-state-different-body fork tail)
 }
 
 /// Canonical bytes a TimeoutMsg signs over (node and driver MUST agree).
@@ -46,6 +46,7 @@ pub struct ConsensusDriver {
     proposals: HashMap<(u64, Hash), Checkpoint>,
     heads: HashMap<u64, u64>, // round → window_head_height (Finalize + next_window mapping)
     state_roots: HashMap<u64, Hash>, // round → checkpoint state_root (Finalize carries it; verified locally, no macroblock body needed)
+    mb_hashes: HashMap<u64, Vec<Hash>>, // round → QC'd per-height body hashes (Finalize content-verifies local bodies against these before advancing — intra checkpoints have no stored macroblock)
     seal_data: HashMap<u64, (Vec<u8>, Vec<NodeId>)>, // round → (eligible_producers, committee)
     sealed: std::collections::HashSet<u64>, // windows we already emitted Persist for (dedup)
     last_proposed_round: u64,               // one proposal per round we lead
@@ -61,7 +62,7 @@ impl ConsensusDriver {
         Self {
             eng: CheckpointConsensus::new(node_id.clone(), committee.clone()),
             committee, genesis_hash, node_id,
-            proposals: HashMap::new(), heads: HashMap::new(), state_roots: HashMap::new(), seal_data: HashMap::new(),
+            proposals: HashMap::new(), heads: HashMap::new(), state_roots: HashMap::new(), mb_hashes: HashMap::new(), seal_data: HashMap::new(),
             sealed: std::collections::HashSet::new(), last_proposed_round: 0, high_window: 0,
             cp_interval: CHECKPOINT_INTERVAL, macro_interval: MACROBLOCK_INTERVAL,
         }
@@ -85,13 +86,13 @@ impl ConsensusDriver {
     /// (head, state_root) of the highest 2-chain-committed checkpoint we hold locally — the run loop
     /// re-emits a deferred Finalize from this. None if nothing committed OR we lack that checkpoint's
     /// head/state (⇒ finality WAITS for §4.5 macroblock sync rather than finalizing a head=0 placeholder).
-    pub fn committed_finalize(&self) -> Option<(u64, Hash)> {
+    pub fn committed_finalize(&self) -> Option<(u64, Hash, Vec<Hash>)> {
         let ci = self.eng.committed_index;
         if ci == 0 { return None; }
         let head = self.heads.get(&ci).copied().filter(|h| *h > 0)?;
-        Some((head, self.state_roots.get(&ci).copied()?))
+        Some((head, self.state_roots.get(&ci).copied()?, self.mb_hashes.get(&ci).cloned().unwrap_or_default()))
     }
-    pub fn committed_head(&self) -> Option<u64> { self.committed_finalize().map(|(h, _)| h) }
+    pub fn committed_head(&self) -> Option<u64> { self.committed_finalize().map(|(h, _, _)| h) }
 
     fn parent_hash(&self) -> Hash {
         self.eng.high_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash)
@@ -137,7 +138,7 @@ impl ConsensusDriver {
         &mut self, window: u64, mb_hashes: Vec<Hash>,
         state_root: Hash, beacon: Hash, head_ts: u64,
         committee: Vec<NodeId>, eligible_producers: Vec<u8>, banned: Vec<NodeId>, reward_root: Hash,
-        registry_root: Hash, logs_root: Hash, total_supply: u64,
+        registry_root: Hash, dilithium_pk_root: Hash, logs_root: Hash, total_supply: u64,
     ) -> Vec<Effect> {
         self.set_committee(committee.clone());
         let round = self.eng.current_index;
@@ -155,7 +156,7 @@ impl ConsensusDriver {
         let head_height = window.saturating_mul(self.cp_interval);
         let cp = Checkpoint {
             index: round, parent_qc: self.eng.high_qc.clone(), window_head_height: head_height,
-            window_mb_hashes: mb_hashes, state_root, beacon, epoch_commitment: epoch_c, reward_root, registry_root,
+            window_mb_hashes: mb_hashes, state_root, beacon, epoch_commitment: epoch_c, reward_root, registry_root, dilithium_pk_root,
             // Consensus event logs root (native QRC-20/721 transfers + WASM emit_log), threaded from the
             // caller = compute_window_logs_root(window). ACTIVE from genesis (`logs_root_required` gate=0):
             // content_ok enforces `cp.logs_root == c.logs_root`, giving trustless light-client event proofs.
@@ -167,6 +168,7 @@ impl ConsensusDriver {
         self.last_proposed_round = round;
         self.heads.insert(round, head_height);
         self.state_roots.insert(round, state_root);
+        self.mb_hashes.insert(round, cp.window_mb_hashes.clone());
         self.proposals.insert((cp.index, cp.hash()), cp.clone());
         vec![Effect::Propose(cp)]
     }
@@ -190,6 +192,7 @@ impl ConsensusDriver {
         if cp.index != qc.index || cp.hash() != qc.checkpoint_hash { return Vec::new(); }
         self.heads.insert(cp.index, cp.window_head_height);
         self.state_roots.insert(cp.index, cp.state_root);
+        self.mb_hashes.insert(cp.index, cp.window_mb_hashes.clone());
         self.proposals.insert((cp.index, cp.hash()), cp.clone());
         let acts = self.eng.sync_checkpoint(cp, qc);
         self.translate(acts)
@@ -213,6 +216,7 @@ impl ConsensusDriver {
                 let ph = cp.parent_qc.as_ref().map(|q| q.checkpoint_hash).unwrap_or(self.genesis_hash);
                 self.heads.insert(cp.index, cp.window_head_height);
                 self.state_roots.insert(cp.index, cp.state_root);
+                self.mb_hashes.insert(cp.index, cp.window_mb_hashes.clone());
                 self.proposals.insert((cp.index, cp.hash()), cp.clone());
                 self.eng.on_proposal(cp, &ph)
             }
@@ -284,7 +288,8 @@ impl ConsensusDriver {
                     // finality waits but never wedges.
                     let head = self.heads.get(&idx).copied().unwrap_or(0);
                     if let (true, Some(sr)) = (head > 0, self.state_roots.get(&idx).copied()) {
-                        out.push(Effect::Finalize { index: idx, head_height: head, state_root: sr });
+                        let mbh = self.mb_hashes.get(&idx).cloned().unwrap_or_default();
+                        out.push(Effect::Finalize { index: idx, head_height: head, state_root: sr, mb_hashes: mbh });
                     }
                 }
                 Action::EnterView(_) => {}
@@ -309,6 +314,7 @@ impl ConsensusDriver {
         self.proposals.retain(|(idx, _), _| *idx >= floor);
         self.heads.retain(|idx, _| *idx >= floor);
         self.state_roots.retain(|idx, _| *idx >= floor);
+        self.mb_hashes.retain(|idx, _| *idx >= floor);
         self.seal_data.retain(|idx, _| *idx >= floor);
         // `sealed` is keyed by macroblock window; map the index floor to a window floor. A pruned
         // window that a late relayed QC re-seals is idempotent (storage.save_macroblock skips an
@@ -388,7 +394,7 @@ mod tests {
         for index in 1..=8u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], 0);
+                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
@@ -416,7 +422,7 @@ mod tests {
         for index in 1..=6u64 {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], 0);
+                let effs = nodes[k].d.build_proposal(index, vec![[index as u8; 32]], [index as u8; 32], [0u8; 32], index * 1000, c.clone(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(&mut nodes, &c, seed);
@@ -435,7 +441,7 @@ mod tests {
         let c: Vec<NodeId> = (0..4).map(|i| format!("n{}", i)).collect();
         let cp = Checkpoint {
             index: 1, parent_qc: None, window_head_height: 10, window_mb_hashes: vec![[1u8; 32]],
-            state_root: [1u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![9, 9],
+            state_root: [1u8; 32], beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0, proposer: "n1".into(), proposer_sig: vec![9, 9],
         };
         // forged proposer_sig fails node verify ⇒ never reaches the driver
         assert!(!verify_msg(&c, &ConsensusMsg::Proposal(cp)));
@@ -458,7 +464,7 @@ mod tests {
         fn step(nodes: &mut Vec<Node>, c: &[NodeId], w: u64) {
             let mut seed = Vec::new();
             for k in 0..nodes.len() {
-                let effs = nodes[k].d.build_proposal(w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], 0);
+                let effs = nodes[k].d.build_proposal(w, vec![[w as u8; 32]], [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(), Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
                 for e in effs { seed.extend(exec(&mut nodes[k], e)); }
             }
             deliver(nodes, c, seed);
@@ -502,7 +508,7 @@ mod tests {
             let cp = Checkpoint {
                 index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
-                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
                 proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
             };
             let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
@@ -551,7 +557,7 @@ mod tests {
             let cp = Checkpoint {
                 index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
-                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
                 proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
             };
             let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
@@ -589,7 +595,7 @@ mod tests {
             let cp = Checkpoint {
                 index: i, parent_qc: prev_qc.clone(), window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
-                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
                 proposer: c[leader_index(i, &parent_hash, c.len())].clone(), proposer_sig: Vec::new(),
             };
             let signers: Vec<NodeId> = c.iter().take(3).cloned().collect();
@@ -604,7 +610,7 @@ mod tests {
         let poison = Checkpoint {
             index: 6, parent_qc: prev_qc.clone(), window_head_height: 10_000 * 90,
             window_mb_hashes: vec![[6u8; 32]], state_root: [6u8; 32],
-            beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+            beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32], registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
             proposer: c[0].clone(), proposer_sig: Vec::new(),
         };
         let effs = d.handle(&ConsensusMsg::Proposal(poison.clone()));
@@ -633,7 +639,7 @@ mod tests {
                 index: i, parent_qc: None, window_head_height: i * 90,
                 window_mb_hashes: vec![[i as u8; 32]], state_root: [i as u8; 32],
                 beacon: [0u8; 32], epoch_commitment: [0u8; 32], reward_root: [0u8; 32],
-                registry_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
+                registry_root: [0u8; 32], dilithium_pk_root: [0u8; 32], logs_root: [0u8; 32], total_supply: 0, timestamp: 0,
                 proposer: "n0".into(), proposer_sig: Vec::new(),
             };
             d.proposals.insert((i, cp.hash()), cp);

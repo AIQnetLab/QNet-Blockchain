@@ -40,7 +40,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use pqcrypto_mldsa::mldsa65 as dilithium3;
-use pqcrypto_traits::sign::{SecretKey as PqSecretKey, PublicKey as PqPublicKey, SignedMessage as PqSignedMessage};
+use pqcrypto_traits::sign::{SecretKey as PqSecretKey, PublicKey as PqPublicKey, DetachedSignature as PqDetachedSignature};
 
 /// QNC decimals: 1 QNC = 10^9 nanoQNC (from core/qnet-state)
 pub const QNC_DECIMALS: u32 = 9;
@@ -336,9 +336,9 @@ pub fn generate_pq_transaction_from_snapshot(
     let msg_bytes = message.as_bytes();
 
     // Dilithium3 (ML-DSA-65) signature only — pure post-quantum path
-    let pq_signed = dilithium3::sign(msg_bytes, &sender.pq_sk);
-    tx.dilithium_signature  = Some(hex::encode(pq_signed.as_bytes()));
-    tx.dilithium_public_key = Some(hex::encode(sender.pq_pk.as_bytes()));
+    let pq_signed = dilithium3::detached_sign(msg_bytes, &sender.pq_sk);
+    tx.dilithium_signature  = Some(pq_signed.as_bytes().to_vec());
+    tx.dilithium_public_key = Some(sender.pq_pk.as_bytes().to_vec());
 
     Some(tx)
 }
@@ -695,9 +695,9 @@ impl BenchmarkManager {
             "{}|{}|{}|{}|{}|{}|{}",
             tx.from, receiver.address, amount, nonce, tx.gas_price, tx.gas_limit, timestamp
         );
-        let pq_signed = dilithium3::sign(message.as_bytes(), &sender.pq_sk);
-        tx.dilithium_signature  = Some(hex::encode(pq_signed.as_bytes()));
-        tx.dilithium_public_key = Some(hex::encode(sender.pq_pk.as_bytes()));
+        let pq_signed = dilithium3::detached_sign(message.as_bytes(), &sender.pq_sk);
+        tx.dilithium_signature  = Some(pq_signed.as_bytes().to_vec());
+        tx.dilithium_public_key = Some(sender.pq_pk.as_bytes().to_vec());
 
         Some(tx)
     }
