@@ -1436,13 +1436,21 @@ impl BlockPipeline {
                 let now = now_ms();
                 let verified_now = metrics_watchdog.verified.load(Ordering::Relaxed);
                 let applied_now = metrics_watchdog.applied.load(Ordering::Relaxed);
+                // dup-skip is a terminal disposition (block already present) = forward progress.
+                // Fold it into both liveness signals: during a node's own production rotation the
+                // pipeline sees only echoes of self-produced blocks (dup-skips that never bump
+                // `applied`), which froze the counter and tripped a spurious apply_stuck CRIT on a
+                // healthy producer. A real stall freezes dup-skip too, so genuine CRITs still fire.
+                let dup_now = metrics_watchdog.duplicates_skipped.load(Ordering::Relaxed);
+                let verify_progress_now = verified_now.saturating_add(dup_now);
+                let apply_progress_now = applied_now.saturating_add(dup_now);
 
-                if verified_now != last_verified {
-                    last_verified = verified_now;
+                if verify_progress_now != last_verified {
+                    last_verified = verify_progress_now;
                     last_verified_progress_ms = now;
                 }
-                if applied_now != last_applied {
-                    last_applied = applied_now;
+                if apply_progress_now != last_applied {
+                    last_applied = apply_progress_now;
                     last_applied_progress_ms = now;
                 }
 

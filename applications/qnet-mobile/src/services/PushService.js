@@ -532,17 +532,27 @@ export async function checkNodeStatus() {
     const nodeId = nodeInfo.nodeId;
     const apiUrl = await getRandomBootstrapNodeAsync();
 
+    // RN fetch has NO default timeout: a slow/unreachable bootstrap node (e.g. during a fresh-genesis
+    // relaunch before nodes are up) would hang this call for the OS TCP timeout, sticking the UI on
+    // "Checking…"/"Connecting…" indefinitely. Abort each request on a short budget so the status
+    // resolves fast (and falls to the error branch → the Activate button stays actionable).
+    const fetchT = (url, ms) => {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), ms);
+      return fetch(url, { method: 'GET', signal: ctl.signal }).finally(() => clearTimeout(t));
+    };
+
     let result = null;
     let fetchErr = null;
     try {
-      const r = await fetch(`${apiUrl}/api/v1/light-node/status?node_id=${encodeURIComponent(nodeId)}`, { method: 'GET' });
+      const r = await fetchT(`${apiUrl}/api/v1/light-node/status?node_id=${encodeURIComponent(nodeId)}`, 6000);
       result = await r.json();
     } catch (e) { fetchErr = e; }
 
-    // Block height for the "Next Rewards" display.
+    // Block height for the "Next Rewards" display (secondary — shorter budget).
     let currentBlockHeight = 0;
     try {
-      const heightResp = await fetch(`${apiUrl}/api/v1/status`, { method: 'GET' });
+      const heightResp = await fetchT(`${apiUrl}/api/v1/status`, 4000);
       if (heightResp.ok) {
         const heightData = await heightResp.json();
         currentBlockHeight = heightData.height || heightData.current_height || 0;

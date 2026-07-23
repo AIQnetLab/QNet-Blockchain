@@ -1231,8 +1231,12 @@ static ANCHOR_PULL_BUDGET: Lazy<Arc<parking_lot::Mutex<(u64, u32)>>> =
 /// spawn one repair per diverged tail height (up to a full window) from a single proposal, and a
 /// re-sendable attacker proposal cycles fresh garbage tails, so the ~3x-peer fan-out is globally
 /// capped + per-height cooldowned regardless of how many heights an unauthenticated proposal forces.
-static REPAIR_REQUEST_BUDGET: Lazy<Arc<parking_lot::Mutex<(u64, u32)>>> =
-    Lazy::new(|| Arc::new(parking_lot::Mutex::new((0, 0))));
+/// (second_start, shared_count, priority_count): the PRIORITY lane is a RESERVED extra budget for
+/// finality-critical repairs (tail-reconcile / deferred-finalize) — bulk callers (hole repair,
+/// parent pulls, sync) draw only from shared, so they can never starve the repair that unwedges
+/// 2f+1 finality. Priority callers draw shared first, then the reserve.
+static REPAIR_REQUEST_BUDGET: Lazy<Arc<parking_lot::Mutex<(u64, u32, u32)>>> =
+    Lazy::new(|| Arc::new(parking_lot::Mutex::new((0, 0, 0))));
 /// Cooldown per height for the block-repair request (secs).
 static REPAIR_REQUEST_TIMES: Lazy<Arc<DashMap<u64, u64>>> = Lazy::new(|| Arc::new(DashMap::new()));
 
@@ -19771,6 +19775,18 @@ impl SimplifiedP2P {
     /// Used by anti-fork protection to get missing blocks before producing
     /// ═══════════════════════════════════════════════════════════════════════════
     pub async fn request_block_repair(&self, height: u64) -> Result<(), String> {
+        self.request_block_repair_lane(height, false).await
+    }
+
+    /// PRIORITY lane for finality-critical repair (tail-reconcile adopt path, deferred-finalize
+    /// bodies): draws the shared budget first, then a RESERVED extra allowance bulk callers cannot
+    /// touch — a hole-repair/parent-pull burst can therefore never starve the repair that unwedges
+    /// 2f+1 finality. 90-height worst case ≈ (16+8)/s ⇒ well inside one escalated view timeout.
+    pub async fn request_block_repair_priority(&self, height: u64) -> Result<(), String> {
+        self.request_block_repair_lane(height, true).await
+    }
+
+    async fn request_block_repair_lane(&self, height: u64, priority: bool) -> Result<(), String> {
         // Allow-list this exact height so its stored-height batch reply is routed to fork-choice
         // supersede (supersede_stored_from_sync) instead of ignored — this is the SOLICITED path that
         // converges a diverged tail. Marking a not-yet-stored height is harmless (TTL-expired).
@@ -19789,12 +19805,19 @@ impl SimplifiedP2P {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs()).unwrap_or(0);
             const REPAIR_REQUESTS_PER_SEC: u32 = 16;
+            /// Reserved for the priority lane ON TOP of the shared budget (total 24/s ceiling).
+            const REPAIR_PRIORITY_RESERVE_PER_SEC: u32 = 8;
             const REPAIR_COOLDOWN_SECS: u64 = 2;
             {
                 let mut b = REPAIR_REQUEST_BUDGET.lock();
-                if b.0 != now { *b = (now, 0); }
-                if b.1 >= REPAIR_REQUESTS_PER_SEC { return Ok(()); }
-                b.1 += 1;
+                if b.0 != now { *b = (now, 0, 0); }
+                if b.1 < REPAIR_REQUESTS_PER_SEC {
+                    b.1 += 1; // shared budget available — both lanes draw here first
+                } else if priority && b.2 < REPAIR_PRIORITY_RESERVE_PER_SEC {
+                    b.2 += 1; // shared exhausted — only finality-critical callers get the reserve
+                } else {
+                    return Ok(());
+                }
             }
             let last = REPAIR_REQUEST_TIMES.get(&height).map(|v| *v).unwrap_or(0);
             if now.saturating_sub(last) < REPAIR_COOLDOWN_SECS { return Ok(()); }

@@ -659,4 +659,115 @@ mod tests {
         assert!(d.heads.len() <= CONSENSUS_STATE_RETAIN as usize + 1, "bounded, not O(chain length)");
         assert_eq!(d.eng.committed_index, total, "prune never regresses committed_index");
     }
+
+    // ============================================================================================
+    // WEDGE HARNESS (Phase 0): reproduce the 2026-07-22 h=12960 boundary tail-fork at the node
+    // layer and pin propose-and-adopt as the fix. The wedge lived ABOVE the driver: a proposal whose
+    // tail differs from a node's local tail is gated by check_content (TailDiverged ⇒ no vote), so the
+    // driver never sees it. Modelled here: each node carries its own window tail; the content gate
+    // decides whether the node votes. SelfDerive = today (vote only on byte-identical tail);
+    // ProposeAndAdopt = the fix (adopt the leader's valid tail, then vote). Committee = n-f = 4 of 5.
+    // ============================================================================================
+
+    // Leader emits its Propose carrying ITS OWN tail; every member buffers seal inputs (mirrors prod).
+    fn propose_window(nodes: &mut Vec<Node>, tails: &[Vec<Hash>], c: &[NodeId], w: u64) -> Vec<ConsensusMsg> {
+        let mut seed = Vec::new();
+        for k in 0..nodes.len() {
+            let effs = nodes[k].d.build_proposal(
+                w, tails[k].clone(), [w as u8; 32], [0u8; 32], w * 1000, c.to_vec(),
+                Vec::new(), Vec::new(), [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], 0);
+            for e in effs { seed.extend(exec(&mut nodes[k], e)); }
+        }
+        seed
+    }
+
+    // deliver() + the node-layer content gate. `adopt=false` models SelfDerive (a tail-divergent node
+    // withholds its vote = today's TailDiverged⇒Vec::new()); `adopt=true` models ProposeAndAdopt (the
+    // node adopts the leader's proposed tail, then votes). Non-Proposal messages are ungated.
+    fn deliver_gated(nodes: &mut Vec<Node>, tails: &mut Vec<Vec<Hash>>, c: &[NodeId], seed: Vec<ConsensusMsg>, adopt: bool) {
+        let mut queue = seed;
+        let mut rounds = 0;
+        while !queue.is_empty() && rounds < 4000 {
+            rounds += 1;
+            let mut next = Vec::new();
+            for m in queue.drain(..) {
+                for k in 0..nodes.len() {
+                    if !verify_msg(c, &m) { continue; }
+                    if let ConsensusMsg::Proposal(cp) = &m {
+                        if tails[k] != cp.window_mb_hashes {
+                            if adopt { tails[k] = cp.window_mb_hashes.clone(); } else { continue; }
+                        }
+                    }
+                    let effs = nodes[k].d.handle(&m);
+                    for e in effs { next.extend(exec(&mut nodes[k], e)); }
+                }
+            }
+            queue = next;
+        }
+    }
+
+    fn five_node_harness() -> (Vec<NodeId>, Vec<Node>, Vec<Vec<Hash>>) {
+        let c: Vec<NodeId> = (0..5).map(|i| format!("n{}", i)).collect();
+        let nodes: Vec<Node> = c.iter().map(|id| {
+            let mut d = ConsensusDriver::new(id.clone(), c.clone(), [7u8; 32]);
+            d.set_intervals(30, 90);
+            Node { d, id: id.clone(), committed: 0, sealed: Vec::new() }
+        }).collect();
+        let tails: Vec<Vec<Hash>> = (0..5).map(|_| vec![[0u8; 32]]).collect();
+        (c, nodes, tails)
+    }
+
+    // Drive 3 clean windows so finality flows and next_window reaches 4, then return.
+    fn warm_three_windows(nodes: &mut Vec<Node>, tails: &mut Vec<Vec<Hash>>, c: &[NodeId], adopt: bool) {
+        for w in 1..=3u64 {
+            for t in tails.iter_mut() { *t = vec![[w as u8; 32]]; }
+            let seed = propose_window(nodes, tails, c, w);
+            deliver_gated(nodes, tails, c, seed, adopt);
+        }
+    }
+
+    // REPRODUCTION: a boundary tail fork (2/5 hold variant A, 3/5 variant B — the stalled-producer
+    // double-production) wedges under SelfDerive. The leader's tail is held by ≤3 of 5, so <4 vote ⇒
+    // no QC ⇒ next_window can never advance past the contested window. This is the live incident.
+    #[test]
+    fn wedge_boundary_tail_fork_self_derive_deadlocks() {
+        let (c, mut nodes, mut tails) = five_node_harness();
+        warm_three_windows(&mut nodes, &mut tails, &c, false);
+        for n in &nodes { assert_eq!(n.d.next_window(), 4, "warm-up must reach the boundary window"); }
+
+        // Contested window 4: 2/3 tail split. No adoption ⇒ divergent nodes withhold their vote.
+        for k in 0..5 { tails[k] = if k < 2 { vec![[0xA1u8; 32]] } else { vec![[0xB2u8; 32]] }; }
+        let seed = propose_window(&mut nodes, &tails, &c, 4);
+        deliver_gated(&mut nodes, &mut tails, &c, seed, false);
+
+        let stuck = nodes.iter().filter(|n| n.d.next_window() == 4).count();
+        assert_eq!(stuck, 5, "self-derive on a boundary tail fork must wedge every node (no 4/5 QC)");
+        assert!(nodes.iter().all(|n| n.committed < 4), "contested window must never finalize under self-derive");
+    }
+
+    // THE FIX SPEC: propose-and-adopt converges the same fork. Every node adopts the leader's valid
+    // tail and votes ⇒ 5/5 ⇒ QC forms, next_window advances, all tails converge to one canonical value,
+    // and finality resumes. This is the acceptance gate the R1+R7 refactor must satisfy against real code.
+    #[test]
+    fn boundary_tail_fork_propose_and_adopt_converges() {
+        let (c, mut nodes, mut tails) = five_node_harness();
+        warm_three_windows(&mut nodes, &mut tails, &c, true);
+
+        // Same 2/3 fork, but adopt-on-divergence.
+        for k in 0..5 { tails[k] = if k < 2 { vec![[0xA1u8; 32]] } else { vec![[0xB2u8; 32]] }; }
+        let seed = propose_window(&mut nodes, &tails, &c, 4);
+        deliver_gated(&mut nodes, &mut tails, &c, seed, true);
+
+        // Every node converged to the single canonical (leader's) tail for the contested window.
+        assert!(tails.iter().all(|t| *t == tails[0]), "propose-and-adopt must converge every node to one tail");
+        assert!(nodes.iter().all(|n| n.d.next_window() >= 5), "contested window must QC and advance under adopt");
+
+        // One more clean window ⇒ 2-chain commits the contested window; all nodes finalize the same height.
+        for t in tails.iter_mut() { *t = vec![[5u8; 32]]; }
+        let seed = propose_window(&mut nodes, &tails, &c, 5);
+        deliver_gated(&mut nodes, &mut tails, &c, seed, true);
+        let committed = nodes[0].committed;
+        assert!(committed >= 3, "finality must advance under adopt, got {}", committed);
+        assert!(nodes.iter().all(|n| n.committed == committed), "all nodes finalize the same height");
+    }
 }

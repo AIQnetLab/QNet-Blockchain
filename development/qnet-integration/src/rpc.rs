@@ -3881,7 +3881,16 @@ async fn handle_account_balance_with_proof(
         }
         Err(e) => {
             // Account not found - return empty balance with proof
-            println!("[WARN][RPC] api_error endpoint=balance_proof address={} err={}", address, e);
+            let msg = e.to_string();
+            // No state account = every empty wallet polling its balance; WARN here would flood
+            // logs at scale (thousands of fresh wallets). Real failures still WARN.
+            if msg.contains("Account not found") {
+                if crate::node::is_debug() {
+                    println!("[DBG][RPC] balance_proof_no_account address={}", address);
+                }
+            } else {
+                println!("[WARN][RPC] api_error endpoint=balance_proof address={} err={}", address, msg);
+            }
             Ok(warp::reply::json(&json!({
                 "address": address,
                 "balance": 0,

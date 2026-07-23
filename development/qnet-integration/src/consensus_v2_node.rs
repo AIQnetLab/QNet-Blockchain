@@ -80,32 +80,47 @@ fn process_authenticated(
 ) -> Vec<Effect> {
     // ACCOUNTABLE SAFETY (pure side effect): cache authentic checkpoints + detect a committee member
     // signing two DIFFERENT checkpoints at the SAME round → sound on-chain vote-equivocation evidence.
-    match msg {
-        ConsensusMsg::Proposal(cp) => crate::node::observe_checkpoint_proposal(
-            cp.index, cp.hash(), bincode::serialize(cp).unwrap_or_default()),
-        ConsensusMsg::Vote(v) => crate::node::observe_checkpoint_vote(
-            v.index, &v.voter, v.checkpoint_hash, v.signature.clone()),
-        _ => {}
-    }
+    observe_accountability(msg);
     // Independent content re-derivation before we sign — single source of truth (check_content),
     // shared with drain_pending so buffered replay applies the same gate.
     match check_content(storage, window_buf, msg) {
         ContentCheck::Ok => {
             let mut effs = driver.handle(msg);
-            effs.extend(try_propose(driver, window_buf, committee));
+            effs.extend(try_propose(driver, window_buf, storage, committee));
             effs.extend(drain_pending(driver, window_buf, storage, p2p, committee, pending, max_pending));
             effs
         }
         ContentCheck::TailDiverged(heights) => {
-            // Boundary-failover tail split: state agreed but our applied chain still holds losing-round
-            // blocks. Pull each peer's 2f+1-certified-canonical block so fork-choice supersedes ours.
+            // PROPOSE-AND-ADOPT (boundary tail-fork root fix; spec = the driver wedge harness): state
+            // agreed EXACTLY, only failover-round-bound tail hashes differ. Pull each 2f+1-certified-
+            // canonical block so fork-choice supersedes our losing variant, AND buffer the proposal —
+            // drain_pending re-runs the full gate once the canonical bodies land, so our vote flows
+            // WITHOUT depending on a proposal re-gossip that never comes. (The SelfDerive wedge: with
+            // ≤ n-f-1 byte-identical tail holders the dropped proposal ⇒ <2f+1 votes ⇒ QC never forms.)
+            // NEVER vote blind: adoption completes only at the re-gate, where hashes + beacon are
+            // reproduced from REAL stored bodies — a Byzantine leader cannot get phantom tail hashes or
+            // a forged beacon 2f+1-signed, and a fork-choice-losing tail is never adopted (its blocks
+            // never supersede ours ⇒ the buffered proposal never re-gates Ok ⇒ TC rotates the leader).
             if crate::node::is_info() {
                 println!("[INFO][BFT2] tail_reconcile idx={} diverged_heights={}", msg_index(msg), heights.len());
             }
+            if let ConsensusMsg::Proposal(cp) = msg {
+                evict_superseded_proposal(pending, cp.index, &cp.proposer);
+            }
+            if let Ok(bytes) = bincode::serialize(msg) { buffer_pending(pending, max_pending, bytes, true); }
             for h in heights {
                 let p = p2p.clone();
-                tokio::spawn(async move { let _ = p.request_block_repair(h).await; });
+                tokio::spawn(async move { let _ = p.request_block_repair_priority(h).await; });
             }
+            Vec::new()
+        }
+        ContentCheck::Defer => {
+            // Not caught up to this checkpoint's window yet — buffer for replay (drain_pending re-runs the
+            // gate once our window is derived) instead of permanently rejecting. Bounded ⇒ no unbounded growth.
+            if let ConsensusMsg::Proposal(cp) = msg {
+                evict_superseded_proposal(pending, cp.index, &cp.proposer);
+            }
+            if let Ok(bytes) = bincode::serialize(msg) { buffer_pending(pending, max_pending, bytes, true); }
             Vec::new()
         }
         ContentCheck::Reject => {
@@ -133,6 +148,21 @@ fn process_authenticated(
             }
             Vec::new()
         }
+    }
+}
+
+/// Accountable-safety observers (pure side effect): cache authentic checkpoints + votes so a
+/// committee member signing two DIFFERENT checkpoints at the SAME round yields sound on-chain
+/// vote-equivocation evidence. MUST run on EVERY message handed to the driver — the live path
+/// (process_authenticated) AND drain_pending's buffered replay — or equivocations that only ever
+/// surface via the replay buffer would produce zero evidence (audit F2).
+fn observe_accountability(msg: &ConsensusMsg) {
+    match msg {
+        ConsensusMsg::Proposal(cp) => crate::node::observe_checkpoint_proposal(
+            cp.index, cp.hash(), bincode::serialize(cp).unwrap_or_default()),
+        ConsensusMsg::Vote(v) => crate::node::observe_checkpoint_vote(
+            v.index, &v.voter, v.checkpoint_hash, v.signature.clone()),
+        _ => {}
     }
 }
 
@@ -429,7 +459,7 @@ pub async fn execute(effects: Vec<Effect>, node_id: &str, p2p: &Arc<SimplifiedP2
                     // Reuse the single scan above; capped like every other repair kick (self-throttled anyway).
                     if let Some((missing, mismatched)) = verdict.as_ref() {
                         for h in missing.iter().chain(mismatched.iter()).take(32) {
-                            let _ = p2p.request_block_repair(*h).await;
+                            let _ = p2p.request_block_repair_priority(*h).await;
                         }
                     }
                     if crate::node::is_warn() {
@@ -485,18 +515,53 @@ struct WindowContent {
     total_supply: u64,     // total minted supply, QC-certified via Checkpoint.total_supply
 }
 
+/// Recompute a window's tail (mb hashes + beacon) FRESH from canonical storage bodies — the same
+/// derivation check_content votes against. None if any body/vrf is absent (mid-rollback/resync:
+/// transient, the caller retries on its next trigger). O(win) reads, leader-proposal-path only.
+fn derive_window_tail(storage: &Storage, head: u64, win: usize) -> Option<(Vec<Hash>, Hash)> {
+    if win == 0 || win as u64 > head { return None; }
+    let start = head - (win as u64 - 1);
+    let mut hashes = Vec::with_capacity(win);
+    let mut vrf: Vec<[u8; 32]> = Vec::with_capacity(win);
+    for h in start..=head {
+        let mb = storage.load_microblock_auto_format(h).ok().flatten()?;
+        vrf.push(mb.vrf_output?);
+        hashes.push(mb.hash());
+    }
+    Some((hashes, qnet_consensus::checkpoint_bft::accumulate_beacon(&vrf)))
+}
+
 /// Adopt the in-flight window's committee and, if we lead the current round, propose the
 /// contiguous next window. No-op until that window's content has been buffered locally.
+/// PROPOSE-FROM-STORAGE (audit F3): the LEADER's proposed tail is re-derived from canonical
+/// storage at propose time, NOT the WindowEnd snapshot — after a fork-choice supersede the
+/// snapshot's tail is dead (its losing bodies can never supersede the stored certified winner,
+/// so nobody — including this node — could ever vote it, and the macro-boundary snapshot is
+/// never re-signalled). Deriving from storage makes the proposer symmetric with the voter gate:
+/// both sides read the same canonical bodies, so a reorged leader proposes the ADOPTABLE tail.
+/// State/epoch fields stay snapshot-sourced — a round-rebind supersede never changes applied
+/// state (the TailDiverged safety premise), and a state-CHANGING divergence must keep failing
+/// the voters' state gate rather than be papered over here. Mid-rollback (body missing) ⇒ fall
+/// back to the snapshot tail: build_proposal must still run on EVERY member (all-seal buffers
+/// seal_data unconditionally), and a dead-tail proposal is no worse than the pre-fix status quo.
 fn try_propose(
     driver: &mut ConsensusDriver,
     buf: &std::collections::HashMap<u64, WindowContent>,
+    storage: &Storage,
     committee: &mut Vec<String>,
 ) -> Vec<Effect> {
     let w = driver.next_window();
     match buf.get(&w) {
         Some(c) => {
             *committee = c.committee.clone(); // committee is per-window (epoch); QC/TC verify against it
-            driver.build_proposal(w, c.mb_hashes.clone(), c.state_root, c.beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root, c.dilithium_pk_root, c.logs_root, c.total_supply)
+            // O(win) storage reads gated on ACTUALLY leading (once per round), never the hot vote path.
+            let (mb_hashes, beacon) = if driver.is_leader_now() {
+                derive_window_tail(storage, w.saturating_mul(qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL), c.mb_hashes.len())
+                    .unwrap_or_else(|| (c.mb_hashes.clone(), c.beacon))
+            } else {
+                (c.mb_hashes.clone(), c.beacon)
+            };
+            driver.build_proposal(w, mb_hashes, c.state_root, beacon, c.head_ts, c.committee.clone(), c.eligible.clone(), c.banned.clone(), c.reward_root, c.registry_root, c.dilithium_pk_root, c.logs_root, c.total_supply)
         }
         None => Vec::new(),
     }
@@ -506,7 +571,8 @@ fn try_propose(
 enum ContentCheck {
     Ok,                     // content independently reproduced ⇒ safe to hand to the driver (vote)
     TailDiverged(Vec<u64>), // pure hash-level tail split (state agrees) at these heights ⇒ reconcile, don't vote yet
-    Reject,                 // genuine state/epoch divergence or absent window ⇒ fail-stop (never vote)
+    Defer,                  // our own window snapshot not derived yet (apply-lag/eviction) ⇒ buffer + retry, NEVER Reject
+    Reject,                 // genuine state/epoch divergence ⇒ fail-stop (never vote)
 }
 
 /// Re-handle buffered inbound now the round / in-flight committee may have advanced. One
@@ -521,12 +587,17 @@ enum ContentCheck {
 /// goes stale the instant fork-choice reorgs our tail to the higher-certified-round winner. When
 /// the state agrees but a tail height still holds our losing-round block, that height is returned
 /// for reconcile (pull the certified-canonical block ⇒ supersede) rather than fail-stop — THE fix
-/// for the boundary-failover finality freeze. No local window ⇒ Reject. Non-Proposal ⇒ Ok. Single
-/// source of truth for the live inbound path AND drain_pending (buffered replay applies the same gate).
+/// for the boundary-failover finality freeze; the adopt is completed by the buffered proposal
+/// re-gating Ok in drain_pending once the canonical bodies land (propose-and-adopt, never a blind
+/// vote). No local window ⇒ Defer (apply-lag is not divergence: buffer + retry). Non-Proposal ⇒ Ok.
+/// Single source of truth for the live inbound path AND drain_pending (replay = the same gate).
 fn check_content(storage: &Storage, buf: &std::collections::HashMap<u64, WindowContent>, msg: &ConsensusMsg) -> ContentCheck {
     let cp = match msg { ConsensusMsg::Proposal(cp) => cp, _ => return ContentCheck::Ok };
     let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
-    let c = match buf.get(&(cp.window_head_height / k)) { Some(c) => c, None => return ContentCheck::Reject };
+    // Absent window snapshot = this node hasn't derived its own view of this checkpoint yet (apply-lag /
+    // eviction), NOT a divergence. Defer (buffer + retry) so a lagging voter never silently fail-stops on a
+    // proposal it simply hasn't caught up to — the silent-abstain trap behind the boundary finality freeze.
+    let c = match buf.get(&(cp.window_head_height / k)) { Some(c) => c, None => return ContentCheck::Defer };
     // State + epoch fields must match EXACTLY — never reconcile a genuine state/epoch divergence.
     // state_root agreeing is the safety gate that makes a tail-hash split safe to reconcile below
     // (same applied state, only the failover-round-bound block hashes differ).
@@ -569,19 +640,62 @@ fn check_content(storage: &Storage, buf: &std::collections::HashMap<u64, WindowC
 
 fn drain_pending(
     driver: &mut ConsensusDriver, buf: &std::collections::HashMap<u64, WindowContent>,
-    storage: &Storage, p2p: &SimplifiedP2P, committee: &[String], pending: &mut Vec<Vec<u8>>, max: usize,
+    storage: &Storage, p2p: &Arc<SimplifiedP2P>, committee: &[String], pending: &mut Vec<Vec<u8>>, max: usize,
 ) -> Vec<Effect> {
     if pending.is_empty() || !buf.contains_key(&driver.next_window()) { return Vec::new(); }
     let cur = driver.current_index();
+    let committed = driver.committed_index();
     let mut effs = Vec::new();
     let mut still = Vec::new();
+    // Per-drain weight bound on RETAINED content-gated Proposals: each costs an O(window) storage
+    // recompute per drain, and drain fires per authenticated inbound message. Honest steady state is
+    // exactly ONE such entry (the current leader's adopt-candidate); this cap makes the worst case
+    // (non-leader committee members mass-signing state-copied proposals — verify_msg checks only
+    // MEMBERSHIP, the engine's is_leader runs later) a constant, not O(committee) (audit F2).
+    let mut retained_gated = 0usize;
     for data in std::mem::take(pending) {
         match bincode::deserialize::<ConsensusMsg>(&data) {
-            // Buffered replay applies the SAME sig + content gate as the live path — a Proposal whose window
-            // content we cannot independently reproduce is never handed to the driver (no forged head/state).
-            // TailDiverged/Reject ⇒ not applied here; the live path drives reconcile, replay retries on re-gossip.
-            Ok(m) if msg_index(&m) <= cur => { if verify_msg(p2p, committee, &m) && matches!(check_content(storage, buf, &m), ContentCheck::Ok) { effs.extend(driver.handle(&m)); } }
-            Ok(_) if still.len() < max => still.push(data),
+            // At/below the committed frontier ⇒ can never matter again; prune. (This is what expires an
+            // adopt-buffered proposal whose window already finalized via the other voters.)
+            Ok(m) if msg_index(&m) <= committed => {}
+            // DEAD ROUND (audit F5/F6): the engine votes only proposals with index == current view
+            // (on_proposal strict equality) — once the view rotated past it, a buffered Proposal can
+            // never produce a vote; the post-TC re-proposal arrives with a NEW index via the live path.
+            // Pruning here is what bounds retained adopt-candidates to the CURRENT round only.
+            Ok(ConsensusMsg::Proposal(p)) if p.index < cur => {}
+            Ok(m) if msg_index(&m) <= cur => {
+                // Certs carry O(committee) ML-DSA sigs — NEVER verify inline on this loop (same rule
+                // as the live path, audit F7): dispatch to the bounded off-loop worker; on success it
+                // re-enters as CertVerified and applies without re-verify.
+                if matches!(&m, ConsensusMsg::Qc(_) | ConsensusMsg::Tc(_)) {
+                    dispatch_cert_verify(data, p2p, committee, cur);
+                    continue;
+                }
+                // Buffered replay applies the SAME sig + content gate as the live path — a Proposal whose
+                // window content we cannot independently reproduce is never handed to the driver.
+                if verify_msg(p2p, committee, &m) {
+                    match check_content(storage, buf, &m) {
+                        ContentCheck::Ok => { observe_accountability(&m); effs.extend(driver.handle(&m)); }
+                        // Adopt still in flight — canonical bodies not yet pulled/superseded (TailDiverged)
+                        // or our window not yet derived (Defer) ⇒ keep buffered; the next drain re-gates.
+                        // Repair is NOT re-fired here (the live path re-fires it at round cadence via the
+                        // re-proposal after TC) so a drain-per-inbound-message can never flood repair.
+                        ContentCheck::TailDiverged(_) | ContentCheck::Defer => {
+                            if retained_gated < MAX_RETAINED_GATED && still.len() < max {
+                                retained_gated += 1;
+                                still.push(data);
+                            }
+                        }
+                        // Genuine state/epoch divergence ⇒ fail-stop, never retried.
+                        ContentCheck::Reject => {}
+                    }
+                }
+            }
+            // Future band, HORIZON-bounded (audit F1): an index beyond cur+HORIZON cannot become
+            // verifiable soon, and — being buffered pre-authentication — would otherwise let junk
+            // squat its slot forever (msg_index is attacker-chosen). Within the horizon an entry is
+            // flushed at the first drain after the view reaches it (sig-fail ⇒ dropped).
+            Ok(m) if msg_index(&m) <= cur.saturating_add(V2_PENDING_VIEW_HORIZON) && still.len() < max => still.push(data),
             _ => {}
         }
     }
@@ -602,12 +716,54 @@ static V2_TX: OnceCell<mpsc::UnboundedSender<V2Event>> = OnceCell::new();
 /// legitimate throughput (unlike the v17.x per-minute limit that stalled the net).
 static V2_INBOUND_BYTES: AtomicUsize = AtomicUsize::new(0);
 const V2_INBOUND_BYTE_CAP: usize = 64 * 1024 * 1024; // 64 MiB of queued inbound consensus bytes
-/// Companion BYTE bound on the driver's future-round `pending` replay buffer. The 256-ENTRY
+/// Companion BYTE bound on the driver's `pending` replay buffer. The 256-ENTRY
 /// count cap alone still allows 256 × msg_size (a large-proposal flood ⇒ hundreds of MiB),
 /// so pending is independently byte-capped. Total inbound consensus memory ≤ this + the
-/// channel cap. `drain_pending` only REMOVES entries, so it can never exceed this bound —
-/// the gate lives solely at the single push site below.
-const V2_PENDING_BYTE_CAP: usize = 32 * 1024 * 1024; // 32 MiB of buffered future-round bytes
+/// channel cap. `drain_pending` only REMOVES or RE-KEEPS entries (never adds), so it can
+/// never exceed this bound — every push site goes through `buffer_pending`.
+const V2_PENDING_BYTE_CAP: usize = 32 * 1024 * 1024; // 32 MiB of buffered replay bytes
+/// How far above the current view a buffered message's index may sit. The future-round push site
+/// buffers PRE-authentication (a Qc/Tc sig can't be checked inline), so msg_index is attacker-
+/// chosen — without a horizon, junk at index u64::MAX squats its buffer slot forever and starves
+/// the adopt path (audit F1). Views advance every view-timeout even during a wedge (TC), so 64
+/// views of legit skew is generous; anything farther is re-gossiped when relevant.
+const V2_PENDING_VIEW_HORIZON: u64 = 64;
+/// Max content-gated Proposals (TailDiverged/Defer) RETAINED per drain — each costs an O(window)
+/// storage recompute per drain pass. Honest steady state = 1 (the current leader's adopt candidate).
+const MAX_RETAINED_GATED: usize = 4;
+
+/// SOLE push site into the replay buffer: count cap + byte cap + re-gossip dedup. Keeping every
+/// producer (future-round buffering, Defer, TailDiverged adopt) on one gate is what makes
+/// V2_PENDING_BYTE_CAP a real invariant rather than a per-site convention. Dedup is a fast-fail
+/// memcmp over ≤256 entries and only runs on buffered paths (never the hot Ok path).
+/// CLASS SPLIT (audit F1): the future-round site buffers PRE-authentication, so unauthenticated
+/// pushes may fill only HALF of each cap — the reserved half is writable solely by the
+/// authenticated paths (TailDiverged/Defer, post-verify_msg). A junk flood can therefore never
+/// starve the adopt-candidate slot that unwedges finality.
+fn buffer_pending(pending: &mut Vec<Vec<u8>>, max: usize, bytes: Vec<u8>, authenticated: bool) {
+    let (cap_n, cap_b) = if authenticated { (max, V2_PENDING_BYTE_CAP) } else { (max / 2, V2_PENDING_BYTE_CAP / 2) };
+    if pending.len() >= cap_n { return; }
+    let used: usize = pending.iter().map(|d| d.len()).sum();
+    if used + bytes.len() > cap_b { return; }
+    if pending.iter().any(|d| *d == bytes) { return; } // re-gossiped duplicate
+    pending.push(bytes);
+}
+
+/// ONE adopt-candidate slot per (ROUND, proposer): before buffering a gated Proposal, evict any
+/// older buffered Proposal from the SAME proposer for the SAME round (cp.index IS the view/round —
+/// a post-TC re-proposal carries a NEW index and is a NEW slot; its stale-round predecessor is
+/// pruned by drain_pending's dead-round arm instead). What this slot stops: an equivocating
+/// signer re-flooding same-round variants to stuff the buffer — it holds exactly ONE entry per
+/// (round, identity), every extra variant it signs is vote-equivocation evidence (recorded by
+/// observe_accountability on both the live and replay paths), and MAX_RETAINED_GATED bounds the
+/// total re-gate weight regardless. O(pending) deserialize, divergence paths only — never the hot
+/// Ok path.
+fn evict_superseded_proposal(pending: &mut Vec<Vec<u8>>, index: u64, proposer: &str) {
+    pending.retain(|d| match bincode::deserialize::<ConsensusMsg>(d) {
+        Ok(ConsensusMsg::Proposal(old)) => !(old.index == index && old.proposer == proposer),
+        _ => true,
+    });
+}
 
 /// P2P dispatch calls this for NetworkMessage::ConsensusV2 (no-op until run() starts).
 pub fn route_inbound(data: Vec<u8>) {
@@ -729,13 +885,13 @@ pub async fn run(
                             // Buffer until we hold that committee, or for a round ahead of us (rounds
                             // skip on timeout) — replayed as we advance. Bounded against DoS.
                             if !window_buf.contains_key(&driver.next_window()) || msg_index(&msg) > driver.current_index() {
-                                // Bound the replay buffer by BYTES as well as its 256-entry count,
-                                // so a large-proposal future-round flood cannot grow it unbounded.
-                                // O(pending) sum; pushes are rare (future-round only). Over either
+                                // Future-round / pre-committee inbound: buffer for replay — PRE-authentication
+                                // (a cert sig can't be checked inline), so this is the UNAUTHENTICATED class:
+                                // half-caps in buffer_pending + the view horizon here (an attacker-chosen far-
+                                // future index would otherwise squat its slot forever — audit F1). Over any
                                 // bound ⇒ drop (re-gossiped later; the buffer is best-effort).
-                                let cur: usize = pending.iter().map(|d| d.len()).sum();
-                                if pending.len() < MAX_PENDING && cur + data.len() <= V2_PENDING_BYTE_CAP {
-                                    pending.push(data);
+                                if msg_index(&msg) <= driver.current_index().saturating_add(V2_PENDING_VIEW_HORIZON) {
+                                    buffer_pending(&mut pending, MAX_PENDING, data, false);
                                 }
                                 Vec::new()
                             } else if matches!(&msg, ConsensusMsg::Qc(_) | ConsensusMsg::Tc(_)) {
@@ -780,9 +936,17 @@ pub async fn run(
                             mb_hashes, state_root, beacon, head_ts, committee: cmt, eligible: eligible_producers, banned, reward_root, registry_root, dilithium_pk_root, logs_root, total_supply,
                         });
                         if window_buf.len() > MAX_WINDOW_BUF {
-                            if let Some(&lo) = window_buf.keys().min() { window_buf.remove(&lo); }
+                            // NEVER evict the IN-FLIGHT window (audit F4): during a finality wedge
+                            // production keeps signalling new windows; evicting by min-key alone put a
+                            // ~256-window (~2h) TTL on the contested window's snapshot, after which
+                            // drain/try_propose/check_content all dead-end (Defer) forever. Stale
+                            // (< next_window) evicts first; else shed the FARTHEST future snapshot.
+                            let nw = driver.next_window();
+                            let victim = window_buf.keys().copied().filter(|k| *k < nw).min()
+                                .or_else(|| window_buf.keys().copied().filter(|k| *k != nw).max());
+                            if let Some(v) = victim { window_buf.remove(&v); }
                         }
-                        let mut effs = try_propose(&mut driver, &window_buf, &mut committee);
+                        let mut effs = try_propose(&mut driver, &window_buf, &storage, &mut committee);
                         effs.extend(drain_pending(&mut driver, &window_buf, &storage, &p2p, &committee, &mut pending, MAX_PENDING));
                         effs
                     }
@@ -797,7 +961,7 @@ pub async fn run(
                                 let mut effs = driver.sync(&cp, &qc);
                                 if !effs.is_empty() {
                                     if let Some(c) = window_buf.get(&driver.next_window()) { committee = c.committee.clone(); }
-                                    effs.extend(try_propose(&mut driver, &window_buf, &mut committee));
+                                    effs.extend(try_propose(&mut driver, &window_buf, &storage, &mut committee));
                                     effs.extend(drain_pending(&mut driver, &window_buf, &storage, &p2p, &committee, &mut pending, MAX_PENDING));
                                 }
                                 effs
@@ -989,9 +1153,112 @@ mod content_gate_tests {
             check_content(&storage, &buf, &ConsensusMsg::Proposal(cp(head, local.clone(), [7u8; 32], beacon))),
             ContentCheck::Reject));
 
-        // Reject: no local window snapshot ⇒ content not independently reproducible.
+        // Defer (NOT Reject): no local window snapshot ⇒ not caught up yet ⇒ buffer + retry, never fail-stop.
         let empty: std::collections::HashMap<u64, WindowContent> = std::collections::HashMap::new();
-        assert!(matches!(check_content(&storage, &empty, &ok), ContentCheck::Reject));
+        assert!(matches!(check_content(&storage, &empty, &ok), ContentCheck::Defer));
+    }
+
+    // PROPOSE-AND-ADOPT at the real gate (node-layer half of the driver wedge harness): a proposal
+    // whose tail diverges at one height (leader's failover-round winner vs our losing variant, state
+    // identical) classifies TailDiverged; once the certified-canonical body lands (repair ⇒ fork-choice
+    // supersede), the SAME proposal re-gates Ok — hashes AND beacon reproduced from real bodies — so the
+    // buffered replay votes. A forged tail whose body never materializes can never re-gate Ok (no blind
+    // adopt), and a forged beacon over real bodies still Rejects.
+    #[test]
+    fn tail_diverged_regates_ok_after_canonical_body_lands() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+        let k = qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL;
+        let head = k;
+        let start = head - (k - 1);
+        let sr = [9u8; 32];
+        let (local, _) = seed_window(&storage, head, k, "loser", 1, sr);
+        let mut buf = std::collections::HashMap::new();
+        buf.insert(head / k, wc(local.clone(), sr, [0u8; 32]));
+
+        // The leader's canonical tail: identical except height start+2 = the failover winner
+        // (higher timeout_round + its own VRF ⇒ different hash, SAME state_root).
+        let mut winner_vrf = [0u8; 32]; winner_vrf[0] = 0xAB;
+        let winner = mk_block(start + 2, "winner", 2, sr, winner_vrf);
+        let mut canon = local.clone();
+        canon[2] = winner.hash();
+        let mut vrfs: Vec<[u8; 32]> = (start..=head).map(|h| {
+            let mut v = [0u8; 32]; v[0] = (h & 0xff) as u8; v[1] = ((h >> 8) & 0xff) as u8; v
+        }).collect();
+        vrfs[2] = winner_vrf;
+        let canon_beacon = qnet_consensus::checkpoint_bft::accumulate_beacon(&vrfs);
+        let proposal = ConsensusMsg::Proposal(cp(head, canon.clone(), sr, canon_beacon));
+
+        // Before the canonical body lands: TailDiverged at exactly the contested height — never a vote.
+        match check_content(&storage, &buf, &proposal) {
+            ContentCheck::TailDiverged(hs) => assert_eq!(hs, vec![start + 2]),
+            _ => panic!("expected TailDiverged before the canonical body lands"),
+        }
+
+        // Repair lands ⇒ fork-choice supersede (round_supersede → v33 rollback deletes the losing
+        // variant, the certified winner re-syncs in). Direct save would trip the equivocation guard —
+        // exactly the invariant that makes blind adopt impossible; simulate the reorg's delete+save.
+        storage.delete_microblock(start + 2).unwrap();
+        storage.save_microblock(start + 2, &bincode::serialize(&winner).unwrap()).unwrap();
+
+        // The SAME proposal now re-gates Ok (tail + beacon reproduced from real bodies) ⇒ replay votes.
+        assert!(matches!(check_content(&storage, &buf, &proposal), ContentCheck::Ok));
+
+        // Forged beacon over the same real bodies must still fail-stop, not adopt.
+        let forged = ConsensusMsg::Proposal(cp(head, canon, sr, [0xEEu8; 32]));
+        assert!(matches!(check_content(&storage, &buf, &forged), ContentCheck::Reject));
+    }
+
+    // Adopt-buffer invariants: ONE candidate slot per (ROUND, proposer) — cp.index IS the view, so
+    // this slot stops a signer re-flooding same-round variants (each replaced, not accumulated);
+    // post-TC re-proposals are a NEW round/slot and the stale round is pruned by drain's dead-round
+    // arm instead. Distinct proposers keep distinct slots; exact re-gossip duplicates are dropped;
+    // the unauthenticated class (pre-sig future-round pushes) may fill only HALF the count cap, so
+    // junk can never starve the authenticated adopt-candidate slots (audit F1).
+    #[test]
+    fn adopt_buffer_one_slot_per_proposer() {
+        let mk = |round: u64, proposer: &str, ts: u64| {
+            let mut c = cp(qnet_consensus::checkpoint_bft::CHECKPOINT_INTERVAL,
+                           vec![[1u8; 32]], [9u8; 32], [0u8; 32]);
+            c.index = round;
+            c.proposer = proposer.to_string();
+            c.timestamp = ts;
+            ConsensusMsg::Proposal(c)
+        };
+        let ser = |m: &ConsensusMsg| bincode::serialize(m).unwrap();
+        let mut pending: Vec<Vec<u8>> = Vec::new();
+
+        // First candidate from p1 buffers (authenticated class = full caps).
+        buffer_pending(&mut pending, 256, ser(&mk(1, "p1", 0)), true);
+        assert_eq!(pending.len(), 1);
+
+        // p1's SAME-ROUND variant (equivocation: different bytes, same round+signer) REPLACES the
+        // previous candidate — an equivocator holds exactly one slot, never accumulates.
+        let v2 = mk(1, "p1", 1);
+        evict_superseded_proposal(&mut pending, 1, "p1");
+        buffer_pending(&mut pending, 256, ser(&v2), true);
+        assert_eq!(pending.len(), 1, "same (round, proposer) must hold exactly one slot");
+        assert_eq!(pending[0], ser(&v2), "the LATEST variant must win the slot");
+
+        // A different proposer for the same round gets its own slot.
+        evict_superseded_proposal(&mut pending, 1, "p2");
+        buffer_pending(&mut pending, 256, ser(&mk(1, "p2", 0)), true);
+        assert_eq!(pending.len(), 2);
+
+        // Exact re-gossip duplicate is dropped by buffer_pending itself.
+        buffer_pending(&mut pending, 256, ser(&v2), true);
+        assert_eq!(pending.len(), 2);
+
+        // Authenticated count cap enforced at the sole push site.
+        buffer_pending(&mut pending, 2, ser(&mk(2, "p3", 0)), true);
+        assert_eq!(pending.len(), 2, "count cap must reject the push");
+
+        // Unauthenticated class is capped at HALF: with 2 entries and max=4 (4/2=2), junk is refused
+        // while an authenticated push still lands — the adopt path can never be starved by a flood.
+        buffer_pending(&mut pending, 4, ser(&mk(3, "junk", 0)), false);
+        assert_eq!(pending.len(), 2, "unauthenticated class must be refused past max/2");
+        buffer_pending(&mut pending, 4, ser(&mk(3, "p4", 0)), true);
+        assert_eq!(pending.len(), 3, "authenticated push must still land in the reserved half");
     }
 
     // REGRESSION (workflow SURV-1): the macroblock-boundary checkpoint covers the FULL macroblock

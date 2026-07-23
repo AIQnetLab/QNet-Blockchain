@@ -1912,6 +1912,9 @@ const WalletScreen = () => {
             }}]
           );
         } else {
+          // Fresh activation: self-attest NOW so this-epoch eligibility is recorded even when the
+          // node's ping slot already passed this epoch (else it earns nothing until app reopen).
+          try { await selfAttestIfNeeded(result.pseudonym, true); } catch (_) {}
           showAlert(
             'Node Activated!',
             `Your ${nodeType} node has been successfully activated and registered in the network.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`,
@@ -6269,50 +6272,43 @@ const WalletScreen = () => {
           >
             <Text style={styles.tabTitle}>Node Monitoring</Text>
             
-            {/* Loading state - shown while initializing (prevents flash of "Get Activation Code") */}
-            {(nodeInitializing || loadingAllNodes) && !activatedNodeType && (
-              <View style={[styles.nodeMonitoringCard, {marginBottom: 16, alignItems: 'center', paddingVertical: 32}]}>
-                <Text style={[styles.nodeMonitoringLabel, {color: '#00d4ff', fontSize: 14}]}>
-                  Loading node data...
-                </Text>
-              </View>
-            )}
-            
-            {/* No node yet - show how to activate (only after loading completes) */}
-            {!nodeInitializing && !loadingAllNodes && allUserNodes.length === 0 && !activatedNodeType && (
-              <View style={[styles.nodeMonitoringCard, {marginBottom: 16}]}>
-                <Text style={[styles.nodeMonitoringLabel, {marginBottom: 8}]}>
-                  No Node Active
-                </Text>
-                <Text style={[styles.nodeMonitoringLabel, {fontSize: 12, color: '#888', marginBottom: 12}]}>
-                  Activate a Light node here, or use your EON address when setting up a Super node on a server.
-                </Text>
-                
-                {/* Copy QNet EON address for server activation */}
-                <View style={{padding: 10, backgroundColor: '#1a1a2e', borderRadius: 8}}>
-                  <Text style={[styles.nodeMonitoringLabel, {fontSize: 11, color: '#888'}]}>
-                    Your QNet Address (for server node activation):
-                  </Text>
-                  <TouchableOpacity 
-                    onPress={() => {
-                      const qnetAddr = wallet?.qnetAddress || wallet?.address;
-                      if (qnetAddr) {
-                        Clipboard.setString(qnetAddr);
-                        setCopiedAddress(qnetAddr);
-                        setTimeout(() => setCopiedAddress(''), 2000);
-                      }
-                    }}
-                    style={{marginTop: 6}}
-                  >
-                    <Text style={[styles.nodeMonitoringLabel, {fontSize: 11, color: '#007AFF'}]}>
-                      {copiedAddress === (wallet?.qnetAddress || wallet?.address) ? 'Copied!' : `Copy: ${(wallet?.qnetAddress || wallet?.address)?.substring(0, 20)}...`}
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            )}
-            
             {activatedNodeType ? (
+              (() => {
+                // Monitoring renders ONLY for a node CONFIRMED on-chain (code entered → status pulled).
+                // Before that: a plain activation box — no status rows, no badges, no polling UI.
+                const nodeConfirmed = activatedNodeType === 'light'
+                  ? lightNodeStatus?.registered === true
+                  : (serverNodeStatus?.success === true && serverNodeStatus?.registered !== false);
+                if (!nodeConfirmed) {
+                  return (
+                    <View style={styles.nodeMonitoringCard}>
+                      <Text style={styles.nodeMonitoringTitle}>
+                        {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node
+                      </Text>
+                      {activatedNodeType === 'light' ? (
+                        <TouchableOpacity
+                          style={[styles.button, styles.primaryButton, {marginTop: 16}]}
+                          onPress={() => {
+                            setShowActivationInput(true);
+                            setActivationInputCode('');
+                          }}
+                        >
+                          <Text style={styles.buttonText}>Activate Node</Text>
+                        </TouchableOpacity>
+                      ) : (
+                        <View style={[styles.serverActivationNotice, {marginTop: 16}]}>
+                          <Text style={styles.serverActivationText}>
+                            Super nodes require server activation
+                          </Text>
+                          <Text style={styles.serverActivationSubtext}>
+                            Use your activation code on a dedicated server
+                          </Text>
+                        </View>
+                      )}
+                    </View>
+                  );
+                }
+                return (
               <View>
                 {/* Node Status Card */}
                 <View style={styles.nodeMonitoringCard}>
@@ -6339,109 +6335,44 @@ const WalletScreen = () => {
                     </View>
                     <View style={[
                       styles.statusBadge,
+                      // Confirmed node only: Light keys off reactivation state, Super off liveness.
                       activatedNodeType === 'light'
-                        ? (!lightNodeStatus || (lightNodeStatus.registered === false && lightNodeStatus.error)
-                            ? styles.statusBadgeActive                                         // Yellow — CHECKING (loading or transient poll error: never falsely offline)
-                            : lightNodeStatus.registered === false
-                              ? styles.statusBadgeActive                                       // Yellow — NOT ACTIVATED (fresh or reinstall)
-                              : lightNodeStatus.needsReactivation
-                                ? styles.statusBadgeInactive                                   // Red   — OFFLINE (was active, dropped)
-                                : styles.statusBadgeActivated)                                 // Green — ONLINE
-                        : (!serverNodeStatus?.success
-                            ? styles.statusBadgeActive                                         // Yellow — CODE RECEIVED
-                            : serverNodeStatus.isOnline
-                              ? styles.statusBadgeActivated                                    // Green — ONLINE
-                              : styles.statusBadgeInactive)                                    // Red   — OFFLINE
+                        ? (lightNodeStatus.needsReactivation ? styles.statusBadgeInactive : styles.statusBadgeActivated)
+                        : (serverNodeStatus.isOnline ? styles.statusBadgeActivated : styles.statusBadgeInactive)
                     ]}>
                       <Text style={[
                         styles.statusBadgeText,
-                        (activatedNodeType === 'light'
-                          ? (!lightNodeStatus || lightNodeStatus.registered === false)
-                          : (!serverNodeStatus?.success)) && styles.statusBadgeTextActive,
-                        ((activatedNodeType === 'light' && lightNodeStatus?.registered && lightNodeStatus?.needsReactivation) ||
-                         (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)) && {color: '#ff3b30'}
+                        ((activatedNodeType === 'light' && lightNodeStatus.needsReactivation) ||
+                         (activatedNodeType !== 'light' && !serverNodeStatus.isOnline)) && {color: '#ff3b30'}
                       ]}>
                         {activatedNodeType === 'light'
-                          ? (!lightNodeStatus || (lightNodeStatus.registered === false && lightNodeStatus.error)
-                              ? 'CHECKING...'
-                              : lightNodeStatus.registered === false
-                                ? 'NOT ACTIVATED'
-                                : lightNodeStatus.needsReactivation ? 'OFFLINE' : 'ONLINE')
-                          : (!serverNodeStatus?.success
-                              ? 'CODE RECEIVED'
-                              : serverNodeStatus.isOnline ? 'ONLINE' : 'OFFLINE')}
+                          ? (lightNodeStatus.needsReactivation ? 'OFFLINE' : 'ONLINE')
+                          : (serverNodeStatus.isOnline ? 'ONLINE' : 'OFFLINE')}
                       </Text>
                     </View>
                   </View>
                   
-                  {/* Action Button based on node type. Light gates key on ACTUAL registration
-                      (lightNodeStatus.registered), not nodePseudonym (which is set at code-receipt,
-                      before the node is registered). */}
-                  {activatedNodeType === 'light' ? (
-                    (lightNodeStatus?.registered && lightNodeStatus?.needsReactivation) ? (
-                      <>
-                        {/* ONLY reached when a registered node WAS active and dropped (ejected /
-                            missed pings). Notice + reactivate button. */}
-                        <View style={[styles.serverActivationNotice, {backgroundColor: '#ff3b3020', borderColor: '#ff3b30', marginBottom: 12}]}>
-                          <Text style={[styles.serverActivationText, {color: '#ff3b30'}]}>
-                            Node Inactive - Reactivation needed
-                          </Text>
-                          <Text style={styles.serverActivationSubtext}>
-                            Your node was offline and needs reactivation
-                          </Text>
-                        </View>
-                        {/* marginTop separates the button from the notice card (they were glued together) */}
-                        <TouchableOpacity
-                          style={[styles.button, styles.primaryButton, {marginTop: 12}, reactivatingNode && styles.buttonDisabled]}
-                          onPress={handleReactivateNode}
-                          disabled={reactivatingNode}
-                        >
-                          <Text style={styles.buttonText}>
-                            {reactivatingNode ? 'Reactivating...' : "I'm Back - Reactivate Node"}
-                          </Text>
-                        </TouchableOpacity>
-                      </>
-                    ) : lightNodeStatus?.registered ? (
+                  {/* Confirmed node: the only in-app action here is Light reactivation after a drop.
+                      Activation lives in the pre-confirmation box; Super nodes are managed on the server. */}
+                  {activatedNodeType === 'light' && lightNodeStatus.needsReactivation && (
+                    <>
+                      <View style={[styles.serverActivationNotice, {backgroundColor: '#ff3b3020', borderColor: '#ff3b30', marginBottom: 12}]}>
+                        <Text style={[styles.serverActivationText, {color: '#ff3b30'}]}>
+                          Node Inactive - Reactivation needed
+                        </Text>
+                        <Text style={styles.serverActivationSubtext}>
+                          Your node was offline and needs reactivation
+                        </Text>
+                      </View>
                       <TouchableOpacity
-                        style={[styles.button, styles.buttonDisabled]}
-                        disabled={true}
+                        style={[styles.button, styles.primaryButton, {marginTop: 12}, reactivatingNode && styles.buttonDisabled]}
+                        onPress={handleReactivateNode}
+                        disabled={reactivatingNode}
                       >
                         <Text style={styles.buttonText}>
-                          Activated
+                          {reactivatingNode ? 'Reactivating...' : "I'm Back - Reactivate Node"}
                         </Text>
                       </TouchableOpacity>
-                    ) : (lightNodeStatus && lightNodeStatus.registered === false && !lightNodeStatus.error) ? (
-                    <TouchableOpacity
-                      style={[styles.button, styles.secondaryButton]}
-                      onPress={() => {
-                        setShowActivationInput(true);
-                        setActivationInputCode(''); // Don't pre-fill the code!
-                      }}
-                    >
-                      <Text style={[styles.buttonText, styles.secondaryButtonText]}>
-                        Activate Node
-                      </Text>
-                    </TouchableOpacity>
-                    ) : (
-                    // null (first load) or transient poll error — neutral placeholder, never flash
-                    // "Activate Node" on an already-registered node before the first status arrives.
-                    <TouchableOpacity style={[styles.button, styles.buttonDisabled]} disabled={true}>
-                      <Text style={styles.buttonText}>Checking…</Text>
-                    </TouchableOpacity>
-                    )
-                  ) : (
-                    <>
-                      {/* Server Node Status - only show activation notice for truly unlinked nodes */}
-                      {!serverNodeStatus?.success && !nodePseudonym && (
-                        <View style={styles.serverActivationNotice}>
-                          <Text style={styles.serverActivationText}>
-                            Super nodes require server activation
-                          </Text>
-                          <Text style={styles.serverActivationSubtext}>
-                            Use your activation code on a dedicated server
-                          </Text>
-                        </View>
-                      )}
                     </>
                   )}
                 </View>
@@ -6453,39 +6384,14 @@ const WalletScreen = () => {
                   <View style={styles.rewardItem}>
                     <Text style={styles.rewardLabel}>Node:</Text>
                     <Text style={[styles.rewardValue, {
-                      // Light-node status keys off ACTUAL registration (see loadLightNodeStatus),
-                      // never off nodePseudonym. Super-node branch is unchanged.
+                      // Confirmed node only: Light keys off reactivation state, Super off liveness.
                       color: activatedNodeType === 'light'
-                        ? ((!lightNodeStatus || (lightNodeStatus.registered === false && lightNodeStatus.error))
-                            ? '#ff9500'  // Orange - checking / transient poll error (never falsely offline)
-                            : lightNodeStatus.registered === false
-                              ? '#ff9500'  // Orange - not activated (fresh or reinstall)
-                              : lightNodeStatus.needsReactivation
-                                ? '#ff9500'  // Orange - was active, dropped -> needs reactivation
-                                : '#34c759') // Green - active
-                        : (activatedNodeType !== 'light' && serverNodeStatus?.success && serverNodeStatus?.registered === false)
-                            ? '#ff9500'  // Orange - not registered on-chain yet (NOT banned)
-                          : (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)
-                            ? '#ff3b30'  // Red - Server offline
-                            : (activatedNodeType !== 'light' && !serverNodeStatus?.success)
-                              ? '#ff9500'  // Orange - connecting (status not loaded yet)
-                              : '#34c759'  // Green - active
+                        ? (lightNodeStatus.needsReactivation ? '#ff9500' : '#34c759')
+                        : (serverNodeStatus.isOnline ? '#34c759' : '#ff3b30')
                     }]}>
                       {activatedNodeType === 'light'
-                        ? ((!lightNodeStatus || (lightNodeStatus.registered === false && lightNodeStatus.error))
-                            ? 'Connecting…'
-                            : lightNodeStatus.registered === false
-                              ? 'Not Activated'
-                              : lightNodeStatus.needsReactivation
-                                ? 'Needs Reactivation'
-                                : 'Active')
-                        : (activatedNodeType !== 'light' && serverNodeStatus?.success && serverNodeStatus?.registered === false)
-                            ? 'Not Activated'
-                          : (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)
-                            ? 'Server Offline'
-                            : (activatedNodeType !== 'light' && !serverNodeStatus?.success)
-                              ? 'Connecting…'
-                              : 'Active'}
+                        ? (lightNodeStatus.needsReactivation ? 'Needs Reactivation' : 'Active')
+                        : (serverNodeStatus.isOnline ? 'Active' : 'Server Offline')}
                     </Text>
                   </View>
                   
@@ -6563,13 +6469,15 @@ const WalletScreen = () => {
                   
                 </View>
               </View>
+                );
+              })()
             ) : (
             <View style={styles.emptyState}>
-                <Text style={styles.emptyText}>No validator nodes configured</Text>
+                <Text style={styles.emptyText}>No Active Node</Text>
                 <Text style={styles.emptySubtext}>
-                  Get an activation code to run a validator node and support the network
+                  Get an activation code to run a Light node here. Super nodes are set up on a server.
                 </Text>
-                
+
                 <TouchableOpacity
                   style={[styles.button, styles.primaryButton, { marginTop: 20 }]}
                   onPress={() => {
