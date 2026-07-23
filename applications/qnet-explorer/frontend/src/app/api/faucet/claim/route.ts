@@ -70,16 +70,25 @@ function checkRateLimit(ip: string): { allowed: boolean; resetTime?: number } {
   return { allowed: true };
 }
 
+// Cooldown key = `${address}:${tokenType}` — NOT the bare address. A claim is a PAIR of parallel
+// requests (1DEV + SOL) for the same wallet; keying by address alone made the first request's
+// pre-dispatch reservation 429 the second one ("wait 24 hours"), so exactly one token ever
+// arrived. Per-type keys let one claim's pair coexist while each token type still enforces its
+// own 24h-per-address limit — anti-abuse is not weakened.
+function cooldownKey(address: string, tokenType: string): string {
+  return `${address}:${tokenType}`;
+}
+
 function checkAddressCooldown(
-  address: string,
+  key: string,
   environment: 'testnet' | 'mainnet',
 ): { allowed: boolean; nextClaimTime?: number } {
   const now = Date.now();
-  const lastClaim = addressCooldowns.get(address);
+  const lastClaim = addressCooldowns.get(key);
   const cooldownMs = FAUCET_CONFIG.cooldown[environment];
 
   if (lastClaim && now - lastClaim > cooldownMs * 2) {
-    addressCooldowns.delete(address);
+    addressCooldowns.delete(key);
   }
 
   if (!lastClaim || now - lastClaim > cooldownMs) {
@@ -433,7 +442,7 @@ export async function POST(request: NextRequest) {
 
     // Rate-limiting & cooldown for mainnet only
     if (environment !== 'testnet') {
-      const cooldownCheck = checkAddressCooldown(walletAddress, environment);
+      const cooldownCheck = checkAddressCooldown(cooldownKey(walletAddress, tokenType), environment);
       if (!cooldownCheck.allowed) {
         return NextResponse.json(
           {
@@ -464,10 +473,11 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      // Reserve the per-address slot BEFORE dispatching (which now awaits confirmation for seconds), so
-      // concurrent same-wallet claims can't all pass the cooldown check and each send. Released below only
-      // on a hard pre-send / on-chain failure — a landed-but-slow tx keeps the reservation.
-      addressCooldowns.set(walletAddress, Date.now());
+      // Reserve the per-(address, tokenType) slot BEFORE dispatching (which now awaits confirmation for
+      // seconds), so concurrent same-wallet same-token claims can't all pass the cooldown check and each
+      // send. Released below only on a hard pre-send / on-chain failure — a landed-but-slow tx keeps the
+      // reservation. Keyed per token type so the UI's parallel 1DEV+SOL pair never 429s itself.
+      addressCooldowns.set(cooldownKey(walletAddress, tokenType), Date.now());
     }
 
     const result = await sendTokens(tokenType, amount, walletAddress, environment);
@@ -489,7 +499,7 @@ export async function POST(request: NextRequest) {
     // slow-but-landed tx can never be double-paid on retry. Always echo the signature (when present)
     // so the money-moving operation is observable on a Solana explorer even on failure.
     if (environment !== 'testnet' && result.releasable === true) {
-      addressCooldowns.delete(walletAddress);
+      addressCooldowns.delete(cooldownKey(walletAddress, tokenType));
     }
     return NextResponse.json(
       { success: false, error: result.error, txHash: result.txHash ?? null },
